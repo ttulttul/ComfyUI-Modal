@@ -103,6 +103,19 @@ def test_stable_modal_cloud_entry_imports_without_modal_sdk(
     assert hasattr(modal_cloud_module, "RemoteEngine")
 
 
+def test_modal_cloud_ignores_heavy_comfyui_paths(
+    modal_cloud_module: Any,
+) -> None:
+    """The Modal cloud module should skip heavyweight ComfyUI runtime artifacts."""
+    from pathlib import Path
+
+    assert modal_cloud_module._should_ignore_comfyui_path(Path("models/checkpoint.safetensors"))
+    assert modal_cloud_module._should_ignore_comfyui_path(Path("output/run/output.png"))
+    assert modal_cloud_module._should_ignore_comfyui_path(Path("__pycache__/execution.pyc"))
+    assert not modal_cloud_module._should_ignore_comfyui_path(Path("execution.py"))
+    assert not modal_cloud_module._should_ignore_comfyui_path(Path("comfy/model_management.py"))
+
+
 class _BoundarySourceNode:
     """Simple source node used for subgraph execution tests."""
 

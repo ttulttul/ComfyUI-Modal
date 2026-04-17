@@ -17,7 +17,9 @@ from typing import Any, Iterator
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
-for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT):
+_LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
+_REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
+for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_COMFYUI_ROOT):
     candidate_str = str(candidate)
     try:
         candidate_exists = candidate.exists()
@@ -282,6 +284,26 @@ def _should_ignore_repo_path(path: Path) -> bool:
     return path.suffix.lower() in {".log", ".pyc", ".pyo", ".swp", ".tmp"}
 
 
+def _should_ignore_comfyui_path(path: Path) -> bool:
+    """Return whether a local ComfyUI path should be omitted from the Modal image mount."""
+    parts = set(path.parts)
+    if {
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "input",
+        "models",
+        "output",
+        "temp",
+        "user",
+    } & parts:
+        return True
+    return path.suffix.lower() in {".bin", ".ckpt", ".log", ".pt", ".pyc", ".pyo", ".safetensors", ".swp", ".tmp"}
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     app = modal.App(settings.app_name)
@@ -295,6 +317,21 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             ignore=_should_ignore_repo_path,
         )
     )
+    if settings.comfyui_root is not None and settings.comfyui_root.exists():
+        image = image.add_local_dir(
+            settings.comfyui_root,
+            remote_path=str(_REMOTE_COMFYUI_ROOT),
+            ignore=_should_ignore_comfyui_path,
+        )
+        logger.info(
+            "Including local ComfyUI checkout %s in Modal image at %s.",
+            settings.comfyui_root,
+            _REMOTE_COMFYUI_ROOT,
+        )
+    else:
+        logger.warning(
+            "No local ComfyUI checkout was discovered; remote Modal execution may fail to import ComfyUI core modules."
+        )
 
     @app.cls(
         gpu="A100",
