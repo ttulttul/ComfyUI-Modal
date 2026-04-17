@@ -228,9 +228,11 @@ These environment variables are supported:
 
 - Run tests with `uv run pytest`.
 - The project includes a minimal [pyproject.toml](/home/ksimpson/git/ComfyUI-Modal/pyproject.toml) so pytest discovery is consistent under `uv`.
+- [modal_test_workflow.json](/home/ksimpson/git/ComfyUI-Modal/modal_test_workflow.json) is checked in as the first captured real workflow that successfully produced output through the Modal path. It is treated as a smoke-test artifact, not a pristine editor-authored workflow.
 
 ## Current limitations
 
 - Remote execution now happens per connected remote component, not per disconnected set of marked nodes. If you leave a local gap in the middle of a would-be remote chain, the boundary still has to be transport-safe.
 - The default sync backend is a local mirror used for development and tests. The Modal runtime entrypoint is present, but real cloud execution still depends on a working Modal SDK environment.
 - Non-JSON, non-bytes, non-tensor values cannot cross the local/remote boundary yet. Unsupported boundary types raise immediately instead of silently degrading.
+- Saved workflow artifacts captured after a remote run may include internal proxy nodes such as `ModalUniversalExecutor`. Those are useful for regression fixtures, but they should not be assumed to be clean source workflows for authoring.
