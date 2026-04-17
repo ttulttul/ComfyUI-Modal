@@ -27,3 +27,13 @@ def test_synthetic_execution_events_match_comfyui_execution_shapes() -> None:
     assert 'dispatchSyntheticApiEvent("executing", displayNode);' in source
     assert 'dispatchSyntheticApiEvent("notification", {' in source
     assert "Waiting for a machine on Modal." in source
+
+
+def test_global_modal_status_badge_is_installed() -> None:
+    """The frontend should expose a dedicated global Modal activity indicator."""
+    source = _modal_toggle_source()
+
+    assert 'element.id = "comfy-modal-global-status";' in source
+    assert "Modal setup running for" in source
+    assert "Modal workflow running on" in source
+    assert "installGlobalStatusStyles()" in source

@@ -22,8 +22,10 @@ const modalNodeStates = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
 const syntheticPromptUiStates = new Map();
+const modalGlobalStatusStates = new Map();
 
 let animationFrameHandle = null;
+let modalGlobalStatusElement = null;
 
 /**
  * Return whether a node should show the Modal toggle.
@@ -78,6 +80,158 @@ function nowMs() {
  */
 function nodeId(node) {
   return String(node?.id ?? "");
+}
+
+/**
+ * Ensure the global Modal execution status badge exists.
+ * @returns {HTMLDivElement | null}
+ */
+function ensureGlobalStatusElement() {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  if (modalGlobalStatusElement?.isConnected) {
+    return modalGlobalStatusElement;
+  }
+
+  const element = document.createElement("div");
+  element.id = "comfy-modal-global-status";
+  element.style.position = "fixed";
+  element.style.top = "14px";
+  element.style.right = "18px";
+  element.style.zIndex = "9999";
+  element.style.display = "none";
+  element.style.alignItems = "center";
+  element.style.gap = "10px";
+  element.style.padding = "10px 14px";
+  element.style.borderRadius = "999px";
+  element.style.border = "1px solid rgba(255, 255, 255, 0.16)";
+  element.style.background = "rgba(15, 23, 42, 0.94)";
+  element.style.boxShadow = "0 10px 30px rgba(0, 0, 0, 0.28)";
+  element.style.color = "#f8fafc";
+  element.style.fontFamily = "ui-sans-serif, system-ui, sans-serif";
+  element.style.fontSize = "13px";
+  element.style.fontWeight = "600";
+  element.style.pointerEvents = "none";
+  element.innerHTML =
+    '<span class="modal-status-dot"></span><span class="modal-status-text"></span>';
+  document.body.appendChild(element);
+  modalGlobalStatusElement = element;
+  return element;
+}
+
+/**
+ * Return the most important active global Modal state.
+ * @returns {{ phase: string, promptId: string, nodeCount: number } | null}
+ */
+function currentGlobalStatus() {
+  if (modalGlobalStatusStates.size === 0) {
+    return null;
+  }
+
+  const phases = Array.from(modalGlobalStatusStates.entries()).map(([promptId, state]) => ({
+    promptId,
+    phase: state.phase,
+    nodeCount: state.nodeCount,
+    updatedAt: state.updatedAt,
+  }));
+  phases.sort((left, right) => right.updatedAt - left.updatedAt);
+
+  return (
+    phases.find((state) => state.phase === STATE_ERROR) ??
+    phases.find((state) => state.phase === STATE_SETUP) ??
+    phases.find((state) => state.phase === STATE_EXECUTING) ??
+    phases[0]
+  );
+}
+
+/**
+ * Redraw the global Modal execution badge.
+ */
+function refreshGlobalStatusElement() {
+  const element = ensureGlobalStatusElement();
+  if (!element) {
+    return;
+  }
+
+  const activeState = currentGlobalStatus();
+  if (!activeState) {
+    element.style.display = "none";
+    element.dataset.phase = "";
+    return;
+  }
+
+  const dot = element.querySelector(".modal-status-dot");
+  const text = element.querySelector(".modal-status-text");
+  const nodeLabel = activeState.nodeCount === 1 ? "node" : "nodes";
+
+  element.style.display = "inline-flex";
+  element.dataset.phase = activeState.phase;
+
+  if (activeState.phase === STATE_SETUP) {
+    element.style.borderColor = "rgba(245, 158, 11, 0.55)";
+    element.style.background = "rgba(61, 42, 9, 0.94)";
+    dot.style.background = SETUP_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
+    dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
+    text.textContent = `Modal setup running for ${activeState.nodeCount} ${nodeLabel}`;
+  } else if (activeState.phase === STATE_EXECUTING) {
+    element.style.borderColor = "rgba(34, 197, 94, 0.55)";
+    element.style.background = "rgba(8, 49, 28, 0.94)";
+    dot.style.background = ACTIVE_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(34, 197, 94, 0.18)";
+    dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
+    text.textContent = `Modal workflow running on ${activeState.nodeCount} ${nodeLabel}`;
+  } else if (activeState.phase === STATE_ERROR) {
+    element.style.borderColor = "rgba(239, 68, 68, 0.55)";
+    element.style.background = "rgba(69, 10, 10, 0.94)";
+    dot.style.background = ERROR_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(239, 68, 68, 0.18)";
+    dot.style.animation = "none";
+    text.textContent = "Modal workflow failed";
+  } else {
+    element.style.borderColor = "rgba(29, 155, 240, 0.5)";
+    element.style.background = "rgba(15, 23, 42, 0.94)";
+    dot.style.background = IDLE_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(29, 155, 240, 0.18)";
+    dot.style.animation = "none";
+    text.textContent = "Modal workflow active";
+  }
+
+  dot.style.width = "10px";
+  dot.style.height = "10px";
+  dot.style.borderRadius = "999px";
+  dot.style.display = "inline-block";
+}
+
+/**
+ * Record one prompt's global Modal execution phase.
+ * @param {string} promptId
+ * @param {string} phase
+ * @param {number} nodeCount
+ */
+function setGlobalStatusPhase(promptId, phase, nodeCount) {
+  if (!promptId) {
+    return;
+  }
+  modalGlobalStatusStates.set(promptId, {
+    phase,
+    nodeCount: Math.max(1, Number(nodeCount) || 1),
+    updatedAt: nowMs(),
+  });
+  refreshGlobalStatusElement();
+}
+
+/**
+ * Clear one prompt from the global Modal execution badge.
+ * @param {string} promptId
+ */
+function clearGlobalStatusPhase(promptId) {
+  if (!promptId) {
+    return;
+  }
+  modalGlobalStatusStates.delete(promptId);
+  refreshGlobalStatusElement();
 }
 
 /**
@@ -388,8 +542,11 @@ function handleModalStatus(event) {
   }
   if (detail.phase === STATE_SETUP) {
     beginSyntheticExecutionUi(promptId, (detail.node_ids ?? []).map((value) => String(value)));
+    setGlobalStatusPhase(promptId, STATE_SETUP, (detail.node_ids ?? []).length);
   } else if (detail.phase === STATE_ERROR) {
     endSyntheticExecutionUi(promptId, true);
+    setGlobalStatusPhase(promptId, STATE_ERROR, (detail.node_ids ?? []).length);
+    setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
   }
 
   const nodeIds = (detail.node_ids ?? []).map((value) => String(value));
@@ -424,6 +581,12 @@ function handleExecutionPhase(event, phase) {
   const componentNodeIds = resolveComponentNodeIds(promptId, representativeNodeId);
   if (!componentNodeIds) {
     return;
+  }
+  if (phase === STATE_EXECUTING) {
+    setGlobalStatusPhase(promptId, STATE_EXECUTING, componentNodeIds.length);
+  } else if (phase === STATE_ERROR) {
+    setGlobalStatusPhase(promptId, STATE_ERROR, componentNodeIds.length);
+    setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
   }
   setNodesPhase(componentNodeIds, phase, promptId, detail.exception_message);
 }
@@ -478,6 +641,7 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds) {
 
   const displayNode = remoteNodeIds[0];
   syntheticPromptUiStates.set(promptId, { displayNode });
+  setGlobalStatusPhase(promptId, STATE_SETUP, remoteNodeIds.length);
   dispatchSyntheticApiEvent("status", statusPayload(1));
   dispatchSyntheticApiEvent("notification", {
     id: promptId,
@@ -502,6 +666,12 @@ function endSyntheticExecutionUi(promptId, failed = false) {
   }
 
   syntheticPromptUiStates.delete(promptId);
+  if (failed) {
+    setGlobalStatusPhase(promptId, STATE_ERROR, 1);
+    setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
+  } else {
+    clearGlobalStatusPhase(promptId);
+  }
   dispatchSyntheticApiEvent("notification", {
     id: promptId,
     value: "Modal setup finished.",
@@ -551,6 +721,7 @@ function registerExecutionListeners() {
       return;
     }
     endSyntheticExecutionUi(promptId);
+    clearGlobalStatusPhase(promptId);
     const promptState = modalPromptStates.get(promptId);
     if (!promptState) {
       return;
@@ -622,10 +793,31 @@ function patchQueuePrompt() {
   api.__modalQueuePromptPatched = true;
 }
 
+/**
+ * Install CSS keyframes used by the global Modal status badge.
+ */
+function installGlobalStatusStyles() {
+  if (typeof document === "undefined" || document.getElementById("comfy-modal-status-styles")) {
+    return;
+  }
+
+  const style = document.createElement("style");
+  style.id = "comfy-modal-status-styles";
+  style.textContent = `
+    @keyframes modal-status-pulse {
+      0% { transform: scale(0.9); opacity: 0.7; }
+      50% { transform: scale(1.08); opacity: 1; }
+      100% { transform: scale(0.9); opacity: 0.7; }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
 app.registerExtension({
   name: "Comfy.ModalSync.Toggle",
 
   async init() {
+    installGlobalStatusStyles();
     patchQueuePrompt();
     registerExecutionListeners();
   },
