@@ -95,6 +95,14 @@ def test_local_remote_app_executes_original_node(
     assert outputs == ("hello", 1)
 
 
+def test_stable_modal_cloud_entry_imports_without_modal_sdk(
+    modal_cloud_module: Any,
+) -> None:
+    """The stable Modal cloud module should stay importable when modal is unavailable."""
+    assert modal_cloud_module.__name__ == "comfyui_modal_sync_cloud"
+    assert hasattr(modal_cloud_module, "RemoteEngine")
+
+
 class _BoundarySourceNode:
     """Simple source node used for subgraph execution tests."""
 
