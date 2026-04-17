@@ -508,6 +508,13 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
             )
             return remote_method.remote(payload, kwargs_payload)
         except lookup_error_types as exc:
+            if not settings.allow_ephemeral_fallback:
+                raise ModalRemoteInvocationError(
+                    "Remote execution requires a deployed Modal app. "
+                    f"Lookup failed for app={settings.app_name!r} component={payload.get('component_id')!r}: {exc}. "
+                    "Deploy the app once and retry, or set COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true "
+                    "to allow slow ephemeral app.run() fallback behavior."
+                ) from exc
             logger.warning(
                 "Deployed Modal app lookup failed for app=%s component=%s: %s. Falling back to ephemeral app.run(); this creates a temporary Modal app session, not a persistent deployment or endpoint.",
                 settings.app_name,

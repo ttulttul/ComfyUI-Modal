@@ -148,6 +148,81 @@ def test_modal_cloud_pins_cu128_pytorch_stack(
     assert modal_cloud_module._PYTORCH_CUDA_INDEX_URL == "https://download.pytorch.org/whl/cu128"
 
 
+def test_modal_cloud_builds_snapshot_enabled_cls_options(
+    modal_cloud_module: Any,
+) -> None:
+    """The remote engine should default to CPU memory snapshots and optional GPU snapshots."""
+    base_settings = types.SimpleNamespace(
+        remote_storage_root="/storage",
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+    )
+
+    options = modal_cloud_module._remote_engine_cls_options(base_settings, "volume", "image")
+
+    assert options["enable_memory_snapshot"] is True
+    assert "experimental_options" not in options
+    assert options["volumes"] == {"/storage": "volume"}
+
+    gpu_snapshot_settings = types.SimpleNamespace(
+        remote_storage_root="/storage",
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=True,
+    )
+    gpu_snapshot_options = modal_cloud_module._remote_engine_cls_options(
+        gpu_snapshot_settings,
+        "volume",
+        "image",
+    )
+    assert gpu_snapshot_options["experimental_options"] == {"enable_gpu_snapshot": True}
+
+
+def test_remote_modal_requires_deployed_app_by_default(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote mode should reject slow ephemeral fallback unless explicitly enabled."""
+
+    class FakeLookupError(Exception):
+        """Stand-in for Modal deployed lookup failures."""
+
+    class FakeModal:
+        """Minimal modal SDK double with deployed lookup failure types."""
+
+        exception = types.SimpleNamespace(
+            NotFoundError=FakeLookupError,
+            ExecutionError=FakeLookupError,
+            InvalidError=FakeLookupError,
+        )
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Simulate a missing deployed app."""
+                raise FakeLookupError("not deployed")
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setenv("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK", "false")
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        try:
+            remote_modal_app_module._invoke_modal_payload_blocking(
+                {"component_id": "component-1"},
+                b"{}",
+            )
+        except remote_modal_app_module.ModalRemoteInvocationError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("Expected ModalRemoteInvocationError to be raised.")
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert "requires a deployed Modal app" in message
+    assert "COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true" in message
+
+
 def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
     modal_cloud_module: Any,
     monkeypatch: Any,

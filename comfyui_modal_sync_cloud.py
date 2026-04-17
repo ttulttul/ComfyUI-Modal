@@ -512,6 +512,20 @@ def _comfyui_torch_packages() -> tuple[str, ...]:
     )
 
 
+def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str, Any]:
+    """Build the Modal class options for the deployed remote execution runtime."""
+    options: dict[str, Any] = {
+        "gpu": "A100",
+        "volumes": {settings.remote_storage_root: vol},
+        "scaledown_window": 60,
+        "image": image,
+        "enable_memory_snapshot": settings.enable_memory_snapshot,
+    }
+    if settings.enable_gpu_memory_snapshot:
+        options["experimental_options"] = {"enable_gpu_snapshot": True}
+    return options
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     app = modal.App(settings.app_name)
@@ -542,12 +556,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             "No local ComfyUI checkout was discovered; remote Modal execution may fail to import ComfyUI core modules."
         )
 
-    @app.cls(
-        gpu="A100",
-        volumes={settings.remote_storage_root: vol},
-        scaledown_window=60,
-        image=image,
-    )
+    @app.cls(**_remote_engine_cls_options(settings, vol, image))
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
 

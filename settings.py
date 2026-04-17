@@ -16,6 +16,9 @@ class ModalSyncSettings:
     """Resolved configuration for local and remote Modal-Sync operations."""
 
     app_name: str
+    allow_ephemeral_fallback: bool
+    enable_memory_snapshot: bool
+    enable_gpu_memory_snapshot: bool
     execution_mode: str
     sync_custom_nodes: bool
     volume_name: str
@@ -102,6 +105,9 @@ def get_settings() -> ModalSyncSettings:
 
     settings = ModalSyncSettings(
         app_name=os.getenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync"),
+        allow_ephemeral_fallback=_read_bool_env("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK") or False,
+        enable_memory_snapshot=_read_bool_env("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT") is not False,
+        enable_gpu_memory_snapshot=_read_bool_env("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT") or False,
         execution_mode=execution_mode,
         sync_custom_nodes=sync_custom_nodes,
         volume_name=os.getenv("COMFY_MODAL_VOLUME_NAME", "comfy-universal-storage"),
