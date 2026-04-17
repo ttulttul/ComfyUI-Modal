@@ -132,6 +132,112 @@ def test_hash_directory_ignores_virtualenv_and_bytecode_artifacts(
     assert ignored_hash == baseline_hash
 
 
+def test_sync_file_reuses_cached_hash_for_unchanged_file(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Unchanged files should reuse the persisted file digest instead of re-reading the payload."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"model-bytes")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+
+    first_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    first_sha = first_engine._hash_file(asset_path)
+
+    second_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+
+    def fail_open(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Expected cached hash lookup to avoid reopening the unchanged file.")
+
+    monkeypatch.setattr(Path, "open", fail_open)
+    second_sha = second_engine._hash_file(asset_path)
+
+    assert second_sha == first_sha
+
+
+def test_sync_custom_nodes_directory_reuses_cached_archive(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """An unchanged custom_nodes tree should reuse its digest-keyed local archive."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    first_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    first_bundle = first_engine.sync_custom_nodes_directory()
+    assert first_bundle is not None
+
+    class NeverExistsVolume:
+        """Volume double that forces archive reuse by reporting no remote markers."""
+
+        def exists(self, remote_path: str) -> bool:
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            return None
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            return None
+
+    second_engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=NeverExistsVolume(),
+        settings=settings,
+    )
+
+    def fail_create_archive(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Expected cached custom_nodes archive to be reused.")
+
+    monkeypatch.setattr(second_engine, "_create_archive", fail_create_archive)
+    second_bundle = second_engine.sync_custom_nodes_directory()
+
+    assert second_bundle is not None
+    assert second_bundle.sha256 == first_bundle.sha256
+    assert second_engine._cached_custom_nodes_archive_path(first_bundle.sha256).exists()
+
+
 def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
     settings_module: Any,
     sync_engine_module: Any,
