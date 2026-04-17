@@ -870,7 +870,7 @@ def _prewarm_restored_runtime() -> None:
 def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str, Any]:
     """Build the Modal class options for the deployed remote execution runtime."""
     options: dict[str, Any] = {
-        "gpu": "A100",
+        "gpu": settings.modal_gpu,
         "volumes": {settings.remote_storage_root: vol},
         "scaledown_window": settings.scaledown_window_seconds,
         "min_containers": settings.min_containers,

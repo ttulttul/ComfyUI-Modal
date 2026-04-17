@@ -101,6 +101,7 @@ Important distinction:
 - the Modal image now installs the core ComfyUI runtime Python packages automatically, including packages ComfyUI and custom/API nodes commonly import at startup such as `alembic`, `pydantic-settings`, `spandrel`, `kornia`, and `comfy-kitchen`
 - the Modal image now includes `comfy-kitchen>=0.2.7` because ComfyUI's FP8/FP4 weight-loading path crashes with `NoneType.Params` if quantized layout support is missing
 - the Modal image now pins `torch==2.10.0`, `torchvision==0.25.0`, and `torchaudio==2.10.0` from PyTorch's CUDA 12.8 wheel index instead of floating `latest`, which keeps the remote runtime aligned with the local ComfyUI `+cu128` stack and avoids newer wheel/driver mismatches
+- the deployed remote class now takes its GPU type from `COMFY_MODAL_GPU` instead of hardcoding `A100`, so you can choose Modal GPU classes such as `L40S`, `A100`, or any other Modal-supported GPU string before app creation
 - the deployed remote class now enables Modal memory snapshots by default so later cold starts can skip more initialization work after the first deployed invocations; GPU memory snapshots remain opt-in because they are still an alpha feature in Modal
 - the deployed remote class now defaults to a `scaledown_window` of 600 seconds with `min_containers=0`, which keeps recently used containers warm for a while without forcing a permanently warm GPU
 - the Modal image filter now preserves internal ComfyUI Python packages such as `comfy/ldm/models` while still excluding top-level runtime asset folders like `models/` and `output/`
@@ -235,8 +236,11 @@ These environment variables are supported:
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
 - `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT`: Enable Modal CPU memory snapshots for the deployed remote class. Default: `true`.
 - `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT`: Opt into Modal GPU memory snapshots. Default: `false`.
+- `COMFY_MODAL_GPU`: Modal GPU type to request when deploying the remote class. Default: `A100`.
 - `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle Modal containers warm for this many seconds after a request. Default: `600`.
 - `COMFY_MODAL_MIN_CONTAINERS`: Keep at least this many containers warm at all times. Default: `0`.
+
+If you change `COMFY_MODAL_GPU`, redeploy the Modal app or delete it and let first-run auto-deploy recreate it. Modal deployment hardware is fixed at deploy time, so changing the environment variable locally does not mutate an already-deployed app in place.
 
 ## Development
 

@@ -30,6 +30,7 @@ class ModalSyncSettings:
     custom_nodes_archive_name: str
     comfyui_root: Path | None
     custom_nodes_dir: Path | None
+    modal_gpu: str = "A100"
     scaledown_window_seconds: int = 600
     min_containers: int = 0
 
@@ -150,6 +151,7 @@ def get_settings() -> ModalSyncSettings:
         ),
         comfyui_root=comfyui_root,
         custom_nodes_dir=custom_nodes_dir,
+        modal_gpu=os.getenv("COMFY_MODAL_GPU", "A100").strip() or "A100",
         scaledown_window_seconds=_read_int_env("COMFY_MODAL_SCALEDOWN_WINDOW", 600),
         min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),
     )

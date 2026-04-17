@@ -348,6 +348,7 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
         remote_storage_root="/storage",
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
+        modal_gpu="L40S",
         scaledown_window_seconds=600,
         min_containers=0,
     )
@@ -356,6 +357,7 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
 
     assert options["enable_memory_snapshot"] is True
     assert "experimental_options" not in options
+    assert options["gpu"] == "L40S"
     assert options["volumes"] == {"/storage": "volume"}
     assert options["scaledown_window"] == 600
     assert options["min_containers"] == 0
@@ -364,6 +366,7 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
         remote_storage_root="/storage",
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=True,
+        modal_gpu="A100",
         scaledown_window_seconds=900,
         min_containers=1,
     )
@@ -373,6 +376,7 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
         "image",
     )
     assert gpu_snapshot_options["experimental_options"] == {"enable_gpu_snapshot": True}
+    assert gpu_snapshot_options["gpu"] == "A100"
     assert gpu_snapshot_options["scaledown_window"] == 900
     assert gpu_snapshot_options["min_containers"] == 1
 
