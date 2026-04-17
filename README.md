@@ -95,6 +95,7 @@ Important distinction:
 - the actual Modal cloud service now lives in a stable importable module, [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py), because ComfyUI’s custom-node loader does not assign Modal-safe module names to node-pack directories
 - the Modal image now installs the core ComfyUI runtime Python packages automatically, but remote execution may still surface additional environment gaps as broader workflows are exercised
 - the Modal image filter now preserves internal ComfyUI Python packages such as `comfy/ldm/models` while still excluding top-level runtime asset folders like `models/` and `output/`
+- the remote worker now initializes ComfyUI's built-in extra nodes and API nodes on first use, and loads extracted custom-node bundles through ComfyUI's normal `custom_nodes` registry path
 
 If you want a stable reusable Modal deployment, that is still a separate step outside the current node-pack behavior.
 
