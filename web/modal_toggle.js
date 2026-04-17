@@ -1,5 +1,5 @@
 import { app } from "../../scripts/app.js";
-import { api } from "../../scripts/api.js";
+import { PromptExecutionError, api } from "../../scripts/api.js";
 
 const REMOTE_PROPERTY = "is_modal_remote";
 const MODAL_ROUTE = "/modal/queue_prompt";
@@ -95,7 +95,6 @@ function patchQueuePrompt() {
     return;
   }
 
-  const originalQueuePrompt = api.queuePrompt.bind(api);
   api.queuePrompt = async function modalQueuePrompt(number, data, options) {
     const { output: prompt, workflow } = data;
     const body = {
@@ -126,7 +125,7 @@ function patchQueuePrompt() {
     });
 
     if (response.status !== 200) {
-      return originalQueuePrompt(number, data, options);
+      throw new PromptExecutionError(await response.json());
     }
 
     return await response.json();
