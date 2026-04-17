@@ -72,14 +72,28 @@ def _read_int_env(name: str, default: int) -> int:
         raise ValueError(f"Environment variable {name} must be an integer, got {value!r}.") from exc
 
 
-def _discover_comfyui_root() -> Path | None:
+def _looks_like_comfyui_root(candidate: Path) -> bool:
+    """Return whether a path appears to be a ComfyUI checkout root."""
+    return (candidate / "main.py").exists() and (candidate / "nodes.py").exists()
+
+
+def _discover_comfyui_root(repo_root: Path) -> Path | None:
     """Locate the local ComfyUI checkout used for tests and path resolution."""
     env_root = _read_path_env("COMFYUI_ROOT")
     if env_root is not None:
         return env_root
 
+    modal_env_root = _read_path_env("COMFY_MODAL_COMFYUI_ROOT")
+    if modal_env_root is not None:
+        return modal_env_root
+
+    if repo_root.parent.name == "custom_nodes":
+        install_root = repo_root.parent.parent.resolve()
+        if _looks_like_comfyui_root(install_root):
+            return install_root
+
     default_root = Path.home() / "git" / "ComfyUI"
-    if default_root.exists():
+    if _looks_like_comfyui_root(default_root):
         return default_root.resolve()
 
     return None
@@ -106,7 +120,7 @@ def _discover_custom_nodes_dir(repo_root: Path, comfyui_root: Path | None) -> Pa
 def get_settings() -> ModalSyncSettings:
     """Return cached extension settings derived from the environment."""
     repo_root = _discover_repo_root()
-    comfyui_root = _discover_comfyui_root()
+    comfyui_root = _discover_comfyui_root(repo_root)
     custom_nodes_dir = _discover_custom_nodes_dir(repo_root, comfyui_root)
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local").strip().lower()
     sync_custom_nodes = _read_bool_env("COMFY_MODAL_SYNC_CUSTOM_NODES")
