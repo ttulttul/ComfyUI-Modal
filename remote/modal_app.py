@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -166,11 +167,17 @@ def _apply_boundary_inputs(
     hydrated_inputs: dict[str, Any],
 ) -> None:
     """Inject hydrated local boundary inputs into a remote subgraph prompt."""
+    logger.info("Applying %d hydrated boundary inputs to remote subgraph prompt.", len(boundary_input_specs))
     for boundary_input in boundary_input_specs:
         proxy_input_name = str(boundary_input["proxy_input_name"])
         if proxy_input_name not in hydrated_inputs:
             raise KeyError(f"Missing hydrated boundary input {proxy_input_name!r}.")
         value = hydrated_inputs[proxy_input_name]
+        logger.info(
+            "Applying boundary input %s to %d targets.",
+            proxy_input_name,
+            len(boundary_input.get("targets", [])),
+        )
         for target in boundary_input.get("targets", []):
             node_id = str(target["node_id"])
             input_name = str(target["input_name"])
@@ -205,6 +212,7 @@ def _resolve_required_subgraph_nodes(
     """Return the dependency closure needed to execute the requested subgraph nodes."""
     required: set[str] = set()
     pending = list(execute_node_ids)
+    logger.info("Resolving dependency closure for remote execute targets: %s", execute_node_ids)
     while pending:
         node_id = str(pending.pop())
         if node_id in required:
@@ -213,7 +221,9 @@ def _resolve_required_subgraph_nodes(
         for input_value in (prompt[node_id].get("inputs") or {}).values():
             if _is_link(input_value):
                 pending.append(str(input_value[0]))
-    return sorted(required)
+    resolved = sorted(required)
+    logger.info("Resolved remote dependency closure: %s", resolved)
+    return resolved
 
 
 def _is_link(value: Any) -> bool:
@@ -232,6 +242,11 @@ def _execute_subgraph_with_mapping(
 ) -> tuple[Any, ...]:
     """Execute a rewritten remote component using an explicit node mapping."""
     prompt = copy.deepcopy(payload["subgraph_prompt"])
+    logger.info(
+        "Executing remote subgraph %s via test mapping with %d prompt nodes.",
+        payload.get("component_id"),
+        len(prompt),
+    )
     _apply_boundary_inputs(
         prompt=prompt,
         boundary_input_specs=list(payload.get("boundary_inputs", [])),
@@ -246,6 +261,7 @@ def _execute_subgraph_with_mapping(
 
     while pending:
         progressed = False
+        logger.info("Mapped remote subgraph pending nodes: %s", sorted(pending))
         for node_id in list(sorted(pending)):
             prompt_node = prompt[node_id]
             kwargs: dict[str, Any] = {}
@@ -265,6 +281,12 @@ def _execute_subgraph_with_mapping(
             class_type = str(prompt_node["class_type"])
             if class_type not in node_mapping:
                 raise KeyError(f"Remote node class {class_type!r} is not registered.")
+            logger.info(
+                "Executing mapped remote node %s (%s) with %d inputs.",
+                node_id,
+                class_type,
+                len(kwargs),
+            )
             executed_outputs[node_id] = _invoke_original_node(
                 node_mapping[class_type],
                 prompt_node,
@@ -287,6 +309,11 @@ def _execute_subgraph_with_mapping(
                 f"Remote subgraph did not execute boundary output node {node_id}."
             )
         outputs.append(node_outputs[output_index])
+    logger.info(
+        "Mapped remote subgraph %s produced %d exported outputs.",
+        payload.get("component_id"),
+        len(outputs),
+    )
     return tuple(outputs)
 
 
@@ -300,6 +327,13 @@ def _execute_subgraph_prompt(
         return _execute_subgraph_with_mapping(payload, hydrated_inputs, node_mapping)
 
     prompt = copy.deepcopy(payload["subgraph_prompt"])
+    logger.info(
+        "Executing remote subgraph %s through PromptExecutor with %d prompt nodes, %d boundary inputs, and %d exported outputs.",
+        payload.get("component_id"),
+        len(prompt),
+        len(payload.get("boundary_inputs", [])),
+        len(payload.get("boundary_outputs", [])),
+    )
     _apply_boundary_inputs(
         prompt=prompt,
         boundary_input_specs=list(payload.get("boundary_inputs", [])),
@@ -309,12 +343,31 @@ def _execute_subgraph_prompt(
 
     with _temporary_node_mapping(node_mapping):
         executor = execution.PromptExecutor(_NullPromptServer())
+        execution_started_at = time.perf_counter()
+        logger.info(
+            "Starting PromptExecutor for remote subgraph %s with execute targets %s.",
+            payload.get("component_id"),
+            payload.get("execute_node_ids", []),
+        )
         executor.execute(
             prompt=prompt,
             prompt_id=str(payload.get("component_id", "modal-subgraph")),
             extra_data=copy.deepcopy(payload.get("extra_data") or {}),
             execute_outputs=list(payload.get("execute_node_ids", [])),
         )
+        logger.info(
+            "PromptExecutor finished for remote subgraph %s in %.3fs with success=%s and %d status messages.",
+            payload.get("component_id"),
+            time.perf_counter() - execution_started_at,
+            executor.success,
+            len(executor.status_messages),
+        )
+        if executor.status_messages:
+            logger.info(
+                "Remote subgraph %s status events: %s",
+                payload.get("component_id"),
+                [event for event, _data in executor.status_messages],
+            )
         if not executor.success:
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
 
@@ -337,6 +390,12 @@ def _execute_subgraph_prompt(
                     is_list=bool(boundary_output.get("is_list", False)),
                 )
             )
+            logger.info(
+                "Collected exported output %s from node %s output %d.",
+                boundary_output.get("proxy_output_name"),
+                node_id,
+                output_index,
+            )
         return tuple(outputs)
 
 
@@ -348,9 +407,26 @@ def execute_subgraph_locally(
     """Execute a rewritten remote component in-process and return serialized outputs."""
     _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    logger.info(
+        "Executing local fallback subgraph %s with %d hydrated inputs.",
+        payload.get("component_id"),
+        len(hydrated_inputs),
+    )
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, node_mapping)
-        outputs = future.result()
+        try:
+            outputs = future.result()
+        except Exception:
+            logger.exception(
+                "Local fallback subgraph %s raised while running in worker thread.",
+                payload.get("component_id"),
+            )
+            raise
+    logger.info(
+        "Local fallback subgraph %s completed with %d outputs.",
+        payload.get("component_id"),
+        len(outputs),
+    )
     return serialize_node_outputs(outputs)
 
 

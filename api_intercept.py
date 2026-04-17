@@ -211,6 +211,12 @@ def _build_remote_components(prompt: dict[str, Any], remote_node_ids: set[str]) 
             component.append(current)
             pending.extend(sorted(adjacency[current] - visited))
         components.append(sorted(component))
+    logger.info(
+        "Partitioned %d remote nodes into %d remote components: %s",
+        len(remote_node_ids),
+        len(components),
+        components,
+    )
     return components
 
 
@@ -272,7 +278,7 @@ def _build_component_plan(
                 is_list=bool(output_is_list[output_index]),
             )
 
-    return RemoteComponentPlan(
+    component = RemoteComponentPlan(
         node_ids=component_node_ids,
         representative_node_id=representative_node_id,
         boundary_inputs=sorted(
@@ -286,6 +292,16 @@ def _build_component_plan(
         execute_node_ids=sorted(output_execution_targets),
         contains_output_node=contains_output_node,
     )
+    logger.info(
+        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s",
+        component.representative_node_id,
+        component.node_ids,
+        len(component.boundary_inputs),
+        len(component.boundary_outputs),
+        component.execute_node_ids,
+        component.contains_output_node,
+    )
+    return component
 
 
 def _build_component_plans(
@@ -351,6 +367,7 @@ def validate_remote_component_transport_compatibility(
     """Reject remote components whose true graph boundaries require unsupported transport."""
     validation_errors: list[str] = []
     consumers = _build_consumer_map(prompt)
+    logger.info("Validating %d remote components for transport compatibility.", len(components))
 
     for component in components:
         for boundary_input in component.boundary_inputs:
@@ -404,6 +421,7 @@ def validate_remote_component_transport_compatibility(
 
     if validation_errors:
         raise ModalPromptValidationError("\n".join(validation_errors))
+    logger.info("Remote component transport validation passed.")
 
 
 def _sync_component_prompt_inputs(
@@ -414,6 +432,11 @@ def _sync_component_prompt_inputs(
     """Build a synced prompt payload for one remote component."""
     component_prompt: dict[str, Any] = {}
     synced_assets: list[SyncedAsset] = []
+    logger.info(
+        "Syncing prompt inputs for remote component %s with %d nodes.",
+        component.representative_node_id,
+        len(component.node_ids),
+    )
     for node_id in component.node_ids:
         prompt_node = rewritten_prompt[node_id]
         synced_inputs, node_assets = sync_engine.sync_prompt_inputs(copy.deepcopy(prompt_node.get("inputs", {})))
@@ -423,6 +446,17 @@ def _sync_component_prompt_inputs(
             "inputs": synced_inputs,
             "_meta": copy.deepcopy(prompt_node.get("_meta", {})),
         }
+        logger.info(
+            "Prepared remote node %s (%s) with %d synced assets.",
+            node_id,
+            component_prompt[node_id]["class_type"],
+            len(node_assets),
+        )
+    logger.info(
+        "Finished syncing remote component %s with %d total synced assets.",
+        component.representative_node_id,
+        len(synced_assets),
+    )
     return component_prompt, synced_assets
 
 
@@ -433,7 +467,7 @@ def _build_component_payload(
     custom_nodes_bundle: SyncedAsset | None,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
-    return {
+    payload = {
         "payload_kind": "subgraph",
         "component_id": component.representative_node_id,
         "subgraph_prompt": component_prompt,
@@ -463,6 +497,14 @@ def _build_component_payload(
             custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
         ),
     }
+    logger.info(
+        "Built remote payload for component %s: boundary_inputs=%d boundary_outputs=%d execute_nodes=%s",
+        component.representative_node_id,
+        len(payload["boundary_inputs"]),
+        len(payload["boundary_outputs"]),
+        payload["execute_node_ids"],
+    )
+    return payload
 
 
 def _rewrite_component_into_proxy(
@@ -538,6 +580,7 @@ def rewrite_prompt_for_modal(
     resolved_settings = settings or get_settings()
     remote_node_ids = extract_remote_node_ids(workflow, resolved_settings)
     summary = RewriteSummary(remote_node_ids=sorted(remote_node_ids))
+    logger.info("Found %d workflow nodes marked for Modal execution.", len(remote_node_ids))
 
     if not remote_node_ids:
         return copy.deepcopy(prompt), summary
@@ -565,6 +608,11 @@ def rewrite_prompt_for_modal(
         for node_id in component.node_ids:
             summary.rewritten_node_id_map[node_id] = component.representative_node_id
 
+        logger.info(
+            "Rewriting remote component %s covering nodes %s.",
+            component.representative_node_id,
+            component.node_ids,
+        )
         component_prompt, synced_assets = _sync_component_prompt_inputs(
             component=component,
             rewritten_prompt=rewritten_prompt,
