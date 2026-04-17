@@ -347,6 +347,17 @@ def _ensure_comfyui_support_packages() -> None:
     _force_import_package_from_root("utils", comfyui_root)
 
 
+def _ensure_default_custom_nodes_dir() -> Path | None:
+    """Create the default ComfyUI custom_nodes directory when the image omits its contents."""
+    comfyui_root = _active_comfyui_root()
+    if comfyui_root is None:
+        return None
+
+    custom_nodes_dir = comfyui_root / "custom_nodes"
+    custom_nodes_dir.mkdir(parents=True, exist_ok=True)
+    return custom_nodes_dir
+
+
 def _materialize_remote_asset_path(value: str) -> str:
     """Resolve a mirrored Modal asset reference to the container-local absolute file path."""
     settings = get_settings()
@@ -413,6 +424,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
             custom_nodes=custom_nodes_root_key or "none",
         ):
             _ensure_comfyui_support_packages()
+            _ensure_default_custom_nodes_dir()
             nodes_module = _load_nodes_module()
 
             if not _COMFY_RUNTIME_BASE_INITIALIZED:

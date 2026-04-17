@@ -662,6 +662,25 @@ def test_modal_cloud_force_imports_comfyui_utils_package(
     assert list(getattr(imported_module, "__path__", [])) == [str(utils_dir)]
 
 
+def test_modal_cloud_creates_default_custom_nodes_dir_when_missing(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The remote runtime should create an empty default custom_nodes directory for ComfyUI."""
+    comfyui_root = tmp_path / "comfyui"
+    comfyui_root.mkdir()
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_COMFYUI_ROOT", comfyui_root)
+    monkeypatch.setattr(modal_cloud_module, "_LOCAL_COMFYUI_ROOT", tmp_path / "missing-local")
+
+    custom_nodes_dir = modal_cloud_module._ensure_default_custom_nodes_dir()
+
+    assert custom_nodes_dir == comfyui_root / "custom_nodes"
+    assert custom_nodes_dir is not None
+    assert custom_nodes_dir.exists()
+    assert custom_nodes_dir.is_dir()
+
+
 class _BoundarySourceNode:
     """Simple source node used for subgraph execution tests."""
 
