@@ -65,6 +65,14 @@ export COMFY_MODAL_EXECUTION_MODE=local
 
 That path still exercises the same prompt rewrite, asset sync, and serialization logic, but it executes the proxied node in-process instead of calling Modal.
 
+In `local` mode, the extension now skips hashing and zipping the entire `custom_nodes/` tree by default. That work is unnecessary for in-process execution and can make queue requests appear stuck on larger ComfyUI installs.
+
+If you want to force custom-node bundle sync even in local mode, set:
+
+```bash
+export COMFY_MODAL_SYNC_CUSTOM_NODES=true
+```
+
 For real Modal execution, you need:
 
 - the `modal` Python package available in the ComfyUI environment
@@ -105,7 +113,7 @@ The frontend extension intercepts queue submission and sends the prompt to `/mod
 1. The request handler inspects the workflow snapshot in `extra_pnginfo.workflow`.
 2. Every node marked with `is_modal_remote` is replaced with an internal `ModalUniversalExecutor_<hash>` proxy node.
 3. Referenced model assets are mirrored into storage.
-4. The local `custom_nodes/` directory is zipped and mirrored if its content hash changed.
+4. If custom-node syncing is enabled, the local `custom_nodes/` directory is zipped and mirrored if its content hash changed.
 5. The rewritten prompt is submitted to the normal ComfyUI prompt queue.
 
 ### 6. What happens during execution
@@ -155,6 +163,7 @@ These environment variables are supported:
 - `COMFY_MODAL_LOCAL_STORAGE_ROOT`: Local mirror root used for sync tests and dry runs. Default: `/tmp/comfyui-modal-sync-storage`.
 - `COMFY_MODAL_CUSTOM_NODES_DIR`: Override the `custom_nodes` directory to bundle and mirror.
 - `COMFY_MODAL_EXECUTION_MODE`: Set to `local` for in-process fallback execution. Default: `local`.
+- `COMFY_MODAL_SYNC_CUSTOM_NODES`: Force-enable or disable custom-node bundle sync. Default: disabled in `local` mode, enabled otherwise.
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
 
 ## Development
