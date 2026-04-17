@@ -114,6 +114,7 @@ def test_modal_cloud_ignores_heavy_comfyui_paths(
     assert modal_cloud_module._should_ignore_comfyui_path(Path("__pycache__/execution.pyc"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("execution.py"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("comfy/model_management.py"))
+    assert not modal_cloud_module._should_ignore_comfyui_path(Path("comfy/ldm/models/diffusion/ddpm.py"))
 
 
 def test_modal_cloud_installs_comfyui_runtime_packages(
