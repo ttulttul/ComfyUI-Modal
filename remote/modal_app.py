@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,8 @@ from ..settings import get_settings
 logger = logging.getLogger(__name__)
 _REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
+_MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
+_MODAL_AUTO_DEPLOYED_APPS: set[tuple[str, str | None]] = set()
 
 try:
     import modal  # type: ignore
@@ -491,6 +494,67 @@ def _lookup_deployed_modal_method(payload: dict[str, Any]) -> Any:
     return remote_engine.execute_payload
 
 
+def _modal_environment_name() -> str | None:
+    """Return the active Modal environment name when explicitly configured."""
+    environment_name = os.getenv("MODAL_ENVIRONMENT")
+    if environment_name is None:
+        return None
+    normalized = environment_name.strip()
+    return normalized or None
+
+
+def _modal_deploy_cache_key() -> tuple[str, str | None]:
+    """Return the cache key for auto-deployed Modal apps."""
+    settings = get_settings()
+    return (settings.app_name, _modal_environment_name())
+
+
+def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException) -> None:
+    """Deploy the stable Modal cloud app once when deployed lookup fails."""
+    if modal is None:
+        raise ModalRemoteInvocationError("Modal SDK is unavailable.")
+
+    settings = get_settings()
+    deploy_key = _modal_deploy_cache_key()
+    cloud_module = _load_modal_cloud_module()
+    cloud_app = getattr(cloud_module, "app", None)
+    if cloud_app is None:
+        raise ModalRemoteInvocationError(
+            "Stable Modal cloud entry module did not expose a deployable app."
+        )
+
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        if deploy_key in _MODAL_AUTO_DEPLOYED_APPS:
+            logger.info(
+                "Auto-deploy already completed for app=%s env=%s; reusing cached deployment state.",
+                settings.app_name,
+                deploy_key[1] or "<default>",
+            )
+            return
+
+        logger.warning(
+            "Deployed Modal app lookup failed for app=%s component=%s: %s. "
+            "Attempting first-run auto-deploy from the custom node.",
+            settings.app_name,
+            payload.get("component_id"),
+            lookup_error,
+        )
+        output_context = modal.enable_output() if hasattr(modal, "enable_output") else nullcontext()
+        deploy_started_at = time.perf_counter()
+        with output_context:
+            cloud_app.deploy(
+                name=settings.app_name,
+                environment_name=deploy_key[1],
+            )
+        _MODAL_AUTO_DEPLOYED_APPS.add(deploy_key)
+        logger.info(
+            "Auto-deployed Modal app %s for env=%s in %.3fs.",
+            settings.app_name,
+            deploy_key[1] or "<default>",
+            time.perf_counter() - deploy_started_at,
+        )
+
+
 def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke the Modal runtime from a worker thread using deployed or ephemeral app state."""
     if modal is None:
@@ -508,12 +572,24 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
             )
             return remote_method.remote(payload, kwargs_payload)
         except lookup_error_types as exc:
+            if settings.auto_deploy:
+                _auto_deploy_modal_app(payload, exc)
+                try:
+                    remote_method = _lookup_deployed_modal_method(payload)
+                    logger.info(
+                        "Using auto-deployed Modal app %s for component %s.",
+                        settings.app_name,
+                        payload.get("component_id"),
+                    )
+                    return remote_method.remote(payload, kwargs_payload)
+                except lookup_error_types as retry_exc:
+                    exc = retry_exc
             if not settings.allow_ephemeral_fallback:
                 raise ModalRemoteInvocationError(
-                    "Remote execution requires a deployed Modal app. "
+                    "Remote execution requires a deployed Modal app or a successful first-run auto-deploy. "
                     f"Lookup failed for app={settings.app_name!r} component={payload.get('component_id')!r}: {exc}. "
-                    "Deploy the app once and retry, or set COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true "
-                    "to allow slow ephemeral app.run() fallback behavior."
+                    "Ensure Modal credentials are configured so the custom node can auto-deploy, "
+                    "or set COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true to allow slow ephemeral app.run() fallback behavior."
                 ) from exc
             logger.warning(
                 "Deployed Modal app lookup failed for app=%s component=%s: %s. Falling back to ephemeral app.run(); this creates a temporary Modal app session, not a persistent deployment or endpoint.",

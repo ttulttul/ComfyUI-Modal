@@ -86,14 +86,16 @@ For real Modal execution, you need:
 
 The remote runtime skeleton lives in [remote/modal_app.py](/home/ksimpson/git/ComfyUI-Modal/remote/modal_app.py). The extension is structured for Modal, but you still need to supply a working Modal environment.
 
-When `COMFY_MODAL_EXECUTION_MODE` is remote, the runtime now treats deployed Modal class lookup via the configured app name as the normal execution path. If no deployed app is available, remote execution fails fast by default instead of silently creating a fresh ephemeral `app.run()` session.
-The intended production path is now a deployed Modal app. Ephemeral `app.run()` fallback is disabled by default because it causes expensive per-run app/image setup and defeats the point of scaling remote execution down to zero between workflows.
+When `COMFY_MODAL_EXECUTION_MODE` is remote, the runtime now treats deployed Modal class lookup via the configured app name as the normal execution path. If no deployed app is available yet, the custom node will first try to deploy it programmatically before giving up or falling back.
+The intended production path is still a deployed Modal app. Ephemeral `app.run()` fallback is disabled by default because it causes expensive per-run app/image setup and defeats the point of scaling remote execution down to zero between workflows.
+On the first remote invocation, the custom node now also attempts a programmatic `App.deploy()` automatically if the named app does not exist yet. That auto-deploy path is now the default way to bootstrap a new Modal app from inside ComfyUI.
 
 Important distinction:
-- remote mode now assumes you have deployed [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py) once, for example with `modal deploy comfyui_modal_sync_cloud.py`
-- repeated remote workflow executions should then reuse the deployed app and cached image instead of rebuilding through ephemeral `app.run()`
-- the extension still does not auto-deploy a persistent Modal app for you
+- remote mode will auto-deploy [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py) on first use when the named app is missing, assuming Modal credentials are already configured in the ComfyUI environment
+- repeated remote workflow executions then reuse the deployed app and cached image instead of rebuilding through ephemeral `app.run()`
+- the extension now auto-deploys the persistent Modal app for you on first remote use, but only if Modal credentials and workspace access are already configured in the ComfyUI environment
 - the extension still does not auto-create a persistent web endpoint
+- `COMFY_MODAL_AUTO_DEPLOY=false` disables first-run auto-deploy if you want strict deployed-only behavior
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true` can re-enable the old temporary `app.run()` path if you explicitly want it
 - the actual Modal cloud service now lives in a stable importable module, [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py), because ComfyUI’s custom-node loader does not assign Modal-safe module names to node-pack directories
 - the Modal image now installs the core ComfyUI runtime Python packages automatically, but remote execution may still surface additional environment gaps as broader workflows are exercised
@@ -217,6 +219,7 @@ These environment variables are supported:
 - `COMFY_MODAL_EXECUTION_MODE`: Set to `local` for in-process fallback execution. Default: `local`.
 - `COMFY_MODAL_SYNC_CUSTOM_NODES`: Force-enable or disable custom-node bundle sync. Default: disabled in `local` mode, enabled otherwise.
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
+- `COMFY_MODAL_AUTO_DEPLOY`: Automatically deploy the Modal app on the first remote invocation when lookup fails. Default: `true`.
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
 - `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT`: Enable Modal CPU memory snapshots for the deployed remote class. Default: `true`.
 - `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT`: Opt into Modal GPU memory snapshots. Default: `false`.

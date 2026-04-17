@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -178,11 +179,90 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
     assert gpu_snapshot_options["experimental_options"] == {"enable_gpu_snapshot": True}
 
 
-def test_remote_modal_requires_deployed_app_by_default(
+def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Remote mode should reject slow ephemeral fallback unless explicitly enabled."""
+    """Remote mode should auto-deploy the stable Modal app on first lookup failure."""
+
+    class FakeLookupError(Exception):
+        """Stand-in for Modal deployed lookup failures."""
+
+    deploy_calls: list[tuple[str | None, str | None]] = []
+
+    class FakeExecuteMethod:
+        """Minimal Modal method handle that records remote calls."""
+
+        def remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Return deterministic remote bytes."""
+            return b"remote-response"
+
+    class FakeRemoteEngine:
+        """Minimal deployed remote engine instance."""
+
+        execute_payload = FakeExecuteMethod()
+
+    class FakeApp:
+        """Minimal deployable cloud app double."""
+
+        def deploy(self, *, name: str | None = None, environment_name: str | None = None, **_: Any) -> "FakeApp":
+            """Record the deploy request and mark the deployment available."""
+            deploy_calls.append((name, environment_name))
+            FakeModal.deployed = True
+            return self
+
+    class FakeModal:
+        """Minimal modal SDK double with deployed lookup failure types."""
+
+        deployed = False
+        exception = types.SimpleNamespace(
+            NotFoundError=FakeLookupError,
+            ExecutionError=FakeLookupError,
+            InvalidError=FakeLookupError,
+        )
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a deployed class after the first auto-deploy."""
+                if not FakeModal.deployed:
+                    raise FakeLookupError("not deployed")
+                return lambda: FakeRemoteEngine()
+
+        @staticmethod
+        def enable_output() -> Any:
+            """Provide a no-op output context manager."""
+            return nullcontext()
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_load_modal_cloud_module",
+        lambda: types.SimpleNamespace(app=FakeApp()),
+    )
+    monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
+    try:
+        response = remote_modal_app_module._invoke_modal_payload_blocking(
+            {"component_id": "component-1"},
+            b"{}",
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
+
+    assert response == b"remote-response"
+    assert deploy_calls == [("comfy-modal-sync", None)]
+
+
+def test_remote_modal_requires_manual_deploy_when_auto_deploy_disabled(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote mode should fail clearly when auto-deploy and ephemeral fallback are both disabled."""
 
     class FakeLookupError(Exception):
         """Stand-in for Modal deployed lookup failures."""
@@ -205,6 +285,7 @@ def test_remote_modal_requires_deployed_app_by_default(
                 raise FakeLookupError("not deployed")
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "false")
     monkeypatch.setenv("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK", "false")
     remote_modal_app_module.get_settings.cache_clear()
     try:
@@ -220,7 +301,7 @@ def test_remote_modal_requires_deployed_app_by_default(
     finally:
         remote_modal_app_module.get_settings.cache_clear()
 
-    assert "requires a deployed Modal app" in message
+    assert "requires a deployed Modal app or a successful first-run auto-deploy" in message
     assert "COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true" in message
 
 

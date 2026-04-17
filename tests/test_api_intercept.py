@@ -53,6 +53,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        auto_deploy=True,
         allow_ephemeral_fallback=False,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
@@ -153,6 +154,7 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        auto_deploy=True,
         allow_ephemeral_fallback=False,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
@@ -230,6 +232,7 @@ def test_rewrite_rejects_non_transportable_remote_outputs(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        auto_deploy=True,
         allow_ephemeral_fallback=False,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
