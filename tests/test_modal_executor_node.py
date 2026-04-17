@@ -293,6 +293,89 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
     assert gpu_snapshot_options["min_containers"] == 1
 
 
+def test_modal_cloud_prewarms_snapshot_state_without_gpu_runtime_by_default(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """CPU-only snapshot prewarm should avoid full ComfyUI runtime initialization."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfyui_support_packages",
+        lambda: calls.append("support"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: calls.append(f"runtime:{custom_nodes_root}"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_execution_module",
+        lambda: calls.append("execution"),
+    )
+
+    modal_cloud_module._prewarm_snapshot_state(
+        types.SimpleNamespace(enable_gpu_memory_snapshot=False)
+    )
+
+    assert calls == ["support"]
+
+
+def test_modal_cloud_prewarms_snapshot_state_fully_for_gpu_snapshots(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """GPU snapshot prewarm should initialize the remote runtime before snapshot capture."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfyui_support_packages",
+        lambda: calls.append("support"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: calls.append(f"runtime:{custom_nodes_root}"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_execution_module",
+        lambda: calls.append("execution"),
+    )
+
+    modal_cloud_module._prewarm_snapshot_state(
+        types.SimpleNamespace(enable_gpu_memory_snapshot=True)
+    )
+
+    assert calls == ["support", "runtime:None", "execution"]
+
+
+def test_modal_cloud_prewarms_restored_runtime(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Post-restore prewarm should fully initialize the request-serving runtime."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: calls.append(f"runtime:{custom_nodes_root}"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_execution_module",
+        lambda: calls.append("execution"),
+    )
+
+    modal_cloud_module._prewarm_restored_runtime()
+
+    assert calls == ["runtime:None", "execution"]
+
+
 def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module: Any,
     monkeypatch: Any,
