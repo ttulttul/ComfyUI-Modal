@@ -5,6 +5,34 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger(__name__)
+_EXTENSION_LOGGER_NAME = __name__.split(".")[0]
+_EXTENSION_HANDLER_NAME = "comfyui-modal-sync-timestamped"
+
+
+def _build_extension_log_formatter() -> logging.Formatter:
+    """Return the default formatter for Modal-Sync logs with wall-clock and relative timestamps."""
+    return logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d +%(relativeCreated)07.0fms %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def _configure_extension_logging() -> logging.Logger:
+    """Install a dedicated timestamped handler for the Modal-Sync logger hierarchy."""
+    extension_logger = logging.getLogger(_EXTENSION_LOGGER_NAME)
+    for existing_handler in extension_logger.handlers:
+        if getattr(existing_handler, "name", "") == _EXTENSION_HANDLER_NAME:
+            return extension_logger
+
+    handler = logging.StreamHandler()
+    handler.set_name(_EXTENSION_HANDLER_NAME)
+    handler.setFormatter(_build_extension_log_formatter())
+    extension_logger.addHandler(handler)
+    extension_logger.propagate = False
+    return extension_logger
+
+
+_configure_extension_logging()
 
 WEB_DIRECTORY = "./web"
 try:
