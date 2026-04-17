@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -124,12 +125,114 @@ def _register_custom_nodes_root(custom_nodes_root: Path) -> None:
     folder_paths.add_model_folder_path("custom_nodes", str(custom_nodes_root), is_default=True)
 
 
+def _active_comfyui_root() -> Path | None:
+    """Return the ComfyUI source root visible to this runtime."""
+    for candidate in (_REMOTE_COMFYUI_ROOT, _LOCAL_COMFYUI_ROOT):
+        try:
+            if candidate.exists():
+                return candidate
+        except PermissionError:
+            continue
+    return None
+
+
+def _force_import_package_from_root(module_name: str, package_root: Path) -> None:
+    """Load a top-level package from a specific root, replacing a non-package shadow if needed."""
+    existing_module = sys.modules.get(module_name)
+    if existing_module is not None and getattr(existing_module, "__path__", None):
+        return
+
+    package_dir = package_root / module_name
+    init_path = package_dir / "__init__.py"
+    if not init_path.exists():
+        logger.debug("Package %s does not exist under %s.", module_name, package_root)
+        return
+
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        init_path,
+        submodule_search_locations=[str(package_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to create an import spec for package {module_name!r}.")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    logger.info("Preloaded ComfyUI package %s from %s.", module_name, package_dir)
+
+
+def _ensure_comfyui_support_packages() -> None:
+    """Preload top-level ComfyUI support packages that are vulnerable to name shadowing."""
+    comfyui_root = _active_comfyui_root()
+    if comfyui_root is None:
+        return
+
+    _force_import_package_from_root("utils", comfyui_root)
+
+
+def _materialize_remote_asset_path(value: str) -> str:
+    """Resolve a mirrored Modal asset reference to the container-local absolute file path."""
+    settings = get_settings()
+    remote_storage_root = settings.remote_storage_root.rstrip("/")
+    if value.startswith(f"{remote_storage_root}/"):
+        return value
+    if value.startswith("/assets/"):
+        return f"{remote_storage_root}{value}"
+    return value
+
+
+def _rewrite_modal_asset_references(value: Any) -> Any:
+    """Recursively replace mirrored asset markers with container-local absolute file paths."""
+    if isinstance(value, str):
+        return _materialize_remote_asset_path(value)
+    if isinstance(value, list):
+        return [_rewrite_modal_asset_references(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _rewrite_modal_asset_references(item) for key, item in value.items()}
+    return value
+
+
+@contextmanager
+def _patched_folder_paths_absolute_lookup() -> Iterator[None]:
+    """Teach ComfyUI folder lookups to accept already-materialized absolute asset paths."""
+    import folder_paths
+
+    original_get_full_path = folder_paths.get_full_path
+    original_get_full_path_or_raise = folder_paths.get_full_path_or_raise
+
+    def patched_get_full_path(folder_name: str, filename: str) -> str | None:
+        """Return the absolute file when the prompt already points at a materialized asset."""
+        resolved_filename = _materialize_remote_asset_path(filename)
+        if os.path.isabs(resolved_filename) and Path(resolved_filename).is_file():
+            return resolved_filename
+        return original_get_full_path(folder_name, resolved_filename)
+
+    def patched_get_full_path_or_raise(folder_name: str, filename: str) -> str:
+        """Raise with the original message when no absolute or folder-based match exists."""
+        full_path = patched_get_full_path(folder_name, filename)
+        if full_path is None:
+            raise FileNotFoundError(
+                f"Model in folder '{folder_name}' with filename '{filename}' not found."
+            )
+        return full_path
+
+    folder_paths.get_full_path = patched_get_full_path
+    folder_paths.get_full_path_or_raise = patched_get_full_path_or_raise
+    try:
+        yield
+    finally:
+        folder_paths.get_full_path = original_get_full_path
+        folder_paths.get_full_path_or_raise = original_get_full_path_or_raise
+
+
 def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
     """Initialize ComfyUI's built-in and external node registries for remote execution."""
     global _COMFY_RUNTIME_BASE_INITIALIZED
 
     custom_nodes_root_key = str(custom_nodes_root.resolve()) if custom_nodes_root is not None else None
     with _COMFY_RUNTIME_INIT_LOCK:
+        _ensure_comfyui_support_packages()
         nodes_module = _load_nodes_module()
 
         if not _COMFY_RUNTIME_BASE_INITIALIZED:
@@ -161,6 +264,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
 
 def _load_execution_module() -> Any:
     """Import the ComfyUI execution module lazily."""
+    _ensure_comfyui_support_packages()
     import execution
 
     return execution
@@ -225,13 +329,14 @@ def execute_node_locally(
     """Execute a single target node in-process and return serialized outputs."""
     custom_nodes_root = _extract_custom_nodes_bundle(node_data.get("custom_nodes_bundle"))
     _ensure_comfy_runtime_initialized(custom_nodes_root)
-    kwargs = deserialize_node_inputs(kwargs_payload)
+    kwargs = _rewrite_modal_asset_references(deserialize_node_inputs(kwargs_payload))
     if node_mapping is not None:
         class_type = node_data["class_type"]
         if class_type not in node_mapping:
             raise KeyError(f"Remote node class {class_type!r} is not registered.")
-        outputs = _invoke_original_node(node_mapping[class_type], node_data, kwargs)
-        return serialize_node_outputs(outputs)
+        with _patched_folder_paths_absolute_lookup():
+            outputs = _invoke_original_node(node_mapping[class_type], node_data, kwargs)
+            return serialize_node_outputs(outputs)
 
     with _temporary_node_mapping(node_mapping):
         resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
@@ -239,7 +344,8 @@ def execute_node_locally(
         if class_type not in resolved_node_mapping:
             raise KeyError(f"Remote node class {class_type!r} is not registered.")
 
-        outputs = _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
+        with _patched_folder_paths_absolute_lookup():
+            outputs = _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
     return serialize_node_outputs(outputs)
 
 
@@ -286,7 +392,7 @@ def _execute_subgraph_prompt(
     hydrated_inputs: dict[str, Any],
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
-    prompt = copy.deepcopy(payload["subgraph_prompt"])
+    prompt = _rewrite_modal_asset_references(copy.deepcopy(payload["subgraph_prompt"]))
     _apply_boundary_inputs(
         prompt=prompt,
         boundary_input_specs=list(payload.get("boundary_inputs", [])),
@@ -295,7 +401,7 @@ def _execute_subgraph_prompt(
     execution = _load_execution_module()
     cache_type, cache_args = _prompt_executor_cache_config(execution)
 
-    with _temporary_node_mapping(None):
+    with _temporary_node_mapping(None), _patched_folder_paths_absolute_lookup():
         executor = execution.PromptExecutor(
             _NullPromptServer(),
             cache_type=cache_type,

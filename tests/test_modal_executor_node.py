@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 from typing import Any
 
 
@@ -212,6 +213,87 @@ def test_modal_cloud_uses_comfy_prompt_executor_cache_defaults(
 
     assert cache_type == "ram-pressure"
     assert cache_args == {"lru": 0, "ram": 4.0}
+
+
+def test_modal_cloud_materializes_synced_asset_paths(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote asset references should resolve to absolute files under the storage root."""
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", "/storage")
+    modal_cloud_module.get_settings.cache_clear()
+    try:
+        assert modal_cloud_module._materialize_remote_asset_path("/assets/model.safetensors") == (
+            "/storage/assets/model.safetensors"
+        )
+        assert modal_cloud_module._rewrite_modal_asset_references(
+            {"clip_name": "/assets/model.safetensors", "nested": ["/assets/other.pt", 3]}
+        ) == {
+            "clip_name": "/storage/assets/model.safetensors",
+            "nested": ["/storage/assets/other.pt", 3],
+        }
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+
+
+def test_modal_cloud_accepts_absolute_asset_paths_in_folder_lookup(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Patched folder lookups should return already-materialized absolute asset paths."""
+    remote_storage_root = tmp_path / "storage"
+    asset_path = remote_storage_root / "assets" / "clip.safetensors"
+    asset_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"clip")
+
+    fake_folder_paths_module = types.SimpleNamespace(
+        get_full_path=lambda folder_name, filename: None,
+        get_full_path_or_raise=lambda folder_name, filename: (_ for _ in ()).throw(
+            FileNotFoundError(filename)
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths_module)
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(remote_storage_root))
+    modal_cloud_module.get_settings.cache_clear()
+    try:
+        with modal_cloud_module._patched_folder_paths_absolute_lookup():
+            resolved = fake_folder_paths_module.get_full_path(
+                "text_encoders",
+                "/assets/clip.safetensors",
+            )
+            assert resolved == str(asset_path)
+            assert (
+                fake_folder_paths_module.get_full_path_or_raise(
+                    "text_encoders",
+                    "/assets/clip.safetensors",
+                )
+                == str(asset_path)
+            )
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+
+
+def test_modal_cloud_force_imports_comfyui_utils_package(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """ComfyUI's utils package should override a shadowing non-package module."""
+    package_root = tmp_path / "comfyui"
+    utils_dir = package_root / "utils"
+    utils_dir.mkdir(parents=True)
+    (utils_dir / "__init__.py").write_text("SENTINEL = 'comfy-utils'\n", encoding="utf-8")
+
+    shadow_module = types.ModuleType("utils")
+    shadow_module.__file__ = str(tmp_path / "utils.py")
+    monkeypatch.setitem(sys.modules, "utils", shadow_module)
+
+    modal_cloud_module._force_import_package_from_root("utils", package_root)
+
+    imported_module = sys.modules["utils"]
+    assert getattr(imported_module, "SENTINEL", None) == "comfy-utils"
+    assert list(getattr(imported_module, "__path__", [])) == [str(utils_dir)]
 
 
 class _BoundarySourceNode:

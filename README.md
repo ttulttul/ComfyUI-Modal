@@ -96,6 +96,8 @@ Important distinction:
 - the Modal image now installs the core ComfyUI runtime Python packages automatically, but remote execution may still surface additional environment gaps as broader workflows are exercised
 - the Modal image filter now preserves internal ComfyUI Python packages such as `comfy/ldm/models` while still excluding top-level runtime asset folders like `models/` and `output/`
 - the remote worker now initializes ComfyUI's built-in extra nodes and API nodes on first use, and loads extracted custom-node bundles through ComfyUI's normal `custom_nodes` registry path
+- mirrored asset references such as `/assets/<sha>_model.safetensors` are now materialized to container-local absolute paths before remote execution, and the worker patches ComfyUI's `folder_paths` lookups so normal loader nodes still accept them
+- the remote worker now force-loads ComfyUI's top-level `utils` package from the bundled ComfyUI source tree before API nodes initialize, which avoids third-party or stray `utils` modules shadowing `utils.install_util`
 
 If you want a stable reusable Modal deployment, that is still a separate step outside the current node-pack behavior.
 
