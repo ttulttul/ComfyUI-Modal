@@ -127,13 +127,25 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
     packages = set(modal_cloud_module._comfyui_runtime_packages())
 
     assert "psutil" in packages
-    assert "torch" in packages
-    assert "torchvision" in packages
     assert "torchsde" in packages
     assert "transformers" in packages
     assert "sentencepiece" in packages
     assert "aiohttp" in packages
     assert "opencv-python-headless" in packages
+
+
+def test_modal_cloud_pins_cu128_pytorch_stack(
+    modal_cloud_module: Any,
+) -> None:
+    """The Modal cloud image should pin the PyTorch stack to the CUDA 12.8 wheel index."""
+    packages = modal_cloud_module._comfyui_torch_packages()
+
+    assert packages == (
+        "torch==2.10.0",
+        "torchvision==0.25.0",
+        "torchaudio==2.10.0",
+    )
+    assert modal_cloud_module._PYTORCH_CUDA_INDEX_URL == "https://download.pytorch.org/whl/cu128"
 
 
 def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
