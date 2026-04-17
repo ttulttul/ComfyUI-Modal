@@ -286,21 +286,16 @@ def _should_ignore_repo_path(path: Path) -> bool:
 
 def _should_ignore_comfyui_path(path: Path) -> bool:
     """Return whether a local ComfyUI path should be omitted from the Modal image mount."""
-    parts = set(path.parts)
-    if {
-        ".git",
-        ".venv",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "input",
-        "models",
-        "output",
-        "temp",
-        "user",
-    } & parts:
+    parts = path.parts
+    if not parts:
+        return False
+
+    if {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"} & set(parts):
         return True
+
+    if parts[0] in {"input", "models", "output", "temp", "user"}:
+        return True
+
     return path.suffix.lower() in {".bin", ".ckpt", ".log", ".pt", ".pyc", ".pyo", ".safetensors", ".swp", ".tmp"}
 
 
