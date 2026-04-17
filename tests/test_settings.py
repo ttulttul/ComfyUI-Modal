@@ -43,3 +43,17 @@ def test_settings_prefers_modal_specific_comfyui_root_env(
 
     assert resolved == env_root.resolve()
 
+
+def test_settings_reads_modal_gpu_override(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The Modal GPU type should be configurable via environment variable."""
+    monkeypatch.setenv("COMFY_MODAL_GPU", "L40S")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.modal_gpu == "L40S"
