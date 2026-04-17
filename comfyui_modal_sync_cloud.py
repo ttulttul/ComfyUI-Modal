@@ -83,13 +83,46 @@ def _configure_cloud_logging() -> logging.Logger:
         if getattr(existing_handler, "name", "") == _CLOUD_HANDLER_NAME:
             return logger
 
-    handler = logging.StreamHandler()
+    handler = logging.StreamHandler(sys.stdout)
     handler.set_name(_CLOUD_HANDLER_NAME)
     handler.setLevel(logging.INFO)
     handler.setFormatter(_build_cloud_log_formatter())
     logger.addHandler(handler)
     logger.propagate = False
     return logger
+
+
+def _is_modal_container_runtime() -> bool:
+    """Return whether the current process is executing inside a Modal container."""
+    return os.getenv("MODAL_IS_REMOTE") == "1" or bool(os.getenv("MODAL_TASK_ID"))
+
+
+def _cloud_formatter() -> logging.Formatter:
+    """Return the configured formatter used for cloud phase trace lines."""
+    for existing_handler in logger.handlers:
+        if getattr(existing_handler, "name", "") == _CLOUD_HANDLER_NAME:
+            formatter = existing_handler.formatter
+            if formatter is not None:
+                return formatter
+    return _build_cloud_log_formatter()
+
+
+def _emit_cloud_info(message: str, *args: Any) -> None:
+    """Emit an info line through logging and mirror it to stdout inside Modal containers."""
+    logger.info(message, *args)
+    if not _is_modal_container_runtime():
+        return
+
+    record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        __file__,
+        0,
+        message,
+        args,
+        exc_info=None,
+    )
+    print(_cloud_formatter().format(record), file=sys.stdout, flush=True)
 
 
 @contextmanager
@@ -100,11 +133,11 @@ def _timed_phase(phase: str, **fields: Any) -> Iterator[None]:
         rendered_fields = " ".join(f"{key}={value}" for key, value in fields.items())
         field_suffix = f" {rendered_fields}"
     phase_started_at = time.perf_counter()
-    logger.info("Starting %s%s", phase, field_suffix)
+    _emit_cloud_info("Starting %s%s", phase, field_suffix)
     try:
         yield
     finally:
-        logger.info(
+        _emit_cloud_info(
             "Finished %s in %.3fs%s",
             phase,
             time.perf_counter() - phase_started_at,
