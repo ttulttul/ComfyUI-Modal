@@ -85,6 +85,8 @@ For real Modal execution, you need:
 
 The remote runtime skeleton lives in [remote/modal_app.py](/home/ksimpson/git/ComfyUI-Modal/remote/modal_app.py). The extension is structured for Modal, but you still need to supply a working Modal environment.
 
+When `COMFY_MODAL_EXECUTION_MODE` is remote, the runtime now tries a deployed Modal class lookup first via the configured app name. If no deployed app is available, it falls back to starting an ephemeral `app.run()` session locally for the invocation. That fallback is slower, but it avoids the old "Function has not been hydrated" failure mode.
+
 ### 3. Open your workflow in ComfyUI
 
 Build your workflow normally. This pack does not replace regular nodes in the editor. Instead, it adds a `Run on Modal` toggle to standard nodes.

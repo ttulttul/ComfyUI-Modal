@@ -10,7 +10,7 @@ import tempfile
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -21,6 +21,7 @@ from ..serialization import (
 from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
+_REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 try:
     import modal  # type: ignore
@@ -30,6 +31,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by local fallback te
 
 class RemoteSubgraphExecutionError(RuntimeError):
     """Raised when remote subgraph execution fails."""
+
+
+class ModalRemoteInvocationError(RuntimeError):
+    """Raised when the Modal client cannot invoke the remote runtime."""
 
 
 class _NullPromptServer:
@@ -430,6 +435,91 @@ def execute_subgraph_locally(
     return serialize_node_outputs(outputs)
 
 
+def _modal_lookup_error_types() -> tuple[type[BaseException], ...]:
+    """Return Modal exception types that indicate lookup or hydration failure."""
+    if modal is None:
+        return tuple()
+    exception_module = getattr(modal, "exception", None)
+    if exception_module is None:
+        return tuple()
+
+    error_types: list[type[BaseException]] = []
+    for error_name in ("NotFoundError", "ExecutionError", "InvalidError"):
+        error_type = getattr(exception_module, error_name, None)
+        if isinstance(error_type, type) and issubclass(error_type, BaseException):
+            error_types.append(error_type)
+    return tuple(error_types)
+
+
+def _lookup_deployed_modal_method(payload: dict[str, Any]) -> Any:
+    """Look up the deployed Modal method used to execute the remote runtime."""
+    if modal is None:
+        raise ModalRemoteInvocationError("Modal SDK is unavailable.")
+
+    settings = get_settings()
+    logger.info(
+        "Attempting deployed Modal invocation for app=%s class=%s component=%s.",
+        settings.app_name,
+        "RemoteEngine",
+        payload.get("component_id"),
+    )
+    remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
+    remote_engine = remote_cls()
+    return remote_engine.execute_payload
+
+
+def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+    """Invoke the Modal runtime from a worker thread using deployed or ephemeral app state."""
+    if modal is None:
+        raise ModalRemoteInvocationError("Modal SDK is unavailable.")
+
+    lookup_error_types = _modal_lookup_error_types()
+    settings = get_settings()
+    if lookup_error_types:
+        try:
+            remote_method = _lookup_deployed_modal_method(payload)
+            logger.info(
+                "Using deployed Modal app %s for component %s.",
+                settings.app_name,
+                payload.get("component_id"),
+            )
+            return remote_method.remote(payload, kwargs_payload)
+        except lookup_error_types as exc:
+            logger.warning(
+                "Deployed Modal app lookup failed for app=%s component=%s: %s. Falling back to ephemeral app.run().",
+                settings.app_name,
+                payload.get("component_id"),
+                exc,
+            )
+    else:
+        remote_method = _lookup_deployed_modal_method(payload)
+        logger.info(
+            "Using deployed Modal app %s for component %s.",
+            settings.app_name,
+            payload.get("component_id"),
+        )
+        return remote_method.remote(payload, kwargs_payload)
+
+    if "app" not in globals() or "RemoteEngine" not in globals():
+        raise ModalRemoteInvocationError(
+            "Modal runtime objects are unavailable; cannot start an ephemeral app.run() session."
+        )
+
+    logger.info(
+        "Starting ephemeral Modal app.run() for component %s.",
+        payload.get("component_id"),
+    )
+    run_context = app.run() if hasattr(app, "run") else nullcontext()
+    with run_context:
+        remote_engine = RemoteEngine()
+        result = remote_engine.execute_payload.remote(payload, kwargs_payload)
+    logger.info(
+        "Ephemeral Modal app.run() invocation completed for component %s.",
+        payload.get("component_id"),
+    )
+    return result
+
+
 def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal when configured, or fall back to local in-process execution."""
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
@@ -438,11 +528,29 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
             return execute_subgraph_locally(payload, kwargs_payload)
         return execute_node_locally(payload, kwargs_payload)
 
-    engine = RemoteEngine()
-    remote_method = getattr(engine.execute_payload, "remote", None)
-    if callable(remote_method):
-        return remote_method(payload, kwargs_payload)
-    return engine.execute_payload(payload, kwargs_payload)
+    logger.info(
+        "Dispatching Modal remote invocation for component=%s payload_kind=%s.",
+        payload.get("component_id"),
+        payload.get("payload_kind"),
+    )
+    future = _REMOTE_MODAL_CALL_EXECUTOR.submit(
+        _invoke_modal_payload_blocking,
+        dict(payload),
+        kwargs_payload,
+    )
+    try:
+        response = future.result()
+    except Exception:
+        logger.exception(
+            "Modal remote invocation failed for component=%s.",
+            payload.get("component_id"),
+        )
+        raise
+    logger.info(
+        "Modal remote invocation completed for component=%s.",
+        payload.get("component_id"),
+    )
+    return response
 
 
 if modal is not None:  # pragma: no branch - simple import-time configuration.
