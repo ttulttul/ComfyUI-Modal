@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import inspect
 import logging
 import os
 import sys
@@ -45,6 +46,9 @@ _COMFY_RUNTIME_INIT_LOCK = threading.Lock()
 _COMFY_RUNTIME_BASE_INITIALIZED = False
 _COMFY_RUNTIME_CUSTOM_NODE_ROOTS: set[str] = set()
 _EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
+_LOADER_CACHE_LOCK = threading.Lock()
+_LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
+_LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 
 try:
     import modal  # type: ignore
@@ -369,6 +373,113 @@ def _materialize_remote_asset_path(value: str) -> str:
     return value
 
 
+def _clone_loader_cache_value(value: Any) -> Any:
+    """Clone a cached loader output when the runtime object supports safe cloning."""
+    clone_method = getattr(value, "clone", None)
+    if callable(clone_method):
+        return clone_method()
+    return value
+
+
+def _clone_loader_cache_outputs(outputs: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Return a request-safe copy of cached loader outputs."""
+    return tuple(_clone_loader_cache_value(output) for output in outputs)
+
+
+def _serialize_loader_cache_key(parts: dict[str, Any]) -> str:
+    """Serialize a loader cache key into a stable string representation."""
+    return json.dumps(parts, sort_keys=True, default=str)
+
+
+def _build_unet_loader_cache_key(kwargs: dict[str, Any]) -> str:
+    """Build a stable cache key for the ComfyUI UNET loader."""
+    import folder_paths
+
+    return _serialize_loader_cache_key(
+        {
+            "unet_path": folder_paths.get_full_path_or_raise(
+                "diffusion_models",
+                str(kwargs["unet_name"]),
+            ),
+            "weight_dtype": kwargs.get("weight_dtype", "default"),
+        }
+    )
+
+
+def _build_clip_loader_cache_key(kwargs: dict[str, Any]) -> str:
+    """Build a stable cache key for the ComfyUI CLIP loader."""
+    import folder_paths
+
+    return _serialize_loader_cache_key(
+        {
+            "clip_path": folder_paths.get_full_path_or_raise(
+                "text_encoders",
+                str(kwargs["clip_name"]),
+            ),
+            "type": kwargs.get("type", "stable_diffusion"),
+            "device": kwargs.get("device", "default"),
+        }
+    )
+
+
+def _build_vae_loader_cache_key(kwargs: dict[str, Any]) -> str:
+    """Build a stable cache key for the ComfyUI VAE loader."""
+    return _serialize_loader_cache_key({"vae_name": kwargs.get("vae_name")})
+
+
+def _wrap_loader_method_with_cache(
+    class_type: str,
+    node_class: type[Any],
+    method_name: str,
+    cache_key_builder: Any,
+) -> None:
+    """Install a warm-container cache wrapper around a heavy loader method."""
+    if class_type in _LOADER_CACHE_WRAPPED_CLASSES:
+        return
+
+    original_method = getattr(node_class, method_name)
+    method_signature = inspect.signature(original_method)
+
+    def cached_method(self: Any, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        """Return cached loader outputs when an identical request was already loaded."""
+        bound = method_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        normalized_kwargs = {key: value for key, value in bound.arguments.items() if key != "self"}
+        cache_key = (class_type, cache_key_builder(normalized_kwargs))
+
+        with _LOADER_CACHE_LOCK:
+            cached_outputs = _LOADER_OUTPUT_CACHE.get(cache_key)
+        if cached_outputs is not None:
+            _emit_cloud_info("Loader cache hit class_type=%s key=%s", class_type, cache_key[1])
+            return _clone_loader_cache_outputs(cached_outputs)
+
+        _emit_cloud_info("Loader cache miss class_type=%s key=%s", class_type, cache_key[1])
+        outputs = original_method(self, *args, **kwargs)
+        normalized_outputs = tuple(outputs) if isinstance(outputs, (list, tuple)) else (outputs,)
+        with _LOADER_CACHE_LOCK:
+            _LOADER_OUTPUT_CACHE[cache_key] = normalized_outputs
+        return _clone_loader_cache_outputs(normalized_outputs)
+
+    setattr(node_class, method_name, cached_method)
+    _LOADER_CACHE_WRAPPED_CLASSES.add(class_type)
+
+
+def _install_loader_cache_wrappers() -> None:
+    """Patch the heavyweight built-in model loaders to reuse warm-container state."""
+    nodes_module = _load_nodes_module()
+    cacheable_loader_specs = {
+        "UNETLoader": ("load_unet", _build_unet_loader_cache_key),
+        "CLIPLoader": ("load_clip", _build_clip_loader_cache_key),
+        "VAELoader": ("load_vae", _build_vae_loader_cache_key),
+    }
+
+    for class_type, (method_name, cache_key_builder) in cacheable_loader_specs.items():
+        node_class = nodes_module.NODE_CLASS_MAPPINGS.get(class_type)
+        if node_class is None:
+            continue
+        _wrap_loader_method_with_cache(class_type, node_class, method_name, cache_key_builder)
+
+
 def _rewrite_modal_asset_references(value: Any) -> Any:
     """Recursively replace mirrored asset markers with container-local absolute file paths."""
     if isinstance(value, str):
@@ -445,18 +556,21 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                             init_api_nodes=True,
                         )
                     )
+                _install_loader_cache_wrappers()
                 _COMFY_RUNTIME_BASE_INITIALIZED = True
                 if custom_nodes_root_key is not None:
                     _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
                 return
 
             if custom_nodes_root_key is None or custom_nodes_root_key in _COMFY_RUNTIME_CUSTOM_NODE_ROOTS:
+                _install_loader_cache_wrappers()
                 return
 
             _register_custom_nodes_root(custom_nodes_root)
             logger.info("Loading extracted remote custom nodes from %s.", custom_nodes_root)
             with _timed_phase("init_external_custom_nodes", custom_nodes=custom_nodes_root_key):
                 asyncio.run(nodes_module.init_external_custom_nodes())
+            _install_loader_cache_wrappers()
             _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
 
 
