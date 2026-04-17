@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -17,6 +18,7 @@ from typing import Any, Protocol
 from .settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
+_MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 _SYNC_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".vae"}
 _SKIP_DIRS = {
@@ -106,19 +108,33 @@ class ModalVolumeBackend:
             raise RuntimeError("Modal SDK is required for ModalVolumeBackend.")
         self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
 
+    def _run_volume_call(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run a Modal SDK volume call in a worker thread outside the request event loop."""
+        future = _MODAL_VOLUME_EXECUTOR.submit(callback, *args, **kwargs)
+        return future.result()
+
     def exists(self, remote_path: str) -> bool:
         """Return whether a file already exists in the Modal volume."""
-        return len(self._volume.listdir(remote_path, recursive=False)) > 0
+        try:
+            return len(self._run_volume_call(self._volume.listdir, remote_path, recursive=False)) > 0
+        except modal.exception.NotFoundError:
+            return False
 
     def put_file(self, local_path: Path, remote_path: str) -> None:
         """Upload a local file into the Modal volume."""
-        with self._volume.batch_upload() as batch:
-            batch.put_file(local_path, remote_path)
+        def upload() -> None:
+            with self._volume.batch_upload() as batch:
+                batch.put_file(local_path, remote_path)
+
+        self._run_volume_call(upload)
 
     def put_bytes(self, payload: bytes, remote_path: str) -> None:
         """Upload bytes into the Modal volume."""
-        with self._volume.batch_upload() as batch:
-            batch.put_file(io.BytesIO(payload), remote_path)
+        def upload() -> None:
+            with self._volume.batch_upload() as batch:
+                batch.put_file(io.BytesIO(payload), remote_path)
+
+        self._run_volume_call(upload)
 
 
 @dataclass
