@@ -18,18 +18,18 @@ logger = logging.getLogger(__name__)
 class RemoteExecutorClient(Protocol):
     """Execution client interface used by Modal proxy nodes."""
 
-    def execute_node(self, node_data: Mapping[str, Any], kwargs: Mapping[str, Any]) -> Sequence[Any]:
-        """Execute a node remotely and return its output tuple."""
+    def execute_payload(self, payload: Mapping[str, Any], kwargs: Mapping[str, Any]) -> Sequence[Any]:
+        """Execute a serialized Modal payload and return its outputs."""
 
 
 class ModalRemoteExecutorClient:
     """Default execution client backed by the remote Modal app module."""
 
-    def execute_node(self, node_data: Mapping[str, Any], kwargs: Mapping[str, Any]) -> Sequence[Any]:
+    def execute_payload(self, payload: Mapping[str, Any], kwargs: Mapping[str, Any]) -> Sequence[Any]:
         """Serialize inputs, invoke the remote engine, and deserialize outputs."""
         from .remote.modal_app import invoke_remote_engine
 
-        response = invoke_remote_engine(dict(node_data), serialize_node_inputs(kwargs))
+        response = invoke_remote_engine(dict(payload), serialize_node_inputs(kwargs))
         return deserialize_node_outputs(response)
 
 
@@ -87,16 +87,21 @@ def _proxy_node_id(original_class_type: str, output_types: Sequence[str]) -> str
 
 
 def _build_proxy_node_class(
-    original_class_type: str,
+    node_id: str,
+    proxy_display_name: str,
+    payload_input_name: str,
     output_types: tuple[str, ...],
     output_names: tuple[str, ...],
     output_is_list: tuple[bool, ...],
+    *,
+    is_output_node: bool,
 ) -> type[io.ComfyNode]:
     """Create a v3 proxy node that mirrors an original node output signature."""
-    node_id = _proxy_node_id(original_class_type, output_types)
 
     class _DynamicModalExecutor(io.ComfyNode):
         """Internal proxy node that forwards execution to Modal."""
+
+        OUTPUT_NODE = is_output_node
 
         @classmethod
         def define_schema(cls) -> io.Schema:
@@ -107,14 +112,14 @@ def _build_proxy_node_class(
             ]
             return io.Schema(
                 node_id=node_id,
-                display_name="Modal Universal Executor",
+                display_name=proxy_display_name,
                 category="Modal",
                 description=(
-                    "Internal proxy node that forwards the original node execution "
-                    "to a Modal-backed runtime."
+                    "Internal proxy node that forwards a rewritten Modal execution "
+                    "payload to a Modal-backed runtime."
                 ),
                 inputs=[
-                    io.AnyType.Input("original_node_data"),
+                    io.AnyType.Input(payload_input_name),
                 ],
                 outputs=outputs,
                 accept_all_inputs=True,
@@ -123,17 +128,18 @@ def _build_proxy_node_class(
             )
 
         @classmethod
-        def execute(cls, original_node_data: Any, **kwargs: Any) -> io.NodeOutput:
-            """Forward the original node payload to the configured remote executor."""
-            if isinstance(original_node_data, str):
-                original_node_data = json.loads(original_node_data)
-            if not isinstance(original_node_data, Mapping):
-                raise TypeError("original_node_data must be a mapping or JSON object.")
+        def execute(cls, **kwargs: Any) -> io.NodeOutput:
+            """Forward the execution payload to the configured remote executor."""
+            payload = kwargs.pop(payload_input_name, None)
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, Mapping):
+                raise TypeError(f"{payload_input_name} must be a mapping or JSON object.")
 
-            outputs = tuple(get_remote_executor_client().execute_node(original_node_data, kwargs))
+            outputs = tuple(get_remote_executor_client().execute_payload(payload, kwargs))
             logger.debug(
-                "Remote execution completed for %s with %d outputs.",
-                original_node_data.get("class_type"),
+                "Remote execution completed for payload kind=%s with %d outputs.",
+                payload.get("payload_kind"),
                 len(outputs),
             )
             return io.NodeOutput(*outputs)
@@ -157,15 +163,56 @@ def ensure_modal_proxy_node_registered(
         return proxy_node_id
 
     proxy_class = _build_proxy_node_class(
-        original_class_type=original_class_type,
+        node_id=proxy_node_id,
+        proxy_display_name="Modal Universal Executor",
+        payload_input_name="original_node_data",
         output_types=output_types,
         output_names=output_names,
         output_is_list=output_is_list,
+        is_output_node=False,
     )
     nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = proxy_class
     nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Universal Executor"
     _PROXY_NODE_CACHE[proxy_node_id] = proxy_class
     logger.info("Registered Modal proxy node %s for %s", proxy_node_id, original_class_type)
+    return proxy_node_id
+
+
+def ensure_modal_component_proxy_node_registered(
+    output_types: Sequence[str],
+    output_names: Sequence[str],
+    output_is_list: Sequence[bool],
+    nodes_module: Any,
+    *,
+    is_output_node: bool,
+) -> str:
+    """Register and return a proxy node id for a remote component signature."""
+    normalized_output_types = tuple(output_types)
+    normalized_output_names = tuple(output_names)
+    normalized_output_is_list = tuple(output_is_list)
+    proxy_node_id = _proxy_node_id(
+        "ModalRemoteComponent",
+        normalized_output_types + (str(is_output_node),),
+    )
+
+    if proxy_node_id in _PROXY_NODE_CACHE:
+        nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = _PROXY_NODE_CACHE[proxy_node_id]
+        nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Remote Component"
+        return proxy_node_id
+
+    proxy_class = _build_proxy_node_class(
+        node_id=proxy_node_id,
+        proxy_display_name="Modal Remote Component",
+        payload_input_name="original_node_data",
+        output_types=normalized_output_types,
+        output_names=normalized_output_names,
+        output_is_list=normalized_output_is_list,
+        is_output_node=is_output_node,
+    )
+    nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = proxy_class
+    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Remote Component"
+    _PROXY_NODE_CACHE[proxy_node_id] = proxy_class
+    logger.info("Registered Modal component proxy node %s", proxy_node_id)
     return proxy_node_id
 
 

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import sys
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ..serialization import (
     deserialize_node_inputs,
@@ -22,6 +25,23 @@ try:
     import modal  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - exercised by local fallback tests.
     modal = None
+
+
+class RemoteSubgraphExecutionError(RuntimeError):
+    """Raised when remote subgraph execution fails."""
+
+
+class _NullPromptServer:
+    """Minimal PromptExecutor server stub for headless subgraph execution."""
+
+    def __init__(self) -> None:
+        """Initialize the no-op prompt server state."""
+        self.client_id: str | None = None
+        self.last_node_id: str | None = None
+
+    def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
+        """Discard PromptExecutor progress and status events."""
+        logger.debug("Suppressed remote prompt event %s for client %s.", event, client_id)
 
 
 def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
@@ -54,6 +74,36 @@ def _load_nodes_module() -> Any:
     import nodes
 
     return nodes
+
+
+def _load_execution_module() -> Any:
+    """Import the ComfyUI execution module lazily."""
+    import execution
+
+    return execution
+
+
+@contextmanager
+def _temporary_node_mapping(node_mapping: dict[str, type[Any]] | None) -> Iterator[None]:
+    """Temporarily overlay node mappings for tests or custom runtimes."""
+    if node_mapping is None:
+        yield
+        return
+
+    nodes_module = _load_nodes_module()
+    original_mappings = dict(nodes_module.NODE_CLASS_MAPPINGS)
+    original_display_mappings = dict(getattr(nodes_module, "NODE_DISPLAY_NAME_MAPPINGS", {}))
+    try:
+        nodes_module.NODE_CLASS_MAPPINGS.update(node_mapping)
+        for class_type in node_mapping:
+            nodes_module.NODE_DISPLAY_NAME_MAPPINGS.setdefault(class_type, class_type)
+        yield
+    finally:
+        nodes_module.NODE_CLASS_MAPPINGS.clear()
+        nodes_module.NODE_CLASS_MAPPINGS.update(original_mappings)
+        if hasattr(nodes_module, "NODE_DISPLAY_NAME_MAPPINGS"):
+            nodes_module.NODE_DISPLAY_NAME_MAPPINGS.clear()
+            nodes_module.NODE_DISPLAY_NAME_MAPPINGS.update(original_display_mappings)
 
 
 def _invoke_original_node(
@@ -90,29 +140,233 @@ def execute_node_locally(
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
     node_mapping: dict[str, type[Any]] | None = None,
 ) -> bytes:
-    """Execute the target node in-process and return serialized outputs."""
+    """Execute a single target node in-process and return serialized outputs."""
     _extract_custom_nodes_bundle(node_data.get("custom_nodes_bundle"))
     kwargs = deserialize_node_inputs(kwargs_payload)
-    resolved_node_mapping = node_mapping or _load_nodes_module().NODE_CLASS_MAPPINGS
-    class_type = node_data["class_type"]
-    if class_type not in resolved_node_mapping:
-        raise KeyError(f"Remote node class {class_type!r} is not registered.")
+    if node_mapping is not None:
+        class_type = node_data["class_type"]
+        if class_type not in node_mapping:
+            raise KeyError(f"Remote node class {class_type!r} is not registered.")
+        outputs = _invoke_original_node(node_mapping[class_type], node_data, kwargs)
+        return serialize_node_outputs(outputs)
 
-    outputs = _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
+    with _temporary_node_mapping(node_mapping):
+        resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
+        class_type = node_data["class_type"]
+        if class_type not in resolved_node_mapping:
+            raise KeyError(f"Remote node class {class_type!r} is not registered.")
+
+        outputs = _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
     return serialize_node_outputs(outputs)
 
 
-def invoke_remote_engine(node_data: dict[str, Any], kwargs_payload: bytes) -> bytes:
+def _apply_boundary_inputs(
+    prompt: dict[str, Any],
+    boundary_input_specs: list[dict[str, Any]],
+    hydrated_inputs: dict[str, Any],
+) -> None:
+    """Inject hydrated local boundary inputs into a remote subgraph prompt."""
+    for boundary_input in boundary_input_specs:
+        proxy_input_name = str(boundary_input["proxy_input_name"])
+        if proxy_input_name not in hydrated_inputs:
+            raise KeyError(f"Missing hydrated boundary input {proxy_input_name!r}.")
+        value = hydrated_inputs[proxy_input_name]
+        for target in boundary_input.get("targets", []):
+            node_id = str(target["node_id"])
+            input_name = str(target["input_name"])
+            prompt[node_id]["inputs"][input_name] = value
+
+
+def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
+    """Convert a PromptExecutor cache slot back into a node-style output value."""
+    if is_list:
+        return slot_values
+    if not isinstance(slot_values, list):
+        return slot_values
+    if len(slot_values) == 1:
+        return slot_values[0]
+    return slot_values
+
+
+def _extract_prompt_executor_error(executor: Any) -> str:
+    """Extract a useful failure message from a PromptExecutor run."""
+    for event, data in reversed(executor.status_messages):
+        if event == "execution_error":
+            return str(data.get("exception_message") or "Remote subgraph execution failed.")
+        if event == "execution_interrupted":
+            return "Remote subgraph execution was interrupted."
+    return "Remote subgraph execution failed."
+
+
+def _resolve_required_subgraph_nodes(
+    prompt: dict[str, Any],
+    execute_node_ids: list[str],
+) -> list[str]:
+    """Return the dependency closure needed to execute the requested subgraph nodes."""
+    required: set[str] = set()
+    pending = list(execute_node_ids)
+    while pending:
+        node_id = str(pending.pop())
+        if node_id in required:
+            continue
+        required.add(node_id)
+        for input_value in (prompt[node_id].get("inputs") or {}).values():
+            if _is_link(input_value):
+                pending.append(str(input_value[0]))
+    return sorted(required)
+
+
+def _is_link(value: Any) -> bool:
+    """Return whether a prompt input value is a ComfyUI link."""
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(not isinstance(item, dict) for item in value)
+    )
+
+
+def _execute_subgraph_with_mapping(
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    node_mapping: dict[str, type[Any]],
+) -> tuple[Any, ...]:
+    """Execute a rewritten remote component using an explicit node mapping."""
+    prompt = copy.deepcopy(payload["subgraph_prompt"])
+    _apply_boundary_inputs(
+        prompt=prompt,
+        boundary_input_specs=list(payload.get("boundary_inputs", [])),
+        hydrated_inputs=hydrated_inputs,
+    )
+    required_node_ids = _resolve_required_subgraph_nodes(
+        prompt=prompt,
+        execute_node_ids=list(payload.get("execute_node_ids", [])),
+    )
+    executed_outputs: dict[str, tuple[Any, ...]] = {}
+    pending = set(required_node_ids)
+
+    while pending:
+        progressed = False
+        for node_id in list(sorted(pending)):
+            prompt_node = prompt[node_id]
+            kwargs: dict[str, Any] = {}
+            unresolved_dependency = False
+            for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+                if _is_link(input_value):
+                    upstream_node_id = str(input_value[0])
+                    if upstream_node_id not in executed_outputs:
+                        unresolved_dependency = True
+                        break
+                    kwargs[str(input_name)] = executed_outputs[upstream_node_id][int(input_value[1])]
+                else:
+                    kwargs[str(input_name)] = input_value
+            if unresolved_dependency:
+                continue
+
+            class_type = str(prompt_node["class_type"])
+            if class_type not in node_mapping:
+                raise KeyError(f"Remote node class {class_type!r} is not registered.")
+            executed_outputs[node_id] = _invoke_original_node(
+                node_mapping[class_type],
+                prompt_node,
+                kwargs,
+            )
+            pending.remove(node_id)
+            progressed = True
+        if not progressed:
+            raise RemoteSubgraphExecutionError(
+                "Unable to resolve execution order for remote subgraph payload."
+            )
+
+    outputs: list[Any] = []
+    for boundary_output in payload.get("boundary_outputs", []):
+        node_id = str(boundary_output["node_id"])
+        output_index = int(boundary_output["output_index"])
+        node_outputs = executed_outputs.get(node_id)
+        if node_outputs is None:
+            raise RemoteSubgraphExecutionError(
+                f"Remote subgraph did not execute boundary output node {node_id}."
+            )
+        outputs.append(node_outputs[output_index])
+    return tuple(outputs)
+
+
+def _execute_subgraph_prompt(
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    node_mapping: dict[str, type[Any]] | None = None,
+) -> tuple[Any, ...]:
+    """Execute a remote component prompt and return its exported outputs."""
+    if node_mapping is not None:
+        return _execute_subgraph_with_mapping(payload, hydrated_inputs, node_mapping)
+
+    prompt = copy.deepcopy(payload["subgraph_prompt"])
+    _apply_boundary_inputs(
+        prompt=prompt,
+        boundary_input_specs=list(payload.get("boundary_inputs", [])),
+        hydrated_inputs=hydrated_inputs,
+    )
+    execution = _load_execution_module()
+
+    with _temporary_node_mapping(node_mapping):
+        executor = execution.PromptExecutor(_NullPromptServer())
+        executor.execute(
+            prompt=prompt,
+            prompt_id=str(payload.get("component_id", "modal-subgraph")),
+            extra_data=copy.deepcopy(payload.get("extra_data") or {}),
+            execute_outputs=list(payload.get("execute_node_ids", [])),
+        )
+        if not executor.success:
+            raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
+
+        outputs: list[Any] = []
+        for boundary_output in payload.get("boundary_outputs", []):
+            node_id = str(boundary_output["node_id"])
+            output_index = int(boundary_output["output_index"])
+            cache_entry = executor.caches.outputs.get(node_id)
+            if cache_entry is None:
+                raise RemoteSubgraphExecutionError(
+                    f"Remote subgraph did not produce cache entry for node {node_id}."
+                )
+            if output_index >= len(cache_entry.outputs):
+                raise RemoteSubgraphExecutionError(
+                    f"Remote subgraph output index {output_index} is missing for node {node_id}."
+                )
+            outputs.append(
+                _collapse_cache_slot(
+                    slot_values=cache_entry.outputs[output_index],
+                    is_list=bool(boundary_output.get("is_list", False)),
+                )
+            )
+        return tuple(outputs)
+
+
+def execute_subgraph_locally(
+    payload: dict[str, Any],
+    kwargs_payload: bytes | bytearray | str | dict[str, Any],
+    node_mapping: dict[str, type[Any]] | None = None,
+) -> bytes:
+    """Execute a rewritten remote component in-process and return serialized outputs."""
+    _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
+    hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, node_mapping)
+        outputs = future.result()
+    return serialize_node_outputs(outputs)
+
+
+def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal when configured, or fall back to local in-process execution."""
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
-        return execute_node_locally(node_data, kwargs_payload)
+        if payload.get("payload_kind") == "subgraph":
+            return execute_subgraph_locally(payload, kwargs_payload)
+        return execute_node_locally(payload, kwargs_payload)
 
     engine = RemoteEngine()
-    remote_method = getattr(engine.execute_node, "remote", None)
+    remote_method = getattr(engine.execute_payload, "remote", None)
     if callable(remote_method):
-        return remote_method(node_data, kwargs_payload)
-    return engine.execute_node(node_data, kwargs_payload)
+        return remote_method(payload, kwargs_payload)
+    return engine.execute_payload(payload, kwargs_payload)
 
 
 if modal is not None:  # pragma: no branch - simple import-time configuration.
@@ -128,7 +382,7 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
         image=image,
     )
     class RemoteEngine:
-        """Modal runtime class that executes proxied ComfyUI nodes."""
+        """Modal runtime class that executes proxied ComfyUI payloads."""
 
         @modal.enter()
         def setup(self) -> None:
@@ -136,9 +390,11 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
             logger.info("RemoteEngine setup complete.")
 
         @modal.method()
-        def execute_node(self, node_data: dict[str, Any], kwargs_payload: bytes) -> bytes:
-            """Execute the proxied node inside the Modal container."""
-            return execute_node_locally(node_data, kwargs_payload)
+        def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Execute a proxied node or subgraph inside the Modal container."""
+            if payload.get("payload_kind") == "subgraph":
+                return execute_subgraph_locally(payload, kwargs_payload)
+            return execute_node_locally(payload, kwargs_payload)
 
 else:
 
@@ -148,6 +404,8 @@ else:
         def setup(self) -> None:
             """No-op setup for local fallback execution."""
 
-        def execute_node(self, node_data: dict[str, Any], kwargs_payload: bytes) -> bytes:
-            """Execute the proxied node locally."""
-            return execute_node_locally(node_data, kwargs_payload)
+        def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Execute the proxied node or subgraph locally."""
+            if payload.get("payload_kind") == "subgraph":
+                return execute_subgraph_locally(payload, kwargs_payload)
+            return execute_node_locally(payload, kwargs_payload)

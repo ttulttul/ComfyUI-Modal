@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import importlib.util
 import sys
 import types
@@ -19,11 +20,21 @@ def _ensure_import_paths() -> None:
     """Add the repository and local ComfyUI checkout to sys.path when present."""
     if "av" not in sys.modules:
         av_module = types.ModuleType("av")
+        av_module.__spec__ = importlib.machinery.ModuleSpec("av", loader=None)
         av_module.open = lambda *args, **kwargs: (_ for _ in ()).throw(
             RuntimeError("The av stub should not be used in tests.")
         )
         av_module.time_base = 1
         av_module.VideoStream = type("VideoStream", (), {})
+        av_module.AVError = RuntimeError
+        av_module.FFmpegError = RuntimeError
+        av_module.logging = types.SimpleNamespace(
+            ERROR="ERROR",
+            set_level=lambda *args, **kwargs: None,
+        )
+        av_module.video = types.SimpleNamespace(
+            frame=types.SimpleNamespace(VideoFrame=type("VideoFrame", (), {"pict_type": None}))
+        )
 
         av_container_module = types.ModuleType("av.container")
         av_container_module.InputContainer = type("InputContainer", (), {})

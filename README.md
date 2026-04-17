@@ -3,13 +3,13 @@
 > [!WARNING]
 > This is an early alpha-level project. It is not ready for general use yet, the execution model is still incomplete, and you should expect missing features, hard limitations, and breaking changes.
 
-`ComfyUI Modal-Sync` is a ComfyUI custom node extension that lets you mark individual nodes for remote execution. The frontend stores a per-node `is_modal_remote` flag in workflow metadata, the backend rewrites those nodes into a Modal proxy before queueing, and the proxy forwards execution payloads through a serialization layer that is safe for tensors and plain JSON values.
+`ComfyUI Modal-Sync` is a ComfyUI custom node extension that lets you mark workflow regions for remote execution. The frontend stores a per-node `is_modal_remote` flag in workflow metadata, the backend groups connected remote-marked nodes into a remote component before queueing, and the proxy forwards that component through a serialization layer that is safe for tensors and plain JSON values.
 
 ## What is implemented
 
 - A frontend extension in [web/modal_toggle.js](/home/ksimpson/git/ComfyUI-Modal/web/modal_toggle.js) that injects a `Run on Modal` toggle into every non-internal node, draws a blue border around remote nodes, and submits queued prompts to `/modal/queue_prompt`.
-- A backend route in [api_intercept.py](/home/ksimpson/git/ComfyUI-Modal/api_intercept.py) that reads the workflow snapshot from `extra_pnginfo.workflow`, identifies remote-marked nodes, syncs referenced assets, and rewrites each remote node into a signature-preserving Modal proxy node.
-- A dynamic proxy registry in [modal_executor_node.py](/home/ksimpson/git/ComfyUI-Modal/modal_executor_node.py) that mirrors the original node’s output count and output types so ComfyUI validation still succeeds after rewrite.
+- A backend route in [api_intercept.py](/home/ksimpson/git/ComfyUI-Modal/api_intercept.py) that reads the workflow snapshot from `extra_pnginfo.workflow`, identifies connected remote-marked node components, syncs referenced assets, and rewrites each component into one signature-preserving Modal proxy node.
+- A dynamic proxy registry in [modal_executor_node.py](/home/ksimpson/git/ComfyUI-Modal/modal_executor_node.py) that mirrors the exported output count and output types of each remote component so ComfyUI validation still succeeds after rewrite.
 - A content-addressable sync engine in [sync_engine.py](/home/ksimpson/git/ComfyUI-Modal/sync_engine.py) that mirrors model files and a zipped `custom_nodes/` bundle into storage keyed by SHA256.
 - A remote runtime skeleton in [remote/modal_app.py](/home/ksimpson/git/ComfyUI-Modal/remote/modal_app.py) that supports local fallback execution for tests and can call into Modal when the SDK is available.
 
@@ -35,9 +35,9 @@
 
 1. Queueing a prompt posts to `/modal/queue_prompt`.
 2. The route loads the workflow metadata from `extra_data.extra_pnginfo.workflow`.
-3. Nodes with `properties.is_modal_remote = true` are replaced with a generated `ModalUniversalExecutor_<hash>` node id.
+3. Connected regions of nodes with `properties.is_modal_remote = true` are replaced with generated `ModalUniversalExecutor_<hash>` proxy nodes.
 4. File-like widget inputs ending in `.safetensors`, `.ckpt`, `.pt`, or `.vae` are resolved to local files and mirrored into storage.
-5. The executor serializes tensors with `safetensors`, forwards the payload to the remote runtime, and deserializes the returned outputs back into ComfyUI values.
+5. The executor serializes the component boundary inputs with `safetensors`, forwards the remote component payload to the runtime, and deserializes the exported boundary outputs back into ComfyUI values.
 
 ## HOWTO
 
@@ -97,7 +97,7 @@ The best candidates for remote execution are nodes that:
 
 Avoid marking nodes remote if they depend on local-only process state or return objects that cannot be serialized by [serialization.py](/home/ksimpson/git/ComfyUI-Modal/serialization.py).
 
-Under the current implementation, a remote-marked node can only consume boundary-crossing inputs whose evaluated values are transportable. In practice that means tensor-like and primitive types such as:
+Under the current implementation, a remote-marked component can only consume or export boundary-crossing values whose evaluated values are transportable. In practice that means tensor-like and primitive types such as:
 
 - `IMAGE`
 - `MASK`
@@ -109,14 +109,14 @@ Under the current implementation, a remote-marked node can only consume boundary
 - `BOOLEAN`
 - `STRING`
 
-Inputs that evaluate to Comfy runtime objects such as `MODEL`, `CONDITIONING`, `CLIP`, `VAE`, `CONTROL_NET`, and similar internal types cannot cross the current local/remote boundary. If you mark a node like `KSampler` remote while its `model` or `positive`/`negative` inputs are still produced locally, the queue request will now be rejected immediately with a validation error instead of failing later during execution.
+Inputs or outputs that evaluate to Comfy runtime objects such as `MODEL`, `CONDITIONING`, `CLIP`, `VAE`, `CONTROL_NET`, and similar internal types cannot cross the current local/remote boundary. If you mark a node like `KSampler` remote while its `model` or `positive`/`negative` inputs are still produced locally, the queue request will now be rejected immediately with a validation error instead of failing later during execution.
 
 ### 4. Mark the nodes you want to offload
 
-For each node you want to run remotely:
+For each connected region you want to run remotely:
 
 1. Find the `Run on Modal` toggle on the node.
-2. Enable it.
+2. Enable it on every node that should belong to the same remote island.
 3. Confirm the node shows the blue remote-execution border.
 
 That toggle stores `properties.is_modal_remote = true` in the workflow metadata. Nothing is rewritten in the canvas itself. The rewrite happens only when you queue the prompt.
@@ -128,22 +128,22 @@ Use the normal queue button in ComfyUI.
 The frontend extension intercepts queue submission and sends the prompt to `/modal/queue_prompt` instead of `/prompt`. On the backend:
 
 1. The request handler inspects the workflow snapshot in `extra_pnginfo.workflow`.
-2. Every node marked with `is_modal_remote` is replaced with an internal `ModalUniversalExecutor_<hash>` proxy node.
+2. Connected remote-marked nodes are partitioned into remote components and each component is replaced with an internal `ModalUniversalExecutor_<hash>` proxy node.
 3. Referenced model assets are mirrored into storage.
 4. If custom-node syncing is enabled, the local `custom_nodes/` directory is zipped and mirrored if its content hash changed.
 5. The rewritten prompt is submitted to the normal ComfyUI prompt queue.
 
 ### 6. What happens during execution
 
-When execution reaches a rewritten node:
+When execution reaches a rewritten component proxy:
 
-- the proxy receives the original node metadata plus the evaluated upstream inputs
-- tensor inputs are serialized with `safetensors`
+- the proxy receives the remote component metadata plus the evaluated boundary inputs
+- tensor boundary inputs are serialized with `safetensors`
 - the proxy calls the remote runtime
-- the remote runtime imports the original node class and executes it
-- outputs are serialized back to the local process and returned to the rest of the workflow
+- the remote runtime executes the full connected remote subgraph
+- exported boundary outputs are serialized back to the local process and returned to the rest of the workflow
 
-This is why the backend generates proxy node classes that preserve the original output signature: downstream validation still has to see the right output count and types.
+This is why the backend generates proxy node classes that preserve the exported output signature: downstream validation still has to see the right output count and types.
 
 ### 7. Asset expectations
 
@@ -166,8 +166,8 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 
 Use this pack with the current limits in mind:
 
-- The rewrite is node-by-node, not subgraph-by-subgraph.
-- Remote-to-remote chains still bounce through the local boundary between nodes.
+- The rewrite is component-based, but only for connected regions that are explicitly marked remote.
+- Only the component boundary is serialized. Non-transportable Comfy runtime objects still cannot cross between local and remote regions.
 - Real Modal execution is scaffolded, but you still need to wire the actual Modal environment and credentials.
 - Non-JSON, non-bytes, non-tensor payloads are not supported across the remote boundary.
 
@@ -190,6 +190,6 @@ These environment variables are supported:
 
 ## Current limitations
 
-- The graph rewrite is per-node, not whole-subgraph partitioning. Remote-to-remote chains will currently round-trip through the local executor boundary between nodes.
+- Remote execution now happens per connected remote component, not per disconnected set of marked nodes. If you leave a local gap in the middle of a would-be remote chain, the boundary still has to be transport-safe.
 - The default sync backend is a local mirror used for development and tests. The Modal runtime entrypoint is present, but real cloud execution still depends on a working Modal SDK environment.
-- Non-JSON, non-bytes, non-tensor values cannot be serialized across the remote boundary yet. Unsupported types raise immediately instead of silently degrading.
+- Non-JSON, non-bytes, non-tensor values cannot cross the local/remote boundary yet. Unsupported boundary types raise immediately instead of silently degrading.

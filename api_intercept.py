@@ -6,12 +6,13 @@ import copy
 import logging
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
 from aiohttp import web
 
-from .modal_executor_node import ensure_modal_proxy_node_registered
+from .modal_executor_node import ensure_modal_component_proxy_node_registered
 from .settings import ModalSyncSettings, get_settings
 from .sync_engine import ModalAssetSyncEngine, SyncedAsset
 
@@ -34,11 +35,60 @@ _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class LinkedOutputRef:
+    """Reference a node output slot within a prompt graph."""
+
+    node_id: str
+    output_index: int
+
+
+@dataclass(frozen=True)
+class InputTarget:
+    """Describe a target input inside a remote component."""
+
+    node_id: str
+    input_name: str
+
+
+@dataclass
+class BoundaryInputSpec:
+    """Describe one local-to-remote boundary value for a component."""
+
+    proxy_input_name: str
+    source: LinkedOutputRef
+    targets: list[InputTarget] = field(default_factory=list)
+
+
+@dataclass
+class BoundaryOutputSpec:
+    """Describe one remote-to-local boundary value for a component."""
+
+    proxy_output_name: str
+    source: LinkedOutputRef
+    io_type: str
+    is_list: bool
+
+
+@dataclass
+class RemoteComponentPlan:
+    """Execution and rewrite plan for one connected remote component."""
+
+    node_ids: list[str]
+    representative_node_id: str
+    boundary_inputs: list[BoundaryInputSpec]
+    boundary_outputs: list[BoundaryOutputSpec]
+    execute_node_ids: list[str]
+    contains_output_node: bool
+
+
 @dataclass
 class RewriteSummary:
     """Summary of the prompt rewrite performed for a queue request."""
 
     remote_node_ids: list[str] = field(default_factory=list)
+    remote_component_ids: list[str] = field(default_factory=list)
+    rewritten_node_id_map: dict[str, str] = field(default_factory=dict)
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
 
@@ -68,6 +118,15 @@ def _get_execution_module() -> Any:
     return execution
 
 
+def _is_link(value: Any) -> bool:
+    """Return whether a prompt input value is a ComfyUI link."""
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(not isinstance(item, dict) for item in value)
+    )
+
+
 def extract_remote_node_ids(
     workflow: dict[str, Any] | None,
     settings: ModalSyncSettings | None = None,
@@ -85,11 +144,22 @@ def extract_remote_node_ids(
     return remote_node_ids
 
 
-def _normalize_return_types(node_class: type[Any]) -> tuple[str, ...]:
-    """Return normalized output types for a node class."""
+def _normalize_output_metadata(node_class: type[Any]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[bool, ...]]:
+    """Return normalized output metadata for a node class."""
     if hasattr(node_class, "GET_SCHEMA"):
         node_class.GET_SCHEMA()
-    return tuple(getattr(node_class, "RETURN_TYPES", ("*",))) or ("*",)
+
+    output_types = tuple(getattr(node_class, "RETURN_TYPES", ("*",))) or ("*",)
+    default_names = tuple(f"output_{index}" for index, _ in enumerate(output_types))
+    output_names = tuple(getattr(node_class, "RETURN_NAMES", default_names))
+    output_is_list = tuple(getattr(node_class, "OUTPUT_IS_LIST", (False,) * len(output_types)))
+
+    if len(output_names) < len(output_types):
+        output_names = output_names + default_names[len(output_names) :]
+    if len(output_is_list) < len(output_types):
+        output_is_list = output_is_list + (False,) * (len(output_types) - len(output_is_list))
+
+    return output_types, output_names[: len(output_types)], output_is_list[: len(output_types)]
 
 
 def _is_transportable_output_type(io_type: str) -> bool:
@@ -98,60 +168,362 @@ def _is_transportable_output_type(io_type: str) -> bool:
     return bool(normalized_parts) and all(part in _TRANSPORTABLE_OUTPUT_TYPES for part in normalized_parts)
 
 
-def validate_remote_node_transport_compatibility(
+def _build_consumer_map(prompt: dict[str, Any]) -> dict[LinkedOutputRef, list[InputTarget]]:
+    """Build a reverse map from node outputs to downstream prompt inputs."""
+    consumers: dict[LinkedOutputRef, list[InputTarget]] = defaultdict(list)
+    for node_id, prompt_node in prompt.items():
+        for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+            if not _is_link(input_value):
+                continue
+            source = LinkedOutputRef(node_id=str(input_value[0]), output_index=int(input_value[1]))
+            consumers[source].append(InputTarget(node_id=str(node_id), input_name=str(input_name)))
+    return consumers
+
+
+def _build_remote_components(prompt: dict[str, Any], remote_node_ids: set[str]) -> list[list[str]]:
+    """Partition remote-marked nodes into connected components."""
+    adjacency: dict[str, set[str]] = {node_id: set() for node_id in remote_node_ids}
+    for node_id in remote_node_ids:
+        prompt_node = prompt.get(node_id)
+        if prompt_node is None:
+            continue
+        for input_value in (prompt_node.get("inputs") or {}).values():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            if upstream_node_id not in remote_node_ids:
+                continue
+            adjacency[node_id].add(upstream_node_id)
+            adjacency[upstream_node_id].add(node_id)
+
+    components: list[list[str]] = []
+    visited: set[str] = set()
+    for node_id in sorted(remote_node_ids):
+        if node_id in visited:
+            continue
+        pending = [node_id]
+        component: list[str] = []
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            pending.extend(sorted(adjacency[current] - visited))
+        components.append(sorted(component))
+    return components
+
+
+def _build_component_plan(
+    component_node_ids: list[str],
+    prompt: dict[str, Any],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    nodes_module: Any,
+) -> RemoteComponentPlan:
+    """Build rewrite metadata for a connected remote component."""
+    component_node_id_set = set(component_node_ids)
+    representative_node_id = component_node_ids[0]
+    boundary_inputs_by_source: dict[LinkedOutputRef, BoundaryInputSpec] = {}
+    boundary_outputs_by_source: dict[LinkedOutputRef, BoundaryOutputSpec] = {}
+    output_execution_targets: set[str] = set()
+    contains_output_node = False
+
+    for node_id in component_node_ids:
+        prompt_node = prompt[node_id]
+        class_type = str(prompt_node["class_type"])
+        node_class = nodes_module.NODE_CLASS_MAPPINGS[class_type]
+        output_types, output_names, output_is_list = _normalize_output_metadata(node_class)
+
+        if getattr(node_class, "OUTPUT_NODE", False):
+            contains_output_node = True
+            output_execution_targets.add(node_id)
+
+        for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            if upstream_node_id in component_node_id_set:
+                continue
+            source = LinkedOutputRef(node_id=upstream_node_id, output_index=int(input_value[1]))
+            spec = boundary_inputs_by_source.get(source)
+            if spec is None:
+                spec = BoundaryInputSpec(
+                    proxy_input_name=f"remote_input_{len(boundary_inputs_by_source)}",
+                    source=source,
+                )
+                boundary_inputs_by_source[source] = spec
+            spec.targets.append(InputTarget(node_id=node_id, input_name=str(input_name)))
+
+        for output_index, io_type in enumerate(output_types):
+            source = LinkedOutputRef(node_id=node_id, output_index=output_index)
+            local_consumers = [
+                consumer for consumer in consumers.get(source, []) if consumer.node_id not in component_node_id_set
+            ]
+            if not local_consumers:
+                continue
+            output_execution_targets.add(node_id)
+            if source in boundary_outputs_by_source:
+                continue
+            output_name = output_names[output_index]
+            boundary_outputs_by_source[source] = BoundaryOutputSpec(
+                proxy_output_name=f"{node_id}_{output_name}",
+                source=source,
+                io_type=str(io_type),
+                is_list=bool(output_is_list[output_index]),
+            )
+
+    return RemoteComponentPlan(
+        node_ids=component_node_ids,
+        representative_node_id=representative_node_id,
+        boundary_inputs=sorted(
+            boundary_inputs_by_source.values(),
+            key=lambda spec: (spec.source.node_id, spec.source.output_index),
+        ),
+        boundary_outputs=sorted(
+            boundary_outputs_by_source.values(),
+            key=lambda spec: (spec.source.node_id, spec.source.output_index),
+        ),
+        execute_node_ids=sorted(output_execution_targets),
+        contains_output_node=contains_output_node,
+    )
+
+
+def _build_component_plans(
     prompt: dict[str, Any],
     remote_node_ids: set[str],
     nodes_module: Any,
+) -> list[RemoteComponentPlan]:
+    """Build plans for every connected remote component."""
+    consumers = _build_consumer_map(prompt)
+    components = _build_remote_components(prompt, remote_node_ids)
+    return [
+        _build_component_plan(component, prompt, consumers, nodes_module)
+        for component in components
+    ]
+
+
+def _describe_output_boundary_error(
+    component: RemoteComponentPlan,
+    source: LinkedOutputRef,
+    source_class_type: str,
+    io_type: str,
+    local_consumer: InputTarget,
+    local_consumer_class_type: str,
+) -> str:
+    """Format a human-readable remote-to-local transport validation error."""
+    return (
+        "Remote component rooted at node "
+        f"{component.representative_node_id} exports node {source.node_id} "
+        f"({source_class_type}) output index {source.output_index} of type '{io_type}' "
+        f"to local node {local_consumer.node_id} ({local_consumer_class_type}) input "
+        f"'{local_consumer.input_name}', which cannot cross the current local/remote boundary. "
+        "Current ComfyUI-Modal transport only supports JSON-compatible values, bytes, "
+        "and tensor-like outputs such as IMAGE, MASK, LATENT, SIGMAS, NOISE, INT, "
+        "FLOAT, BOOLEAN, and STRING."
+    )
+
+
+def _describe_input_boundary_error(
+    component: RemoteComponentPlan,
+    target: InputTarget,
+    target_class_type: str,
+    source: LinkedOutputRef,
+    source_class_type: str,
+    io_type: str,
+) -> str:
+    """Format a human-readable local-to-remote transport validation error."""
+    return (
+        "Remote node "
+        f"{target.node_id} ({target_class_type}) input '{target.input_name}' "
+        f"depends on upstream node {source.node_id} ({source_class_type}) output index "
+        f"{source.output_index} of type '{io_type}', which cannot cross the current "
+        "local/remote boundary. Current ComfyUI-Modal transport only supports "
+        "JSON-compatible values, bytes, and tensor-like outputs such as IMAGE, MASK, "
+        "LATENT, SIGMAS, NOISE, INT, FLOAT, BOOLEAN, and STRING."
+    )
+
+
+def validate_remote_component_transport_compatibility(
+    prompt: dict[str, Any],
+    components: list[RemoteComponentPlan],
+    nodes_module: Any,
 ) -> None:
-    """Reject remote nodes whose linked inputs require unsupported transport types."""
+    """Reject remote components whose true graph boundaries require unsupported transport."""
     validation_errors: list[str] = []
+    consumers = _build_consumer_map(prompt)
 
-    for remote_node_id in sorted(remote_node_ids):
-        prompt_node = prompt.get(remote_node_id)
-        if prompt_node is None:
-            continue
-
-        remote_class_type = str(prompt_node["class_type"])
-        for input_name, input_value in (prompt_node.get("inputs") or {}).items():
-            if not (
-                isinstance(input_value, list)
-                and len(input_value) == 2
-                and all(not isinstance(item, dict) for item in input_value)
-            ):
+    for component in components:
+        for boundary_input in component.boundary_inputs:
+            source_prompt_node = prompt.get(boundary_input.source.node_id)
+            if source_prompt_node is None:
+                continue
+            source_class_type = str(source_prompt_node["class_type"])
+            source_class = nodes_module.NODE_CLASS_MAPPINGS.get(source_class_type)
+            if source_class is None:
                 continue
 
-            upstream_node_id = str(input_value[0])
-            output_index = int(input_value[1])
-            upstream_prompt_node = prompt.get(upstream_node_id)
-            if upstream_prompt_node is None:
+            source_output_types, _, _ = _normalize_output_metadata(source_class)
+            if boundary_input.source.output_index >= len(source_output_types):
+                continue
+            io_type = str(source_output_types[boundary_input.source.output_index])
+            if _is_transportable_output_type(io_type):
                 continue
 
-            upstream_class_type = str(upstream_prompt_node["class_type"])
-            upstream_class = nodes_module.NODE_CLASS_MAPPINGS.get(upstream_class_type)
-            if upstream_class is None:
+            for target in boundary_input.targets:
+                target_class_type = str(prompt[target.node_id]["class_type"])
+                validation_errors.append(
+                    _describe_input_boundary_error(
+                        component=component,
+                        target=target,
+                        target_class_type=target_class_type,
+                        source=boundary_input.source,
+                        source_class_type=source_class_type,
+                        io_type=io_type,
+                    )
+                )
+
+        for boundary_output in component.boundary_outputs:
+            if _is_transportable_output_type(boundary_output.io_type):
                 continue
 
-            upstream_return_types = _normalize_return_types(upstream_class)
-            if output_index >= len(upstream_return_types):
-                continue
-
-            upstream_output_type = str(upstream_return_types[output_index])
-            if _is_transportable_output_type(upstream_output_type):
-                continue
-
-            validation_errors.append(
-                "Remote node "
-                f"{remote_node_id} ({remote_class_type}) input '{input_name}' "
-                f"depends on upstream node {upstream_node_id} ({upstream_class_type}) "
-                f"output index {output_index} of type '{upstream_output_type}', which "
-                "cannot cross the current local/remote boundary. "
-                "Current ComfyUI-Modal transport only supports JSON-compatible values, "
-                "bytes, and tensor-like outputs such as IMAGE, MASK, LATENT, SIGMAS, "
-                "NOISE, INT, FLOAT, BOOLEAN, and STRING."
-            )
+            source_class_type = str(prompt[boundary_output.source.node_id]["class_type"])
+            for local_consumer in consumers.get(boundary_output.source, []):
+                if local_consumer.node_id in component.node_ids:
+                    continue
+                local_consumer_class_type = str(prompt[local_consumer.node_id]["class_type"])
+                validation_errors.append(
+                    _describe_output_boundary_error(
+                        component=component,
+                        source=boundary_output.source,
+                        source_class_type=source_class_type,
+                        io_type=boundary_output.io_type,
+                        local_consumer=local_consumer,
+                        local_consumer_class_type=local_consumer_class_type,
+                    )
+                )
 
     if validation_errors:
         raise ModalPromptValidationError("\n".join(validation_errors))
+
+
+def _sync_component_prompt_inputs(
+    component: RemoteComponentPlan,
+    rewritten_prompt: dict[str, Any],
+    sync_engine: ModalAssetSyncEngine,
+) -> tuple[dict[str, Any], list[SyncedAsset]]:
+    """Build a synced prompt payload for one remote component."""
+    component_prompt: dict[str, Any] = {}
+    synced_assets: list[SyncedAsset] = []
+    for node_id in component.node_ids:
+        prompt_node = rewritten_prompt[node_id]
+        synced_inputs, node_assets = sync_engine.sync_prompt_inputs(copy.deepcopy(prompt_node.get("inputs", {})))
+        synced_assets.extend(node_assets)
+        component_prompt[node_id] = {
+            "class_type": str(prompt_node["class_type"]),
+            "inputs": synced_inputs,
+            "_meta": copy.deepcopy(prompt_node.get("_meta", {})),
+        }
+    return component_prompt, synced_assets
+
+
+def _build_component_payload(
+    component: RemoteComponentPlan,
+    component_prompt: dict[str, Any],
+    extra_data: dict[str, Any] | None,
+    custom_nodes_bundle: SyncedAsset | None,
+) -> dict[str, Any]:
+    """Build the serialized execution payload for one remote component."""
+    return {
+        "payload_kind": "subgraph",
+        "component_id": component.representative_node_id,
+        "subgraph_prompt": component_prompt,
+        "boundary_inputs": [
+            {
+                "proxy_input_name": boundary_input.proxy_input_name,
+                "targets": [
+                    {"node_id": target.node_id, "input_name": target.input_name}
+                    for target in boundary_input.targets
+                ],
+            }
+            for boundary_input in component.boundary_inputs
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": boundary_output.proxy_output_name,
+                "node_id": boundary_output.source.node_id,
+                "output_index": boundary_output.source.output_index,
+                "io_type": boundary_output.io_type,
+                "is_list": boundary_output.is_list,
+            }
+            for boundary_output in component.boundary_outputs
+        ],
+        "execute_node_ids": list(component.execute_node_ids),
+        "extra_data": copy.deepcopy(extra_data or {}),
+        "custom_nodes_bundle": (
+            custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
+        ),
+    }
+
+
+def _rewrite_component_into_proxy(
+    component: RemoteComponentPlan,
+    rewritten_prompt: dict[str, Any],
+    payload: dict[str, Any],
+    nodes_module: Any,
+) -> str:
+    """Replace a remote component with a single proxy node in the prompt."""
+    output_types = tuple(spec.io_type for spec in component.boundary_outputs)
+    output_names = tuple(spec.proxy_output_name for spec in component.boundary_outputs)
+    output_is_list = tuple(spec.is_list for spec in component.boundary_outputs)
+    proxy_node_id = ensure_modal_component_proxy_node_registered(
+        output_types=output_types,
+        output_names=output_names,
+        output_is_list=output_is_list,
+        nodes_module=nodes_module,
+        is_output_node=component.contains_output_node,
+    )
+
+    proxy_inputs: dict[str, Any] = {
+        boundary_input.proxy_input_name: [boundary_input.source.node_id, boundary_input.source.output_index]
+        for boundary_input in component.boundary_inputs
+    }
+    proxy_inputs["original_node_data"] = payload
+
+    representative_node_id = component.representative_node_id
+    representative_meta = copy.deepcopy(rewritten_prompt[representative_node_id].get("_meta", {}))
+    rewritten_prompt[representative_node_id] = {
+        "class_type": proxy_node_id,
+        "inputs": proxy_inputs,
+        "_meta": representative_meta,
+    }
+
+    boundary_output_indices = {
+        spec.source: index for index, spec in enumerate(component.boundary_outputs)
+    }
+    component_node_id_set = set(component.node_ids)
+
+    for node_id, prompt_node in list(rewritten_prompt.items()):
+        if node_id in component_node_id_set and node_id != representative_node_id:
+            del rewritten_prompt[node_id]
+            continue
+        if node_id == representative_node_id:
+            continue
+
+        for input_name, input_value in list((prompt_node.get("inputs") or {}).items()):
+            if not _is_link(input_value):
+                continue
+            source = LinkedOutputRef(node_id=str(input_value[0]), output_index=int(input_value[1]))
+            if source not in boundary_output_indices:
+                continue
+            prompt_node["inputs"][input_name] = [representative_node_id, boundary_output_indices[source]]
+
+    logger.info(
+        "Rewrote remote component %s with %d nodes to Modal proxy %s.",
+        representative_node_id,
+        len(component.node_ids),
+        proxy_node_id,
+    )
+    return representative_node_id
 
 
 def rewrite_prompt_for_modal(
@@ -160,8 +532,9 @@ def rewrite_prompt_for_modal(
     sync_engine: ModalAssetSyncEngine | None = None,
     settings: ModalSyncSettings | None = None,
     nodes_module: Any | None = None,
+    extra_data: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
-    """Rewrite remote-marked nodes into signature-preserving Modal proxy nodes."""
+    """Rewrite connected remote components into Modal proxy nodes."""
     resolved_settings = settings or get_settings()
     remote_node_ids = extract_remote_node_ids(workflow, resolved_settings)
     summary = RewriteSummary(remote_node_ids=sorted(remote_node_ids))
@@ -172,11 +545,13 @@ def rewrite_prompt_for_modal(
     resolved_nodes_module = nodes_module or _get_nodes_module()
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     rewritten_prompt = copy.deepcopy(prompt)
-    validate_remote_node_transport_compatibility(
+    components = _build_component_plans(rewritten_prompt, remote_node_ids, resolved_nodes_module)
+    validate_remote_component_transport_compatibility(
         prompt=rewritten_prompt,
-        remote_node_ids=remote_node_ids,
+        components=components,
         nodes_module=resolved_nodes_module,
     )
+
     if resolved_settings.sync_custom_nodes:
         summary.custom_nodes_bundle = resolved_sync_engine.sync_custom_nodes_directory()
     else:
@@ -185,46 +560,28 @@ def rewrite_prompt_for_modal(
             resolved_settings.execution_mode,
         )
 
-    for node_id in sorted(remote_node_ids):
-        prompt_node = rewritten_prompt.get(node_id)
-        if prompt_node is None:
-            logger.warning("Remote node id %s was not present in the prompt payload.", node_id)
-            continue
+    for component in components:
+        summary.remote_component_ids.append(component.representative_node_id)
+        for node_id in component.node_ids:
+            summary.rewritten_node_id_map[node_id] = component.representative_node_id
 
-        original_class_type = str(prompt_node["class_type"])
-        original_class = resolved_nodes_module.NODE_CLASS_MAPPINGS[original_class_type]
-        proxy_node_id = ensure_modal_proxy_node_registered(
-            original_class_type=original_class_type,
-            original_class=original_class,
-            nodes_module=resolved_nodes_module,
+        component_prompt, synced_assets = _sync_component_prompt_inputs(
+            component=component,
+            rewritten_prompt=rewritten_prompt,
+            sync_engine=resolved_sync_engine,
         )
-
-        original_inputs = copy.deepcopy(prompt_node.get("inputs", {}))
-        remote_inputs, synced_assets = resolved_sync_engine.sync_prompt_inputs(original_inputs)
         summary.synced_assets.extend(synced_assets)
-        original_node_inputs = copy.deepcopy(remote_inputs)
-
-        original_node_data = {
-            "node_id": node_id,
-            "class_type": original_class_type,
-            "inputs": original_node_inputs,
-            "meta": copy.deepcopy(prompt_node.get("_meta", {})),
-            "custom_nodes_bundle": (
-                summary.custom_nodes_bundle.remote_path
-                if summary.custom_nodes_bundle is not None
-                else None
-            ),
-        }
-
-        prompt_node["class_type"] = proxy_node_id
-        prompt_node["inputs"] = copy.deepcopy(remote_inputs)
-        prompt_node["inputs"]["original_node_data"] = original_node_data
-
-        logger.info(
-            "Rewrote node %s (%s) to Modal proxy %s.",
-            node_id,
-            original_class_type,
-            proxy_node_id,
+        payload = _build_component_payload(
+            component=component,
+            component_prompt=component_prompt,
+            extra_data=extra_data,
+            custom_nodes_bundle=summary.custom_nodes_bundle,
+        )
+        _rewrite_component_into_proxy(
+            component=component,
+            rewritten_prompt=rewritten_prompt,
+            payload=payload,
+            nodes_module=resolved_nodes_module,
         )
 
     return rewritten_prompt, summary
@@ -324,15 +681,24 @@ def setup_modal_queue_route(
                     workflow=workflow,
                     sync_engine=resolved_sync_engine,
                     settings=resolved_settings,
+                    extra_data=json_data.get("extra_data"),
                 )
                 logger.info(
-                    "Modal prompt rewrite finished in %.3fs for %d remote nodes.",
+                    "Modal prompt rewrite finished in %.3fs for %d remote nodes across %d components.",
                     time.perf_counter() - rewrite_started_at,
                     len(summary.remote_node_ids),
+                    len(summary.remote_component_ids),
                 )
                 json_data["prompt"] = rewritten_prompt
+                if json_data.get("partial_execution_targets"):
+                    rewritten_targets = {
+                        summary.rewritten_node_id_map.get(str(target), str(target))
+                        for target in json_data["partial_execution_targets"]
+                    }
+                    json_data["partial_execution_targets"] = sorted(rewritten_targets)
                 json_data.setdefault("extra_data", {}).setdefault("modal", {})
                 json_data["extra_data"]["modal"]["remote_node_ids"] = summary.remote_node_ids
+                json_data["extra_data"]["modal"]["remote_component_ids"] = summary.remote_component_ids
                 json_data["extra_data"]["modal"]["synced_assets"] = [
                     asset.remote_path for asset in summary.synced_assets
                 ]
