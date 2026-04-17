@@ -87,6 +87,13 @@ The remote runtime skeleton lives in [remote/modal_app.py](/home/ksimpson/git/Co
 
 When `COMFY_MODAL_EXECUTION_MODE` is remote, the runtime now tries a deployed Modal class lookup first via the configured app name. If no deployed app is available, it falls back to starting an ephemeral `app.run()` session locally for the invocation. That fallback is slower, but it avoids the old "Function has not been hydrated" failure mode.
 
+Important distinction:
+- the current fallback can create a temporary Modal app session automatically
+- it does not auto-deploy a persistent Modal app
+- it does not auto-create a persistent web endpoint
+
+If you want a stable reusable Modal deployment, that is still a separate step outside the current node-pack behavior.
+
 ### 3. Open your workflow in ComfyUI
 
 Build your workflow normally. This pack does not replace regular nodes in the editor. Instead, it adds a `Run on Modal` toggle to standard nodes.
