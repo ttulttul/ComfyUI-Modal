@@ -19,6 +19,7 @@ def test_sync_file_deduplicates_by_hash(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        auto_deploy=True,
         allow_ephemeral_fallback=False,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
@@ -59,6 +60,7 @@ def test_sync_custom_nodes_directory_creates_archive(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        auto_deploy=True,
         allow_ephemeral_fallback=False,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
@@ -97,6 +99,7 @@ def test_hash_directory_ignores_virtualenv_and_bytecode_artifacts(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        auto_deploy=True,
         allow_ephemeral_fallback=False,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
@@ -189,6 +192,7 @@ def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        auto_deploy=True,
         allow_ephemeral_fallback=False,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
