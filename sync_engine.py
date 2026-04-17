@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -38,6 +39,11 @@ _SKIP_FILE_SUFFIXES = {
     ".swp",
     ".tmp",
 }
+
+try:
+    import modal  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - exercised when Modal SDK is unavailable.
+    modal = None
 
 
 class VolumeBackend(Protocol):
@@ -91,6 +97,30 @@ class LocalMirrorVolume:
         return self.root / remote_path.lstrip("/")
 
 
+class ModalVolumeBackend:
+    """Modal Volume-backed storage for real remote execution."""
+
+    def __init__(self, volume_name: str) -> None:
+        """Resolve a named Modal volume lazily from the local SDK client."""
+        if modal is None:
+            raise RuntimeError("Modal SDK is required for ModalVolumeBackend.")
+        self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+
+    def exists(self, remote_path: str) -> bool:
+        """Return whether a file already exists in the Modal volume."""
+        return len(self._volume.listdir(remote_path, recursive=False)) > 0
+
+    def put_file(self, local_path: Path, remote_path: str) -> None:
+        """Upload a local file into the Modal volume."""
+        with self._volume.batch_upload() as batch:
+            batch.put_file(local_path, remote_path)
+
+    def put_bytes(self, payload: bytes, remote_path: str) -> None:
+        """Upload bytes into the Modal volume."""
+        with self._volume.batch_upload() as batch:
+            batch.put_file(io.BytesIO(payload), remote_path)
+
+
 @dataclass
 class ModalAssetSyncEngine:
     """Content-addressable storage sync engine for files and custom nodes."""
@@ -102,7 +132,19 @@ class ModalAssetSyncEngine:
     def from_environment(cls, settings: ModalSyncSettings | None = None) -> "ModalAssetSyncEngine":
         """Create a sync engine using the local mirror backend by default."""
         resolved_settings = settings or get_settings()
-        backend = LocalMirrorVolume(resolved_settings.local_storage_root)
+        backend: VolumeBackend
+        if resolved_settings.execution_mode == "remote" and modal is not None:
+            logger.info(
+                "Using Modal volume backend %s for remote asset sync.",
+                resolved_settings.volume_name,
+            )
+            backend = ModalVolumeBackend(resolved_settings.volume_name)
+        else:
+            if resolved_settings.execution_mode == "remote" and modal is None:
+                logger.warning(
+                    "Modal SDK is unavailable in remote execution mode; falling back to local mirror storage."
+                )
+            backend = LocalMirrorVolume(resolved_settings.local_storage_root)
         return cls(volume=backend, settings=resolved_settings)
 
     def sync_file(self, local_path: Path, remote_folder: str = "/assets") -> SyncedAsset:
