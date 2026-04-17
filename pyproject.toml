@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-modal-sync"
+version = "0.1.0"
+description = "ComfyUI custom node extension for routing marked nodes to Modal-backed execution."
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+package = false
