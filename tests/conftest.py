@@ -115,6 +115,13 @@ def sync_engine_module(extension_package: object) -> object:
     return importlib.import_module(f"{PACKAGE_NAME}.sync_engine")
 
 
+@pytest.fixture(scope="session")
+def modal_cloud_module() -> object:
+    """Return the stable Modal cloud entry module."""
+    _ensure_import_paths()
+    return importlib.import_module("comfyui_modal_sync_cloud")
+
+
 @pytest.fixture(autouse=True)
 def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Isolate Modal-Sync environment variables between tests."""

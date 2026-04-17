@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import logging
 import os
 import sys
@@ -22,6 +23,7 @@ from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
 _REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+_MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
 
 try:
     import modal  # type: ignore
@@ -451,6 +453,27 @@ def _modal_lookup_error_types() -> tuple[type[BaseException], ...]:
     return tuple(error_types)
 
 
+def _load_modal_cloud_module() -> Any:
+    """Load the stable Modal cloud entry module under a valid Python name."""
+    if _MODAL_CLOUD_MODULE_NAME in sys.modules:
+        return sys.modules[_MODAL_CLOUD_MODULE_NAME]
+
+    cloud_module_path = Path(__file__).resolve().parents[1] / f"{_MODAL_CLOUD_MODULE_NAME}.py"
+    module_spec = importlib.util.spec_from_file_location(
+        _MODAL_CLOUD_MODULE_NAME,
+        cloud_module_path,
+    )
+    if module_spec is None or module_spec.loader is None:
+        raise ModalRemoteInvocationError(
+            f"Unable to create module spec for Modal cloud entrypoint at {cloud_module_path}."
+        )
+
+    cloud_module = importlib.util.module_from_spec(module_spec)
+    sys.modules[_MODAL_CLOUD_MODULE_NAME] = cloud_module
+    module_spec.loader.exec_module(cloud_module)
+    return cloud_module
+
+
 def _lookup_deployed_modal_method(payload: dict[str, Any]) -> Any:
     """Look up the deployed Modal method used to execute the remote runtime."""
     if modal is None:
@@ -501,17 +524,22 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
         return remote_method.remote(payload, kwargs_payload)
 
     if "app" not in globals() or "RemoteEngine" not in globals():
-        raise ModalRemoteInvocationError(
-            "Modal runtime objects are unavailable; cannot start an ephemeral app.run() session."
-        )
+        logger.debug("Local module Modal runtime objects are unavailable; loading stable cloud entry module.")
 
+    cloud_module = _load_modal_cloud_module()
+    cloud_app = getattr(cloud_module, "app", None)
+    cloud_remote_engine = getattr(cloud_module, "RemoteEngine", None)
+    if cloud_app is None or cloud_remote_engine is None:
+        raise ModalRemoteInvocationError(
+            "Stable Modal cloud entry module did not expose app and RemoteEngine."
+        )
     logger.info(
         "Starting ephemeral Modal app.run() for component %s. This does not create a persistent deployed app or web endpoint.",
         payload.get("component_id"),
     )
-    run_context = app.run() if hasattr(app, "run") else nullcontext()
+    run_context = cloud_app.run() if hasattr(cloud_app, "run") else nullcontext()
     with run_context:
-        remote_engine = RemoteEngine()
+        remote_engine = cloud_remote_engine()
         result = remote_engine.execute_payload.remote(payload, kwargs_payload)
     logger.info(
         "Ephemeral Modal app.run() invocation completed for component %s.",

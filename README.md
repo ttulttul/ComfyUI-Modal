@@ -91,6 +91,7 @@ Important distinction:
 - the current fallback can create a temporary Modal app session automatically
 - it does not auto-deploy a persistent Modal app
 - it does not auto-create a persistent web endpoint
+- the actual Modal cloud service now lives in a stable importable module, [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py), because ComfyUI’s custom-node loader does not assign Modal-safe module names to node-pack directories
 
 If you want a stable reusable Modal deployment, that is still a separate step outside the current node-pack behavior.
 
