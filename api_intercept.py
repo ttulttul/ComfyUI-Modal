@@ -85,7 +85,13 @@ def rewrite_prompt_for_modal(
     resolved_nodes_module = nodes_module or _get_nodes_module()
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     rewritten_prompt = copy.deepcopy(prompt)
-    summary.custom_nodes_bundle = resolved_sync_engine.sync_custom_nodes_directory()
+    if resolved_settings.sync_custom_nodes:
+        summary.custom_nodes_bundle = resolved_sync_engine.sync_custom_nodes_directory()
+    else:
+        logger.info(
+            "Skipping custom_nodes bundle sync because sync is disabled for execution_mode=%s.",
+            resolved_settings.execution_mode,
+        )
 
     for node_id in sorted(remote_node_ids):
         prompt_node = rewritten_prompt.get(node_id)
@@ -214,15 +220,22 @@ def setup_modal_queue_route(
         """Handle prompt queue requests that include Modal remote markers."""
         logger.info("Received Modal queue request.")
         try:
+            request_started_at = time.perf_counter()
             json_data = await request.json()
             extra_pnginfo = ((json_data.get("extra_data") or {}).get("extra_pnginfo") or {})
             workflow = extra_pnginfo.get("workflow")
             if "prompt" in json_data:
+                rewrite_started_at = time.perf_counter()
                 rewritten_prompt, summary = rewrite_prompt_for_modal(
                     prompt=json_data["prompt"],
                     workflow=workflow,
                     sync_engine=resolved_sync_engine,
                     settings=resolved_settings,
+                )
+                logger.info(
+                    "Modal prompt rewrite finished in %.3fs for %d remote nodes.",
+                    time.perf_counter() - rewrite_started_at,
+                    len(summary.remote_node_ids),
                 )
                 json_data["prompt"] = rewritten_prompt
                 json_data.setdefault("extra_data", {}).setdefault("modal", {})
@@ -234,7 +247,12 @@ def setup_modal_queue_route(
                     json_data["extra_data"]["modal"]["custom_nodes_bundle"] = (
                         summary.custom_nodes_bundle.remote_path
                     )
-            return await _queue_prompt_json(prompt_server, json_data)
+            response = await _queue_prompt_json(prompt_server, json_data)
+            logger.info(
+                "Modal queue request completed in %.3fs.",
+                time.perf_counter() - request_started_at,
+            )
+            return response
         except FileNotFoundError as exc:
             logger.exception("Modal asset sync failed.")
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)

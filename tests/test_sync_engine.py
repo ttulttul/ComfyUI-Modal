@@ -17,6 +17,8 @@ def test_sync_file_deduplicates_by_hash(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        execution_mode="local",
+        sync_custom_nodes=False,
         volume_name="volume",
         route_path="/modal/queue_prompt",
         marker_property="is_modal_remote",
@@ -50,6 +52,8 @@ def test_sync_custom_nodes_directory_creates_archive(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        execution_mode="remote",
+        sync_custom_nodes=True,
         volume_name="volume",
         route_path="/modal/queue_prompt",
         marker_property="is_modal_remote",

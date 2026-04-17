@@ -16,6 +16,8 @@ class ModalSyncSettings:
     """Resolved configuration for local and remote Modal-Sync operations."""
 
     app_name: str
+    execution_mode: str
+    sync_custom_nodes: bool
     volume_name: str
     route_path: str
     marker_property: str
@@ -32,6 +34,20 @@ def _read_path_env(name: str) -> Path | None:
     if not value:
         return None
     return Path(value).expanduser().resolve()
+
+
+def _read_bool_env(name: str) -> bool | None:
+    """Resolve an environment variable into a boolean when present."""
+    value = os.getenv(name)
+    if value is None:
+        return None
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Environment variable {name} must be a boolean, got {value!r}.")
 
 
 def _discover_repo_root() -> Path:
@@ -75,6 +91,10 @@ def get_settings() -> ModalSyncSettings:
     repo_root = _discover_repo_root()
     comfyui_root = _discover_comfyui_root()
     custom_nodes_dir = _discover_custom_nodes_dir(repo_root, comfyui_root)
+    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local").strip().lower()
+    sync_custom_nodes = _read_bool_env("COMFY_MODAL_SYNC_CUSTOM_NODES")
+    if sync_custom_nodes is None:
+        sync_custom_nodes = execution_mode != "local"
     local_storage_root = (
         _read_path_env("COMFY_MODAL_LOCAL_STORAGE_ROOT")
         or Path("/tmp/comfyui-modal-sync-storage")
@@ -82,6 +102,8 @@ def get_settings() -> ModalSyncSettings:
 
     settings = ModalSyncSettings(
         app_name=os.getenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync"),
+        execution_mode=execution_mode,
+        sync_custom_nodes=sync_custom_nodes,
         volume_name=os.getenv("COMFY_MODAL_VOLUME_NAME", "comfy-universal-storage"),
         route_path=os.getenv("COMFY_MODAL_ROUTE_PATH", "/modal/queue_prompt"),
         marker_property=os.getenv("COMFY_MODAL_MARKER_PROPERTY", "is_modal_remote"),

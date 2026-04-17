@@ -29,6 +29,8 @@ def test_rewrite_prompt_for_remote_nodes(
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
+        execution_mode="local",
+        sync_custom_nodes=False,
         volume_name="volume",
         route_path="/modal/queue_prompt",
         marker_property="is_modal_remote",
@@ -85,4 +87,4 @@ def test_rewrite_prompt_for_remote_nodes(
     assert rewritten_prompt["2"]["class_type"] == "OtherNode"
     assert summary.remote_node_ids == ["1"]
     assert len(summary.synced_assets) == 1
-    assert summary.custom_nodes_bundle is not None
+    assert summary.custom_nodes_bundle is None

@@ -30,6 +30,10 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
         return
 
     settings = get_settings()
+    if settings.execution_mode == "local":
+        logger.debug("Skipping custom_nodes bundle extraction in local execution mode.")
+        return
+
     local_bundle = settings.local_storage_root / bundle_path.lstrip("/")
     if not local_bundle.exists():
         logger.warning("Custom nodes bundle %s was not found in local storage.", local_bundle)
