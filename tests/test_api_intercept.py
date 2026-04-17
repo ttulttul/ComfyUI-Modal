@@ -84,6 +84,8 @@ def test_rewrite_prompt_for_remote_nodes(
     assert rewritten_node["class_type"].startswith("ModalUniversalExecutor_")
     assert rewritten_node["inputs"]["model_name"].startswith("/assets/")
     assert rewritten_node["inputs"]["original_node_data"]["class_type"] == "OriginalNode"
+    assert "original_node_data" not in rewritten_node["inputs"]["original_node_data"]["inputs"]
+    assert rewritten_node["inputs"] is not rewritten_node["inputs"]["original_node_data"]["inputs"]
     assert rewritten_prompt["2"]["class_type"] == "OtherNode"
     assert summary.remote_node_ids == ["1"]
     assert len(summary.synced_assets) == 1

@@ -110,11 +110,12 @@ def rewrite_prompt_for_modal(
         original_inputs = copy.deepcopy(prompt_node.get("inputs", {}))
         remote_inputs, synced_assets = resolved_sync_engine.sync_prompt_inputs(original_inputs)
         summary.synced_assets.extend(synced_assets)
+        original_node_inputs = copy.deepcopy(remote_inputs)
 
         original_node_data = {
             "node_id": node_id,
             "class_type": original_class_type,
-            "inputs": remote_inputs,
+            "inputs": original_node_inputs,
             "meta": copy.deepcopy(prompt_node.get("_meta", {})),
             "custom_nodes_bundle": (
                 summary.custom_nodes_bundle.remote_path
@@ -124,7 +125,7 @@ def rewrite_prompt_for_modal(
         }
 
         prompt_node["class_type"] = proxy_node_id
-        prompt_node["inputs"] = remote_inputs
+        prompt_node["inputs"] = copy.deepcopy(remote_inputs)
         prompt_node["inputs"]["original_node_data"] = original_node_data
 
         logger.info(
