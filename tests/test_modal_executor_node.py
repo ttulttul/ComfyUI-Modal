@@ -145,6 +145,69 @@ def test_modal_cloud_mirrors_phase_logs_to_stdout_in_modal_runtime(
     assert "component=component-1" in captured.out
 
 
+def test_modal_cloud_reuses_extracted_custom_nodes_bundle(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The remote runtime should avoid re-extracting an unchanged custom_nodes bundle."""
+    storage_root = tmp_path / "storage"
+    bundle_path = storage_root / "custom_nodes" / "bundle.zip"
+    bundle_path.parent.mkdir(parents=True)
+
+    import zipfile
+
+    with zipfile.ZipFile(bundle_path, "w") as archive:
+        archive.writestr("example/__init__.py", "NODE_CLASS_MAPPINGS = {}\n")
+
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(storage_root))
+    modal_cloud_module.get_settings.cache_clear()
+    original_cache = dict(modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES)
+    modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+    try:
+        first_root = modal_cloud_module._extract_custom_nodes_bundle("/custom_nodes/bundle.zip")
+        monkeypatch.setattr(
+            modal_cloud_module.zipfile,
+            "ZipFile",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("Expected cached extraction root to be reused.")
+            ),
+        )
+        second_root = modal_cloud_module._extract_custom_nodes_bundle("/custom_nodes/bundle.zip")
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
+
+    assert first_root is not None
+    assert second_root == first_root
+
+
+def test_modal_cloud_traces_remote_node_execution_spans(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    """The tracing prompt server should emit per-node timing lines."""
+    prompt = {
+        "7": {"class_type": "UNETLoader", "inputs": {}},
+        "2": {"class_type": "KSampler", "inputs": {}},
+    }
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+    server = modal_cloud_module._TracingPromptServer("component-1", prompt)
+
+    server.send_sync("executing", {"node": "7"}, None)
+    server.send_sync("executed", {"node": "7"}, None)
+    server.send_sync("executing", {"node": "2"}, None)
+    server.send_sync("execution_success", {"prompt_id": "component-1"}, None)
+
+    captured = capsys.readouterr()
+    assert "Remote node 7 class_type=UNETLoader role=model_load started" in captured.out
+    assert "Remote node 7 class_type=UNETLoader role=model_load finished in " in captured.out
+    assert "Remote node 2 class_type=KSampler role=sampling started" in captured.out
+    assert "Remote node 2 class_type=KSampler role=sampling finished in " in captured.out
+
+
 def test_modal_cloud_ignores_heavy_comfyui_paths(
     modal_cloud_module: Any,
 ) -> None:
@@ -152,6 +215,7 @@ def test_modal_cloud_ignores_heavy_comfyui_paths(
     from pathlib import Path
 
     assert modal_cloud_module._should_ignore_comfyui_path(Path("models/checkpoint.safetensors"))
+    assert modal_cloud_module._should_ignore_comfyui_path(Path("custom_nodes/example/__init__.py"))
     assert modal_cloud_module._should_ignore_comfyui_path(Path("output/run/output.png"))
     assert modal_cloud_module._should_ignore_comfyui_path(Path("__pycache__/execution.pyc"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("execution.py"))
