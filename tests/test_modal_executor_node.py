@@ -23,6 +23,18 @@ class _FakeOriginalNode:
         return (kwargs["value"], 1)
 
 
+class _CloneableCacheValue:
+    """Simple cloneable object used for loader cache tests."""
+
+    def __init__(self, value: str) -> None:
+        """Store an identifying value for later clone assertions."""
+        self.value = value
+
+    def clone(self) -> "_CloneableCacheValue":
+        """Return a fresh object carrying the same value."""
+        return _CloneableCacheValue(self.value)
+
+
 def test_dynamic_proxy_node_preserves_output_signature(
     modal_executor_module: Any,
 ) -> None:
@@ -206,6 +218,78 @@ def test_modal_cloud_traces_remote_node_execution_spans(
     assert "Remote node 7 class_type=UNETLoader role=model_load finished in " in captured.out
     assert "Remote node 2 class_type=KSampler role=sampling started" in captured.out
     assert "Remote node 2 class_type=KSampler role=sampling finished in " in captured.out
+
+
+def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Cached loader wrappers should avoid repeated loads and clone cached outputs on hits."""
+
+    class FakeLoader:
+        """Simple loader with one expensive method."""
+
+        def __init__(self) -> None:
+            """Initialize call counter state."""
+            self.calls = 0
+
+        def load(self, model_name: str, device: str = "default") -> tuple[_CloneableCacheValue]:
+            """Return a cloneable payload while counting underlying loads."""
+            self.calls += 1
+            return (_CloneableCacheValue(f"{model_name}:{device}:{self.calls}"),)
+
+    original_cache = dict(modal_cloud_module._LOADER_OUTPUT_CACHE)
+    original_wrapped = set(modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES)
+    modal_cloud_module._LOADER_OUTPUT_CACHE.clear()
+    modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
+    try:
+        modal_cloud_module._wrap_loader_method_with_cache(
+            "FakeLoader",
+            FakeLoader,
+            "load",
+            lambda kwargs: modal_cloud_module._serialize_loader_cache_key(kwargs),
+        )
+        loader = FakeLoader()
+        first = loader.load("model.safetensors", device="cpu")[0]
+        second = loader.load("model.safetensors", device="cpu")[0]
+        third = loader.load("other.safetensors", device="cpu")[0]
+    finally:
+        modal_cloud_module._LOADER_OUTPUT_CACHE.clear()
+        modal_cloud_module._LOADER_OUTPUT_CACHE.update(original_cache)
+        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
+        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
+
+    assert loader.calls == 2
+    assert first.value == "model.safetensors:cpu:1"
+    assert second.value == "model.safetensors:cpu:1"
+    assert third.value == "other.safetensors:cpu:2"
+    assert first is not second
+
+
+def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The runtime should patch the heavyweight built-in loaders once they are available."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "UNETLoader": type("UNETLoader", (), {"load_unet": lambda self, unet_name, weight_dtype="default": (unet_name,)}),
+            "CLIPLoader": type("CLIPLoader", (), {"load_clip": lambda self, clip_name, type="stable_diffusion", device="default": (clip_name,)}),
+            "VAELoader": type("VAELoader", (), {"load_vae": lambda self, vae_name: (vae_name,)}),
+        }
+    )
+
+    original_wrapped = set(modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES)
+    modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
+    monkeypatch.setattr(modal_cloud_module, "_load_nodes_module", lambda: fake_nodes_module)
+    try:
+        modal_cloud_module._install_loader_cache_wrappers()
+        installed_wrappers = set(modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES)
+    finally:
+        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
+        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
+
+    assert {"UNETLoader", "CLIPLoader", "VAELoader"} <= installed_wrappers
 
 
 def test_modal_cloud_ignores_heavy_comfyui_paths(
