@@ -719,6 +719,28 @@ def _comfyui_torch_packages() -> tuple[str, ...]:
     )
 
 
+def _prewarm_snapshot_state(settings: Any) -> None:
+    """Run snapshot-safe initialization before Modal captures a memory snapshot."""
+    with _timed_phase("prewarm_snapshot_state", gpu_snapshot=settings.enable_gpu_memory_snapshot):
+        _ensure_comfyui_support_packages()
+        if settings.enable_gpu_memory_snapshot:
+            _ensure_comfy_runtime_initialized(None)
+            _load_execution_module()
+            _emit_cloud_info("Completed GPU-snapshot ComfyUI prewarm before snapshot capture.")
+            return
+
+        _emit_cloud_info(
+            "Skipping full ComfyUI runtime prewarm during CPU-only snapshot to avoid accidental CUDA initialization."
+        )
+
+
+def _prewarm_restored_runtime() -> None:
+    """Run post-restore initialization that should be ready before serving requests."""
+    with _timed_phase("prewarm_restored_runtime"):
+        _ensure_comfy_runtime_initialized(None)
+        _load_execution_module()
+
+
 def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str, Any]:
     """Build the Modal class options for the deployed remote execution runtime."""
     options: dict[str, Any] = {
@@ -768,14 +790,19 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
 
-        @modal.enter()
-        def setup(self) -> None:
-            """Prepare the container process for headless node execution."""
-            with _timed_phase("remote_engine_setup"):
-                with _timed_phase("prewarm_comfy_runtime"):
-                    _ensure_comfy_runtime_initialized(None)
-                    _load_execution_module()
-                logger.info("RemoteEngine setup complete.")
+        @modal.enter(snap=True)
+        def setup_snapshot_state(self) -> None:
+            """Prepare snapshot-friendly runtime state before Modal captures memory."""
+            with _timed_phase("remote_engine_setup_snapshot"):
+                _prewarm_snapshot_state(settings)
+                logger.info("RemoteEngine snapshot setup complete.")
+
+        @modal.enter(snap=False)
+        def setup_restored_runtime(self) -> None:
+            """Prepare request-serving runtime state after a fresh boot or snapshot restore."""
+            with _timed_phase("remote_engine_setup_restored"):
+                _prewarm_restored_runtime()
+                logger.info("RemoteEngine restored-runtime setup complete.")
 
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
