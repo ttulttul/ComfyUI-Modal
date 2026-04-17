@@ -202,3 +202,38 @@ def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
     uploaded_remote_paths = [remote_path for _, remote_path in fake_volume.uploads]
     assert synced.remote_path in uploaded_remote_paths
     assert f"/hashes/{synced.sha256}.done" in uploaded_remote_paths
+
+
+def test_modal_volume_backend_treats_missing_path_as_cache_miss(
+    sync_engine_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A missing Modal volume path should behave like a normal absent marker file."""
+
+    class FakeNotFoundError(Exception):
+        """Stand-in for modal.exception.NotFoundError."""
+
+    class FakeVolume:
+        """Minimal Modal volume double that raises on missing listdir."""
+
+        def listdir(self, remote_path: str, recursive: bool = False) -> list[str]:
+            """Simulate Modal's missing-path behavior."""
+            raise FakeNotFoundError(remote_path)
+
+    class FakeModal:
+        """Minimal modal SDK double exposing the exception namespace."""
+
+        exception = type("FakeExceptionNamespace", (), {"NotFoundError": FakeNotFoundError})
+
+        class Volume:
+            """Namespace for volume lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> FakeVolume:
+                """Return a fake volume that always reports missing paths."""
+                return FakeVolume()
+
+    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    backend = sync_engine_module.ModalVolumeBackend("volume")
+
+    assert backend.exists("/hashes/missing.done") is False
