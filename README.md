@@ -1,5 +1,8 @@
 # ComfyUI Modal-Sync
 
+> [!WARNING]
+> This is an early alpha-level project. It is not ready for general use yet, the execution model is still incomplete, and you should expect missing features, hard limitations, and breaking changes.
+
 `ComfyUI Modal-Sync` is a ComfyUI custom node extension that lets you mark individual nodes for remote execution. The frontend stores a per-node `is_modal_remote` flag in workflow metadata, the backend rewrites those nodes into a Modal proxy before queueing, and the proxy forwards execution payloads through a serialization layer that is safe for tensors and plain JSON values.
 
 ## What is implemented
