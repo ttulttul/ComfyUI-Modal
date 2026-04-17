@@ -78,12 +78,14 @@ def _build_cloud_log_formatter() -> logging.Formatter:
 
 def _configure_cloud_logging() -> logging.Logger:
     """Install a dedicated timestamped handler for the cloud runtime logger."""
+    logger.setLevel(logging.INFO)
     for existing_handler in logger.handlers:
         if getattr(existing_handler, "name", "") == _CLOUD_HANDLER_NAME:
             return logger
 
     handler = logging.StreamHandler()
     handler.set_name(_CLOUD_HANDLER_NAME)
+    handler.setLevel(logging.INFO)
     handler.setFormatter(_build_cloud_log_formatter())
     logger.addHandler(handler)
     logger.propagate = False
@@ -599,7 +601,8 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
     options: dict[str, Any] = {
         "gpu": "A100",
         "volumes": {settings.remote_storage_root: vol},
-        "scaledown_window": 60,
+        "scaledown_window": settings.scaledown_window_seconds,
+        "min_containers": settings.min_containers,
         "image": image,
         "enable_memory_snapshot": settings.enable_memory_snapshot,
     }

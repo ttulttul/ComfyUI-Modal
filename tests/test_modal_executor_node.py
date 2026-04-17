@@ -120,6 +120,7 @@ def test_modal_cloud_installs_timestamped_logger_handler(
 
     assert len(matching_handlers) == 1
     assert modal_cloud_module.logger.propagate is False
+    assert modal_cloud_module.logger.level == logging.INFO
     formatter = matching_handlers[0].formatter
     assert isinstance(formatter, logging.Formatter)
     assert "%(asctime)s" in formatter._fmt
@@ -181,6 +182,8 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
         remote_storage_root="/storage",
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
+        scaledown_window_seconds=600,
+        min_containers=0,
     )
 
     options = modal_cloud_module._remote_engine_cls_options(base_settings, "volume", "image")
@@ -188,11 +191,15 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
     assert options["enable_memory_snapshot"] is True
     assert "experimental_options" not in options
     assert options["volumes"] == {"/storage": "volume"}
+    assert options["scaledown_window"] == 600
+    assert options["min_containers"] == 0
 
     gpu_snapshot_settings = types.SimpleNamespace(
         remote_storage_root="/storage",
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=True,
+        scaledown_window_seconds=900,
+        min_containers=1,
     )
     gpu_snapshot_options = modal_cloud_module._remote_engine_cls_options(
         gpu_snapshot_settings,
@@ -200,6 +207,8 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
         "image",
     )
     assert gpu_snapshot_options["experimental_options"] == {"enable_gpu_snapshot": True}
+    assert gpu_snapshot_options["scaledown_window"] == 900
+    assert gpu_snapshot_options["min_containers"] == 1
 
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
