@@ -6,15 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-class _FakeOriginalNode:
-    """Simple fake source node for rewrite tests."""
-
-    RETURN_TYPES = ("IMAGE", "INT")
-    RETURN_NAMES = ("image", "count")
-    OUTPUT_IS_LIST = (False, False)
-
-
-class _FakeModelSourceNode:
+class _FakeRemoteModelNode:
     """Fake node that produces a non-transportable MODEL output."""
 
     RETURN_TYPES = ("MODEL",)
@@ -22,13 +14,37 @@ class _FakeModelSourceNode:
     OUTPUT_IS_LIST = (False,)
 
 
-def test_rewrite_prompt_for_remote_nodes(
+class _FakeRemoteSamplerNode:
+    """Fake node that consumes a model and produces a transportable latent."""
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRemoteClipNode:
+    """Fake node that produces a non-transportable CLIP output."""
+
+    RETURN_TYPES = ("CLIP",)
+    RETURN_NAMES = ("clip",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeLocalSinkNode:
+    """Fake local node used to verify downstream rewiring."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    OUTPUT_IS_LIST = (False,)
+
+
+def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     api_intercept_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Prompt rewrite should proxy remote-marked nodes and mirror their assets."""
+    """Connected remote nodes should collapse into one proxy-backed component."""
     model_path = tmp_path / "weights.safetensors"
     model_path.write_bytes(b"weights")
     custom_nodes_dir = tmp_path / "custom_nodes"
@@ -53,7 +69,11 @@ def test_rewrite_prompt_for_remote_nodes(
         "FakeNodesModule",
         (),
         {
-            "NODE_CLASS_MAPPINGS": {"OriginalNode": _FakeOriginalNode},
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRemoteModelNode,
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
             "NODE_DISPLAY_NAME_MAPPINGS": {},
         },
     )()
@@ -61,22 +81,25 @@ def test_rewrite_prompt_for_remote_nodes(
     workflow = {
         "nodes": [
             {"id": 1, "properties": {"is_modal_remote": True}},
-            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
         ]
     }
     prompt = {
         "1": {
-            "class_type": "OriginalNode",
-            "inputs": {
-                "model_name": str(model_path),
-                "strength": 0.5,
-            },
-            "_meta": {"title": "Remote Node"},
+            "class_type": "RemoteModel",
+            "inputs": {"model_name": str(model_path)},
+            "_meta": {"title": "Model"},
         },
         "2": {
-            "class_type": "OtherNode",
-            "inputs": {},
-            "_meta": {"title": "Local Node"},
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0]},
+            "_meta": {"title": "Sampler"},
+        },
+        "3": {
+            "class_type": "LocalSink",
+            "inputs": {"latent": ["2", 0]},
+            "_meta": {"title": "Sink"},
         },
     }
 
@@ -86,18 +109,31 @@ def test_rewrite_prompt_for_remote_nodes(
         sync_engine=sync_engine,
         settings=settings,
         nodes_module=fake_nodes_module,
+        extra_data={"extra_pnginfo": {"workflow": workflow}},
     )
 
+    assert set(rewritten_prompt) == {"1", "3"}
     rewritten_node = rewritten_prompt["1"]
+    payload = rewritten_node["inputs"]["original_node_data"]
     assert rewritten_node["class_type"].startswith("ModalUniversalExecutor_")
-    assert rewritten_node["inputs"]["model_name"].startswith("/assets/")
-    assert rewritten_node["inputs"]["original_node_data"]["class_type"] == "OriginalNode"
-    assert "original_node_data" not in rewritten_node["inputs"]["original_node_data"]["inputs"]
-    assert rewritten_node["inputs"] is not rewritten_node["inputs"]["original_node_data"]["inputs"]
-    assert rewritten_prompt["2"]["class_type"] == "OtherNode"
-    assert summary.remote_node_ids == ["1"]
+    assert payload["payload_kind"] == "subgraph"
+    assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith("/assets/")
+    assert payload["execute_node_ids"] == ["2"]
+    assert payload["boundary_inputs"] == []
+    assert payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "2_latent",
+            "node_id": "2",
+            "output_index": 0,
+            "io_type": "LATENT",
+            "is_list": False,
+        }
+    ]
+    assert rewritten_prompt["3"]["inputs"]["latent"] == ["1", 0]
+    assert summary.remote_node_ids == ["1", "2"]
+    assert summary.remote_component_ids == ["1"]
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
     assert len(summary.synced_assets) == 1
-    assert summary.custom_nodes_bundle is None
 
 
 def test_rewrite_rejects_non_transportable_remote_inputs(
@@ -106,7 +142,7 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Remote nodes should be rejected if they consume non-transportable linked inputs."""
+    """Remote component boundaries should reject non-transportable local inputs."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
     (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
@@ -130,8 +166,8 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
         (),
         {
             "NODE_CLASS_MAPPINGS": {
-                "RemoteConsumer": _FakeOriginalNode,
-                "ModelSource": _FakeModelSourceNode,
+                "RemoteConsumer": _FakeRemoteSamplerNode,
+                "ModelSource": _FakeRemoteModelNode,
             },
             "NODE_DISPLAY_NAME_MAPPINGS": {},
         },
@@ -151,9 +187,7 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
         },
         "2": {
             "class_type": "RemoteConsumer",
-            "inputs": {
-                "model": ["1", 0],
-            },
+            "inputs": {"model": ["1", 0]},
             "_meta": {"title": "Remote Consumer"},
         },
     }
@@ -173,4 +207,77 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
 
     assert "input 'model'" in message
     assert "type 'MODEL'" in message
+    assert "cannot cross the current local/remote boundary" in message
+
+
+def test_rewrite_rejects_non_transportable_remote_outputs(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Remote component boundaries should reject non-transportable local downstream edges."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_nodes_dir.mkdir()
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteClip": _FakeRemoteClipNode,
+                "LocalConsumer": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteClip",
+            "inputs": {},
+            "_meta": {"title": "Remote Clip"},
+        },
+        "2": {
+            "class_type": "LocalConsumer",
+            "inputs": {"clip": ["1", 0]},
+            "_meta": {"title": "Local Consumer"},
+        },
+    }
+
+    try:
+        api_intercept_module.rewrite_prompt_for_modal(
+            prompt=prompt,
+            workflow=workflow,
+            sync_engine=sync_engine,
+            settings=settings,
+            nodes_module=fake_nodes_module,
+        )
+    except api_intercept_module.ModalPromptValidationError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected ModalPromptValidationError to be raised.")
+
+    assert "exports node 1 (RemoteClip) output index 0 of type 'CLIP'" in message
     assert "cannot cross the current local/remote boundary" in message
