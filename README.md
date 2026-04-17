@@ -12,6 +12,7 @@
 - A dynamic proxy registry in [modal_executor_node.py](/home/ksimpson/git/ComfyUI-Modal/modal_executor_node.py) that mirrors the exported output count and output types of each remote component so ComfyUI validation still succeeds after rewrite.
 - A content-addressable sync engine in [sync_engine.py](/home/ksimpson/git/ComfyUI-Modal/sync_engine.py) that mirrors model files and a zipped `custom_nodes/` bundle into storage keyed by SHA256.
 - A remote runtime skeleton in [remote/modal_app.py](/home/ksimpson/git/ComfyUI-Modal/remote/modal_app.py) that supports local fallback execution for tests and can call into Modal when the SDK is available.
+- A stable Modal cloud entry in [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py) that packages the local ComfyUI checkout plus the core ComfyUI Python runtime dependencies into the remote image.
 
 ## Repository layout
 
@@ -92,6 +93,7 @@ Important distinction:
 - it does not auto-deploy a persistent Modal app
 - it does not auto-create a persistent web endpoint
 - the actual Modal cloud service now lives in a stable importable module, [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py), because ComfyUI’s custom-node loader does not assign Modal-safe module names to node-pack directories
+- the Modal image now installs the core ComfyUI runtime Python packages automatically, but remote execution may still surface additional environment gaps as broader workflows are exercised
 
 If you want a stable reusable Modal deployment, that is still a separate step outside the current node-pack behavior.
 

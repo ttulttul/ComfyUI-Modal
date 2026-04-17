@@ -304,13 +304,39 @@ def _should_ignore_comfyui_path(path: Path) -> bool:
     return path.suffix.lower() in {".bin", ".ckpt", ".log", ".pt", ".pyc", ".pyo", ".safetensors", ".swp", ".tmp"}
 
 
+def _comfyui_runtime_packages() -> tuple[str, ...]:
+    """Return the Python packages needed to import and execute ComfyUI core inside Modal."""
+    return (
+        "aiohttp",
+        "av",
+        "einops",
+        "numpy",
+        "opencv-python-headless",
+        "packaging",
+        "pillow",
+        "psutil",
+        "pydantic",
+        "pyyaml",
+        "requests",
+        "safetensors",
+        "scipy",
+        "sentencepiece",
+        "sqlalchemy",
+        "torch",
+        "torchsde",
+        "torchvision",
+        "tqdm",
+        "transformers",
+    )
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     app = modal.App(settings.app_name)
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)
     image = (
         modal.Image.debian_slim()
-        .pip_install("torch", "safetensors", "pillow", "numpy")
+        .pip_install(*_comfyui_runtime_packages())
         .add_local_dir(
             _REPO_ROOT,
             remote_path="/root/comfyui_modal_sync_repo",

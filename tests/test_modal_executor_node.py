@@ -116,6 +116,22 @@ def test_modal_cloud_ignores_heavy_comfyui_paths(
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("comfy/model_management.py"))
 
 
+def test_modal_cloud_installs_comfyui_runtime_packages(
+    modal_cloud_module: Any,
+) -> None:
+    """The Modal cloud image should include the core packages ComfyUI imports at runtime."""
+    packages = set(modal_cloud_module._comfyui_runtime_packages())
+
+    assert "psutil" in packages
+    assert "torch" in packages
+    assert "torchvision" in packages
+    assert "torchsde" in packages
+    assert "transformers" in packages
+    assert "sentencepiece" in packages
+    assert "aiohttp" in packages
+    assert "opencv-python-headless" in packages
+
+
 class _BoundarySourceNode:
     """Simple source node used for subgraph execution tests."""
 
