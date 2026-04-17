@@ -18,7 +18,26 @@ from .settings import ModalSyncSettings, get_settings
 logger = logging.getLogger(__name__)
 
 _SYNC_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".vae"}
-_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache"}
+_SKIP_DIRS = {
+    ".git",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "venv",
+}
+_SKIP_FILE_SUFFIXES = {
+    ".log",
+    ".pyc",
+    ".pyd",
+    ".pyo",
+    ".so",
+    ".swp",
+    ".tmp",
+}
 
 
 class VolumeBackend(Protocol):
@@ -282,5 +301,8 @@ class ModalAssetSyncEngine:
         for root, dirnames, filenames in os.walk(path):
             dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
             for filename in filenames:
-                files.append(Path(root) / filename)
+                child = Path(root) / filename
+                if child.suffix.lower() in _SKIP_FILE_SUFFIXES:
+                    continue
+                files.append(child)
         return files
