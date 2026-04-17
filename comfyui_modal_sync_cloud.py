@@ -22,6 +22,10 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
 _LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
 _REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
+_PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+_COMFYUI_TORCH_VERSION = "2.10.0"
+_COMFYUI_TORCHVISION_VERSION = "0.25.0"
+_COMFYUI_TORCHAUDIO_VERSION = "2.10.0"
 for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_COMFYUI_ROOT):
     candidate_str = str(candidate)
     try:
@@ -493,11 +497,18 @@ def _comfyui_runtime_packages() -> tuple[str, ...]:
         "scipy",
         "sentencepiece",
         "sqlalchemy",
-        "torch",
         "torchsde",
-        "torchvision",
         "tqdm",
         "transformers",
+    )
+
+
+def _comfyui_torch_packages() -> tuple[str, ...]:
+    """Return the pinned CUDA 12.8 PyTorch stack used by the remote Modal image."""
+    return (
+        f"torch=={_COMFYUI_TORCH_VERSION}",
+        f"torchvision=={_COMFYUI_TORCHVISION_VERSION}",
+        f"torchaudio=={_COMFYUI_TORCHAUDIO_VERSION}",
     )
 
 
@@ -508,6 +519,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     image = (
         modal.Image.debian_slim()
         .pip_install(*_comfyui_runtime_packages())
+        .pip_install(*_comfyui_torch_packages(), index_url=_PYTORCH_CUDA_INDEX_URL)
         .add_local_dir(
             _REPO_ROOT,
             remote_path="/root/comfyui_modal_sync_repo",

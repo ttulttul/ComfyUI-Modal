@@ -94,6 +94,7 @@ Important distinction:
 - it does not auto-create a persistent web endpoint
 - the actual Modal cloud service now lives in a stable importable module, [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py), because ComfyUI’s custom-node loader does not assign Modal-safe module names to node-pack directories
 - the Modal image now installs the core ComfyUI runtime Python packages automatically, but remote execution may still surface additional environment gaps as broader workflows are exercised
+- the Modal image now pins `torch==2.10.0`, `torchvision==0.25.0`, and `torchaudio==2.10.0` from PyTorch's CUDA 12.8 wheel index instead of floating `latest`, which keeps the remote runtime aligned with the local ComfyUI `+cu128` stack and avoids newer wheel/driver mismatches
 - the Modal image filter now preserves internal ComfyUI Python packages such as `comfy/ldm/models` while still excluding top-level runtime asset folders like `models/` and `output/`
 - the remote worker now initializes ComfyUI's built-in extra nodes and API nodes on first use, and loads extracted custom-node bundles through ComfyUI's normal `custom_nodes` registry path
 - mirrored asset references such as `/assets/<sha>_model.safetensors` are now materialized to container-local absolute paths before remote execution, and the worker patches ComfyUI's `folder_paths` lookups so normal loader nodes still accept them
