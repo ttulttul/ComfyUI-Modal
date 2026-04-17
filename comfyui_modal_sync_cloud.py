@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -9,6 +10,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -32,6 +34,9 @@ from serialization import deserialize_node_inputs, serialize_node_outputs
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
+_COMFY_RUNTIME_INIT_LOCK = threading.Lock()
+_COMFY_RUNTIME_BASE_INITIALIZED = False
+_COMFY_RUNTIME_CUSTOM_NODE_ROOTS: set[str] = set()
 
 try:
     import modal  # type: ignore
@@ -80,10 +85,10 @@ def _temporary_node_mapping(node_mapping: dict[str, type[Any]] | None) -> Iterat
             nodes.NODE_DISPLAY_NAME_MAPPINGS.update(original_display_mappings)
 
 
-def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
+def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
     """Extract a mirrored custom_nodes archive into a temporary import path."""
     if not bundle_path:
-        return
+        return None
 
     settings = get_settings()
     storage_roots = [Path(settings.remote_storage_root)]
@@ -99,7 +104,7 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
 
     if local_bundle is None:
         logger.warning("Custom nodes bundle %s was not found in any known storage root.", bundle_path)
-        return
+        return None
 
     extraction_root = Path(tempfile.gettempdir()) / "comfy-modal-sync-custom-nodes"
     extraction_root.mkdir(parents=True, exist_ok=True)
@@ -109,6 +114,49 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
     if str(extraction_root) not in sys.path:
         sys.path.insert(0, str(extraction_root))
     logger.info("Extracted remote custom_nodes bundle to %s", extraction_root)
+    return extraction_root
+
+
+def _register_custom_nodes_root(custom_nodes_root: Path) -> None:
+    """Expose an extracted custom_nodes directory to ComfyUI's folder path registry."""
+    import folder_paths
+
+    folder_paths.add_model_folder_path("custom_nodes", str(custom_nodes_root), is_default=True)
+
+
+def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
+    """Initialize ComfyUI's built-in and external node registries for remote execution."""
+    global _COMFY_RUNTIME_BASE_INITIALIZED
+
+    custom_nodes_root_key = str(custom_nodes_root.resolve()) if custom_nodes_root is not None else None
+    with _COMFY_RUNTIME_INIT_LOCK:
+        nodes_module = _load_nodes_module()
+
+        if not _COMFY_RUNTIME_BASE_INITIALIZED:
+            if custom_nodes_root is not None:
+                _register_custom_nodes_root(custom_nodes_root)
+            logger.info(
+                "Initializing remote ComfyUI node registry with built-in extras%s.",
+                " and extracted custom nodes" if custom_nodes_root is not None else "",
+            )
+            asyncio.run(
+                nodes_module.init_extra_nodes(
+                    init_custom_nodes=custom_nodes_root is not None,
+                    init_api_nodes=True,
+                )
+            )
+            _COMFY_RUNTIME_BASE_INITIALIZED = True
+            if custom_nodes_root_key is not None:
+                _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
+            return
+
+        if custom_nodes_root_key is None or custom_nodes_root_key in _COMFY_RUNTIME_CUSTOM_NODE_ROOTS:
+            return
+
+        _register_custom_nodes_root(custom_nodes_root)
+        logger.info("Loading extracted remote custom nodes from %s.", custom_nodes_root)
+        asyncio.run(nodes_module.init_external_custom_nodes())
+        _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
 
 
 def _load_execution_module() -> Any:
@@ -160,7 +208,8 @@ def execute_node_locally(
     node_mapping: dict[str, type[Any]] | None = None,
 ) -> bytes:
     """Execute a single target node in-process and return serialized outputs."""
-    _extract_custom_nodes_bundle(node_data.get("custom_nodes_bundle"))
+    custom_nodes_root = _extract_custom_nodes_bundle(node_data.get("custom_nodes_bundle"))
+    _ensure_comfy_runtime_initialized(custom_nodes_root)
     kwargs = deserialize_node_inputs(kwargs_payload)
     if node_mapping is not None:
         class_type = node_data["class_type"]
@@ -268,7 +317,8 @@ def execute_subgraph_locally(
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
 ) -> bytes:
     """Execute a rewritten remote component in-process and return serialized outputs."""
-    _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
+    custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
+    _ensure_comfy_runtime_initialized(custom_nodes_root)
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs)

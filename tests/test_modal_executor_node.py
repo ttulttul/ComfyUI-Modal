@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from typing import Any
 
 
@@ -131,6 +133,58 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
     assert "sentencepiece" in packages
     assert "aiohttp" in packages
     assert "opencv-python-headless" in packages
+
+
+def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    """The remote runtime should load built-in extras once and custom bundles per extracted root."""
+    init_calls: list[tuple[Any, ...]] = []
+    folder_path_calls: list[tuple[str, str, bool]] = []
+
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+
+    async def fake_init_extra_nodes(init_custom_nodes: bool = True, init_api_nodes: bool = True) -> None:
+        init_calls.append(("extra", init_custom_nodes, init_api_nodes))
+
+    async def fake_init_external_custom_nodes() -> None:
+        init_calls.append(("external",))
+
+    fake_nodes_module.init_extra_nodes = fake_init_extra_nodes
+    fake_nodes_module.init_external_custom_nodes = fake_init_external_custom_nodes
+
+    fake_folder_paths_module = types.SimpleNamespace(
+        add_model_folder_path=lambda folder_name, full_folder_path, is_default=False: folder_path_calls.append(
+            (folder_name, full_folder_path, is_default)
+        )
+    )
+
+    monkeypatch.setitem(sys.modules, "nodes", fake_nodes_module)
+    monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths_module)
+
+    original_base_initialized = modal_cloud_module._COMFY_RUNTIME_BASE_INITIALIZED
+    original_custom_node_roots = set(modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS)
+    modal_cloud_module._COMFY_RUNTIME_BASE_INITIALIZED = False
+    modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.clear()
+    try:
+        custom_nodes_root = tmp_path / "custom_nodes"
+        custom_nodes_root.mkdir()
+
+        modal_cloud_module._ensure_comfy_runtime_initialized(None)
+        modal_cloud_module._ensure_comfy_runtime_initialized(custom_nodes_root)
+        modal_cloud_module._ensure_comfy_runtime_initialized(custom_nodes_root)
+    finally:
+        modal_cloud_module._COMFY_RUNTIME_BASE_INITIALIZED = original_base_initialized
+        modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.clear()
+        modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.update(original_custom_node_roots)
+
+    assert init_calls == [("extra", False, True), ("external",)]
+    assert folder_path_calls == [("custom_nodes", str(custom_nodes_root), True)]
 
 
 class _BoundarySourceNode:
