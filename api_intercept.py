@@ -88,6 +88,7 @@ class RewriteSummary:
 
     remote_node_ids: list[str] = field(default_factory=list)
     remote_component_ids: list[str] = field(default_factory=list)
+    component_node_ids_by_representative: dict[str, list[str]] = field(default_factory=dict)
     rewritten_node_id_map: dict[str, str] = field(default_factory=dict)
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
@@ -95,6 +96,42 @@ class RewriteSummary:
 
 class ModalPromptValidationError(ValueError):
     """Raised when a prompt cannot be executed with the current Modal transport."""
+
+
+def _emit_modal_status(
+    prompt_server: Any,
+    phase: str,
+    *,
+    client_id: str | None,
+    prompt_id: str | None,
+    node_ids: list[str],
+    component_node_ids_by_representative: dict[str, list[str]] | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Send a Modal execution status event to the active websocket client."""
+    if client_id is None:
+        logger.debug("Skipping Modal status event %s because no client id is available.", phase)
+        return
+
+    payload: dict[str, Any] = {
+        "phase": phase,
+        "prompt_id": prompt_id,
+        "node_ids": list(node_ids),
+    }
+    if component_node_ids_by_representative:
+        payload["components"] = [
+            {
+                "representative_node_id": representative_node_id,
+                "node_ids": list(component_node_ids),
+            }
+            for representative_node_id, component_node_ids in sorted(
+                component_node_ids_by_representative.items()
+            )
+        ]
+    if error_message is not None:
+        payload["error_message"] = error_message
+
+    prompt_server.send_sync("modal_status", payload, client_id)
 
 
 def _get_nodes_module() -> Any:
@@ -605,6 +642,9 @@ def rewrite_prompt_for_modal(
 
     for component in components:
         summary.remote_component_ids.append(component.representative_node_id)
+        summary.component_node_ids_by_representative[component.representative_node_id] = list(
+            component.node_ids
+        )
         for node_id in component.node_ids:
             summary.rewritten_node_id_map[node_id] = component.representative_node_id
 
@@ -717,11 +757,20 @@ def setup_modal_queue_route(
     async def modal_queue_prompt(request: web.Request) -> web.Response:
         """Handle prompt queue requests that include Modal remote markers."""
         logger.info("Received Modal queue request.")
+        json_data: dict[str, Any] | None = None
+        workflow: dict[str, Any] | None = None
+        remote_node_ids: list[str] = []
+        summary = RewriteSummary()
         try:
             request_started_at = time.perf_counter()
             json_data = await request.json()
+            json_data.setdefault("prompt_id", str(uuid.uuid4()))
+            json_data.setdefault("extra_data", {})
+            if json_data.get("client_id") is not None:
+                json_data["extra_data"]["client_id"] = json_data["client_id"]
             extra_pnginfo = ((json_data.get("extra_data") or {}).get("extra_pnginfo") or {})
             workflow = extra_pnginfo.get("workflow")
+            remote_node_ids = sorted(extract_remote_node_ids(workflow, resolved_settings))
             if "prompt" in json_data:
                 rewrite_started_at = time.perf_counter()
                 rewritten_prompt, summary = rewrite_prompt_for_modal(
@@ -737,6 +786,7 @@ def setup_modal_queue_route(
                     len(summary.remote_node_ids),
                     len(summary.remote_component_ids),
                 )
+                remote_node_ids = list(summary.remote_node_ids)
                 json_data["prompt"] = rewritten_prompt
                 if json_data.get("partial_execution_targets"):
                     rewritten_targets = {
@@ -754,6 +804,14 @@ def setup_modal_queue_route(
                     json_data["extra_data"]["modal"]["custom_nodes_bundle"] = (
                         summary.custom_nodes_bundle.remote_path
                     )
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="setup",
+                    client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
+                    prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
+                    node_ids=remote_node_ids,
+                    component_node_ids_by_representative=summary.component_node_ids_by_representative,
+                )
             response = await _queue_prompt_json(prompt_server, json_data)
             logger.info(
                 "Modal queue request completed in %.3fs.",
@@ -762,12 +820,39 @@ def setup_modal_queue_route(
             return response
         except FileNotFoundError as exc:
             logger.exception("Modal asset sync failed.")
+            if json_data is not None:
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="error",
+                    client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
+                    prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
+                    node_ids=remote_node_ids,
+                    error_message=str(exc),
+                )
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
         except ModalPromptValidationError as exc:
             logger.exception("Modal prompt validation failed.")
+            if json_data is not None:
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="error",
+                    client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
+                    prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
+                    node_ids=remote_node_ids,
+                    error_message=str(exc),
+                )
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
         except Exception as exc:
             logger.exception("Modal queue handler failed.")
+            if json_data is not None:
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="error",
+                    client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
+                    prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
+                    node_ids=remote_node_ids,
+                    error_message=str(exc),
+                )
             return web.json_response({"error": str(exc), "node_errors": []}, status=500)
 
     _ROUTE_REGISTERED = True

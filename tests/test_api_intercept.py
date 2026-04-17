@@ -132,6 +132,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert rewritten_prompt["3"]["inputs"]["latent"] == ["1", 0]
     assert summary.remote_node_ids == ["1", "2"]
     assert summary.remote_component_ids == ["1"]
+    assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
     assert len(summary.synced_assets) == 1
 
@@ -281,3 +282,48 @@ def test_rewrite_rejects_non_transportable_remote_outputs(
 
     assert "exports node 1 (RemoteClip) output index 0 of type 'CLIP'" in message
     assert "cannot cross the current local/remote boundary" in message
+
+
+def test_emit_modal_status_targets_prompt_client(
+    api_intercept_module: Any,
+) -> None:
+    """Modal status events should preserve prompt and component metadata for the UI."""
+
+    class FakePromptServer:
+        """Capture websocket events emitted by the queue route."""
+
+        def __init__(self) -> None:
+            """Initialize the event sink."""
+            self.messages: list[tuple[str, dict[str, Any], str | None]] = []
+
+        def send_sync(self, event: str, data: dict[str, Any], sid: str | None) -> None:
+            """Record an emitted websocket message."""
+            self.messages.append((event, data, sid))
+
+    prompt_server = FakePromptServer()
+    api_intercept_module._emit_modal_status(
+        prompt_server=prompt_server,
+        phase="setup",
+        client_id="client-1",
+        prompt_id="prompt-1",
+        node_ids=["4", "5"],
+        component_node_ids_by_representative={"4": ["4", "5"]},
+    )
+
+    assert prompt_server.messages == [
+        (
+            "modal_status",
+            {
+                "phase": "setup",
+                "prompt_id": "prompt-1",
+                "node_ids": ["4", "5"],
+                "components": [
+                    {
+                        "representative_node_id": "4",
+                        "node_ids": ["4", "5"],
+                    }
+                ],
+            },
+            "client-1",
+        )
+    ]

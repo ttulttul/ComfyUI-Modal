@@ -7,7 +7,7 @@
 
 ## What is implemented
 
-- A frontend extension in [web/modal_toggle.js](/home/ksimpson/git/ComfyUI-Modal/web/modal_toggle.js) that injects a `Run on Modal` toggle into every non-internal node, draws a blue border around remote nodes, and submits queued prompts to `/modal/queue_prompt`.
+- A frontend extension in [web/modal_toggle.js](/home/ksimpson/git/ComfyUI-Modal/web/modal_toggle.js) that injects a `Run on Modal` toggle into every non-internal node, draws live remote-state overlays on marked nodes, and submits queued prompts to `/modal/queue_prompt`.
 - A backend route in [api_intercept.py](/home/ksimpson/git/ComfyUI-Modal/api_intercept.py) that reads the workflow snapshot from `extra_pnginfo.workflow`, identifies connected remote-marked node components, syncs referenced assets, and rewrites each component into one signature-preserving Modal proxy node.
 - A dynamic proxy registry in [modal_executor_node.py](/home/ksimpson/git/ComfyUI-Modal/modal_executor_node.py) that mirrors the exported output count and output types of each remote component so ComfyUI validation still succeeds after rewrite.
 - A content-addressable sync engine in [sync_engine.py](/home/ksimpson/git/ComfyUI-Modal/sync_engine.py) that mirrors model files and a zipped `custom_nodes/` bundle into storage keyed by SHA256.
@@ -144,6 +144,13 @@ The frontend extension intercepts queue submission and sends the prompt to `/mod
 3. Referenced model assets are mirrored into storage.
 4. If custom-node syncing is enabled, the local `custom_nodes/` directory is zipped and mirrored if its content hash changed.
 5. The rewritten prompt is submitted to the normal ComfyUI prompt queue.
+
+While that is happening, the frontend now shows remote-node state directly on the canvas:
+
+- blue border: marked for Modal, idle
+- orange pulsing border: queued or still being prepared for remote execution
+- green border with light green shading: the remote component is actively executing
+- red border: queue-time or execution failure detected
 
 ### 6. What happens during execution
 
