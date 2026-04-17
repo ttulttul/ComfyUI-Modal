@@ -547,6 +547,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
+            vol.reload()
             if payload.get("payload_kind") == "subgraph":
                 return execute_subgraph_locally(payload, kwargs_payload)
             return execute_node_locally(payload, kwargs_payload)
