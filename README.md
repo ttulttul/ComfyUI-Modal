@@ -154,6 +154,8 @@ While that is happening, the frontend now shows remote-node state directly on th
 - green border with light green shading: the remote component is actively executing
 - red border: queue-time or execution failure detected
 
+Because the Modal queue route can spend noticeable time hashing, syncing, and creating a remote runtime before the prompt is formally queued, the frontend also emits a temporary synthetic running state into ComfyUI's normal queue/execution UI. That keeps the built-in queue indicators alive during the preparatory phase instead of looking idle until the backend finally returns the queued prompt id.
+
 ### 6. What happens during execution
 
 When execution reaches a rewritten component proxy:
