@@ -121,10 +121,28 @@ def test_modal_cloud_installs_timestamped_logger_handler(
     assert len(matching_handlers) == 1
     assert modal_cloud_module.logger.propagate is False
     assert modal_cloud_module.logger.level == logging.INFO
+    assert matching_handlers[0].stream is sys.stdout
     formatter = matching_handlers[0].formatter
     assert isinstance(formatter, logging.Formatter)
     assert "%(asctime)s" in formatter._fmt
     assert "%(relativeCreated)" in formatter._fmt
+
+
+def test_modal_cloud_mirrors_phase_logs_to_stdout_in_modal_runtime(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    """Timed cloud phases should write directly to stdout inside Modal containers."""
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+
+    with modal_cloud_module._timed_phase("phase_under_test", component="component-1"):
+        pass
+
+    captured = capsys.readouterr()
+    assert "Starting phase_under_test component=component-1" in captured.out
+    assert "Finished phase_under_test in " in captured.out
+    assert "component=component-1" in captured.out
 
 
 def test_modal_cloud_ignores_heavy_comfyui_paths(
