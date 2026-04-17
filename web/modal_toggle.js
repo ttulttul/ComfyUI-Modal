@@ -444,7 +444,7 @@ function markQueueFailure(remoteNodeIds, promptId, error) {
 /**
  * Dispatch a synthetic frontend API event when the underlying API supports EventTarget semantics.
  * @param {string} eventType
- * @param {Record<string, any>} detail
+ * @param {any} detail
  */
 function dispatchSyntheticApiEvent(eventType, detail) {
   if (typeof api.dispatchEvent !== "function") {
@@ -478,17 +478,16 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds) {
 
   const displayNode = remoteNodeIds[0];
   syntheticPromptUiStates.set(promptId, { displayNode });
-  dispatchSyntheticApiEvent("status", {
-    status: statusPayload(1),
+  dispatchSyntheticApiEvent("status", statusPayload(1));
+  dispatchSyntheticApiEvent("notification", {
+    id: promptId,
+    value: "Waiting for a machine on Modal.",
   });
   dispatchSyntheticApiEvent("execution_start", {
     prompt_id: promptId,
+    timestamp: nowMs(),
   });
-  dispatchSyntheticApiEvent("executing", {
-    prompt_id: promptId,
-    node: displayNode,
-    display_node: displayNode,
-  });
+  dispatchSyntheticApiEvent("executing", displayNode);
 }
 
 /**
@@ -503,9 +502,11 @@ function endSyntheticExecutionUi(promptId, failed = false) {
   }
 
   syntheticPromptUiStates.delete(promptId);
-  dispatchSyntheticApiEvent("status", {
-    status: statusPayload(0),
+  dispatchSyntheticApiEvent("notification", {
+    id: promptId,
+    value: "Modal setup finished.",
   });
+  dispatchSyntheticApiEvent("status", statusPayload(0));
   if (failed) {
     dispatchSyntheticApiEvent("execution_error", {
       prompt_id: promptId,
