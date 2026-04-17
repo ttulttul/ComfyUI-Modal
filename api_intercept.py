@@ -18,6 +18,20 @@ from .sync_engine import ModalAssetSyncEngine, SyncedAsset
 logger = logging.getLogger(__name__)
 
 _ROUTE_REGISTERED = False
+_TRANSPORTABLE_OUTPUT_TYPES = frozenset(
+    {
+        "*",
+        "BOOLEAN",
+        "FLOAT",
+        "IMAGE",
+        "INT",
+        "LATENT",
+        "MASK",
+        "NOISE",
+        "SIGMAS",
+        "STRING",
+    }
+)
 
 
 @dataclass
@@ -27,6 +41,10 @@ class RewriteSummary:
     remote_node_ids: list[str] = field(default_factory=list)
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
+
+
+class ModalPromptValidationError(ValueError):
+    """Raised when a prompt cannot be executed with the current Modal transport."""
 
 
 def _get_nodes_module() -> Any:
@@ -67,6 +85,75 @@ def extract_remote_node_ids(
     return remote_node_ids
 
 
+def _normalize_return_types(node_class: type[Any]) -> tuple[str, ...]:
+    """Return normalized output types for a node class."""
+    if hasattr(node_class, "GET_SCHEMA"):
+        node_class.GET_SCHEMA()
+    return tuple(getattr(node_class, "RETURN_TYPES", ("*",))) or ("*",)
+
+
+def _is_transportable_output_type(io_type: str) -> bool:
+    """Return whether a ComfyUI output type can cross the current transport."""
+    normalized_parts = [part.strip() for part in io_type.split(",") if part.strip()]
+    return bool(normalized_parts) and all(part in _TRANSPORTABLE_OUTPUT_TYPES for part in normalized_parts)
+
+
+def validate_remote_node_transport_compatibility(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    nodes_module: Any,
+) -> None:
+    """Reject remote nodes whose linked inputs require unsupported transport types."""
+    validation_errors: list[str] = []
+
+    for remote_node_id in sorted(remote_node_ids):
+        prompt_node = prompt.get(remote_node_id)
+        if prompt_node is None:
+            continue
+
+        remote_class_type = str(prompt_node["class_type"])
+        for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+            if not (
+                isinstance(input_value, list)
+                and len(input_value) == 2
+                and all(not isinstance(item, dict) for item in input_value)
+            ):
+                continue
+
+            upstream_node_id = str(input_value[0])
+            output_index = int(input_value[1])
+            upstream_prompt_node = prompt.get(upstream_node_id)
+            if upstream_prompt_node is None:
+                continue
+
+            upstream_class_type = str(upstream_prompt_node["class_type"])
+            upstream_class = nodes_module.NODE_CLASS_MAPPINGS.get(upstream_class_type)
+            if upstream_class is None:
+                continue
+
+            upstream_return_types = _normalize_return_types(upstream_class)
+            if output_index >= len(upstream_return_types):
+                continue
+
+            upstream_output_type = str(upstream_return_types[output_index])
+            if _is_transportable_output_type(upstream_output_type):
+                continue
+
+            validation_errors.append(
+                "Remote node "
+                f"{remote_node_id} ({remote_class_type}) input '{input_name}' "
+                f"depends on upstream node {upstream_node_id} ({upstream_class_type}) "
+                f"output index {output_index} of type '{upstream_output_type}', which "
+                "cannot cross the current local/remote boundary. "
+                "Current ComfyUI-Modal transport only supports JSON-compatible values, "
+                "bytes, and tensor-like outputs such as IMAGE, MASK, LATENT, SIGMAS, "
+                "NOISE, INT, FLOAT, BOOLEAN, and STRING."
+            )
+
+    if validation_errors:
+        raise ModalPromptValidationError("\n".join(validation_errors))
+
+
 def rewrite_prompt_for_modal(
     prompt: dict[str, Any],
     workflow: dict[str, Any] | None,
@@ -85,6 +172,11 @@ def rewrite_prompt_for_modal(
     resolved_nodes_module = nodes_module or _get_nodes_module()
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     rewritten_prompt = copy.deepcopy(prompt)
+    validate_remote_node_transport_compatibility(
+        prompt=rewritten_prompt,
+        remote_node_ids=remote_node_ids,
+        nodes_module=resolved_nodes_module,
+    )
     if resolved_settings.sync_custom_nodes:
         summary.custom_nodes_bundle = resolved_sync_engine.sync_custom_nodes_directory()
     else:
@@ -256,6 +348,9 @@ def setup_modal_queue_route(
             return response
         except FileNotFoundError as exc:
             logger.exception("Modal asset sync failed.")
+            return web.json_response({"error": str(exc), "node_errors": []}, status=400)
+        except ModalPromptValidationError as exc:
+            logger.exception("Modal prompt validation failed.")
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
         except Exception as exc:
             logger.exception("Modal queue handler failed.")

@@ -94,6 +94,20 @@ The best candidates for remote execution are nodes that:
 
 Avoid marking nodes remote if they depend on local-only process state or return objects that cannot be serialized by [serialization.py](/home/ksimpson/git/ComfyUI-Modal/serialization.py).
 
+Under the current implementation, a remote-marked node can only consume boundary-crossing inputs whose evaluated values are transportable. In practice that means tensor-like and primitive types such as:
+
+- `IMAGE`
+- `MASK`
+- `LATENT`
+- `SIGMAS`
+- `NOISE`
+- `INT`
+- `FLOAT`
+- `BOOLEAN`
+- `STRING`
+
+Inputs that evaluate to Comfy runtime objects such as `MODEL`, `CONDITIONING`, `CLIP`, `VAE`, `CONTROL_NET`, and similar internal types cannot cross the current local/remote boundary. If you mark a node like `KSampler` remote while its `model` or `positive`/`negative` inputs are still produced locally, the queue request will now be rejected immediately with a validation error instead of failing later during execution.
+
 ### 4. Mark the nodes you want to offload
 
 For each node you want to run remotely:
