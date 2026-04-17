@@ -132,6 +132,7 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
     assert "sentencepiece" in packages
     assert "aiohttp" in packages
     assert "opencv-python-headless" in packages
+    assert "comfy-kitchen>=0.2.7" in packages
 
 
 def test_modal_cloud_pins_cu128_pytorch_stack(
