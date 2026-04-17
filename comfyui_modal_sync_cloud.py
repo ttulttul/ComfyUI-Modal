@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -39,6 +40,7 @@ from serialization import deserialize_node_inputs, serialize_node_outputs
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
+_CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
 _COMFY_RUNTIME_INIT_LOCK = threading.Lock()
 _COMFY_RUNTIME_BASE_INITIALIZED = False
 _COMFY_RUNTIME_CUSTOM_NODE_ROOTS: set[str] = set()
@@ -64,6 +66,51 @@ class _NullPromptServer:
     def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
         """Discard PromptExecutor progress and status events."""
         logger.debug("Suppressed remote prompt event %s for client %s.", event, client_id)
+
+
+def _build_cloud_log_formatter() -> logging.Formatter:
+    """Return the default formatter for remote Modal-Sync logs with timestamps."""
+    return logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d +%(relativeCreated)07.0fms %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def _configure_cloud_logging() -> logging.Logger:
+    """Install a dedicated timestamped handler for the cloud runtime logger."""
+    for existing_handler in logger.handlers:
+        if getattr(existing_handler, "name", "") == _CLOUD_HANDLER_NAME:
+            return logger
+
+    handler = logging.StreamHandler()
+    handler.set_name(_CLOUD_HANDLER_NAME)
+    handler.setFormatter(_build_cloud_log_formatter())
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+@contextmanager
+def _timed_phase(phase: str, **fields: Any) -> Iterator[None]:
+    """Log a start/finish pair with elapsed time for a named execution phase."""
+    field_suffix = ""
+    if fields:
+        rendered_fields = " ".join(f"{key}={value}" for key, value in fields.items())
+        field_suffix = f" {rendered_fields}"
+    phase_started_at = time.perf_counter()
+    logger.info("Starting %s%s", phase, field_suffix)
+    try:
+        yield
+    finally:
+        logger.info(
+            "Finished %s in %.3fs%s",
+            phase,
+            time.perf_counter() - phase_started_at,
+            field_suffix,
+        )
+
+
+_configure_cloud_logging()
 
 
 @contextmanager
@@ -113,8 +160,9 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
 
     extraction_root = Path(tempfile.gettempdir()) / "comfy-modal-sync-custom-nodes"
     extraction_root.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(local_bundle, "r") as archive:
-        archive.extractall(extraction_root)
+    with _timed_phase("extract_custom_nodes_bundle", bundle=local_bundle.name):
+        with zipfile.ZipFile(local_bundle, "r") as archive:
+            archive.extractall(extraction_root)
 
     if str(extraction_root) not in sys.path:
         sys.path.insert(0, str(extraction_root))
@@ -236,34 +284,44 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
 
     custom_nodes_root_key = str(custom_nodes_root.resolve()) if custom_nodes_root is not None else None
     with _COMFY_RUNTIME_INIT_LOCK:
-        _ensure_comfyui_support_packages()
-        nodes_module = _load_nodes_module()
+        with _timed_phase(
+            "ensure_comfy_runtime_initialized",
+            custom_nodes=custom_nodes_root_key or "none",
+        ):
+            _ensure_comfyui_support_packages()
+            nodes_module = _load_nodes_module()
 
-        if not _COMFY_RUNTIME_BASE_INITIALIZED:
-            if custom_nodes_root is not None:
-                _register_custom_nodes_root(custom_nodes_root)
-            logger.info(
-                "Initializing remote ComfyUI node registry with built-in extras%s.",
-                " and extracted custom nodes" if custom_nodes_root is not None else "",
-            )
-            asyncio.run(
-                nodes_module.init_extra_nodes(
-                    init_custom_nodes=custom_nodes_root is not None,
-                    init_api_nodes=True,
+            if not _COMFY_RUNTIME_BASE_INITIALIZED:
+                if custom_nodes_root is not None:
+                    _register_custom_nodes_root(custom_nodes_root)
+                logger.info(
+                    "Initializing remote ComfyUI node registry with built-in extras%s.",
+                    " and extracted custom nodes" if custom_nodes_root is not None else "",
                 )
-            )
-            _COMFY_RUNTIME_BASE_INITIALIZED = True
-            if custom_nodes_root_key is not None:
-                _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
-            return
+                with _timed_phase(
+                    "init_extra_nodes",
+                    custom_nodes=bool(custom_nodes_root is not None),
+                    api_nodes=True,
+                ):
+                    asyncio.run(
+                        nodes_module.init_extra_nodes(
+                            init_custom_nodes=custom_nodes_root is not None,
+                            init_api_nodes=True,
+                        )
+                    )
+                _COMFY_RUNTIME_BASE_INITIALIZED = True
+                if custom_nodes_root_key is not None:
+                    _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
+                return
 
-        if custom_nodes_root_key is None or custom_nodes_root_key in _COMFY_RUNTIME_CUSTOM_NODE_ROOTS:
-            return
+            if custom_nodes_root_key is None or custom_nodes_root_key in _COMFY_RUNTIME_CUSTOM_NODE_ROOTS:
+                return
 
-        _register_custom_nodes_root(custom_nodes_root)
-        logger.info("Loading extracted remote custom nodes from %s.", custom_nodes_root)
-        asyncio.run(nodes_module.init_external_custom_nodes())
-        _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
+            _register_custom_nodes_root(custom_nodes_root)
+            logger.info("Loading extracted remote custom nodes from %s.", custom_nodes_root)
+            with _timed_phase("init_external_custom_nodes", custom_nodes=custom_nodes_root_key):
+                asyncio.run(nodes_module.init_external_custom_nodes())
+            _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
 
 
 def _load_execution_module() -> Any:
@@ -396,49 +454,63 @@ def _execute_subgraph_prompt(
     hydrated_inputs: dict[str, Any],
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
-    prompt = _rewrite_modal_asset_references(copy.deepcopy(payload["subgraph_prompt"]))
-    _apply_boundary_inputs(
-        prompt=prompt,
-        boundary_input_specs=list(payload.get("boundary_inputs", [])),
-        hydrated_inputs=hydrated_inputs,
-    )
-    execution = _load_execution_module()
-    cache_type, cache_args = _prompt_executor_cache_config(execution)
+    component_id = str(payload.get("component_id", "modal-subgraph"))
+    with _timed_phase("prepare_subgraph_prompt", component=component_id):
+        prompt = _rewrite_modal_asset_references(copy.deepcopy(payload["subgraph_prompt"]))
+        _apply_boundary_inputs(
+            prompt=prompt,
+            boundary_input_specs=list(payload.get("boundary_inputs", [])),
+            hydrated_inputs=hydrated_inputs,
+        )
+    with _timed_phase("load_execution_module", component=component_id):
+        execution = _load_execution_module()
+        cache_type, cache_args = _prompt_executor_cache_config(execution)
 
     with _temporary_node_mapping(None), _patched_folder_paths_absolute_lookup():
-        executor = execution.PromptExecutor(
-            _NullPromptServer(),
-            cache_type=cache_type,
-            cache_args=cache_args,
-        )
-        executor.execute(
-            prompt=prompt,
-            prompt_id=str(payload.get("component_id", "modal-subgraph")),
-            extra_data=copy.deepcopy(payload.get("extra_data") or {}),
-            execute_outputs=list(payload.get("execute_node_ids", [])),
-        )
+        with _timed_phase("create_prompt_executor", component=component_id):
+            executor = execution.PromptExecutor(
+                _NullPromptServer(),
+                cache_type=cache_type,
+                cache_args=cache_args,
+            )
+        with _timed_phase(
+            "prompt_executor_execute",
+            component=component_id,
+            execute_nodes=list(payload.get("execute_node_ids", [])),
+        ):
+            executor.execute(
+                prompt=prompt,
+                prompt_id=component_id,
+                extra_data=copy.deepcopy(payload.get("extra_data") or {}),
+                execute_outputs=list(payload.get("execute_node_ids", [])),
+            )
         if not executor.success:
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
 
         outputs: list[Any] = []
-        for boundary_output in payload.get("boundary_outputs", []):
-            node_id = str(boundary_output["node_id"])
-            output_index = int(boundary_output["output_index"])
-            cache_entry = executor.caches.outputs.get(node_id)
-            if cache_entry is None:
-                raise RemoteSubgraphExecutionError(
-                    f"Remote subgraph did not produce cache entry for node {node_id}."
+        with _timed_phase(
+            "collect_boundary_outputs",
+            component=component_id,
+            output_count=len(payload.get("boundary_outputs", [])),
+        ):
+            for boundary_output in payload.get("boundary_outputs", []):
+                node_id = str(boundary_output["node_id"])
+                output_index = int(boundary_output["output_index"])
+                cache_entry = executor.caches.outputs.get(node_id)
+                if cache_entry is None:
+                    raise RemoteSubgraphExecutionError(
+                        f"Remote subgraph did not produce cache entry for node {node_id}."
+                    )
+                if output_index >= len(cache_entry.outputs):
+                    raise RemoteSubgraphExecutionError(
+                        f"Remote subgraph output index {output_index} is missing for node {node_id}."
+                    )
+                outputs.append(
+                    _collapse_cache_slot(
+                        slot_values=cache_entry.outputs[output_index],
+                        is_list=bool(boundary_output.get("is_list", False)),
+                    )
                 )
-            if output_index >= len(cache_entry.outputs):
-                raise RemoteSubgraphExecutionError(
-                    f"Remote subgraph output index {output_index} is missing for node {node_id}."
-                )
-            outputs.append(
-                _collapse_cache_slot(
-                    slot_values=cache_entry.outputs[output_index],
-                    is_list=bool(boundary_output.get("is_list", False)),
-                )
-            )
         return tuple(outputs)
 
 
@@ -447,13 +519,18 @@ def execute_subgraph_locally(
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
 ) -> bytes:
     """Execute a rewritten remote component in-process and return serialized outputs."""
-    custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
-    _ensure_comfy_runtime_initialized(custom_nodes_root)
-    hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs)
-        outputs = future.result()
-    return serialize_node_outputs(outputs)
+    component_id = str(payload.get("component_id", "modal-subgraph"))
+    with _timed_phase("execute_subgraph_locally", component=component_id):
+        custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
+        _ensure_comfy_runtime_initialized(custom_nodes_root)
+        with _timed_phase("deserialize_boundary_inputs", component=component_id):
+            hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+        with _timed_phase("subgraph_worker_roundtrip", component=component_id):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs)
+                outputs = future.result()
+        with _timed_phase("serialize_boundary_outputs", component=component_id):
+            return serialize_node_outputs(outputs)
 
 
 def _should_ignore_repo_path(path: Path) -> bool:
@@ -568,15 +645,23 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         @modal.enter()
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
-            logger.info("RemoteEngine setup complete.")
+            with _timed_phase("remote_engine_setup"):
+                logger.info("RemoteEngine setup complete.")
 
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
-            vol.reload()
-            if payload.get("payload_kind") == "subgraph":
-                return execute_subgraph_locally(payload, kwargs_payload)
-            return execute_node_locally(payload, kwargs_payload)
+            component_id = payload.get("component_id", "single-node")
+            with _timed_phase(
+                "remote_engine_execute_payload",
+                component=component_id,
+                payload_kind=payload.get("payload_kind"),
+            ):
+                with _timed_phase("modal_volume_reload", component=component_id):
+                    vol.reload()
+                if payload.get("payload_kind") == "subgraph":
+                    return execute_subgraph_locally(payload, kwargs_payload)
+                return execute_node_locally(payload, kwargs_payload)
 
 else:
     app = None

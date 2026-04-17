@@ -7,6 +7,7 @@ import types
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+import logging
 
 
 class _FakeOriginalNode:
@@ -105,6 +106,24 @@ def test_stable_modal_cloud_entry_imports_without_modal_sdk(
     """The stable Modal cloud module should stay importable when modal is unavailable."""
     assert modal_cloud_module.__name__ == "comfyui_modal_sync_cloud"
     assert hasattr(modal_cloud_module, "RemoteEngine")
+
+
+def test_modal_cloud_installs_timestamped_logger_handler(
+    modal_cloud_module: Any,
+) -> None:
+    """The cloud runtime should install its own timestamped logger handler."""
+    matching_handlers = [
+        handler
+        for handler in modal_cloud_module.logger.handlers
+        if getattr(handler, "name", "") == modal_cloud_module._CLOUD_HANDLER_NAME
+    ]
+
+    assert len(matching_handlers) == 1
+    assert modal_cloud_module.logger.propagate is False
+    formatter = matching_handlers[0].formatter
+    assert isinstance(formatter, logging.Formatter)
+    assert "%(asctime)s" in formatter._fmt
+    assert "%(relativeCreated)" in formatter._fmt
 
 
 def test_modal_cloud_ignores_heavy_comfyui_paths(
