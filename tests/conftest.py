@@ -132,4 +132,6 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.delenv("COMFY_MODAL_CUSTOM_NODES_DIR", raising=False)
     monkeypatch.delenv("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT", raising=False)
     monkeypatch.delenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_SCALEDOWN_WINDOW", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_MIN_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFYUI_ROOT", raising=False)

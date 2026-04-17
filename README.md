@@ -102,6 +102,7 @@ Important distinction:
 - the Modal image now includes `comfy-kitchen>=0.2.7` because ComfyUI's FP8/FP4 weight-loading path crashes with `NoneType.Params` if quantized layout support is missing
 - the Modal image now pins `torch==2.10.0`, `torchvision==0.25.0`, and `torchaudio==2.10.0` from PyTorch's CUDA 12.8 wheel index instead of floating `latest`, which keeps the remote runtime aligned with the local ComfyUI `+cu128` stack and avoids newer wheel/driver mismatches
 - the deployed remote class now enables Modal memory snapshots by default so later cold starts can skip more initialization work after the first deployed invocations; GPU memory snapshots remain opt-in because they are still an alpha feature in Modal
+- the deployed remote class now defaults to a `scaledown_window` of 600 seconds with `min_containers=0`, which keeps recently used containers warm for a while without forcing a permanently warm GPU
 - the Modal image filter now preserves internal ComfyUI Python packages such as `comfy/ldm/models` while still excluding top-level runtime asset folders like `models/` and `output/`
 - Modal-Sync now installs its own timestamped logger formatter, so performance investigations can read both wall-clock time and relative elapsed milliseconds directly from extension log lines
 - Asset sync now keeps a persistent local metadata cache keyed by file path, size, and mtime, and it keeps digest-keyed custom_nodes ZIPs under the local storage root so unchanged models and unchanged custom_nodes trees do not need to be fully re-hashed or re-zipped every run
@@ -226,6 +227,8 @@ These environment variables are supported:
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
 - `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT`: Enable Modal CPU memory snapshots for the deployed remote class. Default: `true`.
 - `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT`: Opt into Modal GPU memory snapshots. Default: `false`.
+- `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle Modal containers warm for this many seconds after a request. Default: `600`.
+- `COMFY_MODAL_MIN_CONTAINERS`: Keep at least this many containers warm at all times. Default: `0`.
 
 ## Development
 

@@ -30,6 +30,8 @@ class ModalSyncSettings:
     custom_nodes_archive_name: str
     comfyui_root: Path | None
     custom_nodes_dir: Path | None
+    scaledown_window_seconds: int = 600
+    min_containers: int = 0
 
 
 def _read_path_env(name: str) -> Path | None:
@@ -57,6 +59,17 @@ def _read_bool_env(name: str) -> bool | None:
 def _discover_repo_root() -> Path:
     """Return the repository root containing this module."""
     return Path(__file__).resolve().parent
+
+
+def _read_int_env(name: str, default: int) -> int:
+    """Resolve an environment variable into an integer when present."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got {value!r}.") from exc
 
 
 def _discover_comfyui_root() -> Path | None:
@@ -123,6 +136,8 @@ def get_settings() -> ModalSyncSettings:
         ),
         comfyui_root=comfyui_root,
         custom_nodes_dir=custom_nodes_dir,
+        scaledown_window_seconds=_read_int_env("COMFY_MODAL_SCALEDOWN_WINDOW", 600),
+        min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),
     )
     logger.debug("Resolved Modal-Sync settings: %s", settings)
     return settings
