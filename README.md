@@ -86,15 +86,19 @@ For real Modal execution, you need:
 
 The remote runtime skeleton lives in [remote/modal_app.py](/home/ksimpson/git/ComfyUI-Modal/remote/modal_app.py). The extension is structured for Modal, but you still need to supply a working Modal environment.
 
-When `COMFY_MODAL_EXECUTION_MODE` is remote, the runtime now tries a deployed Modal class lookup first via the configured app name. If no deployed app is available, it falls back to starting an ephemeral `app.run()` session locally for the invocation. That fallback is slower, but it avoids the old "Function has not been hydrated" failure mode.
+When `COMFY_MODAL_EXECUTION_MODE` is remote, the runtime now treats deployed Modal class lookup via the configured app name as the normal execution path. If no deployed app is available, remote execution fails fast by default instead of silently creating a fresh ephemeral `app.run()` session.
+The intended production path is now a deployed Modal app. Ephemeral `app.run()` fallback is disabled by default because it causes expensive per-run app/image setup and defeats the point of scaling remote execution down to zero between workflows.
 
 Important distinction:
-- the current fallback can create a temporary Modal app session automatically
-- it does not auto-deploy a persistent Modal app
-- it does not auto-create a persistent web endpoint
+- remote mode now assumes you have deployed [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py) once, for example with `modal deploy comfyui_modal_sync_cloud.py`
+- repeated remote workflow executions should then reuse the deployed app and cached image instead of rebuilding through ephemeral `app.run()`
+- the extension still does not auto-deploy a persistent Modal app for you
+- the extension still does not auto-create a persistent web endpoint
+- `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true` can re-enable the old temporary `app.run()` path if you explicitly want it
 - the actual Modal cloud service now lives in a stable importable module, [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py), because ComfyUI’s custom-node loader does not assign Modal-safe module names to node-pack directories
 - the Modal image now installs the core ComfyUI runtime Python packages automatically, but remote execution may still surface additional environment gaps as broader workflows are exercised
 - the Modal image now pins `torch==2.10.0`, `torchvision==0.25.0`, and `torchaudio==2.10.0` from PyTorch's CUDA 12.8 wheel index instead of floating `latest`, which keeps the remote runtime aligned with the local ComfyUI `+cu128` stack and avoids newer wheel/driver mismatches
+- the deployed remote class now enables Modal memory snapshots by default so later cold starts can skip more initialization work after the first deployed invocations; GPU memory snapshots remain opt-in because they are still an alpha feature in Modal
 - the Modal image filter now preserves internal ComfyUI Python packages such as `comfy/ldm/models` while still excluding top-level runtime asset folders like `models/` and `output/`
 - the remote worker now initializes ComfyUI's built-in extra nodes and API nodes on first use, and loads extracted custom-node bundles through ComfyUI's normal `custom_nodes` registry path
 - mirrored asset references such as `/assets/<sha>_model.safetensors` are now materialized to container-local absolute paths before remote execution, and the worker patches ComfyUI's `folder_paths` lookups so normal loader nodes still accept them
@@ -102,7 +106,7 @@ Important distinction:
 - the queue route now performs Modal volume SDK calls from a worker thread instead of directly on the aiohttp request loop, and missing marker paths in the volume are treated as normal cache misses rather than fatal errors
 - the remote worker now force-loads ComfyUI's top-level `utils` package from the bundled ComfyUI source tree before API nodes initialize, which avoids third-party or stray `utils` modules shadowing `utils.install_util`
 
-If you want a stable reusable Modal deployment, that is still a separate step outside the current node-pack behavior.
+The recommended operating mode is: deploy once, let compute scale to zero between runs, and rely on Modal's cached image plus deployed-object reuse and memory snapshots for subsequent cold starts.
 
 ### 3. Open your workflow in ComfyUI
 
@@ -212,6 +216,9 @@ These environment variables are supported:
 - `COMFY_MODAL_EXECUTION_MODE`: Set to `local` for in-process fallback execution. Default: `local`.
 - `COMFY_MODAL_SYNC_CUSTOM_NODES`: Force-enable or disable custom-node bundle sync. Default: disabled in `local` mode, enabled otherwise.
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
+- `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
+- `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT`: Enable Modal CPU memory snapshots for the deployed remote class. Default: `true`.
+- `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT`: Opt into Modal GPU memory snapshots. Default: `false`.
 
 ## Development
 

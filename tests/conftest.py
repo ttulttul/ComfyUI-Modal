@@ -127,5 +127,8 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     """Isolate Modal-Sync environment variables between tests."""
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
     monkeypatch.setenv("COMFY_MODAL_LOCAL_STORAGE_ROOT", str(tmp_path / "storage"))
+    monkeypatch.delenv("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK", raising=False)
     monkeypatch.delenv("COMFY_MODAL_CUSTOM_NODES_DIR", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", raising=False)
     monkeypatch.delenv("COMFYUI_ROOT", raising=False)
