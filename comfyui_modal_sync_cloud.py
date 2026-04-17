@@ -173,6 +173,21 @@ def _load_nodes_module() -> Any:
     return nodes
 
 
+def _prompt_executor_cache_config(execution: Any) -> tuple[Any, dict[str, float]]:
+    """Return the cache settings used by ComfyUI's normal prompt worker."""
+    from comfy.cli_args import args
+
+    cache_type = execution.CacheType.CLASSIC
+    if args.cache_lru > 0:
+        cache_type = execution.CacheType.LRU
+    elif args.cache_ram > 0:
+        cache_type = execution.CacheType.RAM_PRESSURE
+    elif args.cache_none:
+        cache_type = execution.CacheType.NONE
+
+    return cache_type, {"lru": args.cache_lru, "ram": args.cache_ram}
+
+
 def _invoke_original_node(
     node_class: type[Any],
     node_data: dict[str, Any],
@@ -278,9 +293,14 @@ def _execute_subgraph_prompt(
         hydrated_inputs=hydrated_inputs,
     )
     execution = _load_execution_module()
+    cache_type, cache_args = _prompt_executor_cache_config(execution)
 
     with _temporary_node_mapping(None):
-        executor = execution.PromptExecutor(_NullPromptServer())
+        executor = execution.PromptExecutor(
+            _NullPromptServer(),
+            cache_type=cache_type,
+            cache_args=cache_args,
+        )
         executor.execute(
             prompt=prompt,
             prompt_id=str(payload.get("component_id", "modal-subgraph")),

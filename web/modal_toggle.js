@@ -21,6 +21,7 @@ const ERROR_CLEAR_DELAY_MS = 5000;
 const modalNodeStates = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
+const syntheticPromptUiStates = new Map();
 
 let animationFrameHandle = null;
 
@@ -385,6 +386,11 @@ function handleModalStatus(event) {
   if (!promptId) {
     return;
   }
+  if (detail.phase === STATE_SETUP) {
+    beginSyntheticExecutionUi(promptId, (detail.node_ids ?? []).map((value) => String(value)));
+  } else if (detail.phase === STATE_ERROR) {
+    endSyntheticExecutionUi(promptId, true);
+  }
 
   const nodeIds = (detail.node_ids ?? []).map((value) => String(value));
   const components = detail.components ?? [];
@@ -436,6 +442,86 @@ function markQueueFailure(remoteNodeIds, promptId, error) {
 }
 
 /**
+ * Dispatch a synthetic frontend API event when the underlying API supports EventTarget semantics.
+ * @param {string} eventType
+ * @param {Record<string, any>} detail
+ */
+function dispatchSyntheticApiEvent(eventType, detail) {
+  if (typeof api.dispatchEvent !== "function") {
+    return;
+  }
+  api.dispatchEvent(new CustomEvent(eventType, { detail }));
+}
+
+/**
+ * Return the minimal queue status payload expected by ComfyUI's status listeners.
+ * @param {number} queueRemaining
+ * @returns {{ exec_info: { queue_remaining: number } }}
+ */
+function statusPayload(queueRemaining) {
+  return {
+    exec_info: {
+      queue_remaining: queueRemaining,
+    },
+  };
+}
+
+/**
+ * Start a synthetic running state so ComfyUI shows active execution while the Modal route is still preparing.
+ * @param {string} promptId
+ * @param {string[]} remoteNodeIds
+ */
+function beginSyntheticExecutionUi(promptId, remoteNodeIds) {
+  if (remoteNodeIds.length === 0 || syntheticPromptUiStates.has(promptId)) {
+    return;
+  }
+
+  const displayNode = remoteNodeIds[0];
+  syntheticPromptUiStates.set(promptId, { displayNode });
+  dispatchSyntheticApiEvent("status", {
+    status: statusPayload(1),
+  });
+  dispatchSyntheticApiEvent("execution_start", {
+    prompt_id: promptId,
+  });
+  dispatchSyntheticApiEvent("executing", {
+    prompt_id: promptId,
+    node: displayNode,
+    display_node: displayNode,
+  });
+}
+
+/**
+ * End a synthetic running state after real queue/execution events take over or the request fails.
+ * @param {string} promptId
+ * @param {boolean} failed
+ */
+function endSyntheticExecutionUi(promptId, failed = false) {
+  const syntheticState = syntheticPromptUiStates.get(promptId);
+  if (!syntheticState) {
+    return;
+  }
+
+  syntheticPromptUiStates.delete(promptId);
+  dispatchSyntheticApiEvent("status", {
+    status: statusPayload(0),
+  });
+  if (failed) {
+    dispatchSyntheticApiEvent("execution_error", {
+      prompt_id: promptId,
+      node_id: syntheticState.displayNode,
+      node_type: "ModalRemoteComponent",
+      executed: [],
+      exception_message: "Modal queue request failed before prompt execution started.",
+      exception_type: "ModalQueueError",
+      traceback: [],
+      current_inputs: [],
+      current_outputs: [],
+    });
+  }
+}
+
+/**
  * Register websocket listeners for Modal and execution status updates.
  */
 function registerExecutionListeners() {
@@ -445,15 +531,25 @@ function registerExecutionListeners() {
 
   api.addEventListener("modal_status", handleModalStatus);
   api.addEventListener("executing", (event) => handleExecutionPhase(event, STATE_EXECUTING));
-  api.addEventListener("executed", (event) => handleExecutionPhase(event, STATE_COMPLETE));
-  api.addEventListener("execution_error", (event) => handleExecutionPhase(event, STATE_ERROR));
-  api.addEventListener("execution_interrupted", (event) => handleExecutionPhase(event, STATE_ERROR));
+  api.addEventListener("executed", (event) => {
+    endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""));
+    handleExecutionPhase(event, STATE_COMPLETE);
+  });
+  api.addEventListener("execution_error", (event) => {
+    endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""), true);
+    handleExecutionPhase(event, STATE_ERROR);
+  });
+  api.addEventListener("execution_interrupted", (event) => {
+    endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""), true);
+    handleExecutionPhase(event, STATE_ERROR);
+  });
   api.addEventListener("execution_success", (event) => {
     const detail = eventDetail(event);
     const promptId = String(detail.prompt_id ?? "");
     if (!promptId) {
       return;
     }
+    endSyntheticExecutionUi(promptId);
     const promptState = modalPromptStates.get(promptId);
     if (!promptState) {
       return;
@@ -478,6 +574,7 @@ function patchQueuePrompt() {
     registerPromptComponents(promptId, remoteNodeIds, []);
     if (remoteNodeIds.length > 0) {
       setNodesPhase(remoteNodeIds, STATE_SETUP, promptId);
+      beginSyntheticExecutionUi(promptId, remoteNodeIds);
     }
 
     const body = {
@@ -515,6 +612,7 @@ function patchQueuePrompt() {
 
       return await response.json();
     } catch (error) {
+      endSyntheticExecutionUi(promptId, true);
       markQueueFailure(remoteNodeIds, promptId, error);
       throw error;
     }

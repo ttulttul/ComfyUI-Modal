@@ -187,6 +187,33 @@ def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
     assert folder_path_calls == [("custom_nodes", str(custom_nodes_root), True)]
 
 
+def test_modal_cloud_uses_comfy_prompt_executor_cache_defaults(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The remote worker should mirror ComfyUI's prompt executor cache configuration."""
+    fake_args = types.SimpleNamespace(
+        cache_lru=0,
+        cache_ram=4.0,
+        cache_none=False,
+    )
+    fake_cli_args_module = types.SimpleNamespace(args=fake_args)
+    fake_execution_module = types.SimpleNamespace(
+        CacheType=types.SimpleNamespace(
+            CLASSIC="classic",
+            LRU="lru",
+            RAM_PRESSURE="ram-pressure",
+            NONE="none",
+        )
+    )
+    monkeypatch.setitem(sys.modules, "comfy.cli_args", fake_cli_args_module)
+
+    cache_type, cache_args = modal_cloud_module._prompt_executor_cache_config(fake_execution_module)
+
+    assert cache_type == "ram-pressure"
+    assert cache_args == {"lru": 0, "ram": 4.0}
+
+
 class _BoundarySourceNode:
     """Simple source node used for subgraph execution tests."""
 
