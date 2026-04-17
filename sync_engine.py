@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,6 +113,8 @@ class ModalAssetSyncEngine:
     def sync_prompt_inputs(self, inputs: dict[str, Any]) -> tuple[dict[str, Any], list[SyncedAsset]]:
         """Rewrite file-like prompt inputs to mirrored storage paths."""
         synced_assets: list[SyncedAsset] = []
+        sync_started_at = time.perf_counter()
+        logger.info("Scanning prompt inputs for syncable assets.")
 
         def rewrite(value: Any) -> Any:
             if isinstance(value, str):
@@ -127,7 +130,13 @@ class ModalAssetSyncEngine:
                 return {str(key): rewrite(item) for key, item in value.items()}
             return value
 
-        return rewrite(inputs), synced_assets
+        rewritten_inputs = rewrite(inputs)
+        logger.info(
+            "Finished scanning prompt inputs in %.3fs with %d synced assets.",
+            time.perf_counter() - sync_started_at,
+            len(synced_assets),
+        )
+        return rewritten_inputs, synced_assets
 
     def sync_custom_nodes_directory(self) -> SyncedAsset | None:
         """Zip and mirror the local custom_nodes directory when available."""
@@ -136,19 +145,38 @@ class ModalAssetSyncEngine:
             logger.info("No custom_nodes directory detected for mirroring.")
             return None
 
+        sync_started_at = time.perf_counter()
+        logger.info("Hashing custom_nodes directory at %s", custom_nodes_dir)
         directory_hash = self._hash_directory(custom_nodes_dir)
+        logger.info(
+            "Finished hashing custom_nodes directory in %.3fs with digest %s.",
+            time.perf_counter() - sync_started_at,
+            directory_hash,
+        )
         archive_name = self.settings.custom_nodes_archive_name
         marker_path = f"/hashes/custom_nodes_{directory_hash}.done"
         remote_path = f"/custom_nodes/{directory_hash}_{archive_name}"
 
         if self.volume.exists(marker_path):
+            logger.info(
+                "Custom_nodes bundle already mirrored at %s after %.3fs total sync time.",
+                remote_path,
+                time.perf_counter() - sync_started_at,
+            )
             return SyncedAsset(
                 local_path=custom_nodes_dir,
                 remote_path=remote_path,
                 sha256=directory_hash,
             )
 
+        archive_started_at = time.perf_counter()
+        logger.info("Creating custom_nodes archive for %s", custom_nodes_dir)
         archive_path = self._create_archive(custom_nodes_dir)
+        logger.info(
+            "Created custom_nodes archive %s in %.3fs.",
+            archive_path,
+            time.perf_counter() - archive_started_at,
+        )
         try:
             logger.info("Syncing custom_nodes bundle from %s to %s", custom_nodes_dir, remote_path)
             self.volume.put_file(archive_path, remote_path)
@@ -161,6 +189,11 @@ class ModalAssetSyncEngine:
         finally:
             archive_path.unlink(missing_ok=True)
 
+        logger.info(
+            "Finished custom_nodes sync to %s in %.3fs total.",
+            remote_path,
+            time.perf_counter() - sync_started_at,
+        )
         return SyncedAsset(local_path=custom_nodes_dir, remote_path=remote_path, sha256=directory_hash)
 
     def _resolve_model_path(self, value: str) -> Path | None:
@@ -202,17 +235,27 @@ class ModalAssetSyncEngine:
 
     def _hash_directory(self, path: Path) -> str:
         """Compute a stable SHA256 digest for a directory tree."""
+        hash_started_at = time.perf_counter()
         digest = hashlib.sha256()
-        for child in sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix()):
+        files = sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix())
+        logger.info("Hashing %d files under %s", len(files), path)
+        for child in files:
             relative_path = child.relative_to(path).as_posix()
             digest.update(relative_path.encode("utf-8"))
             digest.update(b"\0")
             digest.update(self._hash_file(child).encode("ascii"))
             digest.update(b"\0")
+        logger.info(
+            "Computed directory hash for %s over %d files in %.3fs.",
+            path,
+            len(files),
+            time.perf_counter() - hash_started_at,
+        )
         return digest.hexdigest()
 
     def _create_archive(self, path: Path) -> Path:
         """Create a zip archive for the given directory tree."""
+        archive_started_at = time.perf_counter()
         with tempfile.NamedTemporaryFile(
             prefix="comfy-modal-custom-nodes-",
             suffix=".zip",
@@ -220,10 +263,17 @@ class ModalAssetSyncEngine:
         ) as handle:
             archive_path = Path(handle.name)
 
+        files = sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix())
+        logger.info("Archiving %d files from %s into %s", len(files), path, archive_path)
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for child in sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix()):
+            for child in files:
                 archive.write(child, arcname=child.relative_to(path))
 
+        logger.info(
+            "Finished archive build for %s in %.3fs.",
+            path,
+            time.perf_counter() - archive_started_at,
+        )
         return archive_path
 
     def _iter_files(self, path: Path) -> list[Path]:
