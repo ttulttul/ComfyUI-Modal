@@ -7,11 +7,10 @@ import io
 import json
 import logging
 import os
-import tempfile
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -143,6 +142,13 @@ class ModalAssetSyncEngine:
 
     volume: VolumeBackend
     settings: ModalSyncSettings
+    _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
+    _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
+    _hash_cache_dirty: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        """Load persistent metadata caches used to avoid repeated hashing work."""
+        self._hash_cache = self._load_hash_cache()
 
     @classmethod
     def from_environment(cls, settings: ModalSyncSettings | None = None) -> "ModalAssetSyncEngine":
@@ -246,25 +252,27 @@ class ModalAssetSyncEngine:
                 sha256=directory_hash,
             )
 
-        archive_started_at = time.perf_counter()
-        logger.info("Creating custom_nodes archive for %s", custom_nodes_dir)
-        archive_path = self._create_archive(custom_nodes_dir)
-        logger.info(
-            "Created custom_nodes archive %s in %.3fs.",
-            archive_path,
-            time.perf_counter() - archive_started_at,
-        )
-        try:
-            logger.info("Syncing custom_nodes bundle from %s to %s", custom_nodes_dir, remote_path)
-            self.volume.put_file(archive_path, remote_path)
-            self.volume.put_bytes(
-                json.dumps({"source": str(custom_nodes_dir), "remote_path": remote_path}).encode(
-                    "utf-8"
-                ),
-                marker_path,
+        archive_path = self._cached_custom_nodes_archive_path(directory_hash)
+        if archive_path.exists():
+            logger.info("Reusing cached custom_nodes archive %s for digest %s.", archive_path, directory_hash)
+        else:
+            archive_started_at = time.perf_counter()
+            logger.info("Creating custom_nodes archive for %s", custom_nodes_dir)
+            self._create_archive(custom_nodes_dir, archive_path)
+            logger.info(
+                "Created custom_nodes archive %s in %.3fs.",
+                archive_path,
+                time.perf_counter() - archive_started_at,
             )
-        finally:
-            archive_path.unlink(missing_ok=True)
+
+        logger.info("Syncing custom_nodes bundle from %s to %s", custom_nodes_dir, remote_path)
+        self.volume.put_file(archive_path, remote_path)
+        self.volume.put_bytes(
+            json.dumps({"source": str(custom_nodes_dir), "remote_path": remote_path}).encode(
+                "utf-8"
+            ),
+            marker_path,
+        )
 
         logger.info(
             "Finished custom_nodes sync to %s in %.3fs total.",
@@ -275,13 +283,21 @@ class ModalAssetSyncEngine:
 
     def _resolve_model_path(self, value: str) -> Path | None:
         """Resolve a prompt string into a local model file path when possible."""
+        if value in self._path_resolution_cache:
+            cached = self._path_resolution_cache[value]
+            return Path(cached) if cached is not None else None
+
         path = Path(value).expanduser()
         if path.suffix.lower() not in _SYNC_EXTENSIONS:
+            self._path_resolution_cache[value] = None
             return None
         if path.is_file():
-            return path.resolve()
+            resolved = path.resolve()
+            self._path_resolution_cache[value] = str(resolved)
+            return resolved
 
         if os.path.isabs(value):
+            self._path_resolution_cache[value] = None
             return None
 
         try:
@@ -293,54 +309,97 @@ class ModalAssetSyncEngine:
             for folder_name in folder_paths.folder_names_and_paths:
                 full_path = folder_paths.get_full_path(folder_name, value)
                 if full_path is not None:
-                    return Path(full_path).resolve()
+                    resolved = Path(full_path).resolve()
+                    self._path_resolution_cache[value] = str(resolved)
+                    return resolved
 
         if self.settings.comfyui_root is not None:
             candidate = self.settings.comfyui_root / value
             if candidate.is_file():
-                return candidate.resolve()
+                resolved = candidate.resolve()
+                self._path_resolution_cache[value] = str(resolved)
+                return resolved
 
+        self._path_resolution_cache[value] = None
         return None
 
     def _hash_file(self, path: Path) -> str:
         """Compute the SHA256 digest for a file."""
+        resolved_path = path.resolve()
+        stat_result = resolved_path.stat()
+        cache_key = str(resolved_path)
+        cache_entry = self._hash_cache.get(cache_key)
+        if (
+            cache_entry is not None
+            and cache_entry.get("kind") == "file"
+            and cache_entry.get("size") == stat_result.st_size
+            and cache_entry.get("mtime_ns") == stat_result.st_mtime_ns
+        ):
+            return str(cache_entry["sha256"])
+
         digest = hashlib.sha256()
-        with path.open("rb") as handle:
+        with resolved_path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-        return digest.hexdigest()
+        sha256 = digest.hexdigest()
+        self._hash_cache[cache_key] = {
+            "kind": "file",
+            "size": stat_result.st_size,
+            "mtime_ns": stat_result.st_mtime_ns,
+            "sha256": sha256,
+        }
+        self._mark_hash_cache_dirty()
+        return sha256
 
     def _hash_directory(self, path: Path) -> str:
         """Compute a stable SHA256 digest for a directory tree."""
         hash_started_at = time.perf_counter()
+        resolved_path = path.resolve()
         digest = hashlib.sha256()
-        files = sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix())
-        logger.info("Hashing %d files under %s", len(files), path)
+        files = sorted(self._iter_files(resolved_path), key=lambda item: item.relative_to(resolved_path).as_posix())
+        logger.info("Hashing %d files under %s", len(files), resolved_path)
+        fingerprint = self._directory_fingerprint(resolved_path, files)
+        cache_key = f"dir::{resolved_path}"
+        cache_entry = self._hash_cache.get(cache_key)
+        if (
+            cache_entry is not None
+            and cache_entry.get("kind") == "dir"
+            and cache_entry.get("fingerprint") == fingerprint
+        ):
+            logger.info(
+                "Reused cached directory hash for %s over %d files in %.3fs.",
+                resolved_path,
+                len(files),
+                time.perf_counter() - hash_started_at,
+            )
+            return str(cache_entry["sha256"])
+
         for child in files:
-            relative_path = child.relative_to(path).as_posix()
+            relative_path = child.relative_to(resolved_path).as_posix()
             digest.update(relative_path.encode("utf-8"))
             digest.update(b"\0")
             digest.update(self._hash_file(child).encode("ascii"))
             digest.update(b"\0")
+        sha256 = digest.hexdigest()
+        self._hash_cache[cache_key] = {
+            "kind": "dir",
+            "fingerprint": fingerprint,
+            "sha256": sha256,
+        }
+        self._mark_hash_cache_dirty()
         logger.info(
             "Computed directory hash for %s over %d files in %.3fs.",
-            path,
+            resolved_path,
             len(files),
             time.perf_counter() - hash_started_at,
         )
-        return digest.hexdigest()
+        return sha256
 
-    def _create_archive(self, path: Path) -> Path:
+    def _create_archive(self, path: Path, archive_path: Path) -> Path:
         """Create a zip archive for the given directory tree."""
         archive_started_at = time.perf_counter()
-        with tempfile.NamedTemporaryFile(
-            prefix="comfy-modal-custom-nodes-",
-            suffix=".zip",
-            delete=False,
-        ) as handle:
-            archive_path = Path(handle.name)
-
         files = sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix())
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
         logger.info("Archiving %d files from %s into %s", len(files), path, archive_path)
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for child in files:
@@ -352,6 +411,63 @@ class ModalAssetSyncEngine:
             time.perf_counter() - archive_started_at,
         )
         return archive_path
+
+    def _cached_custom_nodes_archive_path(self, directory_hash: str) -> Path:
+        """Return the deterministic local path for a digest-keyed custom_nodes archive."""
+        return (
+            self.settings.local_storage_root
+            / "custom_nodes_archives"
+            / f"{directory_hash}_{self.settings.custom_nodes_archive_name}"
+        )
+
+    def _directory_fingerprint(self, root: Path, files: list[Path]) -> str:
+        """Return a metadata-only fingerprint for a directory tree."""
+        digest = hashlib.sha256()
+        for child in files:
+            stat_result = child.stat()
+            digest.update(child.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(stat_result.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(stat_result.st_mtime_ns).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _hash_cache_path(self) -> Path:
+        """Return the on-disk metadata cache path."""
+        return self.settings.local_storage_root / "metadata" / "hash_cache.json"
+
+    def _load_hash_cache(self) -> dict[str, dict[str, Any]]:
+        """Load the persistent hash cache from disk when available."""
+        cache_path = self._hash_cache_path()
+        if not cache_path.exists():
+            return {}
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Hash cache at %s is unreadable; rebuilding it from scratch.", cache_path)
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in payload.items()
+            if isinstance(value, dict)
+        }
+
+    def _mark_hash_cache_dirty(self) -> None:
+        """Persist the hash cache after it changes."""
+        self._hash_cache_dirty = True
+        self._save_hash_cache()
+
+    def _save_hash_cache(self) -> None:
+        """Write the persistent hash cache to disk."""
+        if not self._hash_cache_dirty:
+            return
+        cache_path = self._hash_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(self._hash_cache, sort_keys=True), encoding="utf-8")
+        self._hash_cache_dirty = False
 
     def _iter_files(self, path: Path) -> list[Path]:
         """Yield files from a directory tree while skipping cache folders."""
