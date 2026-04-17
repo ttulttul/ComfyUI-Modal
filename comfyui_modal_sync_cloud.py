@@ -484,6 +484,7 @@ def _comfyui_runtime_packages() -> tuple[str, ...]:
     return (
         "aiohttp",
         "av",
+        "comfy-kitchen>=0.2.7",
         "einops",
         "numpy",
         "opencv-python-headless",

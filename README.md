@@ -97,6 +97,7 @@ Important distinction:
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true` can re-enable the old temporary `app.run()` path if you explicitly want it
 - the actual Modal cloud service now lives in a stable importable module, [comfyui_modal_sync_cloud.py](/home/ksimpson/git/ComfyUI-Modal/comfyui_modal_sync_cloud.py), because ComfyUI’s custom-node loader does not assign Modal-safe module names to node-pack directories
 - the Modal image now installs the core ComfyUI runtime Python packages automatically, but remote execution may still surface additional environment gaps as broader workflows are exercised
+- the Modal image now includes `comfy-kitchen>=0.2.7` because ComfyUI's FP8/FP4 weight-loading path crashes with `NoneType.Params` if quantized layout support is missing
 - the Modal image now pins `torch==2.10.0`, `torchvision==0.25.0`, and `torchaudio==2.10.0` from PyTorch's CUDA 12.8 wheel index instead of floating `latest`, which keeps the remote runtime aligned with the local ComfyUI `+cu128` stack and avoids newer wheel/driver mismatches
 - the deployed remote class now enables Modal memory snapshots by default so later cold starts can skip more initialization work after the first deployed invocations; GPU memory snapshots remain opt-in because they are still an alpha feature in Modal
 - the Modal image filter now preserves internal ComfyUI Python packages such as `comfy/ldm/models` while still excluding top-level runtime asset folders like `models/` and `output/`
