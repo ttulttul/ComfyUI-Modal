@@ -44,6 +44,7 @@ _CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
 _COMFY_RUNTIME_INIT_LOCK = threading.Lock()
 _COMFY_RUNTIME_BASE_INITIALIZED = False
 _COMFY_RUNTIME_CUSTOM_NODE_ROOTS: set[str] = set()
+_EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
 
 try:
     import modal  # type: ignore
@@ -66,6 +67,82 @@ class _NullPromptServer:
     def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
         """Discard PromptExecutor progress and status events."""
         logger.debug("Suppressed remote prompt event %s for client %s.", event, client_id)
+
+
+class _TracingPromptServer(_NullPromptServer):
+    """PromptExecutor server stub that records coarse per-node execution timings."""
+
+    def __init__(self, prompt_id: str, prompt: dict[str, Any]) -> None:
+        """Initialize timing state for a specific prompt execution."""
+        super().__init__()
+        self.prompt_id = prompt_id
+        self.prompt = prompt
+        self._active_node_id: str | None = None
+        self._active_node_started_at: float | None = None
+
+    def _classify_node_role(self, class_type: str) -> str:
+        """Return a coarse role name for a node class."""
+        normalized = class_type.lower()
+        if "loader" in normalized or normalized in {"clipvisionencode"}:
+            return "model_load"
+        if "ksampler" in normalized or "sampler" in normalized:
+            return "sampling"
+        if "encode" in normalized:
+            return "conditioning"
+        return "node"
+
+    def _log_node_finish(self, reason: str) -> None:
+        """Emit a timing line for the currently active node when one is running."""
+        if self._active_node_id is None or self._active_node_started_at is None:
+            return
+
+        node_id = self._active_node_id
+        node_info = self.prompt.get(node_id, {})
+        class_type = str(node_info.get("class_type", "<unknown>"))
+        role = self._classify_node_role(class_type)
+        elapsed_seconds = time.perf_counter() - self._active_node_started_at
+        _emit_cloud_info(
+            "Remote node %s class_type=%s role=%s finished in %.3fs reason=%s",
+            node_id,
+            class_type,
+            role,
+            elapsed_seconds,
+            reason,
+        )
+        self._active_node_id = None
+        self._active_node_started_at = None
+
+    def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
+        """Track per-node timing transitions from PromptExecutor progress events."""
+        if event == "executing":
+            next_node_id = data.get("node")
+            if next_node_id != self._active_node_id:
+                self._log_node_finish(reason="next_node")
+            if next_node_id is not None and next_node_id != self._active_node_id:
+                node_info = self.prompt.get(str(next_node_id), {})
+                class_type = str(node_info.get("class_type", "<unknown>"))
+                role = self._classify_node_role(class_type)
+                self._active_node_id = str(next_node_id)
+                self._active_node_started_at = time.perf_counter()
+                _emit_cloud_info(
+                    "Remote node %s class_type=%s role=%s started",
+                    self._active_node_id,
+                    class_type,
+                    role,
+                )
+            return
+
+        if event == "executed":
+            executed_node_id = data.get("node")
+            if executed_node_id is not None and str(executed_node_id) == self._active_node_id:
+                self._log_node_finish(reason="executed")
+            return
+
+        if event in {"execution_error", "execution_interrupted", "execution_success"}:
+            self._log_node_finish(reason=event)
+            return
+
+        super().send_sync(event, data, client_id)
 
 
 def _build_cloud_log_formatter() -> logging.Formatter:
@@ -109,8 +186,8 @@ def _cloud_formatter() -> logging.Formatter:
 
 def _emit_cloud_info(message: str, *args: Any) -> None:
     """Emit an info line through logging and mirror it to stdout inside Modal containers."""
-    logger.info(message, *args)
     if not _is_modal_container_runtime():
+        logger.info(message, *args)
         return
 
     record = logger.makeRecord(
@@ -193,7 +270,18 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
         logger.warning("Custom nodes bundle %s was not found in any known storage root.", bundle_path)
         return None
 
-    extraction_root = Path(tempfile.gettempdir()) / "comfy-modal-sync-custom-nodes"
+    cached_extraction_root = _EXTRACTED_CUSTOM_NODE_BUNDLES.get(local_bundle.name)
+    if cached_extraction_root is not None and cached_extraction_root.exists():
+        if str(cached_extraction_root) not in sys.path:
+            sys.path.insert(0, str(cached_extraction_root))
+        _emit_cloud_info(
+            "Reusing extracted remote custom_nodes bundle from %s for %s.",
+            cached_extraction_root,
+            local_bundle.name,
+        )
+        return cached_extraction_root
+
+    extraction_root = Path(tempfile.gettempdir()) / "comfy-modal-sync-custom-nodes" / local_bundle.stem
     extraction_root.mkdir(parents=True, exist_ok=True)
     with _timed_phase("extract_custom_nodes_bundle", bundle=local_bundle.name):
         with zipfile.ZipFile(local_bundle, "r") as archive:
@@ -201,6 +289,7 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
 
     if str(extraction_root) not in sys.path:
         sys.path.insert(0, str(extraction_root))
+    _EXTRACTED_CUSTOM_NODE_BUNDLES[local_bundle.name] = extraction_root
     logger.info("Extracted remote custom_nodes bundle to %s", extraction_root)
     return extraction_root
 
@@ -502,9 +591,10 @@ def _execute_subgraph_prompt(
         cache_type, cache_args = _prompt_executor_cache_config(execution)
 
     with _temporary_node_mapping(None), _patched_folder_paths_absolute_lookup():
+        prompt_server = _TracingPromptServer(component_id, prompt)
         with _timed_phase("create_prompt_executor", component=component_id):
             executor = execution.PromptExecutor(
-                _NullPromptServer(),
+                prompt_server,
                 cache_type=cache_type,
                 cache_args=cache_args,
             )
@@ -585,7 +675,7 @@ def _should_ignore_comfyui_path(path: Path) -> bool:
     if {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"} & set(parts):
         return True
 
-    if parts[0] in {"input", "models", "output", "temp", "user"}:
+    if parts[0] in {"custom_nodes", "input", "models", "output", "temp", "user"}:
         return True
 
     return path.suffix.lower() in {".bin", ".ckpt", ".log", ".pt", ".pyc", ".pyo", ".safetensors", ".swp", ".tmp"}
@@ -682,6 +772,9 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
             with _timed_phase("remote_engine_setup"):
+                with _timed_phase("prewarm_comfy_runtime"):
+                    _ensure_comfy_runtime_initialized(None)
+                    _load_execution_module()
                 logger.info("RemoteEngine setup complete.")
 
         @modal.method()
