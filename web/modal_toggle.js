@@ -22,6 +22,7 @@ const STATE_ERROR = "error";
 const ERROR_CLEAR_DELAY_MS = 5000;
 
 const modalNodeStates = new Map();
+const modalNodeProgress = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
 const syntheticPromptUiStates = new Map();
@@ -431,6 +432,9 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     if (phase === STATE_ERROR) {
       scheduleNodeClear(currentNodeId, promptId, ERROR_CLEAR_DELAY_MS);
     }
+    if (phase === STATE_COMPLETE || phase === STATE_ERROR) {
+      clearNodeProgress(currentNodeId, promptId);
+    }
     for (const ancestorNodeId of ancestorNodeIds(currentNodeId)) {
       affectedAncestorNodeIds.add(ancestorNodeId);
     }
@@ -564,6 +568,53 @@ function setPromptActiveNode(promptId, activeNodeId) {
 }
 
 /**
+ * Remove stored numeric progress for one node and its visible ancestors.
+ * @param {string} nodeIdValue
+ * @param {string | undefined} promptId
+ */
+function clearNodeProgress(nodeIdValue, promptId) {
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+  for (const progressNodeId of progressNodeIds) {
+    const progressState = modalNodeProgress.get(progressNodeId);
+    if (!progressState) {
+      continue;
+    }
+    if (promptId && progressState.promptId !== promptId) {
+      continue;
+    }
+    modalNodeProgress.delete(progressNodeId);
+  }
+}
+
+/**
+ * Record numeric progress for one node and its visible ancestors.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @param {number} value
+ * @param {number} maxValue
+ */
+function setNodeProgress(nodeIdValue, promptId, value, maxValue) {
+  const safeMaxValue = Math.max(1, Number(maxValue) || 1);
+  const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+
+  for (const progressNodeId of progressNodeIds) {
+    if (!shouldApplyPromptState(progressNodeId, promptId)) {
+      continue;
+    }
+    modalNodeProgress.set(progressNodeId, {
+      promptId,
+      value: safeValue,
+      max: safeMaxValue,
+      updatedAt: nowMs(),
+    });
+  }
+
+  ensureAnimationLoop();
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+/**
  * Return remote component node ids for an executing proxy node event.
  * @param {string} promptId
  * @param {string} representativeNodeId
@@ -614,9 +665,11 @@ function getRemoteVisualState(node) {
     return state;
   }
   const promptState = modalPromptStates.get(state.promptId);
+  const progressState = modalNodeProgress.get(nodeId(node)) ?? null;
   return {
     ...state,
     isActiveRemoteNode: promptState?.activeNodeId === nodeId(node),
+    progress: progressState?.promptId === state.promptId ? progressState : null,
   };
 }
 
@@ -691,6 +744,26 @@ function drawRemoteNodeDecoration(node, ctx) {
     node.size[1] + titleHeight + borderWidth,
   );
   ctx.restore();
+
+  if (!state?.progress || state.phase !== STATE_ACTIVE) {
+    return;
+  }
+
+  const progressRatio = Math.max(0, Math.min(1, state.progress.value / state.progress.max));
+  const progressWidth = Math.max(0, (node.size[0] + borderWidth * 2) * progressRatio);
+  const progressY = node.size[1] - Math.max(10 / scale, borderWidth * 2);
+
+  ctx.save();
+  ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+  ctx.fillRect(-borderWidth, progressY, node.size[0] + borderWidth * 2, 8 / scale);
+  ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
+  ctx.fillRect(-borderWidth, progressY, progressWidth, 8 / scale);
+  ctx.fillStyle = "#f8fafc";
+  ctx.font = `${Math.max(11 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`${Math.round(progressRatio * 100)}%`, node.size[0], progressY - 2 / scale);
+  ctx.restore();
 }
 
 /**
@@ -758,6 +831,9 @@ function handleModalStatus(event) {
     setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
     setPromptActiveNode(promptId, null);
+    for (const nodeIdValue of nodeIds) {
+      clearNodeProgress(nodeIdValue, promptId);
+    }
     setNodesPhase(nodeIds, STATE_ERROR, promptId, detail.error_message);
     return;
   }
@@ -770,6 +846,7 @@ function handleModalStatus(event) {
     setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length);
     setNodesPhase(nodeIds, STATE_READY, promptId);
     if (previousActiveNodeId && previousActiveNodeId !== nextActiveNodeId) {
+      clearNodeProgress(previousActiveNodeId, promptId);
       setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
     }
     if (nextActiveNodeId) {
@@ -782,12 +859,38 @@ function handleModalStatus(event) {
   if (detail.phase === "execution_success") {
     promptState.hasStreamedProgress = true;
     if (promptState.activeNodeId) {
+      clearNodeProgress(promptState.activeNodeId, promptId);
       setNodesPhase([promptState.activeNodeId], STATE_COMPLETE, promptId);
     }
     setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_COMPLETE, promptId);
     return;
   }
+}
+
+/**
+ * Apply a streamed numeric Modal node-progress event.
+ * @param {CustomEvent} event
+ */
+function handleModalProgress(event) {
+  const detail = eventDetail(event);
+  const promptId = String(detail.prompt_id ?? "");
+  const progressNodeId = String(detail.display_node_id ?? detail.node_id ?? "");
+  if (!promptId || !progressNodeId) {
+    return;
+  }
+
+  const promptState = ensurePromptState(promptId);
+  promptState.hasStreamedProgress = true;
+  setPromptActiveNode(promptId, progressNodeId);
+  setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
+  setNodesPhase([progressNodeId], STATE_ACTIVE, promptId);
+  setNodeProgress(
+    progressNodeId,
+    promptId,
+    Number(detail.value ?? 0),
+    Number(detail.max ?? 1),
+  );
 }
 
 /**
@@ -824,11 +927,17 @@ function handleExecutionPhase(event, phase) {
     setGlobalStatusPhase(promptId, STATE_ERROR, componentNodeIds.length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
     setPromptActiveNode(promptId, null);
+    for (const nodeIdValue of componentNodeIds) {
+      clearNodeProgress(nodeIdValue, promptId);
+    }
     setNodesPhase(componentNodeIds, STATE_ERROR, promptId, detail.exception_message);
     return;
   }
   if (phase === STATE_COMPLETE) {
     setPromptActiveNode(promptId, null);
+    for (const nodeIdValue of componentNodeIds) {
+      clearNodeProgress(nodeIdValue, promptId);
+    }
     setNodesPhase(componentNodeIds, STATE_COMPLETE, promptId, detail.exception_message);
   }
 }
@@ -846,6 +955,7 @@ function clearPromptRemoteStates(promptId) {
   }
   for (const remoteNodeId of promptState.remoteNodeIds) {
     clearNodeTimer(remoteNodeId);
+    clearNodeProgress(remoteNodeId, promptId);
     const currentState = modalNodeStates.get(remoteNodeId);
     if (currentState?.promptId === promptId) {
       modalNodeStates.delete(remoteNodeId);
@@ -853,6 +963,7 @@ function clearPromptRemoteStates(promptId) {
   }
   for (const ancestorNodeId of promptState.descendantNodeIdsByAncestor.keys()) {
     clearNodeTimer(ancestorNodeId);
+    clearNodeProgress(ancestorNodeId, promptId);
     const currentState = modalNodeStates.get(ancestorNodeId);
     if (currentState?.promptId === promptId) {
       modalNodeStates.delete(ancestorNodeId);
@@ -974,6 +1085,7 @@ function registerExecutionListeners() {
   }
 
   api.addEventListener("modal_status", handleModalStatus);
+  api.addEventListener("modal_progress", handleModalProgress);
   api.addEventListener("executing", (event) => handleExecutionPhase(event, EXECUTION_PHASE));
   api.addEventListener("executed", (event) => {
     endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""));

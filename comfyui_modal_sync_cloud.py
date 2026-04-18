@@ -82,6 +82,7 @@ class _NullPromptServer:
         """Initialize the no-op prompt server state."""
         self.client_id: str | None = None
         self.last_node_id: str | None = None
+        self.last_prompt_id: str | None = None
 
     def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
         """Discard PromptExecutor progress and status events."""
@@ -131,6 +132,7 @@ class _TracingPromptServer(_NullPromptServer):
         self._status_callback = status_callback
         self._active_node_id: str | None = None
         self._active_node_started_at: float | None = None
+        self.last_prompt_id = prompt_id
 
     def _classify_node_role(self, class_type: str) -> str:
         """Return a coarse role name for a node class."""
@@ -185,12 +187,56 @@ class _TracingPromptServer(_NullPromptServer):
                     )
                 self._active_node_id = str(next_node_id)
                 self._active_node_started_at = time.perf_counter()
+                self.last_node_id = self._active_node_id
                 _emit_cloud_info(
                     "Remote node %s class_type=%s role=%s started",
                     self._active_node_id,
                     class_type,
                     role,
                 )
+            return
+
+        if event == "progress_state":
+            if self._status_callback is None:
+                return
+
+            nodes_payload = data.get("nodes")
+            if not isinstance(nodes_payload, dict):
+                return
+
+            tracked_node_id = self._active_node_id
+            tracked_node_state: dict[str, Any] | None = None
+            if tracked_node_id is not None:
+                candidate_state = nodes_payload.get(tracked_node_id)
+                if isinstance(candidate_state, dict):
+                    tracked_node_state = candidate_state
+
+            if tracked_node_state is None:
+                for node_state in nodes_payload.values():
+                    if isinstance(node_state, dict) and node_state.get("state") == "running":
+                        tracked_node_state = node_state
+                        break
+
+            if tracked_node_state is None:
+                return
+
+            display_node_id = tracked_node_state.get("display_node_id")
+            real_node_id = tracked_node_state.get("real_node_id")
+            reported_node_id = display_node_id or real_node_id or tracked_node_state.get("node_id")
+            if reported_node_id is None:
+                return
+
+            self._status_callback(
+                {
+                    "event_type": "node_progress",
+                    "node_id": str(reported_node_id),
+                    "display_node_id": (
+                        str(display_node_id) if display_node_id is not None else None
+                    ),
+                    "value": float(tracked_node_state.get("value", 0.0)),
+                    "max": float(tracked_node_state.get("max", 1.0)),
+                }
+            )
             return
 
         if event == "executed":
@@ -425,6 +471,44 @@ def _ensure_headless_prompt_server_instance() -> None:
 
     prompt_server_class.instance = _HeadlessPromptServerInstance()
     logger.info("Installed headless PromptServer.instance for remote custom-node initialization.")
+
+
+@contextmanager
+def _temporary_progress_hook(prompt_server: _NullPromptServer) -> Iterator[None]:
+    """Install a ComfyUI progress hook so remote samplers emit numeric progress updates."""
+    import comfy.utils
+    from comfy_execution.progress import get_progress_state
+    from comfy_execution.utils import get_executing_context
+
+    previous_hook = comfy.utils.PROGRESS_BAR_HOOK
+
+    def hook(
+        value: float,
+        total: float,
+        preview_image: Any,
+        prompt_id: str | None = None,
+        node_id: str | None = None,
+    ) -> None:
+        """Mirror ComfyUI progress-bar updates into the headless progress registry."""
+        executing_context = get_executing_context()
+        if prompt_id is None and executing_context is not None:
+            prompt_id = executing_context.prompt_id
+        if node_id is None and executing_context is not None:
+            node_id = executing_context.node_id
+        if prompt_id is None:
+            prompt_id = prompt_server.last_prompt_id
+        if node_id is None:
+            node_id = prompt_server.last_node_id
+        if node_id is None:
+            return
+
+        get_progress_state().update_progress(str(node_id), value, total, preview_image)
+
+    comfy.utils.set_progress_bar_global_hook(hook)
+    try:
+        yield
+    finally:
+        comfy.utils.set_progress_bar_global_hook(previous_hook)
 
 
 def _ensure_default_custom_nodes_dir() -> Path | None:
@@ -848,12 +932,15 @@ def _execute_subgraph_prompt(
         execution = _load_execution_module()
         cache_type, cache_args = _prompt_executor_cache_config(execution)
 
-    with _temporary_node_mapping(None), _patched_folder_paths_absolute_lookup():
-        prompt_server = _TracingPromptServer(
+    with (
+        _temporary_node_mapping(None),
+        _patched_folder_paths_absolute_lookup(),
+        _temporary_progress_hook(prompt_server := _TracingPromptServer(
             component_id,
             prompt,
             status_callback=status_callback,
-        )
+        )),
+    ):
         with _timed_phase("create_prompt_executor", component=component_id):
             executor_state = _get_or_create_prompt_executor_state(
                 execution=execution,

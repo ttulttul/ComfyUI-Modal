@@ -523,6 +523,34 @@ def _emit_local_modal_status(
     prompt_server.send_sync("modal_status", payload, client_id)
 
 
+def _emit_local_modal_progress(
+    *,
+    prompt_id: str | None,
+    client_id: str | None,
+    node_id: str,
+    value: float,
+    max_value: float,
+    display_node_id: str | None = None,
+) -> None:
+    """Forward remote numeric node progress into the local ComfyUI websocket stream."""
+    if client_id is None:
+        return
+
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+
+    payload: dict[str, Any] = {
+        "prompt_id": prompt_id,
+        "node_id": node_id,
+        "value": float(value),
+        "max": float(max_value),
+    }
+    if display_node_id is not None:
+        payload["display_node_id"] = display_node_id
+    prompt_server.send_sync("modal_progress", payload, client_id)
+
+
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
@@ -551,6 +579,29 @@ def _consume_remote_payload_stream(
     for stream_event in stream_events:
         event_kind = str(stream_event.get("kind", ""))
         if event_kind == "progress":
+            if stream_event.get("event_type") == "node_progress":
+                reported_node_id = stream_event.get("node_id")
+                if reported_node_id is not None:
+                    logger.debug(
+                        "Forwarding streamed Modal node progress for component=%s node_id=%s value=%s max=%s.",
+                        payload.get("component_id"),
+                        reported_node_id,
+                        stream_event.get("value"),
+                        stream_event.get("max"),
+                    )
+                    _emit_local_modal_progress(
+                        prompt_id=prompt_id,
+                        client_id=client_id,
+                        node_id=str(reported_node_id),
+                        value=float(stream_event.get("value", 0.0)),
+                        max_value=float(stream_event.get("max", 1.0)),
+                        display_node_id=(
+                            str(stream_event["display_node_id"])
+                            if stream_event.get("display_node_id") is not None
+                            else None
+                        ),
+                    )
+                continue
             logger.info(
                 "Forwarding streamed Modal progress for component=%s phase=%s active_node_id=%s.",
                 payload.get("component_id"),

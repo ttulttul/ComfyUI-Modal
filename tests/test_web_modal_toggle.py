@@ -75,6 +75,18 @@ def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
     assert "if (promptState.hasStreamedProgress && phase !== STATE_ERROR)" in source
 
 
+def test_streamed_modal_node_progress_updates_active_overlay() -> None:
+    """The frontend should listen for numeric Modal node progress and render it on the node."""
+    source = _modal_toggle_source()
+
+    assert 'api.addEventListener("modal_progress", handleModalProgress);' in source
+    assert "function handleModalProgress(event)" in source
+    assert "function setNodeProgress(nodeIdValue, promptId, value, maxValue)" in source
+    assert "function clearNodeProgress(nodeIdValue, promptId)" in source
+    assert "state?.progress" in source
+    assert 'ctx.fillText(`${Math.round(progressRatio * 100)}%`' in source
+
+
 def test_prompt_cleanup_prunes_orphaned_global_status_entries() -> None:
     """Workflow cleanup should remove stale global badge states once prompt state is gone."""
     source = _modal_toggle_source()

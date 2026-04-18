@@ -164,6 +164,8 @@ The frontend shows remote state directly on the canvas:
 - steady green border: finished for the current run
 - red border: queue-time or execution failure
 
+When a remote node reports numeric progress through ComfyUI's progress hooks, the active Modal-marked node now also shows an in-node progress bar and percentage locally while the remote work is running. That is especially useful for sampler-style nodes such as `KSampler`.
+
 The extension also keeps a global activity badge visible during queue-time sync and remote execution, including the period before the prompt is formally queued.
 
 ### 6. Asset sync expectations
