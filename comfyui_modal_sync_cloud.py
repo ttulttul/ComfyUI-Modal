@@ -1348,7 +1348,6 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
         "volumes": {settings.remote_storage_root: vol},
         "scaledown_window": settings.scaledown_window_seconds,
         "min_containers": settings.min_containers,
-        "allow_concurrent_inputs": 2,
         "image": image,
         "enable_memory_snapshot": settings.enable_memory_snapshot,
     }
@@ -1433,6 +1432,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         )
 
     @app.cls(**_remote_engine_cls_options(settings, vol, image))
+    @modal.concurrent(max_inputs=2)
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
 
