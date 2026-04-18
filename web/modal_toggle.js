@@ -136,6 +136,43 @@ function pruneGlobalStatusStates() {
 }
 
 /**
+ * Return all current node states for a prompt id.
+ * @param {string} promptId
+ * @returns {Array<{ phase: string, promptId: string }>}
+ */
+function promptNodeStates(promptId) {
+  return Array.from(modalNodeStates.values()).filter((state) => state?.promptId === promptId);
+}
+
+/**
+ * Derive the effective global phase for one prompt from its live node state.
+ * @param {string} promptId
+ * @param {string} phase
+ * @returns {string}
+ */
+function effectiveGlobalStatusPhase(promptId, phase) {
+  const promptState = modalPromptStates.get(promptId);
+  const nodeStates = promptNodeStates(promptId);
+
+  if (phase === STATE_ERROR) {
+    return STATE_ERROR;
+  }
+  if (nodeStates.some((state) => state.phase === STATE_ERROR)) {
+    return STATE_ERROR;
+  }
+  if (promptState?.hasStreamedProgress || promptState?.activeNodeId) {
+    return EXECUTION_PHASE;
+  }
+  if (nodeStates.some((state) => state.phase === STATE_ACTIVE)) {
+    return EXECUTION_PHASE;
+  }
+  if (nodeStates.some((state) => state.phase === STATE_READY || state.phase === STATE_COMPLETE)) {
+    return EXECUTION_PHASE;
+  }
+  return phase;
+}
+
+/**
  * Return the most important active global Modal state.
  * @returns {{ phase: string, promptId: string, nodeCount: number } | null}
  */
@@ -147,7 +184,7 @@ function currentGlobalStatus() {
 
   const phases = Array.from(modalGlobalStatusStates.entries()).map(([promptId, state]) => ({
     promptId,
-    phase: state.phase,
+    phase: effectiveGlobalStatusPhase(promptId, state.phase),
     nodeCount: state.nodeCount,
     updatedAt: state.updatedAt,
   }));
@@ -239,7 +276,7 @@ function setGlobalStatusPhase(promptId, phase, nodeCount) {
     return;
   }
   modalGlobalStatusStates.set(promptId, {
-    phase,
+    phase: effectiveGlobalStatusPhase(promptId, phase),
     nodeCount: Math.max(1, Number(nodeCount) || 1),
     updatedAt: nowMs(),
   });
@@ -256,6 +293,17 @@ function clearGlobalStatusPhase(promptId) {
   }
   modalGlobalStatusStates.delete(promptId);
   refreshGlobalStatusElement();
+}
+
+/**
+ * Refresh the badge and canvas when the tab regains visibility.
+ */
+function refreshModalUiAfterVisibilityChange() {
+  refreshGlobalStatusElement();
+  if (Array.from(modalNodeStates.values()).length > 0) {
+    ensureAnimationLoop();
+  }
+  app.graph?.setDirtyCanvas(true, true);
 }
 
 /**
@@ -949,6 +997,16 @@ function registerExecutionListeners() {
     clearGlobalStatusPhase(promptId);
     clearPromptRemoteStates(promptId);
   });
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        refreshModalUiAfterVisibilityChange();
+      }
+    });
+  }
+  if (typeof window !== "undefined") {
+    window.addEventListener("focus", refreshModalUiAfterVisibilityChange);
+  }
   api.__modalExecutionListenersRegistered = true;
 }
 

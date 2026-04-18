@@ -39,6 +39,7 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "Modal workflow running on" in source
     assert "installGlobalStatusStyles()" in source
     assert "function pruneGlobalStatusStates()" in source
+    assert "function effectiveGlobalStatusPhase(promptId, phase)" in source
 
 
 def test_remote_modal_status_tracks_active_node_ids() -> None:
@@ -91,3 +92,12 @@ def test_subgraph_descendant_states_percolate_to_visible_ancestor_nodes() -> Non
     assert "function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage)" in source
     assert "promptState.descendantNodeIdsByAncestor.get(ancestorNodeId)" in source
     assert "descendantStates.every((state) => state.phase === STATE_COMPLETE)" in source
+
+
+def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
+    """Background-tab throttling should not leave the status pill stale after refocus."""
+    source = _modal_toggle_source()
+
+    assert "function refreshModalUiAfterVisibilityChange()" in source
+    assert 'document.addEventListener("visibilitychange"' in source
+    assert 'window.addEventListener("focus", refreshModalUiAfterVisibilityChange);' in source
