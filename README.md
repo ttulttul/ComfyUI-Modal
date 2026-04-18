@@ -28,6 +28,7 @@
 2. Queueing goes to `/modal/queue_prompt` instead of ComfyUI's normal `/prompt` route.
 3. The backend reads `extra_pnginfo.workflow`, including nested subgraph metadata, and resolves those markers onto queued prompt node ids.
 4. Remote-marked nodes are partitioned into transport-aware components, with upstream auto-expansion when required by non-transportable inputs.
+   If the coarse transport-aware split would create a cyclic quotient between components, the backend merges that SCC back into one larger remote component before rewrite.
 5. Each component is replaced with a generated `ModalUniversalExecutor_<hash>` proxy node.
 6. Boundary inputs are serialized, referenced assets are synced, and the component executes locally or remotely.
 7. Exported boundary outputs are deserialized back into normal ComfyUI values for the rest of the graph.

@@ -613,6 +613,13 @@ def _component_topological_order(
             dependency_edges[upstream_component_id].add(representative_node_id)
             indegree_by_component_id[representative_node_id] += 1
 
+    merged_component_groups = _merge_cyclic_component_groups(
+        component_groups=component_groups,
+        dependency_edges=dependency_edges,
+    )
+    if merged_component_groups != component_groups:
+        return _component_topological_order(prompt, merged_component_groups)
+
     ready_component_ids = deque(sorted(
         [
             component_id
@@ -645,6 +652,67 @@ def _component_topological_order(
             continue
         ordered_components.append(sorted(component_groups[component_id]))
     return ordered_components
+
+
+def _merge_cyclic_component_groups(
+    *,
+    component_groups: dict[str, set[str]],
+    dependency_edges: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    """Collapse cyclic coarse component groups into SCC-merged groups."""
+    component_ids = sorted(component_groups)
+    reverse_edges: dict[str, set[str]] = {component_id: set() for component_id in component_ids}
+    for upstream_component_id, downstream_component_ids in dependency_edges.items():
+        for downstream_component_id in downstream_component_ids:
+            reverse_edges.setdefault(downstream_component_id, set()).add(upstream_component_id)
+
+    visited_component_ids: set[str] = set()
+    finish_order: list[str] = []
+
+    def visit_forward(component_id: str) -> None:
+        """Record reverse-topological finish order over the coarse graph."""
+        if component_id in visited_component_ids:
+            return
+        visited_component_ids.add(component_id)
+        for downstream_component_id in sorted(dependency_edges.get(component_id, set())):
+            visit_forward(downstream_component_id)
+        finish_order.append(component_id)
+
+    for component_id in component_ids:
+        visit_forward(component_id)
+
+    assigned_component_ids: set[str] = set()
+    merged_groups: dict[str, set[str]] = {}
+    merged_sccs = 0
+
+    def visit_reverse(component_id: str, scc_component_ids: set[str]) -> None:
+        """Collect one SCC by walking reverse edges from the finish-order seed."""
+        if component_id in assigned_component_ids:
+            return
+        assigned_component_ids.add(component_id)
+        scc_component_ids.add(component_id)
+        for upstream_component_id in sorted(reverse_edges.get(component_id, set())):
+            visit_reverse(upstream_component_id, scc_component_ids)
+
+    for component_id in reversed(finish_order):
+        if component_id in assigned_component_ids:
+            continue
+        scc_component_ids: set[str] = set()
+        visit_reverse(component_id, scc_component_ids)
+        merged_node_ids: set[str] = set()
+        for scc_component_id in scc_component_ids:
+            merged_node_ids.update(component_groups[scc_component_id])
+        representative_node_id = min(merged_node_ids)
+        merged_groups[representative_node_id] = merged_node_ids
+        if len(scc_component_ids) > 1:
+            merged_sccs += 1
+
+    if merged_sccs:
+        logger.warning(
+            "Transport-aware coarse component graph contained %d cyclic SCC(s); merging them back into larger remote components.",
+            merged_sccs,
+        )
+    return merged_groups
 
 
 def _build_remote_components(
