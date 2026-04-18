@@ -238,6 +238,7 @@ Use this pack with the current limits in mind:
 - The rewrite is component-based, but only for connected regions that are explicitly marked remote.
 - Remote regions now auto-expand upstream across non-transportable edges, so the final remote component can be larger than the exact set of nodes you manually marked.
 - Only the component boundary is serialized. Non-transportable Comfy runtime objects still cannot cross between local and remote regions.
+- Streamed Modal progress/result events now use the same tensor-aware transport rules as normal node I/O, so stray tensor payloads in the remote event channel are serialized instead of crashing JSON encoding.
 - Real Modal execution is scaffolded, but you still need to wire the actual Modal environment and credentials.
 - Non-JSON, non-bytes, non-tensor payloads are not supported across the remote boundary.
 
