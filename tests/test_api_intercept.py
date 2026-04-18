@@ -131,6 +131,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert payload["payload_kind"] == "subgraph"
     assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith("/assets/")
     assert payload["execute_node_ids"] == ["2"]
+    assert payload["requires_volume_reload"] is True
     assert payload["boundary_inputs"] == []
     assert payload["boundary_outputs"] == [
         {
@@ -147,6 +148,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
     assert len(summary.synced_assets) == 1
+    assert summary.synced_assets[0].uploaded is True
 
 
 def test_rewrite_rejects_non_transportable_remote_inputs(

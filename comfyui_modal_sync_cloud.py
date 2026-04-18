@@ -954,6 +954,11 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
     return options
 
 
+def _should_reload_modal_volume(payload: dict[str, Any]) -> bool:
+    """Return whether this request needs the mounted Modal volume reloaded."""
+    return bool(payload.get("requires_volume_reload", True))
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     app = modal.App(settings.app_name)
@@ -1011,8 +1016,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 component=component_id,
                 payload_kind=payload.get("payload_kind"),
             ):
-                with _timed_phase("modal_volume_reload", component=component_id):
-                    vol.reload()
+                if _should_reload_modal_volume(payload):
+                    with _timed_phase("modal_volume_reload", component=component_id):
+                        vol.reload()
+                else:
+                    _emit_cloud_info(
+                        "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
+                        component_id,
+                    )
                 if payload.get("payload_kind") == "subgraph":
                     return execute_subgraph_locally(payload, kwargs_payload)
                 return execute_node_locally(payload, kwargs_payload)

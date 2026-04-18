@@ -67,6 +67,7 @@ class SyncedAsset:
     local_path: Path
     remote_path: str
     sha256: str
+    uploaded: bool
 
 
 class LocalMirrorVolume:
@@ -178,6 +179,7 @@ class ModalAssetSyncEngine:
         sha256 = self._hash_file(resolved_path)
         marker_path = f"/hashes/{sha256}.done"
         remote_path = f"{remote_folder.rstrip('/')}/{sha256}_{resolved_path.name}"
+        uploaded = False
 
         if not self.volume.exists(marker_path):
             logger.info("Syncing %s to %s", resolved_path, remote_path)
@@ -188,10 +190,16 @@ class ModalAssetSyncEngine:
                 ),
                 marker_path,
             )
+            uploaded = True
         else:
             logger.debug("Asset already mirrored for sha=%s", sha256)
 
-        return SyncedAsset(local_path=resolved_path, remote_path=remote_path, sha256=sha256)
+        return SyncedAsset(
+            local_path=resolved_path,
+            remote_path=remote_path,
+            sha256=sha256,
+            uploaded=uploaded,
+        )
 
     def sync_prompt_inputs(self, inputs: dict[str, Any]) -> tuple[dict[str, Any], list[SyncedAsset]]:
         """Rewrite file-like prompt inputs to mirrored storage paths."""
@@ -250,6 +258,7 @@ class ModalAssetSyncEngine:
                 local_path=custom_nodes_dir,
                 remote_path=remote_path,
                 sha256=directory_hash,
+                uploaded=False,
             )
 
         archive_path = self._cached_custom_nodes_archive_path(directory_hash)
@@ -279,7 +288,13 @@ class ModalAssetSyncEngine:
             remote_path,
             time.perf_counter() - sync_started_at,
         )
-        return SyncedAsset(local_path=custom_nodes_dir, remote_path=remote_path, sha256=directory_hash)
+        return SyncedAsset(
+            local_path=custom_nodes_dir,
+            remote_path=remote_path,
+            sha256=directory_hash,
+            uploaded=True,
+        )
+
 
     def _resolve_model_path(self, value: str) -> Path | None:
         """Resolve a prompt string into a local model file path when possible."""

@@ -566,9 +566,13 @@ def _build_component_payload(
     component: RemoteComponentPlan,
     component_prompt: dict[str, Any],
     extra_data: dict[str, Any] | None,
+    synced_assets: list[SyncedAsset],
     custom_nodes_bundle: SyncedAsset | None,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
+    requires_volume_reload = any(asset.uploaded for asset in synced_assets) or (
+        custom_nodes_bundle is not None and custom_nodes_bundle.uploaded
+    )
     payload = {
         "payload_kind": "subgraph",
         "component_id": component.representative_node_id,
@@ -595,6 +599,7 @@ def _build_component_payload(
         ],
         "execute_node_ids": list(component.execute_node_ids),
         "extra_data": copy.deepcopy(extra_data or {}),
+        "requires_volume_reload": requires_volume_reload,
         "custom_nodes_bundle": (
             custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
         ),
@@ -605,6 +610,11 @@ def _build_component_payload(
         len(payload["boundary_inputs"]),
         len(payload["boundary_outputs"]),
         payload["execute_node_ids"],
+    )
+    logger.info(
+        "Remote payload for component %s requires_volume_reload=%s",
+        component.representative_node_id,
+        requires_volume_reload,
     )
     return payload
 
@@ -738,6 +748,7 @@ def rewrite_prompt_for_modal(
             component=component,
             component_prompt=component_prompt,
             extra_data=extra_data,
+            synced_assets=synced_assets,
             custom_nodes_bundle=summary.custom_nodes_bundle,
         )
         _rewrite_component_into_proxy(

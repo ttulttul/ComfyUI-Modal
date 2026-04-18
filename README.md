@@ -121,6 +121,7 @@ Important distinction:
 - mirrored asset references such as `/assets/<sha>_model.safetensors` are now materialized to container-local absolute paths before remote execution, and the worker patches ComfyUI's `folder_paths` lookups so normal loader nodes still accept them
 - in real remote mode, queue-time asset sync now uploads into the named Modal volume instead of only mirroring to local disk, and the worker reloads that mounted volume before each execution so warm containers can see newly uploaded assets
 - the queue route now performs Modal volume SDK calls from a worker thread instead of directly on the aiohttp request loop, and missing marker paths in the volume are treated as normal cache misses rather than fatal errors
+- the remote worker now reloads the mounted Modal volume only when queue-time sync actually uploaded new assets or a new custom_nodes bundle for that request; steady-state warm runs skip `vol.reload()`, which avoids Modal's open-file conflict when cached models remain in use
 - the remote worker now force-loads ComfyUI's top-level `utils` package from the bundled ComfyUI source tree before API nodes initialize, which avoids third-party or stray `utils` modules shadowing `utils.install_util`
 
 The recommended operating mode is: deploy once, let compute scale to zero between runs, and rely on Modal's cached image plus deployed-object reuse and memory snapshots for subsequent cold starts.
