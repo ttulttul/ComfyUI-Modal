@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 import logging
 
+import pytest
+
 
 class _FakeOriginalNode:
     """Simple fake legacy node for proxy signature mirroring."""
@@ -295,6 +297,52 @@ def test_modal_cloud_streams_progress_and_result_events(
             "outputs": b"serialized-outputs",
         },
     ]
+
+
+def test_modal_cloud_streams_tensor_safe_progress_and_result_events(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    serialization_module: Any,
+) -> None:
+    """Streamed Modal events should serialize stray tensor payloads before yielding them."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+
+    def fake_execute_subgraph_locally(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        status_callback: Any = None,
+    ) -> tuple[Any, ...]:
+        if status_callback is not None:
+            status_callback(
+                {
+                    "phase": "executing",
+                    "active_node_id": "7",
+                    "preview_tensor": tensor,
+                }
+            )
+        return (tensor,)
+
+    monkeypatch.setattr(modal_cloud_module, "execute_subgraph_locally", fake_execute_subgraph_locally)
+
+    events = list(
+        modal_cloud_module._stream_remote_payload_events(
+            {"payload_kind": "subgraph", "component_id": "component-1"},
+            b"{}",
+        )
+    )
+
+    assert events[0]["kind"] == "progress"
+    assert events[0]["phase"] == "executing"
+    assert torch.equal(
+        serialization_module.deserialize_value(events[0]["preview_tensor"]),
+        tensor,
+    )
+
+    assert events[1]["kind"] == "result"
+    decoded_outputs = serialization_module.deserialize_node_outputs(events[1]["outputs"])
+    assert len(decoded_outputs) == 1
+    assert torch.equal(decoded_outputs[0], tensor)
 
 
 def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
@@ -736,6 +784,36 @@ def test_remote_modal_consumes_streamed_progress_and_result(
             "client-1",
         ),
     ]
+
+
+def test_remote_modal_consumes_streamed_tensor_result_payload(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+) -> None:
+    """The local stream consumer should accept JSON-safe serialized tensor outputs."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(5, dtype=torch.float32)
+
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "component-1",
+            "component_node_ids": ["7"],
+            "extra_data": {"client_id": "client-1"},
+        },
+        iter(
+            [
+                {
+                    "kind": "result",
+                    "outputs": [serialization_module.serialize_value(tensor)],
+                },
+            ]
+        ),
+    )
+
+    decoded_outputs = serialization_module.deserialize_node_outputs(result)
+    assert len(decoded_outputs) == 1
+    assert torch.equal(decoded_outputs[0], tensor)
 
 
 def test_remote_modal_requires_manual_deploy_when_auto_deploy_disabled(

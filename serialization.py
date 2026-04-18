@@ -89,6 +89,11 @@ def serialize_value(value: Any) -> Any:
     )
 
 
+def serialize_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a mapping into a JSON-safe payload using the Modal transport rules."""
+    return {str(key): serialize_value(item) for key, item in mapping.items()}
+
+
 def deserialize_value(payload: Any) -> Any:
     """Reconstruct a serialized execution payload back into Python values."""
     if _is_scalar(payload):
@@ -114,7 +119,7 @@ def deserialize_value(payload: Any) -> Any:
 
 def serialize_node_inputs(inputs: Mapping[str, Any]) -> bytes:
     """Serialize node keyword arguments into transport bytes."""
-    payload = {str(key): serialize_value(value) for key, value in inputs.items()}
+    payload = serialize_mapping(inputs)
     return json.dumps(payload, sort_keys=True).encode("utf-8")
 
 
@@ -136,6 +141,19 @@ def serialize_node_outputs(outputs: Sequence[Any]) -> bytes:
     """Serialize node outputs into transport bytes."""
     payload = [serialize_value(value) for value in outputs]
     return json.dumps(payload).encode("utf-8")
+
+
+def coerce_serialized_node_outputs(outputs: bytes | bytearray | str | Sequence[Any] | Any) -> bytes:
+    """Normalize raw or pre-serialized node outputs into transport bytes."""
+    if isinstance(outputs, bytes):
+        return outputs
+    if isinstance(outputs, bytearray):
+        return bytes(outputs)
+    if isinstance(outputs, str):
+        return outputs.encode("utf-8")
+    if isinstance(outputs, (list, tuple)):
+        return serialize_node_outputs(tuple(outputs))
+    return serialize_node_outputs((outputs,))
 
 
 def deserialize_node_outputs(payload: bytes | bytearray | str | Sequence[Any]) -> tuple[Any, ...]:

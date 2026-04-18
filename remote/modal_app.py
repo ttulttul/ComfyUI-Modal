@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ..serialization import (
+    coerce_serialized_node_outputs,
     deserialize_node_inputs,
     serialize_node_outputs,
 )
@@ -580,11 +581,12 @@ def _consume_remote_payload_stream(
             continue
         if event_kind == "result":
             candidate_outputs = stream_event.get("outputs")
-            if not isinstance(candidate_outputs, (bytes, bytearray)):
+            try:
+                result_payload = coerce_serialized_node_outputs(candidate_outputs)
+            except TypeError as exc:
                 raise ModalRemoteInvocationError(
-                    "Modal streamed payload result did not include serialized output bytes."
-                )
-            result_payload = candidate_outputs
+                    "Modal streamed payload result did not include transport-safe outputs."
+                ) from exc
             continue
 
             logger.debug(

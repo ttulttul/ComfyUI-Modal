@@ -40,7 +40,7 @@ for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_CO
     if candidate_exists and candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-from serialization import deserialize_node_inputs, serialize_node_outputs
+from serialization import coerce_serialized_node_outputs, deserialize_node_inputs, serialize_mapping, serialize_node_outputs
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -941,7 +941,7 @@ def _stream_remote_payload_events(
 
     def publish_status(progress_state: dict[str, Any]) -> None:
         """Queue a progress envelope for the remote caller."""
-        event_queue.put(("progress", dict(progress_state)))
+        event_queue.put(("progress", serialize_mapping(progress_state)))
 
     def execute_payload() -> None:
         """Run the payload in a worker thread and enqueue the terminal outcome."""
@@ -974,7 +974,7 @@ def _stream_remote_payload_events(
                 yield {"kind": "progress", **event_payload}
                 continue
             if event_kind == "result":
-                yield {"kind": "result", "outputs": event_payload}
+                yield {"kind": "result", "outputs": coerce_serialized_node_outputs(event_payload)}
                 continue
             if event_kind == "error":
                 raise event_payload
