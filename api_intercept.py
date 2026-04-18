@@ -6,7 +6,7 @@ import copy
 import logging
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -500,10 +500,59 @@ def _build_consumer_map(prompt: dict[str, Any]) -> dict[LinkedOutputRef, list[In
     return consumers
 
 
-def _build_remote_components(prompt: dict[str, Any], remote_node_ids: set[str]) -> list[list[str]]:
-    """Partition remote-marked nodes into connected components."""
-    adjacency: dict[str, set[str]] = {node_id: set() for node_id in remote_node_ids}
-    for node_id in remote_node_ids:
+def _remote_output_io_type(
+    *,
+    prompt: dict[str, Any],
+    node_id: str,
+    output_index: int,
+    nodes_module: Any,
+) -> str | None:
+    """Return the declared output type for one prompt node output when available."""
+    prompt_node = prompt.get(node_id)
+    if prompt_node is None:
+        return None
+
+    class_type = str(prompt_node["class_type"])
+    node_class = nodes_module.NODE_CLASS_MAPPINGS.get(class_type)
+    if node_class is None:
+        return None
+
+    output_types, _, _ = _normalize_output_metadata(node_class)
+    if output_index < 0 or output_index >= len(output_types):
+        return None
+    return str(output_types[output_index])
+
+
+def _remote_component_partition_groups(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    nodes_module: Any,
+) -> dict[str, set[str]]:
+    """Return component groups after merging remote nodes across non-transportable edges."""
+    parent: dict[str, str] = {node_id: node_id for node_id in remote_node_ids}
+
+    def find(node_id: str) -> str:
+        """Return the canonical union-find representative for one remote node."""
+        root = parent[node_id]
+        while root != parent[root]:
+            root = parent[root]
+        while node_id != root:
+            next_node_id = parent[node_id]
+            parent[node_id] = root
+            node_id = next_node_id
+        return root
+
+    def union(left_node_id: str, right_node_id: str) -> None:
+        """Merge two remote nodes into the same mandatory component."""
+        left_root = find(left_node_id)
+        right_root = find(right_node_id)
+        if left_root == right_root:
+            return
+        canonical_root = min(left_root, right_root)
+        merged_root = max(left_root, right_root)
+        parent[merged_root] = canonical_root
+
+    for node_id in sorted(remote_node_ids):
         prompt_node = prompt.get(node_id)
         if prompt_node is None:
             continue
@@ -513,26 +562,101 @@ def _build_remote_components(prompt: dict[str, Any], remote_node_ids: set[str]) 
             upstream_node_id = str(input_value[0])
             if upstream_node_id not in remote_node_ids:
                 continue
-            adjacency[node_id].add(upstream_node_id)
-            adjacency[upstream_node_id].add(node_id)
-
-    components: list[list[str]] = []
-    visited: set[str] = set()
-    for node_id in sorted(remote_node_ids):
-        if node_id in visited:
-            continue
-        pending = [node_id]
-        component: list[str] = []
-        while pending:
-            current = pending.pop()
-            if current in visited:
+            io_type = _remote_output_io_type(
+                prompt=prompt,
+                node_id=upstream_node_id,
+                output_index=int(input_value[1]),
+                nodes_module=nodes_module,
+            )
+            if io_type is None or _is_transportable_output_type(io_type):
                 continue
-            visited.add(current)
-            component.append(current)
-            pending.extend(sorted(adjacency[current] - visited))
-        components.append(sorted(component))
+            union(node_id, upstream_node_id)
+
+    groups: dict[str, set[str]] = defaultdict(set)
+    for node_id in sorted(remote_node_ids):
+        groups[find(node_id)].add(node_id)
+    return groups
+
+
+def _component_topological_order(
+    prompt: dict[str, Any],
+    component_groups: dict[str, set[str]],
+) -> list[list[str]]:
+    """Return component node ids ordered from upstream to downstream."""
+    component_id_by_node_id: dict[str, str] = {}
+    for representative_node_id, component_node_ids in component_groups.items():
+        for node_id in component_node_ids:
+            component_id_by_node_id[node_id] = representative_node_id
+
+    dependency_edges: dict[str, set[str]] = {
+        representative_node_id: set()
+        for representative_node_id in component_groups
+    }
+    indegree_by_component_id: dict[str, int] = {
+        representative_node_id: 0
+        for representative_node_id in component_groups
+    }
+
+    for node_id, representative_node_id in component_id_by_node_id.items():
+        prompt_node = prompt.get(node_id)
+        if prompt_node is None:
+            continue
+        for input_value in (prompt_node.get("inputs") or {}).values():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            upstream_component_id = component_id_by_node_id.get(upstream_node_id)
+            if upstream_component_id is None or upstream_component_id == representative_node_id:
+                continue
+            if representative_node_id in dependency_edges[upstream_component_id]:
+                continue
+            dependency_edges[upstream_component_id].add(representative_node_id)
+            indegree_by_component_id[representative_node_id] += 1
+
+    ready_component_ids = deque(sorted(
+        [
+            component_id
+            for component_id, indegree in indegree_by_component_id.items()
+            if indegree == 0
+        ]
+    ))
+    ordered_components: list[list[str]] = []
+    emitted_component_ids: set[str] = set()
+
+    while ready_component_ids:
+        component_id = ready_component_ids.popleft()
+        if component_id in emitted_component_ids:
+            continue
+        emitted_component_ids.add(component_id)
+        ordered_components.append(sorted(component_groups[component_id]))
+        for downstream_component_id in sorted(dependency_edges[component_id]):
+            indegree_by_component_id[downstream_component_id] -= 1
+            if indegree_by_component_id[downstream_component_id] == 0:
+                ready_component_ids.append(downstream_component_id)
+
+    if len(emitted_component_ids) == len(component_groups):
+        return ordered_components
+
+    logger.warning(
+        "Transport-aware component ordering encountered a cycle or unresolved dependency; falling back to stable component order."
+    )
+    for component_id in sorted(component_groups):
+        if component_id in emitted_component_ids:
+            continue
+        ordered_components.append(sorted(component_groups[component_id]))
+    return ordered_components
+
+
+def _build_remote_components(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    nodes_module: Any,
+) -> list[list[str]]:
+    """Partition remote-marked nodes into transport-aware DAG components."""
+    component_groups = _remote_component_partition_groups(prompt, remote_node_ids, nodes_module)
+    components = _component_topological_order(prompt, component_groups)
     logger.info(
-        "Partitioned %d remote nodes into %d remote components: %s",
+        "Partitioned %d remote nodes into %d transport-aware remote components: %s",
         len(remote_node_ids),
         len(components),
         components,
@@ -789,7 +913,7 @@ def _build_component_plans(
 ) -> list[RemoteComponentPlan]:
     """Build plans for every connected remote component."""
     consumers = _build_consumer_map(prompt)
-    components = _build_remote_components(prompt, remote_node_ids)
+    components = _build_remote_components(prompt, remote_node_ids, nodes_module)
     return [
         _build_component_plan(component, prompt, consumers, nodes_module)
         for component in components
@@ -1016,10 +1140,23 @@ def _rewrite_component_into_proxy(
         is_output_node=component.contains_output_node,
     )
 
-    proxy_inputs: dict[str, Any] = {
-        boundary_input.proxy_input_name: [boundary_input.source.node_id, boundary_input.source.output_index]
-        for boundary_input in component.boundary_inputs
-    }
+    proxy_inputs: dict[str, Any] = {}
+    for boundary_input in component.boundary_inputs:
+        current_input_value: Any = None
+        for target in boundary_input.targets:
+            target_prompt_node = rewritten_prompt.get(target.node_id)
+            if target_prompt_node is None:
+                continue
+            target_input_value = (target_prompt_node.get("inputs") or {}).get(target.input_name)
+            if _is_link(target_input_value):
+                current_input_value = list(target_input_value)
+                break
+        if current_input_value is None:
+            current_input_value = [
+                boundary_input.source.node_id,
+                boundary_input.source.output_index,
+            ]
+        proxy_inputs[boundary_input.proxy_input_name] = current_input_value
     proxy_inputs["original_node_data"] = payload
 
     representative_node_id = component.representative_node_id
