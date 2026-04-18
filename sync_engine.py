@@ -107,18 +107,53 @@ class ModalVolumeBackend:
         if modal is None:
             raise RuntimeError("Modal SDK is required for ModalVolumeBackend.")
         self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+        self._exists_cache: dict[str, bool] = {}
+
+    def _resource_exhausted_error_types(self) -> tuple[type[BaseException], ...]:
+        """Return the Modal SDK exception types that indicate transient rate limiting."""
+        if modal is None:
+            return ()
+        exception_namespace = getattr(modal, "exception", None)
+        if exception_namespace is None:
+            return ()
+        error_type = getattr(exception_namespace, "ResourceExhaustedError", None)
+        if isinstance(error_type, type) and issubclass(error_type, BaseException):
+            return (error_type,)
+        return ()
 
     def _run_volume_call(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
         """Run a Modal SDK volume call in a worker thread outside the request event loop."""
-        future = _MODAL_VOLUME_EXECUTOR.submit(callback, *args, **kwargs)
-        return future.result()
+        retryable_errors = self._resource_exhausted_error_types()
+        max_attempts = 5
+        for attempt_index in range(max_attempts):
+            future = _MODAL_VOLUME_EXECUTOR.submit(callback, *args, **kwargs)
+            try:
+                return future.result()
+            except retryable_errors as exc:
+                if attempt_index >= max_attempts - 1:
+                    raise
+                backoff_seconds = 0.25 * (2**attempt_index)
+                logger.warning(
+                    "Modal volume call %s hit rate limiting on attempt %d/%d; retrying in %.2fs.",
+                    getattr(callback, "__name__", repr(callback)),
+                    attempt_index + 1,
+                    max_attempts,
+                    backoff_seconds,
+                )
+                time.sleep(backoff_seconds)
+        raise RuntimeError("Modal volume call retry loop exited unexpectedly.")
 
     def exists(self, remote_path: str) -> bool:
         """Return whether a file already exists in the Modal volume."""
+        cached_result = self._exists_cache.get(remote_path)
+        if cached_result is not None:
+            return cached_result
         try:
-            return len(self._run_volume_call(self._volume.listdir, remote_path, recursive=False)) > 0
+            exists = len(self._run_volume_call(self._volume.listdir, remote_path, recursive=False)) > 0
         except modal.exception.NotFoundError:
-            return False
+            exists = False
+        self._exists_cache[remote_path] = exists
+        return exists
 
     def put_file(self, local_path: Path, remote_path: str) -> None:
         """Upload a local file into the Modal volume."""
@@ -127,6 +162,7 @@ class ModalVolumeBackend:
                 batch.put_file(local_path, remote_path)
 
         self._run_volume_call(upload)
+        self._exists_cache[remote_path] = True
 
     def put_bytes(self, payload: bytes, remote_path: str) -> None:
         """Upload bytes into the Modal volume."""
@@ -135,6 +171,7 @@ class ModalVolumeBackend:
                 batch.put_file(io.BytesIO(payload), remote_path)
 
         self._run_volume_call(upload)
+        self._exists_cache[remote_path] = True
 
 
 @dataclass
