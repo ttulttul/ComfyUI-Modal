@@ -194,6 +194,7 @@ Because the Modal queue route can spend noticeable time hashing, syncing, and cr
 
 The extension also now renders its own global activity badge in the ComfyUI UI during Modal setup and remote execution. That badge stays visible even when ComfyUI's stock queue state does not fully reflect the pre-queue setup phase.
 The badge now also prunes orphaned prompt entries when a workflow finishes, so stale orange "setup running" indicators do not linger after the remote work is done.
+The badge now distinguishes queue-time graph/resource sync from remote-app wait time: it shows `Syncing graph with Modal` while the queue route is scanning and syncing, then `Waiting for Modal app` once the proxy has started but before the first streamed remote node begins executing.
 
 For headless remote execution, the worker also installs a minimal `PromptServer.instance` shim before it imports external custom nodes. That keeps route-registering custom node packs from crashing at import time just because the remote worker is not running ComfyUI's full HTTP server.
 

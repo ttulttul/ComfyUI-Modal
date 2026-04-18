@@ -34,7 +34,8 @@ def test_global_modal_status_badge_is_installed() -> None:
     source = _modal_toggle_source()
 
     assert 'element.id = "comfy-modal-global-status";' in source
-    assert "Modal setup running for" in source
+    assert "Syncing graph with Modal" in source
+    assert "Waiting for Modal app" in source
     assert "Modal workflow running on" in source
     assert "installGlobalStatusStyles()" in source
     assert "function pruneGlobalStatusStates()" in source
@@ -58,6 +59,7 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert 'const READY_BORDER_COLOR = "#22c55e";' in source
     assert 'const ACTIVE_BORDER_COLOR = "#a855f7";' in source
     assert 'const COMPLETE_BORDER_COLOR = "#16a34a";' in source
+    assert 'const STATE_WAITING = "waiting";' in source
     assert 'const STATE_READY = "ready";' in source
     assert 'const STATE_ACTIVE = "active";' in source
     assert 'detail.phase === "execution_success"' in source
