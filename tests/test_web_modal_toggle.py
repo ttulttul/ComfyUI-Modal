@@ -44,6 +44,7 @@ def test_remote_modal_status_tracks_active_node_ids() -> None:
     source = _modal_toggle_source()
 
     assert "activeNodeId: null" in source
+    assert "hasStreamedProgress: false" in source
     assert "function setPromptActiveNode(promptId, activeNodeId)" in source
     assert "detail.active_node_id" in source
     assert "clearPromptRemoteStates(promptId)" in source
@@ -59,3 +60,11 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert 'const STATE_READY = "ready";' in source
     assert 'const STATE_ACTIVE = "active";' in source
     assert 'detail.phase === "execution_success"' in source
+
+
+def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
+    """Once streamed node progress starts, coarse proxy execution events should stop overriding it."""
+    source = _modal_toggle_source()
+
+    assert "promptState.hasStreamedProgress = true;" in source
+    assert "if (promptState.hasStreamedProgress && phase !== STATE_ERROR)" in source

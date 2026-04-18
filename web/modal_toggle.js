@@ -248,6 +248,7 @@ function ensurePromptState(promptId) {
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
       activeNodeId: null,
+      hasStreamedProgress: false,
     });
   }
   return modalPromptStates.get(promptId);
@@ -371,14 +372,19 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
  */
 function registerPromptComponents(promptId, remoteNodeIds, components) {
   const promptState = ensurePromptState(promptId);
-  promptState.remoteNodeIds = [...remoteNodeIds];
-  promptState.componentsByRepresentative.clear();
-  promptState.activeNodeId = null;
-  for (const component of components) {
-    promptState.componentsByRepresentative.set(
-      String(component.representative_node_id),
-      component.node_ids.map((nodeIdValue) => String(nodeIdValue)),
-    );
+  if (remoteNodeIds.length > 0) {
+    promptState.remoteNodeIds = [...remoteNodeIds];
+  }
+  if (components.length > 0) {
+    promptState.componentsByRepresentative.clear();
+    promptState.activeNodeId = null;
+    promptState.hasStreamedProgress = false;
+    for (const component of components) {
+      promptState.componentsByRepresentative.set(
+        String(component.representative_node_id),
+        component.node_ids.map((nodeIdValue) => String(nodeIdValue)),
+      );
+    }
   }
 }
 
@@ -595,6 +601,7 @@ function handleModalStatus(event) {
     const nextActiveNodeId =
       detail.active_node_id != null ? String(detail.active_node_id) : null;
     const previousActiveNodeId = promptState.activeNodeId;
+    promptState.hasStreamedProgress = true;
     setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length);
     setNodesPhase(nodeIds, STATE_READY, promptId);
     if (previousActiveNodeId && previousActiveNodeId !== nextActiveNodeId) {
@@ -608,6 +615,7 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === "execution_success") {
+    promptState.hasStreamedProgress = true;
     if (promptState.activeNodeId) {
       setNodesPhase([promptState.activeNodeId], STATE_COMPLETE, promptId);
     }
@@ -632,6 +640,10 @@ function handleExecutionPhase(event, phase) {
 
   const componentNodeIds = resolveComponentNodeIds(promptId, representativeNodeId);
   if (!componentNodeIds) {
+    return;
+  }
+  const promptState = ensurePromptState(promptId);
+  if (promptState.hasStreamedProgress && phase !== STATE_ERROR) {
     return;
   }
   if (phase === EXECUTION_PHASE) {
