@@ -257,6 +257,71 @@ def _build_remote_components(prompt: dict[str, Any], remote_node_ids: set[str]) 
     return components
 
 
+def _expand_remote_node_ids_for_non_transportable_inputs(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    nodes_module: Any,
+) -> set[str]:
+    """Grow the remote set upstream until non-transportable inputs stay inside the remote island."""
+    expanded_remote_node_ids = set(remote_node_ids)
+    added_node_ids: list[str] = []
+
+    changed = True
+    while changed:
+        changed = False
+        for node_id in sorted(expanded_remote_node_ids):
+            prompt_node = prompt.get(node_id)
+            if prompt_node is None:
+                continue
+            for input_value in (prompt_node.get("inputs") or {}).values():
+                if not _is_link(input_value):
+                    continue
+                upstream_node_id = str(input_value[0])
+                if upstream_node_id in expanded_remote_node_ids:
+                    continue
+
+                upstream_prompt_node = prompt.get(upstream_node_id)
+                if upstream_prompt_node is None:
+                    continue
+
+                upstream_class_type = str(upstream_prompt_node["class_type"])
+                upstream_class = nodes_module.NODE_CLASS_MAPPINGS.get(upstream_class_type)
+                if upstream_class is None:
+                    continue
+
+                output_types, _, _ = _normalize_output_metadata(upstream_class)
+                output_index = int(input_value[1])
+                if output_index >= len(output_types):
+                    continue
+
+                io_type = str(output_types[output_index])
+                if _is_transportable_output_type(io_type):
+                    continue
+
+                expanded_remote_node_ids.add(upstream_node_id)
+                added_node_ids.append(upstream_node_id)
+                changed = True
+                logger.info(
+                    "Auto-expanded remote execution upstream: added node %s (%s) because node %s depends on non-transportable type '%s'.",
+                    upstream_node_id,
+                    upstream_class_type,
+                    node_id,
+                    io_type,
+                )
+                break
+            if changed:
+                break
+
+    if added_node_ids:
+        logger.info(
+            "Expanded remote node set from %d to %d nodes by absorbing upstream non-transportable dependencies: %s",
+            len(remote_node_ids),
+            len(expanded_remote_node_ids),
+            sorted(set(added_node_ids)),
+        )
+    return expanded_remote_node_ids
+
+
 def _build_component_plan(
     component_node_ids: list[str],
     prompt: dict[str, Any],
@@ -625,7 +690,17 @@ def rewrite_prompt_for_modal(
     resolved_nodes_module = nodes_module or _get_nodes_module()
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     rewritten_prompt = copy.deepcopy(prompt)
-    components = _build_component_plans(rewritten_prompt, remote_node_ids, resolved_nodes_module)
+    expanded_remote_node_ids = _expand_remote_node_ids_for_non_transportable_inputs(
+        prompt=rewritten_prompt,
+        remote_node_ids=remote_node_ids,
+        nodes_module=resolved_nodes_module,
+    )
+    summary.remote_node_ids = sorted(expanded_remote_node_ids)
+    components = _build_component_plans(
+        rewritten_prompt,
+        expanded_remote_node_ids,
+        resolved_nodes_module,
+    )
     validate_remote_component_transport_compatibility(
         prompt=rewritten_prompt,
         components=components,

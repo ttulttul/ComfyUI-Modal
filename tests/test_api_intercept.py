@@ -38,6 +38,14 @@ class _FakeLocalSinkNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeRemoteConditioningNode:
+    """Fake node that produces a non-transportable CONDITIONING output."""
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    OUTPUT_IS_LIST = (False,)
+
+
 def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     api_intercept_module: Any,
     settings_module: Any,
@@ -147,7 +155,7 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Remote component boundaries should reject non-transportable local inputs."""
+    """Remote nodes should absorb a single non-transportable upstream dependency automatically."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
     (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
@@ -201,22 +209,113 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
         },
     }
 
-    try:
-        api_intercept_module.rewrite_prompt_for_modal(
-            prompt=prompt,
-            workflow=workflow,
-            sync_engine=sync_engine,
-            settings=settings,
-            nodes_module=fake_nodes_module,
-        )
-    except api_intercept_module.ModalPromptValidationError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("Expected ModalPromptValidationError to be raised.")
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
 
-    assert "input 'model'" in message
-    assert "type 'MODEL'" in message
-    assert "cannot cross the current local/remote boundary" in message
+    assert list(rewritten_prompt) == ["1"]
+    assert summary.remote_node_ids == ["1", "2"]
+    assert summary.remote_component_ids == ["1"]
+
+
+def test_rewrite_auto_expands_upstream_non_transportable_dependencies(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Marked remote nodes should absorb upstream non-transportable producers automatically."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_nodes_dir.mkdir()
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "ModelSource": _FakeRemoteModelNode,
+                "ConditioningSource": _FakeRemoteConditioningNode,
+                "RemoteConsumer": _FakeRemoteSamplerNode,
+                "LocalConsumer": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": False}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "ModelSource",
+            "inputs": {},
+            "_meta": {"title": "Model Source"},
+        },
+        "2": {
+            "class_type": "ConditioningSource",
+            "inputs": {},
+            "_meta": {"title": "Conditioning Source"},
+        },
+        "3": {
+            "class_type": "RemoteConsumer",
+            "inputs": {
+                "model": ["1", 0],
+                "conditioning": ["2", 0],
+            },
+            "_meta": {"title": "Remote Consumer"},
+        },
+        "4": {
+            "class_type": "LocalConsumer",
+            "inputs": {"latent": ["3", 0]},
+            "_meta": {"title": "Local Consumer"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert set(rewritten_prompt) == {"1", "4"}
+    assert summary.remote_node_ids == ["1", "2", "3"]
+    assert summary.remote_component_ids == ["1"]
+    assert summary.component_node_ids_by_representative == {"1": ["1", "2", "3"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "1", "3": "1"}
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["boundary_inputs"] == []
+    assert payload["execute_node_ids"] == ["3"]
+    assert rewritten_prompt["4"]["inputs"]["latent"] == ["1", 0]
 
 
 def test_rewrite_rejects_non_transportable_remote_outputs(

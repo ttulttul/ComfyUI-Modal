@@ -160,6 +160,8 @@ For each connected region you want to run remotely:
 
 That toggle stores `properties.is_modal_remote = true` in the workflow metadata. Nothing is rewritten in the canvas itself. The rewrite happens only when you queue the prompt.
 
+You do not always have to mark every upstream dependency manually. During queue-time rewrite, Modal-Sync now automatically expands the remote island upstream when a marked node depends on non-transportable inputs such as `MODEL`, `CLIP`, `CONDITIONING`, or similar runtime-only values. In practice, that means you can often mark just the downstream sampler or custom node you want to run remotely and let the backend absorb the necessary upstream loaders/builders into the same remote component.
+
 ### 5. Queue the workflow
 
 Use the normal queue button in ComfyUI.
@@ -217,6 +219,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 Use this pack with the current limits in mind:
 
 - The rewrite is component-based, but only for connected regions that are explicitly marked remote.
+- Remote regions now auto-expand upstream across non-transportable edges, so the final remote component can be larger than the exact set of nodes you manually marked.
 - Only the component boundary is serialized. Non-transportable Comfy runtime objects still cannot cross between local and remote regions.
 - Real Modal execution is scaffolded, but you still need to wire the actual Modal environment and credentials.
 - Non-JSON, non-bytes, non-tensor payloads are not supported across the remote boundary.
