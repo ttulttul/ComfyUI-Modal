@@ -1115,6 +1115,7 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === EXECUTION_PHASE) {
+    endSyntheticExecutionUi(promptId);
     const nextActiveNodeId =
       detail.active_node_id != null ? String(detail.active_node_id) : null;
     const previousActiveNodeId = promptState.activeNodeId;
@@ -1156,6 +1157,7 @@ function handleModalProgress(event) {
     return;
   }
 
+  endSyntheticExecutionUi(promptId);
   const promptState = ensurePromptState(promptId);
   promptState.hasStreamedProgress = true;
   setPromptActiveNode(promptId, progressNodeId);
@@ -1364,7 +1366,6 @@ function registerExecutionListeners() {
   api.addEventListener("modal_progress", handleModalProgress);
   api.addEventListener("executing", (event) => handleExecutionPhase(event, EXECUTION_PHASE));
   api.addEventListener("executed", (event) => {
-    endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""));
     handleExecutionPhase(event, STATE_COMPLETE);
   });
   api.addEventListener("execution_error", (event) => {

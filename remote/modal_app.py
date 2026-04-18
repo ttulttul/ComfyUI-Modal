@@ -4,20 +4,23 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+from io import BytesIO
 import logging
 import os
+import queue
 import sys
 import tempfile
 import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from ..serialization import (
     coerce_serialized_node_outputs,
+    deserialize_value,
     deserialize_node_inputs,
     serialize_node_outputs,
 )
@@ -551,6 +554,78 @@ def _emit_local_modal_progress(
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 
+def _emit_local_executed_output(
+    *,
+    prompt_id: str | None,
+    client_id: str | None,
+    node_id: str,
+    display_node_id: str | None,
+    output_payload: Any,
+) -> None:
+    """Forward one remote node's executed UI payload into the local websocket stream."""
+    if client_id is None:
+        return
+
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+
+    payload = {
+        "prompt_id": prompt_id,
+        "node": node_id,
+        "display_node": display_node_id or node_id,
+        "output": output_payload,
+    }
+    prompt_server.send_sync("executed", payload, client_id)
+
+
+def _emit_local_preview_image(
+    *,
+    prompt_id: str | None,
+    client_id: str | None,
+    node_id: str,
+    display_node_id: str | None,
+    parent_node_id: str | None,
+    real_node_id: str | None,
+    image_type: str,
+    image_bytes: bytes,
+    max_size: int | None,
+) -> None:
+    """Forward one remote preview image into the local ComfyUI preview websocket path."""
+    if client_id is None:
+        return
+
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+
+    try:
+        from PIL import Image
+        from protocol import BinaryEventTypes
+    except ModuleNotFoundError:
+        logger.warning("Preview forwarding is unavailable because Pillow or ComfyUI protocol imports failed.")
+        return
+
+    with BytesIO(image_bytes) as image_buffer:
+        image = Image.open(image_buffer)
+        image.load()
+
+    metadata: dict[str, Any] = {
+        "node_id": node_id,
+        "prompt_id": prompt_id,
+        "display_node_id": display_node_id or node_id,
+        "real_node_id": real_node_id or node_id,
+    }
+    if parent_node_id is not None:
+        metadata["parent_node_id"] = parent_node_id
+
+    prompt_server.send_sync(
+        BinaryEventTypes.PREVIEW_IMAGE_WITH_METADATA,
+        ((image_type, image, max_size), metadata),
+        client_id,
+    )
+
+
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
@@ -563,6 +638,94 @@ def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
         and isinstance(payload.get("component_node_ids"), list)
         and len(payload.get("component_node_ids")) > 0
     )
+
+
+def _local_processing_interrupted() -> bool:
+    """Return whether the current local ComfyUI execution was interrupted."""
+    try:
+        import comfy.model_management
+    except ModuleNotFoundError:
+        return False
+
+    return bool(comfy.model_management.processing_interrupted())
+
+
+def _raise_local_interrupt() -> None:
+    """Raise ComfyUI's native interruption exception for the current execution."""
+    import comfy.model_management
+
+    raise comfy.model_management.InterruptProcessingException()
+
+
+def _remote_interrupt_key(payload: dict[str, Any]) -> tuple[str, str]:
+    """Return the prompt/component pair used to interrupt one remote execution."""
+    prompt_id = str(payload.get("prompt_id") or payload.get("component_id") or "modal-subgraph")
+    component_id = str(payload.get("component_id") or "single-node")
+    return prompt_id, component_id
+
+
+def _invoke_remote_call_with_interrupts(
+    *,
+    payload: dict[str, Any],
+    invoke_remote_call: Callable[[], bytes],
+    interrupt_remote_call: Callable[[], Any] | None,
+    cancellation_event: threading.Event | None,
+) -> bytes:
+    """Run one blocking remote call while optionally propagating cancellation to Modal."""
+    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def execute_remote_call() -> None:
+        """Run the blocking Modal request in a worker thread."""
+        try:
+            result_queue.put(("result", invoke_remote_call()))
+        except BaseException as exc:
+            result_queue.put(("error", exc))
+
+    request_thread = threading.Thread(
+        target=execute_remote_call,
+        name=f"modal-request-{payload.get('component_id', 'payload')}",
+        daemon=True,
+    )
+    request_thread.start()
+    interrupt_sent = False
+    prompt_id, component_id = _remote_interrupt_key(payload)
+    try:
+        while True:
+            try:
+                result_kind, result_payload = result_queue.get(timeout=0.1)
+            except queue.Empty:
+                if (
+                    cancellation_event is not None
+                    and cancellation_event.is_set()
+                    and not interrupt_sent
+                ):
+                    if interrupt_remote_call is None:
+                        logger.warning(
+                            "Local interrupt requested for component=%s, but no remote interrupt method is available.",
+                            component_id,
+                        )
+                    else:
+                        try:
+                            interrupt_remote_call()
+                            logger.info(
+                                "Propagated local interrupt to Modal prompt=%s component=%s.",
+                                prompt_id,
+                                component_id,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to propagate local interrupt to Modal prompt=%s component=%s.",
+                                prompt_id,
+                                component_id,
+                            )
+                    interrupt_sent = True
+                continue
+
+            if result_kind == "result":
+                return bytes(result_payload)
+            raise result_payload
+    finally:
+        request_thread.join(timeout=1.0)
 
 
 def _consume_remote_payload_stream(
@@ -579,7 +742,8 @@ def _consume_remote_payload_stream(
     for stream_event in stream_events:
         event_kind = str(stream_event.get("kind", ""))
         if event_kind == "progress":
-            if stream_event.get("event_type") == "node_progress":
+            event_type = str(stream_event.get("event_type", ""))
+            if event_type == "node_progress":
                 reported_node_id = stream_event.get("node_id")
                 if reported_node_id is not None:
                     logger.debug(
@@ -598,6 +762,63 @@ def _consume_remote_payload_stream(
                         display_node_id=(
                             str(stream_event["display_node_id"])
                             if stream_event.get("display_node_id") is not None
+                            else None
+                        ),
+                    )
+                continue
+            if event_type == "executed":
+                reported_node_id = stream_event.get("node_id")
+                if reported_node_id is not None:
+                    logger.debug(
+                        "Forwarding streamed Modal executed output for component=%s node_id=%s.",
+                        payload.get("component_id"),
+                        reported_node_id,
+                    )
+                    _emit_local_executed_output(
+                        prompt_id=prompt_id,
+                        client_id=client_id,
+                        node_id=str(reported_node_id),
+                        display_node_id=(
+                            str(stream_event["display_node_id"])
+                            if stream_event.get("display_node_id") is not None
+                            else None
+                        ),
+                        output_payload=deserialize_value(stream_event.get("output")),
+                    )
+                continue
+            if event_type == "preview":
+                reported_node_id = stream_event.get("node_id")
+                image_bytes = deserialize_value(stream_event.get("image_bytes"))
+                if reported_node_id is not None and isinstance(image_bytes, bytes):
+                    logger.debug(
+                        "Forwarding streamed Modal preview image for component=%s node_id=%s.",
+                        payload.get("component_id"),
+                        reported_node_id,
+                    )
+                    _emit_local_preview_image(
+                        prompt_id=prompt_id,
+                        client_id=client_id,
+                        node_id=str(reported_node_id),
+                        display_node_id=(
+                            str(stream_event["display_node_id"])
+                            if stream_event.get("display_node_id") is not None
+                            else None
+                        ),
+                        parent_node_id=(
+                            str(stream_event["parent_node_id"])
+                            if stream_event.get("parent_node_id") is not None
+                            else None
+                        ),
+                        real_node_id=(
+                            str(stream_event["real_node_id"])
+                            if stream_event.get("real_node_id") is not None
+                            else None
+                        ),
+                        image_type=str(stream_event.get("image_type", "PNG")),
+                        image_bytes=image_bytes,
+                        max_size=(
+                            int(stream_event["max_size"])
+                            if stream_event.get("max_size") is not None
                             else None
                         ),
                     )
@@ -639,12 +860,11 @@ def _consume_remote_payload_stream(
                     "Modal streamed payload result did not include transport-safe outputs."
                 ) from exc
             continue
-
-            logger.debug(
-                "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
-                event_kind,
-                payload.get("component_id"),
-            )
+        logger.debug(
+            "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
+            event_kind,
+            payload.get("component_id"),
+        )
 
     if result_payload is None:
         raise ModalRemoteInvocationError(
@@ -730,7 +950,58 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
         )
 
 
-def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+def _build_remote_interrupt_callback(remote_engine: Any, payload: dict[str, Any]) -> Callable[[], Any] | None:
+    """Return a callable that interrupts one active Modal payload when supported."""
+    interrupt_method = getattr(remote_engine, "interrupt_payload", None)
+    if interrupt_method is None or not hasattr(interrupt_method, "remote"):
+        return None
+
+    prompt_id, component_id = _remote_interrupt_key(payload)
+    return lambda: interrupt_method.remote(prompt_id, component_id)
+
+
+def _invoke_remote_engine_payload(
+    remote_engine: Any,
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    cancellation_event: threading.Event | None,
+) -> bytes:
+    """Invoke one prepared remote engine instance with optional progress streaming."""
+    stream_method = getattr(remote_engine, "execute_payload_stream", None)
+    interrupt_remote_call = _build_remote_interrupt_callback(remote_engine, payload)
+    if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+        logger.info(
+            "Using streamed Modal progress path for component=%s via execute_payload_stream.remote_gen(...).",
+            payload.get("component_id"),
+        )
+        return _invoke_remote_call_with_interrupts(
+            payload=payload,
+            invoke_remote_call=lambda: _consume_remote_payload_stream(
+                payload,
+                stream_method.remote_gen(payload, kwargs_payload),
+            ),
+            interrupt_remote_call=interrupt_remote_call,
+            cancellation_event=cancellation_event,
+        )
+
+    if _should_stream_remote_progress(payload):
+        logger.warning(
+            "Streamed Modal progress is unavailable for component=%s; falling back to execute_payload.remote(...).",
+            payload.get("component_id"),
+        )
+    return _invoke_remote_call_with_interrupts(
+        payload=payload,
+        invoke_remote_call=lambda: remote_engine.execute_payload.remote(payload, kwargs_payload),
+        interrupt_remote_call=interrupt_remote_call,
+        cancellation_event=cancellation_event,
+    )
+
+
+def _invoke_modal_payload_blocking(
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    cancellation_event: threading.Event | None = None,
+) -> bytes:
     """Invoke the Modal runtime from a worker thread using deployed or ephemeral app state."""
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
@@ -745,22 +1016,12 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
                 settings.app_name,
                 payload.get("component_id"),
             )
-            stream_method = getattr(remote_engine, "execute_payload_stream", None)
-            if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
-                logger.info(
-                    "Using streamed Modal progress path for component=%s via execute_payload_stream.remote_gen(...).",
-                    payload.get("component_id"),
-                )
-                return _consume_remote_payload_stream(
-                    payload,
-                    stream_method.remote_gen(payload, kwargs_payload),
-                )
-            if _should_stream_remote_progress(payload):
-                logger.warning(
-                    "Streamed Modal progress is unavailable for component=%s; falling back to execute_payload.remote(...).",
-                    payload.get("component_id"),
-                )
-            return remote_engine.execute_payload.remote(payload, kwargs_payload)
+            return _invoke_remote_engine_payload(
+                remote_engine,
+                payload,
+                kwargs_payload,
+                cancellation_event,
+            )
         except lookup_error_types as exc:
             if settings.auto_deploy:
                 _auto_deploy_modal_app(payload, exc)
@@ -771,22 +1032,12 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
                         settings.app_name,
                         payload.get("component_id"),
                     )
-                    stream_method = getattr(remote_engine, "execute_payload_stream", None)
-                    if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
-                        logger.info(
-                            "Using streamed Modal progress path for component=%s via auto-deployed execute_payload_stream.remote_gen(...).",
-                            payload.get("component_id"),
-                        )
-                        return _consume_remote_payload_stream(
-                            payload,
-                            stream_method.remote_gen(payload, kwargs_payload),
-                        )
-                    if _should_stream_remote_progress(payload):
-                        logger.warning(
-                            "Streamed Modal progress is unavailable for component=%s after auto-deploy; falling back to execute_payload.remote(...).",
-                            payload.get("component_id"),
-                        )
-                    return remote_engine.execute_payload.remote(payload, kwargs_payload)
+                    return _invoke_remote_engine_payload(
+                        remote_engine,
+                        payload,
+                        kwargs_payload,
+                        cancellation_event,
+                    )
                 except lookup_error_types as retry_exc:
                     exc = retry_exc
             if not settings.allow_ephemeral_fallback:
@@ -809,22 +1060,12 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
             settings.app_name,
             payload.get("component_id"),
         )
-        stream_method = getattr(remote_engine, "execute_payload_stream", None)
-        if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
-            logger.info(
-                "Using streamed Modal progress path for component=%s via execute_payload_stream.remote_gen(...).",
-                payload.get("component_id"),
-            )
-            return _consume_remote_payload_stream(
-                payload,
-                stream_method.remote_gen(payload, kwargs_payload),
-            )
-        if _should_stream_remote_progress(payload):
-            logger.warning(
-                "Streamed Modal progress is unavailable for component=%s; falling back to execute_payload.remote(...).",
-                payload.get("component_id"),
-            )
-        return remote_engine.execute_payload.remote(payload, kwargs_payload)
+        return _invoke_remote_engine_payload(
+            remote_engine,
+            payload,
+            kwargs_payload,
+            cancellation_event,
+        )
 
     if "app" not in globals() or "RemoteEngine" not in globals():
         logger.debug("Local module Modal runtime objects are unavailable; loading stable cloud entry module.")
@@ -843,23 +1084,12 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
     run_context = cloud_app.run() if hasattr(cloud_app, "run") else nullcontext()
     with run_context:
         remote_engine = cloud_remote_engine()
-        stream_method = getattr(remote_engine, "execute_payload_stream", None)
-        if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
-            logger.info(
-                "Using streamed Modal progress path for component=%s via ephemeral execute_payload_stream.remote_gen(...).",
-                payload.get("component_id"),
-            )
-            result = _consume_remote_payload_stream(
-                payload,
-                stream_method.remote_gen(payload, kwargs_payload),
-            )
-        else:
-            if _should_stream_remote_progress(payload):
-                logger.warning(
-                    "Streamed Modal progress is unavailable for component=%s in ephemeral fallback; falling back to execute_payload.remote(...).",
-                    payload.get("component_id"),
-                )
-            result = remote_engine.execute_payload.remote(payload, kwargs_payload)
+        result = _invoke_remote_engine_payload(
+            remote_engine,
+            payload,
+            kwargs_payload,
+            cancellation_event,
+        )
     logger.info(
         "Ephemeral Modal app.run() invocation completed for component %s.",
         payload.get("component_id"),
@@ -880,19 +1110,44 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
         payload.get("component_id"),
         payload.get("payload_kind"),
     )
+    cancellation_event = threading.Event()
     future = _REMOTE_MODAL_CALL_EXECUTOR.submit(
         _invoke_modal_payload_blocking,
         dict(payload),
         kwargs_payload,
+        cancellation_event,
     )
     try:
-        response = future.result()
+        while True:
+            try:
+                response = future.result(timeout=0.1)
+                break
+            except FutureTimeoutError:
+                if _local_processing_interrupted() and not cancellation_event.is_set():
+                    logger.info(
+                        "Observed local interrupt while Modal component=%s was running; requesting remote cancellation.",
+                        payload.get("component_id"),
+                    )
+                    cancellation_event.set()
+                continue
     except Exception:
+        if cancellation_event.is_set() or _local_processing_interrupted():
+            logger.info(
+                "Reraising Modal failure as a local interrupt for component=%s after cancellation.",
+                payload.get("component_id"),
+            )
+            _raise_local_interrupt()
         logger.exception(
             "Modal remote invocation failed for component=%s.",
             payload.get("component_id"),
         )
         raise
+    if cancellation_event.is_set() or _local_processing_interrupted():
+        logger.info(
+            "Remote invocation for component=%s finished after interruption; raising local interrupt.",
+            payload.get("component_id"),
+        )
+        _raise_local_interrupt()
     logger.info(
         "Modal remote invocation completed for component=%s.",
         payload.get("component_id"),
