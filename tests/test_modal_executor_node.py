@@ -220,6 +220,60 @@ def test_modal_cloud_traces_remote_node_execution_spans(
     assert "Remote node 2 class_type=KSampler role=sampling finished in " in captured.out
 
 
+def test_modal_cloud_streams_progress_and_result_events(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The cloud runtime should stream progress envelopes before the final result."""
+    progress_callbacks: list[dict[str, Any]] = []
+
+    def fake_execute_subgraph_locally(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        status_callback: Any = None,
+    ) -> bytes:
+        if status_callback is not None:
+            status_callback(
+                {
+                    "phase": "executing",
+                    "active_node_id": "7",
+                    "active_node_class_type": "UNETLoader",
+                    "active_node_role": "model_load",
+                }
+            )
+            status_callback({"phase": "execution_success"})
+        progress_callbacks.append({"component_id": payload["component_id"], "kwargs": kwargs_payload})
+        return b"serialized-outputs"
+
+    monkeypatch.setattr(modal_cloud_module, "execute_subgraph_locally", fake_execute_subgraph_locally)
+
+    events = list(
+        modal_cloud_module._stream_remote_payload_events(
+            {"payload_kind": "subgraph", "component_id": "component-1"},
+            b"{}",
+        )
+    )
+
+    assert progress_callbacks == [{"component_id": "component-1", "kwargs": b"{}"}]
+    assert events == [
+        {
+            "kind": "progress",
+            "phase": "executing",
+            "active_node_id": "7",
+            "active_node_class_type": "UNETLoader",
+            "active_node_role": "model_load",
+        },
+        {
+            "kind": "progress",
+            "phase": "execution_success",
+        },
+        {
+            "kind": "result",
+            "outputs": b"serialized-outputs",
+        },
+    ]
+
+
 def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
     modal_cloud_module: Any,
 ) -> None:
@@ -551,6 +605,81 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", None)]
+
+
+def test_remote_modal_consumes_streamed_progress_and_result(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local Modal client should forward streamed progress events into the UI websocket."""
+
+    class FakePromptServer:
+        """Capture websocket events emitted by streamed remote progress."""
+
+        def __init__(self) -> None:
+            """Initialize the event sink."""
+            self.messages: list[tuple[str, dict[str, Any], str | None]] = []
+
+        def send_sync(self, event: str, data: dict[str, Any], sid: str | None) -> None:
+            """Record one emitted websocket message."""
+            self.messages.append((event, data, sid))
+
+    prompt_server = FakePromptServer()
+    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+
+    payload = {
+        "prompt_id": "prompt-1",
+        "component_id": "component-1",
+        "component_node_ids": ["7", "8"],
+        "extra_data": {"client_id": "client-1"},
+    }
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {
+                    "kind": "progress",
+                    "phase": "executing",
+                    "active_node_id": "7",
+                    "active_node_class_type": "UNETLoader",
+                    "active_node_role": "model_load",
+                },
+                {
+                    "kind": "progress",
+                    "phase": "execution_success",
+                },
+                {
+                    "kind": "result",
+                    "outputs": b"serialized-outputs",
+                },
+            ]
+        ),
+    )
+
+    assert result == b"serialized-outputs"
+    assert prompt_server.messages == [
+        (
+            "modal_status",
+            {
+                "phase": "executing",
+                "prompt_id": "prompt-1",
+                "node_ids": ["7", "8"],
+                "active_node_id": "7",
+                "active_node_class_type": "UNETLoader",
+                "active_node_role": "model_load",
+            },
+            "client-1",
+        ),
+        (
+            "modal_status",
+            {
+                "phase": "execution_success",
+                "prompt_id": "prompt-1",
+                "node_ids": ["7", "8"],
+            },
+            "client-1",
+        ),
+    ]
 
 
 def test_remote_modal_requires_manual_deploy_when_auto_deploy_disabled(

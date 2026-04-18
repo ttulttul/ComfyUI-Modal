@@ -129,6 +129,8 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     payload = rewritten_node["inputs"]["original_node_data"]
     assert rewritten_node["class_type"].startswith("ModalUniversalExecutor_")
     assert payload["payload_kind"] == "subgraph"
+    assert payload["prompt_id"] is None
+    assert payload["component_node_ids"] == ["1", "2"]
     assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith("/assets/")
     assert payload["execute_node_ids"] == ["2"]
     assert payload["requires_volume_reload"] is True
@@ -416,20 +418,26 @@ def test_emit_modal_status_targets_prompt_client(
     prompt_server = FakePromptServer()
     api_intercept_module._emit_modal_status(
         prompt_server=prompt_server,
-        phase="setup",
+        phase="executing",
         client_id="client-1",
         prompt_id="prompt-1",
         node_ids=["4", "5"],
         component_node_ids_by_representative={"4": ["4", "5"]},
+        active_node_id="5",
+        active_node_class_type="KSampler",
+        active_node_role="sampling",
     )
 
     assert prompt_server.messages == [
         (
             "modal_status",
             {
-                "phase": "setup",
+                "phase": "executing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["4", "5"],
+                "active_node_id": "5",
+                "active_node_class_type": "KSampler",
+                "active_node_role": "sampling",
                 "components": [
                     {
                         "representative_node_id": "4",

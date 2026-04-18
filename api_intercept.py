@@ -106,6 +106,9 @@ def _emit_modal_status(
     prompt_id: str | None,
     node_ids: list[str],
     component_node_ids_by_representative: dict[str, list[str]] | None = None,
+    active_node_id: str | None = None,
+    active_node_class_type: str | None = None,
+    active_node_role: str | None = None,
     error_message: str | None = None,
 ) -> None:
     """Send a Modal execution status event to the active websocket client."""
@@ -128,6 +131,12 @@ def _emit_modal_status(
                 component_node_ids_by_representative.items()
             )
         ]
+    if active_node_id is not None:
+        payload["active_node_id"] = active_node_id
+    if active_node_class_type is not None:
+        payload["active_node_class_type"] = active_node_class_type
+    if active_node_role is not None:
+        payload["active_node_role"] = active_node_role
     if error_message is not None:
         payload["error_message"] = error_message
 
@@ -576,6 +585,8 @@ def _build_component_payload(
     payload = {
         "payload_kind": "subgraph",
         "component_id": component.representative_node_id,
+        "prompt_id": (extra_data or {}).get("prompt_id"),
+        "component_node_ids": list(component.node_ids),
         "subgraph_prompt": component_prompt,
         "boundary_inputs": [
             {
@@ -852,6 +863,7 @@ def setup_modal_queue_route(
             json_data = await request.json()
             json_data.setdefault("prompt_id", str(uuid.uuid4()))
             json_data.setdefault("extra_data", {})
+            json_data["extra_data"]["prompt_id"] = json_data["prompt_id"]
             if json_data.get("client_id") is not None:
                 json_data["extra_data"]["client_id"] = json_data["client_id"]
             extra_pnginfo = ((json_data.get("extra_data") or {}).get("extra_pnginfo") or {})

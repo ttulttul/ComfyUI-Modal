@@ -37,3 +37,13 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "Modal setup running for" in source
     assert "Modal workflow running on" in source
     assert "installGlobalStatusStyles()" in source
+
+
+def test_remote_modal_status_tracks_active_node_ids() -> None:
+    """The frontend should track and highlight the currently active remote node."""
+    source = _modal_toggle_source()
+
+    assert "activeNodeId: null" in source
+    assert "function setPromptActiveNode(promptId, activeNodeId)" in source
+    assert "detail.active_node_id" in source
+    assert "isActiveRemoteNode" in source
