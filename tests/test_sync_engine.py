@@ -41,6 +41,8 @@ def test_sync_file_deduplicates_by_hash(
 
     assert first.remote_path == second.remote_path
     assert first.sha256 == second.sha256
+    assert first.uploaded is True
+    assert second.uploaded is False
     assert (settings.local_storage_root / first.remote_path.lstrip("/")).exists()
     assert (settings.local_storage_root / f"hashes/{first.sha256}.done").exists()
 
@@ -81,6 +83,7 @@ def test_sync_custom_nodes_directory_creates_archive(
 
     assert bundle is not None
     assert bundle.remote_path.startswith("/custom_nodes/")
+    assert bundle.uploaded is True
     assert (settings.local_storage_root / bundle.remote_path.lstrip("/")).exists()
 
 
@@ -235,6 +238,7 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
 
     assert second_bundle is not None
     assert second_bundle.sha256 == first_bundle.sha256
+    assert second_bundle.uploaded is True
     assert second_engine._cached_custom_nodes_archive_path(first_bundle.sha256).exists()
 
 

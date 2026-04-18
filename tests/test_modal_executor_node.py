@@ -220,6 +220,16 @@ def test_modal_cloud_traces_remote_node_execution_spans(
     assert "Remote node 2 class_type=KSampler role=sampling finished in " in captured.out
 
 
+def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
+    modal_cloud_module: Any,
+) -> None:
+    """Steady-state requests should skip Modal volume reload when queue-time sync uploaded nothing."""
+
+    assert modal_cloud_module._should_reload_modal_volume({"requires_volume_reload": True}) is True
+    assert modal_cloud_module._should_reload_modal_volume({"requires_volume_reload": False}) is False
+    assert modal_cloud_module._should_reload_modal_volume({}) is True
+
+
 def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
     modal_cloud_module: Any,
     monkeypatch: Any,
