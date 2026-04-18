@@ -220,6 +220,29 @@ def test_modal_cloud_traces_remote_node_execution_spans(
     assert "Remote node 2 class_type=KSampler role=sampling finished in " in captured.out
 
 
+def test_modal_cloud_installs_headless_prompt_server_instance(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote custom-node init should get a minimal PromptServer.instance shim."""
+    fake_prompt_server_class = type("PromptServer", (), {})
+    fake_server_module = types.SimpleNamespace(PromptServer=fake_prompt_server_class)
+
+    monkeypatch.setitem(sys.modules, "server", fake_server_module)
+    modal_cloud_module._ensure_headless_prompt_server_instance()
+
+    instance = fake_prompt_server_class.instance
+    assert instance is not None
+    assert hasattr(instance, "routes")
+    assert hasattr(instance, "app")
+    assert instance.supports == ["custom_nodes_from_web"]
+    assert instance.client_id is None
+    assert instance.last_node_id is None
+
+    instance.add_on_prompt_handler("handler")
+    assert instance.on_prompt_handlers == ["handler"]
+
+
 def test_modal_cloud_streams_progress_and_result_events(
     modal_cloud_module: Any,
     monkeypatch: Any,

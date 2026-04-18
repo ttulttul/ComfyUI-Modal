@@ -189,6 +189,8 @@ Because the Modal queue route can spend noticeable time hashing, syncing, and cr
 
 The extension also now renders its own global activity badge in the ComfyUI UI during Modal setup and remote execution. That badge stays visible even when ComfyUI's stock queue state does not fully reflect the pre-queue setup phase.
 
+For headless remote execution, the worker also installs a minimal `PromptServer.instance` shim before it imports external custom nodes. That keeps route-registering custom node packs from crashing at import time just because the remote worker is not running ComfyUI's full HTTP server.
+
 ### 6. What happens during execution
 
 When execution reaches a rewritten component proxy:

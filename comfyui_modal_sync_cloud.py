@@ -87,6 +87,33 @@ class _NullPromptServer:
         logger.debug("Suppressed remote prompt event %s for client %s.", event, client_id)
 
 
+class _HeadlessPromptServerInstance:
+    """Minimal PromptServer.instance replacement for custom-node import side effects."""
+
+    def __init__(self) -> None:
+        """Initialize route registration and no-op websocket state."""
+        from aiohttp import web
+
+        self.routes = web.RouteTableDef()
+        self.app = web.Application()
+        self.supports = ["custom_nodes_from_web"]
+        self.client_id: str | None = None
+        self.last_node_id: str | None = None
+        self.on_prompt_handlers: list[Any] = []
+
+    async def send(self, event: str, data: dict[str, Any], sid: str | None = None) -> None:
+        """Discard async websocket sends from import-time custom-node helpers."""
+        logger.debug("Suppressed headless remote prompt event %s for client %s.", event, sid)
+
+    def send_sync(self, event: str, data: dict[str, Any], sid: str | None = None) -> None:
+        """Discard sync websocket sends from import-time custom-node helpers."""
+        logger.debug("Suppressed headless remote prompt event %s for client %s.", event, sid)
+
+    def add_on_prompt_handler(self, handler: Any) -> None:
+        """Record prompt handlers registered by custom nodes during import."""
+        self.on_prompt_handlers.append(handler)
+
+
 class _TracingPromptServer(_NullPromptServer):
     """PromptExecutor server stub that records coarse per-node execution timings."""
 
@@ -382,6 +409,23 @@ def _ensure_comfyui_support_packages() -> None:
     _force_import_package_from_root("utils", comfyui_root)
 
 
+def _ensure_headless_prompt_server_instance() -> None:
+    """Install a minimal PromptServer.instance for custom-node import-time hooks."""
+    try:
+        import server
+    except ModuleNotFoundError:
+        return
+
+    prompt_server_class = getattr(server, "PromptServer", None)
+    if prompt_server_class is None:
+        return
+    if getattr(prompt_server_class, "instance", None) is not None:
+        return
+
+    prompt_server_class.instance = _HeadlessPromptServerInstance()
+    logger.info("Installed headless PromptServer.instance for remote custom-node initialization.")
+
+
 def _ensure_default_custom_nodes_dir() -> Path | None:
     """Create the default ComfyUI custom_nodes directory when the image omits its contents."""
     comfyui_root = _active_comfyui_root()
@@ -567,6 +611,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
         ):
             _ensure_comfyui_support_packages()
             _ensure_default_custom_nodes_dir()
+            _ensure_headless_prompt_server_instance()
             nodes_module = _load_nodes_module()
 
             if not _COMFY_RUNTIME_BASE_INITIALIZED:
