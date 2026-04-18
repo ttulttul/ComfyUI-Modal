@@ -13,6 +13,7 @@ const COMPLETE_BORDER_COLOR = "#16a34a";
 const ERROR_BORDER_COLOR = "#ef4444";
 
 const STATE_SETUP = "setup";
+const STATE_WAITING = "waiting";
 const EXECUTION_PHASE = "executing";
 const STATE_READY = "ready";
 const STATE_ACTIVE = "active";
@@ -155,6 +156,7 @@ function currentGlobalStatus() {
   return (
     phases.find((state) => state.phase === STATE_ERROR) ??
     phases.find((state) => state.phase === STATE_SETUP) ??
+    phases.find((state) => state.phase === STATE_WAITING) ??
     phases.find((state) => state.phase === EXECUTION_PHASE) ??
     phases[0]
   );
@@ -189,7 +191,14 @@ function refreshGlobalStatusElement() {
     dot.style.background = SETUP_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = `Modal setup running for ${activeState.nodeCount} ${nodeLabel}`;
+    text.textContent = "Syncing graph with Modal";
+  } else if (activeState.phase === STATE_WAITING) {
+    element.style.borderColor = "rgba(245, 158, 11, 0.55)";
+    element.style.background = "rgba(61, 42, 9, 0.94)";
+    dot.style.background = SETUP_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
+    dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
+    text.textContent = "Waiting for Modal app";
   } else if (activeState.phase === EXECUTION_PHASE) {
     element.style.borderColor = "rgba(34, 197, 94, 0.55)";
     element.style.background = "rgba(8, 49, 28, 0.94)";
@@ -660,7 +669,11 @@ function handleExecutionPhase(event, phase) {
     return;
   }
   if (phase === EXECUTION_PHASE) {
-    setGlobalStatusPhase(promptId, EXECUTION_PHASE, componentNodeIds.length);
+    setGlobalStatusPhase(
+      promptId,
+      promptState.hasStreamedProgress ? EXECUTION_PHASE : STATE_WAITING,
+      componentNodeIds.length,
+    );
     setNodesPhase(componentNodeIds, STATE_READY, promptId, detail.exception_message);
     return;
   }
