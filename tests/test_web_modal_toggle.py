@@ -96,7 +96,10 @@ def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
     assert "function findNodeByWorkflowPath(workflowPath)" in source
     assert "function selectedWorkflowNodePaths(node)" in source
     assert "function analyzeAndMarkRequiredRemoteNodes(node)" in source
+    assert "function installModalContextMenu(nodeType, nodeData)" in source
     assert 'api.fetchApi(MODAL_ANALYZE_ROUTE, {' in source
+    assert "async beforeRegisterNodeDef(nodeType, nodeData)" in source
+    assert "installModalContextMenu(nodeType, nodeData);" in source
     assert '"Modal: Include Required Upstream Nodes"' in source
     assert '"Modal: Include Required Upstream Nodes for Selection"' in source
 

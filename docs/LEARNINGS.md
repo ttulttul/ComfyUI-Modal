@@ -7,6 +7,7 @@
 - `comfy node pack` is not git-aware by default; it uses `.gitignore` as its practical packaging filter. For a clean registry artifact, this repo needs an allowlist-style `.gitignore` so untracked local files like logs, caches, virtualenvs, and scratch docs cannot leak into `node.zip`.
 - Remote per-node phase events are not enough to mirror sampler progress in the local UI. The Modal worker also needs a headless equivalent of ComfyUI's global progress hook so `ProgressBar` updates feed `progress_state`, and the local relay should forward those numeric updates as a separate high-frequency UI event rather than overloading coarse execution-phase messages.
 - Queue-time remote-boundary fixes should come from the backend's actual rewrite logic, not from parsing error text in the browser. A small dry-run analysis route can reuse the same prompt-id resolution and upstream auto-expansion rules, then return workflow-node paths for the frontend to mark directly from a context-menu action, including nested subgraph nodes.
+- For ComfyUI node right-click menus, patch `getExtraMenuOptions` at node-definition time in `beforeRegisterNodeDef`, not per-instance in `nodeCreated`. The prototype-level hook matches how working extensions inject menu entries and avoids menu items silently disappearing even when other per-node UI changes still show up.
 
 ## 2026-04-17
 
