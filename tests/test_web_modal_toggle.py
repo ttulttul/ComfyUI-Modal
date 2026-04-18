@@ -37,6 +37,7 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "Modal setup running for" in source
     assert "Modal workflow running on" in source
     assert "installGlobalStatusStyles()" in source
+    assert "function pruneGlobalStatusStates()" in source
 
 
 def test_remote_modal_status_tracks_active_node_ids() -> None:
@@ -68,3 +69,11 @@ def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
 
     assert "promptState.hasStreamedProgress = true;" in source
     assert "if (promptState.hasStreamedProgress && phase !== STATE_ERROR)" in source
+
+
+def test_prompt_cleanup_prunes_orphaned_global_status_entries() -> None:
+    """Workflow cleanup should remove stale global badge states once prompt state is gone."""
+    source = _modal_toggle_source()
+
+    assert "pruneGlobalStatusStates();" in source
+    assert "refreshGlobalStatusElement();" in source

@@ -193,6 +193,7 @@ When the full workflow finishes successfully, all Modal-marked nodes return imme
 Because the Modal queue route can spend noticeable time hashing, syncing, and creating a remote runtime before the prompt is formally queued, the frontend also emits a temporary synthetic running state into ComfyUI's normal queue/execution UI. Those events now mirror ComfyUI's native websocket payload shapes, including the temporary "Waiting for a machine" initialization notification, so the built-in queue indicators stay alive during the preparatory phase instead of looking idle until the backend finally returns the queued prompt id.
 
 The extension also now renders its own global activity badge in the ComfyUI UI during Modal setup and remote execution. That badge stays visible even when ComfyUI's stock queue state does not fully reflect the pre-queue setup phase.
+The badge now also prunes orphaned prompt entries when a workflow finishes, so stale orange "setup running" indicators do not linger after the remote work is done.
 
 For headless remote execution, the worker also installs a minimal `PromptServer.instance` shim before it imports external custom nodes. That keeps route-registering custom node packs from crashing at import time just because the remote worker is not running ComfyUI's full HTTP server.
 

@@ -123,10 +123,23 @@ function ensureGlobalStatusElement() {
 }
 
 /**
+ * Remove orphaned global status entries that no longer have any live prompt state.
+ */
+function pruneGlobalStatusStates() {
+  for (const promptId of Array.from(modalGlobalStatusStates.keys())) {
+    if (modalPromptStates.has(promptId) || syntheticPromptUiStates.has(promptId)) {
+      continue;
+    }
+    modalGlobalStatusStates.delete(promptId);
+  }
+}
+
+/**
  * Return the most important active global Modal state.
  * @returns {{ phase: string, promptId: string, nodeCount: number } | null}
  */
 function currentGlobalStatus() {
+  pruneGlobalStatusStates();
   if (modalGlobalStatusStates.size === 0) {
     return null;
   }
@@ -671,6 +684,8 @@ function handleExecutionPhase(event, phase) {
 function clearPromptRemoteStates(promptId) {
   const promptState = modalPromptStates.get(promptId);
   if (!promptState) {
+    pruneGlobalStatusStates();
+    refreshGlobalStatusElement();
     return;
   }
   for (const remoteNodeId of promptState.remoteNodeIds) {
@@ -681,6 +696,8 @@ function clearPromptRemoteStates(promptId) {
     }
   }
   modalPromptStates.delete(promptId);
+  pruneGlobalStatusStates();
+  refreshGlobalStatusElement();
   app.graph?.setDirtyCanvas(true, true);
 }
 
