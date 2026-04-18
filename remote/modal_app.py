@@ -550,6 +550,12 @@ def _consume_remote_payload_stream(
     for stream_event in stream_events:
         event_kind = str(stream_event.get("kind", ""))
         if event_kind == "progress":
+            logger.info(
+                "Forwarding streamed Modal progress for component=%s phase=%s active_node_id=%s.",
+                payload.get("component_id"),
+                stream_event.get("phase"),
+                stream_event.get("active_node_id"),
+            )
             _emit_local_modal_status(
                 prompt_id=prompt_id,
                 client_id=client_id,
@@ -581,11 +587,11 @@ def _consume_remote_payload_stream(
             result_payload = candidate_outputs
             continue
 
-        logger.debug(
-            "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
-            event_kind,
-            payload.get("component_id"),
-        )
+            logger.debug(
+                "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
+                event_kind,
+                payload.get("component_id"),
+            )
 
     if result_payload is None:
         raise ModalRemoteInvocationError(
@@ -688,9 +694,18 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
             )
             stream_method = getattr(remote_engine, "execute_payload_stream", None)
             if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+                logger.info(
+                    "Using streamed Modal progress path for component=%s via execute_payload_stream.remote_gen(...).",
+                    payload.get("component_id"),
+                )
                 return _consume_remote_payload_stream(
                     payload,
                     stream_method.remote_gen(payload, kwargs_payload),
+                )
+            if _should_stream_remote_progress(payload):
+                logger.warning(
+                    "Streamed Modal progress is unavailable for component=%s; falling back to execute_payload.remote(...).",
+                    payload.get("component_id"),
                 )
             return remote_engine.execute_payload.remote(payload, kwargs_payload)
         except lookup_error_types as exc:
@@ -705,9 +720,18 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
                     )
                     stream_method = getattr(remote_engine, "execute_payload_stream", None)
                     if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+                        logger.info(
+                            "Using streamed Modal progress path for component=%s via auto-deployed execute_payload_stream.remote_gen(...).",
+                            payload.get("component_id"),
+                        )
                         return _consume_remote_payload_stream(
                             payload,
                             stream_method.remote_gen(payload, kwargs_payload),
+                        )
+                    if _should_stream_remote_progress(payload):
+                        logger.warning(
+                            "Streamed Modal progress is unavailable for component=%s after auto-deploy; falling back to execute_payload.remote(...).",
+                            payload.get("component_id"),
                         )
                     return remote_engine.execute_payload.remote(payload, kwargs_payload)
                 except lookup_error_types as retry_exc:
@@ -734,9 +758,18 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
         )
         stream_method = getattr(remote_engine, "execute_payload_stream", None)
         if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+            logger.info(
+                "Using streamed Modal progress path for component=%s via execute_payload_stream.remote_gen(...).",
+                payload.get("component_id"),
+            )
             return _consume_remote_payload_stream(
                 payload,
                 stream_method.remote_gen(payload, kwargs_payload),
+            )
+        if _should_stream_remote_progress(payload):
+            logger.warning(
+                "Streamed Modal progress is unavailable for component=%s; falling back to execute_payload.remote(...).",
+                payload.get("component_id"),
             )
         return remote_engine.execute_payload.remote(payload, kwargs_payload)
 
@@ -759,11 +792,20 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
         remote_engine = cloud_remote_engine()
         stream_method = getattr(remote_engine, "execute_payload_stream", None)
         if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+            logger.info(
+                "Using streamed Modal progress path for component=%s via ephemeral execute_payload_stream.remote_gen(...).",
+                payload.get("component_id"),
+            )
             result = _consume_remote_payload_stream(
                 payload,
                 stream_method.remote_gen(payload, kwargs_payload),
             )
         else:
+            if _should_stream_remote_progress(payload):
+                logger.warning(
+                    "Streamed Modal progress is unavailable for component=%s in ephemeral fallback; falling back to execute_payload.remote(...).",
+                    payload.get("component_id"),
+                )
             result = remote_engine.execute_payload.remote(payload, kwargs_payload)
     logger.info(
         "Ephemeral Modal app.run() invocation completed for component %s.",
