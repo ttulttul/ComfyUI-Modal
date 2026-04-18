@@ -1,5 +1,9 @@
 # Learnings
 
+## 2026-04-18
+
+- The README had drifted into release-note territory, especially in the old `Important distinction:` block. For this project, the maintainable structure is: short overview, explicit local-vs-remote execution sections, concise operational caveats, and a separate learnings log for historical implementation details.
+
 ## 2026-04-17
 
 - The workflow metadata already rides along in `extra_data.extra_pnginfo.workflow`, so the backend can discover `node.properties.is_modal_remote` without any extra frontend metadata channel.
