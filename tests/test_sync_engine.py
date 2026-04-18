@@ -363,3 +363,137 @@ def test_modal_volume_backend_treats_missing_path_as_cache_miss(
     backend = sync_engine_module.ModalVolumeBackend("volume")
 
     assert backend.exists("/hashes/missing.done") is False
+
+
+def test_modal_volume_backend_caches_exists_results_and_uploaded_paths(
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Repeated existence checks for the same path should avoid repeated Modal metadata calls."""
+
+    class FakeBatch:
+        """Capture one uploaded path."""
+
+        def __init__(self, volume: "FakeVolume") -> None:
+            """Store the backing volume."""
+            self.volume = volume
+
+        def __enter__(self) -> "FakeBatch":
+            """Return the active batch context."""
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            """Close the fake batch context."""
+            return None
+
+        def put_file(self, source: Any, remote_path: str) -> None:
+            """Record the uploaded path as present."""
+            self.volume.paths.add(remote_path)
+
+    class FakeVolume:
+        """Minimal Modal volume double with listdir accounting."""
+
+        def __init__(self) -> None:
+            """Initialize fake storage state."""
+            self.paths: set[str] = set()
+            self.listdir_calls = 0
+
+        def listdir(self, remote_path: str, recursive: bool = False) -> list[str]:
+            """Return a listing for known paths while counting calls."""
+            self.listdir_calls += 1
+            return [remote_path] if remote_path in self.paths else []
+
+        def batch_upload(self) -> FakeBatch:
+            """Return a fake uploader."""
+            return FakeBatch(self)
+
+    fake_volume = FakeVolume()
+
+    class FakeModal:
+        """Minimal modal SDK double exposing a fake volume."""
+
+        exception = type(
+            "FakeExceptionNamespace",
+            (),
+            {
+                "NotFoundError": FileNotFoundError,
+            },
+        )
+
+        class Volume:
+            """Namespace for volume lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> FakeVolume:
+                """Return the fake volume for any lookup."""
+                return fake_volume
+
+    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    backend = sync_engine_module.ModalVolumeBackend("volume")
+
+    assert backend.exists("/hashes/present.done") is False
+    assert backend.exists("/hashes/present.done") is False
+    assert fake_volume.listdir_calls == 1
+
+    local_path = tmp_path / "marker.txt"
+    local_path.write_text("marker", encoding="utf-8")
+    backend.put_file(local_path, "/hashes/present.done")
+
+    assert backend.exists("/hashes/present.done") is True
+    assert fake_volume.listdir_calls == 1
+
+
+def test_modal_volume_backend_retries_rate_limited_calls(
+    sync_engine_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Transient Modal rate limiting should back off and retry instead of failing immediately."""
+
+    class FakeResourceExhaustedError(Exception):
+        """Stand-in for modal.exception.ResourceExhaustedError."""
+
+    class FakeVolume:
+        """Minimal Modal volume double that rate limits once."""
+
+        def __init__(self) -> None:
+            """Initialize the listdir attempt counter."""
+            self.listdir_calls = 0
+
+        def listdir(self, remote_path: str, recursive: bool = False) -> list[str]:
+            """Raise once, then succeed."""
+            self.listdir_calls += 1
+            if self.listdir_calls == 1:
+                raise FakeResourceExhaustedError("rate limited")
+            return [remote_path]
+
+    fake_volume = FakeVolume()
+
+    class FakeModal:
+        """Minimal modal SDK double exposing retryable error types."""
+
+        exception = type(
+            "FakeExceptionNamespace",
+            (),
+            {
+                "NotFoundError": FileNotFoundError,
+                "ResourceExhaustedError": FakeResourceExhaustedError,
+            },
+        )
+
+        class Volume:
+            """Namespace for volume lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> FakeVolume:
+                """Return the fake volume for any lookup."""
+                return fake_volume
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    backend = sync_engine_module.ModalVolumeBackend("volume")
+
+    assert backend.exists("/hashes/present.done") is True
+    assert fake_volume.listdir_calls == 2
+    assert sleep_calls == [0.25]
