@@ -1,8 +1,21 @@
 [project]
-name = "comfyui-modal-sync"
+name = "modal-sync"
 version = "0.1.0"
 description = "ComfyUI custom node extension for routing marked nodes to Modal-backed execution."
+readme = "README.md"
 requires-python = ">=3.11"
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/ttulttul/ComfyUI-Modal"
+"Bug Tracker" = "https://github.com/ttulttul/ComfyUI-Modal/issues"
+
+[tool.comfy]
+PublisherId = "ttulttul"
+DisplayName = "Modal Sync"
+requires-comfyui = ">=0.11.1"
 
 [build-system]
 requires = ["hatchling"]

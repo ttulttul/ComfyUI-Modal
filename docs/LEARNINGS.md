@@ -3,6 +3,8 @@
 ## 2026-04-18
 
 - The README had drifted into release-note territory, especially in the old `Important distinction:` block. For this project, the maintainable structure is: short overview, explicit local-vs-remote execution sections, concise operational caveats, and a separate learnings log for historical implementation details.
+- ComfyUI registry setup is mostly metadata, not code. The repo needs a real `[tool.comfy]` block in `pyproject.toml`, a stable immutable node-pack id, repository URLs, and an optional GitHub publish workflow; choosing a software license should stay explicit instead of being guessed during packaging work.
+- `comfy node pack` is not git-aware by default; it uses `.gitignore` as its practical packaging filter. For a clean registry artifact, this repo needs an allowlist-style `.gitignore` so untracked local files like logs, caches, virtualenvs, and scratch docs cannot leak into `node.zip`.
 
 ## 2026-04-17
 

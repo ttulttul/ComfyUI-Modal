@@ -216,6 +216,9 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - Manage the project with `uv`.
 - Run the test suite with `uv run pytest`.
 - [`pyproject.toml`](pyproject.toml) provides pytest discovery configuration for `uv`.
+- The repository is now structured as a ComfyUI Registry node pack with registry metadata in [`pyproject.toml`](pyproject.toml) and a publish workflow in [`.github/workflows/publish_action.yml`](.github/workflows/publish_action.yml).
+- Before publishing, create a Comfy Registry publisher and API key, then store the token in the GitHub Actions secret `REGISTRY_ACCESS_TOKEN`.
+- The registry pack name is `modal-sync`, the display name is `Modal Sync`, and the current publisher id is set to `ttulttul` to match the GitHub origin owner.
 - [`modal_test_workflow.json`](modal_test_workflow.json) is a checked-in smoke artifact from a successful Modal-path run, not a pristine authoring workflow.
 
 ## Current limitations

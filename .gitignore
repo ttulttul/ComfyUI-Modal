@@ -1,0 +1,23 @@
+# Comfy CLI pack output should only contain the explicit runtime payload for the node pack.
+*
+
+!/README.md
+!/pyproject.toml
+!/LICENSE
+!/LICENSE.*
+
+!/__init__.py
+!/api_intercept.py
+!/comfyui_modal_sync_cloud.py
+!/modal_executor_node.py
+!/serialization.py
+!/settings.py
+!/sync_engine.py
+
+!/remote/
+/remote/*
+!/remote/*.py
+
+!/web/
+/web/*
+!/web/*.js
