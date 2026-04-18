@@ -8,7 +8,7 @@
 ## What is implemented
 
 - A frontend extension in [web/modal_toggle.js](/home/ksimpson/git/ComfyUI-Modal/web/modal_toggle.js) that injects a `Run on Modal` toggle into every non-internal node, draws live remote-state overlays on marked nodes, and submits queued prompts to `/modal/queue_prompt`.
-- A backend route in [api_intercept.py](/home/ksimpson/git/ComfyUI-Modal/api_intercept.py) that reads the workflow snapshot from `extra_pnginfo.workflow`, identifies connected remote-marked node components, syncs referenced assets, and rewrites each component into one signature-preserving Modal proxy node.
+- A backend route in [api_intercept.py](/home/ksimpson/git/ComfyUI-Modal/api_intercept.py) that reads the workflow snapshot from `extra_pnginfo.workflow`, recursively discovers Modal markers even inside nested subgraph workflow metadata, identifies connected remote-marked node components, syncs referenced assets, and rewrites each component into one signature-preserving Modal proxy node.
 - A dynamic proxy registry in [modal_executor_node.py](/home/ksimpson/git/ComfyUI-Modal/modal_executor_node.py) that mirrors the exported output count and output types of each remote component so ComfyUI validation still succeeds after rewrite.
 - A content-addressable sync engine in [sync_engine.py](/home/ksimpson/git/ComfyUI-Modal/sync_engine.py) that mirrors model files and a zipped `custom_nodes/` bundle into storage keyed by SHA256.
 - A remote runtime skeleton in [remote/modal_app.py](/home/ksimpson/git/ComfyUI-Modal/remote/modal_app.py) that supports local fallback execution for tests and can call into Modal when the SDK is available.
@@ -35,7 +35,7 @@
 ## Runtime behavior
 
 1. Queueing a prompt posts to `/modal/queue_prompt`.
-2. The route loads the workflow metadata from `extra_data.extra_pnginfo.workflow`.
+2. The route loads the workflow metadata from `extra_data.extra_pnginfo.workflow`, including nested saved subgraph fragments.
 3. Connected regions of nodes with `properties.is_modal_remote = true` are replaced with generated `ModalUniversalExecutor_<hash>` proxy nodes.
 4. File-like widget inputs ending in `.safetensors`, `.ckpt`, `.pt`, or `.vae` are resolved to local files and mirrored into storage.
 5. The executor serializes the component boundary inputs with `safetensors`, forwards the remote component payload to the runtime, and deserializes the exported boundary outputs back into ComfyUI values.
@@ -171,6 +171,7 @@ Use the normal queue button in ComfyUI.
 The frontend extension intercepts queue submission and sends the prompt to `/modal/queue_prompt` instead of `/prompt`. On the backend:
 
 1. The request handler inspects the workflow snapshot in `extra_pnginfo.workflow`.
+   Modal marker discovery now walks nested saved subgraph fragments too, so nodes marked inside ComfyUI subgraphs still participate in remote rewrite.
 2. Connected remote-marked nodes are partitioned into remote components and each component is replaced with an internal `ModalUniversalExecutor_<hash>` proxy node.
 3. Referenced model assets are mirrored into storage.
 4. If custom-node syncing is enabled, the local `custom_nodes/` directory is zipped and mirrored if its content hash changed.

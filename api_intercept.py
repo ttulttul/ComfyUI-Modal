@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from aiohttp import web
 
@@ -173,6 +173,42 @@ def _is_link(value: Any) -> bool:
     )
 
 
+def _looks_like_workflow_node(fragment: dict[str, Any]) -> bool:
+    """Return whether a JSON fragment resembles a saved ComfyUI workflow node."""
+    return "id" in fragment and "properties" in fragment
+
+
+def _iter_workflow_nodes(
+    workflow_fragment: Any,
+    visited_object_ids: set[int] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield workflow node dictionaries from a nested saved workflow fragment."""
+    if visited_object_ids is None:
+        visited_object_ids = set()
+
+    if isinstance(workflow_fragment, dict):
+        object_id = id(workflow_fragment)
+        if object_id in visited_object_ids:
+            return
+        visited_object_ids.add(object_id)
+
+        if _looks_like_workflow_node(workflow_fragment):
+            yield workflow_fragment
+
+        for value in workflow_fragment.values():
+            yield from _iter_workflow_nodes(value, visited_object_ids)
+        return
+
+    if isinstance(workflow_fragment, list):
+        object_id = id(workflow_fragment)
+        if object_id in visited_object_ids:
+            return
+        visited_object_ids.add(object_id)
+
+        for item in workflow_fragment:
+            yield from _iter_workflow_nodes(item, visited_object_ids)
+
+
 def extract_remote_node_ids(
     workflow: dict[str, Any] | None,
     settings: ModalSyncSettings | None = None,
@@ -183,7 +219,7 @@ def extract_remote_node_ids(
 
     marker = (settings or get_settings()).marker_property
     remote_node_ids: set[str] = set()
-    for node in workflow.get("nodes", []):
+    for node in _iter_workflow_nodes(workflow):
         properties = node.get("properties") or {}
         if properties.get(marker):
             remote_node_ids.add(str(node.get("id")))

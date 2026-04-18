@@ -153,6 +153,47 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert summary.synced_assets[0].uploaded is True
 
 
+def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """Modal marker extraction should find nodes nested inside saved subgraph metadata."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+
+    workflow = {
+        "nodes": [
+            {
+                "id": 100,
+                "properties": {"is_modal_remote": False},
+                "subgraph": {
+                    "nodes": [
+                        {"id": 11, "properties": {"is_modal_remote": True}},
+                        {"id": 12, "properties": {"is_modal_remote": False}},
+                    ]
+                },
+            }
+        ]
+    }
+
+    assert api_intercept_module.extract_remote_node_ids(workflow, settings) == {"11"}
+
+
 def test_rewrite_rejects_non_transportable_remote_inputs(
     api_intercept_module: Any,
     settings_module: Any,
@@ -222,6 +263,95 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
     )
 
     assert list(rewritten_prompt) == ["1"]
+    assert summary.remote_node_ids == ["1", "2"]
+    assert summary.remote_component_ids == ["1"]
+
+
+def test_rewrite_detects_remote_marker_inside_nested_subgraph_workflow(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Prompt rewrite should honor Modal markers found inside nested subgraph metadata."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_nodes_dir.mkdir()
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "ModelSource": _FakeRemoteModelNode,
+                "RemoteConsumer": _FakeRemoteSamplerNode,
+                "LocalConsumer": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {
+                "id": 99,
+                "properties": {"is_modal_remote": False},
+                "subgraph": {
+                    "nodes": [
+                        {"id": 1, "properties": {"is_modal_remote": False}},
+                        {"id": 2, "properties": {"is_modal_remote": True}},
+                    ]
+                },
+            },
+            {"id": 3, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "ModelSource",
+            "inputs": {},
+            "_meta": {"title": "Model Source"},
+        },
+        "2": {
+            "class_type": "RemoteConsumer",
+            "inputs": {"model": ["1", 0]},
+            "_meta": {"title": "Remote Consumer"},
+        },
+        "3": {
+            "class_type": "LocalConsumer",
+            "inputs": {"latent": ["2", 0]},
+            "_meta": {"title": "Local Consumer"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert list(rewritten_prompt) == ["1", "3"]
+    assert rewritten_prompt["3"]["inputs"]["latent"] == ["1", 0]
     assert summary.remote_node_ids == ["1", "2"]
     assert summary.remote_component_ids == ["1"]
 
