@@ -868,6 +868,58 @@ async function analyzeAndMarkRequiredRemoteNodes(node) {
 }
 
 /**
+ * Return whether one node definition should expose Modal UI affordances.
+ * @param {object | undefined} nodeData
+ * @returns {boolean}
+ */
+function isEligibleNodeDef(nodeData) {
+  return Boolean(nodeData?.name) && !String(nodeData.name).startsWith(INTERNAL_NODE_PREFIX);
+}
+
+/**
+ * Inject the Modal context-menu entry on a node type prototype.
+ * @param {typeof LGraphNode} nodeType
+ * @param {object | undefined} nodeData
+ */
+function installModalContextMenu(nodeType, nodeData) {
+  if (!isEligibleNodeDef(nodeData) || nodeType?.prototype?.__modalContextMenuInjected) {
+    return;
+  }
+
+  const originalGetExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+  nodeType.prototype.getExtraMenuOptions = function getExtraMenuOptionsWithModalAnalysis(
+    canvas,
+    options,
+  ) {
+    const menuOptions = originalGetExtraMenuOptions?.call(this, canvas, options) ?? options ?? [];
+    const targetOptions = options ?? menuOptions;
+    if (!Array.isArray(targetOptions)) {
+      return menuOptions;
+    }
+
+    const selectedNodePaths = selectedWorkflowNodePaths(this);
+    const menuItemLabel =
+      selectedNodePaths.length > 1
+        ? "Modal: Include Required Upstream Nodes for Selection"
+        : "Modal: Include Required Upstream Nodes";
+    if (!targetOptions.some((option) => option?.content === menuItemLabel)) {
+      targetOptions.push(null, {
+        content: menuItemLabel,
+        callback: () => {
+          void analyzeAndMarkRequiredRemoteNodes(this).catch((error) => {
+            console.error("Modal remote-node analysis failed.", error);
+            notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
+          });
+        },
+      });
+    }
+
+    return menuOptions;
+  };
+  nodeType.prototype.__modalContextMenuInjected = true;
+}
+
+/**
  * Update the node state and redraw the canvas.
  * @param {LGraphNode} node
  * @param {boolean} value
@@ -1022,34 +1074,6 @@ function decorateNode(node) {
   node.onDrawForeground = function onDrawForeground(ctx) {
     originalDrawForeground?.apply(this, arguments);
     drawRemoteNodeDecoration(this, ctx);
-  };
-
-  const originalGetExtraMenuOptions = node.getExtraMenuOptions;
-  node.getExtraMenuOptions = function getExtraMenuOptionsWithModalAnalysis(_, options) {
-    const menuOptions = originalGetExtraMenuOptions?.apply(this, arguments) ?? options ?? [];
-    const targetOptions = options ?? menuOptions;
-    if (!Array.isArray(targetOptions)) {
-      return menuOptions;
-    }
-
-    const selectedNodePaths = selectedWorkflowNodePaths(this);
-    const menuItemLabel =
-      selectedNodePaths.length > 1
-        ? "Modal: Include Required Upstream Nodes for Selection"
-        : "Modal: Include Required Upstream Nodes";
-    if (!targetOptions.some((option) => option?.content === menuItemLabel)) {
-      targetOptions.push(null, {
-        content: menuItemLabel,
-        callback: () => {
-          void analyzeAndMarkRequiredRemoteNodes(this).catch((error) => {
-            console.error("Modal remote-node analysis failed.", error);
-            notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
-          });
-        },
-      });
-    }
-
-    return menuOptions;
   };
 }
 
@@ -1463,6 +1487,10 @@ app.registerExtension({
     installGlobalStatusStyles();
     patchQueuePrompt();
     registerExecutionListeners();
+  },
+
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    installModalContextMenu(nodeType, nodeData);
   },
 
   async nodeCreated(node) {
