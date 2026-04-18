@@ -145,6 +145,9 @@ class _TracingPromptServer(_NullPromptServer):
         self._active_node_id: str | None = None
         self._active_node_started_at: float | None = None
         self.last_prompt_id = prompt_id
+        self._boundary_outputs_by_node_id: dict[str, list[dict[str, Any]]] = {}
+        self._lookup_cache_entry: Callable[[str], Any | None] | None = None
+        self._published_boundary_outputs: set[tuple[str, int]] = set()
 
     def _classify_node_role(self, class_type: str) -> str:
         """Return a coarse role name for a node class."""
@@ -231,11 +234,90 @@ class _TracingPromptServer(_NullPromptServer):
             }
         )
 
+    def configure_boundary_output_stream(
+        self,
+        *,
+        boundary_outputs: list[dict[str, Any]],
+        lookup_cache_entry: Callable[[str], Any | None],
+    ) -> None:
+        """Configure streamed remote boundary-output publication for this execution."""
+        outputs_by_node_id: dict[str, list[dict[str, Any]]] = {}
+        for boundary_output in boundary_outputs:
+            preview_target_node_ids = [
+                str(node_id)
+                for node_id in boundary_output.get("preview_target_node_ids", [])
+                if str(node_id)
+            ]
+            if not preview_target_node_ids:
+                continue
+            if str(boundary_output.get("io_type")) != "IMAGE":
+                continue
+            node_id = str(boundary_output["node_id"])
+            outputs_by_node_id.setdefault(node_id, []).append(boundary_output)
+
+        self._boundary_outputs_by_node_id = outputs_by_node_id
+        self._lookup_cache_entry = lookup_cache_entry
+        self._published_boundary_outputs.clear()
+
+    def _emit_boundary_outputs_for_node(self, node_id: str | None) -> None:
+        """Publish configured boundary image outputs for one completed node once."""
+        if (
+            node_id is None
+            or self._status_callback is None
+            or self._lookup_cache_entry is None
+        ):
+            return
+
+        boundary_outputs = self._boundary_outputs_by_node_id.get(str(node_id), [])
+        if not boundary_outputs:
+            return
+
+        cache_entry = self._lookup_cache_entry(str(node_id))
+        if cache_entry is None:
+            return
+
+        cache_outputs = getattr(cache_entry, "outputs", None)
+        if not isinstance(cache_outputs, (list, tuple)):
+            return
+
+        for boundary_output in boundary_outputs:
+            output_index = int(boundary_output["output_index"])
+            publication_key = (str(node_id), output_index)
+            if publication_key in self._published_boundary_outputs:
+                continue
+            if output_index >= len(cache_outputs):
+                continue
+
+            preview_target_node_ids = [
+                str(target_node_id)
+                for target_node_id in boundary_output.get("preview_target_node_ids", [])
+                if str(target_node_id)
+            ]
+            if not preview_target_node_ids:
+                continue
+
+            self._status_callback(
+                {
+                    "event_type": "boundary_output",
+                    "node_id": str(node_id),
+                    "output_index": output_index,
+                    "io_type": str(boundary_output.get("io_type", "")),
+                    "is_list": bool(boundary_output.get("is_list", False)),
+                    "preview_target_node_ids": preview_target_node_ids,
+                    "value": _collapse_cache_slot(
+                        slot_values=cache_outputs[output_index],
+                        is_list=bool(boundary_output.get("is_list", False)),
+                    ),
+                }
+            )
+            self._published_boundary_outputs.add(publication_key)
+
     def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
         """Track per-node timing transitions from PromptExecutor progress events."""
         if event == "executing":
             next_node_id = data.get("node")
             if next_node_id != self._active_node_id:
+                self._emit_boundary_outputs_for_node(self._active_node_id)
                 self._log_node_finish(reason="next_node")
             if next_node_id is not None and next_node_id != self._active_node_id:
                 node_info = self.prompt.get(str(next_node_id), {})
@@ -324,6 +406,7 @@ class _TracingPromptServer(_NullPromptServer):
             return
 
         if event in {"execution_error", "execution_interrupted", "execution_success"}:
+            self._emit_boundary_outputs_for_node(self._active_node_id)
             self._log_node_finish(reason=event)
             if self._status_callback is not None:
                 self._status_callback({"phase": event})
@@ -1127,6 +1210,10 @@ def _execute_subgraph_prompt(
                 cache_args=cache_args,
                 custom_nodes_root=custom_nodes_root,
             )
+        prompt_server.configure_boundary_output_stream(
+            boundary_outputs=list(payload.get("boundary_outputs", [])),
+            lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
+        )
         with executor_state.lock:
             _reset_prompt_executor_request_state(executor_state.executor, prompt_server)
             with _timed_phase(

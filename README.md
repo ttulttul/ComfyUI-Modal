@@ -174,6 +174,8 @@ Cancelling a prompt in local ComfyUI now propagates to the active Modal componen
 
 Remote nodes that emit ComfyUI UI outputs also stream those `executed` payloads and preview frames back into the local PromptServer while the remote subgraph is still running. That means image previews can appear during a Modal run instead of only after the final proxy node returns.
 
+For direct local `PreviewImage` consumers of a remote boundary `IMAGE` output, the relay also synthesizes the local preview-node UI event as soon as that remote boundary image is ready. This improves the common "remote decode -> local preview" case even though the proxy node itself still returns its formal outputs only when the remote component finishes.
+
 The extension also keeps a global activity badge visible during queue-time sync and remote execution, including the period before the prompt is formally queued.
 
 ### 6. Asset sync expectations

@@ -46,6 +46,14 @@ class _FakeRemoteConditioningNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeRemoteImageNode:
+    """Fake remote node that produces a transportable IMAGE output."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    OUTPUT_IS_LIST = (False,)
+
+
 def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     api_intercept_module: Any,
     settings_module: Any,
@@ -142,6 +150,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
             "output_index": 0,
             "io_type": "LATENT",
             "is_list": False,
+            "preview_target_node_ids": [],
         }
     ]
     assert rewritten_prompt["3"]["inputs"]["latent"] == ["1", 0]
@@ -151,6 +160,82 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
     assert len(summary.synced_assets) == 1
     assert summary.synced_assets[0].uploaded is True
+
+
+def test_rewrite_records_local_preview_targets_for_remote_boundary_images(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Boundary IMAGE outputs should remember direct local PreviewImage consumers."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteImage": _FakeRemoteImageNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 9, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteImage",
+            "inputs": {},
+            "_meta": {"title": "Remote Image"},
+        },
+        "9": {
+            "class_type": "PreviewImage",
+            "inputs": {"images": ["1", 0]},
+            "_meta": {"title": "Preview"},
+        },
+    }
+
+    rewritten_prompt, _summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "1_image",
+            "node_id": "1",
+            "output_index": 0,
+            "io_type": "IMAGE",
+            "is_list": False,
+            "preview_target_node_ids": ["9"],
+        }
+    ]
 
 
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(

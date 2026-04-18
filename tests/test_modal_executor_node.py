@@ -930,6 +930,99 @@ def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
     }
 
 
+def test_remote_modal_consumes_streamed_boundary_output_preview_targets(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+    serialization_module: Any,
+) -> None:
+    """A streamed remote boundary IMAGE should synthesize local PreviewImage executed events."""
+    torch = pytest.importorskip("torch")
+    image_tensor = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
+
+    class FakePromptServer:
+        """Capture websocket events emitted by boundary preview synthesis."""
+
+        def __init__(self) -> None:
+            """Initialize the event sink."""
+            self.messages: list[tuple[Any, Any, str | None]] = []
+
+        def send_sync(self, event: Any, data: Any, sid: str | None) -> None:
+            """Record one emitted websocket message."""
+            self.messages.append((event, data, sid))
+
+    class FakePreviewImage:
+        """Minimal PreviewImage double that returns deterministic UI payloads."""
+
+        def save_images(self, images: Any) -> dict[str, Any]:
+            """Return a fake UI payload for the supplied image tensor."""
+            assert torch.equal(images, image_tensor)
+            return {
+                "ui": {
+                    "images": [
+                        {
+                            "filename": "temp_preview.png",
+                            "subfolder": "",
+                            "type": "temp",
+                        }
+                    ]
+                }
+            }
+
+    prompt_server = FakePromptServer()
+    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+    monkeypatch.setitem(sys.modules, "nodes", types.SimpleNamespace(PreviewImage=FakePreviewImage))
+
+    payload = {
+        "prompt_id": "prompt-1",
+        "component_id": "component-1",
+        "component_node_ids": ["7"],
+        "extra_data": {"client_id": "client-1"},
+    }
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {
+                    "kind": "progress",
+                    "event_type": "boundary_output",
+                    "node_id": "7",
+                    "output_index": 0,
+                    "io_type": "IMAGE",
+                    "is_list": False,
+                    "preview_target_node_ids": ["9"],
+                    "value": serialization_module.serialize_value(image_tensor),
+                },
+                {
+                    "kind": "result",
+                    "outputs": b"serialized-outputs",
+                },
+            ]
+        ),
+    )
+
+    assert result == b"serialized-outputs"
+    assert prompt_server.messages == [
+        (
+            "executed",
+            {
+                "prompt_id": "prompt-1",
+                "node": "9",
+                "display_node": "9",
+                "output": {
+                    "images": [
+                        {
+                            "filename": "temp_preview.png",
+                            "subfolder": "",
+                            "type": "temp",
+                        }
+                    ]
+                },
+            },
+            "client-1",
+        )
+    ]
+
+
 def test_modal_cloud_tracing_prompt_server_emits_numeric_node_progress(
     modal_cloud_module: Any,
 ) -> None:
@@ -999,6 +1092,53 @@ def test_modal_cloud_tracing_prompt_server_emits_executed_outputs(
             "output": {"images": [{"filename": "preview.png"}]},
         }
     ]
+
+
+def test_modal_cloud_tracing_prompt_server_emits_boundary_image_outputs(
+    modal_cloud_module: Any,
+) -> None:
+    """The cloud tracing prompt server should stream configured boundary IMAGE outputs once cached."""
+    torch = pytest.importorskip("torch")
+    image_tensor = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
+    observed_updates: list[dict[str, Any]] = []
+    server = modal_cloud_module._TracingPromptServer(
+        "component-1",
+        {
+            "7": {"class_type": "VAEDecode", "inputs": {}},
+            "8": {"class_type": "OtherNode", "inputs": {}},
+        },
+        status_callback=observed_updates.append,
+    )
+    cache_entries = {
+        "7": types.SimpleNamespace(outputs=[image_tensor]),
+    }
+    server.configure_boundary_output_stream(
+        boundary_outputs=[
+            {
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "IMAGE",
+                "is_list": False,
+                "preview_target_node_ids": ["9"],
+            }
+        ],
+        lookup_cache_entry=lambda node_id: cache_entries.get(node_id),
+    )
+
+    server.send_sync("executing", {"node": "7"}, None)
+    server.send_sync("executing", {"node": "8"}, None)
+
+    assert observed_updates[0]["phase"] == "executing"
+    assert observed_updates[1] == {
+        "event_type": "boundary_output",
+        "node_id": "7",
+        "output_index": 0,
+        "io_type": "IMAGE",
+        "is_list": False,
+        "preview_target_node_ids": ["9"],
+        "value": image_tensor,
+    }
+    assert observed_updates[2]["phase"] == "executing"
 
 
 def test_remote_modal_consumes_streamed_tensor_result_payload(
