@@ -180,10 +180,14 @@ While that is happening, the frontend now shows remote-node state directly on th
 
 - blue border: marked for Modal, idle
 - orange pulsing border: queued or still being prepared for remote execution
-- green border with light green shading: the remote component is actively executing
+- pulsing green border: the remote component is ready in Modal and waiting for the next remote node to run
+- pulsing purple border: the specific remote node currently executing inside Modal
+- steady green border: a remote node already finished executing for the current workflow run
 - red border: queue-time or execution failure detected
 
 During remote execution, the Modal runtime now streams progress events back over the same invocation. Those streamed events identify the currently active remote node, so the local canvas can brighten the specific original node that is running inside the remote component instead of only showing the component as generically active.
+
+When the full workflow finishes successfully, all Modal-marked nodes return immediately to their normal idle blue outline.
 
 Because the Modal queue route can spend noticeable time hashing, syncing, and creating a remote runtime before the prompt is formally queued, the frontend also emits a temporary synthetic running state into ComfyUI's normal queue/execution UI. Those events now mirror ComfyUI's native websocket payload shapes, including the temporary "Waiting for a machine" initialization notification, so the built-in queue indicators stay alive during the preparatory phase instead of looking idle until the backend finally returns the queued prompt id.
 

@@ -7,15 +7,17 @@ const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
 const SETUP_BORDER_COLOR = "#f59e0b";
-const ACTIVE_BORDER_COLOR = "#22c55e";
+const READY_BORDER_COLOR = "#22c55e";
+const ACTIVE_BORDER_COLOR = "#a855f7";
+const COMPLETE_BORDER_COLOR = "#16a34a";
 const ERROR_BORDER_COLOR = "#ef4444";
 
 const STATE_SETUP = "setup";
-const STATE_EXECUTING = "executing";
+const EXECUTION_PHASE = "executing";
+const STATE_READY = "ready";
+const STATE_ACTIVE = "active";
 const STATE_COMPLETE = "complete";
 const STATE_ERROR = "error";
-
-const COMPLETION_CLEAR_DELAY_MS = 1800;
 const ERROR_CLEAR_DELAY_MS = 5000;
 
 const modalNodeStates = new Map();
@@ -140,7 +142,7 @@ function currentGlobalStatus() {
   return (
     phases.find((state) => state.phase === STATE_ERROR) ??
     phases.find((state) => state.phase === STATE_SETUP) ??
-    phases.find((state) => state.phase === STATE_EXECUTING) ??
+    phases.find((state) => state.phase === EXECUTION_PHASE) ??
     phases[0]
   );
 }
@@ -175,7 +177,7 @@ function refreshGlobalStatusElement() {
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
     text.textContent = `Modal setup running for ${activeState.nodeCount} ${nodeLabel}`;
-  } else if (activeState.phase === STATE_EXECUTING) {
+  } else if (activeState.phase === EXECUTION_PHASE) {
     element.style.borderColor = "rgba(34, 197, 94, 0.55)";
     element.style.background = "rgba(8, 49, 28, 0.94)";
     dot.style.background = ACTIVE_BORDER_COLOR;
@@ -282,7 +284,7 @@ function shouldApplyPromptState(nodeIdValue, promptId) {
 function refreshCanvasAnimation() {
   app.graph?.setDirtyCanvas(true, true);
   const hasAnimatedState = Array.from(modalNodeStates.values()).some((state) =>
-    [STATE_SETUP, STATE_EXECUTING, STATE_COMPLETE, STATE_ERROR].includes(state.phase),
+    [STATE_SETUP, STATE_READY, STATE_ACTIVE, STATE_ERROR].includes(state.phase),
   );
   if (!hasAnimatedState) {
     animationFrameHandle = null;
@@ -353,9 +355,7 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
       errorMessage,
       updatedAt: nowMs(),
     });
-    if (phase === STATE_COMPLETE) {
-      scheduleNodeClear(currentNodeId, promptId, COMPLETION_CLEAR_DELAY_MS);
-    } else if (phase === STATE_ERROR) {
+    if (phase === STATE_ERROR) {
       scheduleNodeClear(currentNodeId, promptId, ERROR_CLEAR_DELAY_MS);
     }
   }
@@ -475,18 +475,20 @@ function drawRemoteNodeDecoration(node, ctx) {
       .toString(16)
       .padStart(2, "0")}`;
     shadowColor = `rgba(245, 158, 11, ${0.25 + pulse * 0.35})`;
-  } else if (state?.phase === STATE_EXECUTING) {
+  } else if (state?.phase === STATE_READY) {
     const pulse = (Math.sin(elapsed * 6) + 1) / 2;
-    borderColor = ACTIVE_BORDER_COLOR;
+    borderColor = READY_BORDER_COLOR;
     shadowColor = "rgba(34, 197, 94, 0.35)";
     fillColor = `rgba(134, 239, 172, ${0.12 + pulse * 0.08})`;
-    if (state.isActiveRemoteNode) {
-      borderColor = "#4ade80";
-      shadowColor = `rgba(74, 222, 128, ${0.38 + pulse * 0.28})`;
-      fillColor = `rgba(187, 247, 208, ${0.24 + pulse * 0.12})`;
-    }
+  } else if (state?.phase === STATE_ACTIVE) {
+    const pulse = (Math.sin(elapsed * 7) + 1) / 2;
+    borderColor = `${ACTIVE_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(168, 85, 247, ${0.28 + pulse * 0.32})`;
+    fillColor = `rgba(216, 180, 254, ${0.16 + pulse * 0.1})`;
   } else if (state?.phase === STATE_COMPLETE) {
-    borderColor = ACTIVE_BORDER_COLOR;
+    borderColor = COMPLETE_BORDER_COLOR;
     shadowColor = "rgba(34, 197, 94, 0.28)";
     fillColor = "rgba(134, 239, 172, 0.14)";
   } else if (state?.phase === STATE_ERROR) {
@@ -565,41 +567,53 @@ function handleModalStatus(event) {
   if (!promptId) {
     return;
   }
-  if (detail.phase === STATE_SETUP) {
-    beginSyntheticExecutionUi(promptId, (detail.node_ids ?? []).map((value) => String(value)));
-    setGlobalStatusPhase(promptId, STATE_SETUP, (detail.node_ids ?? []).length);
-    setPromptActiveNode(promptId, null);
-  } else if (detail.phase === STATE_ERROR) {
-    endSyntheticExecutionUi(promptId, true);
-    setGlobalStatusPhase(promptId, STATE_ERROR, (detail.node_ids ?? []).length);
-    setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
-    setPromptActiveNode(promptId, null);
-  } else if (detail.phase === STATE_EXECUTING) {
-    setGlobalStatusPhase(promptId, STATE_EXECUTING, (detail.node_ids ?? []).length);
-    setPromptActiveNode(
-      promptId,
-      detail.active_node_id != null ? String(detail.active_node_id) : null,
-    );
-  }
-
   const nodeIds = (detail.node_ids ?? []).map((value) => String(value));
   const components = detail.components ?? [];
   if (components.length > 0 || nodeIds.length > 0) {
     registerPromptComponents(promptId, nodeIds, components);
   }
+  const promptState = ensurePromptState(promptId);
 
   if (detail.phase === STATE_SETUP) {
+    beginSyntheticExecutionUi(promptId, nodeIds);
+    setGlobalStatusPhase(promptId, STATE_SETUP, nodeIds.length);
+    setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_SETUP, promptId);
     return;
   }
 
-  if (detail.phase === STATE_EXECUTING) {
-    setNodesPhase(nodeIds, STATE_EXECUTING, promptId);
+  if (detail.phase === STATE_ERROR) {
+    endSyntheticExecutionUi(promptId, true);
+    setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length);
+    setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
+    setPromptActiveNode(promptId, null);
+    setNodesPhase(nodeIds, STATE_ERROR, promptId, detail.error_message);
     return;
   }
 
-  if (detail.phase === STATE_ERROR) {
-    setNodesPhase(nodeIds, STATE_ERROR, promptId, detail.error_message);
+  if (detail.phase === EXECUTION_PHASE) {
+    const nextActiveNodeId =
+      detail.active_node_id != null ? String(detail.active_node_id) : null;
+    const previousActiveNodeId = promptState.activeNodeId;
+    setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length);
+    setNodesPhase(nodeIds, STATE_READY, promptId);
+    if (previousActiveNodeId && previousActiveNodeId !== nextActiveNodeId) {
+      setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
+    }
+    if (nextActiveNodeId) {
+      setNodesPhase([nextActiveNodeId], STATE_ACTIVE, promptId);
+    }
+    setPromptActiveNode(promptId, nextActiveNodeId);
+    return;
+  }
+
+  if (detail.phase === "execution_success") {
+    if (promptState.activeNodeId) {
+      setNodesPhase([promptState.activeNodeId], STATE_COMPLETE, promptId);
+    }
+    setPromptActiveNode(promptId, null);
+    setNodesPhase(nodeIds, STATE_COMPLETE, promptId);
+    return;
   }
 }
 
@@ -620,16 +634,42 @@ function handleExecutionPhase(event, phase) {
   if (!componentNodeIds) {
     return;
   }
-  if (phase === STATE_EXECUTING) {
-    setGlobalStatusPhase(promptId, STATE_EXECUTING, componentNodeIds.length);
-  } else if (phase === STATE_ERROR) {
+  if (phase === EXECUTION_PHASE) {
+    setGlobalStatusPhase(promptId, EXECUTION_PHASE, componentNodeIds.length);
+    setNodesPhase(componentNodeIds, STATE_READY, promptId, detail.exception_message);
+    return;
+  }
+  if (phase === STATE_ERROR) {
     setGlobalStatusPhase(promptId, STATE_ERROR, componentNodeIds.length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
     setPromptActiveNode(promptId, null);
-  } else {
-    setPromptActiveNode(promptId, null);
+    setNodesPhase(componentNodeIds, STATE_ERROR, promptId, detail.exception_message);
+    return;
   }
-  setNodesPhase(componentNodeIds, phase, promptId, detail.exception_message);
+  if (phase === STATE_COMPLETE) {
+    setPromptActiveNode(promptId, null);
+    setNodesPhase(componentNodeIds, STATE_COMPLETE, promptId, detail.exception_message);
+  }
+}
+
+/**
+ * Clear all temporary remote execution visuals for a completed prompt.
+ * @param {string} promptId
+ */
+function clearPromptRemoteStates(promptId) {
+  const promptState = modalPromptStates.get(promptId);
+  if (!promptState) {
+    return;
+  }
+  for (const remoteNodeId of promptState.remoteNodeIds) {
+    clearNodeTimer(remoteNodeId);
+    const currentState = modalNodeStates.get(remoteNodeId);
+    if (currentState?.promptId === promptId) {
+      modalNodeStates.delete(remoteNodeId);
+    }
+  }
+  modalPromptStates.delete(promptId);
+  app.graph?.setDirtyCanvas(true, true);
 }
 
 /**
@@ -742,7 +782,7 @@ function registerExecutionListeners() {
   }
 
   api.addEventListener("modal_status", handleModalStatus);
-  api.addEventListener("executing", (event) => handleExecutionPhase(event, STATE_EXECUTING));
+  api.addEventListener("executing", (event) => handleExecutionPhase(event, EXECUTION_PHASE));
   api.addEventListener("executed", (event) => {
     endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""));
     handleExecutionPhase(event, STATE_COMPLETE);
@@ -763,11 +803,7 @@ function registerExecutionListeners() {
     }
     endSyntheticExecutionUi(promptId);
     clearGlobalStatusPhase(promptId);
-    const promptState = modalPromptStates.get(promptId);
-    if (!promptState) {
-      return;
-    }
-    setNodesPhase(promptState.remoteNodeIds, STATE_COMPLETE, promptId);
+    clearPromptRemoteStates(promptId);
   });
   api.__modalExecutionListenersRegistered = true;
 }
