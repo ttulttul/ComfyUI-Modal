@@ -192,6 +192,11 @@ def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
     }
 
     assert api_intercept_module.extract_remote_node_ids(workflow, settings) == {"11"}
+    assert api_intercept_module.extract_remote_node_ids(
+        workflow,
+        settings,
+        prompt_node_ids={"100"},
+    ) == {"100"}
 
 
 def test_rewrite_rejects_non_transportable_remote_inputs(
@@ -301,7 +306,6 @@ def test_rewrite_detects_remote_marker_inside_nested_subgraph_workflow(
         (),
         {
             "NODE_CLASS_MAPPINGS": {
-                "ModelSource": _FakeRemoteModelNode,
                 "RemoteConsumer": _FakeRemoteSamplerNode,
                 "LocalConsumer": _FakeLocalSinkNode,
             },
@@ -325,19 +329,14 @@ def test_rewrite_detects_remote_marker_inside_nested_subgraph_workflow(
         ]
     }
     prompt = {
-        "1": {
-            "class_type": "ModelSource",
-            "inputs": {},
-            "_meta": {"title": "Model Source"},
-        },
-        "2": {
+        "99": {
             "class_type": "RemoteConsumer",
-            "inputs": {"model": ["1", 0]},
-            "_meta": {"title": "Remote Consumer"},
+            "inputs": {},
+            "_meta": {"title": "Subgraph Container"},
         },
-        "3": {
+        "4": {
             "class_type": "LocalConsumer",
-            "inputs": {"latent": ["2", 0]},
+            "inputs": {"latent": ["99", 0]},
             "_meta": {"title": "Local Consumer"},
         },
     }
@@ -350,10 +349,10 @@ def test_rewrite_detects_remote_marker_inside_nested_subgraph_workflow(
         nodes_module=fake_nodes_module,
     )
 
-    assert list(rewritten_prompt) == ["1", "3"]
-    assert rewritten_prompt["3"]["inputs"]["latent"] == ["1", 0]
-    assert summary.remote_node_ids == ["1", "2"]
-    assert summary.remote_component_ids == ["1"]
+    assert list(rewritten_prompt) == ["99", "4"]
+    assert rewritten_prompt["4"]["inputs"]["latent"] == ["99", 0]
+    assert summary.remote_node_ids == ["99"]
+    assert summary.remote_component_ids == ["99"]
 
 
 def test_rewrite_auto_expands_upstream_non_transportable_dependencies(

@@ -209,9 +209,53 @@ def _iter_workflow_nodes(
             yield from _iter_workflow_nodes(item, visited_object_ids)
 
 
+def _iter_workflow_nodes_with_ancestors(
+    workflow_fragment: Any,
+    ancestor_node_ids: tuple[str, ...] = (),
+    visited_object_ids: set[int] | None = None,
+) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
+    """Yield workflow nodes together with their ancestor workflow-node ids."""
+    if visited_object_ids is None:
+        visited_object_ids = set()
+
+    if isinstance(workflow_fragment, dict):
+        object_id = id(workflow_fragment)
+        if object_id in visited_object_ids:
+            return
+        visited_object_ids.add(object_id)
+
+        next_ancestor_node_ids = ancestor_node_ids
+        if _looks_like_workflow_node(workflow_fragment):
+            node_id = str(workflow_fragment.get("id"))
+            yield workflow_fragment, ancestor_node_ids
+            next_ancestor_node_ids = ancestor_node_ids + (node_id,)
+
+        for value in workflow_fragment.values():
+            yield from _iter_workflow_nodes_with_ancestors(
+                value,
+                next_ancestor_node_ids,
+                visited_object_ids,
+            )
+        return
+
+    if isinstance(workflow_fragment, list):
+        object_id = id(workflow_fragment)
+        if object_id in visited_object_ids:
+            return
+        visited_object_ids.add(object_id)
+
+        for item in workflow_fragment:
+            yield from _iter_workflow_nodes_with_ancestors(
+                item,
+                ancestor_node_ids,
+                visited_object_ids,
+            )
+
+
 def extract_remote_node_ids(
     workflow: dict[str, Any] | None,
     settings: ModalSyncSettings | None = None,
+    prompt_node_ids: set[str] | None = None,
 ) -> set[str]:
     """Return the node ids marked for remote execution in the workflow metadata."""
     if workflow is None:
@@ -219,10 +263,23 @@ def extract_remote_node_ids(
 
     marker = (settings or get_settings()).marker_property
     remote_node_ids: set[str] = set()
-    for node in _iter_workflow_nodes(workflow):
+    for node, ancestor_node_ids in _iter_workflow_nodes_with_ancestors(workflow):
         properties = node.get("properties") or {}
         if properties.get(marker):
-            remote_node_ids.add(str(node.get("id")))
+            node_id = str(node.get("id"))
+            if prompt_node_ids is None or node_id in prompt_node_ids:
+                remote_node_ids.add(node_id)
+                continue
+
+            for ancestor_node_id in reversed(ancestor_node_ids):
+                if ancestor_node_id in prompt_node_ids:
+                    remote_node_ids.add(ancestor_node_id)
+                    logger.info(
+                        "Mapped nested Modal marker from workflow node %s to prompt node %s.",
+                        node_id,
+                        ancestor_node_id,
+                    )
+                    break
     return remote_node_ids
 
 
@@ -737,7 +794,7 @@ def rewrite_prompt_for_modal(
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Rewrite connected remote components into Modal proxy nodes."""
     resolved_settings = settings or get_settings()
-    remote_node_ids = extract_remote_node_ids(workflow, resolved_settings)
+    remote_node_ids = extract_remote_node_ids(workflow, resolved_settings, set(prompt.keys()))
     summary = RewriteSummary(remote_node_ids=sorted(remote_node_ids))
     logger.info("Found %d workflow nodes marked for Modal execution.", len(remote_node_ids))
 
@@ -904,7 +961,14 @@ def setup_modal_queue_route(
                 json_data["extra_data"]["client_id"] = json_data["client_id"]
             extra_pnginfo = ((json_data.get("extra_data") or {}).get("extra_pnginfo") or {})
             workflow = extra_pnginfo.get("workflow")
-            remote_node_ids = sorted(extract_remote_node_ids(workflow, resolved_settings))
+            prompt_node_ids = (
+                {str(node_id) for node_id in json_data.get("prompt", {}).keys()}
+                if "prompt" in json_data
+                else None
+            )
+            remote_node_ids = sorted(
+                extract_remote_node_ids(workflow, resolved_settings, prompt_node_ids)
+            )
             if "prompt" in json_data:
                 rewrite_started_at = time.perf_counter()
                 rewritten_prompt, summary = rewrite_prompt_for_modal(
