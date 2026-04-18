@@ -100,6 +100,8 @@ Remote runtime behavior:
 
 If you change `COMFY_MODAL_GPU`, redeploy the Modal app or delete it and let auto-deploy recreate it. Modal hardware is fixed at deploy time.
 
+If you upgrade this node pack and expect changed remote runtime behavior such as faster interrupt handling, redeploy the Modal app once so the deployed class picks up the new code and class options.
+
 ## Using it in ComfyUI
 
 ### 1. Build your workflow
