@@ -54,7 +54,6 @@ _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
-_ACTIVE_REMOTE_EXECUTIONS_LOCK = threading.Lock()
 
 try:
     import modal  # type: ignore
@@ -83,9 +82,7 @@ class _RemoteExecutionControl:
     """Track interruption state for one active remote payload execution."""
 
     cancellation_event: threading.Event
-
-
-_ACTIVE_REMOTE_EXECUTIONS: dict[tuple[str, str], _RemoteExecutionControl] = {}
+    interrupt_flag_key: str
 
 
 class _NullPromptServer:
@@ -480,43 +477,28 @@ def _remote_execution_key(payload: dict[str, Any]) -> tuple[str, str]:
     return prompt_id, component_id
 
 
+def _remote_interrupt_flag_key(prompt_id: str, component_id: str) -> str:
+    """Return the shared Modal interrupt-store key for one payload execution."""
+    return f"{prompt_id}:{component_id}"
+
+
 @contextmanager
 def _registered_remote_execution(
     payload: dict[str, Any],
 ) -> Iterator[_RemoteExecutionControl]:
-    """Register one active remote execution so callers can interrupt it."""
-    execution_key = _remote_execution_key(payload)
-    control = _RemoteExecutionControl(cancellation_event=threading.Event())
-    with _ACTIVE_REMOTE_EXECUTIONS_LOCK:
-        _ACTIVE_REMOTE_EXECUTIONS[execution_key] = control
+    """Prepare interruption state for one active remote execution."""
+    prompt_id, component_id = _remote_execution_key(payload)
+    control = _RemoteExecutionControl(
+        cancellation_event=threading.Event(),
+        interrupt_flag_key=_remote_interrupt_flag_key(prompt_id, component_id),
+    )
+    if modal is not None and "interrupt_flags" in globals():
+        interrupt_flags.pop(control.interrupt_flag_key, None)
     try:
         yield control
     finally:
-        with _ACTIVE_REMOTE_EXECUTIONS_LOCK:
-            if _ACTIVE_REMOTE_EXECUTIONS.get(execution_key) is control:
-                _ACTIVE_REMOTE_EXECUTIONS.pop(execution_key, None)
-
-
-def _interrupt_registered_remote_execution(prompt_id: str, component_id: str) -> bool:
-    """Request interruption for one active remote execution."""
-    execution_key = (str(prompt_id), str(component_id))
-    with _ACTIVE_REMOTE_EXECUTIONS_LOCK:
-        control = _ACTIVE_REMOTE_EXECUTIONS.get(execution_key)
-    if control is None:
-        logger.info(
-            "Remote interrupt requested for prompt=%s component=%s, but no active execution was registered.",
-            prompt_id,
-            component_id,
-        )
-        return False
-
-    control.cancellation_event.set()
-    logger.info(
-        "Marked remote execution for interruption prompt=%s component=%s.",
-        prompt_id,
-        component_id,
-    )
-    return True
+        if modal is not None and "interrupt_flags" in globals():
+            interrupt_flags.pop(control.interrupt_flag_key, None)
 
 
 @contextmanager
@@ -729,9 +711,11 @@ def _temporary_progress_hook(prompt_server: _NullPromptServer) -> Iterator[None]
 def _temporary_remote_interrupt_monitor(
     component_id: str,
     cancellation_event: threading.Event | None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
 ) -> Iterator[None]:
-    """Mirror local cancellation requests into ComfyUI's interrupt flag inside Modal."""
-    if cancellation_event is None:
+    """Mirror shared cancellation requests into ComfyUI's interrupt flag inside Modal."""
+    if cancellation_event is None and (interrupt_store is None or interrupt_flag_key is None):
         yield
         return
 
@@ -742,9 +726,21 @@ def _temporary_remote_interrupt_monitor(
     def monitor_interrupts() -> None:
         """Set ComfyUI's interrupt flag once the caller requests cancellation."""
         while not stop_event.is_set():
-            if not cancellation_event.wait(timeout=0.1):
+            if cancellation_event is not None and cancellation_event.wait(timeout=0.1):
+                logger.info("Remote interrupt monitor tripped local event for component=%s.", component_id)
+                nodes.interrupt_processing()
+                return
+            if interrupt_store is None or interrupt_flag_key is None:
                 continue
-            logger.info("Remote interrupt monitor tripped for component=%s.", component_id)
+            if not interrupt_store.contains(interrupt_flag_key):
+                continue
+            logger.info(
+                "Remote interrupt monitor observed shared cancel flag for component=%s.",
+                component_id,
+            )
+            interrupt_store.pop(interrupt_flag_key, None)
+            if cancellation_event is not None:
+                cancellation_event.set()
             nodes.interrupt_processing()
             return
 
@@ -1102,6 +1098,8 @@ def execute_node_locally(
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
     node_mapping: dict[str, type[Any]] | None = None,
     cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
 ) -> bytes:
     """Execute a single target node in-process and return serialized outputs."""
     custom_nodes_root = _extract_custom_nodes_bundle(node_data.get("custom_nodes_bundle"))
@@ -1114,7 +1112,12 @@ def execute_node_locally(
             raise KeyError(f"Remote node class {class_type!r} is not registered.")
         with (
             _patched_folder_paths_absolute_lookup(),
-            _temporary_remote_interrupt_monitor(component_id, cancellation_event),
+            _temporary_remote_interrupt_monitor(
+                component_id,
+                cancellation_event,
+                interrupt_store=interrupt_store,
+                interrupt_flag_key=interrupt_flag_key,
+            ),
         ):
             outputs = _invoke_original_node(node_mapping[class_type], node_data, kwargs)
             return serialize_node_outputs(outputs)
@@ -1127,7 +1130,12 @@ def execute_node_locally(
 
         with (
             _patched_folder_paths_absolute_lookup(),
-            _temporary_remote_interrupt_monitor(component_id, cancellation_event),
+            _temporary_remote_interrupt_monitor(
+                component_id,
+                cancellation_event,
+                interrupt_store=interrupt_store,
+                interrupt_flag_key=interrupt_flag_key,
+            ),
         ):
             outputs = _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
     return serialize_node_outputs(outputs)
@@ -1177,6 +1185,8 @@ def _execute_subgraph_prompt(
     custom_nodes_root: Path | None,
     status_callback: Callable[[dict[str, Any]], None] | None = None,
     cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
@@ -1194,7 +1204,12 @@ def _execute_subgraph_prompt(
     with (
         _temporary_node_mapping(None),
         _patched_folder_paths_absolute_lookup(),
-        _temporary_remote_interrupt_monitor(component_id, cancellation_event),
+        _temporary_remote_interrupt_monitor(
+            component_id,
+            cancellation_event,
+            interrupt_store=interrupt_store,
+            interrupt_flag_key=interrupt_flag_key,
+        ),
         _temporary_progress_hook(
             prompt_server := _TracingPromptServer(
                 component_id,
@@ -1264,6 +1279,8 @@ def execute_subgraph_locally(
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
     status_callback: Callable[[dict[str, Any]], None] | None = None,
     cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
 ) -> bytes:
     """Execute a rewritten remote component in-process and return serialized outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
@@ -1281,6 +1298,8 @@ def execute_subgraph_locally(
                     custom_nodes_root,
                     status_callback,
                     cancellation_event,
+                    interrupt_store,
+                    interrupt_flag_key,
                 )
                 outputs = future.result()
         with _timed_phase("serialize_boundary_outputs", component=component_id):
@@ -1291,6 +1310,8 @@ def _stream_remote_payload_events(
     payload: dict[str, Any],
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
     cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield progress and result events for one remote payload execution."""
     event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -1306,6 +1327,10 @@ def _stream_remote_payload_events(
                 execute_subgraph_kwargs: dict[str, Any] = {"status_callback": publish_status}
                 if "cancellation_event" in inspect.signature(execute_subgraph_locally).parameters:
                     execute_subgraph_kwargs["cancellation_event"] = cancellation_event
+                if "interrupt_store" in inspect.signature(execute_subgraph_locally).parameters:
+                    execute_subgraph_kwargs["interrupt_store"] = interrupt_store
+                if "interrupt_flag_key" in inspect.signature(execute_subgraph_locally).parameters:
+                    execute_subgraph_kwargs["interrupt_flag_key"] = interrupt_flag_key
                 outputs = execute_subgraph_locally(
                     payload,
                     kwargs_payload,
@@ -1315,6 +1340,10 @@ def _stream_remote_payload_events(
                 execute_node_kwargs: dict[str, Any] = {}
                 if "cancellation_event" in inspect.signature(execute_node_locally).parameters:
                     execute_node_kwargs["cancellation_event"] = cancellation_event
+                if "interrupt_store" in inspect.signature(execute_node_locally).parameters:
+                    execute_node_kwargs["interrupt_store"] = interrupt_store
+                if "interrupt_flag_key" in inspect.signature(execute_node_locally).parameters:
+                    execute_node_kwargs["interrupt_flag_key"] = interrupt_flag_key
                 outputs = execute_node_locally(payload, kwargs_payload, **execute_node_kwargs)
         except Exception as exc:  # pragma: no cover - exercised through generator consumer tests.
             event_queue.put(("error", exc))
@@ -1439,6 +1468,12 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
         "image": image,
         "enable_memory_snapshot": settings.enable_memory_snapshot,
     }
+    max_containers = getattr(settings, "max_containers", None)
+    buffer_containers = getattr(settings, "buffer_containers", None)
+    if max_containers is not None:
+        options["max_containers"] = max_containers
+    if buffer_containers is not None:
+        options["buffer_containers"] = buffer_containers
     if settings.enable_gpu_memory_snapshot:
         options["experimental_options"] = {"enable_gpu_snapshot": True}
     return options
@@ -1521,6 +1556,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     app = modal.App(settings.app_name)
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)
+    interrupt_flags = modal.Dict.from_name(
+        settings.interrupt_dict_name,
+        create_if_missing=True,
+    )
     image = (
         modal.Image.debian_slim()
         .pip_install(*_comfyui_runtime_packages())
@@ -1548,7 +1587,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         )
 
     @app.cls(**_remote_engine_cls_options(settings, vol, image))
-    @modal.concurrent(max_inputs=2)
+    @modal.concurrent(max_inputs=1)
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
 
@@ -1588,11 +1627,15 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                             payload,
                             kwargs_payload,
                             cancellation_event=execution_control.cancellation_event,
+                            interrupt_store=interrupt_flags,
+                            interrupt_flag_key=execution_control.interrupt_flag_key,
                         )
                     return execute_node_locally(
                         payload,
                         kwargs_payload,
                         cancellation_event=execution_control.cancellation_event,
+                        interrupt_store=interrupt_flags,
+                        interrupt_flag_key=execution_control.interrupt_flag_key,
                     )
 
         @modal.method()
@@ -1620,12 +1663,9 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                         payload,
                         kwargs_payload,
                         cancellation_event=execution_control.cancellation_event,
+                        interrupt_store=interrupt_flags,
+                        interrupt_flag_key=execution_control.interrupt_flag_key,
                     )
-
-        @modal.method()
-        def interrupt_payload(self, prompt_id: str, component_id: str) -> bool:
-            """Interrupt one active remote payload execution."""
-            return _interrupt_registered_remote_execution(prompt_id, component_id)
 
 else:
     app = None
