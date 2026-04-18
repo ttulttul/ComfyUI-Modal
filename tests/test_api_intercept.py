@@ -197,6 +197,56 @@ def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
         settings,
         prompt_node_ids={"100"},
     ) == {"100"}
+    assert api_intercept_module.extract_remote_node_ids(
+        workflow,
+        settings,
+        prompt_node_ids={"100:11"},
+    ) == {"100:11"}
+
+
+def test_extract_remote_node_ids_maps_subgraph_container_to_descendant_prompt_nodes(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """A marked subgraph container should remote its expanded descendant prompt nodes."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+
+    workflow = {
+        "nodes": [
+            {
+                "id": 24,
+                "properties": {"is_modal_remote": True},
+                "subgraph": {
+                    "nodes": [
+                        {"id": 23, "properties": {"is_modal_remote": False}},
+                        {"id": 25, "properties": {"is_modal_remote": False}},
+                    ]
+                },
+            }
+        ]
+    }
+
+    assert api_intercept_module.extract_remote_node_ids(
+        workflow,
+        settings,
+        prompt_node_ids={"24:23", "24:25", "99"},
+    ) == {"24:23", "24:25"}
 
 
 def test_rewrite_rejects_non_transportable_remote_inputs(
@@ -353,6 +403,87 @@ def test_rewrite_detects_remote_marker_inside_nested_subgraph_workflow(
     assert rewritten_prompt["4"]["inputs"]["latent"] == ["99", 0]
     assert summary.remote_node_ids == ["99"]
     assert summary.remote_component_ids == ["99"]
+
+
+def test_rewrite_detects_marked_inner_subgraph_prompt_node_ids(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A marked nested workflow node should resolve to its composed prompt id."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_nodes_dir.mkdir()
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteClip": _FakeRemoteClipNode,
+                "RemoteConsumer": _FakeRemoteSamplerNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {
+                "id": 24,
+                "properties": {"is_modal_remote": False},
+                "subgraph": {
+                    "nodes": [
+                        {"id": 23, "properties": {"is_modal_remote": True}},
+                    ]
+                },
+            },
+            {"id": 30, "properties": {"is_modal_remote": True}},
+        ]
+    }
+    prompt = {
+        "30": {
+            "class_type": "RemoteClip",
+            "inputs": {},
+            "_meta": {"title": "Remote VAE Source"},
+        },
+        "24:23": {
+            "class_type": "RemoteConsumer",
+            "inputs": {"clip": ["30", 0]},
+            "_meta": {"title": "Nested Remote Consumer"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert list(rewritten_prompt) == ["24:23"]
+    assert summary.remote_node_ids == ["24:23", "30"]
+    assert summary.remote_component_ids == ["24:23"]
 
 
 def test_rewrite_auto_expands_upstream_non_transportable_dependencies(
