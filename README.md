@@ -3,14 +3,14 @@
 > [!WARNING]
 > This project is still alpha. Expect missing features, rough edges, and breaking changes.
 
-`ComfyUI Modal-Sync` is a ComfyUI custom node extension for marking parts of a workflow for remote execution. The frontend stores a per-node `is_modal_remote` flag in workflow metadata, the backend groups connected marked nodes into a remote component, and a proxy node executes that component either locally or through Modal.
+`ComfyUI Modal-Sync` is a ComfyUI custom node extension for marking parts of a workflow for remote execution. The frontend stores a per-node `is_modal_remote` flag in workflow metadata, the backend partitions the selected remote graph into transport-aware components, and a proxy node executes each component either locally or through Modal.
 
 ## Status
 
 - The queue rewrite, serialization, and sync pipeline are implemented.
 - `local` execution mode is the default development path and exercises the same rewrite and transport flow in-process.
 - `remote` execution targets a deployed Modal app and can auto-deploy it on first use.
-- Remote execution happens per connected remote component, not per individual marked node.
+- Remote execution happens per transport-aware remote component, not per individual marked node.
 - Remote components can expand upstream automatically when a marked node depends on non-transportable Comfy runtime objects.
 
 ## What is implemented
@@ -27,7 +27,7 @@
 1. You mark nodes with `Run on Modal`.
 2. Queueing goes to `/modal/queue_prompt` instead of ComfyUI's normal `/prompt` route.
 3. The backend reads `extra_pnginfo.workflow`, including nested subgraph metadata, and resolves those markers onto queued prompt node ids.
-4. Connected remote-marked nodes are grouped into components, with upstream auto-expansion when required by non-transportable inputs.
+4. Remote-marked nodes are partitioned into transport-aware components, with upstream auto-expansion when required by non-transportable inputs.
 5. Each component is replaced with a generated `ModalUniversalExecutor_<hash>` proxy node.
 6. Boundary inputs are serialized, referenced assets are synced, and the component executes locally or remotely.
 7. Exported boundary outputs are deserialized back into normal ComfyUI values for the rest of the graph.
@@ -154,7 +154,7 @@ During queue-time processing, the backend:
 
 1. Inspects `extra_pnginfo.workflow`, including nested saved subgraph fragments.
 2. Resolves nested markers onto the actual queued prompt ids, including composed ids like `24:23` when needed.
-3. Replaces each connected remote component with an internal `ModalUniversalExecutor_<hash>` proxy node.
+3. Replaces each transport-aware remote component with an internal `ModalUniversalExecutor_<hash>` proxy node.
 4. Mirrors referenced model assets into storage.
 5. Optionally syncs a zipped `custom_nodes/` bundle.
 6. Submits the rewritten prompt to ComfyUI's normal queue.
