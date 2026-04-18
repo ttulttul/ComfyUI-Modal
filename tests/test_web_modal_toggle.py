@@ -35,7 +35,7 @@ def test_global_modal_status_badge_is_installed() -> None:
 
     assert 'element.id = "comfy-modal-global-status";' in source
     assert "Syncing graph with Modal" in source
-    assert "Waiting for Modal app" in source
+    assert "Waiting for Modal startup" in source
     assert "Modal workflow running on" in source
     assert "installGlobalStatusStyles()" in source
     assert "function pruneGlobalStatusStates()" in source

@@ -237,7 +237,7 @@ function refreshGlobalStatusElement() {
     dot.style.background = SETUP_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = "Waiting for Modal app";
+    text.textContent = "Waiting for Modal startup";
   } else if (activeState.phase === EXECUTION_PHASE) {
     element.style.borderColor = "rgba(34, 197, 94, 0.55)";
     element.style.background = "rgba(8, 49, 28, 0.94)";
