@@ -47,6 +47,7 @@ def test_remote_modal_status_tracks_active_node_ids() -> None:
 
     assert "activeNodeId: null" in source
     assert "hasStreamedProgress: false" in source
+    assert "descendantNodeIdsByAncestor: new Map()" in source
     assert "function setPromptActiveNode(promptId, activeNodeId)" in source
     assert "detail.active_node_id" in source
     assert "clearPromptRemoteStates(promptId)" in source
@@ -79,3 +80,14 @@ def test_prompt_cleanup_prunes_orphaned_global_status_entries() -> None:
 
     assert "pruneGlobalStatusStates();" in source
     assert "refreshGlobalStatusElement();" in source
+
+
+def test_subgraph_descendant_states_percolate_to_visible_ancestor_nodes() -> None:
+    """Subgraph-expanded remote prompt ids should aggregate their phase onto visible ancestor nodes."""
+    source = _modal_toggle_source()
+
+    assert "function ancestorNodeIds(nodeIdValue)" in source
+    assert "function rebuildPromptAncestorMap(promptState)" in source
+    assert "function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage)" in source
+    assert "promptState.descendantNodeIdsByAncestor.get(ancestorNodeId)" in source
+    assert "descendantStates.every((state) => state.phase === STATE_COMPLETE)" in source

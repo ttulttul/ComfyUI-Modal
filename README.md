@@ -187,6 +187,7 @@ While that is happening, the frontend now shows remote-node state directly on th
 - red border: queue-time or execution failure detected
 
 During remote execution, the Modal runtime now streams progress events back over the same invocation. Those streamed events identify the currently active remote node, so the local canvas can brighten the specific original node that is running inside the remote component instead of only showing the component as generically active.
+For subgraph-expanded prompt ids such as `24:23`, the frontend now aggregates descendant remote states back onto the visible ancestor subgraph node too. That keeps the outer subgraph border from getting stuck orange once internal remote execution has started, and it only turns steady green after the subgraph's remote descendants have all finished.
 
 When the full workflow finishes successfully, all Modal-marked nodes return immediately to their normal idle blue outline.
 
