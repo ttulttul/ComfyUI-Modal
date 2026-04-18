@@ -183,6 +183,8 @@ While that is happening, the frontend now shows remote-node state directly on th
 - green border with light green shading: the remote component is actively executing
 - red border: queue-time or execution failure detected
 
+During remote execution, the Modal runtime now streams progress events back over the same invocation. Those streamed events identify the currently active remote node, so the local canvas can brighten the specific original node that is running inside the remote component instead of only showing the component as generically active.
+
 Because the Modal queue route can spend noticeable time hashing, syncing, and creating a remote runtime before the prompt is formally queued, the frontend also emits a temporary synthetic running state into ComfyUI's normal queue/execution UI. Those events now mirror ComfyUI's native websocket payload shapes, including the temporary "Waiting for a machine" initialization notification, so the built-in queue indicators stay alive during the preparatory phase instead of looking idle until the backend finally returns the queued prompt id.
 
 The extension also now renders its own global activity badge in the ComfyUI UI during Modal setup and remote execution. That badge stays visible even when ComfyUI's stock queue state does not fully reflect the pre-queue setup phase.

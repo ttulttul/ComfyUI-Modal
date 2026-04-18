@@ -245,6 +245,7 @@ function ensurePromptState(promptId) {
       startedAt: nowMs(),
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
+      activeNodeId: null,
     });
   }
   return modalPromptStates.get(promptId);
@@ -372,12 +373,23 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
   const promptState = ensurePromptState(promptId);
   promptState.remoteNodeIds = [...remoteNodeIds];
   promptState.componentsByRepresentative.clear();
+  promptState.activeNodeId = null;
   for (const component of components) {
     promptState.componentsByRepresentative.set(
       String(component.representative_node_id),
       component.node_ids.map((nodeIdValue) => String(nodeIdValue)),
     );
   }
+}
+
+/**
+ * Record the currently active remote node inside one prompt.
+ * @param {string} promptId
+ * @param {string | null} activeNodeId
+ */
+function setPromptActiveNode(promptId, activeNodeId) {
+  const promptState = ensurePromptState(promptId);
+  promptState.activeNodeId = activeNodeId ? String(activeNodeId) : null;
 }
 
 /**
@@ -426,7 +438,15 @@ function setRemoteFlag(node, value) {
  * @returns {{ phase: string, promptId: string } | null}
  */
 function getRemoteVisualState(node) {
-  return modalNodeStates.get(nodeId(node)) ?? null;
+  const state = modalNodeStates.get(nodeId(node)) ?? null;
+  if (!state?.promptId) {
+    return state;
+  }
+  const promptState = modalPromptStates.get(state.promptId);
+  return {
+    ...state,
+    isActiveRemoteNode: promptState?.activeNodeId === nodeId(node),
+  };
 }
 
 /**
@@ -460,6 +480,11 @@ function drawRemoteNodeDecoration(node, ctx) {
     borderColor = ACTIVE_BORDER_COLOR;
     shadowColor = "rgba(34, 197, 94, 0.35)";
     fillColor = `rgba(134, 239, 172, ${0.12 + pulse * 0.08})`;
+    if (state.isActiveRemoteNode) {
+      borderColor = "#4ade80";
+      shadowColor = `rgba(74, 222, 128, ${0.38 + pulse * 0.28})`;
+      fillColor = `rgba(187, 247, 208, ${0.24 + pulse * 0.12})`;
+    }
   } else if (state?.phase === STATE_COMPLETE) {
     borderColor = ACTIVE_BORDER_COLOR;
     shadowColor = "rgba(34, 197, 94, 0.28)";
@@ -543,10 +568,18 @@ function handleModalStatus(event) {
   if (detail.phase === STATE_SETUP) {
     beginSyntheticExecutionUi(promptId, (detail.node_ids ?? []).map((value) => String(value)));
     setGlobalStatusPhase(promptId, STATE_SETUP, (detail.node_ids ?? []).length);
+    setPromptActiveNode(promptId, null);
   } else if (detail.phase === STATE_ERROR) {
     endSyntheticExecutionUi(promptId, true);
     setGlobalStatusPhase(promptId, STATE_ERROR, (detail.node_ids ?? []).length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
+    setPromptActiveNode(promptId, null);
+  } else if (detail.phase === STATE_EXECUTING) {
+    setGlobalStatusPhase(promptId, STATE_EXECUTING, (detail.node_ids ?? []).length);
+    setPromptActiveNode(
+      promptId,
+      detail.active_node_id != null ? String(detail.active_node_id) : null,
+    );
   }
 
   const nodeIds = (detail.node_ids ?? []).map((value) => String(value));
@@ -557,6 +590,11 @@ function handleModalStatus(event) {
 
   if (detail.phase === STATE_SETUP) {
     setNodesPhase(nodeIds, STATE_SETUP, promptId);
+    return;
+  }
+
+  if (detail.phase === STATE_EXECUTING) {
+    setNodesPhase(nodeIds, STATE_EXECUTING, promptId);
     return;
   }
 
@@ -587,6 +625,9 @@ function handleExecutionPhase(event, phase) {
   } else if (phase === STATE_ERROR) {
     setGlobalStatusPhase(promptId, STATE_ERROR, componentNodeIds.length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
+    setPromptActiveNode(promptId, null);
+  } else {
+    setPromptActiveNode(promptId, null);
   }
   setNodesPhase(componentNodeIds, phase, promptId, detail.exception_message);
 }

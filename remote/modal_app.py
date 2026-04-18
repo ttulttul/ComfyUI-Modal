@@ -477,8 +477,125 @@ def _load_modal_cloud_module() -> Any:
     return cloud_module
 
 
-def _lookup_deployed_modal_method(payload: dict[str, Any]) -> Any:
-    """Look up the deployed Modal method used to execute the remote runtime."""
+def _lookup_local_prompt_server() -> Any | None:
+    """Return the live local ComfyUI PromptServer instance when available."""
+    try:
+        import server
+    except ModuleNotFoundError:
+        return None
+
+    return getattr(server.PromptServer, "instance", None)
+
+
+def _emit_local_modal_status(
+    *,
+    prompt_id: str | None,
+    client_id: str | None,
+    phase: str,
+    node_ids: list[str],
+    active_node_id: str | None = None,
+    active_node_class_type: str | None = None,
+    active_node_role: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Forward remote execution progress into the local ComfyUI websocket stream."""
+    if client_id is None:
+        return
+
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+
+    payload: dict[str, Any] = {
+        "phase": phase,
+        "prompt_id": prompt_id,
+        "node_ids": list(node_ids),
+    }
+    if active_node_id is not None:
+        payload["active_node_id"] = active_node_id
+    if active_node_class_type is not None:
+        payload["active_node_class_type"] = active_node_class_type
+    if active_node_role is not None:
+        payload["active_node_role"] = active_node_role
+    if error_message is not None:
+        payload["error_message"] = error_message
+    prompt_server.send_sync("modal_status", payload, client_id)
+
+
+def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
+    """Return whether the local client has enough context to mirror remote node progress."""
+    extra_data = payload.get("extra_data") or {}
+    return (
+        payload.get("payload_kind") == "subgraph"
+        and isinstance(payload.get("prompt_id"), str)
+        and bool(payload.get("prompt_id"))
+        and isinstance(extra_data.get("client_id"), str)
+        and bool(extra_data.get("client_id"))
+        and isinstance(payload.get("component_node_ids"), list)
+        and len(payload.get("component_node_ids")) > 0
+    )
+
+
+def _consume_remote_payload_stream(
+    payload: dict[str, Any],
+    stream_events: Iterator[dict[str, Any]],
+) -> bytes:
+    """Forward remote progress events into the local UI and return the final payload bytes."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    extra_data = payload.get("extra_data") or {}
+    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    node_ids = [str(node_id) for node_id in payload.get("component_node_ids", [])]
+    result_payload: bytes | bytearray | None = None
+
+    for stream_event in stream_events:
+        event_kind = str(stream_event.get("kind", ""))
+        if event_kind == "progress":
+            _emit_local_modal_status(
+                prompt_id=prompt_id,
+                client_id=client_id,
+                phase=str(stream_event.get("phase", "executing")),
+                node_ids=node_ids,
+                active_node_id=(
+                    str(stream_event["active_node_id"])
+                    if stream_event.get("active_node_id") is not None
+                    else None
+                ),
+                active_node_class_type=(
+                    str(stream_event["active_node_class_type"])
+                    if stream_event.get("active_node_class_type") is not None
+                    else None
+                ),
+                active_node_role=(
+                    str(stream_event["active_node_role"])
+                    if stream_event.get("active_node_role") is not None
+                    else None
+                ),
+            )
+            continue
+        if event_kind == "result":
+            candidate_outputs = stream_event.get("outputs")
+            if not isinstance(candidate_outputs, (bytes, bytearray)):
+                raise ModalRemoteInvocationError(
+                    "Modal streamed payload result did not include serialized output bytes."
+                )
+            result_payload = candidate_outputs
+            continue
+
+        logger.debug(
+            "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
+            event_kind,
+            payload.get("component_id"),
+        )
+
+    if result_payload is None:
+        raise ModalRemoteInvocationError(
+            f"Modal streamed payload for component={payload.get('component_id')!r} did not yield a final result."
+        )
+    return bytes(result_payload)
+
+
+def _lookup_deployed_remote_engine(payload: dict[str, Any]) -> Any:
+    """Look up the deployed Modal runtime class instance."""
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
@@ -490,8 +607,7 @@ def _lookup_deployed_modal_method(payload: dict[str, Any]) -> Any:
         payload.get("component_id"),
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
-    remote_engine = remote_cls()
-    return remote_engine.execute_payload
+    return remote_cls()
 
 
 def _modal_environment_name() -> str | None:
@@ -564,24 +680,36 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
     settings = get_settings()
     if lookup_error_types:
         try:
-            remote_method = _lookup_deployed_modal_method(payload)
+            remote_engine = _lookup_deployed_remote_engine(payload)
             logger.info(
                 "Using deployed Modal app %s for component %s.",
                 settings.app_name,
                 payload.get("component_id"),
             )
-            return remote_method.remote(payload, kwargs_payload)
+            stream_method = getattr(remote_engine, "execute_payload_stream", None)
+            if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+                return _consume_remote_payload_stream(
+                    payload,
+                    stream_method.remote_gen(payload, kwargs_payload),
+                )
+            return remote_engine.execute_payload.remote(payload, kwargs_payload)
         except lookup_error_types as exc:
             if settings.auto_deploy:
                 _auto_deploy_modal_app(payload, exc)
                 try:
-                    remote_method = _lookup_deployed_modal_method(payload)
+                    remote_engine = _lookup_deployed_remote_engine(payload)
                     logger.info(
                         "Using auto-deployed Modal app %s for component %s.",
                         settings.app_name,
                         payload.get("component_id"),
                     )
-                    return remote_method.remote(payload, kwargs_payload)
+                    stream_method = getattr(remote_engine, "execute_payload_stream", None)
+                    if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+                        return _consume_remote_payload_stream(
+                            payload,
+                            stream_method.remote_gen(payload, kwargs_payload),
+                        )
+                    return remote_engine.execute_payload.remote(payload, kwargs_payload)
                 except lookup_error_types as retry_exc:
                     exc = retry_exc
             if not settings.allow_ephemeral_fallback:
@@ -598,13 +726,19 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
                 exc,
             )
     else:
-        remote_method = _lookup_deployed_modal_method(payload)
+        remote_engine = _lookup_deployed_remote_engine(payload)
         logger.info(
             "Using deployed Modal app %s for component %s.",
             settings.app_name,
             payload.get("component_id"),
         )
-        return remote_method.remote(payload, kwargs_payload)
+        stream_method = getattr(remote_engine, "execute_payload_stream", None)
+        if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+            return _consume_remote_payload_stream(
+                payload,
+                stream_method.remote_gen(payload, kwargs_payload),
+            )
+        return remote_engine.execute_payload.remote(payload, kwargs_payload)
 
     if "app" not in globals() or "RemoteEngine" not in globals():
         logger.debug("Local module Modal runtime objects are unavailable; loading stable cloud entry module.")
@@ -623,7 +757,14 @@ def _invoke_modal_payload_blocking(payload: dict[str, Any], kwargs_payload: byte
     run_context = cloud_app.run() if hasattr(cloud_app, "run") else nullcontext()
     with run_context:
         remote_engine = cloud_remote_engine()
-        result = remote_engine.execute_payload.remote(payload, kwargs_payload)
+        stream_method = getattr(remote_engine, "execute_payload_stream", None)
+        if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
+            result = _consume_remote_payload_stream(
+                payload,
+                stream_method.remote_gen(payload, kwargs_payload),
+            )
+        else:
+            result = remote_engine.execute_payload.remote(payload, kwargs_payload)
     logger.info(
         "Ephemeral Modal app.run() invocation completed for component %s.",
         payload.get("component_id"),

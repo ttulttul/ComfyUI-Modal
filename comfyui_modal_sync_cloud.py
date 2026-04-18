@@ -10,6 +10,7 @@ import json
 import inspect
 import logging
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -19,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
@@ -89,11 +90,17 @@ class _NullPromptServer:
 class _TracingPromptServer(_NullPromptServer):
     """PromptExecutor server stub that records coarse per-node execution timings."""
 
-    def __init__(self, prompt_id: str, prompt: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        prompt_id: str,
+        prompt: dict[str, Any],
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         """Initialize timing state for a specific prompt execution."""
         super().__init__()
         self.prompt_id = prompt_id
         self.prompt = prompt
+        self._status_callback = status_callback
         self._active_node_id: str | None = None
         self._active_node_started_at: float | None = None
 
@@ -139,6 +146,15 @@ class _TracingPromptServer(_NullPromptServer):
                 node_info = self.prompt.get(str(next_node_id), {})
                 class_type = str(node_info.get("class_type", "<unknown>"))
                 role = self._classify_node_role(class_type)
+                if self._status_callback is not None:
+                    self._status_callback(
+                        {
+                            "phase": "executing",
+                            "active_node_id": str(next_node_id),
+                            "active_node_class_type": class_type,
+                            "active_node_role": role,
+                        }
+                    )
                 self._active_node_id = str(next_node_id)
                 self._active_node_started_at = time.perf_counter()
                 _emit_cloud_info(
@@ -157,6 +173,8 @@ class _TracingPromptServer(_NullPromptServer):
 
         if event in {"execution_error", "execution_interrupted", "execution_success"}:
             self._log_node_finish(reason=event)
+            if self._status_callback is not None:
+                self._status_callback({"phase": event})
             return
 
         super().send_sync(event, data, client_id)
@@ -769,6 +787,7 @@ def _execute_subgraph_prompt(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
     custom_nodes_root: Path | None,
+    status_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
@@ -784,7 +803,11 @@ def _execute_subgraph_prompt(
         cache_type, cache_args = _prompt_executor_cache_config(execution)
 
     with _temporary_node_mapping(None), _patched_folder_paths_absolute_lookup():
-        prompt_server = _TracingPromptServer(component_id, prompt)
+        prompt_server = _TracingPromptServer(
+            component_id,
+            prompt,
+            status_callback=status_callback,
+        )
         with _timed_phase("create_prompt_executor", component=component_id):
             executor_state = _get_or_create_prompt_executor_state(
                 execution=execution,
@@ -840,6 +863,7 @@ def _execute_subgraph_prompt(
 def execute_subgraph_locally(
     payload: dict[str, Any],
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
+    status_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bytes:
     """Execute a rewritten remote component in-process and return serialized outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
@@ -850,10 +874,68 @@ def execute_subgraph_locally(
             hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         with _timed_phase("subgraph_worker_roundtrip", component=component_id):
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, custom_nodes_root)
+                future = executor.submit(
+                    _execute_subgraph_prompt,
+                    payload,
+                    hydrated_inputs,
+                    custom_nodes_root,
+                    status_callback,
+                )
                 outputs = future.result()
         with _timed_phase("serialize_boundary_outputs", component=component_id):
             return serialize_node_outputs(outputs)
+
+
+def _stream_remote_payload_events(
+    payload: dict[str, Any],
+    kwargs_payload: bytes | bytearray | str | dict[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """Yield progress and result events for one remote payload execution."""
+    event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def publish_status(progress_state: dict[str, Any]) -> None:
+        """Queue a progress envelope for the remote caller."""
+        event_queue.put(("progress", dict(progress_state)))
+
+    def execute_payload() -> None:
+        """Run the payload in a worker thread and enqueue the terminal outcome."""
+        try:
+            if payload.get("payload_kind") == "subgraph":
+                outputs = execute_subgraph_locally(
+                    payload,
+                    kwargs_payload,
+                    status_callback=publish_status,
+                )
+            else:
+                outputs = execute_node_locally(payload, kwargs_payload)
+        except Exception as exc:  # pragma: no cover - exercised through generator consumer tests.
+            event_queue.put(("error", exc))
+        else:
+            event_queue.put(("result", outputs))
+        finally:
+            event_queue.put(("done", None))
+
+    worker_thread = threading.Thread(
+        target=execute_payload,
+        name=f"modal-stream-{payload.get('component_id', 'payload')}",
+        daemon=True,
+    )
+    worker_thread.start()
+    try:
+        while True:
+            event_kind, event_payload = event_queue.get()
+            if event_kind == "progress":
+                yield {"kind": "progress", **event_payload}
+                continue
+            if event_kind == "result":
+                yield {"kind": "result", "outputs": event_payload}
+                continue
+            if event_kind == "error":
+                raise event_payload
+            if event_kind == "done":
+                return
+    finally:
+        worker_thread.join(timeout=1.0)
 
 
 def _should_ignore_repo_path(path: Path) -> bool:
@@ -1027,6 +1109,29 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 if payload.get("payload_kind") == "subgraph":
                     return execute_subgraph_locally(payload, kwargs_payload)
                 return execute_node_locally(payload, kwargs_payload)
+
+        @modal.method()
+        def execute_payload_stream(
+            self,
+            payload: dict[str, Any],
+            kwargs_payload: bytes,
+        ) -> Iterator[dict[str, Any]]:
+            """Stream progress envelopes and a final serialized result for one payload."""
+            component_id = payload.get("component_id", "single-node")
+            with _timed_phase(
+                "remote_engine_execute_payload",
+                component=component_id,
+                payload_kind=payload.get("payload_kind"),
+            ):
+                if _should_reload_modal_volume(payload):
+                    with _timed_phase("modal_volume_reload", component=component_id):
+                        vol.reload()
+                else:
+                    _emit_cloud_info(
+                        "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
+                        component_id,
+                    )
+                yield from _stream_remote_payload_events(payload, kwargs_payload)
 
 else:
     app = None
