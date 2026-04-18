@@ -1207,6 +1207,28 @@ def test_modal_cloud_uses_comfy_prompt_executor_cache_defaults(
     assert cache_args == {"lru": 0, "ram": 4.0}
 
 
+def test_modal_cloud_allows_concurrent_inputs_for_interrupts(
+    modal_cloud_module: Any,
+) -> None:
+    """The deployed Modal class should keep one spare input slot for interrupt RPCs."""
+    fake_settings = types.SimpleNamespace(
+        modal_gpu="A100",
+        remote_storage_root="/vol/data",
+        scaledown_window_seconds=60,
+        min_containers=0,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+    )
+
+    options = modal_cloud_module._remote_engine_cls_options(
+        fake_settings,
+        vol=object(),
+        image=object(),
+    )
+
+    assert options["allow_concurrent_inputs"] == 2
+
+
 def test_modal_cloud_reuses_prompt_executor_for_same_cache_scope(
     modal_cloud_module: Any,
     tmp_path: Path,
