@@ -269,6 +269,7 @@ function ensurePromptState(promptId) {
       startedAt: nowMs(),
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
+      descendantNodeIdsByAncestor: new Map(),
       activeNodeId: null,
       hasStreamedProgress: false,
     });
@@ -367,6 +368,7 @@ function scheduleNodeClear(nodeIdValue, promptId, delayMs) {
  * @param {string | undefined} errorMessage
  */
 function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
+  const affectedAncestorNodeIds = new Set();
   for (const currentNodeId of nodeIds) {
     if (!shouldApplyPromptState(currentNodeId, promptId)) {
       continue;
@@ -381,6 +383,12 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     if (phase === STATE_ERROR) {
       scheduleNodeClear(currentNodeId, promptId, ERROR_CLEAR_DELAY_MS);
     }
+    for (const ancestorNodeId of ancestorNodeIds(currentNodeId)) {
+      affectedAncestorNodeIds.add(ancestorNodeId);
+    }
+  }
+  for (const ancestorNodeId of affectedAncestorNodeIds) {
+    refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage);
   }
   ensureAnimationLoop();
   app.graph?.setDirtyCanvas(true, true);
@@ -397,6 +405,7 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
   if (remoteNodeIds.length > 0) {
     promptState.remoteNodeIds = [...remoteNodeIds];
   }
+  rebuildPromptAncestorMap(promptState);
   if (components.length > 0) {
     promptState.componentsByRepresentative.clear();
     promptState.activeNodeId = null;
@@ -407,6 +416,92 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
         component.node_ids.map((nodeIdValue) => String(nodeIdValue)),
       );
     }
+    rebuildPromptAncestorMap(promptState);
+  }
+}
+
+/**
+ * Return ancestor node ids for a composed subgraph prompt id like `24:23`.
+ * @param {string} nodeIdValue
+ * @returns {string[]}
+ */
+function ancestorNodeIds(nodeIdValue) {
+  const segments = String(nodeIdValue).split(":");
+  const ancestorNodeIds = [];
+  for (let index = 1; index < segments.length; index += 1) {
+    ancestorNodeIds.push(segments.slice(0, index).join(":"));
+  }
+  return ancestorNodeIds;
+}
+
+/**
+ * Rebuild descendant-to-ancestor mappings for one prompt state.
+ * @param {{ remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, descendantNodeIdsByAncestor: Map<string, Set<string>> }} promptState
+ */
+function rebuildPromptAncestorMap(promptState) {
+  promptState.descendantNodeIdsByAncestor.clear();
+  const candidateNodeIds = new Set(promptState.remoteNodeIds);
+  for (const componentNodeIds of promptState.componentsByRepresentative.values()) {
+    for (const componentNodeId of componentNodeIds) {
+      candidateNodeIds.add(String(componentNodeId));
+    }
+  }
+
+  for (const candidateNodeId of candidateNodeIds) {
+    for (const ancestorNodeId of ancestorNodeIds(candidateNodeId)) {
+      if (!promptState.descendantNodeIdsByAncestor.has(ancestorNodeId)) {
+        promptState.descendantNodeIdsByAncestor.set(ancestorNodeId, new Set());
+      }
+      promptState.descendantNodeIdsByAncestor.get(ancestorNodeId).add(candidateNodeId);
+    }
+  }
+}
+
+/**
+ * Recompute one visible ancestor node's phase from its descendant remote prompt nodes.
+ * @param {string} promptId
+ * @param {string} ancestorNodeId
+ * @param {string | undefined} errorMessage
+ */
+function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage) {
+  const promptState = modalPromptStates.get(promptId);
+  const descendantNodeIds = promptState?.descendantNodeIdsByAncestor.get(ancestorNodeId);
+  if (!promptState || !descendantNodeIds || descendantNodeIds.size === 0) {
+    return;
+  }
+
+  const descendantStates = Array.from(descendantNodeIds)
+    .map((descendantNodeId) => modalNodeStates.get(descendantNodeId))
+    .filter((state) => state?.promptId === promptId);
+  if (descendantStates.length === 0) {
+    return;
+  }
+
+  let ancestorPhase = STATE_SETUP;
+  if (descendantStates.some((state) => state.phase === STATE_ERROR)) {
+    ancestorPhase = STATE_ERROR;
+  } else if (descendantStates.some((state) => state.phase === STATE_ACTIVE)) {
+    ancestorPhase = STATE_ACTIVE;
+  } else if (descendantStates.every((state) => state.phase === STATE_COMPLETE)) {
+    ancestorPhase = STATE_COMPLETE;
+  } else if (
+    descendantStates.some((state) => state.phase === STATE_READY || state.phase === STATE_COMPLETE)
+  ) {
+    ancestorPhase = STATE_READY;
+  }
+
+  if (!shouldApplyPromptState(ancestorNodeId, promptId)) {
+    return;
+  }
+  clearNodeTimer(ancestorNodeId);
+  modalNodeStates.set(ancestorNodeId, {
+    phase: ancestorPhase,
+    promptId,
+    errorMessage,
+    updatedAt: nowMs(),
+  });
+  if (ancestorPhase === STATE_ERROR) {
+    scheduleNodeClear(ancestorNodeId, promptId, ERROR_CLEAR_DELAY_MS);
   }
 }
 
@@ -706,6 +801,13 @@ function clearPromptRemoteStates(promptId) {
     const currentState = modalNodeStates.get(remoteNodeId);
     if (currentState?.promptId === promptId) {
       modalNodeStates.delete(remoteNodeId);
+    }
+  }
+  for (const ancestorNodeId of promptState.descendantNodeIdsByAncestor.keys()) {
+    clearNodeTimer(ancestorNodeId);
+    const currentState = modalNodeStates.get(ancestorNodeId);
+    if (currentState?.promptId === promptId) {
+      modalNodeStates.delete(ancestorNodeId);
     }
   }
   modalPromptStates.delete(promptId);
