@@ -75,6 +75,7 @@ class _ReusablePromptExecutorState:
 
 
 _PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
+_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (0.0, 0.1, 0.25, 0.5, 1.0)
 
 
 @dataclass
@@ -1471,21 +1472,49 @@ def _prepare_for_modal_volume_reload() -> None:
     gc.collect()
 
 
+def _is_modal_volume_open_files_error(exc: RuntimeError) -> bool:
+    """Return whether a Modal volume reload failed because mounted files are still open."""
+    return "open files" in str(exc)
+
+
+def _sleep_before_modal_volume_reload_retry(delay_seconds: float) -> None:
+    """Pause briefly so recently cancelled work can release mounted-volume file handles."""
+    if delay_seconds <= 0:
+        return
+    time.sleep(delay_seconds)
+
+
 def _reload_modal_volume_for_request(volume: Any, component_id: str) -> None:
-    """Reload the Modal volume, retrying once after unloading warm model state if needed."""
+    """Reload the Modal volume, retrying briefly while warm state releases open files."""
     with _timed_phase("modal_volume_reload", component=component_id):
-        try:
-            volume.reload()
-            return
-        except RuntimeError as exc:
-            if "open files" not in str(exc):
-                raise
-            _emit_cloud_info(
-                "Modal volume reload hit open files for component=%s; clearing warm caches and retrying once.",
-                component_id,
-            )
-            _prepare_for_modal_volume_reload()
-            volume.reload()
+        for attempt_index, retry_delay_seconds in enumerate(
+            _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS,
+            start=1,
+        ):
+            if attempt_index > 1:
+                _sleep_before_modal_volume_reload_retry(retry_delay_seconds)
+            try:
+                volume.reload()
+                if attempt_index > 1:
+                    _emit_cloud_info(
+                        "Modal volume reload succeeded for component=%s after %d attempt(s).",
+                        component_id,
+                        attempt_index,
+                    )
+                return
+            except RuntimeError as exc:
+                if not _is_modal_volume_open_files_error(exc):
+                    raise
+                if attempt_index == len(_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS):
+                    raise
+                _emit_cloud_info(
+                    "Modal volume reload hit open files for component=%s on attempt %d/%d; clearing warm caches and retrying after %.2fs.",
+                    component_id,
+                    attempt_index,
+                    len(_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS),
+                    _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS[attempt_index],
+                )
+                _prepare_for_modal_volume_reload()
 
 
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
