@@ -17,6 +17,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -49,6 +50,7 @@ _EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
 _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
+_PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 
 try:
     import modal  # type: ignore
@@ -58,6 +60,17 @@ except ModuleNotFoundError:  # pragma: no cover - remote entrypoint only.
 
 class RemoteSubgraphExecutionError(RuntimeError):
     """Raised when remote subgraph execution fails."""
+
+
+@dataclass
+class _ReusablePromptExecutorState:
+    """Hold a warm-container PromptExecutor and the lock guarding its reuse."""
+
+    executor: Any
+    lock: threading.Lock
+
+
+_PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
 
 
 class _NullPromptServer:
@@ -604,6 +617,59 @@ def _prompt_executor_cache_config(execution: Any) -> tuple[Any, dict[str, float]
     return cache_type, {"lru": args.cache_lru, "ram": args.cache_ram}
 
 
+def _serialize_prompt_executor_cache_scope(
+    cache_type: Any,
+    cache_args: dict[str, Any],
+    custom_nodes_root: Path | None,
+) -> str:
+    """Return a stable cache scope key for reusable PromptExecutor instances."""
+    return json.dumps(
+        {
+            "cache_type": str(cache_type),
+            "cache_args": cache_args,
+            "custom_nodes_root": str(custom_nodes_root.resolve()) if custom_nodes_root is not None else None,
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _reset_prompt_executor_request_state(executor: Any, prompt_server: Any) -> None:
+    """Prepare a reusable PromptExecutor for a fresh request without discarding its caches."""
+    executor.server = prompt_server
+    executor.status_messages = []
+    executor.success = True
+    executor.history_result = {}
+    prompt_server.client_id = None
+    prompt_server.last_node_id = None
+
+
+def _get_or_create_prompt_executor_state(
+    execution: Any,
+    prompt_server: Any,
+    cache_type: Any,
+    cache_args: dict[str, Any],
+    custom_nodes_root: Path | None,
+) -> _ReusablePromptExecutorState:
+    """Return the warm-container PromptExecutor state for a cache scope, creating it once."""
+    state_key = _serialize_prompt_executor_cache_scope(cache_type, cache_args, custom_nodes_root)
+    with _PROMPT_EXECUTOR_STATES_LOCK:
+        existing_state = _PROMPT_EXECUTOR_STATES.get(state_key)
+        if existing_state is not None:
+            _emit_cloud_info("Prompt executor cache hit scope=%s", state_key)
+            return existing_state
+
+        _emit_cloud_info("Prompt executor cache miss scope=%s", state_key)
+        executor = execution.PromptExecutor(
+            prompt_server,
+            cache_type=cache_type,
+            cache_args=cache_args,
+        )
+        state = _ReusablePromptExecutorState(executor=executor, lock=threading.Lock())
+        _PROMPT_EXECUTOR_STATES[state_key] = state
+        return state
+
+
 def _invoke_original_node(
     node_class: type[Any],
     node_data: dict[str, Any],
@@ -702,6 +768,7 @@ def _extract_prompt_executor_error(executor: Any) -> str:
 def _execute_subgraph_prompt(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
+    custom_nodes_root: Path | None,
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
@@ -719,22 +786,27 @@ def _execute_subgraph_prompt(
     with _temporary_node_mapping(None), _patched_folder_paths_absolute_lookup():
         prompt_server = _TracingPromptServer(component_id, prompt)
         with _timed_phase("create_prompt_executor", component=component_id):
-            executor = execution.PromptExecutor(
-                prompt_server,
+            executor_state = _get_or_create_prompt_executor_state(
+                execution=execution,
+                prompt_server=prompt_server,
                 cache_type=cache_type,
                 cache_args=cache_args,
+                custom_nodes_root=custom_nodes_root,
             )
-        with _timed_phase(
-            "prompt_executor_execute",
-            component=component_id,
-            execute_nodes=list(payload.get("execute_node_ids", [])),
-        ):
-            executor.execute(
-                prompt=prompt,
-                prompt_id=component_id,
-                extra_data=copy.deepcopy(payload.get("extra_data") or {}),
-                execute_outputs=list(payload.get("execute_node_ids", [])),
-            )
+        with executor_state.lock:
+            _reset_prompt_executor_request_state(executor_state.executor, prompt_server)
+            with _timed_phase(
+                "prompt_executor_execute",
+                component=component_id,
+                execute_nodes=list(payload.get("execute_node_ids", [])),
+            ):
+                executor_state.executor.execute(
+                    prompt=prompt,
+                    prompt_id=component_id,
+                    extra_data=copy.deepcopy(payload.get("extra_data") or {}),
+                    execute_outputs=list(payload.get("execute_node_ids", [])),
+                )
+            executor = executor_state.executor
         if not executor.success:
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
 
@@ -778,7 +850,7 @@ def execute_subgraph_locally(
             hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         with _timed_phase("subgraph_worker_roundtrip", component=component_id):
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs)
+                future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, custom_nodes_root)
                 outputs = future.result()
         with _timed_phase("serialize_boundary_outputs", component=component_id):
             return serialize_node_outputs(outputs)

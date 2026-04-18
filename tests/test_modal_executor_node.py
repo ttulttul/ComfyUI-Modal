@@ -669,6 +669,112 @@ def test_modal_cloud_uses_comfy_prompt_executor_cache_defaults(
     assert cache_args == {"lru": 0, "ram": 4.0}
 
 
+def test_modal_cloud_reuses_prompt_executor_for_same_cache_scope(
+    modal_cloud_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Warm-container subgraph runs should reuse one PromptExecutor per cache scope."""
+
+    class FakePromptExecutor:
+        """Simple PromptExecutor double that records how many instances were created."""
+
+        instances_created = 0
+
+        def __init__(self, server: Any, cache_type: Any = False, cache_args: Any = None) -> None:
+            """Capture initialization state for later assertions."""
+            type(self).instances_created += 1
+            self.server = server
+            self.cache_type = cache_type
+            self.cache_args = cache_args
+            self.status_messages = [("stale", {})]
+            self.success = False
+            self.history_result = {"stale": True}
+
+    fake_execution_module = types.SimpleNamespace(PromptExecutor=FakePromptExecutor)
+    first_server = types.SimpleNamespace(client_id="first", last_node_id="node-1")
+    second_server = types.SimpleNamespace(client_id="second", last_node_id="node-2")
+
+    original_states = dict(modal_cloud_module._PROMPT_EXECUTOR_STATES)
+    modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
+    try:
+        first_state = modal_cloud_module._get_or_create_prompt_executor_state(
+            execution=fake_execution_module,
+            prompt_server=first_server,
+            cache_type="classic",
+            cache_args={"lru": 0, "ram": 0.0},
+            custom_nodes_root=tmp_path / "bundle-a",
+        )
+        modal_cloud_module._reset_prompt_executor_request_state(first_state.executor, first_server)
+        second_state = modal_cloud_module._get_or_create_prompt_executor_state(
+            execution=fake_execution_module,
+            prompt_server=second_server,
+            cache_type="classic",
+            cache_args={"lru": 0, "ram": 0.0},
+            custom_nodes_root=tmp_path / "bundle-a",
+        )
+        modal_cloud_module._reset_prompt_executor_request_state(second_state.executor, second_server)
+    finally:
+        modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
+        modal_cloud_module._PROMPT_EXECUTOR_STATES.update(original_states)
+
+    assert FakePromptExecutor.instances_created == 1
+    assert first_state is second_state
+    assert second_state.executor.server is second_server
+    assert second_state.executor.status_messages == []
+    assert second_state.executor.success is True
+    assert second_state.executor.history_result == {}
+    assert second_server.client_id is None
+    assert second_server.last_node_id is None
+
+
+def test_modal_cloud_separates_prompt_executor_cache_scopes_by_custom_nodes_root(
+    modal_cloud_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Different custom-node bundle roots should not share a PromptExecutor cache scope."""
+
+    class FakePromptExecutor:
+        """Simple PromptExecutor double used to count cache-scope creations."""
+
+        instances_created = 0
+
+        def __init__(self, server: Any, cache_type: Any = False, cache_args: Any = None) -> None:
+            """Capture initialization state for later assertions."""
+            type(self).instances_created += 1
+            self.server = server
+            self.cache_type = cache_type
+            self.cache_args = cache_args
+            self.status_messages = []
+            self.success = True
+            self.history_result = {}
+
+    fake_execution_module = types.SimpleNamespace(PromptExecutor=FakePromptExecutor)
+
+    original_states = dict(modal_cloud_module._PROMPT_EXECUTOR_STATES)
+    modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
+    try:
+        first_state = modal_cloud_module._get_or_create_prompt_executor_state(
+            execution=fake_execution_module,
+            prompt_server=types.SimpleNamespace(client_id=None, last_node_id=None),
+            cache_type="classic",
+            cache_args={"lru": 0, "ram": 0.0},
+            custom_nodes_root=tmp_path / "bundle-a",
+        )
+        second_state = modal_cloud_module._get_or_create_prompt_executor_state(
+            execution=fake_execution_module,
+            prompt_server=types.SimpleNamespace(client_id=None, last_node_id=None),
+            cache_type="classic",
+            cache_args={"lru": 0, "ram": 0.0},
+            custom_nodes_root=tmp_path / "bundle-b",
+        )
+    finally:
+        modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
+        modal_cloud_module._PROMPT_EXECUTOR_STATES.update(original_states)
+
+    assert FakePromptExecutor.instances_created == 2
+    assert first_state is not second_state
+
+
 def test_modal_cloud_materializes_synced_asset_paths(
     modal_cloud_module: Any,
     monkeypatch: Any,
