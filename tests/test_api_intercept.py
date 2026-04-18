@@ -582,6 +582,159 @@ def test_rewrite_auto_expands_upstream_non_transportable_dependencies(
     assert rewritten_prompt["4"]["inputs"]["latent"] == ["1", 0]
 
 
+def test_analyze_remote_node_selection_returns_nodes_to_mark_and_reasons(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """Dry-run analysis should surface the clicked node plus required upstream nodes."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "ModelSource": _FakeRemoteModelNode,
+                "ConditioningSource": _FakeRemoteConditioningNode,
+                "RemoteConsumer": _FakeRemoteSamplerNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": False}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {"class_type": "ModelSource", "inputs": {}, "_meta": {"title": "Model"}},
+        "2": {
+            "class_type": "ConditioningSource",
+            "inputs": {},
+            "_meta": {"title": "Conditioning"},
+        },
+        "3": {
+            "class_type": "RemoteConsumer",
+            "inputs": {"model": ["1", 0], "conditioning": ["2", 0]},
+            "_meta": {"title": "Remote Consumer"},
+        },
+    }
+
+    analysis = api_intercept_module.analyze_remote_node_selection(
+        prompt=prompt,
+        workflow=workflow,
+        seed_workflow_node_paths=["3"],
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert analysis.requested_node_ids == ["3"]
+    assert analysis.requested_workflow_node_paths == ["3"]
+    assert analysis.current_remote_node_ids == []
+    assert analysis.current_remote_workflow_node_paths == []
+    assert analysis.resolved_remote_node_ids == ["1", "2", "3"]
+    assert analysis.resolved_workflow_node_paths == ["1", "2", "3"]
+    assert analysis.added_node_ids == ["1", "2", "3"]
+    assert analysis.added_workflow_node_paths == ["1", "2", "3"]
+    assert [(reason.node_id, reason.required_by_node_id) for reason in analysis.reasons] == [
+        ("1", "3"),
+        ("2", "3"),
+    ]
+
+
+def test_analyze_remote_node_selection_prefers_nested_workflow_paths(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """Nested prompt ids should map back to the specific inner workflow node path."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "ModelSource": _FakeRemoteModelNode,
+                "RemoteConsumer": _FakeRemoteSamplerNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {
+                "id": 24,
+                "properties": {"is_modal_remote": False},
+                "subgraph": {
+                    "nodes": [
+                        {"id": 23, "properties": {"is_modal_remote": True}},
+                    ]
+                },
+            },
+            {"id": 30, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "30": {"class_type": "ModelSource", "inputs": {}, "_meta": {"title": "Model"}},
+        "24:23": {
+            "class_type": "RemoteConsumer",
+            "inputs": {"model": ["30", 0]},
+            "_meta": {"title": "Nested Consumer"},
+        },
+    }
+
+    analysis = api_intercept_module.analyze_remote_node_selection(
+        prompt=prompt,
+        workflow=workflow,
+        seed_workflow_node_paths=["24:23"],
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert analysis.requested_node_ids == ["24:23"]
+    assert analysis.current_remote_node_ids == ["24:23"]
+    assert analysis.current_remote_workflow_node_paths == ["24:23"]
+    assert analysis.resolved_remote_node_ids == ["24:23", "30"]
+    assert analysis.resolved_workflow_node_paths == ["24:23", "30"]
+    assert analysis.added_node_ids == ["30"]
+    assert analysis.added_workflow_node_paths == ["30"]
+    assert [(reason.node_id, reason.required_by_node_id) for reason in analysis.reasons] == [
+        ("30", "24:23"),
+    ]
+
+
 def test_rewrite_rejects_non_transportable_remote_outputs(
     api_intercept_module: Any,
     settings_module: Any,

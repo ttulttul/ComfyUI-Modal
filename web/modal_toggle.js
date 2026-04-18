@@ -3,6 +3,7 @@ import { PromptExecutionError, api } from "../../scripts/api.js";
 
 const REMOTE_PROPERTY = "is_modal_remote";
 const MODAL_ROUTE = "/modal/queue_prompt";
+const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
@@ -644,6 +645,229 @@ function extractRemoteNodeIds(workflow) {
 }
 
 /**
+ * Return the root workflow graph, including subgraphs when available.
+ * @returns {LGraph | null}
+ */
+function rootGraph() {
+  return app.rootGraph ?? app.graph?.rootGraph ?? app.graph ?? null;
+}
+
+/**
+ * Look up a graph-local node id without assuming whether ids are numeric or strings.
+ * @param {LGraph | null | undefined} graph
+ * @param {string} id
+ * @returns {LGraphNode | null}
+ */
+function getGraphNodeById(graph, id) {
+  if (!graph || id == null) {
+    return null;
+  }
+  const directMatch = graph.getNodeById?.(id) ?? null;
+  if (directMatch) {
+    return directMatch;
+  }
+  const numericId = Number(id);
+  if (Number.isFinite(numericId)) {
+    return graph.getNodeById?.(numericId) ?? null;
+  }
+  return null;
+}
+
+/**
+ * Search every live subgraph for one matching value.
+ * @param {(graph: LGraph) => any} matcher
+ * @returns {any}
+ */
+function findSomethingInAllSubgraphs(matcher) {
+  const graph = rootGraph();
+  if (!graph) {
+    return null;
+  }
+
+  const subgraphs = [graph];
+  if (graph.subgraphs?.values) {
+    subgraphs.push(...graph.subgraphs.values());
+  }
+  for (const subgraph of subgraphs) {
+    const match = matcher(subgraph);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+/**
+ * Return the workflow node that owns one nested subgraph graph id.
+ * @param {number | string | undefined} subgraphId
+ * @returns {LGraphNode | null}
+ */
+function findContainingSubgraphNode(subgraphId) {
+  if (subgraphId == null) {
+    return null;
+  }
+  return (
+    findSomethingInAllSubgraphs((graph) =>
+      (graph?.nodes ?? []).find(
+        (candidate) =>
+          typeof candidate?.isSubgraphNode === "function" &&
+          candidate.isSubgraphNode() &&
+          candidate.subgraph?.id === subgraphId,
+      ),
+    ) ?? null
+  );
+}
+
+/**
+ * Return one node's composed workflow path, including any subgraph ancestors.
+ * @param {LGraphNode} node
+ * @returns {string}
+ */
+function workflowNodePath(node) {
+  const pathSegments = [String(node?.id ?? "")];
+  let currentGraph = node?.graph ?? null;
+  const currentRootGraph = rootGraph();
+
+  while (currentGraph && currentRootGraph && currentGraph !== currentRootGraph) {
+    const parentNode = findContainingSubgraphNode(currentGraph.id);
+    if (!parentNode) {
+      break;
+    }
+    pathSegments.unshift(String(parentNode.id));
+    currentGraph = parentNode.graph ?? null;
+  }
+
+  return pathSegments.filter(Boolean).join(":");
+}
+
+/**
+ * Resolve a composed workflow path like `24:23` to a live node instance.
+ * @param {string} workflowPath
+ * @returns {LGraphNode | null}
+ */
+function findNodeByWorkflowPath(workflowPath) {
+  const pathSegments = String(workflowPath)
+    .split(":")
+    .filter(Boolean);
+  if (pathSegments.length === 0) {
+    return null;
+  }
+
+  let currentGraph = rootGraph();
+  let currentNode = null;
+  for (const pathSegment of pathSegments) {
+    currentNode = getGraphNodeById(currentGraph, pathSegment);
+    if (!currentNode) {
+      return null;
+    }
+    currentGraph = currentNode.subgraph ?? null;
+  }
+  return currentNode;
+}
+
+/**
+ * Return the workflow-node paths that a context-menu action should expand from.
+ * @param {LGraphNode} node
+ * @returns {string[]}
+ */
+function selectedWorkflowNodePaths(node) {
+  const selectedNodes = Object.values(app.canvas?.selected_nodes ?? {}).filter(
+    (candidate) => candidate?.graph === node?.graph && isEligibleNode(candidate),
+  );
+  if (selectedNodes.some((candidate) => candidate === node) && selectedNodes.length > 1) {
+    return selectedNodes.map((candidate) => workflowNodePath(candidate));
+  }
+  return [workflowNodePath(node)];
+}
+
+/**
+ * Return the graph snapshot shape ComfyUI already uses for queue submission.
+ * @returns {Promise<{ output: object, workflow: object }>}
+ */
+async function serializeCurrentGraphForModal() {
+  if (typeof app.graphToPrompt !== "function") {
+    throw new Error("ComfyUI graph serialization is unavailable.");
+  }
+  const prompt = await app.graphToPrompt();
+  if (!prompt?.output || !prompt?.workflow) {
+    throw new Error("ComfyUI did not return prompt and workflow data.");
+  }
+  return {
+    output: prompt.output,
+    workflow: prompt.workflow,
+  };
+}
+
+/**
+ * Show a short frontend notification without taking over the whole UI.
+ * @param {string} value
+ */
+function notifyModal(value) {
+  dispatchSyntheticApiEvent("notification", {
+    id: `modal-analysis-${Date.now()}`,
+    value,
+  });
+}
+
+/**
+ * Apply the remote marker to the workflow nodes named by composed workflow paths.
+ * @param {string[]} workflowNodePaths
+ * @returns {number}
+ */
+function markWorkflowNodePathsRemote(workflowNodePaths) {
+  let appliedCount = 0;
+  for (const workflowPath of workflowNodePaths) {
+    const node = findNodeByWorkflowPath(workflowPath);
+    if (!node) {
+      console.warn("Unable to find Modal workflow node path in the live graph.", workflowPath);
+      continue;
+    }
+    setRemoteFlag(node, true);
+    appliedCount += 1;
+  }
+  return appliedCount;
+}
+
+/**
+ * Request required upstream nodes from the backend and mark them remote in the UI.
+ * @param {LGraphNode} node
+ */
+async function analyzeAndMarkRequiredRemoteNodes(node) {
+  const seedNodeIds = selectedWorkflowNodePaths(node);
+  const graphSnapshot = await serializeCurrentGraphForModal();
+  const response = await api.fetchApi(MODAL_ANALYZE_ROUTE, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      prompt: graphSnapshot.output,
+      workflow: graphSnapshot.workflow,
+      seed_node_ids: seedNodeIds,
+    }),
+  });
+  if (response.status !== 200) {
+    throw new PromptExecutionError(await response.json());
+  }
+
+  const result = await response.json();
+  const resolvedWorkflowNodePaths = result.resolved_workflow_node_paths ?? [];
+  const addedWorkflowNodePaths = result.added_workflow_node_paths ?? [];
+  const appliedCount = markWorkflowNodePathsRemote(resolvedWorkflowNodePaths);
+  app.graph?.setDirtyCanvas(true, true);
+
+  if (addedWorkflowNodePaths.length > 0) {
+    notifyModal(`Marked ${addedWorkflowNodePaths.length} node${addedWorkflowNodePaths.length === 1 ? "" : "s"} for Modal.`);
+    return;
+  }
+  notifyModal(
+    appliedCount > 0
+      ? "No extra upstream Modal nodes were required."
+      : "Modal analysis finished, but no matching live nodes were found to update.",
+  );
+}
+
+/**
  * Update the node state and redraw the canvas.
  * @param {LGraphNode} node
  * @param {boolean} value
@@ -798,6 +1022,34 @@ function decorateNode(node) {
   node.onDrawForeground = function onDrawForeground(ctx) {
     originalDrawForeground?.apply(this, arguments);
     drawRemoteNodeDecoration(this, ctx);
+  };
+
+  const originalGetExtraMenuOptions = node.getExtraMenuOptions;
+  node.getExtraMenuOptions = function getExtraMenuOptionsWithModalAnalysis(_, options) {
+    const menuOptions = originalGetExtraMenuOptions?.apply(this, arguments) ?? options ?? [];
+    const targetOptions = options ?? menuOptions;
+    if (!Array.isArray(targetOptions)) {
+      return menuOptions;
+    }
+
+    const selectedNodePaths = selectedWorkflowNodePaths(this);
+    const menuItemLabel =
+      selectedNodePaths.length > 1
+        ? "Modal: Include Required Upstream Nodes for Selection"
+        : "Modal: Include Required Upstream Nodes";
+    if (!targetOptions.some((option) => option?.content === menuItemLabel)) {
+      targetOptions.push(null, {
+        content: menuItemLabel,
+        callback: () => {
+          void analyzeAndMarkRequiredRemoteNodes(this).catch((error) => {
+            console.error("Modal remote-node analysis failed.", error);
+            notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
+          });
+        },
+      });
+    }
+
+    return menuOptions;
   };
 }
 

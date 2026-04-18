@@ -87,6 +87,32 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert 'ctx.fillText(`${Math.round(progressRatio * 100)}%`' in source
 
 
+def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
+    """Right-clicking a node should offer a dry-run expansion action backed by the backend."""
+    source = _modal_toggle_source()
+
+    assert 'const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\\/queue_prompt$/, "/analyze_remote_nodes");' in source
+    assert "function workflowNodePath(node)" in source
+    assert "function findNodeByWorkflowPath(workflowPath)" in source
+    assert "function selectedWorkflowNodePaths(node)" in source
+    assert "function analyzeAndMarkRequiredRemoteNodes(node)" in source
+    assert 'api.fetchApi(MODAL_ANALYZE_ROUTE, {' in source
+    assert '"Modal: Include Required Upstream Nodes"' in source
+    assert '"Modal: Include Required Upstream Nodes for Selection"' in source
+
+
+def test_modal_context_menu_marks_nodes_across_subgraphs() -> None:
+    """The UI action should be able to resolve and mark nested workflow-node paths."""
+    source = _modal_toggle_source()
+
+    assert "function rootGraph()" in source
+    assert "function findSomethingInAllSubgraphs(matcher)" in source
+    assert "function findContainingSubgraphNode(subgraphId)" in source
+    assert "candidate.subgraph?.id === subgraphId" in source
+    assert "function markWorkflowNodePathsRemote(workflowNodePaths)" in source
+    assert "setRemoteFlag(node, true);" in source
+
+
 def test_prompt_cleanup_prunes_orphaned_global_status_entries() -> None:
     """Workflow cleanup should remove stale global badge states once prompt state is gone."""
     source = _modal_toggle_source()
