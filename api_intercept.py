@@ -94,6 +94,33 @@ class RewriteSummary:
     custom_nodes_bundle: SyncedAsset | None = None
 
 
+@dataclass(frozen=True)
+class RemoteExpansionReason:
+    """Describe why one upstream node had to join a remote component."""
+
+    node_id: str
+    class_type: str
+    required_by_node_id: str
+    required_by_class_type: str
+    output_index: int
+    io_type: str
+
+
+@dataclass
+class RemoteNodeAnalysis:
+    """Structured dry-run result for context-menu remote expansion."""
+
+    requested_node_ids: list[str] = field(default_factory=list)
+    requested_workflow_node_paths: list[str] = field(default_factory=list)
+    current_remote_node_ids: list[str] = field(default_factory=list)
+    current_remote_workflow_node_paths: list[str] = field(default_factory=list)
+    resolved_remote_node_ids: list[str] = field(default_factory=list)
+    resolved_workflow_node_paths: list[str] = field(default_factory=list)
+    added_node_ids: list[str] = field(default_factory=list)
+    added_workflow_node_paths: list[str] = field(default_factory=list)
+    reasons: list[RemoteExpansionReason] = field(default_factory=list)
+
+
 class ModalPromptValidationError(ValueError):
     """Raised when a prompt cannot be executed with the current Modal transport."""
 
@@ -289,6 +316,118 @@ def _resolve_prompt_node_ids_for_workflow_node(
     return resolved_prompt_node_ids
 
 
+def _workflow_node_path(workflow_node_id: str, ancestor_node_ids: tuple[str, ...]) -> str:
+    """Return one workflow node's composed path, including subgraph ancestors."""
+    if not ancestor_node_ids:
+        return workflow_node_id
+    return ":".join((*ancestor_node_ids, workflow_node_id))
+
+
+def _extract_marked_workflow_node_paths(
+    workflow: dict[str, Any] | None,
+    settings: ModalSyncSettings | None = None,
+) -> set[str]:
+    """Return composed workflow paths for nodes explicitly marked remote in metadata."""
+    if workflow is None:
+        return set()
+
+    marker = (settings or get_settings()).marker_property
+    marked_workflow_node_paths: set[str] = set()
+    for node, ancestor_node_ids in _iter_workflow_nodes_with_ancestors(workflow):
+        properties = node.get("properties") or {}
+        if not properties.get(marker):
+            continue
+        marked_workflow_node_paths.add(
+            _workflow_node_path(str(node.get("id")), ancestor_node_ids)
+        )
+    return marked_workflow_node_paths
+
+
+def _build_workflow_prompt_resolution_maps(
+    workflow: dict[str, Any] | None,
+    prompt_node_ids: set[str],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Return bidirectional mappings between workflow paths and queued prompt ids."""
+    workflow_path_to_prompt_node_ids: dict[str, set[str]] = {}
+    prompt_node_id_to_workflow_paths: dict[str, set[str]] = defaultdict(set)
+
+    if workflow is None:
+        for prompt_node_id in prompt_node_ids:
+            workflow_path_to_prompt_node_ids[prompt_node_id] = {prompt_node_id}
+            prompt_node_id_to_workflow_paths[prompt_node_id].add(prompt_node_id)
+        return workflow_path_to_prompt_node_ids, prompt_node_id_to_workflow_paths
+
+    for node, ancestor_node_ids in _iter_workflow_nodes_with_ancestors(workflow):
+        workflow_node_id = str(node.get("id"))
+        workflow_node_path = _workflow_node_path(workflow_node_id, ancestor_node_ids)
+        resolved_prompt_node_ids = _resolve_prompt_node_ids_for_workflow_node(
+            workflow_node_id,
+            ancestor_node_ids,
+            prompt_node_ids,
+        )
+        if workflow_node_id in prompt_node_ids:
+            resolved_prompt_node_ids.add(workflow_node_id)
+        if workflow_node_path in prompt_node_ids:
+            resolved_prompt_node_ids.add(workflow_node_path)
+        if not resolved_prompt_node_ids:
+            continue
+
+        workflow_path_to_prompt_node_ids[workflow_node_path] = resolved_prompt_node_ids
+        for prompt_node_id in resolved_prompt_node_ids:
+            prompt_node_id_to_workflow_paths[prompt_node_id].add(workflow_node_path)
+
+    for prompt_node_id in prompt_node_ids:
+        workflow_path_to_prompt_node_ids.setdefault(prompt_node_id, {prompt_node_id})
+        prompt_node_id_to_workflow_paths[prompt_node_id].add(prompt_node_id)
+
+    return workflow_path_to_prompt_node_ids, prompt_node_id_to_workflow_paths
+
+
+def _resolve_requested_prompt_node_ids(
+    requested_workflow_node_paths: set[str],
+    prompt_node_ids: set[str],
+    workflow_path_to_prompt_node_ids: dict[str, set[str]],
+) -> set[str]:
+    """Resolve requested workflow-node paths to the prompt ids that queue-time rewrite sees."""
+    requested_prompt_node_ids: set[str] = set()
+    for requested_workflow_node_path in requested_workflow_node_paths:
+        if requested_workflow_node_path in workflow_path_to_prompt_node_ids:
+            requested_prompt_node_ids.update(
+                workflow_path_to_prompt_node_ids[requested_workflow_node_path]
+            )
+            continue
+        if requested_workflow_node_path in prompt_node_ids:
+            requested_prompt_node_ids.add(requested_workflow_node_path)
+    return requested_prompt_node_ids
+
+
+def _best_workflow_path_for_prompt_node(
+    prompt_node_id: str,
+    prompt_node_id_to_workflow_paths: dict[str, set[str]],
+) -> str:
+    """Choose the most specific workflow path for one queued prompt node id."""
+    workflow_node_paths = prompt_node_id_to_workflow_paths.get(prompt_node_id, {prompt_node_id})
+    return max(
+        workflow_node_paths,
+        key=lambda workflow_node_path: (
+            workflow_node_path.count(":"),
+            len(workflow_node_path),
+            workflow_node_path,
+        ),
+    )
+
+
+def _resolve_workflow_node_paths_for_prompt_nodes(
+    prompt_node_ids: set[str],
+    prompt_node_id_to_workflow_paths: dict[str, set[str]],
+) -> set[str]:
+    """Map queued prompt ids back to the workflow node paths the UI can mark remote."""
+    return {
+        _best_workflow_path_for_prompt_node(prompt_node_id, prompt_node_id_to_workflow_paths)
+        for prompt_node_id in prompt_node_ids
+    }
+
+
 def extract_remote_node_ids(
     workflow: dict[str, Any] | None,
     settings: ModalSyncSettings | None = None,
@@ -404,10 +543,11 @@ def _expand_remote_node_ids_for_non_transportable_inputs(
     prompt: dict[str, Any],
     remote_node_ids: set[str],
     nodes_module: Any,
-) -> set[str]:
+) -> tuple[set[str], list[RemoteExpansionReason]]:
     """Grow the remote set upstream until non-transportable inputs stay inside the remote island."""
     expanded_remote_node_ids = set(remote_node_ids)
-    added_node_ids: list[str] = []
+    added_node_ids: set[str] = set()
+    reasons: list[RemoteExpansionReason] = []
 
     changed = True
     while changed:
@@ -442,14 +582,23 @@ def _expand_remote_node_ids_for_non_transportable_inputs(
                     continue
 
                 expanded_remote_node_ids.add(upstream_node_id)
-                added_node_ids.append(upstream_node_id)
+                reason = RemoteExpansionReason(
+                    node_id=upstream_node_id,
+                    class_type=upstream_class_type,
+                    required_by_node_id=node_id,
+                    required_by_class_type=str(prompt_node["class_type"]),
+                    output_index=output_index,
+                    io_type=io_type,
+                )
+                reasons.append(reason)
+                added_node_ids.add(upstream_node_id)
                 changed = True
                 logger.info(
                     "Auto-expanded remote execution upstream: added node %s (%s) because node %s depends on non-transportable type '%s'.",
-                    upstream_node_id,
-                    upstream_class_type,
-                    node_id,
-                    io_type,
+                    reason.node_id,
+                    reason.class_type,
+                    reason.required_by_node_id,
+                    reason.io_type,
                 )
                 break
             if changed:
@@ -460,9 +609,71 @@ def _expand_remote_node_ids_for_non_transportable_inputs(
             "Expanded remote node set from %d to %d nodes by absorbing upstream non-transportable dependencies: %s",
             len(remote_node_ids),
             len(expanded_remote_node_ids),
-            sorted(set(added_node_ids)),
+            sorted(added_node_ids),
         )
-    return expanded_remote_node_ids
+    return expanded_remote_node_ids, reasons
+
+
+def analyze_remote_node_selection(
+    prompt: dict[str, Any],
+    workflow: dict[str, Any] | None,
+    seed_workflow_node_paths: list[str],
+    settings: ModalSyncSettings | None = None,
+    nodes_module: Any | None = None,
+) -> RemoteNodeAnalysis:
+    """Return the nodes the UI should mark remote for one context-menu expansion request."""
+    resolved_settings = settings or get_settings()
+    resolved_nodes_module = nodes_module or _get_nodes_module()
+    prompt_node_ids = {str(node_id) for node_id in prompt.keys()}
+    requested_workflow_node_paths = {
+        str(seed_workflow_node_path)
+        for seed_workflow_node_path in seed_workflow_node_paths
+        if str(seed_workflow_node_path)
+    }
+    current_remote_node_ids = extract_remote_node_ids(
+        workflow,
+        resolved_settings,
+        prompt_node_ids,
+    )
+    current_remote_workflow_node_paths = _extract_marked_workflow_node_paths(
+        workflow,
+        resolved_settings,
+    )
+    workflow_path_to_prompt_node_ids, prompt_node_id_to_workflow_paths = (
+        _build_workflow_prompt_resolution_maps(workflow, prompt_node_ids)
+    )
+    requested_node_ids = _resolve_requested_prompt_node_ids(
+        requested_workflow_node_paths,
+        prompt_node_ids,
+        workflow_path_to_prompt_node_ids,
+    )
+    initial_remote_node_ids = current_remote_node_ids | requested_node_ids
+    resolved_remote_node_ids, reasons = _expand_remote_node_ids_for_non_transportable_inputs(
+        prompt=prompt,
+        remote_node_ids=initial_remote_node_ids,
+        nodes_module=resolved_nodes_module,
+    )
+    resolved_workflow_node_paths = (
+        _resolve_workflow_node_paths_for_prompt_nodes(
+            resolved_remote_node_ids,
+            prompt_node_id_to_workflow_paths,
+        )
+        | current_remote_workflow_node_paths
+    )
+    added_node_ids = resolved_remote_node_ids - current_remote_node_ids
+    added_workflow_node_paths = resolved_workflow_node_paths - current_remote_workflow_node_paths
+
+    return RemoteNodeAnalysis(
+        requested_node_ids=sorted(requested_node_ids),
+        requested_workflow_node_paths=sorted(requested_workflow_node_paths),
+        current_remote_node_ids=sorted(current_remote_node_ids),
+        current_remote_workflow_node_paths=sorted(current_remote_workflow_node_paths),
+        resolved_remote_node_ids=sorted(resolved_remote_node_ids),
+        resolved_workflow_node_paths=sorted(resolved_workflow_node_paths),
+        added_node_ids=sorted(added_node_ids),
+        added_workflow_node_paths=sorted(added_workflow_node_paths),
+        reasons=reasons,
+    )
 
 
 def _build_component_plan(
@@ -845,7 +1056,7 @@ def rewrite_prompt_for_modal(
     resolved_nodes_module = nodes_module or _get_nodes_module()
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     rewritten_prompt = copy.deepcopy(prompt)
-    expanded_remote_node_ids = _expand_remote_node_ids_for_non_transportable_inputs(
+    expanded_remote_node_ids, _ = _expand_remote_node_ids_for_non_transportable_inputs(
         prompt=rewritten_prompt,
         remote_node_ids=remote_node_ids,
         nodes_module=resolved_nodes_module,
@@ -960,6 +1171,13 @@ async def _queue_prompt_json(prompt_server: Any, json_data: dict[str, Any]) -> w
     )
 
 
+def _analysis_route_path(route_path: str) -> str:
+    """Return the sibling HTTP route used for dry-run remote-node expansion."""
+    if route_path.endswith("/queue_prompt"):
+        return f"{route_path.removesuffix('/queue_prompt')}/analyze_remote_nodes"
+    return f"{route_path.rstrip('/')}/analyze_remote_nodes"
+
+
 def setup_modal_queue_route(
     prompt_server: Any | None = None,
     sync_engine: ModalAssetSyncEngine | None = None,
@@ -983,6 +1201,64 @@ def setup_modal_queue_route(
         return
 
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
+    analysis_route_path = _analysis_route_path(resolved_settings.route_path)
+
+    @prompt_server.routes.post(analysis_route_path)
+    async def modal_analyze_remote_nodes(request: web.Request) -> web.Response:
+        """Analyze which workflow nodes should be marked remote for the current graph."""
+        logger.info("Received Modal remote-node analysis request.")
+        try:
+            request_started_at = time.perf_counter()
+            json_data = await request.json()
+            prompt = json_data.get("prompt")
+            if not isinstance(prompt, dict):
+                raise ValueError("Modal remote-node analysis requires a 'prompt' object.")
+
+            workflow = json_data.get("workflow")
+            seed_node_ids = json_data.get("seed_node_ids") or []
+            if not isinstance(seed_node_ids, list):
+                raise ValueError("Modal remote-node analysis requires 'seed_node_ids' to be a list.")
+
+            analysis = analyze_remote_node_selection(
+                prompt=prompt,
+                workflow=workflow if isinstance(workflow, dict) else None,
+                seed_workflow_node_paths=[str(seed_node_id) for seed_node_id in seed_node_ids],
+                settings=resolved_settings,
+            )
+            logger.info(
+                "Modal remote-node analysis finished in %.3fs with %d requested nodes and %d additions.",
+                time.perf_counter() - request_started_at,
+                len(analysis.requested_workflow_node_paths),
+                len(analysis.added_workflow_node_paths),
+            )
+            return web.json_response(
+                {
+                    "requested_node_ids": analysis.requested_node_ids,
+                    "requested_workflow_node_paths": analysis.requested_workflow_node_paths,
+                    "current_remote_node_ids": analysis.current_remote_node_ids,
+                    "current_remote_workflow_node_paths": (
+                        analysis.current_remote_workflow_node_paths
+                    ),
+                    "resolved_remote_node_ids": analysis.resolved_remote_node_ids,
+                    "resolved_workflow_node_paths": analysis.resolved_workflow_node_paths,
+                    "added_node_ids": analysis.added_node_ids,
+                    "added_workflow_node_paths": analysis.added_workflow_node_paths,
+                    "reasons": [
+                        {
+                            "node_id": reason.node_id,
+                            "class_type": reason.class_type,
+                            "required_by_node_id": reason.required_by_node_id,
+                            "required_by_class_type": reason.required_by_class_type,
+                            "output_index": reason.output_index,
+                            "io_type": reason.io_type,
+                        }
+                        for reason in analysis.reasons
+                    ],
+                }
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning("Modal remote-node analysis request was invalid: %s", exc)
+            return web.json_response({"error": str(exc), "node_errors": []}, status=400)
 
     @prompt_server.routes.post(resolved_settings.route_path)
     async def modal_queue_prompt(request: web.Request) -> web.Response:
@@ -1095,4 +1371,8 @@ def setup_modal_queue_route(
             return web.json_response({"error": str(exc), "node_errors": []}, status=500)
 
     _ROUTE_REGISTERED = True
-    logger.info("Registered Modal queue route at %s", resolved_settings.route_path)
+    logger.info(
+        "Registered Modal queue route at %s and analysis route at %s",
+        resolved_settings.route_path,
+        analysis_route_path,
+    )
