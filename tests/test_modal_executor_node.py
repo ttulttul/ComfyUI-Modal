@@ -266,6 +266,15 @@ def test_modal_cloud_streams_progress_and_result_events(
                     "active_node_role": "model_load",
                 }
             )
+            status_callback(
+                {
+                    "event_type": "node_progress",
+                    "node_id": "7",
+                    "display_node_id": "7",
+                    "value": 3,
+                    "max": 10,
+                }
+            )
             status_callback({"phase": "execution_success"})
         progress_callbacks.append({"component_id": payload["component_id"], "kwargs": kwargs_payload})
         return b"serialized-outputs"
@@ -287,6 +296,14 @@ def test_modal_cloud_streams_progress_and_result_events(
             "active_node_id": "7",
             "active_node_class_type": "UNETLoader",
             "active_node_role": "model_load",
+        },
+        {
+            "kind": "progress",
+            "event_type": "node_progress",
+            "node_id": "7",
+            "display_node_id": "7",
+            "value": 3,
+            "max": 10,
         },
         {
             "kind": "progress",
@@ -750,6 +767,14 @@ def test_remote_modal_consumes_streamed_progress_and_result(
                 },
                 {
                     "kind": "progress",
+                    "event_type": "node_progress",
+                    "node_id": "7",
+                    "display_node_id": "7",
+                    "value": 4,
+                    "max": 20,
+                },
+                {
+                    "kind": "progress",
                     "phase": "execution_success",
                 },
                 {
@@ -775,6 +800,17 @@ def test_remote_modal_consumes_streamed_progress_and_result(
             "client-1",
         ),
         (
+            "modal_progress",
+            {
+                "prompt_id": "prompt-1",
+                "node_id": "7",
+                "display_node_id": "7",
+                "value": 4.0,
+                "max": 20.0,
+            },
+            "client-1",
+        ),
+        (
             "modal_status",
             {
                 "phase": "execution_success",
@@ -784,6 +820,46 @@ def test_remote_modal_consumes_streamed_progress_and_result(
             "client-1",
         ),
     ]
+
+
+def test_modal_cloud_tracing_prompt_server_emits_numeric_node_progress(
+    modal_cloud_module: Any,
+) -> None:
+    """The cloud tracing prompt server should forward active-node numeric progress updates."""
+    observed_updates: list[dict[str, Any]] = []
+    server = modal_cloud_module._TracingPromptServer(
+        "component-1",
+        {"7": {"class_type": "KSampler", "inputs": {}}},
+        status_callback=observed_updates.append,
+    )
+
+    server.send_sync("executing", {"node": "7"}, None)
+    server.send_sync(
+        "progress_state",
+        {
+            "prompt_id": "component-1",
+            "nodes": {
+                "7": {
+                    "node_id": "7",
+                    "display_node_id": "7",
+                    "real_node_id": "7",
+                    "state": "running",
+                    "value": 5,
+                    "max": 20,
+                }
+            },
+        },
+        None,
+    )
+
+    assert observed_updates[0]["phase"] == "executing"
+    assert observed_updates[1] == {
+        "event_type": "node_progress",
+        "node_id": "7",
+        "display_node_id": "7",
+        "value": 5.0,
+        "max": 20.0,
+    }
 
 
 def test_remote_modal_consumes_streamed_tensor_result_payload(
