@@ -626,6 +626,52 @@ def _emit_local_preview_image(
     )
 
 
+def _emit_local_preview_boundary_output(
+    *,
+    prompt_id: str | None,
+    client_id: str | None,
+    preview_target_node_ids: list[str],
+    image_value: Any,
+) -> None:
+    """Render one streamed remote boundary IMAGE value into local PreviewImage UI events."""
+    if client_id is None or not preview_target_node_ids:
+        return
+
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+
+    try:
+        import nodes
+    except ModuleNotFoundError:
+        logger.warning("Preview boundary streaming is unavailable because ComfyUI nodes could not be imported.")
+        return
+
+    preview_factory = getattr(nodes, "PreviewImage", None)
+    if preview_factory is None:
+        logger.warning("Preview boundary streaming is unavailable because PreviewImage is not registered.")
+        return
+
+    preview_result = preview_factory().save_images(images=image_value)
+    if not isinstance(preview_result, dict):
+        return
+    output_payload = preview_result.get("ui")
+    if not isinstance(output_payload, dict):
+        return
+
+    for preview_target_node_id in preview_target_node_ids:
+        prompt_server.send_sync(
+            "executed",
+            {
+                "prompt_id": prompt_id,
+                "node": preview_target_node_id,
+                "display_node": preview_target_node_id,
+                "output": output_payload,
+            },
+            client_id,
+        )
+
+
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
@@ -821,6 +867,26 @@ def _consume_remote_payload_stream(
                             if stream_event.get("max_size") is not None
                             else None
                         ),
+                    )
+                continue
+            if event_type == "boundary_output":
+                preview_target_node_ids = [
+                    str(node_id)
+                    for node_id in stream_event.get("preview_target_node_ids", [])
+                    if str(node_id)
+                ]
+                if preview_target_node_ids:
+                    logger.debug(
+                        "Forwarding streamed Modal boundary output previews for component=%s source_node=%s targets=%s.",
+                        payload.get("component_id"),
+                        stream_event.get("node_id"),
+                        preview_target_node_ids,
+                    )
+                    _emit_local_preview_boundary_output(
+                        prompt_id=prompt_id,
+                        client_id=client_id,
+                        preview_target_node_ids=preview_target_node_ids,
+                        image_value=deserialize_value(stream_event.get("value")),
                     )
                 continue
             logger.info(

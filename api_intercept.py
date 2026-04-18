@@ -68,6 +68,7 @@ class BoundaryOutputSpec:
     source: LinkedOutputRef
     io_type: str
     is_list: bool
+    preview_target_node_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -732,6 +733,10 @@ def _build_component_plan(
                 source=source,
                 io_type=str(io_type),
                 is_list=bool(output_is_list[output_index]),
+                preview_target_node_ids=_preview_target_node_ids(
+                    prompt=prompt,
+                    local_consumers=local_consumers,
+                ),
             )
 
     component = RemoteComponentPlan(
@@ -758,6 +763,23 @@ def _build_component_plan(
         component.contains_output_node,
     )
     return component
+
+
+def _preview_target_node_ids(
+    *,
+    prompt: dict[str, Any],
+    local_consumers: list[InputTarget],
+) -> list[str]:
+    """Return direct local PreviewImage consumers for one remote boundary output."""
+    preview_target_node_ids: set[str] = set()
+    for local_consumer in local_consumers:
+        consumer_prompt_node = prompt.get(local_consumer.node_id)
+        if consumer_prompt_node is None:
+            continue
+        if str(consumer_prompt_node.get("class_type")) != "PreviewImage":
+            continue
+        preview_target_node_ids.add(str(local_consumer.node_id))
+    return sorted(preview_target_node_ids)
 
 
 def _build_component_plans(
@@ -950,6 +972,7 @@ def _build_component_payload(
                 "output_index": boundary_output.source.output_index,
                 "io_type": boundary_output.io_type,
                 "is_list": boundary_output.is_list,
+                "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
             }
             for boundary_output in component.boundary_outputs
         ],
