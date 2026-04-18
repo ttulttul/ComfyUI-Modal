@@ -1428,6 +1428,64 @@ def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
     assert observed_cancellation_events[0].is_set()
 
 
+def test_remote_modal_interrupt_callback_writes_shared_control_flag(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local interrupt callback should write to the shared Modal Dict control store."""
+
+    class FakeInterruptStore:
+        """Simple Modal Dict double that records written interruption flags."""
+
+        def __init__(self) -> None:
+            """Initialize captured writes."""
+            self.put_calls: list[tuple[str, Any]] = []
+
+        def put(self, key: str, value: Any, *, skip_if_exists: bool = False) -> bool:
+            """Record one interrupt flag write."""
+            self.put_calls.append((key, value))
+            return True
+
+    interrupt_store = FakeInterruptStore()
+
+    class FakeModalDict:
+        """Minimal modal.Dict shim that returns the fake interrupt store."""
+
+        @staticmethod
+        def from_name(
+            name: str,
+            *,
+            environment_name: str | None = None,
+            create_if_missing: bool = False,
+            client: Any | None = None,
+        ) -> FakeInterruptStore:
+            return interrupt_store
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "modal",
+        types.SimpleNamespace(Dict=FakeModalDict),
+    )
+    monkeypatch.setenv("COMFY_MODAL_INTERRUPT_DICT_NAME", "shared-interrupts")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+    try:
+        callback = remote_modal_app_module._build_remote_interrupt_callback(
+            object(),
+            {"prompt_id": "prompt-1", "component_id": "component-2"},
+        )
+        assert callback is not None
+        callback()
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+
+    assert len(interrupt_store.put_calls) == 1
+    interrupt_key, interrupt_value = interrupt_store.put_calls[0]
+    assert interrupt_key == "prompt-1:component-2"
+    assert isinstance(interrupt_value["requested_at"], float)
+
+
 def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -1516,6 +1574,8 @@ def test_modal_cloud_class_options_do_not_use_deprecated_concurrency_flag(
         remote_storage_root="/vol/data",
         scaledown_window_seconds=60,
         min_containers=0,
+        max_containers=4,
+        buffer_containers=1,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
     )
@@ -1527,8 +1587,91 @@ def test_modal_cloud_class_options_do_not_use_deprecated_concurrency_flag(
     )
 
     assert "allow_concurrent_inputs" not in options
+    assert options["max_containers"] == 4
+    assert options["buffer_containers"] == 1
     module_source = Path(modal_cloud_module.__file__).read_text(encoding="utf-8")
-    assert "@modal.concurrent(max_inputs=2)" in module_source
+    assert "@modal.concurrent(max_inputs=1)" in module_source
+
+
+def test_modal_cloud_registered_execution_clears_shared_interrupt_flags(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote execution registration should clear stale shared interrupt flags on entry and exit."""
+
+    class FakeInterruptFlags:
+        """Simple Modal Dict double that records cleared keys."""
+
+        def __init__(self) -> None:
+            """Initialize captured pop calls."""
+            self.pop_calls: list[tuple[str, Any]] = []
+
+        def pop(self, key: str, default: Any = None) -> Any:
+            """Record one cleared interrupt flag."""
+            self.pop_calls.append((key, default))
+            return None
+
+    interrupt_flags = FakeInterruptFlags()
+    monkeypatch.setattr(modal_cloud_module, "modal", object())
+    monkeypatch.setattr(modal_cloud_module, "interrupt_flags", interrupt_flags, raising=False)
+
+    with modal_cloud_module._registered_remote_execution(
+        {"prompt_id": "prompt-1", "component_id": "component-2"}
+    ) as execution_control:
+        assert execution_control.interrupt_flag_key == "prompt-1:component-2"
+
+    assert interrupt_flags.pop_calls == [
+        ("prompt-1:component-2", None),
+        ("prompt-1:component-2", None),
+    ]
+
+
+def test_modal_cloud_interrupt_monitor_consumes_shared_cancel_flag(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The remote interrupt monitor should trip when the shared Modal Dict flag appears."""
+
+    class FakeInterruptFlags:
+        """Simple Modal Dict double that exposes one shared cancel flag."""
+
+        def __init__(self) -> None:
+            """Initialize the backing key set."""
+            self.keys = {"prompt-1:component-2"}
+            self.contains_calls = 0
+            self.pop_calls: list[tuple[str, Any]] = []
+
+        def contains(self, key: str) -> bool:
+            """Report whether the shared interrupt flag exists."""
+            self.contains_calls += 1
+            return key in self.keys
+
+        def pop(self, key: str, default: Any = None) -> Any:
+            """Remove the shared interrupt flag once consumed."""
+            self.pop_calls.append((key, default))
+            self.keys.discard(key)
+            return None
+
+    interrupt_calls: list[str] = []
+    cancellation_event = threading.Event()
+    monkeypatch.setitem(
+        sys.modules,
+        "nodes",
+        types.SimpleNamespace(interrupt_processing=lambda: interrupt_calls.append("interrupt")),
+    )
+
+    with modal_cloud_module._temporary_remote_interrupt_monitor(
+        "component-2",
+        cancellation_event,
+        interrupt_store=FakeInterruptFlags(),
+        interrupt_flag_key="prompt-1:component-2",
+    ):
+        deadline = time.time() + 1.0
+        while not interrupt_calls and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert interrupt_calls == ["interrupt"]
+    assert cancellation_event.is_set()
 
 
 def test_modal_cloud_reuses_prompt_executor_for_same_cache_scope(

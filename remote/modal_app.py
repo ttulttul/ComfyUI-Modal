@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOYED_APPS: set[tuple[str, str | None]] = set()
+_MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
+_MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
 
 
 def _remote_modal_call_worker_count() -> int:
@@ -718,6 +720,52 @@ def _remote_interrupt_key(payload: dict[str, Any]) -> tuple[str, str]:
     return prompt_id, component_id
 
 
+def _remote_interrupt_flag_key(prompt_id: str, component_id: str) -> str:
+    """Return the shared Modal interrupt-store key for one payload execution."""
+    return f"{prompt_id}:{component_id}"
+
+
+def _lookup_modal_interrupt_store() -> Any | None:
+    """Return the shared Modal Dict used to signal remote cancellation requests."""
+    if modal is None or not hasattr(modal, "Dict"):
+        return None
+
+    settings = get_settings()
+    cache_key = (settings.interrupt_dict_name, _modal_environment_name())
+    with _MODAL_INTERRUPT_DICTS_LOCK:
+        cached_store = _MODAL_INTERRUPT_DICTS.get(cache_key)
+        if cached_store is not None:
+            return cached_store
+
+    interrupt_store = modal.Dict.from_name(
+        settings.interrupt_dict_name,
+        environment_name=cache_key[1],
+        create_if_missing=True,
+    )
+    with _MODAL_INTERRUPT_DICTS_LOCK:
+        _MODAL_INTERRUPT_DICTS[cache_key] = interrupt_store
+    return interrupt_store
+
+
+def _request_remote_interrupt(payload: dict[str, Any]) -> bool:
+    """Write one remote cancellation request into the shared Modal interrupt store."""
+    interrupt_store = _lookup_modal_interrupt_store()
+    if interrupt_store is None:
+        return False
+
+    prompt_id, component_id = _remote_interrupt_key(payload)
+    interrupt_store.put(
+        _remote_interrupt_flag_key(prompt_id, component_id),
+        {"requested_at": time.time()},
+    )
+    logger.info(
+        "Propagated local interrupt to Modal prompt=%s component=%s through shared control state.",
+        prompt_id,
+        component_id,
+    )
+    return True
+
+
 def _invoke_remote_call_with_interrupts(
     *,
     payload: dict[str, Any],
@@ -1024,14 +1072,12 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
         )
 
 
-def _build_remote_interrupt_callback(remote_engine: Any, payload: dict[str, Any]) -> Callable[[], Any] | None:
-    """Return a callable that interrupts one active Modal payload when supported."""
-    interrupt_method = getattr(remote_engine, "interrupt_payload", None)
-    if interrupt_method is None or not hasattr(interrupt_method, "remote"):
+def _build_remote_interrupt_callback(_remote_engine: Any, payload: dict[str, Any]) -> Callable[[], Any] | None:
+    """Return a callable that requests interruption for one active Modal payload."""
+    interrupt_store = _lookup_modal_interrupt_store()
+    if interrupt_store is None:
         return None
-
-    prompt_id, component_id = _remote_interrupt_key(payload)
-    return lambda: interrupt_method.remote(prompt_id, component_id)
+    return lambda: _request_remote_interrupt(payload)
 
 
 def _invoke_remote_engine_payload(

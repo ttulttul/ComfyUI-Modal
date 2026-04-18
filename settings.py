@@ -30,9 +30,12 @@ class ModalSyncSettings:
     custom_nodes_archive_name: str
     comfyui_root: Path | None
     custom_nodes_dir: Path | None
+    interrupt_dict_name: str = "comfy-modal-sync-interrupts"
     modal_gpu: str = "A100"
     scaledown_window_seconds: int = 600
     min_containers: int = 0
+    max_containers: int | None = None
+    buffer_containers: int | None = None
 
 
 def _read_path_env(name: str) -> Path | None:
@@ -67,6 +70,17 @@ def _read_int_env(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
         return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got {value!r}.") from exc
+
+
+def _read_optional_int_env(name: str) -> int | None:
+    """Resolve an environment variable into an optional integer when present."""
+    value = os.getenv(name)
+    if value is None:
+        return None
     try:
         return int(value)
     except ValueError as exc:
@@ -133,7 +147,7 @@ def get_settings() -> ModalSyncSettings:
     )
 
     settings = ModalSyncSettings(
-        app_name=os.getenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync"),
+        app_name=(app_name := os.getenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync")),
         auto_deploy=_read_bool_env("COMFY_MODAL_AUTO_DEPLOY") is not False,
         allow_ephemeral_fallback=_read_bool_env("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK") or False,
         enable_memory_snapshot=_read_bool_env("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT") is not False,
@@ -151,9 +165,15 @@ def get_settings() -> ModalSyncSettings:
         ),
         comfyui_root=comfyui_root,
         custom_nodes_dir=custom_nodes_dir,
+        interrupt_dict_name=os.getenv(
+            "COMFY_MODAL_INTERRUPT_DICT_NAME",
+            f"{app_name}-interrupts",
+        ),
         modal_gpu=os.getenv("COMFY_MODAL_GPU", "A100").strip() or "A100",
         scaledown_window_seconds=_read_int_env("COMFY_MODAL_SCALEDOWN_WINDOW", 600),
         min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),
+        max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),
+        buffer_containers=_read_optional_int_env("COMFY_MODAL_BUFFER_CONTAINERS"),
     )
     logger.debug("Resolved Modal-Sync settings: %s", settings)
     return settings

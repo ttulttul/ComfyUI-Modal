@@ -98,8 +98,10 @@ Remote runtime behavior:
 - GPU memory snapshots remain opt-in.
 - The default `scaledown_window` is `600` seconds with `min_containers=0`.
 - Warm containers can reuse loader state and `PromptExecutor` state across compatible requests.
+- Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.
 - Remote proxy nodes now execute through ComfyUI's async node path, so independent Modal-backed components can overlap instead of being forced through one blocking local proxy at a time.
 - The local Modal call executor keeps multiple worker threads available, which removes the previous `max_workers=1` bottleneck when several remote components are ready at once.
+- Remote cancellation now uses a shared Modal `Dict` control store instead of a second RPC lane into the execution class, so per-container execution concurrency can stay at `1` without losing interrupt propagation.
 - If a run is cancelled and restarted quickly, the remote worker now gives Modal volume reload a short bounded retry window so recently released model files can close before the next request needs a fresh `vol.reload()`.
 
 If you change `COMFY_MODAL_GPU`, redeploy the Modal app or delete it and let auto-deploy recreate it. Modal hardware is fixed at deploy time.
@@ -216,6 +218,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 
 - `COMFY_MODAL_EXECUTION_MODE`: Set to `local` for in-process fallback execution. Default: `local`.
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
+- `COMFY_MODAL_INTERRUPT_DICT_NAME`: Override the shared Modal `Dict` used for remote cancellation flags. Default: `<app_name>-interrupts`.
 - `COMFY_MODAL_AUTO_DEPLOY`: Automatically deploy the Modal app on first remote invocation when lookup fails. Default: `true`.
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
 
@@ -226,6 +229,8 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_GPU`: Modal GPU type to request when deploying the remote class. Default: `A100`.
 - `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle containers warm for this many seconds. Default: `600`.
 - `COMFY_MODAL_MIN_CONTAINERS`: Keep at least this many containers warm. Default: `0`.
+- `COMFY_MODAL_MAX_CONTAINERS`: Optional upper bound on simultaneously scaled Modal containers.
+- `COMFY_MODAL_BUFFER_CONTAINERS`: Optional number of spare warm containers Modal should try to keep ready above current load.
 
 ## Development
 

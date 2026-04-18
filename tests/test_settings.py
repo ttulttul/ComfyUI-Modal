@@ -57,3 +57,52 @@ def test_settings_reads_modal_gpu_override(
         settings_module.get_settings.cache_clear()
 
     assert settings.modal_gpu == "L40S"
+
+
+def test_settings_reads_modal_container_scaling_overrides(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Modal autoscaling knobs should be configurable via environment variables."""
+    monkeypatch.setenv("COMFY_MODAL_MIN_CONTAINERS", "1")
+    monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "6")
+    monkeypatch.setenv("COMFY_MODAL_BUFFER_CONTAINERS", "2")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.min_containers == 1
+    assert settings.max_containers == 6
+    assert settings.buffer_containers == 2
+
+
+def test_settings_defaults_interrupt_dict_name_from_app_name(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The shared interrupt dict name should default to one derived from the app name."""
+    monkeypatch.setenv("COMFY_MODAL_APP_NAME", "my-modal-app")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.interrupt_dict_name == "my-modal-app-interrupts"
+
+
+def test_settings_reads_interrupt_dict_name_override(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The shared interrupt dict name should be overridable explicitly."""
+    monkeypatch.setenv("COMFY_MODAL_INTERRUPT_DICT_NAME", "custom-interrupt-store")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.interrupt_dict_name == "custom-interrupt-store"
