@@ -100,6 +100,7 @@ Remote runtime behavior:
 - Warm containers can reuse loader state and `PromptExecutor` state across compatible requests.
 - Remote proxy nodes now execute through ComfyUI's async node path, so independent Modal-backed components can overlap instead of being forced through one blocking local proxy at a time.
 - The local Modal call executor keeps multiple worker threads available, which removes the previous `max_workers=1` bottleneck when several remote components are ready at once.
+- If a run is cancelled and restarted quickly, the remote worker now gives Modal volume reload a short bounded retry window so recently released model files can close before the next request needs a fresh `vol.reload()`.
 
 If you change `COMFY_MODAL_GPU`, redeploy the Modal app or delete it and let auto-deploy recreate it. Modal hardware is fixed at deploy time.
 

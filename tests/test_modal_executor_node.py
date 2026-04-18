@@ -434,33 +434,86 @@ def test_modal_cloud_retries_volume_reload_after_clearing_warm_state(
     modal_cloud_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Modal volume reload should retry once after unloading warm caches when open files block it."""
+    """Modal volume reload should retry after unloading warm caches when open files block it."""
 
     class FakeVolume:
-        """Simple Modal volume double that fails once before succeeding."""
+        """Simple Modal volume double that fails twice before succeeding."""
 
         def __init__(self) -> None:
             """Initialize the reload attempt counter."""
             self.reload_calls = 0
 
         def reload(self) -> None:
-            """Raise on the first call and succeed on the second."""
+            """Raise on the first two calls and succeed on the third."""
             self.reload_calls += 1
-            if self.reload_calls == 1:
+            if self.reload_calls < 3:
                 raise RuntimeError("there are open files preventing the operation")
 
     prepare_calls: list[str] = []
+    sleep_calls: list[float] = []
     monkeypatch.setattr(
         modal_cloud_module,
         "_prepare_for_modal_volume_reload",
         lambda: prepare_calls.append("prepared"),
     )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_sleep_before_modal_volume_reload_retry",
+        lambda delay_seconds: sleep_calls.append(delay_seconds),
+    )
 
     volume = FakeVolume()
     modal_cloud_module._reload_modal_volume_for_request(volume, "component-1")
 
-    assert volume.reload_calls == 2
-    assert prepare_calls == ["prepared"]
+    assert volume.reload_calls == 3
+    assert prepare_calls == ["prepared", "prepared"]
+    assert sleep_calls == [0.1, 0.25]
+
+
+def test_modal_cloud_raises_after_exhausting_open_file_reload_retries(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Modal volume reload should surface persistent open-file errors after bounded retries."""
+
+    class FakeVolume:
+        """Simple Modal volume double that always fails with open files."""
+
+        def __init__(self) -> None:
+            """Initialize the reload attempt counter."""
+            self.reload_calls = 0
+
+        def reload(self) -> None:
+            """Always fail with the same open-file reload error."""
+            self.reload_calls += 1
+            raise RuntimeError("there are open files preventing the operation")
+
+    prepare_calls: list[str] = []
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_prepare_for_modal_volume_reload",
+        lambda: prepare_calls.append("prepared"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_sleep_before_modal_volume_reload_retry",
+        lambda delay_seconds: sleep_calls.append(delay_seconds),
+    )
+
+    volume = FakeVolume()
+    with pytest.raises(RuntimeError, match="open files"):
+        modal_cloud_module._reload_modal_volume_for_request(volume, "component-1")
+
+    assert volume.reload_calls == len(
+        modal_cloud_module._MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS
+    )
+    assert prepare_calls == ["prepared"] * (
+        len(modal_cloud_module._MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS) - 1
+    )
+    assert sleep_calls == list(
+        modal_cloud_module._MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS[1:]
+    )
 
 
 def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
