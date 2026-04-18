@@ -195,6 +195,8 @@ The extension also now renders its own global activity badge in the ComfyUI UI d
 
 For headless remote execution, the worker also installs a minimal `PromptServer.instance` shim before it imports external custom nodes. That keeps route-registering custom node packs from crashing at import time just because the remote worker is not running ComfyUI's full HTTP server.
 
+If a request really uploads fresh assets and therefore needs a Modal volume reload, the remote worker now retries that reload after dropping its warm loader and executor caches and unloading ComfyUI model state. That avoids Modal's "open files preventing the operation" failure when a warm container is still holding model files from the previous request.
+
 ### 6. What happens during execution
 
 When execution reaches a rewritten component proxy:
