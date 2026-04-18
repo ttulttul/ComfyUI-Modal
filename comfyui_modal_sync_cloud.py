@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import gc
 import hashlib
 import importlib.util
 import json
@@ -1086,6 +1087,46 @@ def _should_reload_modal_volume(payload: dict[str, Any]) -> bool:
     return bool(payload.get("requires_volume_reload", True))
 
 
+def _clear_warm_remote_caches() -> None:
+    """Drop warm-container caches that may retain references to mounted volume files."""
+    with _PROMPT_EXECUTOR_STATES_LOCK:
+        _PROMPT_EXECUTOR_STATES.clear()
+    with _LOADER_CACHE_LOCK:
+        _LOADER_OUTPUT_CACHE.clear()
+
+
+def _prepare_for_modal_volume_reload() -> None:
+    """Release warm runtime state so a Modal volume reload can proceed safely."""
+    _clear_warm_remote_caches()
+    try:
+        import comfy.model_management as model_management
+    except ModuleNotFoundError:
+        gc.collect()
+        return
+
+    model_management.unload_all_models()
+    model_management.cleanup_models()
+    model_management.soft_empty_cache(True)
+    gc.collect()
+
+
+def _reload_modal_volume_for_request(volume: Any, component_id: str) -> None:
+    """Reload the Modal volume, retrying once after unloading warm model state if needed."""
+    with _timed_phase("modal_volume_reload", component=component_id):
+        try:
+            volume.reload()
+            return
+        except RuntimeError as exc:
+            if "open files" not in str(exc):
+                raise
+            _emit_cloud_info(
+                "Modal volume reload hit open files for component=%s; clearing warm caches and retrying once.",
+                component_id,
+            )
+            _prepare_for_modal_volume_reload()
+            volume.reload()
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     app = modal.App(settings.app_name)
@@ -1144,8 +1185,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 payload_kind=payload.get("payload_kind"),
             ):
                 if _should_reload_modal_volume(payload):
-                    with _timed_phase("modal_volume_reload", component=component_id):
-                        vol.reload()
+                    _reload_modal_volume_for_request(vol, str(component_id))
                 else:
                     _emit_cloud_info(
                         "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
@@ -1169,8 +1209,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 payload_kind=payload.get("payload_kind"),
             ):
                 if _should_reload_modal_volume(payload):
-                    with _timed_phase("modal_volume_reload", component=component_id):
-                        vol.reload()
+                    _reload_modal_volume_for_request(vol, str(component_id))
                 else:
                     _emit_cloud_info(
                         "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",

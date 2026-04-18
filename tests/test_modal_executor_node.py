@@ -307,6 +307,39 @@ def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
     assert modal_cloud_module._should_reload_modal_volume({}) is True
 
 
+def test_modal_cloud_retries_volume_reload_after_clearing_warm_state(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Modal volume reload should retry once after unloading warm caches when open files block it."""
+
+    class FakeVolume:
+        """Simple Modal volume double that fails once before succeeding."""
+
+        def __init__(self) -> None:
+            """Initialize the reload attempt counter."""
+            self.reload_calls = 0
+
+        def reload(self) -> None:
+            """Raise on the first call and succeed on the second."""
+            self.reload_calls += 1
+            if self.reload_calls == 1:
+                raise RuntimeError("there are open files preventing the operation")
+
+    prepare_calls: list[str] = []
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_prepare_for_modal_volume_reload",
+        lambda: prepare_calls.append("prepared"),
+    )
+
+    volume = FakeVolume()
+    modal_cloud_module._reload_modal_volume_for_request(volume, "component-1")
+
+    assert volume.reload_calls == 2
+    assert prepare_calls == ["prepared"]
+
+
 def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
     modal_cloud_module: Any,
     monkeypatch: Any,
