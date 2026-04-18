@@ -1207,10 +1207,10 @@ def test_modal_cloud_uses_comfy_prompt_executor_cache_defaults(
     assert cache_args == {"lru": 0, "ram": 4.0}
 
 
-def test_modal_cloud_allows_concurrent_inputs_for_interrupts(
+def test_modal_cloud_class_options_do_not_use_deprecated_concurrency_flag(
     modal_cloud_module: Any,
 ) -> None:
-    """The deployed Modal class should keep one spare input slot for interrupt RPCs."""
+    """The deployed Modal class options should avoid deprecated concurrency flags."""
     fake_settings = types.SimpleNamespace(
         modal_gpu="A100",
         remote_storage_root="/vol/data",
@@ -1226,7 +1226,9 @@ def test_modal_cloud_allows_concurrent_inputs_for_interrupts(
         image=object(),
     )
 
-    assert options["allow_concurrent_inputs"] == 2
+    assert "allow_concurrent_inputs" not in options
+    module_source = Path(modal_cloud_module.__file__).read_text(encoding="utf-8")
+    assert "@modal.concurrent(max_inputs=2)" in module_source
 
 
 def test_modal_cloud_reuses_prompt_executor_for_same_cache_scope(
