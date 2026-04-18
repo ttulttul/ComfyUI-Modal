@@ -252,6 +252,43 @@ def _iter_workflow_nodes_with_ancestors(
             )
 
 
+def _resolve_prompt_node_ids_for_workflow_node(
+    workflow_node_id: str,
+    ancestor_node_ids: tuple[str, ...],
+    prompt_node_ids: set[str],
+) -> set[str]:
+    """Resolve one saved workflow node id to matching queued prompt node ids."""
+    path_segments = ancestor_node_ids + (workflow_node_id,)
+    resolved_prompt_node_ids: set[str] = set()
+
+    for index in range(len(path_segments)):
+        candidate = ":".join(path_segments[index:])
+        if candidate in prompt_node_ids:
+            resolved_prompt_node_ids.add(candidate)
+        descendant_prefix = f"{candidate}:"
+        resolved_prompt_node_ids.update(
+            prompt_node_id
+            for prompt_node_id in prompt_node_ids
+            if prompt_node_id.startswith(descendant_prefix)
+        )
+
+    if resolved_prompt_node_ids:
+        return resolved_prompt_node_ids
+
+    for ancestor_node_id in reversed(ancestor_node_ids):
+        if ancestor_node_id in prompt_node_ids:
+            resolved_prompt_node_ids.add(ancestor_node_id)
+            descendant_prefix = f"{ancestor_node_id}:"
+            resolved_prompt_node_ids.update(
+                prompt_node_id
+                for prompt_node_id in prompt_node_ids
+                if prompt_node_id.startswith(descendant_prefix)
+            )
+            break
+
+    return resolved_prompt_node_ids
+
+
 def extract_remote_node_ids(
     workflow: dict[str, Any] | None,
     settings: ModalSyncSettings | None = None,
@@ -271,15 +308,19 @@ def extract_remote_node_ids(
                 remote_node_ids.add(node_id)
                 continue
 
-            for ancestor_node_id in reversed(ancestor_node_ids):
-                if ancestor_node_id in prompt_node_ids:
-                    remote_node_ids.add(ancestor_node_id)
-                    logger.info(
-                        "Mapped nested Modal marker from workflow node %s to prompt node %s.",
-                        node_id,
-                        ancestor_node_id,
-                    )
-                    break
+            resolved_prompt_node_ids = _resolve_prompt_node_ids_for_workflow_node(
+                node_id,
+                ancestor_node_ids,
+                prompt_node_ids,
+            )
+            if resolved_prompt_node_ids:
+                remote_node_ids.update(resolved_prompt_node_ids)
+                logger.info(
+                    "Mapped workflow Modal marker from node %s with ancestors %s to prompt nodes %s.",
+                    node_id,
+                    list(ancestor_node_ids),
+                    sorted(resolved_prompt_node_ids),
+                )
     return remote_node_ids
 
 
