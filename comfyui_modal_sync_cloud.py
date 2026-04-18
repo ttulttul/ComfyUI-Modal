@@ -7,6 +7,7 @@ import copy
 import gc
 import hashlib
 import importlib.util
+from io import BytesIO
 import json
 import inspect
 import logging
@@ -53,6 +54,7 @@ _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
+_ACTIVE_REMOTE_EXECUTIONS_LOCK = threading.Lock()
 
 try:
     import modal  # type: ignore
@@ -73,6 +75,16 @@ class _ReusablePromptExecutorState:
 
 
 _PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
+
+
+@dataclass
+class _RemoteExecutionControl:
+    """Track interruption state for one active remote payload execution."""
+
+    cancellation_event: threading.Event
+
+
+_ACTIVE_REMOTE_EXECUTIONS: dict[tuple[str, str], _RemoteExecutionControl] = {}
 
 
 class _NullPromptServer:
@@ -166,6 +178,59 @@ class _TracingPromptServer(_NullPromptServer):
         self._active_node_id = None
         self._active_node_started_at = None
 
+    def emit_preview_update(
+        self,
+        *,
+        node_id: str,
+        preview_image: Any,
+    ) -> None:
+        """Publish one preview image update through the status callback."""
+        if self._status_callback is None:
+            return
+
+        try:
+            image_type, image, max_size = preview_image
+            image_buffer = BytesIO()
+            save_kwargs: dict[str, Any] = {"format": image_type}
+            if image_type == "JPEG":
+                save_kwargs["quality"] = 95
+            elif image_type == "PNG":
+                save_kwargs["compress_level"] = 1
+            image.save(image_buffer, **save_kwargs)
+        except Exception:
+            logger.exception("Failed to serialize remote preview image for node %s.", node_id)
+            return
+
+        try:
+            from comfy_execution.progress import get_progress_state
+
+            registry = get_progress_state()
+            display_node_id = registry.dynprompt.get_display_node_id(node_id)
+            parent_node_id = registry.dynprompt.get_parent_node_id(node_id)
+            real_node_id = registry.dynprompt.get_real_node_id(node_id)
+        except Exception:
+            logger.exception("Failed to resolve preview metadata for remote node %s.", node_id)
+            display_node_id = node_id
+            parent_node_id = None
+            real_node_id = node_id
+
+        self._status_callback(
+            {
+                "event_type": "preview",
+                "node_id": str(node_id),
+                "display_node_id": (
+                    str(display_node_id) if display_node_id is not None else None
+                ),
+                "parent_node_id": (
+                    str(parent_node_id) if parent_node_id is not None else None
+                ),
+                "real_node_id": str(real_node_id) if real_node_id is not None else None,
+                "image_type": str(image_type),
+                "image_bytes": image_buffer.getvalue(),
+                "max_size": int(max_size) if max_size is not None else None,
+            }
+        )
+
     def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
         """Track per-node timing transitions from PromptExecutor progress events."""
         if event == "executing":
@@ -243,6 +308,19 @@ class _TracingPromptServer(_NullPromptServer):
             executed_node_id = data.get("node")
             if executed_node_id is not None and str(executed_node_id) == self._active_node_id:
                 self._log_node_finish(reason="executed")
+            if self._status_callback is not None and data.get("output") is not None:
+                self._status_callback(
+                    {
+                        "event_type": "executed",
+                        "node_id": str(data.get("node")),
+                        "display_node_id": (
+                            str(data["display_node"])
+                            if data.get("display_node") is not None
+                            else None
+                        ),
+                        "output": data.get("output"),
+                    }
+                )
             return
 
         if event in {"execution_error", "execution_interrupted", "execution_success"}:
@@ -309,6 +387,52 @@ def _emit_cloud_info(message: str, *args: Any) -> None:
         exc_info=None,
     )
     print(_cloud_formatter().format(record), file=sys.stdout, flush=True)
+
+
+def _remote_execution_key(payload: dict[str, Any]) -> tuple[str, str]:
+    """Return the registry key for one active remote execution."""
+    prompt_id = str(payload.get("prompt_id") or payload.get("component_id") or "modal-subgraph")
+    component_id = str(payload.get("component_id") or "single-node")
+    return prompt_id, component_id
+
+
+@contextmanager
+def _registered_remote_execution(
+    payload: dict[str, Any],
+) -> Iterator[_RemoteExecutionControl]:
+    """Register one active remote execution so callers can interrupt it."""
+    execution_key = _remote_execution_key(payload)
+    control = _RemoteExecutionControl(cancellation_event=threading.Event())
+    with _ACTIVE_REMOTE_EXECUTIONS_LOCK:
+        _ACTIVE_REMOTE_EXECUTIONS[execution_key] = control
+    try:
+        yield control
+    finally:
+        with _ACTIVE_REMOTE_EXECUTIONS_LOCK:
+            if _ACTIVE_REMOTE_EXECUTIONS.get(execution_key) is control:
+                _ACTIVE_REMOTE_EXECUTIONS.pop(execution_key, None)
+
+
+def _interrupt_registered_remote_execution(prompt_id: str, component_id: str) -> bool:
+    """Request interruption for one active remote execution."""
+    execution_key = (str(prompt_id), str(component_id))
+    with _ACTIVE_REMOTE_EXECUTIONS_LOCK:
+        control = _ACTIVE_REMOTE_EXECUTIONS.get(execution_key)
+    if control is None:
+        logger.info(
+            "Remote interrupt requested for prompt=%s component=%s, but no active execution was registered.",
+            prompt_id,
+            component_id,
+        )
+        return False
+
+    control.cancellation_event.set()
+    logger.info(
+        "Marked remote execution for interruption prompt=%s component=%s.",
+        prompt_id,
+        component_id,
+    )
+    return True
 
 
 @contextmanager
@@ -477,6 +601,7 @@ def _ensure_headless_prompt_server_instance() -> None:
 def _temporary_progress_hook(prompt_server: _NullPromptServer) -> Iterator[None]:
     """Install a ComfyUI progress hook so remote samplers emit numeric progress updates."""
     import comfy.utils
+    import comfy.model_management
     from comfy_execution.progress import get_progress_state
     from comfy_execution.utils import get_executing_context
 
@@ -495,6 +620,7 @@ def _temporary_progress_hook(prompt_server: _NullPromptServer) -> Iterator[None]
             prompt_id = executing_context.prompt_id
         if node_id is None and executing_context is not None:
             node_id = executing_context.node_id
+        comfy.model_management.throw_exception_if_processing_interrupted()
         if prompt_id is None:
             prompt_id = prompt_server.last_prompt_id
         if node_id is None:
@@ -502,13 +628,53 @@ def _temporary_progress_hook(prompt_server: _NullPromptServer) -> Iterator[None]
         if node_id is None:
             return
 
-        get_progress_state().update_progress(str(node_id), value, total, preview_image)
+        resolved_node_id = str(node_id)
+        get_progress_state().update_progress(resolved_node_id, value, total, preview_image)
+        preview_emitter = getattr(prompt_server, "emit_preview_update", None)
+        if preview_image is not None and callable(preview_emitter):
+            preview_emitter(node_id=resolved_node_id, preview_image=preview_image)
 
     comfy.utils.set_progress_bar_global_hook(hook)
     try:
         yield
     finally:
         comfy.utils.set_progress_bar_global_hook(previous_hook)
+
+
+@contextmanager
+def _temporary_remote_interrupt_monitor(
+    component_id: str,
+    cancellation_event: threading.Event | None,
+) -> Iterator[None]:
+    """Mirror local cancellation requests into ComfyUI's interrupt flag inside Modal."""
+    if cancellation_event is None:
+        yield
+        return
+
+    import nodes
+
+    stop_event = threading.Event()
+
+    def monitor_interrupts() -> None:
+        """Set ComfyUI's interrupt flag once the caller requests cancellation."""
+        while not stop_event.is_set():
+            if not cancellation_event.wait(timeout=0.1):
+                continue
+            logger.info("Remote interrupt monitor tripped for component=%s.", component_id)
+            nodes.interrupt_processing()
+            return
+
+    interrupt_thread = threading.Thread(
+        target=monitor_interrupts,
+        name=f"modal-interrupt-{component_id}",
+        daemon=True,
+    )
+    interrupt_thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        interrupt_thread.join(timeout=1.0)
 
 
 def _ensure_default_custom_nodes_dir() -> Path | None:
@@ -851,16 +1017,21 @@ def execute_node_locally(
     node_data: dict[str, Any],
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
     node_mapping: dict[str, type[Any]] | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> bytes:
     """Execute a single target node in-process and return serialized outputs."""
     custom_nodes_root = _extract_custom_nodes_bundle(node_data.get("custom_nodes_bundle"))
     _ensure_comfy_runtime_initialized(custom_nodes_root)
     kwargs = _rewrite_modal_asset_references(deserialize_node_inputs(kwargs_payload))
+    component_id = str(node_data.get("component_id") or node_data.get("class_type") or "single-node")
     if node_mapping is not None:
         class_type = node_data["class_type"]
         if class_type not in node_mapping:
             raise KeyError(f"Remote node class {class_type!r} is not registered.")
-        with _patched_folder_paths_absolute_lookup():
+        with (
+            _patched_folder_paths_absolute_lookup(),
+            _temporary_remote_interrupt_monitor(component_id, cancellation_event),
+        ):
             outputs = _invoke_original_node(node_mapping[class_type], node_data, kwargs)
             return serialize_node_outputs(outputs)
 
@@ -870,7 +1041,10 @@ def execute_node_locally(
         if class_type not in resolved_node_mapping:
             raise KeyError(f"Remote node class {class_type!r} is not registered.")
 
-        with _patched_folder_paths_absolute_lookup():
+        with (
+            _patched_folder_paths_absolute_lookup(),
+            _temporary_remote_interrupt_monitor(component_id, cancellation_event),
+        ):
             outputs = _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
     return serialize_node_outputs(outputs)
 
@@ -918,6 +1092,7 @@ def _execute_subgraph_prompt(
     hydrated_inputs: dict[str, Any],
     custom_nodes_root: Path | None,
     status_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
@@ -935,11 +1110,14 @@ def _execute_subgraph_prompt(
     with (
         _temporary_node_mapping(None),
         _patched_folder_paths_absolute_lookup(),
-        _temporary_progress_hook(prompt_server := _TracingPromptServer(
-            component_id,
-            prompt,
-            status_callback=status_callback,
-        )),
+        _temporary_remote_interrupt_monitor(component_id, cancellation_event),
+        _temporary_progress_hook(
+            prompt_server := _TracingPromptServer(
+                component_id,
+                prompt,
+                status_callback=status_callback,
+            )
+        ),
     ):
         with _timed_phase("create_prompt_executor", component=component_id):
             executor_state = _get_or_create_prompt_executor_state(
@@ -997,6 +1175,7 @@ def execute_subgraph_locally(
     payload: dict[str, Any],
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
     status_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> bytes:
     """Execute a rewritten remote component in-process and return serialized outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
@@ -1013,6 +1192,7 @@ def execute_subgraph_locally(
                     hydrated_inputs,
                     custom_nodes_root,
                     status_callback,
+                    cancellation_event,
                 )
                 outputs = future.result()
         with _timed_phase("serialize_boundary_outputs", component=component_id):
@@ -1022,6 +1202,7 @@ def execute_subgraph_locally(
 def _stream_remote_payload_events(
     payload: dict[str, Any],
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
+    cancellation_event: threading.Event | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield progress and result events for one remote payload execution."""
     event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -1034,13 +1215,19 @@ def _stream_remote_payload_events(
         """Run the payload in a worker thread and enqueue the terminal outcome."""
         try:
             if payload.get("payload_kind") == "subgraph":
+                execute_subgraph_kwargs: dict[str, Any] = {"status_callback": publish_status}
+                if "cancellation_event" in inspect.signature(execute_subgraph_locally).parameters:
+                    execute_subgraph_kwargs["cancellation_event"] = cancellation_event
                 outputs = execute_subgraph_locally(
                     payload,
                     kwargs_payload,
-                    status_callback=publish_status,
+                    **execute_subgraph_kwargs,
                 )
             else:
-                outputs = execute_node_locally(payload, kwargs_payload)
+                execute_node_kwargs: dict[str, Any] = {}
+                if "cancellation_event" in inspect.signature(execute_node_locally).parameters:
+                    execute_node_kwargs["cancellation_event"] = cancellation_event
+                outputs = execute_node_locally(payload, kwargs_payload, **execute_node_kwargs)
         except Exception as exc:  # pragma: no cover - exercised through generator consumer tests.
             event_queue.put(("error", exc))
         else:
@@ -1266,21 +1453,30 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
             component_id = payload.get("component_id", "single-node")
-            with _timed_phase(
-                "remote_engine_execute_payload",
-                component=component_id,
-                payload_kind=payload.get("payload_kind"),
-            ):
-                if _should_reload_modal_volume(payload):
-                    _reload_modal_volume_for_request(vol, str(component_id))
-                else:
-                    _emit_cloud_info(
-                        "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
-                        component_id,
+            with _registered_remote_execution(payload) as execution_control:
+                with _timed_phase(
+                    "remote_engine_execute_payload",
+                    component=component_id,
+                    payload_kind=payload.get("payload_kind"),
+                ):
+                    if _should_reload_modal_volume(payload):
+                        _reload_modal_volume_for_request(vol, str(component_id))
+                    else:
+                        _emit_cloud_info(
+                            "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
+                            component_id,
+                        )
+                    if payload.get("payload_kind") == "subgraph":
+                        return execute_subgraph_locally(
+                            payload,
+                            kwargs_payload,
+                            cancellation_event=execution_control.cancellation_event,
+                        )
+                    return execute_node_locally(
+                        payload,
+                        kwargs_payload,
+                        cancellation_event=execution_control.cancellation_event,
                     )
-                if payload.get("payload_kind") == "subgraph":
-                    return execute_subgraph_locally(payload, kwargs_payload)
-                return execute_node_locally(payload, kwargs_payload)
 
         @modal.method()
         def execute_payload_stream(
@@ -1290,19 +1486,29 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         ) -> Iterator[dict[str, Any]]:
             """Stream progress envelopes and a final serialized result for one payload."""
             component_id = payload.get("component_id", "single-node")
-            with _timed_phase(
-                "remote_engine_execute_payload",
-                component=component_id,
-                payload_kind=payload.get("payload_kind"),
-            ):
-                if _should_reload_modal_volume(payload):
-                    _reload_modal_volume_for_request(vol, str(component_id))
-                else:
-                    _emit_cloud_info(
-                        "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
-                        component_id,
+            with _registered_remote_execution(payload) as execution_control:
+                with _timed_phase(
+                    "remote_engine_execute_payload",
+                    component=component_id,
+                    payload_kind=payload.get("payload_kind"),
+                ):
+                    if _should_reload_modal_volume(payload):
+                        _reload_modal_volume_for_request(vol, str(component_id))
+                    else:
+                        _emit_cloud_info(
+                            "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
+                            component_id,
+                        )
+                    yield from _stream_remote_payload_events(
+                        payload,
+                        kwargs_payload,
+                        cancellation_event=execution_control.cancellation_event,
                     )
-                yield from _stream_remote_payload_events(payload, kwargs_payload)
+
+        @modal.method()
+        def interrupt_payload(self, prompt_id: str, component_id: str) -> bool:
+            """Interrupt one active remote payload execution."""
+            return _interrupt_registered_remote_execution(prompt_id, component_id)
 
 else:
     app = None

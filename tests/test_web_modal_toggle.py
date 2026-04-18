@@ -75,6 +75,16 @@ def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
     assert "if (promptState.hasStreamedProgress && phase !== STATE_ERROR)" in source
 
 
+def test_streamed_modal_execution_ends_synthetic_setup_without_waiting_for_final_executed() -> None:
+    """Real streamed execution should end synthetic setup on progress, not on the first executed node."""
+    source = _modal_toggle_source()
+
+    assert "if (detail.phase === EXECUTION_PHASE) {\n    endSyntheticExecutionUi(promptId);" in source
+    assert "function handleModalProgress(event)" in source
+    assert "  endSyntheticExecutionUi(promptId);" in source
+    assert 'endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""));' not in source
+
+
 def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     """The frontend should listen for numeric Modal node progress and render it on the node."""
     source = _modal_toggle_source()

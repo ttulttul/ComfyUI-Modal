@@ -168,6 +168,10 @@ The frontend shows remote state directly on the canvas:
 
 When a remote node reports numeric progress through ComfyUI's progress hooks, the active Modal-marked node now also shows an in-node progress bar and percentage locally while the remote work is running. That is especially useful for sampler-style nodes such as `KSampler`.
 
+Cancelling a prompt in local ComfyUI now propagates to the active Modal component as a targeted remote interrupt. In practice, long-running remote samplers no longer continue burning time after you hit cancel locally.
+
+Remote nodes that emit ComfyUI UI outputs also stream those `executed` payloads and preview frames back into the local PromptServer while the remote subgraph is still running. That means image previews can appear during a Modal run instead of only after the final proxy node returns.
+
 The extension also keeps a global activity badge visible during queue-time sync and remote execution, including the period before the prompt is formally queued.
 
 ### 6. Asset sync expectations

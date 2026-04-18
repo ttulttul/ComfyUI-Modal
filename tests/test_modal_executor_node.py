@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 from contextlib import nullcontext
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 import logging
@@ -822,6 +825,111 @@ def test_remote_modal_consumes_streamed_progress_and_result(
     ]
 
 
+def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+    serialization_module: Any,
+) -> None:
+    """The local Modal client should forward streamed executed outputs and previews."""
+    from PIL import Image
+    from protocol import BinaryEventTypes
+
+    class FakePromptServer:
+        """Capture websocket events emitted by streamed remote UI output updates."""
+
+        def __init__(self) -> None:
+            """Initialize the event sink."""
+            self.messages: list[tuple[Any, Any, str | None]] = []
+
+        def send_sync(self, event: Any, data: Any, sid: str | None) -> None:
+            """Record one emitted websocket message."""
+            self.messages.append((event, data, sid))
+
+    preview_buffer = BytesIO()
+    Image.new("RGB", (2, 2), color="red").save(preview_buffer, format="PNG")
+
+    prompt_server = FakePromptServer()
+    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+
+    payload = {
+        "prompt_id": "prompt-1",
+        "component_id": "component-1",
+        "component_node_ids": ["7"],
+        "extra_data": {"client_id": "client-1"},
+    }
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {
+                    "kind": "progress",
+                    "event_type": "executed",
+                    "node_id": "7",
+                    "display_node_id": "7",
+                    "output": {
+                        "images": [
+                            {
+                                "filename": "preview.png",
+                                "subfolder": "",
+                                "type": "temp",
+                            }
+                        ]
+                    },
+                },
+                {
+                    "kind": "progress",
+                    "event_type": "preview",
+                    "node_id": "7",
+                    "display_node_id": "7",
+                    "parent_node_id": None,
+                    "real_node_id": "7",
+                    "image_type": "PNG",
+                    "image_bytes": serialization_module.serialize_value(preview_buffer.getvalue()),
+                    "max_size": 256,
+                },
+                {
+                    "kind": "result",
+                    "outputs": b"serialized-outputs",
+                },
+            ]
+        ),
+    )
+
+    assert result == b"serialized-outputs"
+    assert prompt_server.messages[0] == (
+        "executed",
+        {
+            "prompt_id": "prompt-1",
+            "node": "7",
+            "display_node": "7",
+            "output": {
+                "images": [
+                    {
+                        "filename": "preview.png",
+                        "subfolder": "",
+                        "type": "temp",
+                    }
+                ]
+            },
+        },
+        "client-1",
+    )
+
+    preview_event, preview_payload, preview_sid = prompt_server.messages[1]
+    preview_image, preview_metadata = preview_payload
+    assert preview_event == BinaryEventTypes.PREVIEW_IMAGE_WITH_METADATA
+    assert preview_sid == "client-1"
+    assert preview_image[0] == "PNG"
+    assert preview_image[2] == 256
+    assert preview_image[1].size == (2, 2)
+    assert preview_metadata == {
+        "node_id": "7",
+        "prompt_id": "prompt-1",
+        "display_node_id": "7",
+        "real_node_id": "7",
+    }
+
+
 def test_modal_cloud_tracing_prompt_server_emits_numeric_node_progress(
     modal_cloud_module: Any,
 ) -> None:
@@ -860,6 +968,37 @@ def test_modal_cloud_tracing_prompt_server_emits_numeric_node_progress(
         "value": 5.0,
         "max": 20.0,
     }
+
+
+def test_modal_cloud_tracing_prompt_server_emits_executed_outputs(
+    modal_cloud_module: Any,
+) -> None:
+    """The cloud tracing prompt server should stream node UI outputs as executed events."""
+    observed_updates: list[dict[str, Any]] = []
+    server = modal_cloud_module._TracingPromptServer(
+        "component-1",
+        {"7": {"class_type": "PreviewImage", "inputs": {}}},
+        status_callback=observed_updates.append,
+    )
+
+    server.send_sync(
+        "executed",
+        {
+            "node": "7",
+            "display_node": "7",
+            "output": {"images": [{"filename": "preview.png"}]},
+        },
+        None,
+    )
+
+    assert observed_updates == [
+        {
+            "event_type": "executed",
+            "node_id": "7",
+            "display_node_id": "7",
+            "output": {"images": [{"filename": "preview.png"}]},
+        }
+    ]
 
 
 def test_remote_modal_consumes_streamed_tensor_result_payload(
@@ -937,6 +1076,56 @@ def test_remote_modal_requires_manual_deploy_when_auto_deploy_disabled(
 
     assert "requires a deployed Modal app or a successful first-run auto-deploy" in message
     assert "COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK=true" in message
+
+
+def test_invoke_remote_engine_propagates_local_interrupt_to_modal(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local proxy should propagate ComfyUI interrupts to the remote Modal call."""
+
+    class FakeInterrupt(Exception):
+        """Stand-in for ComfyUI's InterruptProcessingException."""
+
+    observed_cancellation_events: list[threading.Event] = []
+    interrupt_checks = iter([False, True, True])
+
+    def fake_blocking_invoke(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        cancellation_event: threading.Event | None = None,
+    ) -> bytes:
+        assert cancellation_event is not None
+        observed_cancellation_events.append(cancellation_event)
+        while not cancellation_event.is_set():
+            time.sleep(0.01)
+        raise RuntimeError("remote interrupted")
+
+    def fake_local_processing_interrupted() -> bool:
+        return next(interrupt_checks, True)
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_local_processing_interrupted",
+        fake_local_processing_interrupted,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_raise_local_interrupt",
+        lambda: (_ for _ in ()).throw(FakeInterrupt()),
+    )
+
+    with pytest.raises(FakeInterrupt):
+        remote_modal_app_module.invoke_remote_engine(
+            {"component_id": "component-1", "payload_kind": "subgraph"},
+            b"{}",
+        )
+
+    assert len(observed_cancellation_events) == 1
+    assert observed_cancellation_events[0].is_set()
 
 
 def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
