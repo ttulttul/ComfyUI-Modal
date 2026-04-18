@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 import time
@@ -70,7 +71,7 @@ def test_dynamic_proxy_node_preserves_output_signature(
 def test_proxy_execution_uses_injected_remote_client(
     modal_executor_module: Any,
 ) -> None:
-    """Proxy execution should delegate to the configured remote client."""
+    """Proxy execution should delegate to the configured remote client asynchronously."""
     fake_nodes_module = type(
         "FakeNodesModule",
         (),
@@ -90,17 +91,61 @@ def test_proxy_execution_uses_injected_remote_client(
     class FakeClient:
         """Test client that returns deterministic outputs."""
 
-        def execute_payload(self, payload: dict[str, Any], kwargs: dict[str, Any]) -> tuple[str, int]:
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str, int]:
             """Return values derived from the proxied node payload."""
             return (f"{payload['class_type']}::{kwargs['value']}", 3)
 
     modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
     try:
-        result = proxy_class.execute(original_node_data={"class_type": "OriginalNode"}, value="payload")
+        result = asyncio.run(
+            proxy_class.execute(original_node_data={"class_type": "OriginalNode"}, value="payload")
+        )
     finally:
         modal_executor_module.set_remote_executor_client_factory(None)
 
     assert result.result == ("OriginalNode::payload", 3)
+
+
+def test_proxy_execution_wraps_sync_remote_clients(
+    modal_executor_module: Any,
+) -> None:
+    """Async proxy execution should still support legacy sync remote clients."""
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {"OriginalNode": _FakeOriginalNode},
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    proxy_id = modal_executor_module.ensure_modal_proxy_node_registered(
+        original_class_type="OriginalNode",
+        original_class=_FakeOriginalNode,
+        nodes_module=fake_nodes_module,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_id]
+
+    class FakeSyncClient:
+        """Legacy client that only exposes the blocking execution method."""
+
+        def execute_payload(self, payload: dict[str, Any], kwargs: dict[str, Any]) -> tuple[str, int]:
+            """Return values derived from the proxied node payload."""
+            return (f"sync::{payload['class_type']}::{kwargs['value']}", 4)
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeSyncClient())
+    try:
+        result = asyncio.run(
+            proxy_class.execute(original_node_data={"class_type": "OriginalNode"}, value="payload")
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert result.result == ("sync::OriginalNode::payload", 4)
 
 
 def test_local_remote_app_executes_original_node(
@@ -115,6 +160,16 @@ def test_local_remote_app_executes_original_node(
     )
     outputs = serialization_module.deserialize_node_outputs(payload)
     assert outputs == ("hello", 1)
+
+
+def test_remote_modal_call_worker_count_allows_parallel_blocking_calls(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local Modal dispatch pool should have more than one worker."""
+    monkeypatch.setattr(remote_modal_app_module.os, "cpu_count", lambda: 8)
+
+    assert remote_modal_app_module._remote_modal_call_worker_count() == 8
 
 
 def test_stable_modal_cloud_entry_imports_without_modal_sdk(
@@ -1262,6 +1317,58 @@ def test_invoke_remote_engine_propagates_local_interrupt_to_modal(
         remote_modal_app_module.invoke_remote_engine(
             {"component_id": "component-1", "payload_kind": "subgraph"},
             b"{}",
+        )
+
+    assert len(observed_cancellation_events) == 1
+    assert observed_cancellation_events[0].is_set()
+
+
+def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The async local proxy should also propagate ComfyUI interrupts to the remote Modal call."""
+
+    class FakeInterrupt(Exception):
+        """Stand-in for ComfyUI's InterruptProcessingException."""
+
+    observed_cancellation_events: list[threading.Event] = []
+    interrupt_checks = iter([False, True, True])
+
+    def fake_blocking_invoke(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        cancellation_event: threading.Event | None = None,
+    ) -> bytes:
+        assert cancellation_event is not None
+        observed_cancellation_events.append(cancellation_event)
+        while not cancellation_event.is_set():
+            time.sleep(0.01)
+        raise RuntimeError("remote interrupted")
+
+    def fake_local_processing_interrupted() -> bool:
+        return next(interrupt_checks, True)
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_local_processing_interrupted",
+        fake_local_processing_interrupted,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_raise_local_interrupt",
+        lambda: (_ for _ in ()).throw(FakeInterrupt()),
+    )
+
+    with pytest.raises(FakeInterrupt):
+        asyncio.run(
+            remote_modal_app_module.invoke_remote_engine_async(
+                {"component_id": "component-1", "payload_kind": "subgraph"},
+                b"{}",
+            )
         )
 
     assert len(observed_cancellation_events) == 1
