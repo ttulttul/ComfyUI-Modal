@@ -46,4 +46,16 @@ def test_remote_modal_status_tracks_active_node_ids() -> None:
     assert "activeNodeId: null" in source
     assert "function setPromptActiveNode(promptId, activeNodeId)" in source
     assert "detail.active_node_id" in source
-    assert "isActiveRemoteNode" in source
+    assert "clearPromptRemoteStates(promptId)" in source
+
+
+def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
+    """The frontend should distinguish ready, active, and completed remote nodes visually."""
+    source = _modal_toggle_source()
+
+    assert 'const READY_BORDER_COLOR = "#22c55e";' in source
+    assert 'const ACTIVE_BORDER_COLOR = "#a855f7";' in source
+    assert 'const COMPLETE_BORDER_COLOR = "#16a34a";' in source
+    assert 'const STATE_READY = "ready";' in source
+    assert 'const STATE_ACTIVE = "active";' in source
+    assert 'detail.phase === "execution_success"' in source
