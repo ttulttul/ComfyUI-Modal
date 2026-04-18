@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib.util
 from io import BytesIO
@@ -27,10 +28,17 @@ from ..serialization import (
 from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
-_REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOYED_APPS: set[tuple[str, str | None]] = set()
+
+
+def _remote_modal_call_worker_count() -> int:
+    """Return the number of local worker threads reserved for blocking Modal calls."""
+    return max(4, os.cpu_count() or 1)
+
+
+_REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=_remote_modal_call_worker_count())
 
 try:
     import modal  # type: ignore
@@ -1216,6 +1224,66 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
         _raise_local_interrupt()
     logger.info(
         "Modal remote invocation completed for component=%s.",
+        payload.get("component_id"),
+    )
+    return response
+
+
+async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+    """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
+    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
+    if execution_mode == "local" or modal is None:
+        return await asyncio.to_thread(invoke_remote_engine, payload, kwargs_payload)
+
+    logger.info(
+        "Dispatching async Modal remote invocation for component=%s payload_kind=%s.",
+        payload.get("component_id"),
+        payload.get("payload_kind"),
+    )
+    cancellation_event = threading.Event()
+    future = _REMOTE_MODAL_CALL_EXECUTOR.submit(
+        _invoke_modal_payload_blocking,
+        dict(payload),
+        kwargs_payload,
+        cancellation_event,
+    )
+    wrapped_future = asyncio.wrap_future(future)
+    try:
+        while True:
+            try:
+                response = await asyncio.wait_for(asyncio.shield(wrapped_future), timeout=0.1)
+                break
+            except asyncio.TimeoutError:
+                if _local_processing_interrupted() and not cancellation_event.is_set():
+                    logger.info(
+                        "Observed local interrupt while async Modal component=%s was running; requesting remote cancellation.",
+                        payload.get("component_id"),
+                    )
+                    cancellation_event.set()
+                continue
+    except asyncio.CancelledError:
+        cancellation_event.set()
+        raise
+    except Exception:
+        if cancellation_event.is_set() or _local_processing_interrupted():
+            logger.info(
+                "Reraising async Modal failure as a local interrupt for component=%s after cancellation.",
+                payload.get("component_id"),
+            )
+            _raise_local_interrupt()
+        logger.exception(
+            "Async Modal remote invocation failed for component=%s.",
+            payload.get("component_id"),
+        )
+        raise
+    if cancellation_event.is_set() or _local_processing_interrupted():
+        logger.info(
+            "Async remote invocation for component=%s finished after interruption; raising local interrupt.",
+            payload.get("component_id"),
+        )
+        _raise_local_interrupt()
+    logger.info(
+        "Async Modal remote invocation completed for component=%s.",
         payload.get("component_id"),
     )
     return response

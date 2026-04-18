@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
@@ -21,6 +23,13 @@ class RemoteExecutorClient(Protocol):
     def execute_payload(self, payload: Mapping[str, Any], kwargs: Mapping[str, Any]) -> Sequence[Any]:
         """Execute a serialized Modal payload and return its outputs."""
 
+    async def execute_payload_async(
+        self,
+        payload: Mapping[str, Any],
+        kwargs: Mapping[str, Any],
+    ) -> Sequence[Any]:
+        """Execute a serialized Modal payload asynchronously and return its outputs."""
+
 
 class ModalRemoteExecutorClient:
     """Default execution client backed by the remote Modal app module."""
@@ -30,6 +39,17 @@ class ModalRemoteExecutorClient:
         from .remote.modal_app import invoke_remote_engine
 
         response = invoke_remote_engine(dict(payload), serialize_node_inputs(kwargs))
+        return deserialize_node_outputs(response)
+
+    async def execute_payload_async(
+        self,
+        payload: Mapping[str, Any],
+        kwargs: Mapping[str, Any],
+    ) -> Sequence[Any]:
+        """Serialize inputs, invoke the remote engine asynchronously, and deserialize outputs."""
+        from .remote.modal_app import invoke_remote_engine_async
+
+        response = await invoke_remote_engine_async(dict(payload), serialize_node_inputs(kwargs))
         return deserialize_node_outputs(response)
 
 
@@ -48,6 +68,25 @@ def set_remote_executor_client_factory(
 def get_remote_executor_client() -> RemoteExecutorClient:
     """Instantiate the configured execution client."""
     return _REMOTE_EXECUTOR_CLIENT_FACTORY()
+
+
+async def _execute_payload_async(
+    client: RemoteExecutorClient,
+    payload: Mapping[str, Any],
+    kwargs: Mapping[str, Any],
+) -> Sequence[Any]:
+    """Execute one Modal payload through the client, adapting sync clients when needed."""
+    execute_payload_async = getattr(client, "execute_payload_async", None)
+    if callable(execute_payload_async):
+        result = execute_payload_async(payload, kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    execute_payload = getattr(client, "execute_payload", None)
+    if not callable(execute_payload):
+        raise TypeError("Remote executor client must define execute_payload or execute_payload_async.")
+    return await asyncio.to_thread(execute_payload, payload, kwargs)
 
 
 def _output_spec(io_type: str, name: str, is_list: bool) -> io.Output:
@@ -128,7 +167,7 @@ def _build_proxy_node_class(
             )
 
         @classmethod
-        def execute(cls, **kwargs: Any) -> io.NodeOutput:
+        async def execute(cls, **kwargs: Any) -> io.NodeOutput:
             """Forward the execution payload to the configured remote executor."""
             payload = kwargs.pop(payload_input_name, None)
             if isinstance(payload, str):
@@ -136,7 +175,7 @@ def _build_proxy_node_class(
             if not isinstance(payload, Mapping):
                 raise TypeError(f"{payload_input_name} must be a mapping or JSON object.")
 
-            outputs = tuple(get_remote_executor_client().execute_payload(payload, kwargs))
+            outputs = tuple(await _execute_payload_async(get_remote_executor_client(), payload, kwargs))
             logger.debug(
                 "Remote execution completed for payload kind=%s with %d outputs.",
                 payload.get("payload_kind"),
