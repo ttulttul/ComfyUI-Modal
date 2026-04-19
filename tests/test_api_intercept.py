@@ -287,6 +287,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert payload["requires_volume_reload"] is True
     assert isinstance(payload["volume_reload_marker"], str)
     assert payload["volume_reload_marker"]
+    assert payload["uploaded_volume_paths"] == [summary.synced_assets[0].remote_path]
     assert payload["terminate_container_on_error"] is True
     assert payload["boundary_inputs"] == []
     assert payload["boundary_outputs"] == [
@@ -578,7 +579,13 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
     ) -> tuple[dict[str, Any], list[Any]]:
         if component.representative_node_id == "1":
             return {"1": rewritten_prompt["1"]}, []
-        return {"2": rewritten_prompt["2"]}, [uploaded_asset]
+        return {
+            "2": {
+                "class_type": rewritten_prompt["2"]["class_type"],
+                "inputs": {"image_path": uploaded_asset.remote_path},
+                "_meta": rewritten_prompt["2"]["_meta"],
+            }
+        }, [uploaded_asset]
 
     monkeypatch.setattr(
         api_intercept_module,
@@ -599,11 +606,13 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
 
     assert summary.remote_component_ids == ["1", "2"]
     assert summary.synced_assets == [uploaded_asset]
-    assert first_payload["requires_volume_reload"] is True
+    assert first_payload["requires_volume_reload"] is False
     assert second_payload["requires_volume_reload"] is True
     assert isinstance(first_payload["volume_reload_marker"], str)
     assert first_payload["volume_reload_marker"]
     assert first_payload["volume_reload_marker"] == second_payload["volume_reload_marker"]
+    assert first_payload["uploaded_volume_paths"] == []
+    assert second_payload["uploaded_volume_paths"] == [uploaded_asset.remote_path]
 
 
 def test_rewrite_merges_cyclic_coarse_components_back_into_single_proxy(
