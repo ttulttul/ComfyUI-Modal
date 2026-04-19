@@ -1780,7 +1780,19 @@ function patchQueuePrompt() {
         throw new PromptExecutionError(await response.json());
       }
 
-      return await response.json();
+      const responsePayload = await response.json();
+      if (remoteNodeIds.length > 0) {
+        const promptState = ensurePromptState(promptId);
+        const resolvedRemoteNodeIds =
+          promptState.remoteNodeIds.length > 0 ? promptState.remoteNodeIds : remoteNodeIds;
+        endSyntheticExecutionUi(promptId);
+        setGlobalStatusPhase(promptId, STATE_WAITING, resolvedRemoteNodeIds.length, {
+          message: "Waiting for Modal startup",
+        });
+        setNodesPhase(resolvedRemoteNodeIds, STATE_READY, promptId);
+      }
+
+      return responsePayload;
     } catch (error) {
       endSyntheticExecutionUi(promptId, true);
       markQueueFailure(remoteNodeIds, promptId, error);
