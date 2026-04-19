@@ -141,7 +141,7 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
             kwargs: dict[str, Any],
         ) -> tuple[str, int]:
             """Capture the kwargs forwarded by the proxy."""
-            del payload
+            observed_kwargs["payload_kind"] = payload["payload_kind"]
             observed_kwargs.update(kwargs)
             return ("ok", 1)
 
@@ -149,7 +149,7 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
     try:
         result = asyncio.run(
             proxy_class.execute(
-                original_node_data={"class_type": "OriginalNode"},
+                original_node_data=[{"payload_kind": "subgraph", "class_type": "OriginalNode"}],
                 scalar_value=[3],
                 mapped_value=["a", "b", "c"],
             )
@@ -159,6 +159,7 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
 
     assert result.result == ("ok", 1)
     assert observed_kwargs == {
+        "payload_kind": "subgraph",
         "scalar_value": 3,
         "mapped_value": ["a", "b", "c"],
     }

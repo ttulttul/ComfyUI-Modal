@@ -107,6 +107,17 @@ def _normalize_proxy_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     return normalized_kwargs
 
 
+def _normalize_proxy_payload(payload: Any) -> Mapping[str, Any]:
+    """Convert ComfyUI INPUT_IS_LIST payload wrappers back into one payload mapping."""
+    if isinstance(payload, list) and len(payload) == 1:
+        payload = payload[0]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, Mapping):
+        raise TypeError("original_node_data must be a mapping or JSON object.")
+    return payload
+
+
 def _normalized_output_metadata(
     original_class: type[Any],
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[bool, ...]]:
@@ -182,11 +193,7 @@ def _build_proxy_node_class(
         @classmethod
         async def execute(cls, **kwargs: Any) -> io.NodeOutput:
             """Forward the execution payload to the configured remote executor."""
-            payload = kwargs.pop(payload_input_name, None)
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            if not isinstance(payload, Mapping):
-                raise TypeError(f"{payload_input_name} must be a mapping or JSON object.")
+            payload = _normalize_proxy_payload(kwargs.pop(payload_input_name, None))
 
             outputs = tuple(
                 await _execute_payload_async(
