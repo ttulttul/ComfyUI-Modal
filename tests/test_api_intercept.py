@@ -78,6 +78,38 @@ class _FakeRemoteModelAndImageConsumerNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakePromptListNode:
+    """Fake upstream node that represents a prompt-list producer."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeModalMapInputNode:
+    """Fake Modal map marker node that passes a wildcard value through."""
+
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("value",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRemoteStringEchoNode:
+    """Fake remote node that echoes a string output."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeLocalStringSinkNode:
+    """Fake local node used to consume remote STRING outputs."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+
+
 def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     api_intercept_module: Any,
     settings_module: Any,
@@ -469,6 +501,108 @@ def test_rewrite_merges_cyclic_coarse_components_back_into_single_proxy(
         }
     ]
     assert rewritten_prompt["4"]["inputs"]["images"] == ["1", 0]
+
+
+def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A remote component fed through ModalMapInput should rewrite to a mapped payload."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "PromptList": _FakePromptListNode,
+                "ModalMapInput": _FakeModalMapInputNode,
+                "RemoteStringEcho": _FakeRemoteStringEchoNode,
+                "LocalStringSink": _FakeLocalStringSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": False}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 5, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "PromptList",
+            "inputs": {},
+            "_meta": {"title": "Prompt List"},
+        },
+        "2": {
+            "class_type": "ModalMapInput",
+            "inputs": {"value": ["1", 0]},
+            "_meta": {"title": "Map Input"},
+        },
+        "3": {
+            "class_type": "RemoteStringEcho",
+            "inputs": {"text": ["2", 0]},
+            "_meta": {"title": "Remote Echo"},
+        },
+        "5": {
+            "class_type": "RemoteStringEcho",
+            "inputs": {"text": ["3", 0]},
+            "_meta": {"title": "Remote Echo 2"},
+        },
+        "4": {
+            "class_type": "LocalStringSink",
+            "inputs": {"text": ["5", 0]},
+            "_meta": {"title": "Local Sink"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert set(rewritten_prompt) == {"1", "2", "4"}
+    assert summary.remote_component_ids == ["2"]
+    payload = rewritten_prompt["2"]["inputs"]["original_node_data"]
+    assert payload["payload_kind"] == "mapped_subgraph"
+    assert payload["component_node_ids"] == ["2", "3", "5"]
+    assert payload["mapped_input"] == {
+        "proxy_input_name": "remote_input_0",
+        "io_type": "STRING",
+    }
+    assert payload["boundary_inputs"] == [
+        {
+            "proxy_input_name": "remote_input_0",
+            "targets": [{"node_id": "2", "input_name": "value"}],
+        }
+    ]
+    assert rewritten_prompt["4"]["inputs"]["text"] == ["2", 0]
 
 
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(

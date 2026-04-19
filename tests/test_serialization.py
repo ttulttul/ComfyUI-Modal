@@ -64,3 +64,40 @@ def test_coerce_serialized_node_outputs_accepts_raw_tensor_outputs(serialization
 
     assert len(decoded) == 1
     assert torch.equal(decoded[0], tensor)
+
+
+def test_split_mapped_value_accepts_python_lists(serialization_module: Any) -> None:
+    """Mapped execution should split list inputs item-by-item without changing order."""
+    items = serialization_module.split_mapped_value(["a", "b", "c"], "STRING")
+
+    assert items == ["a", "b", "c"]
+
+
+def test_split_and_join_tensor_batch_for_mapped_execution(serialization_module: Any) -> None:
+    """Mapped execution should split and reassemble tensor batches on the leading dimension."""
+    torch = pytest.importorskip("torch")
+    batch = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
+
+    split_items = serialization_module.split_mapped_value(batch, "IMAGE")
+    rejoined = serialization_module.join_mapped_values(split_items, "IMAGE", is_list=False)
+
+    assert len(split_items) == 3
+    assert all(item.shape[0] == 1 for item in split_items)
+    assert torch.equal(rejoined, batch)
+
+
+def test_split_and_join_latent_batch_for_mapped_execution(serialization_module: Any) -> None:
+    """Mapped execution should split and reassemble ComfyUI LATENT dictionaries."""
+    torch = pytest.importorskip("torch")
+    latent = {
+        "samples": torch.arange(48, dtype=torch.float32).reshape(3, 4, 2, 2),
+        "batch_index": [0, 1, 2],
+    }
+
+    split_items = serialization_module.split_mapped_value(latent, "LATENT")
+    rejoined = serialization_module.join_mapped_values(split_items, "LATENT", is_list=False)
+
+    assert len(split_items) == 3
+    assert all(item["samples"].shape[0] == 1 for item in split_items)
+    assert torch.equal(rejoined["samples"], latent["samples"])
+    assert rejoined["batch_index"] == [0, 1, 2]

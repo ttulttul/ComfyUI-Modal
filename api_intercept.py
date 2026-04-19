@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 from aiohttp import web
 
-from .modal_executor_node import ensure_modal_component_proxy_node_registered
+from .modal_executor_node import MODAL_MAP_INPUT_NODE_ID, ensure_modal_component_proxy_node_registered
 from .settings import ModalSyncSettings, get_settings
 from .sync_engine import ModalAssetSyncEngine, SyncedAsset
 
@@ -81,6 +81,8 @@ class RemoteComponentPlan:
     boundary_outputs: list[BoundaryOutputSpec]
     execute_node_ids: list[str]
     contains_output_node: bool
+    mapped_boundary_input_name: str | None = None
+    mapped_boundary_input_io_type: str | None = None
 
 
 @dataclass
@@ -530,6 +532,7 @@ def _remote_component_partition_groups(
 ) -> dict[str, set[str]]:
     """Return component groups after merging remote nodes across non-transportable edges."""
     parent: dict[str, str] = {node_id: node_id for node_id in remote_node_ids}
+    downstream_remote_node_ids_by_node_id: dict[str, set[str]] = defaultdict(set)
 
     def find(node_id: str) -> str:
         """Return the canonical union-find representative for one remote node."""
@@ -562,6 +565,14 @@ def _remote_component_partition_groups(
             upstream_node_id = str(input_value[0])
             if upstream_node_id not in remote_node_ids:
                 continue
+            downstream_remote_node_ids_by_node_id[upstream_node_id].add(node_id)
+            upstream_prompt_node = prompt.get(upstream_node_id)
+            if (
+                upstream_prompt_node is not None
+                and str(upstream_prompt_node.get("class_type")) == MODAL_MAP_INPUT_NODE_ID
+            ):
+                union(node_id, upstream_node_id)
+                continue
             io_type = _remote_output_io_type(
                 prompt=prompt,
                 node_id=upstream_node_id,
@@ -571,6 +582,21 @@ def _remote_component_partition_groups(
             if io_type is None or _is_transportable_output_type(io_type):
                 continue
             union(node_id, upstream_node_id)
+
+    for remote_node_id in sorted(remote_node_ids):
+        prompt_node = prompt.get(remote_node_id)
+        if prompt_node is None or str(prompt_node.get("class_type")) != MODAL_MAP_INPUT_NODE_ID:
+            continue
+        pending_node_ids = [remote_node_id]
+        visited_node_ids: set[str] = set()
+        while pending_node_ids:
+            current_node_id = pending_node_ids.pop()
+            if current_node_id in visited_node_ids:
+                continue
+            visited_node_ids.add(current_node_id)
+            union(remote_node_id, current_node_id)
+            for downstream_node_id in sorted(downstream_remote_node_ids_by_node_id.get(current_node_id, set())):
+                pending_node_ids.append(downstream_node_id)
 
     groups: dict[str, set[str]] = defaultdict(set)
     for node_id in sorted(remote_node_ids):
@@ -931,6 +957,32 @@ def _build_component_plan(
                 ),
             )
 
+    mapped_boundary_spec: BoundaryInputSpec | None = None
+    mapped_boundary_input_io_type: str | None = None
+    for boundary_input in boundary_inputs_by_source.values():
+        mapped_targets = [
+            target
+            for target in boundary_input.targets
+            if str(prompt[target.node_id]["class_type"]) == MODAL_MAP_INPUT_NODE_ID
+        ]
+        if not mapped_targets:
+            continue
+        if len(mapped_targets) != len(boundary_input.targets):
+            raise ModalPromptValidationError(
+                "Mapped remote execution requires the mapped boundary input to feed only ModalMapInput nodes."
+            )
+        if mapped_boundary_spec is not None:
+            raise ModalPromptValidationError(
+                "Remote components currently support only one mapped ModalMapInput boundary."
+            )
+        mapped_boundary_spec = boundary_input
+        mapped_boundary_input_io_type = _remote_output_io_type(
+            prompt=prompt,
+            node_id=boundary_input.source.node_id,
+            output_index=boundary_input.source.output_index,
+            nodes_module=nodes_module,
+        )
+
     component = RemoteComponentPlan(
         node_ids=component_node_ids,
         representative_node_id=representative_node_id,
@@ -944,15 +996,20 @@ def _build_component_plan(
         ),
         execute_node_ids=sorted(output_execution_targets),
         contains_output_node=contains_output_node,
+        mapped_boundary_input_name=(
+            mapped_boundary_spec.proxy_input_name if mapped_boundary_spec is not None else None
+        ),
+        mapped_boundary_input_io_type=mapped_boundary_input_io_type,
     )
     logger.info(
-        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s",
+        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s",
         component.representative_node_id,
         component.node_ids,
         len(component.boundary_inputs),
         len(component.boundary_outputs),
         component.execute_node_ids,
         component.contains_output_node,
+        component.mapped_boundary_input_name,
     )
     return component
 
@@ -1142,7 +1199,7 @@ def _build_component_payload(
         custom_nodes_bundle is not None and custom_nodes_bundle.uploaded
     )
     payload = {
-        "payload_kind": "subgraph",
+        "payload_kind": "mapped_subgraph" if component.mapped_boundary_input_name else "subgraph",
         "component_id": component.representative_node_id,
         "prompt_id": (extra_data or {}).get("prompt_id"),
         "component_node_ids": list(component.node_ids),
@@ -1173,6 +1230,14 @@ def _build_component_payload(
         "requires_volume_reload": requires_volume_reload,
         "custom_nodes_bundle": (
             custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
+        ),
+        "mapped_input": (
+            {
+                "proxy_input_name": component.mapped_boundary_input_name,
+                "io_type": str(component.mapped_boundary_input_io_type or "*"),
+            }
+            if component.mapped_boundary_input_name
+            else None
         ),
     }
     logger.info(

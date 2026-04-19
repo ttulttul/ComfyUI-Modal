@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -15,6 +16,7 @@ _VALUE_KEY = "value"
 _TENSOR_KIND = "tensor"
 _BYTES_KIND = "bytes"
 _TUPLE_KIND = "tuple"
+_BATCHABLE_TENSOR_IO_TYPES = frozenset({"IMAGE", "MASK", "NOISE", "SIGMAS"})
 
 
 def _is_scalar(value: Any) -> bool:
@@ -168,3 +170,124 @@ def deserialize_node_outputs(payload: bytes | bytearray | str | Sequence[Any]) -
     if not isinstance(raw_payload, list):
         raise TypeError("Serialized node outputs must decode to a list.")
     return tuple(deserialize_value(value) for value in raw_payload)
+
+
+def _split_tensor_batch(value: Any) -> list[Any]:
+    """Split one tensor batch into per-item tensors that retain the batch dimension."""
+    torch = _import_torch()
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("Expected a tensor batch.")
+    if value.ndim == 0 or value.shape[0] == 0:
+        raise ValueError("Mapped tensor batches must have a non-zero leading batch dimension.")
+    return [value[index : index + 1] for index in range(int(value.shape[0]))]
+
+
+def _latent_batch_size(value: Mapping[str, Any]) -> int:
+    """Return the batch size of a ComfyUI LATENT-like mapping."""
+    torch = _import_torch()
+    samples = value.get("samples")
+    if not isinstance(samples, torch.Tensor) or samples.ndim == 0 or samples.shape[0] == 0:
+        raise TypeError("Mapped LATENT values must contain a batched 'samples' tensor.")
+    return int(samples.shape[0])
+
+
+def _split_latent_batch(value: Mapping[str, Any]) -> list[Any]:
+    """Split one ComfyUI LATENT mapping into per-item latent mappings."""
+    torch = _import_torch()
+    batch_size = _latent_batch_size(value)
+    items: list[dict[str, Any]] = []
+    for index in range(batch_size):
+        item: dict[str, Any] = {}
+        for key, entry in value.items():
+            if isinstance(entry, torch.Tensor) and entry.ndim > 0 and entry.shape[0] == batch_size:
+                item[str(key)] = entry[index : index + 1]
+                continue
+            if isinstance(entry, list) and len(entry) == batch_size:
+                item[str(key)] = [entry[index]]
+                continue
+            item[str(key)] = copy.deepcopy(entry)
+        items.append(item)
+    return items
+
+
+def split_mapped_value(value: Any, io_type: str) -> list[Any]:
+    """Split one mapped input value into ordered per-item values."""
+    if isinstance(value, list):
+        if len(value) == 0:
+            raise ValueError("Mapped list inputs must contain at least one item.")
+        return list(value)
+
+    normalized_io_type = str(io_type)
+    if normalized_io_type == "LATENT" and isinstance(value, Mapping):
+        return _split_latent_batch(value)
+
+    try:
+        torch = _import_torch()
+    except ModuleNotFoundError as exc:
+        raise TypeError(
+            f"Mapped input type {normalized_io_type!r} requires torch to split batched values."
+        ) from exc
+
+    if isinstance(value, torch.Tensor) and (
+        normalized_io_type in _BATCHABLE_TENSOR_IO_TYPES or value.ndim > 0
+    ):
+        return _split_tensor_batch(value)
+
+    raise TypeError(
+        "Mapped execution only supports Python lists, tensor batches, and LATENT dictionaries. "
+        f"Unsupported mapped value type {type(value)!r} for io_type={normalized_io_type!r}."
+    )
+
+
+def _join_latent_batches(values: Sequence[Any]) -> Any:
+    """Reassemble ordered per-item LATENT mappings into one batched latent mapping."""
+    torch = _import_torch()
+    if not values:
+        raise ValueError("Expected at least one mapped LATENT output to aggregate.")
+    if not all(isinstance(value, Mapping) for value in values):
+        raise TypeError("Mapped LATENT outputs must all be mappings.")
+
+    first_value = values[0]
+    merged: dict[str, Any] = {}
+    for key, first_entry in first_value.items():
+        entries = [value[key] for value in values]
+        if isinstance(first_entry, torch.Tensor):
+            merged[str(key)] = torch.cat(entries, dim=0)
+            continue
+        if isinstance(first_entry, list):
+            flattened: list[Any] = []
+            for entry in entries:
+                flattened.extend(entry)
+            merged[str(key)] = flattened
+            continue
+        merged[str(key)] = copy.deepcopy(first_entry)
+    return merged
+
+
+def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> Any:
+    """Reassemble ordered per-item mapped outputs into one proxy output value."""
+    if not values:
+        raise ValueError("Mapped execution produced no outputs to aggregate.")
+
+    if is_list:
+        flattened: list[Any] = []
+        for value in values:
+            if isinstance(value, list):
+                flattened.extend(value)
+                continue
+            flattened.append(value)
+        return flattened
+
+    normalized_io_type = str(io_type)
+    if normalized_io_type == "LATENT":
+        return _join_latent_batches(values)
+
+    try:
+        torch = _import_torch()
+    except ModuleNotFoundError:
+        torch = None
+
+    if torch is not None and all(isinstance(value, torch.Tensor) for value in values):
+        return torch.cat(list(values), dim=0)
+
+    return list(values)
