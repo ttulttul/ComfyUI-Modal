@@ -1213,7 +1213,7 @@ def _apply_boundary_inputs(
         for target in boundary_input.get("targets", []):
             node_id = str(target["node_id"])
             input_name = str(target["input_name"])
-            prompt[node_id]["inputs"][input_name] = value
+            prompt[node_id]["inputs"][input_name] = _normalize_prompt_input_value(value)
 
 
 def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
