@@ -88,6 +88,17 @@ def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> No
     assert 'text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";' in source
 
 
+def test_queue_success_marks_all_remote_nodes_ready_before_component_execution() -> None:
+    """Once the Modal route accepts the prompt, all remote nodes should flip from setup to ready."""
+    source = _modal_toggle_source()
+
+    assert "const resolvedRemoteNodeIds =" in source
+    assert "endSyntheticExecutionUi(promptId);" in source
+    assert 'setGlobalStatusPhase(promptId, STATE_WAITING, resolvedRemoteNodeIds.length, {' in source
+    assert 'message: "Waiting for Modal startup",' in source
+    assert "setNodesPhase(resolvedRemoteNodeIds, STATE_READY, promptId);" in source
+
+
 def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
     """Once streamed node progress starts, coarse proxy execution events should stop overriding it."""
     source = _modal_toggle_source()
