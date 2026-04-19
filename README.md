@@ -255,6 +255,7 @@ Current mapped-execution rules:
 - aggregate mapped-batch completion now shades the global Modal status pill like a progress bar and shows counts such as `3/16`, while node-local progress bars remain reserved for real streamed node progress only
 - the representative remote node also shows a small non-bar batch badge like `3/16` during mapped execution so you can see which remote island owns the batch without implying that the node itself emits sampler-style progress
 - prompt-wide global status metadata is now merged across later per-component status updates instead of being overwritten by whichever remote component reports most recently, so the global pill keeps the correct total remote node count even when several components are running in parallel
+- the global status pill now also reports queue-time setup detail such as packaging the custom-nodes ZIP, uploading named assets, and finalizing the run by receiving Modal outputs back into the local workflow
 - streamed per-item progress lanes now follow the real executing node id instead of being forced onto the component representative node, so concurrent remote samplers no longer all paint their progress bars onto the first node in the remote island
 - worker lanes no longer emit a placeholder progress bar on the component representative node before real node progress arrives, which avoids leaving stray lane bars behind on the first node in the remote island
 - the proxy node itself now opts into ComfyUI `INPUT_IS_LIST` handling and unwraps singleton list wrappers on both `original_node_data` and ordinary inputs before dispatch, so list-valued mapped inputs reach the internal Modal scheduler without causing the whole proxy node to be auto-mapped once per item
@@ -292,7 +293,7 @@ Remote nodes that emit ComfyUI UI outputs also stream those `executed` payloads 
 
 For direct local `PreviewImage` consumers of a remote boundary `IMAGE` output, the relay also synthesizes the local preview-node UI event as soon as that remote boundary image is ready. This improves the common "remote decode -> local preview" case even though the proxy node itself still returns its formal outputs only when the remote component finishes.
 
-The extension also keeps a global activity badge visible during queue-time sync and remote execution, including the period before the prompt is formally queued.
+The extension also keeps a global activity badge visible during queue-time sync and remote execution, including the period before the prompt is formally queued. During setup it now surfaces more specific stages such as packaging the `custom_nodes` ZIP and uploading named assets, and after remote execution finishes it can briefly report that it is still receiving Modal outputs before the local proxy returns.
 
 ### 6. Asset sync expectations
 

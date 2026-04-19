@@ -15,6 +15,7 @@ const ERROR_BORDER_COLOR = "#ef4444";
 
 const STATE_SETUP = "setup";
 const STATE_WAITING = "waiting";
+const STATE_FINALIZING = "finalizing";
 const EXECUTION_PHASE = "executing";
 const STATE_READY = "ready";
 const STATE_ACTIVE = "active";
@@ -161,10 +162,22 @@ function effectiveGlobalStatusPhase(promptId, phase) {
   if (phase === STATE_ERROR) {
     return STATE_ERROR;
   }
+  if (phase === STATE_SETUP || phase === STATE_WAITING) {
+    return phase;
+  }
   if (nodeStates.some((state) => state.phase === STATE_ERROR)) {
     return STATE_ERROR;
   }
-  if (promptState?.hasStreamedProgress || promptState?.activeNodeId) {
+  if (phase === STATE_FINALIZING) {
+    if (
+      promptState?.activeNodeId ||
+      nodeStates.some((state) => state.phase === STATE_ACTIVE || state.phase === STATE_READY)
+    ) {
+      return EXECUTION_PHASE;
+    }
+    return STATE_FINALIZING;
+  }
+  if (promptState?.activeNodeId) {
     return EXECUTION_PHASE;
   }
   if (nodeStates.some((state) => state.phase === STATE_ACTIVE)) {
@@ -192,6 +205,9 @@ function currentGlobalStatus() {
     nodeCount: state.nodeCount,
     batchValue: state.batchValue ?? null,
     batchMax: state.batchMax ?? null,
+    statusMessage: state.statusMessage ?? null,
+    statusCurrent: state.statusCurrent ?? null,
+    statusTotal: state.statusTotal ?? null,
     updatedAt: state.updatedAt,
   }));
   phases.sort((left, right) => right.updatedAt - left.updatedAt);
@@ -201,6 +217,7 @@ function currentGlobalStatus() {
     phases.find((state) => state.phase === STATE_SETUP) ??
     phases.find((state) => state.phase === STATE_WAITING) ??
     phases.find((state) => state.phase === EXECUTION_PHASE) ??
+    phases.find((state) => state.phase === STATE_FINALIZING) ??
     phases[0]
   );
 }
@@ -232,24 +249,37 @@ function refreshGlobalStatusElement() {
     : 0;
   const batchMax = hasBatchProgress ? Math.max(1, Number(activeState.batchMax)) : 1;
   const batchRatio = hasBatchProgress ? batchValue / batchMax : 0;
+  const hasStatusProgress = Number(activeState.statusTotal ?? 0) > 1;
+  const statusValue = hasStatusProgress
+    ? Math.max(
+        0,
+        Math.min(Number(activeState.statusTotal), Number(activeState.statusCurrent ?? 0)),
+      )
+    : 0;
+  const statusMax = hasStatusProgress ? Math.max(1, Number(activeState.statusTotal)) : 1;
+  const statusRatio = hasStatusProgress ? statusValue / statusMax : 0;
 
   element.style.display = "inline-flex";
   element.dataset.phase = activeState.phase;
 
   if (activeState.phase === STATE_SETUP) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
-    element.style.background = "rgba(61, 42, 9, 0.94)";
+    element.style.background = hasStatusProgress
+      ? `linear-gradient(90deg, rgba(180, 83, 9, 0.94) 0%, rgba(180, 83, 9, 0.94) ${(
+          statusRatio * 100
+        ).toFixed(2)}%, rgba(61, 42, 9, 0.94) ${(statusRatio * 100).toFixed(2)}%, rgba(61, 42, 9, 0.94) 100%)`
+      : "rgba(61, 42, 9, 0.94)";
     dot.style.background = SETUP_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = "Syncing graph with Modal";
+    text.textContent = activeState.statusMessage ?? "Syncing graph with Modal";
   } else if (activeState.phase === STATE_WAITING) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
     element.style.background = "rgba(61, 42, 9, 0.94)";
     dot.style.background = SETUP_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = "Waiting for Modal startup";
+    text.textContent = activeState.statusMessage ?? "Waiting for Modal startup";
   } else if (activeState.phase === EXECUTION_PHASE) {
     element.style.borderColor = "rgba(34, 197, 94, 0.55)";
     element.style.background = hasBatchProgress
@@ -263,6 +293,13 @@ function refreshGlobalStatusElement() {
     text.textContent = hasBatchProgress
       ? `Modal workflow running on ${activeState.nodeCount} ${nodeLabel} · ${Math.round(batchValue)}/${Math.round(batchMax)}`
       : `Modal workflow running on ${activeState.nodeCount} ${nodeLabel}`;
+  } else if (activeState.phase === STATE_FINALIZING) {
+    element.style.borderColor = "rgba(59, 130, 246, 0.55)";
+    element.style.background = "rgba(15, 23, 42, 0.94)";
+    dot.style.background = READY_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(59, 130, 246, 0.18)";
+    dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
+    text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";
   } else if (activeState.phase === STATE_ERROR) {
     element.style.borderColor = "rgba(239, 68, 68, 0.55)";
     element.style.background = "rgba(69, 10, 10, 0.94)";
@@ -290,8 +327,9 @@ function refreshGlobalStatusElement() {
  * @param {string} promptId
  * @param {string} phase
  * @param {number} nodeCount
+ * @param {{ message?: string | null, current?: number | null, total?: number | null } | null} details
  */
-function setGlobalStatusPhase(promptId, phase, nodeCount) {
+function setGlobalStatusPhase(promptId, phase, nodeCount, details = null) {
   if (!promptId) {
     return;
   }
@@ -301,6 +339,9 @@ function setGlobalStatusPhase(promptId, phase, nodeCount) {
     nodeCount: Math.max(1, Number(nodeCount) || 1),
     batchValue: existingState?.batchValue ?? null,
     batchMax: existingState?.batchMax ?? null,
+    statusMessage: details?.message ?? null,
+    statusCurrent: details?.current ?? null,
+    statusTotal: details?.total ?? null,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -1335,9 +1376,33 @@ function handleModalStatus(event) {
 
   if (detail.phase === STATE_SETUP) {
     beginSyntheticExecutionUi(promptId, nodeIds);
-    setGlobalStatusPhase(promptId, STATE_SETUP, nodeIds.length);
+    setGlobalStatusPhase(promptId, STATE_SETUP, nodeIds.length, {
+      message: detail.status_message ?? null,
+      current: detail.status_current ?? null,
+      total: detail.status_total ?? null,
+    });
     setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_SETUP, promptId);
+    return;
+  }
+
+  if (detail.phase === STATE_WAITING) {
+    setGlobalStatusPhase(promptId, STATE_WAITING, nodeIds.length, {
+      message: detail.status_message ?? null,
+      current: detail.status_current ?? null,
+      total: detail.status_total ?? null,
+    });
+    setPromptActiveNode(promptId, null);
+    return;
+  }
+
+  if (detail.phase === STATE_FINALIZING) {
+    setGlobalStatusPhase(promptId, STATE_FINALIZING, nodeIds.length, {
+      message: detail.status_message ?? null,
+      current: detail.status_current ?? null,
+      total: detail.status_total ?? null,
+    });
+    setPromptActiveNode(promptId, null);
     return;
   }
 

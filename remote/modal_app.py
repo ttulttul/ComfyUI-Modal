@@ -754,6 +754,9 @@ def _emit_local_modal_status(
     active_node_class_type: str | None = None,
     active_node_role: str | None = None,
     error_message: str | None = None,
+    status_message: str | None = None,
+    status_current: int | None = None,
+    status_total: int | None = None,
 ) -> None:
     """Forward remote execution progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -776,6 +779,12 @@ def _emit_local_modal_status(
         payload["active_node_role"] = active_node_role
     if error_message is not None:
         payload["error_message"] = error_message
+    if status_message is not None:
+        payload["status_message"] = status_message
+    if status_current is not None:
+        payload["status_current"] = int(status_current)
+    if status_total is not None:
+        payload["status_total"] = int(status_total)
     prompt_server.send_sync("modal_status", payload, client_id)
 
 
@@ -1270,10 +1279,20 @@ def _consume_remote_payload_stream(
             )
             if suppress_status_stream:
                 continue
+            remote_phase = str(stream_event.get("phase", "executing"))
+            if remote_phase == "execution_success":
+                _emit_local_modal_status(
+                    prompt_id=prompt_id,
+                    client_id=client_id,
+                    phase="finalizing",
+                    node_ids=node_ids,
+                    status_message="Receiving Modal outputs",
+                )
+                continue
             _emit_local_modal_status(
                 prompt_id=prompt_id,
                 client_id=client_id,
-                phase=str(stream_event.get("phase", "executing")),
+                phase=remote_phase,
                 node_ids=node_ids,
                 active_node_id=(
                     str(stream_event["active_node_id"])

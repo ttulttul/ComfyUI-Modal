@@ -1250,9 +1250,10 @@ def test_remote_modal_consumes_streamed_progress_and_result(
         (
             "modal_status",
             {
-                "phase": "execution_success",
+                "phase": "finalizing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["7", "8"],
+                "status_message": "Receiving Modal outputs",
             },
             "client-1",
         ),

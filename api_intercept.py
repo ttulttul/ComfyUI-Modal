@@ -144,6 +144,9 @@ def _emit_modal_status(
     active_node_class_type: str | None = None,
     active_node_role: str | None = None,
     error_message: str | None = None,
+    status_message: str | None = None,
+    status_current: int | None = None,
+    status_total: int | None = None,
 ) -> None:
     """Send a Modal execution status event to the active websocket client."""
     if client_id is None:
@@ -173,6 +176,12 @@ def _emit_modal_status(
         payload["active_node_role"] = active_node_role
     if error_message is not None:
         payload["error_message"] = error_message
+    if status_message is not None:
+        payload["status_message"] = status_message
+    if status_current is not None:
+        payload["status_current"] = int(status_current)
+    if status_total is not None:
+        payload["status_total"] = int(status_total)
 
     prompt_server.send_sync("modal_status", payload, client_id)
 
@@ -1208,6 +1217,7 @@ def _sync_component_prompt_inputs(
     component: RemoteComponentPlan,
     rewritten_prompt: dict[str, Any],
     sync_engine: ModalAssetSyncEngine,
+    status_callback: Any | None = None,
 ) -> tuple[dict[str, Any], list[SyncedAsset]]:
     """Build a synced prompt payload for one remote component."""
     component_prompt: dict[str, Any] = {}
@@ -1219,7 +1229,10 @@ def _sync_component_prompt_inputs(
     )
     for node_id in component.node_ids:
         prompt_node = rewritten_prompt[node_id]
-        synced_inputs, node_assets = sync_engine.sync_prompt_inputs(copy.deepcopy(prompt_node.get("inputs", {})))
+        synced_inputs, node_assets = sync_engine.sync_prompt_inputs(
+            copy.deepcopy(prompt_node.get("inputs", {})),
+            status_callback=status_callback,
+        )
         synced_assets.extend(node_assets)
         component_prompt[node_id] = {
             "class_type": str(prompt_node["class_type"]),
@@ -1406,6 +1419,7 @@ def rewrite_prompt_for_modal(
     settings: ModalSyncSettings | None = None,
     nodes_module: Any | None = None,
     extra_data: dict[str, Any] | None = None,
+    status_callback: Any | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Rewrite connected remote components into Modal proxy nodes."""
     resolved_settings = settings or get_settings()
@@ -1436,8 +1450,13 @@ def rewrite_prompt_for_modal(
         nodes_module=resolved_nodes_module,
     )
 
+    if status_callback is not None:
+        status_callback("Preparing remote assets for Modal", None, None)
+
     if resolved_settings.sync_custom_nodes:
-        summary.custom_nodes_bundle = resolved_sync_engine.sync_custom_nodes_directory()
+        summary.custom_nodes_bundle = resolved_sync_engine.sync_custom_nodes_directory(
+            status_callback=status_callback,
+        )
     else:
         logger.info(
             "Skipping custom_nodes bundle sync because sync is disabled for execution_mode=%s.",
@@ -1450,6 +1469,7 @@ def rewrite_prompt_for_modal(
             component=component,
             rewritten_prompt=rewritten_prompt,
             sync_engine=resolved_sync_engine,
+            status_callback=status_callback,
         )
         synced_component_prompts[component.representative_node_id] = component_prompt
         summary.synced_assets.extend(synced_assets)
@@ -1657,6 +1677,8 @@ def setup_modal_queue_route(
             json_data["extra_data"]["prompt_id"] = json_data["prompt_id"]
             if json_data.get("client_id") is not None:
                 json_data["extra_data"]["client_id"] = json_data["client_id"]
+            client_id = str(json_data.get("client_id")) if json_data.get("client_id") else None
+            prompt_id = str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None
             extra_pnginfo = ((json_data.get("extra_data") or {}).get("extra_pnginfo") or {})
             workflow = extra_pnginfo.get("workflow")
             prompt_node_ids = (
@@ -1667,7 +1689,29 @@ def setup_modal_queue_route(
             remote_node_ids = sorted(
                 extract_remote_node_ids(workflow, resolved_settings, prompt_node_ids)
             )
+
+            def emit_setup_status(
+                message: str,
+                current: int | None = None,
+                total: int | None = None,
+            ) -> None:
+                """Forward one queue-time Modal setup update into the websocket stream."""
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="setup",
+                    client_id=client_id,
+                    prompt_id=prompt_id,
+                    node_ids=remote_node_ids,
+                    component_node_ids_by_representative=(
+                        summary.component_node_ids_by_representative or None
+                    ),
+                    status_message=message,
+                    status_current=current,
+                    status_total=total,
+                )
+
             if "prompt" in json_data:
+                emit_setup_status("Preparing Modal workflow")
                 rewrite_started_at = time.perf_counter()
                 rewritten_prompt, summary = rewrite_prompt_for_modal(
                     prompt=json_data["prompt"],
@@ -1675,6 +1719,7 @@ def setup_modal_queue_route(
                     sync_engine=resolved_sync_engine,
                     settings=resolved_settings,
                     extra_data=json_data.get("extra_data"),
+                    status_callback=emit_setup_status,
                 )
                 logger.info(
                     "Modal prompt rewrite finished in %.3fs for %d remote nodes across %d components.",
@@ -1703,10 +1748,11 @@ def setup_modal_queue_route(
                 _emit_modal_status(
                     prompt_server=prompt_server,
                     phase="setup",
-                    client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
-                    prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
+                    client_id=client_id,
+                    prompt_id=prompt_id,
                     node_ids=remote_node_ids,
                     component_node_ids_by_representative=summary.component_node_ids_by_representative,
+                    status_message="Submitting Modal workflow",
                 )
             response = await _queue_prompt_json(prompt_server, json_data)
             logger.info(
