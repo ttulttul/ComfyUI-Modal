@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import pytest
 
 
 class _FakeRemoteModelNode:
@@ -16,6 +17,14 @@ class _FakeRemoteModelNode:
 
 class _FakeRemoteSamplerNode:
     """Fake node that consumes a model and produces a transportable latent."""
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeLatentSourceNode:
+    """Fake node that produces a transportable LATENT output."""
 
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("latent",)
@@ -712,6 +721,114 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
         }
     ]
     assert rewritten_prompt["4"]["inputs"]["text"] == ["2", 0]
+
+
+def test_rewrite_rejects_mapped_branch_that_shares_non_transportable_upstream_with_unmapped_sibling(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Mapped execution should reject sibling execute nodes that do not depend on ModalMapInput."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRemoteModelNode,
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "LatentSource": _FakeLatentSourceNode,
+                "ModalMapInput": _FakeModalMapInputNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+            {"id": 5, "properties": {"is_modal_remote": False}},
+            {"id": 6, "properties": {"is_modal_remote": True}},
+            {"id": 7, "properties": {"is_modal_remote": True}},
+            {"id": 8, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {},
+            "_meta": {"title": "Shared Model"},
+        },
+        "2": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Single Latent"},
+        },
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["2", 0]},
+            "_meta": {"title": "Unmapped Sampler"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["3", 0]},
+            "_meta": {"title": "Local Sink 1"},
+        },
+        "5": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Batch Latent Source"},
+        },
+        "6": {
+            "class_type": "ModalMapInput",
+            "inputs": {"value": ["5", 0]},
+            "_meta": {"title": "Map Input"},
+        },
+        "7": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["6", 0]},
+            "_meta": {"title": "Mapped Sampler"},
+        },
+        "8": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["7", 0]},
+            "_meta": {"title": "Local Sink 2"},
+        },
+    }
+
+    with pytest.raises(
+        api_intercept_module.ModalPromptValidationError,
+        match="Mapped remote execution cannot include execute nodes that do not depend on the Modal Map Input",
+    ):
+        api_intercept_module.rewrite_prompt_for_modal(
+            prompt=prompt,
+            workflow=workflow,
+            sync_engine=sync_engine,
+            settings=settings,
+            nodes_module=fake_nodes_module,
+        )
 
 
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(

@@ -983,6 +983,26 @@ def _build_component_plan(
             nodes_module=nodes_module,
         )
 
+    if mapped_boundary_spec is not None:
+        mapped_reachable_node_ids = _component_downstream_closure(
+            seed_node_ids={target.node_id for target in mapped_boundary_spec.targets},
+            component_node_id_set=component_node_id_set,
+            consumers=consumers,
+        )
+        invalid_execute_node_ids = sorted(output_execution_targets - mapped_reachable_node_ids)
+        if invalid_execute_node_ids:
+            invalid_node_descriptions = [
+                f"{node_id} ({prompt[node_id]['class_type']})"
+                for node_id in invalid_execute_node_ids
+                if node_id in prompt
+            ]
+            raise ModalPromptValidationError(
+                "Mapped remote execution cannot include execute nodes that do not depend on the Modal Map Input. "
+                "This graph shape currently appears when a mapped branch shares non-transportable upstream nodes with "
+                "an unmapped remote sibling branch. Unsupported execute nodes: "
+                f"{', '.join(invalid_node_descriptions or invalid_execute_node_ids)}."
+            )
+
     component = RemoteComponentPlan(
         node_ids=component_node_ids,
         representative_node_id=representative_node_id,
@@ -1029,6 +1049,29 @@ def _preview_target_node_ids(
             continue
         preview_target_node_ids.add(str(local_consumer.node_id))
     return sorted(preview_target_node_ids)
+
+
+def _component_downstream_closure(
+    *,
+    seed_node_ids: set[str],
+    component_node_id_set: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+) -> set[str]:
+    """Return component-local nodes reachable downstream from one seed set."""
+    reachable_node_ids: set[str] = set()
+    pending_node_ids = list(sorted(seed_node_ids))
+    while pending_node_ids:
+        current_node_id = pending_node_ids.pop()
+        if current_node_id in reachable_node_ids or current_node_id not in component_node_id_set:
+            continue
+        reachable_node_ids.add(current_node_id)
+        for consumer_source, consumer_targets in consumers.items():
+            if consumer_source.node_id != current_node_id:
+                continue
+            for consumer_target in consumer_targets:
+                if consumer_target.node_id in component_node_id_set:
+                    pending_node_ids.append(consumer_target.node_id)
+    return reachable_node_ids
 
 
 def _build_component_plans(
