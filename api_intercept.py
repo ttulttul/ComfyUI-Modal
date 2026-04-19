@@ -216,6 +216,22 @@ def _is_link(value: Any) -> bool:
     )
 
 
+def _iter_payload_input_strings(value: Any) -> Iterator[str]:
+    """Yield string literals nested inside one serialized prompt input value."""
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, list):
+        if len(value) == 2 and isinstance(value[0], str):
+            return
+        for item in value:
+            yield from _iter_payload_input_strings(item)
+        return
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            yield from _iter_payload_input_strings(nested_value)
+
+
 def _looks_like_workflow_node(fragment: dict[str, Any]) -> bool:
     """Return whether a JSON fragment resembles a saved ComfyUI workflow node."""
     return "id" in fragment and "properties" in fragment
@@ -1260,6 +1276,7 @@ def _build_component_payload(
     requires_volume_reload: bool,
     volume_reload_marker: str | None,
     custom_nodes_bundle: SyncedAsset | None,
+    uploaded_volume_paths: list[str],
     terminate_container_on_error: bool,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
@@ -1309,6 +1326,7 @@ def _build_component_payload(
         "extra_data": copy.deepcopy(extra_data or {}),
         "requires_volume_reload": requires_volume_reload,
         "volume_reload_marker": volume_reload_marker,
+        "uploaded_volume_paths": list(uploaded_volume_paths),
         "terminate_container_on_error": terminate_container_on_error,
         "custom_nodes_bundle": (
             custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
@@ -1336,6 +1354,36 @@ def _build_component_payload(
         volume_reload_marker,
     )
     return payload
+
+
+def _component_uploaded_volume_paths(
+    *,
+    component_prompt: dict[str, Any],
+    synced_assets: list[SyncedAsset],
+    custom_nodes_bundle: SyncedAsset | None,
+) -> list[str]:
+    """Return newly uploaded mounted-volume paths that this component can actually reference."""
+    referenced_paths: set[str] = set()
+
+    for prompt_node in component_prompt.values():
+        if not isinstance(prompt_node, dict):
+            continue
+        inputs = prompt_node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        for input_value in inputs.values():
+            for candidate_path in _iter_payload_input_strings(input_value):
+                if isinstance(candidate_path, str) and candidate_path.startswith("/"):
+                    referenced_paths.add(candidate_path)
+
+    uploaded_paths = {
+        asset.remote_path
+        for asset in synced_assets
+        if asset.uploaded and asset.remote_path in referenced_paths
+    }
+    if custom_nodes_bundle is not None and custom_nodes_bundle.uploaded:
+        uploaded_paths.add(custom_nodes_bundle.remote_path)
+    return sorted(uploaded_paths)
 
 
 def _rewrite_component_into_proxy(
@@ -1464,6 +1512,7 @@ def rewrite_prompt_for_modal(
         )
 
     synced_component_prompts: dict[str, dict[str, Any]] = {}
+    synced_assets_by_component_id: dict[str, list[SyncedAsset]] = {}
     for component in components:
         component_prompt, synced_assets = _sync_component_prompt_inputs(
             component=component,
@@ -1472,6 +1521,7 @@ def rewrite_prompt_for_modal(
             status_callback=status_callback,
         )
         synced_component_prompts[component.representative_node_id] = component_prompt
+        synced_assets_by_component_id[component.representative_node_id] = list(synced_assets)
         summary.synced_assets.extend(synced_assets)
 
     requires_volume_reload = any(asset.uploaded for asset in summary.synced_assets) or (
@@ -1499,13 +1549,19 @@ def rewrite_prompt_for_modal(
             component.representative_node_id,
             component.node_ids,
         )
+        uploaded_volume_paths = _component_uploaded_volume_paths(
+            component_prompt=synced_component_prompts[component.representative_node_id],
+            synced_assets=synced_assets_by_component_id[component.representative_node_id],
+            custom_nodes_bundle=summary.custom_nodes_bundle,
+        )
         payload = _build_component_payload(
             component=component,
             component_prompt=synced_component_prompts[component.representative_node_id],
             extra_data=extra_data,
-            requires_volume_reload=requires_volume_reload,
+            requires_volume_reload=bool(uploaded_volume_paths),
             volume_reload_marker=volume_reload_marker,
             custom_nodes_bundle=summary.custom_nodes_bundle,
+            uploaded_volume_paths=uploaded_volume_paths,
             terminate_container_on_error=resolved_settings.terminate_container_on_error,
         )
         _rewrite_component_into_proxy(

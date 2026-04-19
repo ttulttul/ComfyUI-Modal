@@ -856,6 +856,19 @@ def _materialize_remote_asset_path(value: str) -> str:
     remote_storage_root = settings.remote_storage_root.rstrip("/")
     if value.startswith(f"{remote_storage_root}/"):
         return value
+    if value.startswith("/"):
+        volume_relative_roots = (
+            "/assets/",
+            "/custom_nodes/",
+            "/hashes/",
+            "/input/",
+            "/models/",
+            "/output/",
+            "/temp/",
+            "/user/",
+        )
+        if any(value.startswith(root) for root in volume_relative_roots):
+            return f"{remote_storage_root}{value}"
     if value.startswith("/assets/"):
         return f"{remote_storage_root}{value}"
     return value
@@ -1875,6 +1888,11 @@ def _should_reload_modal_volume(payload: dict[str, Any]) -> bool:
     """Return whether this request needs the mounted Modal volume reloaded."""
     if not bool(payload.get("requires_volume_reload", True)):
         return False
+    if _payload_uploaded_volume_paths_visible(payload):
+        reload_marker = _modal_volume_reload_marker(payload)
+        if reload_marker is not None:
+            _record_modal_volume_reload_marker(reload_marker)
+        return False
     reload_marker = _modal_volume_reload_marker(payload)
     if reload_marker is None:
         return True
@@ -1965,14 +1983,13 @@ def _iter_payload_input_strings(value: Any) -> Iterator[str]:
 
 def _payload_volume_paths(payload: dict[str, Any]) -> set[Path]:
     """Return mounted-volume paths referenced by this remote payload."""
-    remote_storage_root = Path(get_settings().remote_storage_root)
-    remote_storage_root_text = str(remote_storage_root).rstrip("/")
+    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
     referenced_paths: set[Path] = set()
 
     custom_nodes_bundle = payload.get("custom_nodes_bundle")
     if isinstance(custom_nodes_bundle, str):
-        bundle_path = Path(custom_nodes_bundle)
-        if bundle_path.is_absolute():
+        bundle_path = Path(_materialize_remote_asset_path(custom_nodes_bundle))
+        if bundle_path.is_absolute() and bundle_path.resolve().is_relative_to(remote_storage_root):
             referenced_paths.add(bundle_path)
 
     prompt = payload.get("subgraph_prompt", {})
@@ -1987,11 +2004,37 @@ def _payload_volume_paths(payload: dict[str, Any]) -> set[Path]:
             continue
         for input_value in inputs.values():
             for candidate_path in _iter_payload_input_strings(input_value):
-                if candidate_path == remote_storage_root_text or candidate_path.startswith(
-                    f"{remote_storage_root_text}/"
+                materialized_path = _materialize_remote_asset_path(candidate_path)
+                materialized_path_obj = Path(materialized_path)
+                if (
+                    materialized_path_obj.is_absolute()
+                    and materialized_path_obj.resolve().is_relative_to(remote_storage_root)
                 ):
-                    referenced_paths.add(Path(candidate_path))
+                    referenced_paths.add(materialized_path_obj)
     return referenced_paths
+
+
+def _payload_uploaded_volume_paths(payload: dict[str, Any]) -> set[Path]:
+    """Return newly uploaded mounted-volume paths relevant to this payload."""
+    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
+    uploaded_paths: set[Path] = set()
+    for candidate_path in payload.get("uploaded_volume_paths", []):
+        if isinstance(candidate_path, str) and candidate_path.strip():
+            materialized_path = Path(_materialize_remote_asset_path(candidate_path))
+            if (
+                materialized_path.is_absolute()
+                and materialized_path.resolve().is_relative_to(remote_storage_root)
+            ):
+                uploaded_paths.add(materialized_path)
+    return uploaded_paths
+
+
+def _payload_uploaded_volume_paths_visible(payload: dict[str, Any]) -> bool:
+    """Return whether every newly uploaded mounted-volume path is already visible."""
+    uploaded_paths = _payload_uploaded_volume_paths(payload)
+    if not uploaded_paths:
+        return False
+    return all(path.exists() for path in uploaded_paths)
 
 
 def _payload_volume_paths_visible(payload: dict[str, Any]) -> bool:
@@ -2002,6 +2045,29 @@ def _payload_volume_paths_visible(payload: dict[str, Any]) -> bool:
     return all(path.exists() for path in referenced_paths)
 
 
+def _log_payload_volume_reload_diagnostics(
+    component_id: str,
+    payload: dict[str, Any] | None,
+    *,
+    context: str,
+) -> None:
+    """Log the mounted-volume paths relevant to one reload decision or failure."""
+    if payload is None:
+        return
+
+    uploaded_paths = sorted(str(path) for path in _payload_uploaded_volume_paths(payload))
+    referenced_paths = sorted(str(path) for path in _payload_volume_paths(payload))
+    logger.info(
+        "Modal volume reload diagnostics for component=%s context=%s uploaded_paths=%s referenced_paths=%s visible_uploaded=%s visible_referenced=%s.",
+        component_id,
+        context,
+        uploaded_paths,
+        referenced_paths,
+        _payload_uploaded_volume_paths_visible(payload),
+        _payload_volume_paths_visible(payload),
+    )
+
+
 def _reload_modal_volume_for_request(
     volume: Any,
     component_id: str,
@@ -2010,6 +2076,7 @@ def _reload_modal_volume_for_request(
 ) -> None:
     """Reload the Modal volume, retrying briefly while warm state releases open files."""
     with _timed_phase("modal_volume_reload", component=component_id):
+        diagnostics_logged = False
         for attempt_index, retry_delay_seconds in enumerate(
             _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS,
             start=1,
@@ -2030,6 +2097,13 @@ def _reload_modal_volume_for_request(
             except RuntimeError as exc:
                 if not _is_modal_volume_open_files_error(exc):
                     raise
+                if payload is not None and not diagnostics_logged:
+                    _log_payload_volume_reload_diagnostics(
+                        component_id,
+                        payload,
+                        context="open_files_retry",
+                    )
+                    diagnostics_logged = True
                 if attempt_index == len(_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS):
                     if payload is not None and _payload_volume_paths_visible(payload):
                         _emit_cloud_info(
@@ -2054,6 +2128,17 @@ def _reload_modal_volume_for_request(
 
 def _emit_modal_volume_reload_skip(component_id: Any, payload: dict[str, Any]) -> None:
     """Log why a request did not need a Modal volume reload."""
+    if _payload_uploaded_volume_paths_visible(payload):
+        _emit_cloud_info(
+            "Skipping modal_volume_reload for component=%s because all uploaded mounted-volume paths are already visible in this container.",
+            component_id,
+        )
+        _log_payload_volume_reload_diagnostics(
+            str(component_id),
+            payload,
+            context="skip_visible_uploaded_paths",
+        )
+        return
     reload_marker = _modal_volume_reload_marker(payload)
     if reload_marker is not None and _has_seen_modal_volume_reload_marker(reload_marker):
         _emit_cloud_info(
@@ -2061,10 +2146,20 @@ def _emit_modal_volume_reload_skip(component_id: Any, payload: dict[str, Any]) -
             component_id,
             reload_marker,
         )
+        _log_payload_volume_reload_diagnostics(
+            str(component_id),
+            payload,
+            context="skip_reload_marker_seen",
+        )
         return
     _emit_cloud_info(
         "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
         component_id,
+    )
+    _log_payload_volume_reload_diagnostics(
+        str(component_id),
+        payload,
+        context="skip_no_new_assets",
     )
 
 

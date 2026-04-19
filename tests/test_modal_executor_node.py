@@ -501,6 +501,40 @@ def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
     assert modal_cloud_module._should_reload_modal_volume({}) is True
 
 
+def test_modal_cloud_skips_reload_when_uploaded_paths_are_already_visible(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Visible immutable uploaded paths should not force an extra Modal volume reload."""
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    uploaded_path = storage_root / "assets" / "hash_model.safetensors"
+    uploaded_path.parent.mkdir(parents=True, exist_ok=True)
+    uploaded_path.write_bytes(b"weights")
+    recorded_markers: list[str] = []
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_record_modal_volume_reload_marker",
+        lambda marker: recorded_markers.append(marker),
+    )
+
+    payload = {
+        "requires_volume_reload": True,
+        "volume_reload_marker": "marker-1",
+        "uploaded_volume_paths": ["/assets/hash_model.safetensors"],
+    }
+
+    assert modal_cloud_module._should_reload_modal_volume(payload) is False
+    assert recorded_markers == ["marker-1"]
+
+
 def test_modal_cloud_schedules_container_exit_for_remote_failures(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -733,11 +767,11 @@ def test_modal_cloud_proceeds_when_referenced_volume_paths_are_already_visible(
     )
 
     payload = {
-        "custom_nodes_bundle": str(bundle_path),
+        "custom_nodes_bundle": "/custom_nodes/hash_bundle.zip",
         "subgraph_prompt": {
             "1": {
                 "class_type": "CheckpointLoaderSimple",
-                "inputs": {"ckpt_name": str(asset_path)},
+                "inputs": {"ckpt_name": "/assets/hash_model.safetensors"},
             }
         },
     }
@@ -759,6 +793,76 @@ def test_modal_cloud_proceeds_when_referenced_volume_paths_are_already_visible(
     )
     assert sleep_calls == list(
         modal_cloud_module._MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS[1:]
+    )
+
+
+def test_modal_cloud_logs_volume_reload_diagnostics_for_open_file_retries(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Open-file retries should log which uploaded and referenced volume paths matter."""
+
+    class FakeVolume:
+        """Simple Modal volume double that always fails with open files."""
+
+        def reload(self) -> None:
+            """Always fail with the same open-file reload error."""
+            raise RuntimeError("there are open files preventing the operation")
+
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    uploaded_path = storage_root / "assets" / "missing_model.safetensors"
+    logged_messages: list[tuple[str, tuple[Any, ...]]] = []
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_prepare_for_modal_volume_reload",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_sleep_before_modal_volume_reload_retry",
+        lambda delay_seconds: None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module.logger,
+        "info",
+        lambda message, *args: logged_messages.append((message, args)),
+    )
+
+    payload = {
+        "uploaded_volume_paths": ["/assets/missing_model.safetensors"],
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": "/assets/missing_model.safetensors"},
+            }
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="open files"):
+        modal_cloud_module._reload_modal_volume_for_request(
+            FakeVolume(),
+            "component-1",
+            payload=payload,
+        )
+
+    assert any(
+        "Modal volume reload diagnostics for component=%s context=%s uploaded_paths=%s referenced_paths=%s visible_uploaded=%s visible_referenced=%s."
+        in message
+        and args[0] == "component-1"
+        and args[1] == "open_files_retry"
+        and args[2] == [str(uploaded_path)]
+        and args[3] == [str(uploaded_path)]
+        and args[4] is False
+        and args[5] is False
+        for message, args in logged_messages
     )
 
 
