@@ -2164,6 +2164,38 @@ def _emit_modal_volume_reload_skip(component_id: Any, payload: dict[str, Any]) -
     )
 
 
+def _prepare_warm_container_for_request(volume: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Prime one RemoteEngine container for a request before the first real execution payload arrives."""
+    component_id = str(payload.get("component_id") or "modal-warmup")
+    reload_marker = _modal_volume_reload_marker(payload)
+    needs_volume_reload = _should_reload_modal_volume(payload)
+    with _timed_phase("remote_engine_warmup", component=component_id):
+        if needs_volume_reload:
+            _reload_modal_volume_for_request(
+                volume,
+                component_id,
+                reload_marker=reload_marker,
+                payload=payload,
+            )
+        else:
+            _emit_modal_volume_reload_skip(component_id, payload)
+        custom_nodes_bundle = payload.get("custom_nodes_bundle")
+        if isinstance(custom_nodes_bundle, str) and custom_nodes_bundle.strip():
+            custom_nodes_root = _extract_custom_nodes_bundle(custom_nodes_bundle)
+            if custom_nodes_root is not None:
+                _register_custom_nodes_root(custom_nodes_root)
+        return {
+            "component_id": component_id,
+            "task_id": os.getenv("MODAL_TASK_ID"),
+            "warmup_slot_index": (
+                int(payload["warmup_slot_index"])
+                if payload.get("warmup_slot_index") is not None
+                else None
+            ),
+            "reloaded_volume": needs_volume_reload,
+        }
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     app = modal.App(settings.app_name)
@@ -2256,6 +2288,11 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             except Exception as exc:
                 _maybe_schedule_container_termination_on_error(payload, exc)
                 raise
+
+        @modal.method()
+        def warmup_for_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+            """Prime the current or a newly started Modal container for one prompt."""
+            return _prepare_warm_container_for_request(vol, payload)
 
         @modal.method()
         def execute_payload_stream(

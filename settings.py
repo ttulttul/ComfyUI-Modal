@@ -37,6 +37,7 @@ class ModalSyncSettings:
     min_containers: int = 0
     max_containers: int | None = None
     buffer_containers: int | None = None
+    enable_proactive_warmup: bool = True
 
 
 def _read_path_env(name: str) -> Path | None:
@@ -177,6 +178,7 @@ def get_settings() -> ModalSyncSettings:
         min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),
         max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),
         buffer_containers=_read_optional_int_env("COMFY_MODAL_BUFFER_CONTAINERS"),
+        enable_proactive_warmup=_read_bool_env("COMFY_MODAL_ENABLE_PROACTIVE_WARMUP") is not False,
     )
     logger.debug("Resolved Modal-Sync settings: %s", settings)
     return settings

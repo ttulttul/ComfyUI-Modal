@@ -188,6 +188,8 @@ Remote runtime behavior:
 - Mapped remote execution now carries a per-request volume reload marker, so one warm container only performs `vol.reload()` once for that uploaded asset snapshot even if the local scheduler fans the component out into many per-item Modal calls.
 - Volume reload dedupe is now request-wide, not component-wide. If one queued workflow rewrites into several remote components, they all share the same reload marker so a warm container only reloads once for that overall synced asset set instead of once per component.
 - Reload eligibility is now narrower than that request-wide marker. Each payload carries only the newly uploaded mounted-volume paths it can actually reference, so a component that does not touch a fresh asset no longer forces a reload just because some other component in the same queued workflow uploaded one.
+- Queue-time prompt rewrite now emits a best-effort staged parallelism plan for the remote component DAG. Modal-Sync uses that estimate to start background container warmup as soon as assets are synced instead of waiting for the first proxy node to hit Modal.
+- When a mapped or implicitly batched component finally hydrates its input batch, Modal-Sync upgrades that queue-time estimate with the exact per-item lane count and tops up background warmup again. That keeps early warmup conservative when fan-out size is unknown, but still lets the runtime race ahead of the heavy component once the true item count is available.
 - If `vol.reload()` still reports open files after that bounded retry window, the worker now checks whether the payload's referenced mounted-volume paths are already visible on disk. When they are, Modal-Sync proceeds and records the reload marker instead of failing on a redundant reload.
 - The worker now logs mounted-volume reload diagnostics when open-file retries start, including the uploaded paths and referenced paths for that payload, so you can see exactly which files were relevant when reload got stuck behind open handles.
 - Custom-node bundle sync now treats the hash-addressed bundle path itself as authoritative. If ComfyUI crashes after uploading `/custom_nodes/<hash>_custom_nodes_bundle.zip` but before writing its marker, the next run backfills the marker and reuses the existing bundle instead of trying to rebuild or reupload it.
@@ -350,6 +352,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_MAX_CONTAINERS`: Optional upper bound on simultaneously scaled Modal containers.
 - `COMFY_MODAL_MAX_CONTAINERS` also caps the local mapped-execution worker queue driven by `ModalMapInput`.
 - `COMFY_MODAL_BUFFER_CONTAINERS`: Optional number of spare warm containers Modal should try to keep ready above current load.
+- `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP`: Start best-effort background warmup RPCs based on queue-time and runtime parallelism estimates. Default: `true`.
 
 ## Development
 

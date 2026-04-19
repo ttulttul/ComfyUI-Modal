@@ -243,6 +243,85 @@ def test_remote_modal_call_worker_count_honors_max_container_limit(
         remote_modal_app_module.get_settings.cache_clear()
 
 
+def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Prompt-scoped proactive warmup should only schedule each target slot once."""
+    submitted_tasks: list[tuple[Any, tuple[Any, ...]]] = []
+
+    class FakeExecutor:
+        """Minimal executor that records submitted warmup jobs."""
+
+        def submit(self, fn: Any, *args: Any) -> None:
+            """Capture one scheduled warmup task without running it."""
+            submitted_tasks.append((fn, args))
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module, "_REMOTE_MODAL_WARMUP_EXECUTOR", FakeExecutor())
+    remote_modal_app_module.get_settings.cache_clear()
+    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
+
+    try:
+        warmup_request = {"prompt_id": "prompt-1", "component_id": "component-1"}
+        first_target = remote_modal_app_module.ensure_remote_warm_capacity(
+            warmup_request,
+            warmup_target=2,
+            reason="queue_time",
+        )
+        second_target = remote_modal_app_module.ensure_remote_warm_capacity(
+            warmup_request,
+            warmup_target=2,
+            reason="queue_time_repeat",
+        )
+        third_target = remote_modal_app_module.ensure_remote_warm_capacity(
+            warmup_request,
+            warmup_target=4,
+            reason="runtime_top_up",
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert first_target == 2
+    assert second_target == 2
+    assert third_target == 4
+    assert len(submitted_tasks) == 4
+    assert [args[1] for _fn, args in submitted_tasks] == [0, 1, 2, 3]
+
+
+def test_register_exact_component_parallelism_refines_prompt_target(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped fan-out should raise the prompt-wide warmup target once exact item count is known."""
+    monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "6")
+    remote_modal_app_module.get_settings.cache_clear()
+    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
+
+    try:
+        payload = {
+            "prompt_id": "prompt-2",
+            "component_id": "component-a",
+            "extra_data": {
+                "modal": {
+                    "component_execution_stages": [["component-a", "component-b"], ["component-c"]],
+                    "mapped_component_ids": ["component-a"],
+                    "estimated_max_parallel_requests": 2,
+                }
+            },
+        }
+        refined_target = remote_modal_app_module._register_exact_component_parallelism(payload, 5)
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert refined_target == 6
+
+
 def test_stable_modal_cloud_entry_imports_without_modal_sdk(
     modal_cloud_module: Any,
 ) -> None:
@@ -1108,6 +1187,56 @@ def test_modal_cloud_prewarms_restored_runtime(
     modal_cloud_module._prewarm_restored_runtime()
 
     assert calls == ["runtime:None", "execution"]
+
+
+def test_modal_cloud_prepares_warm_container_for_request(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Warmup requests should prime volume visibility and extracted custom nodes without executing a payload."""
+    calls: list[tuple[str, Any]] = []
+
+    monkeypatch.setattr(modal_cloud_module, "_should_reload_modal_volume", lambda payload: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_reload_modal_volume_for_request",
+        lambda volume, component_id, reload_marker=None, payload=None: calls.append(
+            ("reload", component_id, reload_marker, payload.get("uploaded_volume_paths"))
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_extract_custom_nodes_bundle",
+        lambda bundle_path: Path("/tmp/extracted-bundle") if bundle_path else None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_register_custom_nodes_root",
+        lambda custom_nodes_root: calls.append(("register", custom_nodes_root)),
+    )
+    monkeypatch.setenv("MODAL_TASK_ID", "task-123")
+
+    result = modal_cloud_module._prepare_warm_container_for_request(
+        object(),
+        {
+            "component_id": "component-1",
+            "volume_reload_marker": "marker-1",
+            "uploaded_volume_paths": ["/storage/example.bin"],
+            "custom_nodes_bundle": "custom_nodes_bundle.zip",
+            "warmup_slot_index": 2,
+        },
+    )
+
+    assert calls == [
+        ("reload", "component-1", "marker-1", ["/storage/example.bin"]),
+        ("register", Path("/tmp/extracted-bundle")),
+    ]
+    assert result == {
+        "component_id": "component-1",
+        "task_id": "task-123",
+        "warmup_slot_index": 2,
+        "reloaded_volume": True,
+    }
 
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
