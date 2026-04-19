@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
 import threading
 import time
@@ -946,6 +947,86 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", None)]
+
+
+def test_load_modal_cloud_module_reloads_stale_partial_module(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Stale partially imported cloud modules should be discarded and reloaded."""
+    original_module = sys.modules.get(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME)
+    stale_module = types.SimpleNamespace(app=None)
+    sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = stale_module
+
+    loaded_module = types.SimpleNamespace(app="fresh-app")
+
+    class FakeLoader:
+        """Populate the fresh replacement module during exec."""
+
+        def create_module(self, spec: Any) -> None:
+            """Use the default module creation path."""
+            del spec
+            return None
+
+        def exec_module(self, module: Any) -> None:
+            """Install the expected deployable app onto the reloaded module."""
+            module.app = loaded_module.app
+
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: importlib.util.spec_from_loader(
+            remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+            FakeLoader(),
+        ),
+    )
+    try:
+        reloaded_module = remote_modal_app_module._load_modal_cloud_module()
+    finally:
+        sys.modules.pop(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME, None)
+        if original_module is not None:
+            sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = original_module
+
+    assert reloaded_module is not stale_module
+    assert getattr(reloaded_module, "app", None) == "fresh-app"
+
+
+def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Failed cloud-module imports should not leave a poisoned cache entry behind."""
+    original_module = sys.modules.get(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME)
+
+    class FakeLoader:
+        """Raise during module execution to simulate a partial import failure."""
+
+        def create_module(self, spec: Any) -> None:
+            """Use the default module creation path."""
+            del spec
+            return None
+
+        def exec_module(self, module: Any) -> None:
+            """Fail while the module is being initialized."""
+            module.app = None
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: importlib.util.spec_from_loader(
+            remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+            FakeLoader(),
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            remote_modal_app_module._load_modal_cloud_module()
+        assert remote_modal_app_module._MODAL_CLOUD_MODULE_NAME not in sys.modules
+    finally:
+        sys.modules.pop(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME, None)
+        if original_module is not None:
+            sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = original_module
 
 
 def test_remote_modal_consumes_streamed_progress_and_result(

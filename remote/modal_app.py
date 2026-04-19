@@ -477,8 +477,15 @@ def _modal_lookup_error_types() -> tuple[type[BaseException], ...]:
 
 def _load_modal_cloud_module() -> Any:
     """Load the stable Modal cloud entry module under a valid Python name."""
-    if _MODAL_CLOUD_MODULE_NAME in sys.modules:
-        return sys.modules[_MODAL_CLOUD_MODULE_NAME]
+    existing_module = sys.modules.get(_MODAL_CLOUD_MODULE_NAME)
+    if existing_module is not None and getattr(existing_module, "app", None) is not None:
+        return existing_module
+    if existing_module is not None:
+        logger.warning(
+            "Discarding partially initialized Modal cloud module %s before reload.",
+            _MODAL_CLOUD_MODULE_NAME,
+        )
+        sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
 
     cloud_module_path = Path(__file__).resolve().parents[1] / f"{_MODAL_CLOUD_MODULE_NAME}.py"
     module_spec = importlib.util.spec_from_file_location(
@@ -492,7 +499,11 @@ def _load_modal_cloud_module() -> Any:
 
     cloud_module = importlib.util.module_from_spec(module_spec)
     sys.modules[_MODAL_CLOUD_MODULE_NAME] = cloud_module
-    module_spec.loader.exec_module(cloud_module)
+    try:
+        module_spec.loader.exec_module(cloud_module)
+    except BaseException:
+        sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
+        raise
     return cloud_module
 
 

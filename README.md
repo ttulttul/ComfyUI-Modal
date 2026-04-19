@@ -78,6 +78,7 @@ Remote mode requires:
 - `COMFY_MODAL_EXECUTION_MODE` set to something other than `local`
 
 The normal remote path is deployed-app lookup by name. On first remote use, the extension can auto-deploy the stable cloud entrypoint from [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py) if the configured app does not exist yet.
+If a previous attempt imported that cloud entrypoint only partially before failing, the loader now discards the stale cached module and retries the import cleanly before auto-deploy.
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=remote
