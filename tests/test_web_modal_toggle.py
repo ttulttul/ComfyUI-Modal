@@ -136,6 +136,8 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "detail.lane_id != null" in source
     assert "clearNodeProgressLane(progressNodeId, promptId, String(detail.lane_id));" in source
     assert "setNodeProgressLane(" in source
+    assert "function deriveRemoteNodePhase(phase, hasLiveProgress)" in source
+    assert "isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === nodeId(node)," in source
     assert 'const panelY = node.size[1] + 6 / scale;' in source
     assert 'ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);' in source
     assert 'const headerText = hasAggregateProgress' in source
@@ -152,6 +154,9 @@ def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     assert 'const badgeText = hasBatchBadge' in source
     assert 'const badgeY = panelY + panelPaddingY;' in source
     assert 'let laneY = barY;' in source
+    assert "laneNodeIdsByLane: new Map()," in source
+    assert "function deleteNodeProgressLane(nodeIdValue, promptId, laneId)" in source
+    assert "promptState.laneNodeIdsByLane.set(safeLaneId, safeNodeIdValue);" in source
 
 
 def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:

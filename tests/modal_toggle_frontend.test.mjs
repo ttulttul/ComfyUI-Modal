@@ -45,6 +45,7 @@ const transformedSource = `${[
   "  handleModalProgress,",
   "  handleExecutionPhase,",
   "  clearPromptRemoteStates,",
+  "  getRemoteVisualState,",
   "  modalNodeStates,",
   "  modalNodeProgress,",
   "  modalNodeProgressLanes,",
@@ -115,9 +116,89 @@ modalToggle.handleModalProgress({
     lane_id: "0",
   },
 });
-assert.equal(modalToggle.modalPromptStates.get("prompt-c")?.activeNodeId, "12");
+assert.equal(modalToggle.modalPromptStates.get("prompt-c")?.activeNodeId ?? null, null);
 assert.equal(modalToggle.modalNodeStates.get("10")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeStates.get("11")?.phase, modalToggle.STATE_READY);
-assert.equal(modalToggle.modalNodeStates.get("12")?.phase, modalToggle.STATE_ACTIVE);
+assert.equal(modalToggle.modalNodeStates.get("12")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeProgressLanes.has("11"), false);
 assert.equal(modalToggle.modalNodeProgressLanes.get("12")?.lanes.get("0")?.value, 3);
+assert.equal(modalToggle.getRemoteVisualState({ id: "12" })?.phase, modalToggle.STATE_ACTIVE);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-d", ["10", "11"], [
+  {
+    representative_node_id: "10",
+    node_ids: ["10", "11"],
+  },
+]);
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-d",
+    node_id: "10",
+    display_node_id: "10",
+    real_node_id: "10",
+    value: 2,
+    max: 8,
+    lane_id: "0",
+  },
+});
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-d",
+    node_id: "10",
+    display_node_id: "10",
+    real_node_id: "11",
+    value: 5,
+    max: 9,
+    lane_id: "1",
+  },
+});
+assert.equal(modalToggle.getRemoteVisualState({ id: "10" })?.phase, modalToggle.STATE_ACTIVE);
+assert.equal(modalToggle.getRemoteVisualState({ id: "11" })?.phase, modalToggle.STATE_ACTIVE);
+assert.equal(modalToggle.modalNodeStates.get("10")?.phase, modalToggle.STATE_READY);
+assert.equal(modalToggle.modalNodeStates.get("11")?.phase, modalToggle.STATE_READY);
+assert.equal(modalToggle.modalNodeProgressLanes.get("10")?.lanes.get("0")?.value, 2);
+assert.equal(modalToggle.modalNodeProgressLanes.get("11")?.lanes.get("1")?.value, 5);
+
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-d",
+    node_id: "10",
+    display_node_id: "10",
+    real_node_id: "11",
+    value: 6,
+    max: 9,
+    lane_id: "0",
+  },
+});
+assert.equal(modalToggle.modalNodeProgressLanes.get("10")?.lanes.has("0") ?? false, false);
+assert.equal(modalToggle.modalNodeProgressLanes.get("11")?.lanes.get("0")?.value, 6);
+
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-d",
+    node_id: "10",
+    display_node_id: "10",
+    real_node_id: "11",
+    value: 0,
+    max: 1,
+    lane_id: "1",
+    clear: true,
+  },
+});
+assert.equal(modalToggle.getRemoteVisualState({ id: "10" })?.phase, modalToggle.STATE_READY);
+assert.equal(modalToggle.getRemoteVisualState({ id: "11" })?.phase, modalToggle.STATE_ACTIVE);
+
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-d",
+    node_id: "10",
+    display_node_id: "10",
+    real_node_id: "11",
+    value: 0,
+    max: 1,
+    lane_id: "0",
+    clear: true,
+  },
+});
+assert.equal(modalToggle.getRemoteVisualState({ id: "11" })?.phase, modalToggle.STATE_READY);

@@ -396,7 +396,7 @@ function refreshModalUiAfterVisibilityChange() {
 /**
  * Return the prompt metadata bucket, creating it if needed.
  * @param {string} promptId
- * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]> }}
+ * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, laneNodeIdsByLane: Map<string, string> }}
  */
 function ensurePromptState(promptId) {
   if (!modalPromptStates.has(promptId)) {
@@ -406,6 +406,7 @@ function ensurePromptState(promptId) {
       componentsByRepresentative: new Map(),
       componentNodeIdsByMember: new Map(),
       descendantNodeIdsByAncestor: new Map(),
+      laneNodeIdsByLane: new Map(),
       activeNodeId: null,
       hasStreamedProgress: false,
     });
@@ -678,6 +679,83 @@ function setPromptActiveNode(promptId, activeNodeId) {
 }
 
 /**
+ * Return the numeric progress payload for one node when it belongs to the prompt.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @returns {{ promptId: string, value: number, max: number, updatedAt: number } | null}
+ */
+function nodeProgressState(nodeIdValue, promptId) {
+  const progressState = modalNodeProgress.get(String(nodeIdValue)) ?? null;
+  return progressState?.promptId === promptId ? progressState : null;
+}
+
+/**
+ * Return sorted per-lane progress payloads for one node when they belong to the prompt.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @returns {{ laneId: string, value: number, max: number, itemIndex: number | null, updatedAt: number }[]}
+ */
+function nodeProgressLanes(nodeIdValue, promptId) {
+  const progressLaneState = modalNodeProgressLanes.get(String(nodeIdValue)) ?? null;
+  if (progressLaneState?.promptId !== promptId) {
+    return [];
+  }
+  return Array.from(progressLaneState.lanes.values()).sort(
+    (left, right) => Number(left.laneId) - Number(right.laneId),
+  );
+}
+
+/**
+ * Return whether one node currently has live numeric or per-lane progress.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function hasLiveNodeProgress(nodeIdValue, promptId) {
+  return (
+    Boolean(nodeProgressState(nodeIdValue, promptId)) ||
+    nodeProgressLanes(nodeIdValue, promptId).length > 0
+  );
+}
+
+/**
+ * Derive the displayed node phase from the stored phase plus live progress.
+ * @param {string | undefined} phase
+ * @param {boolean} hasLiveProgress
+ * @returns {string | undefined}
+ */
+function deriveRemoteNodePhase(phase, hasLiveProgress) {
+  if ([STATE_ERROR, STATE_SETUP].includes(phase ?? "")) {
+    return phase;
+  }
+  if (hasLiveProgress) {
+    return STATE_ACTIVE;
+  }
+  return phase;
+}
+
+/**
+ * Remove one worker lane from a node and its visible ancestors without triggering a redraw.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @param {string} laneId
+ */
+function deleteNodeProgressLane(nodeIdValue, promptId, laneId) {
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+
+  for (const progressNodeId of progressNodeIds) {
+    const laneState = modalNodeProgressLanes.get(progressNodeId);
+    if (!laneState || laneState.promptId !== promptId) {
+      continue;
+    }
+    laneState.lanes.delete(laneId);
+    if (laneState.lanes.size === 0) {
+      modalNodeProgressLanes.delete(progressNodeId);
+    }
+  }
+}
+
+/**
  * Remove stored numeric progress for one node and its visible ancestors.
  * @param {string} nodeIdValue
  * @param {string | undefined} promptId
@@ -772,9 +850,16 @@ function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, ite
   if (!safeLaneId) {
     return;
   }
+  const safeNodeIdValue = String(nodeIdValue);
   const safeMaxValue = Math.max(1, Number(maxValue) || 1);
   const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
-  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+  const promptState = ensurePromptState(promptId);
+  const previousNodeId = promptState.laneNodeIdsByLane.get(safeLaneId);
+  if (previousNodeId && previousNodeId !== safeNodeIdValue) {
+    deleteNodeProgressLane(previousNodeId, promptId, safeLaneId);
+  }
+  promptState.laneNodeIdsByLane.set(safeLaneId, safeNodeIdValue);
+  const progressNodeIds = [safeNodeIdValue, ...ancestorNodeIds(safeNodeIdValue)];
 
   for (const progressNodeId of progressNodeIds) {
     if (!shouldApplyPromptState(progressNodeId, promptId)) {
@@ -813,18 +898,12 @@ function clearNodeProgressLane(nodeIdValue, promptId, laneId) {
   if (!safeLaneId) {
     return;
   }
-  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
-
-  for (const progressNodeId of progressNodeIds) {
-    const laneState = modalNodeProgressLanes.get(progressNodeId);
-    if (!laneState || laneState.promptId !== promptId) {
-      continue;
-    }
-    laneState.lanes.delete(safeLaneId);
-    if (laneState.lanes.size === 0) {
-      modalNodeProgressLanes.delete(progressNodeId);
-    }
+  const safeNodeIdValue = String(nodeIdValue);
+  const promptState = modalPromptStates.get(promptId);
+  if (promptState?.laneNodeIdsByLane.get(safeLaneId) === safeNodeIdValue) {
+    promptState.laneNodeIdsByLane.delete(safeLaneId);
   }
+  deleteNodeProgressLane(safeNodeIdValue, promptId, safeLaneId);
 
   ensureAnimationLoop();
   app.graph?.setDirtyCanvas(true, true);
@@ -1163,20 +1242,17 @@ function getRemoteVisualState(node) {
     return state;
   }
   const promptState = modalPromptStates.get(state.promptId);
-  const progressState = modalNodeProgress.get(nodeId(node)) ?? null;
-  const progressLaneState = modalNodeProgressLanes.get(nodeId(node)) ?? null;
+  const progressState = nodeProgressState(nodeId(node), state.promptId);
+  const progressLanes = nodeProgressLanes(nodeId(node), state.promptId);
   const batchProgressState = modalNodeBatchProgress.get(nodeId(node)) ?? null;
+  const hasLiveProgress = hasLiveNodeProgress(nodeId(node), state.promptId);
   return {
     ...state,
-    isActiveRemoteNode: promptState?.activeNodeId === nodeId(node),
-    progress: progressState?.promptId === state.promptId ? progressState : null,
+    phase: deriveRemoteNodePhase(state.phase, hasLiveProgress),
+    isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === nodeId(node),
+    progress: progressState,
     batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,
-    progressLanes:
-      progressLaneState?.promptId === state.promptId
-        ? Array.from(progressLaneState.lanes.values()).sort(
-            (left, right) => Number(left.laneId) - Number(right.laneId),
-          )
-        : [],
+    progressLanes,
   };
 }
 
@@ -1515,13 +1591,14 @@ function handleModalProgress(event) {
     setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
     return;
   }
-  if (readyNodeIds.length > 0) {
-    setNodesPhase(readyNodeIds, STATE_READY, promptId);
-  }
-  setPromptActiveNode(promptId, progressNodeId);
   setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
-  setNodesPhase([progressNodeId], STATE_ACTIVE, promptId);
   if (detail.lane_id != null) {
+    setPromptActiveNode(promptId, null);
+    if (componentNodeIds?.length) {
+      setNodesPhase(componentNodeIds, STATE_READY, promptId);
+    } else {
+      setNodesPhase([progressNodeId], STATE_READY, promptId);
+    }
     if (detail.clear) {
       clearNodeProgressLane(progressNodeId, promptId, String(detail.lane_id));
       return;
@@ -1536,6 +1613,11 @@ function handleModalProgress(event) {
     );
     return;
   }
+  if (readyNodeIds.length > 0) {
+    setNodesPhase(readyNodeIds, STATE_READY, promptId);
+  }
+  setPromptActiveNode(promptId, progressNodeId);
+  setNodesPhase([progressNodeId], STATE_ACTIVE, promptId);
   setNodeProgress(
     progressNodeId,
     promptId,
