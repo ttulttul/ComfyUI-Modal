@@ -264,6 +264,11 @@ def _join_latent_batches(values: Sequence[Any]) -> Any:
     return merged
 
 
+def _join_mapped_values_as_list(values: Sequence[Any]) -> list[Any]:
+    """Return mapped outputs as an ordered Python list."""
+    return list(values)
+
+
 def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> Any:
     """Reassemble ordered per-item mapped outputs into one proxy output value."""
     if not values:
@@ -280,7 +285,15 @@ def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> An
 
     normalized_io_type = str(io_type)
     if normalized_io_type == "LATENT":
-        return _join_latent_batches(values)
+        try:
+            return _join_latent_batches(values)
+        except RuntimeError as exc:
+            logger.info(
+                "Falling back to list aggregation for mapped LATENT outputs because batch concatenation "
+                "failed: %s",
+                exc,
+            )
+            return _join_mapped_values_as_list(values)
 
     try:
         torch = _import_torch()
@@ -288,6 +301,15 @@ def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> An
         torch = None
 
     if torch is not None and all(isinstance(value, torch.Tensor) for value in values):
-        return torch.cat(list(values), dim=0)
+        try:
+            return torch.cat(list(values), dim=0)
+        except RuntimeError as exc:
+            logger.info(
+                "Falling back to list aggregation for mapped %s outputs because tensor concatenation "
+                "failed: %s",
+                normalized_io_type,
+                exc,
+            )
+            return _join_mapped_values_as_list(values)
 
-    return list(values)
+    return _join_mapped_values_as_list(values)

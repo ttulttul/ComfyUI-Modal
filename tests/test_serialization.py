@@ -101,3 +101,27 @@ def test_split_and_join_latent_batch_for_mapped_execution(serialization_module: 
     assert all(item["samples"].shape[0] == 1 for item in split_items)
     assert torch.equal(rejoined["samples"], latent["samples"])
     assert rejoined["batch_index"] == [0, 1, 2]
+
+
+def test_join_mapped_latents_falls_back_to_list_when_shapes_differ(
+    serialization_module: Any,
+) -> None:
+    """Mapped LATENT outputs should stay ordered as a list when batch concatenation is impossible."""
+    torch = pytest.importorskip("torch")
+    latents = [
+        {
+            "samples": torch.zeros((1, 4, 32, 32), dtype=torch.float32),
+            "batch_index": [0],
+        },
+        {
+            "samples": torch.zeros((1, 4, 35, 35), dtype=torch.float32),
+            "batch_index": [1],
+        },
+    ]
+
+    rejoined = serialization_module.join_mapped_values(latents, "LATENT", is_list=False)
+
+    assert isinstance(rejoined, list)
+    assert len(rejoined) == 2
+    assert rejoined[0]["samples"].shape == (1, 4, 32, 32)
+    assert rejoined[1]["samples"].shape == (1, 4, 35, 35)
