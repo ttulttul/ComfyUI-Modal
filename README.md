@@ -33,6 +33,76 @@
 6. Boundary inputs are serialized, referenced assets are synced, and the component executes locally or remotely.
 7. Exported boundary outputs are deserialized back into normal ComfyUI values for the rest of the graph.
 
+The list above is the shortest accurate summary. If you want the execution path in a more algorithmic form, the pipeline below follows the same request from the frontend toggle through queue-time rewrite, remote dispatch, remote execution, and reintegration into the local graph.
+
+### Remote Execution Pipeline
+
+- **1. Frontend queue interception**
+  - The user marks workflow nodes with `Run on Modal`.
+  - The frontend intercepts the normal queue action.
+  - It sends the prompt and workflow metadata to `POST /modal/queue_prompt`.
+
+- **2. Queue-time rewrite on the local ComfyUI server**
+  1. Read `extra_pnginfo.workflow` and find nodes marked for remote execution.
+  2. Expand the remote set upstream when required by non-transportable inputs.
+  3. Partition the marked graph into transport-aware remote components.
+  4. Validate that each component boundary only uses supported transport types.
+  5. Sync referenced assets to storage.
+     - Model files are mirrored into remote storage.
+     - The `custom_nodes` bundle may also be synced.
+  6. Build a payload for each component.
+     - Include the subgraph prompt.
+     - Include boundary input specs.
+     - Include boundary output specs.
+     - Include execute target node ids.
+     - Include asset and volume-reload metadata.
+  7. Rewrite each remote component into a single dynamic Modal proxy node.
+  8. Submit the rewritten prompt into ComfyUI's normal execution queue.
+
+- **3. Local execution reaches a proxy node**
+  - Local nodes execute normally until a rewritten Modal proxy node is reached.
+  - The proxy node serializes its boundary inputs.
+  - It checks the payload kind.
+    - If the payload is a normal remote component, it dispatches a `subgraph` payload.
+    - If the payload uses `ModalMapInput`, it dispatches a `mapped_subgraph` payload and fans out per-item executions.
+
+- **4. Dispatch decision**
+  1. Check `COMFY_MODAL_EXECUTION_MODE`.
+  2. If execution mode is `local`, or the Modal SDK is unavailable:
+     - Execute the same payload locally in-process.
+  3. Otherwise:
+     - Look up the deployed Modal `RemoteEngine`.
+     - If lookup fails:
+       1. Try first-run auto-deploy.
+       2. If allowed, fall back to ephemeral `app.run()`.
+     - Invoke the remote payload.
+       - Prefer `execute_payload_stream` when available.
+       - Otherwise use `execute_payload`.
+
+- **5. Remote execution inside the Modal container**
+  1. Optionally reload the Modal volume if newly uploaded assets require it.
+  2. Extract the synced `custom_nodes` bundle if present.
+  3. Initialize the ComfyUI runtime.
+  4. Deserialize the boundary inputs.
+  5. Inject those inputs into the remote subgraph prompt.
+  6. Run `PromptExecutor` for the component's `execute_node_ids`.
+  7. Collect the declared boundary outputs.
+  8. Serialize the outputs for transport back to the caller.
+
+- **6. Streaming and local UI updates**
+  - While the remote component runs, streamed events may be sent back.
+    - Status changes
+    - Numeric progress
+    - Executed UI payloads
+    - Preview images
+  - The local frontend updates node overlays and global status from those events.
+
+- **7. Return to the local workflow**
+  1. The proxy node receives the serialized result.
+  2. It deserializes the returned outputs.
+  3. It exposes those outputs as normal ComfyUI node outputs.
+  4. Downstream local nodes continue executing normally.
+
 ## Installation
 
 Install this repository under ComfyUI's `custom_nodes/` directory:
@@ -256,8 +326,19 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 ## Development
 
 - Manage the project with `uv`.
-- Run the test suite with `uv run pytest`.
-- [`pyproject.toml`](pyproject.toml) provides pytest discovery configuration for `uv`.
+- Install test dependencies with `uv sync --group test`.
+- The test dependency group includes the local packages this extension needs directly plus the minimum runtime packages required to import a ComfyUI checkout during pytest.
+- Tests look for ComfyUI in `COMFYUI_ROOT` first, then fall back to `~/git/ComfyUI`.
+- To run tests against a temporary checkout, clone ComfyUI somewhere disposable and point `COMFYUI_ROOT` at it.
+
+```bash
+git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /tmp/comfyui-modal-test/ComfyUI
+UV_PROJECT_ENVIRONMENT=/tmp/comfyui-modal-test-env uv sync --group test
+COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
+  /tmp/comfyui-modal-test-env/bin/python -m pytest
+```
+
+- `uv run pytest` should also work in a normal environment once the `test` dependency group has been synced into the active project environment.
 - The repository is now structured as a ComfyUI Registry node pack with registry metadata in [`pyproject.toml`](pyproject.toml) and a publish workflow in [`.github/workflows/publish_action.yml`](.github/workflows/publish_action.yml).
 - Before publishing, create a Comfy Registry publisher and API key, then store the token in the GitHub Actions secret `REGISTRY_ACCESS_TOKEN`.
 - The registry pack name is `modal-sync`, the display name is `Modal Sync`, and the current publisher id is set to `ttulttul` to match the GitHub origin owner.
