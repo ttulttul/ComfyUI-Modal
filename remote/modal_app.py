@@ -549,6 +549,9 @@ def _emit_local_modal_progress(
     value: float,
     max_value: float,
     display_node_id: str | None = None,
+    lane_id: str | None = None,
+    clear: bool = False,
+    item_index: int | None = None,
 ) -> None:
     """Forward remote numeric node progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -566,6 +569,12 @@ def _emit_local_modal_progress(
     }
     if display_node_id is not None:
         payload["display_node_id"] = display_node_id
+    if lane_id is not None:
+        payload["lane_id"] = lane_id
+    if clear:
+        payload["clear"] = True
+    if item_index is not None:
+        payload["item_index"] = int(item_index)
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 
@@ -852,16 +861,22 @@ def _consume_remote_payload_stream(
         if event_kind == "progress":
             event_type = str(stream_event.get("event_type", ""))
             if event_type == "node_progress":
-                if suppress_status_stream:
+                lane_id = (
+                    str(payload["mapped_progress_lane_id"])
+                    if payload.get("mapped_progress_lane_id") is not None
+                    else None
+                )
+                if suppress_status_stream and lane_id is None:
                     continue
                 reported_node_id = stream_event.get("node_id")
                 if reported_node_id is not None:
                     logger.debug(
-                        "Forwarding streamed Modal node progress for component=%s node_id=%s value=%s max=%s.",
+                        "Forwarding streamed Modal node progress for component=%s node_id=%s value=%s max=%s lane_id=%s.",
                         payload.get("component_id"),
                         reported_node_id,
                         stream_event.get("value"),
                         stream_event.get("max"),
+                        lane_id,
                     )
                     _emit_local_modal_progress(
                         prompt_id=prompt_id,
@@ -870,8 +885,18 @@ def _consume_remote_payload_stream(
                         value=float(stream_event.get("value", 0.0)),
                         max_value=float(stream_event.get("max", 1.0)),
                         display_node_id=(
-                            str(stream_event["display_node_id"])
-                            if stream_event.get("display_node_id") is not None
+                            str(payload["mapped_progress_display_node_id"])
+                            if payload.get("mapped_progress_display_node_id") is not None
+                            else (
+                                str(stream_event["display_node_id"])
+                                if stream_event.get("display_node_id") is not None
+                                else None
+                            )
+                        ),
+                        lane_id=lane_id,
+                        item_index=(
+                            int(payload["map_item_index"])
+                            if payload.get("map_item_index") is not None
                             else None
                         ),
                     )
@@ -1012,7 +1037,11 @@ def _mapped_execution_parallelism(item_count: int) -> int:
     return max(1, min(item_count, configured_limit))
 
 
-def _build_mapped_item_payload(payload: dict[str, Any], item_index: int) -> dict[str, Any]:
+def _build_mapped_item_payload(
+    payload: dict[str, Any],
+    item_index: int,
+    lane_index: int,
+) -> dict[str, Any]:
     """Return one per-item subgraph payload derived from a mapped remote component payload."""
     item_payload = copy.deepcopy(payload)
     item_payload["payload_kind"] = "subgraph"
@@ -1020,6 +1049,10 @@ def _build_mapped_item_payload(payload: dict[str, Any], item_index: int) -> dict
     item_payload["mapped_input"] = None
     item_payload["suppress_status_stream"] = True
     item_payload["map_item_index"] = item_index
+    item_payload["mapped_progress_lane_id"] = str(lane_index)
+    item_payload["mapped_progress_display_node_id"] = str(
+        payload.get("component_id", "modal-subgraph")
+    )
     return item_payload
 
 
@@ -1071,6 +1104,55 @@ def _emit_local_mapped_progress(
     )
 
 
+def _clear_local_mapped_lane_progress(
+    payload: dict[str, Any],
+    lane_index: int,
+    item_index: int,
+) -> None:
+    """Remove one mapped worker lane from the local node overlay."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    extra_data = payload.get("extra_data") or {}
+    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    display_node_id = str(payload.get("component_id") or "")
+    if not prompt_id or not client_id or not display_node_id:
+        return
+    _emit_local_modal_progress(
+        prompt_id=prompt_id,
+        client_id=client_id,
+        node_id=display_node_id,
+        value=0.0,
+        max_value=1.0,
+        display_node_id=display_node_id,
+        lane_id=str(lane_index),
+        clear=True,
+        item_index=item_index,
+    )
+
+
+def _emit_local_mapped_lane_progress_start(
+    payload: dict[str, Any],
+    lane_index: int,
+    item_index: int,
+) -> None:
+    """Create or reset one mapped worker lane before remote progress begins arriving."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    extra_data = payload.get("extra_data") or {}
+    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    display_node_id = str(payload.get("component_id") or "")
+    if not prompt_id or not client_id or not display_node_id:
+        return
+    _emit_local_modal_progress(
+        prompt_id=prompt_id,
+        client_id=client_id,
+        node_id=display_node_id,
+        value=0.0,
+        max_value=1.0,
+        display_node_id=display_node_id,
+        lane_id=str(lane_index),
+        item_index=item_index,
+    )
+
+
 async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Split one mapped boundary input, run per-item remote executions, and reassemble outputs."""
     mapped_input = payload.get("mapped_input") or {}
@@ -1101,31 +1183,40 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
     )
     _emit_local_mapped_progress(payload, 0, total_items)
 
-    semaphore = asyncio.Semaphore(parallelism)
     per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
     completed_items = 0
+    item_queue: asyncio.Queue[tuple[int, Any] | None] = asyncio.Queue()
+    for item_index, item_value in enumerate(mapped_items):
+        item_queue.put_nowait((item_index, item_value))
+    for _ in range(parallelism):
+        item_queue.put_nowait(None)
 
-    async def run_item(item_index: int, item_value: Any) -> None:
-        """Execute one mapped item through the ordinary remote subgraph path."""
+    async def run_worker(lane_index: int) -> None:
+        """Execute queued mapped items through one stable local worker lane."""
         nonlocal completed_items
-        async with semaphore:
+        while True:
+            queued_item = await item_queue.get()
+            if queued_item is None:
+                return
+            item_index, item_value = queued_item
             if _local_processing_interrupted():
                 _raise_local_interrupt()
-            item_payload = _build_mapped_item_payload(payload, item_index)
-            item_inputs = dict(broadcast_inputs)
-            item_inputs[mapped_input_name] = item_value
-            item_response = await invoke_remote_engine_async(
-                item_payload,
-                serialize_node_inputs(item_inputs),
-            )
-            per_item_outputs[item_index] = deserialize_node_outputs(item_response)
-            completed_items += 1
-            _emit_local_mapped_progress(payload, completed_items, total_items)
+            _emit_local_mapped_lane_progress_start(payload, lane_index, item_index)
+            try:
+                item_payload = _build_mapped_item_payload(payload, item_index, lane_index)
+                item_inputs = dict(broadcast_inputs)
+                item_inputs[mapped_input_name] = item_value
+                item_response = await invoke_remote_engine_async(
+                    item_payload,
+                    serialize_node_inputs(item_inputs),
+                )
+                per_item_outputs[item_index] = deserialize_node_outputs(item_response)
+                completed_items += 1
+                _emit_local_mapped_progress(payload, completed_items, total_items)
+            finally:
+                _clear_local_mapped_lane_progress(payload, lane_index, item_index)
 
-    tasks = [
-        asyncio.create_task(run_item(item_index, item_value))
-        for item_index, item_value in enumerate(mapped_items)
-    ]
+    tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
     try:
         await asyncio.gather(*tasks)
     except Exception:

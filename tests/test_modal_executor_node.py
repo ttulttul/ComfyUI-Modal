@@ -1548,12 +1548,13 @@ def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
     """Mapped remote execution should refill a local queue up to COMFY_MODAL_MAX_CONTAINERS."""
     in_flight = 0
     max_in_flight = 0
-    progress_updates: list[float] = []
+    progress_updates: list[dict[str, Any]] = []
 
     async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
         nonlocal in_flight, max_in_flight
         assert payload["payload_kind"] == "subgraph"
         assert payload["suppress_status_stream"] is True
+        assert payload["mapped_progress_lane_id"] in {"0", "1"}
         mapped_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
         item_value = mapped_inputs["remote_input_0"]
         in_flight += 1
@@ -1572,7 +1573,7 @@ def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
     monkeypatch.setattr(
         remote_modal_app_module,
         "_emit_local_modal_progress",
-        lambda **kwargs: progress_updates.append(float(kwargs["value"])),
+        lambda **kwargs: progress_updates.append(kwargs),
     )
     try:
         payload = {
@@ -1598,8 +1599,13 @@ def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
         ["done:a", "done:b", "done:c", "done:d"],
     )
     assert max_in_flight == 2
-    assert progress_updates[0] == 0.0
-    assert progress_updates[-1] == 4.0
+    assert progress_updates[0]["value"] == 0.0
+    assert progress_updates[0].get("lane_id") is None
+    aggregate_updates = [update for update in progress_updates if update.get("lane_id") is None]
+    lane_updates = [update for update in progress_updates if update.get("lane_id") is not None]
+    assert aggregate_updates[-1]["value"] == 4.0
+    assert {update["lane_id"] for update in lane_updates} == {"0", "1"}
+    assert any(update.get("clear") is True for update in lane_updates)
 
 
 def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_previews(
@@ -1607,7 +1613,7 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Mapped per-item remote calls should suppress node-status chatter but still forward previews."""
+    """Mapped per-item remote calls should suppress status chatter but still forward previews and lane progress."""
     progress_calls: list[dict[str, Any]] = []
     status_calls: list[dict[str, Any]] = []
     preview_calls: list[dict[str, Any]] = []
@@ -1634,6 +1640,9 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
         "component_node_ids": ["6", "7"],
         "extra_data": {"client_id": "client-1"},
         "suppress_status_stream": True,
+        "mapped_progress_lane_id": "1",
+        "mapped_progress_display_node_id": "6",
+        "map_item_index": 0,
     }
     stream_events = iter(
         [
@@ -1666,7 +1675,18 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
     response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
 
     assert serialization_module.deserialize_node_outputs(response) == ("done",)
-    assert progress_calls == []
+    assert progress_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "7",
+            "value": 1.0,
+            "max_value": 4.0,
+            "display_node_id": "6",
+            "lane_id": "1",
+            "item_index": 0,
+        }
+    ]
     assert status_calls == []
     assert preview_calls == [
         {
