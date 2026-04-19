@@ -37,6 +37,8 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "Syncing graph with Modal" in source
     assert "Waiting for Modal startup" in source
     assert "Modal workflow running on" in source
+    assert "setGlobalStatusBatchProgress(promptId, value, maxValue)" in source
+    assert "linear-gradient(90deg" in source
     assert "installGlobalStatusStyles()" in source
     assert "function pruneGlobalStatusStates()" in source
     assert "function effectiveGlobalStatusPhase(promptId, phase)" in source
@@ -92,6 +94,7 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert 'api.addEventListener("modal_progress", handleModalProgress);' in source
     assert "function handleModalProgress(event)" in source
     assert "if (detail.aggregate_only) {" in source
+    assert "setNodeBatchProgress(" in source
     assert "function setNodeProgress(nodeIdValue, promptId, value, maxValue)" in source
     assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex)" in source
     assert "function clearNodeProgressLane(nodeIdValue, promptId, laneId)" in source
@@ -109,9 +112,11 @@ def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     source = _modal_toggle_source()
 
     assert "const modalNodeProgressLanes = new Map();" in source
+    assert "const modalNodeBatchProgress = new Map();" in source
     assert "progressLanes.length > 0" in source
     assert "const laneColors = [" in source
     assert 'ctx.fillText(`${progressLanes.length}x`' in source
+    assert 'const badgeText = `${completedItems}/${totalItems}`;' in source
 
 
 def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
