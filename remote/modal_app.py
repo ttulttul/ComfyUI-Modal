@@ -264,13 +264,46 @@ def _is_link(value: Any) -> bool:
     )
 
 
+def _normalize_link_output_index(value: Any) -> Any:
+    """Unwrap a singleton list around a prompt-link output index when present."""
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], int | float):
+        return value[0]
+    return value
+
+
+def _normalize_subgraph_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a subgraph payload with canonical prompt-link and output-index shapes."""
+    normalized_payload = copy.deepcopy(payload)
+
+    for node_info in normalized_payload.get("subgraph_prompt", {}).values():
+        inputs = node_info.get("inputs") or {}
+        for input_name, input_value in list(inputs.items()):
+            if not isinstance(input_value, list) or len(input_value) != 2:
+                continue
+            if not isinstance(input_value[0], str):
+                continue
+            inputs[input_name] = [
+                input_value[0],
+                _normalize_link_output_index(input_value[1]),
+            ]
+
+    for boundary_output in normalized_payload.get("boundary_outputs", []):
+        if "output_index" in boundary_output:
+            boundary_output["output_index"] = _normalize_link_output_index(
+                boundary_output["output_index"]
+            )
+
+    return normalized_payload
+
+
 def _execute_subgraph_with_mapping(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
     node_mapping: dict[str, type[Any]],
 ) -> tuple[Any, ...]:
     """Execute a rewritten remote component using an explicit node mapping."""
-    prompt = copy.deepcopy(payload["subgraph_prompt"])
+    normalized_payload = _normalize_subgraph_payload(payload)
+    prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s via test mapping with %d prompt nodes.",
         payload.get("component_id"),
@@ -278,12 +311,12 @@ def _execute_subgraph_with_mapping(
     )
     _apply_boundary_inputs(
         prompt=prompt,
-        boundary_input_specs=list(payload.get("boundary_inputs", [])),
+        boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
         hydrated_inputs=hydrated_inputs,
     )
     required_node_ids = _resolve_required_subgraph_nodes(
         prompt=prompt,
-        execute_node_ids=list(payload.get("execute_node_ids", [])),
+        execute_node_ids=list(normalized_payload.get("execute_node_ids", [])),
     )
     executed_outputs: dict[str, tuple[Any, ...]] = {}
     pending = set(required_node_ids)
@@ -329,7 +362,7 @@ def _execute_subgraph_with_mapping(
             )
 
     outputs: list[Any] = []
-    for boundary_output in payload.get("boundary_outputs", []):
+    for boundary_output in normalized_payload.get("boundary_outputs", []):
         node_id = str(boundary_output["node_id"])
         output_index = int(boundary_output["output_index"])
         node_outputs = executed_outputs.get(node_id)
@@ -355,17 +388,18 @@ def _execute_subgraph_prompt(
     if node_mapping is not None:
         return _execute_subgraph_with_mapping(payload, hydrated_inputs, node_mapping)
 
-    prompt = copy.deepcopy(payload["subgraph_prompt"])
+    normalized_payload = _normalize_subgraph_payload(payload)
+    prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s through PromptExecutor with %d prompt nodes, %d boundary inputs, and %d exported outputs.",
         payload.get("component_id"),
         len(prompt),
-        len(payload.get("boundary_inputs", [])),
-        len(payload.get("boundary_outputs", [])),
+        len(normalized_payload.get("boundary_inputs", [])),
+        len(normalized_payload.get("boundary_outputs", [])),
     )
     _apply_boundary_inputs(
         prompt=prompt,
-        boundary_input_specs=list(payload.get("boundary_inputs", [])),
+        boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
         hydrated_inputs=hydrated_inputs,
     )
     execution = _load_execution_module()
@@ -376,13 +410,13 @@ def _execute_subgraph_prompt(
         logger.info(
             "Starting PromptExecutor for remote subgraph %s with execute targets %s.",
             payload.get("component_id"),
-            payload.get("execute_node_ids", []),
+            normalized_payload.get("execute_node_ids", []),
         )
         executor.execute(
             prompt=prompt,
             prompt_id=str(payload.get("component_id", "modal-subgraph")),
-            extra_data=copy.deepcopy(payload.get("extra_data") or {}),
-            execute_outputs=list(payload.get("execute_node_ids", [])),
+            extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
+            execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
         )
         logger.info(
             "PromptExecutor finished for remote subgraph %s in %.3fs with success=%s and %d status messages.",
@@ -401,7 +435,7 @@ def _execute_subgraph_prompt(
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
 
         outputs: list[Any] = []
-        for boundary_output in payload.get("boundary_outputs", []):
+        for boundary_output in normalized_payload.get("boundary_outputs", []):
             node_id = str(boundary_output["node_id"])
             output_index = int(boundary_output["output_index"])
             cache_entry = executor.caches.outputs.get(node_id)

@@ -2479,3 +2479,53 @@ def test_local_remote_app_executes_subgraph_payload(
     )
     outputs = serialization_module.deserialize_node_outputs(payload)
     assert outputs == (10,)
+
+
+def test_local_remote_app_normalizes_wrapped_subgraph_link_indexes(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+) -> None:
+    """The local fallback runner should canonicalize singleton-list prompt link indexes."""
+    payload = remote_modal_app_module.execute_subgraph_locally(
+        payload={
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "subgraph_prompt": {
+                "remote_1": {
+                    "class_type": "BoundarySource",
+                    "inputs": {"value": 0},
+                    "_meta": {},
+                },
+                "remote_2": {
+                    "class_type": "BoundarySink",
+                    "inputs": {"value": ["remote_1", [0]]},
+                    "_meta": {},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_0",
+                    "targets": [{"node_id": "remote_1", "input_name": "value"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "remote_2_value",
+                    "node_id": "remote_2",
+                    "output_index": [0],
+                    "io_type": "INT",
+                    "is_list": False,
+                }
+            ],
+            "execute_node_ids": ["remote_2"],
+            "extra_data": {},
+            "custom_nodes_bundle": None,
+        },
+        kwargs_payload='{"remote_input_0": 4}',
+        node_mapping={
+            "BoundarySource": _BoundarySourceNode,
+            "BoundarySink": _BoundarySinkNode,
+        },
+    )
+    outputs = serialization_module.deserialize_node_outputs(payload)
+    assert outputs == (10,)
