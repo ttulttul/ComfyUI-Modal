@@ -11,8 +11,8 @@ import types
 from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
-from typing import Any
 import logging
+from typing import Any, Iterator
 
 import pytest
 
@@ -2085,6 +2085,72 @@ def test_remote_modal_interrupt_callback_writes_shared_control_flag(
     interrupt_key, interrupt_value = interrupt_store.put_calls[0]
     assert interrupt_key == "prompt-1:component-2"
     assert isinstance(interrupt_value["requested_at"], float)
+
+
+def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_outer_sync(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The blocking streamed Modal bridge should propagate interrupts without relying on the outer wrapper loop."""
+    cancellation_event = threading.Event()
+    remote_release_event = threading.Event()
+    interrupt_calls: list[str] = []
+    interrupt_checks = iter([False, True, True])
+
+    def fake_local_processing_interrupted() -> bool:
+        """Report a local interrupt after the first poll interval."""
+        return next(interrupt_checks, True)
+
+    def fake_interrupt_remote_call() -> None:
+        """Record the propagated remote interrupt and let the fake stream finish."""
+        interrupt_calls.append("interrupt")
+        remote_release_event.set()
+
+    def fake_stream_events() -> Iterator[dict[str, Any]]:
+        """Block until the local bridge requests cancellation, then yield one final result."""
+        while not remote_release_event.is_set():
+            time.sleep(0.01)
+        yield {
+            "kind": "result",
+            "outputs": serialization_module.serialize_node_outputs(("done",)),
+        }
+
+    class FakeStreamMethod:
+        """Minimal Modal stream method shim."""
+
+        def remote_gen(self, payload: dict[str, Any], kwargs_payload: bytes) -> Iterator[dict[str, Any]]:
+            """Return the fake delayed stream for this request."""
+            del payload, kwargs_payload
+            return fake_stream_events()
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_local_processing_interrupted",
+        fake_local_processing_interrupted,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_build_remote_interrupt_callback",
+        lambda remote_engine, payload: fake_interrupt_remote_call,
+    )
+
+    response = remote_modal_app_module._invoke_remote_engine_payload(
+        types.SimpleNamespace(execute_payload_stream=FakeStreamMethod()),
+        {
+            "component_id": "component-1",
+            "payload_kind": "subgraph",
+            "prompt_id": "prompt-1",
+            "component_node_ids": ["1"],
+            "extra_data": {"client_id": "client-1"},
+        },
+        b"{}",
+        cancellation_event,
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert cancellation_event.is_set()
+    assert interrupt_calls == ["interrupt"]
 
 
 def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
