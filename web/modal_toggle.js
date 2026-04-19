@@ -1252,7 +1252,16 @@ function drawRemoteNodeDecoration(node, ctx) {
   const aggregateHeight = 8 / scale;
   const laneHeight = 5 / scale;
   const laneGap = 2 / scale;
-  const progressY = node.size[1] - Math.max(10 / scale, borderWidth * 2);
+  const panelY = node.size[1] + 6 / scale;
+  const panelPaddingX = 6 / scale;
+  const panelPaddingY = 6 / scale;
+  const headerHeight = 16 / scale;
+  const laneBlockHeight = hasLaneProgress
+    ? progressLanes.length * laneHeight + (progressLanes.length - 1) * laneGap
+    : 0;
+  const bodyHeight =
+    (hasLaneProgress ? laneBlockHeight + laneGap : 0) + (hasAggregateProgress ? aggregateHeight : 0);
+  const panelHeight = panelPaddingY * 2 + headerHeight + bodyHeight;
   const laneColors = [
     "rgba(196, 181, 253, 0.94)",
     "rgba(147, 197, 253, 0.94)",
@@ -1261,10 +1270,56 @@ function drawRemoteNodeDecoration(node, ctx) {
     "rgba(251, 146, 60, 0.94)",
     "rgba(244, 114, 182, 0.94)",
   ];
+  const badgeText = hasBatchBadge
+    ? `${Math.round(batchProgress.value)}/${Math.round(batchProgress.max)}`
+    : null;
+
+  ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
+  ctx.beginPath();
+  ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);
+  ctx.fill();
+  ctx.strokeStyle = shadowColor;
+  ctx.lineWidth = 1 / scale;
+  ctx.stroke();
+
+  const headerText = hasAggregateProgress
+    ? `${Math.round((state.progress.value / state.progress.max) * 100)}%`
+    : hasLaneProgress
+      ? `${progressLanes.length}x`
+      : null;
+  const headerBaselineY = panelY + panelPaddingY + headerHeight / 2;
+  if (headerText) {
+    ctx.fillStyle = "#f8fafc";
+    ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(headerText, panelPaddingX, headerBaselineY);
+  }
+
+  if (badgeText) {
+    ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
+    const badgePaddingX = 6 / scale;
+    const badgeWidth = ctx.measureText(badgeText).width + badgePaddingX * 2;
+    const badgeHeight = 16 / scale;
+    const badgeX = Math.max(0, node.size[0] - badgeWidth - 4 / scale);
+    const badgeY = panelY + panelPaddingY;
+    ctx.fillStyle = "rgba(2, 6, 23, 0.82)";
+    ctx.beginPath();
+    ctx.roundRect(badgeX, badgeY, badgeWidth, badgeHeight, 8 / scale);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(34, 197, 94, 0.55)";
+    ctx.lineWidth = 1 / scale;
+    ctx.stroke();
+    ctx.fillStyle = "#f8fafc";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(badgeText, badgeX + badgeWidth / 2, badgeY + badgeHeight / 2);
+  }
+
+  const barY = panelY + panelPaddingY + headerHeight + laneGap;
 
   if (hasLaneProgress) {
-    const laneBlockHeight = progressLanes.length * laneHeight + (progressLanes.length - 1) * laneGap;
-    let laneY = progressY - laneGap - laneBlockHeight;
+    let laneY = barY;
     for (const [laneIndex, laneProgress] of progressLanes.entries()) {
       const laneRatio = Math.max(0, Math.min(1, laneProgress.value / laneProgress.max));
       const laneWidth = Math.max(0, barWidth * laneRatio);
@@ -1279,45 +1334,11 @@ function drawRemoteNodeDecoration(node, ctx) {
   if (hasAggregateProgress) {
     const progressRatio = Math.max(0, Math.min(1, state.progress.value / state.progress.max));
     const progressWidth = Math.max(0, barWidth * progressRatio);
+    const aggregateY = hasLaneProgress ? barY + laneBlockHeight + laneGap : barY;
     ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-    ctx.fillRect(-borderWidth, progressY, barWidth, aggregateHeight);
+    ctx.fillRect(-borderWidth, aggregateY, barWidth, aggregateHeight);
     ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
-    ctx.fillRect(-borderWidth, progressY, progressWidth, aggregateHeight);
-    ctx.fillStyle = "#f8fafc";
-    ctx.font = `${Math.max(11 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
-    ctx.textAlign = "right";
-    ctx.textBaseline = "bottom";
-    ctx.fillText(`${Math.round(progressRatio * 100)}%`, node.size[0], progressY - 2 / scale);
-  } else if (hasLaneProgress) {
-    ctx.fillStyle = "#f8fafc";
-    ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
-    ctx.textAlign = "right";
-    ctx.textBaseline = "bottom";
-    ctx.fillText(`${progressLanes.length}x`, node.size[0], progressY - 2 / scale);
-  }
-
-  if (hasBatchBadge) {
-    const completedItems = Math.round(batchProgress.value);
-    const totalItems = Math.round(batchProgress.max);
-    const badgeText = `${completedItems}/${totalItems}`;
-    ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
-    const badgePaddingX = 6 / scale;
-    const badgePaddingY = 4 / scale;
-    const badgeWidth = ctx.measureText(badgeText).width + badgePaddingX * 2;
-    const badgeHeight = 16 / scale;
-    const badgeX = Math.max(0, node.size[0] - badgeWidth - 4 / scale);
-    const badgeY = 6 / scale;
-    ctx.fillStyle = "rgba(15, 23, 42, 0.82)";
-    ctx.beginPath();
-    ctx.roundRect(badgeX, badgeY, badgeWidth, badgeHeight, 8 / scale);
-    ctx.fill();
-    ctx.strokeStyle = "rgba(34, 197, 94, 0.55)";
-    ctx.lineWidth = 1 / scale;
-    ctx.stroke();
-    ctx.fillStyle = "#f8fafc";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(badgeText, badgeX + badgeWidth / 2, badgeY + badgeHeight / 2);
+    ctx.fillRect(-borderWidth, aggregateY, progressWidth, aggregateHeight);
   }
   ctx.restore();
 }
