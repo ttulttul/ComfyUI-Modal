@@ -2765,3 +2765,59 @@ def test_apply_boundary_inputs_normalizes_wrapped_scalar_values(
     )
 
     assert prompt["remote_1"]["inputs"]["value"] == 4
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Prepared remote prompts should fail early when primitive widget inputs still carry raw lists."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    prompt = {
+        "remote_1": {
+            "class_type": "BoundarySource",
+            "inputs": {"value": [4, 5]},
+            "_meta": {},
+        }
+    }
+
+    with pytest.raises(target_module.RemoteSubgraphExecutionError, match="input_name='value'"):
+        target_module._validate_prompt_input_shapes(
+            prompt,
+            {"BoundarySource": _BoundarySourceNode},
+        )
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_format_prompt_executor_error_payload_includes_node_context(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """PromptExecutor failure formatting should surface the failing node and current inputs."""
+    target_module = request.getfixturevalue(module_fixture_name)
+
+    message = target_module._format_prompt_executor_error_payload(
+        {
+            "exception_message": "int() argument must be a string, a bytes-like object or a real number, not 'list'",
+            "node_id": "12",
+            "node_type": "KSampler",
+            "current_inputs": [{"input_name": "steps", "value": [4, 5]}],
+        }
+    )
+
+    assert "node_id='12'" in message
+    assert "node_type='KSampler'" in message
+    assert "current_inputs=" in message
