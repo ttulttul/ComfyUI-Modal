@@ -168,8 +168,23 @@ def test_remote_modal_call_worker_count_allows_parallel_blocking_calls(
 ) -> None:
     """The local Modal dispatch pool should have more than one worker."""
     monkeypatch.setattr(remote_modal_app_module.os, "cpu_count", lambda: 8)
+    remote_modal_app_module.get_settings.cache_clear()
 
     assert remote_modal_app_module._remote_modal_call_worker_count() == 8
+
+
+def test_remote_modal_call_worker_count_honors_max_container_limit(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local Modal dispatch pool should scale up to the configured max container count."""
+    monkeypatch.setattr(remote_modal_app_module.os, "cpu_count", lambda: 8)
+    monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "12")
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        assert remote_modal_app_module._remote_modal_call_worker_count() == 12
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
 
 
 def test_stable_modal_cloud_entry_imports_without_modal_sdk(
@@ -1484,6 +1499,144 @@ def test_remote_modal_interrupt_callback_writes_shared_control_flag(
     interrupt_key, interrupt_value = interrupt_store.put_calls[0]
     assert interrupt_key == "prompt-1:component-2"
     assert isinstance(interrupt_value["requested_at"], float)
+
+
+def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped remote execution should refill a local queue up to COMFY_MODAL_MAX_CONTAINERS."""
+    in_flight = 0
+    max_in_flight = 0
+    progress_updates: list[float] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        nonlocal in_flight, max_in_flight
+        assert payload["payload_kind"] == "subgraph"
+        assert payload["suppress_status_stream"] is True
+        mapped_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        item_value = mapped_inputs["remote_input_0"]
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return serialization_module.serialize_node_outputs((f"done:{item_value}",))
+
+    monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "2")
+    remote_modal_app_module.get_settings.cache_clear()
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: progress_updates.append(float(kwargs["value"])),
+    )
+    try:
+        payload = {
+            "payload_kind": "mapped_subgraph",
+            "component_id": "6",
+            "prompt_id": "prompt-1",
+            "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "STRING"},
+            "boundary_outputs": [{"io_type": "STRING", "is_list": False}],
+            "extra_data": {"client_id": "client-1"},
+        }
+        response = asyncio.run(
+            remote_modal_app_module._invoke_mapped_remote_engine_async(
+                payload,
+                serialization_module.serialize_node_inputs(
+                    {"remote_input_0": ["a", "b", "c", "d"]}
+                ),
+            )
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["done:a", "done:b", "done:c", "done:d"],
+    )
+    assert max_in_flight == 2
+    assert progress_updates[0] == 0.0
+    assert progress_updates[-1] == 4.0
+
+
+def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_previews(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped per-item remote calls should suppress node-status chatter but still forward previews."""
+    progress_calls: list[dict[str, Any]] = []
+    status_calls: list[dict[str, Any]] = []
+    preview_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: progress_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_status",
+        lambda **kwargs: status_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_preview_boundary_output",
+        lambda **kwargs: preview_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "6::item:0",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["6", "7"],
+        "extra_data": {"client_id": "client-1"},
+        "suppress_status_stream": True,
+    }
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "node_progress",
+                "node_id": "7",
+                "value": 1.0,
+                "max": 4.0,
+            },
+            {
+                "kind": "progress",
+                "event_type": "boundary_output",
+                "node_id": "7",
+                "preview_target_node_ids": ["9"],
+                "value": serialization_module.serialize_value(["preview"]),
+            },
+            {
+                "kind": "progress",
+                "phase": "executing",
+                "active_node_id": "7",
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert progress_calls == []
+    assert status_calls == []
+    assert preview_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "preview_target_node_ids": ["9"],
+            "image_value": ["preview"],
+        }
+    ]
 
 
 def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(

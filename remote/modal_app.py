@@ -20,10 +20,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from ..serialization import (
+    join_mapped_values,
     coerce_serialized_node_outputs,
     deserialize_value,
     deserialize_node_inputs,
+    deserialize_node_outputs,
+    split_mapped_value,
     serialize_node_outputs,
+    serialize_node_inputs,
 )
 from ..settings import get_settings
 
@@ -37,7 +41,8 @@ _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
 
 def _remote_modal_call_worker_count() -> int:
     """Return the number of local worker threads reserved for blocking Modal calls."""
-    return max(4, os.cpu_count() or 1)
+    configured_parallelism = get_settings().max_containers or 0
+    return max(4, os.cpu_count() or 1, configured_parallelism)
 
 
 _REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=_remote_modal_call_worker_count())
@@ -839,6 +844,7 @@ def _consume_remote_payload_stream(
     extra_data = payload.get("extra_data") or {}
     client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
     node_ids = [str(node_id) for node_id in payload.get("component_node_ids", [])]
+    suppress_status_stream = bool(payload.get("suppress_status_stream"))
     result_payload: bytes | bytearray | None = None
 
     for stream_event in stream_events:
@@ -846,6 +852,8 @@ def _consume_remote_payload_stream(
         if event_kind == "progress":
             event_type = str(stream_event.get("event_type", ""))
             if event_type == "node_progress":
+                if suppress_status_stream:
+                    continue
                 reported_node_id = stream_event.get("node_id")
                 if reported_node_id is not None:
                     logger.debug(
@@ -951,6 +959,8 @@ def _consume_remote_payload_stream(
                 stream_event.get("phase"),
                 stream_event.get("active_node_id"),
             )
+            if suppress_status_stream:
+                continue
             _emit_local_modal_status(
                 prompt_id=prompt_id,
                 client_id=client_id,
@@ -993,6 +1003,143 @@ def _consume_remote_payload_stream(
             f"Modal streamed payload for component={payload.get('component_id')!r} did not yield a final result."
         )
     return bytes(result_payload)
+
+
+def _mapped_execution_parallelism(item_count: int) -> int:
+    """Return the local worker width used to schedule mapped Modal item executions."""
+    settings = get_settings()
+    configured_limit = settings.max_containers or _remote_modal_call_worker_count()
+    return max(1, min(item_count, configured_limit))
+
+
+def _build_mapped_item_payload(payload: dict[str, Any], item_index: int) -> dict[str, Any]:
+    """Return one per-item subgraph payload derived from a mapped remote component payload."""
+    item_payload = copy.deepcopy(payload)
+    item_payload["payload_kind"] = "subgraph"
+    item_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}"
+    item_payload["mapped_input"] = None
+    item_payload["suppress_status_stream"] = True
+    item_payload["map_item_index"] = item_index
+    return item_payload
+
+
+def _aggregate_mapped_outputs(
+    per_item_outputs: list[tuple[Any, ...]],
+    payload: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Reassemble ordered per-item outputs from mapped execution into one proxy result tuple."""
+    if not per_item_outputs:
+        raise ValueError("Mapped execution produced no per-item outputs to aggregate.")
+
+    output_count = len(per_item_outputs[0])
+    if any(len(item_outputs) != output_count for item_outputs in per_item_outputs):
+        raise RemoteSubgraphExecutionError("Mapped remote execution produced inconsistent output arity.")
+
+    boundary_outputs = list(payload.get("boundary_outputs", []))
+    aggregated_outputs: list[Any] = []
+    for output_index in range(output_count):
+        boundary_output = boundary_outputs[output_index] if output_index < len(boundary_outputs) else {}
+        aggregated_outputs.append(
+            join_mapped_values(
+                [item_outputs[output_index] for item_outputs in per_item_outputs],
+                io_type=str(boundary_output.get("io_type", "*")),
+                is_list=bool(boundary_output.get("is_list", False)),
+            )
+        )
+    return tuple(aggregated_outputs)
+
+
+def _emit_local_mapped_progress(
+    payload: dict[str, Any],
+    completed_items: int,
+    total_items: int,
+) -> None:
+    """Emit one aggregate mapped-execution progress update for the component representative node."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    extra_data = payload.get("extra_data") or {}
+    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    display_node_id = str(payload.get("component_id") or "")
+    if not prompt_id or not client_id or not display_node_id:
+        return
+    _emit_local_modal_progress(
+        prompt_id=prompt_id,
+        client_id=client_id,
+        node_id=display_node_id,
+        value=float(completed_items),
+        max_value=float(total_items),
+        display_node_id=display_node_id,
+    )
+
+
+async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+    """Split one mapped boundary input, run per-item remote executions, and reassemble outputs."""
+    mapped_input = payload.get("mapped_input") or {}
+    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
+    if not mapped_input_name:
+        raise ModalRemoteInvocationError("Mapped remote payloads must define mapped_input.proxy_input_name.")
+
+    hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    if mapped_input_name not in hydrated_inputs:
+        raise KeyError(f"Mapped remote payload input {mapped_input_name!r} was not provided.")
+
+    mapped_items = split_mapped_value(
+        hydrated_inputs[mapped_input_name],
+        str(mapped_input.get("io_type", "*")),
+    )
+    if not mapped_items:
+        raise ValueError("Mapped remote execution requires at least one input item.")
+
+    broadcast_inputs = dict(hydrated_inputs)
+    broadcast_inputs.pop(mapped_input_name, None)
+    total_items = len(mapped_items)
+    parallelism = _mapped_execution_parallelism(total_items)
+    logger.info(
+        "Scheduling mapped Modal component=%s for %d item(s) with local parallelism=%d.",
+        payload.get("component_id"),
+        total_items,
+        parallelism,
+    )
+    _emit_local_mapped_progress(payload, 0, total_items)
+
+    semaphore = asyncio.Semaphore(parallelism)
+    per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
+    completed_items = 0
+
+    async def run_item(item_index: int, item_value: Any) -> None:
+        """Execute one mapped item through the ordinary remote subgraph path."""
+        nonlocal completed_items
+        async with semaphore:
+            if _local_processing_interrupted():
+                _raise_local_interrupt()
+            item_payload = _build_mapped_item_payload(payload, item_index)
+            item_inputs = dict(broadcast_inputs)
+            item_inputs[mapped_input_name] = item_value
+            item_response = await invoke_remote_engine_async(
+                item_payload,
+                serialize_node_inputs(item_inputs),
+            )
+            per_item_outputs[item_index] = deserialize_node_outputs(item_response)
+            completed_items += 1
+            _emit_local_mapped_progress(payload, completed_items, total_items)
+
+    tasks = [
+        asyncio.create_task(run_item(item_index, item_value))
+        for item_index, item_value in enumerate(mapped_items)
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    return serialize_node_outputs(
+        _aggregate_mapped_outputs(
+            [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+            payload,
+        )
+    )
 
 
 def _lookup_deployed_remote_engine(payload: dict[str, Any]) -> Any:
@@ -1219,6 +1366,9 @@ def _invoke_modal_payload_blocking(
 
 def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal when configured, or fall back to local in-process execution."""
+    if payload.get("payload_kind") == "mapped_subgraph":
+        return asyncio.run(_invoke_mapped_remote_engine_async(payload, kwargs_payload))
+
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
         if payload.get("payload_kind") == "subgraph":
@@ -1277,6 +1427,9 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
 
 async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
+    if payload.get("payload_kind") == "mapped_subgraph":
+        return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
+
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
         return await asyncio.to_thread(invoke_remote_engine, payload, kwargs_payload)

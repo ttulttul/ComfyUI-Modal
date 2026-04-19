@@ -15,6 +15,7 @@ from comfy_api.latest import _io as io
 from .serialization import deserialize_node_outputs, serialize_node_inputs
 
 logger = logging.getLogger(__name__)
+MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
 
 
 class RemoteExecutorClient(Protocol):
@@ -283,3 +284,29 @@ class ModalUniversalExecutor(io.ComfyNode):
             original_node_data = json.loads(original_node_data)
         outputs = tuple(get_remote_executor_client().execute_node(original_node_data, kwargs))
         return io.NodeOutput(*outputs)
+
+
+class ModalMapInput(io.ComfyNode):
+    """Queue-time marker node that turns one remote boundary input into mapped parallel work."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        """Expose a simple any-to-any adapter node for mapped remote execution."""
+        return io.Schema(
+            node_id=MODAL_MAP_INPUT_NODE_ID,
+            display_name="Modal Map Input",
+            category="Modal",
+            description=(
+                "Pass-through marker for data-parallel Modal execution. "
+                "When used inside a remote-marked component, list inputs and batched tensors "
+                "can fan out across multiple Modal executions and reassemble automatically."
+            ),
+            inputs=[io.AnyType.Input("value")],
+            outputs=[io.AnyType.Output(display_name="value")],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, value: Any) -> io.NodeOutput:
+        """Pass the input value through unchanged at runtime."""
+        return io.NodeOutput(value)

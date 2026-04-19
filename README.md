@@ -101,6 +101,7 @@ Remote runtime behavior:
 - Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.
 - Remote proxy nodes now execute through ComfyUI's async node path, so independent Modal-backed components can overlap instead of being forced through one blocking local proxy at a time.
 - The local Modal call executor keeps multiple worker threads available, which removes the previous `max_workers=1` bottleneck when several remote components are ready at once.
+- `ModalMapInput` can turn one remote component boundary into a locally scheduled mapped execution. List inputs and batched tensors fan out into multiple per-item Modal subgraph calls, and the local scheduler refills that queue up to the configured `COMFY_MODAL_MAX_CONTAINERS`.
 - Remote cancellation now uses a shared Modal `Dict` control store instead of a second RPC lane into the execution class, so per-container execution concurrency can stay at `1` without losing interrupt propagation.
 - If a run is cancelled and restarted quickly, the remote worker now gives Modal volume reload a short bounded retry window so recently released model files can close before the next request needs a fresh `vol.reload()`.
 
@@ -119,6 +120,8 @@ Good candidates for remote execution are nodes that:
 - consume large model files
 - do expensive tensor work
 - accept and return values that can cross the local/remote boundary cleanly
+
+For batched workflows, you can also insert `Modal Map Input` before a remote-marked region. When that boundary input resolves to a Python list, an `IMAGE` batch, a `LATENT` batch, or another supported batched tensor value, Modal-Sync can split it into per-item remote executions and refill the available Modal slots locally until the batch completes.
 
 ### 2. Understand the transport boundary
 
@@ -149,6 +152,19 @@ For each connected region you want to offload:
 If queue-time validation tells you a remote node still depends on local-only runtime objects, you no longer have to hunt those upstream nodes manually. Right-click the node and use `Modal: Include Required Upstream Nodes` to ask the backend which extra nodes must join that remote island. If multiple nodes are selected in the current graph, the same context menu expands the whole selection at once.
 
 The toggle stores `properties.is_modal_remote = true` in workflow metadata. The visible graph is not rewritten in the editor. Rewrite happens only at queue time.
+
+### 3a. Map batched inputs across Modal
+
+`Modal Map Input` is a pass-through adapter node. Its queue-time meaning only activates when it sits inside a remote-marked component.
+
+Current mapped-execution rules:
+
+- one `Modal Map Input` boundary per remote component
+- downstream remote nodes reachable from that map marker stay in the same mapped remote component
+- mapped inputs may currently be Python lists, `IMAGE` batches, `LATENT` batches, and other batched tensors split on dimension `0`
+- non-mapped boundary inputs are broadcast unchanged to every per-item execution
+- mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
+- per-item remote node status updates are suppressed, but preview images and boundary preview outputs still stream back as each item finishes
 
 ### 4. Queue the workflow
 
@@ -230,6 +246,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle containers warm for this many seconds. Default: `600`.
 - `COMFY_MODAL_MIN_CONTAINERS`: Keep at least this many containers warm. Default: `0`.
 - `COMFY_MODAL_MAX_CONTAINERS`: Optional upper bound on simultaneously scaled Modal containers.
+- `COMFY_MODAL_MAX_CONTAINERS` also caps the local mapped-execution worker queue driven by `ModalMapInput`.
 - `COMFY_MODAL_BUFFER_CONTAINERS`: Optional number of spare warm containers Modal should try to keep ready above current load.
 
 ## Development
