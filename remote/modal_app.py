@@ -264,13 +264,57 @@ def _is_link(value: Any) -> bool:
     )
 
 
+def _normalize_link_output_index(value: Any) -> Any:
+    """Unwrap a singleton list around a prompt-link output index when present."""
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return value
+
+
+def _normalize_prompt_input_value(value: Any) -> Any:
+    """Unwrap transport-added singleton lists around scalar prompt input values."""
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+        return [value[0], _normalize_link_output_index(value[1])]
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return value
+
+
+def _normalize_subgraph_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a subgraph payload with canonical prompt-link and output-index shapes."""
+    normalized_payload = copy.deepcopy(payload)
+
+    for node_info in normalized_payload.get("subgraph_prompt", {}).values():
+        inputs = node_info.get("inputs") or {}
+        for input_name, input_value in list(inputs.items()):
+            inputs[input_name] = _normalize_prompt_input_value(input_value)
+
+    for boundary_output in normalized_payload.get("boundary_outputs", []):
+        if "node_id" in boundary_output and isinstance(boundary_output["node_id"], list):
+            boundary_output["node_id"] = _normalize_prompt_input_value(boundary_output["node_id"])
+        if "output_index" in boundary_output:
+            boundary_output["output_index"] = _normalize_link_output_index(
+                boundary_output["output_index"]
+            )
+
+    normalized_payload["execute_node_ids"] = [
+        _normalize_prompt_input_value(node_id)
+        for node_id in normalized_payload.get("execute_node_ids", [])
+    ]
+
+    return normalized_payload
+
+
 def _execute_subgraph_with_mapping(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
     node_mapping: dict[str, type[Any]],
 ) -> tuple[Any, ...]:
     """Execute a rewritten remote component using an explicit node mapping."""
-    prompt = copy.deepcopy(payload["subgraph_prompt"])
+    normalized_payload = _normalize_subgraph_payload(payload)
+    prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s via test mapping with %d prompt nodes.",
         payload.get("component_id"),
@@ -278,12 +322,12 @@ def _execute_subgraph_with_mapping(
     )
     _apply_boundary_inputs(
         prompt=prompt,
-        boundary_input_specs=list(payload.get("boundary_inputs", [])),
+        boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
         hydrated_inputs=hydrated_inputs,
     )
     required_node_ids = _resolve_required_subgraph_nodes(
         prompt=prompt,
-        execute_node_ids=list(payload.get("execute_node_ids", [])),
+        execute_node_ids=list(normalized_payload.get("execute_node_ids", [])),
     )
     executed_outputs: dict[str, tuple[Any, ...]] = {}
     pending = set(required_node_ids)
@@ -329,7 +373,7 @@ def _execute_subgraph_with_mapping(
             )
 
     outputs: list[Any] = []
-    for boundary_output in payload.get("boundary_outputs", []):
+    for boundary_output in normalized_payload.get("boundary_outputs", []):
         node_id = str(boundary_output["node_id"])
         output_index = int(boundary_output["output_index"])
         node_outputs = executed_outputs.get(node_id)
@@ -355,17 +399,18 @@ def _execute_subgraph_prompt(
     if node_mapping is not None:
         return _execute_subgraph_with_mapping(payload, hydrated_inputs, node_mapping)
 
-    prompt = copy.deepcopy(payload["subgraph_prompt"])
+    normalized_payload = _normalize_subgraph_payload(payload)
+    prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s through PromptExecutor with %d prompt nodes, %d boundary inputs, and %d exported outputs.",
         payload.get("component_id"),
         len(prompt),
-        len(payload.get("boundary_inputs", [])),
-        len(payload.get("boundary_outputs", [])),
+        len(normalized_payload.get("boundary_inputs", [])),
+        len(normalized_payload.get("boundary_outputs", [])),
     )
     _apply_boundary_inputs(
         prompt=prompt,
-        boundary_input_specs=list(payload.get("boundary_inputs", [])),
+        boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
         hydrated_inputs=hydrated_inputs,
     )
     execution = _load_execution_module()
@@ -376,13 +421,13 @@ def _execute_subgraph_prompt(
         logger.info(
             "Starting PromptExecutor for remote subgraph %s with execute targets %s.",
             payload.get("component_id"),
-            payload.get("execute_node_ids", []),
+            normalized_payload.get("execute_node_ids", []),
         )
         executor.execute(
             prompt=prompt,
             prompt_id=str(payload.get("component_id", "modal-subgraph")),
-            extra_data=copy.deepcopy(payload.get("extra_data") or {}),
-            execute_outputs=list(payload.get("execute_node_ids", [])),
+            extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
+            execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
         )
         logger.info(
             "PromptExecutor finished for remote subgraph %s in %.3fs with success=%s and %d status messages.",
@@ -401,7 +446,7 @@ def _execute_subgraph_prompt(
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
 
         outputs: list[Any] = []
-        for boundary_output in payload.get("boundary_outputs", []):
+        for boundary_output in normalized_payload.get("boundary_outputs", []):
             node_id = str(boundary_output["node_id"])
             output_index = int(boundary_output["output_index"])
             cache_entry = executor.caches.outputs.get(node_id)
@@ -477,8 +522,15 @@ def _modal_lookup_error_types() -> tuple[type[BaseException], ...]:
 
 def _load_modal_cloud_module() -> Any:
     """Load the stable Modal cloud entry module under a valid Python name."""
-    if _MODAL_CLOUD_MODULE_NAME in sys.modules:
-        return sys.modules[_MODAL_CLOUD_MODULE_NAME]
+    existing_module = sys.modules.get(_MODAL_CLOUD_MODULE_NAME)
+    if existing_module is not None and getattr(existing_module, "app", None) is not None:
+        return existing_module
+    if existing_module is not None:
+        logger.warning(
+            "Discarding partially initialized Modal cloud module %s before reload.",
+            _MODAL_CLOUD_MODULE_NAME,
+        )
+        sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
 
     cloud_module_path = Path(__file__).resolve().parents[1] / f"{_MODAL_CLOUD_MODULE_NAME}.py"
     module_spec = importlib.util.spec_from_file_location(
@@ -492,7 +544,11 @@ def _load_modal_cloud_module() -> Any:
 
     cloud_module = importlib.util.module_from_spec(module_spec)
     sys.modules[_MODAL_CLOUD_MODULE_NAME] = cloud_module
-    module_spec.loader.exec_module(cloud_module)
+    try:
+        module_spec.loader.exec_module(cloud_module)
+    except BaseException:
+        sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
+        raise
     return cloud_module
 
 
@@ -694,6 +750,36 @@ def _emit_local_preview_boundary_output(
             },
             client_id,
         )
+
+
+def _allowed_suppressed_stream_node_ids(payload: dict[str, Any]) -> set[str]:
+    """Return the node ids that may surface UI events for a suppressed mapped/static stream."""
+    allowed_node_ids = {
+        str(node_id)
+        for node_id in payload.get("execute_node_ids", [])
+        if str(node_id)
+    }
+    allowed_node_ids.update(
+        str(boundary_output["node_id"])
+        for boundary_output in payload.get("boundary_outputs", [])
+        if boundary_output.get("node_id") is not None and str(boundary_output["node_id"])
+    )
+    return allowed_node_ids
+
+
+def _should_forward_suppressed_stream_event(
+    payload: dict[str, Any],
+    reported_node_id: Any,
+) -> bool:
+    """Return whether a suppressed mapped/static stream event belongs to this payload."""
+    if not bool(payload.get("suppress_status_stream")):
+        return True
+    if reported_node_id is None:
+        return False
+    allowed_node_ids = _allowed_suppressed_stream_node_ids(payload)
+    if not allowed_node_ids:
+        return True
+    return str(reported_node_id) in allowed_node_ids
 
 
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
@@ -904,6 +990,13 @@ def _consume_remote_payload_stream(
             if event_type == "executed":
                 reported_node_id = stream_event.get("node_id")
                 if reported_node_id is not None:
+                    if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                        logger.debug(
+                            "Suppressing streamed Modal executed output for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                            payload.get("component_id"),
+                            reported_node_id,
+                        )
+                        continue
                     logger.debug(
                         "Forwarding streamed Modal executed output for component=%s node_id=%s.",
                         payload.get("component_id"),
@@ -925,6 +1018,13 @@ def _consume_remote_payload_stream(
                 reported_node_id = stream_event.get("node_id")
                 image_bytes = deserialize_value(stream_event.get("image_bytes"))
                 if reported_node_id is not None and isinstance(image_bytes, bytes):
+                    if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                        logger.debug(
+                            "Suppressing streamed Modal preview image for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                            payload.get("component_id"),
+                            reported_node_id,
+                        )
+                        continue
                     logger.debug(
                         "Forwarding streamed Modal preview image for component=%s node_id=%s.",
                         payload.get("component_id"),
@@ -1053,6 +1153,14 @@ def _build_mapped_item_payload(
     item_payload["mapped_progress_display_node_id"] = str(
         payload.get("component_id", "modal-subgraph")
     )
+    item_payload["execute_node_ids"] = list(
+        payload.get("mapped_execute_node_ids") or payload.get("execute_node_ids", [])
+    )
+    item_payload["boundary_outputs"] = [
+        copy.deepcopy(boundary_output)
+        for boundary_output in payload.get("boundary_outputs", [])
+        if _is_mapped_boundary_output(boundary_output, payload)
+    ]
     return item_payload
 
 
@@ -1080,6 +1188,64 @@ def _aggregate_mapped_outputs(
             )
         )
     return tuple(aggregated_outputs)
+
+
+def _is_mapped_boundary_output(boundary_output: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Return whether one boundary output belongs to the mapped per-item branch."""
+    mapped_output = boundary_output.get("mapped_output")
+    if mapped_output is not None:
+        return bool(mapped_output)
+    return bool(payload.get("mapped_input")) and not bool(payload.get("static_execute_node_ids"))
+
+
+def _build_static_mapped_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the one-time static subgraph payload for a hybrid mapped component."""
+    static_payload = copy.deepcopy(payload)
+    static_payload["payload_kind"] = "subgraph"
+    static_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::static"
+    static_payload["mapped_input"] = None
+    static_payload["suppress_status_stream"] = True
+    static_payload["execute_node_ids"] = list(payload.get("static_execute_node_ids") or [])
+    static_payload["boundary_outputs"] = [
+        copy.deepcopy(boundary_output)
+        for boundary_output in payload.get("boundary_outputs", [])
+        if not _is_mapped_boundary_output(boundary_output, payload)
+    ]
+    return static_payload
+
+
+def _merge_static_and_mapped_outputs(
+    *,
+    static_outputs: tuple[Any, ...],
+    mapped_outputs: tuple[Any, ...],
+    payload: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Reassemble one hybrid mapped component's static and mapped outputs in original order."""
+    combined_outputs: list[Any] = []
+    static_output_index = 0
+    mapped_output_index = 0
+
+    for boundary_output in payload.get("boundary_outputs", []):
+        if _is_mapped_boundary_output(boundary_output, payload):
+            if mapped_output_index >= len(mapped_outputs):
+                raise RemoteSubgraphExecutionError(
+                    "Mapped remote execution returned fewer mapped outputs than expected."
+                )
+            combined_outputs.append(mapped_outputs[mapped_output_index])
+            mapped_output_index += 1
+            continue
+        if static_output_index >= len(static_outputs):
+            raise RemoteSubgraphExecutionError(
+                "Mapped remote execution returned fewer static outputs than expected."
+            )
+        combined_outputs.append(static_outputs[static_output_index])
+        static_output_index += 1
+
+    if static_output_index != len(static_outputs) or mapped_output_index != len(mapped_outputs):
+        raise RemoteSubgraphExecutionError(
+            "Mapped remote execution produced extra outputs that did not match the declared boundary outputs."
+        )
+    return tuple(combined_outputs)
 
 
 def _emit_local_mapped_progress(
@@ -1183,6 +1349,14 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
     )
     _emit_local_mapped_progress(payload, 0, total_items)
 
+    static_outputs: tuple[Any, ...] = ()
+    if payload.get("static_execute_node_ids"):
+        static_response = await invoke_remote_engine_async(
+            _build_static_mapped_payload(payload),
+            kwargs_payload,
+        )
+        static_outputs = deserialize_node_outputs(static_response)
+
     per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
     completed_items = 0
     item_queue: asyncio.Queue[tuple[int, Any] | None] = asyncio.Queue()
@@ -1226,9 +1400,20 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
         raise
 
     return serialize_node_outputs(
-        _aggregate_mapped_outputs(
-            [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
-            payload,
+        _merge_static_and_mapped_outputs(
+            static_outputs=static_outputs,
+            mapped_outputs=_aggregate_mapped_outputs(
+                [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+                {
+                    **payload,
+                    "boundary_outputs": [
+                        boundary_output
+                        for boundary_output in payload.get("boundary_outputs", [])
+                        if _is_mapped_boundary_output(boundary_output, payload)
+                    ],
+                },
+            ),
+            payload=payload,
         )
     )
 

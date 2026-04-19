@@ -148,6 +148,8 @@ Remote mode requires:
 - `COMFY_MODAL_EXECUTION_MODE` set to something other than `local`
 
 The normal remote path is deployed-app lookup by name. On first remote use, the extension can auto-deploy the stable cloud entrypoint from [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py) if the configured app does not exist yet.
+If a previous attempt imported that cloud entrypoint only partially before failing, the loader now discards the stale cached module and retries the import cleanly before auto-deploy.
+The local and remote subgraph runners also canonicalize malformed singleton-list wrappers in rewritten prompts, including socket indexes like `["node", [0]]`, scalar inputs like `[4]`, and wrapped execute node ids like `["12"]`, before handing the prompt to ComfyUI.
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=remote
@@ -173,6 +175,7 @@ Remote runtime behavior:
 - The local Modal call executor keeps multiple worker threads available, which removes the previous `max_workers=1` bottleneck when several remote components are ready at once.
 - `ModalMapInput` can turn one remote component boundary into a locally scheduled mapped execution. List inputs and batched tensors fan out into multiple per-item Modal subgraph calls, and the local scheduler refills that queue up to the configured `COMFY_MODAL_MAX_CONTAINERS`.
 - When a mapped remote component has several Modal workers running at once, the local node overlay now shows one progress lane per active worker plus the aggregate completion bar, instead of letting concurrent runs overwrite a single progress bar.
+- Mapped remote components can now contain both one-time execute targets and per-item execute targets. A common case is two remote `KSampler` nodes sharing one upstream `Load Diffusion Model`, where only the sampler fed by `ModalMapInput` should fan out per latent while the sibling sampler still runs exactly once.
 - Remote cancellation now uses a shared Modal `Dict` control store instead of a second RPC lane into the execution class, so per-container execution concurrency can stay at `1` without losing interrupt propagation.
 - If a run is cancelled and restarted quickly, or a warm container is still releasing heavy model files, the remote worker now gives Modal volume reload a longer bounded retry window so recently released files can close before the next request needs a fresh `vol.reload()`.
 - Mapped remote execution now carries a per-request volume reload marker, so one warm container only performs `vol.reload()` once for that uploaded asset snapshot even if the local scheduler fans the component out into many per-item Modal calls.
@@ -238,7 +241,8 @@ Current mapped-execution rules:
 - mapped inputs may currently be Python lists, `IMAGE` batches, `LATENT` batches, and other batched tensors split on dimension `0`
 - non-mapped boundary inputs are broadcast unchanged to every per-item execution
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
-- per-item remote node status updates are suppressed, but preview images and boundary preview outputs still stream back as each item finishes
+- per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item
+- the proxy node itself now opts into ComfyUI `INPUT_IS_LIST` handling and unwraps singleton list wrappers on both `original_node_data` and ordinary inputs before dispatch, so list-valued mapped inputs reach the internal Modal scheduler without causing the whole proxy node to be auto-mapped once per item
 
 ### 4. Queue the workflow
 
