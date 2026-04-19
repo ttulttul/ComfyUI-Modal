@@ -1053,6 +1053,14 @@ def _build_mapped_item_payload(
     item_payload["mapped_progress_display_node_id"] = str(
         payload.get("component_id", "modal-subgraph")
     )
+    item_payload["execute_node_ids"] = list(
+        payload.get("mapped_execute_node_ids") or payload.get("execute_node_ids", [])
+    )
+    item_payload["boundary_outputs"] = [
+        copy.deepcopy(boundary_output)
+        for boundary_output in payload.get("boundary_outputs", [])
+        if _is_mapped_boundary_output(boundary_output, payload)
+    ]
     return item_payload
 
 
@@ -1080,6 +1088,64 @@ def _aggregate_mapped_outputs(
             )
         )
     return tuple(aggregated_outputs)
+
+
+def _is_mapped_boundary_output(boundary_output: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Return whether one boundary output belongs to the mapped per-item branch."""
+    mapped_output = boundary_output.get("mapped_output")
+    if mapped_output is not None:
+        return bool(mapped_output)
+    return bool(payload.get("mapped_input")) and not bool(payload.get("static_execute_node_ids"))
+
+
+def _build_static_mapped_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the one-time static subgraph payload for a hybrid mapped component."""
+    static_payload = copy.deepcopy(payload)
+    static_payload["payload_kind"] = "subgraph"
+    static_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::static"
+    static_payload["mapped_input"] = None
+    static_payload["suppress_status_stream"] = True
+    static_payload["execute_node_ids"] = list(payload.get("static_execute_node_ids") or [])
+    static_payload["boundary_outputs"] = [
+        copy.deepcopy(boundary_output)
+        for boundary_output in payload.get("boundary_outputs", [])
+        if not _is_mapped_boundary_output(boundary_output, payload)
+    ]
+    return static_payload
+
+
+def _merge_static_and_mapped_outputs(
+    *,
+    static_outputs: tuple[Any, ...],
+    mapped_outputs: tuple[Any, ...],
+    payload: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Reassemble one hybrid mapped component's static and mapped outputs in original order."""
+    combined_outputs: list[Any] = []
+    static_output_index = 0
+    mapped_output_index = 0
+
+    for boundary_output in payload.get("boundary_outputs", []):
+        if _is_mapped_boundary_output(boundary_output, payload):
+            if mapped_output_index >= len(mapped_outputs):
+                raise RemoteSubgraphExecutionError(
+                    "Mapped remote execution returned fewer mapped outputs than expected."
+                )
+            combined_outputs.append(mapped_outputs[mapped_output_index])
+            mapped_output_index += 1
+            continue
+        if static_output_index >= len(static_outputs):
+            raise RemoteSubgraphExecutionError(
+                "Mapped remote execution returned fewer static outputs than expected."
+            )
+        combined_outputs.append(static_outputs[static_output_index])
+        static_output_index += 1
+
+    if static_output_index != len(static_outputs) or mapped_output_index != len(mapped_outputs):
+        raise RemoteSubgraphExecutionError(
+            "Mapped remote execution produced extra outputs that did not match the declared boundary outputs."
+        )
+    return tuple(combined_outputs)
 
 
 def _emit_local_mapped_progress(
@@ -1183,6 +1249,14 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
     )
     _emit_local_mapped_progress(payload, 0, total_items)
 
+    static_outputs: tuple[Any, ...] = ()
+    if payload.get("static_execute_node_ids"):
+        static_response = await invoke_remote_engine_async(
+            _build_static_mapped_payload(payload),
+            kwargs_payload,
+        )
+        static_outputs = deserialize_node_outputs(static_response)
+
     per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
     completed_items = 0
     item_queue: asyncio.Queue[tuple[int, Any] | None] = asyncio.Queue()
@@ -1226,9 +1300,20 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
         raise
 
     return serialize_node_outputs(
-        _aggregate_mapped_outputs(
-            [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
-            payload,
+        _merge_static_and_mapped_outputs(
+            static_outputs=static_outputs,
+            mapped_outputs=_aggregate_mapped_outputs(
+                [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+                {
+                    **payload,
+                    "boundary_outputs": [
+                        boundary_output
+                        for boundary_output in payload.get("boundary_outputs", [])
+                        if _is_mapped_boundary_output(boundary_output, payload)
+                    ],
+                },
+            ),
+            payload=payload,
         )
     )
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-import pytest
 
 
 class _FakeRemoteModelNode:
@@ -723,13 +722,13 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
     assert rewritten_prompt["4"]["inputs"]["text"] == ["2", 0]
 
 
-def test_rewrite_rejects_mapped_branch_that_shares_non_transportable_upstream_with_unmapped_sibling(
+def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_with_unmapped_sibling(
     api_intercept_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Mapped execution should reject sibling execute nodes that do not depend on ModalMapInput."""
+    """Mapped execution should separate static and per-item execute targets within one coarse component."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -818,17 +817,45 @@ def test_rewrite_rejects_mapped_branch_that_shares_non_transportable_upstream_wi
         },
     }
 
-    with pytest.raises(
-        api_intercept_module.ModalPromptValidationError,
-        match="Mapped remote execution cannot include execute nodes that do not depend on the Modal Map Input",
-    ):
-        api_intercept_module.rewrite_prompt_for_modal(
-            prompt=prompt,
-            workflow=workflow,
-            sync_engine=sync_engine,
-            settings=settings,
-            nodes_module=fake_nodes_module,
-        )
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert summary.remote_component_ids == ["1"]
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["payload_kind"] == "mapped_subgraph"
+    assert payload["component_node_ids"] == ["1", "3", "6", "7"]
+    assert payload["execute_node_ids"] == ["3", "7"]
+    assert payload["static_execute_node_ids"] == ["3"]
+    assert payload["mapped_execute_node_ids"] == ["7"]
+    assert payload["mapped_input"] == {
+        "proxy_input_name": "remote_input_1",
+        "io_type": "LATENT",
+    }
+    assert payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "3_latent",
+            "node_id": "3",
+            "output_index": 0,
+            "io_type": "LATENT",
+            "is_list": False,
+            "preview_target_node_ids": [],
+            "mapped_output": False,
+        },
+        {
+            "proxy_output_name": "7_latent",
+            "node_id": "7",
+            "output_index": 0,
+            "io_type": "LATENT",
+            "is_list": False,
+            "preview_target_node_ids": [],
+            "mapped_output": True,
+        },
+    ]
 
 
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(

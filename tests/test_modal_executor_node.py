@@ -1608,6 +1608,72 @@ def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
     assert any(update.get("clear") is True for update in lane_updates)
 
 
+def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped remote execution should run static execute targets once and mapped targets per item."""
+    observed_execute_node_ids: list[tuple[str, tuple[str, ...]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        observed_execute_node_ids.append(
+            (
+                str(payload["component_id"]),
+                tuple(str(node_id) for node_id in payload.get("execute_node_ids", [])),
+            )
+        )
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        if str(payload["component_id"]).endswith("::static"):
+            assert tuple(payload.get("execute_node_ids", [])) == ("3",)
+            assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["3"]
+            return serialization_module.serialize_node_outputs(("static-output",))
+
+        assert tuple(payload.get("execute_node_ids", [])) == ("7",)
+        assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["7"]
+        return serialization_module.serialize_node_outputs((f"mapped:{hydrated_inputs['remote_input_1']}",))
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "1",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "boundary_outputs": [
+            {"node_id": "3", "io_type": "STRING", "is_list": False, "mapped_output": False},
+            {"node_id": "7", "io_type": "STRING", "is_list": False, "mapped_output": True},
+        ],
+        "execute_node_ids": ["3", "7"],
+        "static_execute_node_ids": ["3"],
+        "mapped_execute_node_ids": ["7"],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_mapped_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {"remote_input_1": ["a", "b"]}
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        "static-output",
+        ["mapped:a", "mapped:b"],
+    )
+    assert observed_execute_node_ids[0] == ("1::static", ("3",))
+    assert observed_execute_node_ids[1:] == [
+        ("1::item:0", ("7",)),
+        ("1::item:1", ("7",)),
+    ]
+
+
 def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_previews(
     remote_modal_app_module: Any,
     serialization_module: Any,
