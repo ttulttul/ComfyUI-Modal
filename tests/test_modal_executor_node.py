@@ -1891,6 +1891,16 @@ def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
         "payload_kind": "subgraph",
         "component_id": "12",
         "prompt_id": "prompt-1",
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "latent_image": ["remote_input_0", 0],
+                    "seed": ["remote_input_1", 0],
+                },
+            }
+        },
         "boundary_inputs": [
             {
                 "proxy_input_name": "remote_input_0",
@@ -1928,13 +1938,6 @@ def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Implicit subgraph batching still reruns static sibling samplers that share a MODEL "
-        "with the batched sampler instead of separating one-time and per-item execute nodes."
-    ),
-)
 def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_run(
     remote_modal_app_module: Any,
     serialization_module: Any,
@@ -1968,10 +1971,10 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
         "execute_node_ids": ["4", "12"],
         "subgraph_prompt": {
             "17": {"class_type": "LoraLoaderModelOnly", "inputs": {}},
-            "4": {"class_type": "KSampler", "inputs": {"model": ["17", 0], "seed": ["remote_input_1", 0]}},
+            "4": {"class_type": "KSampler", "inputs": {"model": ["17", 0], "seed": 0}},
             "12": {
                 "class_type": "KSampler",
-                "inputs": {"model": ["17", 0], "seed": ["remote_input_0", 0]},
+                "inputs": {"model": ["17", 0], "seed": 0},
             },
         },
         "boundary_inputs": [
@@ -2010,11 +2013,11 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
         ["sampler-12:10", "sampler-12:11", "sampler-12:12", "sampler-12:13"],
     )
     assert observed_calls == [
-        ("17::static", ("4",), {"remote_input_1": 28}),
-        ("17::item:0", ("12",), {"remote_input_0": 10}),
-        ("17::item:1", ("12",), {"remote_input_0": 11}),
-        ("17::item:2", ("12",), {"remote_input_0": 12}),
-        ("17::item:3", ("12",), {"remote_input_0": 13}),
+        ("17::static", ("4",), {"remote_input_1": [28]}),
+        ("17::item:0", ("12",), {"remote_input_0": 10, "remote_input_1": [28]}),
+        ("17::item:1", ("12",), {"remote_input_0": 11, "remote_input_1": [28]}),
+        ("17::item:2", ("12",), {"remote_input_0": 12, "remote_input_1": [28]}),
+        ("17::item:3", ("12",), {"remote_input_0": 13, "remote_input_1": [28]}),
     ]
 
 
@@ -2177,7 +2180,7 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
             "node_id": "7",
             "value": 1.0,
             "max_value": 4.0,
-            "display_node_id": "6",
+            "display_node_id": "7",
             "lane_id": "1",
             "item_index": 0,
         }
