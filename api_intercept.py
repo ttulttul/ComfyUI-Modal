@@ -57,6 +57,7 @@ class BoundaryInputSpec:
 
     proxy_input_name: str
     source: LinkedOutputRef
+    io_type: str
     targets: list[InputTarget] = field(default_factory=list)
 
 
@@ -931,9 +932,16 @@ def _build_component_plan(
             source = LinkedOutputRef(node_id=upstream_node_id, output_index=int(input_value[1]))
             spec = boundary_inputs_by_source.get(source)
             if spec is None:
+                source_io_type = _remote_output_io_type(
+                    prompt=prompt,
+                    node_id=source.node_id,
+                    output_index=source.output_index,
+                    nodes_module=nodes_module,
+                )
                 spec = BoundaryInputSpec(
                     proxy_input_name=f"remote_input_{len(boundary_inputs_by_source)}",
                     source=source,
+                    io_type=source_io_type,
                 )
                 boundary_inputs_by_source[source] = spec
             spec.targets.append(InputTarget(node_id=node_id, input_name=str(input_name)))
@@ -1251,6 +1259,7 @@ def _build_component_payload(
         "boundary_inputs": [
             {
                 "proxy_input_name": boundary_input.proxy_input_name,
+                "io_type": boundary_input.io_type,
                 "targets": [
                     {"node_id": target.node_id, "input_name": target.input_name}
                     for target in boundary_input.targets

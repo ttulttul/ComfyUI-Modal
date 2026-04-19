@@ -1499,6 +1499,124 @@ def _emit_local_mapped_lane_progress_start(
     )
 
 
+def _split_batch_boundary_inputs(
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+) -> tuple[dict[str, list[Any]], int] | None:
+    """Return zipped per-item boundary inputs when an ordinary subgraph receives batched values."""
+    split_inputs: dict[str, list[Any]] = {}
+    for boundary_input in payload.get("boundary_inputs", []):
+        proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
+        if not proxy_input_name or proxy_input_name not in hydrated_inputs:
+            continue
+        try:
+            items = split_mapped_value(
+                hydrated_inputs[proxy_input_name],
+                str(boundary_input.get("io_type", "*")),
+            )
+        except (TypeError, ValueError):
+            continue
+        if len(items) <= 1:
+            continue
+        split_inputs[proxy_input_name] = items
+
+    if not split_inputs:
+        return None
+
+    item_counts = {input_name: len(items) for input_name, items in split_inputs.items()}
+    unique_counts = set(item_counts.values())
+    if len(unique_counts) != 1:
+        raise ModalRemoteInvocationError(
+            "Implicit Modal batch boundary inputs must all have the same item count. "
+            f"Received counts: {item_counts!r}"
+        )
+    return split_inputs, next(iter(unique_counts))
+
+
+async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+    """Fan out one ordinary subgraph payload when batchable boundary inputs arrive zipped."""
+    hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    split_batch_inputs = _split_batch_boundary_inputs(payload, hydrated_inputs)
+    if split_batch_inputs is None:
+        raise ModalRemoteInvocationError(
+            "Implicit mapped subgraph execution requires at least one batched boundary input."
+        )
+
+    split_inputs, total_items = split_batch_inputs
+    parallelism = _mapped_execution_parallelism(total_items)
+    logger.info(
+        "Scheduling implicitly mapped Modal component=%s for %d item(s) with local parallelism=%d across inputs=%s.",
+        payload.get("component_id"),
+        total_items,
+        parallelism,
+        sorted(split_inputs),
+    )
+    _emit_local_mapped_progress(payload, 0, total_items)
+
+    broadcast_inputs = {
+        input_name: value
+        for input_name, value in hydrated_inputs.items()
+        if input_name not in split_inputs
+    }
+    per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
+    completed_items = 0
+    item_queue: asyncio.Queue[int | None] = asyncio.Queue()
+    for item_index in range(total_items):
+        item_queue.put_nowait(item_index)
+    for _ in range(parallelism):
+        item_queue.put_nowait(None)
+
+    async def run_worker(lane_index: int) -> None:
+        """Execute queued implicit mapped items through one stable local worker lane."""
+        nonlocal completed_items
+        while True:
+            item_index = await item_queue.get()
+            if item_index is None:
+                return
+            if _local_processing_interrupted():
+                _raise_local_interrupt()
+            _emit_local_mapped_lane_progress_start(payload, lane_index, item_index)
+            try:
+                item_payload = copy.deepcopy(payload)
+                item_payload["component_id"] = (
+                    f"{payload.get('component_id', 'modal-subgraph')}::implicit-item:{item_index}"
+                )
+                item_payload["suppress_status_stream"] = True
+                item_payload["map_item_index"] = item_index
+                item_payload["mapped_progress_lane_id"] = str(lane_index)
+                item_payload["mapped_progress_display_node_id"] = str(
+                    payload.get("component_id", "modal-subgraph")
+                )
+                item_inputs = dict(broadcast_inputs)
+                for input_name, items in split_inputs.items():
+                    item_inputs[input_name] = items[item_index]
+                item_response = await invoke_remote_engine_async(
+                    item_payload,
+                    serialize_node_inputs(item_inputs),
+                )
+                per_item_outputs[item_index] = deserialize_node_outputs(item_response)
+                completed_items += 1
+                _emit_local_mapped_progress(payload, completed_items, total_items)
+            finally:
+                _clear_local_mapped_lane_progress(payload, lane_index, item_index)
+
+    tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
+    try:
+        await asyncio.gather(*tasks)
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    return serialize_node_outputs(
+        _aggregate_mapped_outputs(
+            [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+            payload,
+        )
+    )
+
+
 async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Split one mapped boundary input, run per-item remote executions, and reassemble outputs."""
     mapped_input = payload.get("mapped_input") or {}
@@ -1824,6 +1942,10 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
     """Invoke Modal when configured, or fall back to local in-process execution."""
     if payload.get("payload_kind") == "mapped_subgraph":
         return asyncio.run(_invoke_mapped_remote_engine_async(payload, kwargs_payload))
+    if payload.get("payload_kind") == "subgraph":
+        hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+        if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
+            return asyncio.run(_invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload))
 
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
@@ -1885,6 +2007,10 @@ async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: by
     """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
     if payload.get("payload_kind") == "mapped_subgraph":
         return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
+    if payload.get("payload_kind") == "subgraph":
+        hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+        if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
+            return await _invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload)
 
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:

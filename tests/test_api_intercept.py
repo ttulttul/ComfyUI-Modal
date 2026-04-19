@@ -401,6 +401,7 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
     assert second_payload["boundary_inputs"] == [
         {
             "proxy_input_name": "remote_input_0",
+            "io_type": "IMAGE",
             "targets": [{"node_id": "2", "input_name": "image"}],
         }
     ]
@@ -717,6 +718,7 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
     assert payload["boundary_inputs"] == [
         {
             "proxy_input_name": "remote_input_0",
+            "io_type": "STRING",
             "targets": [{"node_id": "2", "input_name": "value"}],
         }
     ]
