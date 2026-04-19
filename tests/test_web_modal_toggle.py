@@ -134,7 +134,9 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "detail.lane_id != null" in source
     assert "clearNodeProgressLane(progressNodeId, promptId, String(detail.lane_id));" in source
     assert "setNodeProgressLane(" in source
-    assert 'ctx.fillText(`${Math.round(progressRatio * 100)}%`' in source
+    assert 'const panelY = node.size[1] + 6 / scale;' in source
+    assert 'ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);' in source
+    assert 'const headerText = hasAggregateProgress' in source
 
 
 def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
@@ -145,8 +147,9 @@ def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     assert "const modalNodeBatchProgress = new Map();" in source
     assert "progressLanes.length > 0" in source
     assert "const laneColors = [" in source
-    assert 'ctx.fillText(`${progressLanes.length}x`' in source
-    assert 'const badgeText = `${completedItems}/${totalItems}`;' in source
+    assert 'const badgeText = hasBatchBadge' in source
+    assert 'const badgeY = panelY + panelPaddingY;' in source
+    assert 'let laneY = barY;' in source
 
 
 def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
