@@ -177,6 +177,7 @@ Remote runtime behavior:
 - `ModalMapInput` can turn one remote component boundary into a locally scheduled mapped execution. List inputs and batched tensors fan out into multiple per-item Modal subgraph calls, and the local scheduler refills that queue up to the configured `COMFY_MODAL_MAX_CONTAINERS`.
 - When a mapped remote component has several Modal workers running at once, the local node overlay now shows one progress lane per active worker plus the aggregate completion bar, instead of letting concurrent runs overwrite a single progress bar.
 - Mapped remote components can now contain both one-time execute targets and per-item execute targets. A common case is two remote `KSampler` nodes sharing one upstream `Load Diffusion Model`, where only the sampler fed by `ModalMapInput` should fan out per latent while the sibling sampler still runs exactly once.
+- Hybrid mapped sub-runs now trim their prompt down to the dependency closure of the specific `execute_node_ids` they are about to run. That keeps a static-only sub-run from validating or executing the unrelated mapped branch just because both branches originally lived in the same coarse remote component.
 - Remote cancellation now uses a shared Modal `Dict` control store instead of a second RPC lane into the execution class, so per-container execution concurrency can stay at `1` without losing interrupt propagation.
 - If a run is cancelled and restarted quickly, or a warm container is still releasing heavy model files, the remote worker now gives Modal volume reload a longer bounded retry window so recently released files can close before the next request needs a fresh `vol.reload()`.
 - Mapped remote execution now carries a per-request volume reload marker, so one warm container only performs `vol.reload()` once for that uploaded asset snapshot even if the local scheduler fans the component out into many per-item Modal calls.
@@ -244,6 +245,7 @@ Current mapped-execution rules:
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
 - per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item
 - the proxy node itself now opts into ComfyUI `INPUT_IS_LIST` handling and unwraps singleton list wrappers on both `original_node_data` and ordinary inputs before dispatch, so list-valued mapped inputs reach the internal Modal scheduler without causing the whole proxy node to be auto-mapped once per item
+- static and per-item sub-runs prune the rewritten prompt to only the nodes they actually depend on before handing it to `PromptExecutor`, so shared-upstream hybrid components do not validate the other branch's batched inputs during the wrong sub-run
 
 ### 4. Queue the workflow
 
