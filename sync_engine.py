@@ -216,20 +216,12 @@ class ModalAssetSyncEngine:
         sha256 = self._hash_file(resolved_path)
         marker_path = f"/hashes/{sha256}.done"
         remote_path = f"{remote_folder.rstrip('/')}/{sha256}_{resolved_path.name}"
-        uploaded = False
-
-        if not self.volume.exists(marker_path):
-            logger.info("Syncing %s to %s", resolved_path, remote_path)
-            self.volume.put_file(resolved_path, remote_path)
-            self.volume.put_bytes(
-                json.dumps({"source": str(resolved_path), "remote_path": remote_path}).encode(
-                    "utf-8"
-                ),
-                marker_path,
-            )
-            uploaded = True
-        else:
-            logger.debug("Asset already mirrored for sha=%s", sha256)
+        uploaded = self._sync_content_addressed_file(
+            local_path=resolved_path,
+            remote_path=remote_path,
+            marker_path=marker_path,
+            source_description=str(resolved_path),
+        )
 
         return SyncedAsset(
             local_path=resolved_path,
@@ -298,6 +290,24 @@ class ModalAssetSyncEngine:
                 uploaded=False,
             )
 
+        if self.volume.exists(remote_path):
+            logger.warning(
+                "Reusing mirrored custom_nodes bundle at %s because the deterministic payload already exists without marker %s; backfilling the marker.",
+                remote_path,
+                marker_path,
+            )
+            self._write_sync_marker(
+                source_description=str(custom_nodes_dir),
+                remote_path=remote_path,
+                marker_path=marker_path,
+            )
+            return SyncedAsset(
+                local_path=custom_nodes_dir,
+                remote_path=remote_path,
+                sha256=directory_hash,
+                uploaded=False,
+            )
+
         archive_path = self._cached_custom_nodes_archive_path(directory_hash)
         if archive_path.exists():
             logger.info("Reusing cached custom_nodes archive %s for digest %s.", archive_path, directory_hash)
@@ -311,13 +321,11 @@ class ModalAssetSyncEngine:
                 time.perf_counter() - archive_started_at,
             )
 
-        logger.info("Syncing custom_nodes bundle from %s to %s", custom_nodes_dir, remote_path)
-        self.volume.put_file(archive_path, remote_path)
-        self.volume.put_bytes(
-            json.dumps({"source": str(custom_nodes_dir), "remote_path": remote_path}).encode(
-                "utf-8"
-            ),
-            marker_path,
+        uploaded = self._sync_content_addressed_file(
+            local_path=archive_path,
+            remote_path=remote_path,
+            marker_path=marker_path,
+            source_description=str(custom_nodes_dir),
         )
 
         logger.info(
@@ -329,7 +337,47 @@ class ModalAssetSyncEngine:
             local_path=custom_nodes_dir,
             remote_path=remote_path,
             sha256=directory_hash,
-            uploaded=True,
+            uploaded=uploaded,
+        )
+
+    def _sync_content_addressed_file(
+        self,
+        *,
+        local_path: Path,
+        remote_path: str,
+        marker_path: str,
+        source_description: str,
+    ) -> bool:
+        """Upload one deterministic file only when neither the file nor its marker already exists."""
+        if self.volume.exists(marker_path):
+            logger.info("Reusing mirrored asset at %s because marker %s already exists.", remote_path, marker_path)
+            return False
+
+        if self.volume.exists(remote_path):
+            logger.warning(
+                "Reusing mirrored asset at %s because the deterministic file already exists without marker %s; backfilling the marker.",
+                remote_path,
+                marker_path,
+            )
+            self._write_sync_marker(source_description=source_description, remote_path=remote_path, marker_path=marker_path)
+            return False
+
+        logger.info("Syncing %s to %s", source_description, remote_path)
+        self.volume.put_file(local_path, remote_path)
+        self._write_sync_marker(source_description=source_description, remote_path=remote_path, marker_path=marker_path)
+        return True
+
+    def _write_sync_marker(
+        self,
+        *,
+        source_description: str,
+        remote_path: str,
+        marker_path: str,
+    ) -> None:
+        """Persist one sync marker payload describing a mirrored content-addressed file."""
+        self.volume.put_bytes(
+            json.dumps({"source": source_description, "remote_path": remote_path}).encode("utf-8"),
+            marker_path,
         )
 
 

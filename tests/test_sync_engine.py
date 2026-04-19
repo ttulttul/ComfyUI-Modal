@@ -242,6 +242,134 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
     assert second_engine._cached_custom_nodes_archive_path(first_bundle.sha256).exists()
 
 
+def test_sync_file_backfills_marker_when_remote_payload_already_exists(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """An existing deterministic remote asset should be reused even when its marker is missing."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"model-bytes")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+
+    class ExistingRemoteFileVolume:
+        """Volume double with a missing marker but a pre-existing deterministic payload path."""
+
+        def __init__(self) -> None:
+            """Initialize captured writes."""
+            self.put_file_calls: list[tuple[Path, str]] = []
+            self.put_bytes_calls: list[tuple[bytes, str]] = []
+
+        def exists(self, remote_path: str) -> bool:
+            return remote_path.startswith("/assets/") and remote_path.endswith("_model.safetensors")
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            self.put_file_calls.append((local_path, remote_path))
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            self.put_bytes_calls.append((payload, remote_path))
+
+    volume = ExistingRemoteFileVolume()
+    engine = sync_engine_module.ModalAssetSyncEngine(volume=volume, settings=settings)
+
+    synced_asset = engine.sync_file(asset_path)
+
+    assert synced_asset.uploaded is False
+    assert volume.put_file_calls == []
+    assert len(volume.put_bytes_calls) == 1
+    assert volume.put_bytes_calls[0][1] == f"/hashes/{synced_asset.sha256}.done"
+
+
+def test_sync_custom_nodes_directory_backfills_marker_when_remote_bundle_already_exists(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """An existing hash-named remote custom_nodes bundle should be reused without rebuilding or reuploading."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    directory_hash = engine._hash_directory(custom_nodes_dir)
+    remote_path = f"/custom_nodes/{directory_hash}_{settings.custom_nodes_archive_name}"
+    marker_path = f"/hashes/custom_nodes_{directory_hash}.done"
+
+    class ExistingRemoteBundleVolume:
+        """Volume double with a missing marker but a pre-existing deterministic custom_nodes bundle path."""
+
+        def __init__(self) -> None:
+            """Initialize captured writes."""
+            self.put_file_calls: list[tuple[Path, str]] = []
+            self.put_bytes_calls: list[tuple[bytes, str]] = []
+
+        def exists(self, candidate_path: str) -> bool:
+            return candidate_path == remote_path
+
+        def put_file(self, local_path: Path, candidate_path: str) -> None:
+            self.put_file_calls.append((local_path, candidate_path))
+
+        def put_bytes(self, payload: bytes, candidate_path: str) -> None:
+            self.put_bytes_calls.append((payload, candidate_path))
+
+    volume = ExistingRemoteBundleVolume()
+    engine = sync_engine_module.ModalAssetSyncEngine(volume=volume, settings=settings)
+
+    def fail_create_archive(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Expected the existing hash-named remote bundle to be reused.")
+
+    monkeypatch.setattr(engine, "_create_archive", fail_create_archive)
+    bundle = engine.sync_custom_nodes_directory()
+
+    assert bundle is not None
+    assert bundle.sha256 == directory_hash
+    assert bundle.remote_path == remote_path
+    assert bundle.uploaded is False
+    assert volume.put_file_calls == []
+    assert len(volume.put_bytes_calls) == 1
+    assert volume.put_bytes_calls[0][1] == marker_path
+
+
 def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
     settings_module: Any,
     sync_engine_module: Any,
