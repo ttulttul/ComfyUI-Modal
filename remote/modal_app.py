@@ -37,6 +37,8 @@ _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOYED_APPS: set[tuple[str, str | None]] = set()
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
+_MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
+_MAPPED_PROGRESS_NODE_IDS: dict[tuple[str, str, str], str] = {}
 
 
 def _remote_modal_call_worker_count() -> int:
@@ -1136,6 +1138,13 @@ def _consume_remote_payload_stream(
                     continue
                 reported_node_id = stream_event.get("node_id")
                 if reported_node_id is not None:
+                    display_node_id = (
+                        str(stream_event["display_node_id"])
+                        if stream_event.get("display_node_id") is not None
+                        else str(reported_node_id)
+                    )
+                    if lane_id is not None:
+                        _remember_mapped_lane_node_id(payload, lane_id, display_node_id)
                     logger.debug(
                         "Forwarding streamed Modal node progress for component=%s node_id=%s value=%s max=%s lane_id=%s.",
                         payload.get("component_id"),
@@ -1150,15 +1159,7 @@ def _consume_remote_payload_stream(
                         node_id=str(reported_node_id),
                         value=float(stream_event.get("value", 0.0)),
                         max_value=float(stream_event.get("max", 1.0)),
-                        display_node_id=(
-                            str(payload["mapped_progress_display_node_id"])
-                            if payload.get("mapped_progress_display_node_id") is not None
-                            else (
-                                str(stream_event["display_node_id"])
-                                if stream_event.get("display_node_id") is not None
-                                else None
-                            )
-                        ),
+                        display_node_id=display_node_id,
                         lane_id=lane_id,
                         item_index=(
                             int(payload["map_item_index"])
@@ -1450,6 +1451,35 @@ def _emit_local_mapped_progress(
     )
 
 
+def _mapped_progress_owner_component_id(payload: dict[str, Any]) -> str | None:
+    """Return the stable component id used to track one mapped worker lane locally."""
+    owner_component_id = payload.get("mapped_progress_display_node_id", payload.get("component_id"))
+    if owner_component_id is None:
+        return None
+    owner_component = str(owner_component_id)
+    return owner_component or None
+
+
+def _remember_mapped_lane_node_id(payload: dict[str, Any], lane_id: str, node_id: str) -> None:
+    """Remember the last real node id that emitted progress for one mapped worker lane."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    owner_component_id = _mapped_progress_owner_component_id(payload)
+    if not prompt_id or not owner_component_id or not node_id:
+        return
+    with _MAPPED_PROGRESS_NODE_IDS_LOCK:
+        _MAPPED_PROGRESS_NODE_IDS[(prompt_id, owner_component_id, lane_id)] = node_id
+
+
+def _pop_mapped_lane_node_id(payload: dict[str, Any], lane_id: str) -> str | None:
+    """Forget and return the last real node id that emitted progress for one mapped worker lane."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    owner_component_id = _mapped_progress_owner_component_id(payload)
+    if not prompt_id or not owner_component_id:
+        return None
+    with _MAPPED_PROGRESS_NODE_IDS_LOCK:
+        return _MAPPED_PROGRESS_NODE_IDS.pop((prompt_id, owner_component_id, lane_id), None)
+
+
 def _clear_local_mapped_lane_progress(
     payload: dict[str, Any],
     lane_index: int,
@@ -1459,7 +1489,8 @@ def _clear_local_mapped_lane_progress(
     prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
     extra_data = payload.get("extra_data") or {}
     client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
-    display_node_id = str(payload.get("component_id") or "")
+    lane_id = str(lane_index)
+    display_node_id = _pop_mapped_lane_node_id(payload, lane_id) or str(payload.get("component_id") or "")
     if not prompt_id or not client_id or not display_node_id:
         return
     _emit_local_modal_progress(
@@ -1469,7 +1500,7 @@ def _clear_local_mapped_lane_progress(
         value=0.0,
         max_value=1.0,
         display_node_id=display_node_id,
-        lane_id=str(lane_index),
+        lane_id=lane_id,
         clear=True,
         item_index=item_index,
     )
@@ -1533,6 +1564,84 @@ def _split_batch_boundary_inputs(
     return split_inputs, next(iter(unique_counts))
 
 
+def _partition_implicit_batched_execute_nodes(
+    payload: dict[str, Any],
+    split_inputs: dict[str, list[Any]],
+) -> tuple[list[str], list[str]]:
+    """Split one implicitly batched subgraph into static and per-item execute targets."""
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict):
+        execute_node_ids = [str(node_id) for node_id in payload.get("execute_node_ids", [])]
+        return [], execute_node_ids
+
+    batched_target_node_ids: set[str] = set()
+    for boundary_input in payload.get("boundary_inputs", []):
+        proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
+        if proxy_input_name not in split_inputs:
+            continue
+        for target in boundary_input.get("targets", []):
+            target_node_id = target.get("node_id")
+            if target_node_id is not None:
+                batched_target_node_ids.add(str(target_node_id))
+
+    execute_node_ids = [str(node_id) for node_id in payload.get("execute_node_ids", [])]
+    static_execute_node_ids: list[str] = []
+    mapped_execute_node_ids: list[str] = []
+    for execute_node_id in execute_node_ids:
+        required_node_ids = set(
+            _resolve_required_subgraph_nodes(
+                prompt=prompt,
+                execute_node_ids=[execute_node_id],
+            )
+        )
+        if required_node_ids & batched_target_node_ids:
+            mapped_execute_node_ids.append(execute_node_id)
+            continue
+        static_execute_node_ids.append(execute_node_id)
+
+    if not mapped_execute_node_ids and execute_node_ids:
+        logger.warning(
+            "Implicitly batched Modal component=%s had batched inputs %s but no execute target depended on them; "
+            "falling back to per-item execution for all execute nodes.",
+            payload.get("component_id"),
+            sorted(split_inputs),
+        )
+        return [], execute_node_ids
+
+    logger.info(
+        "Partitioned implicitly batched Modal component=%s into static execute nodes=%s and mapped execute nodes=%s.",
+        payload.get("component_id"),
+        static_execute_node_ids,
+        mapped_execute_node_ids,
+    )
+    return static_execute_node_ids, mapped_execute_node_ids
+
+
+def _annotate_implicit_batched_boundary_outputs(
+    payload: dict[str, Any],
+    mapped_execute_node_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Mark which boundary outputs belong to the per-item branch of an implicitly batched subgraph."""
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict) or not mapped_execute_node_ids:
+        return [copy.deepcopy(boundary_output) for boundary_output in payload.get("boundary_outputs", [])]
+
+    mapped_required_node_ids = set(
+        _resolve_required_subgraph_nodes(
+            prompt=prompt,
+            execute_node_ids=[str(node_id) for node_id in mapped_execute_node_ids],
+        )
+    )
+    annotated_outputs: list[dict[str, Any]] = []
+    for boundary_output in payload.get("boundary_outputs", []):
+        annotated_output = copy.deepcopy(boundary_output)
+        annotated_output["mapped_output"] = (
+            str(boundary_output.get("node_id")) in mapped_required_node_ids
+        )
+        annotated_outputs.append(annotated_output)
+    return annotated_outputs
+
+
 async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Fan out one ordinary subgraph payload when batchable boundary inputs arrive zipped."""
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
@@ -1558,6 +1667,26 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         for input_name, value in hydrated_inputs.items()
         if input_name not in split_inputs
     }
+    static_execute_node_ids, mapped_execute_node_ids = _partition_implicit_batched_execute_nodes(
+        payload,
+        split_inputs,
+    )
+    hybrid_payload = copy.deepcopy(payload)
+    hybrid_payload["static_execute_node_ids"] = static_execute_node_ids
+    hybrid_payload["mapped_execute_node_ids"] = mapped_execute_node_ids
+    hybrid_payload["boundary_outputs"] = _annotate_implicit_batched_boundary_outputs(
+        payload,
+        mapped_execute_node_ids,
+    )
+
+    static_outputs: tuple[Any, ...] = ()
+    if static_execute_node_ids:
+        static_response = await invoke_remote_engine_async(
+            _build_static_mapped_payload(hybrid_payload),
+            serialize_node_inputs(broadcast_inputs),
+        )
+        static_outputs = deserialize_node_outputs(static_response)
+
     per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
     completed_items = 0
     item_queue: asyncio.Queue[int | None] = asyncio.Queue()
@@ -1577,16 +1706,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                 _raise_local_interrupt()
             _emit_local_mapped_lane_progress_start(payload, lane_index, item_index)
             try:
-                item_payload = copy.deepcopy(payload)
-                item_payload["component_id"] = (
-                    f"{payload.get('component_id', 'modal-subgraph')}::implicit-item:{item_index}"
-                )
-                item_payload["suppress_status_stream"] = True
-                item_payload["map_item_index"] = item_index
-                item_payload["mapped_progress_lane_id"] = str(lane_index)
-                item_payload["mapped_progress_display_node_id"] = str(
-                    payload.get("component_id", "modal-subgraph")
-                )
+                item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
                 item_inputs = dict(broadcast_inputs)
                 for input_name, items in split_inputs.items():
                     item_inputs[input_name] = items[item_index]
@@ -1610,9 +1730,20 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         raise
 
     return serialize_node_outputs(
-        _aggregate_mapped_outputs(
-            [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
-            payload,
+        _merge_static_and_mapped_outputs(
+            static_outputs=static_outputs,
+            mapped_outputs=_aggregate_mapped_outputs(
+                [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+                {
+                    **hybrid_payload,
+                    "boundary_outputs": [
+                        boundary_output
+                        for boundary_output in hybrid_payload.get("boundary_outputs", [])
+                        if _is_mapped_boundary_output(boundary_output, hybrid_payload)
+                    ],
+                },
+            ),
+            payload=hybrid_payload,
         )
     )
 

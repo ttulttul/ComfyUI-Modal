@@ -246,9 +246,11 @@ Current mapped-execution rules:
 - downstream remote nodes reachable from that map marker stay in the same mapped remote component
 - mapped inputs may currently be Python lists, `IMAGE` batches, `LATENT` batches, and other batched tensors split on dimension `0`
 - ordinary remote components without `Modal Map Input` still preserve ComfyUI's usual zipped batch semantics at the remote boundary: if multiple boundary inputs arrive as compatible batches, Modal-Sync fans that component out per item instead of injecting the raw list into primitive widget sockets like `seed: INT`
+- that implicit batching path now partitions one-time and per-item execute nodes too, so if two remote samplers share the same upstream `MODEL` but only one sampler receives a multi-item batch input, the sibling sampler still runs once instead of repeating once per batch item
 - non-mapped boundary inputs are broadcast unchanged to every per-item execution
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
 - per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item
+- streamed per-item progress lanes now follow the real executing node id instead of being forced onto the component representative node, so concurrent remote samplers no longer all paint their progress bars onto the first node in the remote island
 - the proxy node itself now opts into ComfyUI `INPUT_IS_LIST` handling and unwraps singleton list wrappers on both `original_node_data` and ordinary inputs before dispatch, so list-valued mapped inputs reach the internal Modal scheduler without causing the whole proxy node to be auto-mapped once per item
 - static and per-item sub-runs prune the rewritten prompt to only the nodes they actually depend on before handing it to `PromptExecutor`, so shared-upstream hybrid components do not validate the other branch's batched inputs during the wrong sub-run
 
