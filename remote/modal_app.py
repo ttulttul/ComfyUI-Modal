@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from dataclasses import dataclass, field
 import importlib.util
 from io import BytesIO
 import logging
@@ -39,6 +40,18 @@ _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
 _MAPPED_PROGRESS_NODE_IDS: dict[tuple[str, str, str], str] = {}
+_PROMPT_WARMUP_STATES_LOCK = threading.Lock()
+_PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
+_PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
+_PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
+
+
+@dataclass
+class _PromptWarmupState:
+    """Track proactive warmup state for one local prompt."""
+
+    scheduled_slots: set[int] = field(default_factory=set)
+    exact_component_parallelism: dict[str, int] = field(default_factory=dict)
 
 
 def _remote_modal_call_worker_count() -> int:
@@ -48,6 +61,7 @@ def _remote_modal_call_worker_count() -> int:
 
 
 _REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=_remote_modal_call_worker_count())
+_REMOTE_MODAL_WARMUP_EXECUTOR = ThreadPoolExecutor(max_workers=_remote_modal_call_worker_count())
 
 try:
     import modal  # type: ignore
@@ -1687,11 +1701,18 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
 
     split_inputs, total_items = split_batch_inputs
     parallelism = _mapped_execution_parallelism(total_items)
+    refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
+    ensure_remote_warm_capacity(
+        _build_prompt_warmup_request(payload),
+        warmup_target=refined_prompt_warmup_target,
+        reason="implicit_mapped_component_exact_parallelism",
+    )
     logger.info(
-        "Scheduling implicitly mapped Modal component=%s for %d item(s) with local parallelism=%d across inputs=%s.",
+        "Scheduling implicitly mapped Modal component=%s for %d item(s) with local parallelism=%d prompt_warmup_target=%d across inputs=%s.",
         payload.get("component_id"),
         total_items,
         parallelism,
+        refined_prompt_warmup_target,
         sorted(split_inputs),
     )
     _emit_local_mapped_progress(payload, 0, total_items)
@@ -1803,11 +1824,18 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
     broadcast_inputs.pop(mapped_input_name, None)
     total_items = len(mapped_items)
     parallelism = _mapped_execution_parallelism(total_items)
+    refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
+    ensure_remote_warm_capacity(
+        _build_prompt_warmup_request(payload),
+        warmup_target=refined_prompt_warmup_target,
+        reason="mapped_component_exact_parallelism",
+    )
     logger.info(
-        "Scheduling mapped Modal component=%s for %d item(s) with local parallelism=%d.",
+        "Scheduling mapped Modal component=%s for %d item(s) with local parallelism=%d prompt_warmup_target=%d.",
         payload.get("component_id"),
         total_items,
         parallelism,
+        refined_prompt_warmup_target,
     )
     _emit_local_mapped_progress(payload, 0, total_items)
 
@@ -1908,6 +1936,270 @@ def _modal_deploy_cache_key() -> tuple[str, str | None]:
     """Return the cache key for auto-deployed Modal apps."""
     settings = get_settings()
     return (settings.app_name, _modal_environment_name())
+
+
+def _warmup_prompt_id(warmup_request: dict[str, Any]) -> str | None:
+    """Return the prompt id that scopes proactive warmup state."""
+    prompt_id = warmup_request.get("prompt_id")
+    if prompt_id is None:
+        return None
+    normalized_prompt_id = str(prompt_id).strip()
+    return normalized_prompt_id or None
+
+
+def _ensure_prompt_warmup_state(prompt_id: str) -> _PromptWarmupState:
+    """Return the cached warmup state bucket for one prompt."""
+    global _PROMPT_WARMUP_STATE_ORDER
+
+    state = _PROMPT_WARMUP_STATES.get(prompt_id)
+    if state is not None:
+        return state
+
+    state = _PromptWarmupState()
+    _PROMPT_WARMUP_STATES[prompt_id] = state
+    if _PROMPT_WARMUP_STATE_ORDER is None:
+        _PROMPT_WARMUP_STATE_ORDER = queue.SimpleQueue()
+    _PROMPT_WARMUP_STATE_ORDER.put(prompt_id)
+    while len(_PROMPT_WARMUP_STATES) > _PROMPT_WARMUP_STATE_CACHE_LIMIT:
+        expired_prompt_id = _PROMPT_WARMUP_STATE_ORDER.get()
+        _PROMPT_WARMUP_STATES.pop(expired_prompt_id, None)
+    return state
+
+
+def _clamp_prompt_warmup_target(warmup_target: int) -> int:
+    """Clamp one proactive warmup target to the configured Modal container cap."""
+    normalized_target = max(0, int(warmup_target))
+    max_containers = get_settings().max_containers
+    if max_containers is not None:
+        return min(normalized_target, max_containers)
+    return normalized_target
+
+
+def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract the prompt-scoped warmup-relevant fields from one payload."""
+    return {
+        "prompt_id": (
+            str(payload.get("prompt_id"))
+            if payload.get("prompt_id") is not None
+            else None
+        ),
+        "component_id": str(
+            payload.get("mapped_progress_display_node_id", payload.get("component_id", "modal-warmup"))
+        ),
+        "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
+        "volume_reload_marker": payload.get("volume_reload_marker"),
+        "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
+        "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
+    }
+
+
+def _component_parallelism_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the prompt-level parallelism metadata attached by the queue rewrite."""
+    extra_data = payload.get("extra_data") or {}
+    modal_metadata = extra_data.get("modal") or {}
+    if not isinstance(modal_metadata, dict):
+        return {}
+    return modal_metadata
+
+
+def _prompt_parallelism_target(
+    payload: dict[str, Any],
+    *,
+    exact_component_parallelism: dict[str, int] | None = None,
+) -> int:
+    """Return the current best-effort prompt-wide warmup target for one payload."""
+    metadata = _component_parallelism_metadata(payload)
+    execution_stages = metadata.get("component_execution_stages")
+    if not isinstance(execution_stages, list):
+        return 1
+
+    mapped_component_ids = {
+        str(component_id)
+        for component_id in metadata.get("mapped_component_ids", [])
+        if str(component_id)
+    }
+    exact_parallelism = exact_component_parallelism or {}
+    stage_parallelism = 0
+    for stage in execution_stages:
+        if not isinstance(stage, list):
+            continue
+        current_stage_parallelism = 0
+        for component_id_value in stage:
+            component_id = str(component_id_value)
+            if component_id in exact_parallelism:
+                current_stage_parallelism += max(1, int(exact_parallelism[component_id]))
+            elif component_id in mapped_component_ids:
+                current_stage_parallelism += 1
+            else:
+                current_stage_parallelism += 1
+        stage_parallelism = max(stage_parallelism, current_stage_parallelism)
+
+    fallback_parallelism = metadata.get("estimated_max_parallel_requests")
+    if stage_parallelism <= 0 and isinstance(fallback_parallelism, int):
+        stage_parallelism = max(stage_parallelism, fallback_parallelism)
+    return _clamp_prompt_warmup_target(max(1, stage_parallelism))
+
+
+def _register_exact_component_parallelism(payload: dict[str, Any], component_parallelism: int) -> int:
+    """Record exact mapped-component parallelism and return the refined prompt-wide warmup target."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    component_id = str(payload.get("component_id")) if payload.get("component_id") is not None else None
+    if not prompt_id or not component_id:
+        return _clamp_prompt_warmup_target(component_parallelism)
+
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _ensure_prompt_warmup_state(prompt_id)
+        warmup_state.exact_component_parallelism[component_id] = max(1, int(component_parallelism))
+        exact_parallelism = dict(warmup_state.exact_component_parallelism)
+    return _prompt_parallelism_target(payload, exact_component_parallelism=exact_parallelism)
+
+
+def _warmup_slot_payload(warmup_request: dict[str, Any], slot_index: int) -> dict[str, Any]:
+    """Return the remote warmup payload for one desired container slot."""
+    slot_payload = copy.deepcopy(warmup_request)
+    component_id = str(slot_payload.get("component_id") or slot_payload.get("prompt_id") or "modal-warmup")
+    slot_payload["component_id"] = f"{component_id}::warmup:{slot_index}"
+    slot_payload["warmup_slot_index"] = int(slot_index)
+    slot_payload["warmup_only"] = True
+    return slot_payload
+
+
+def _invoke_remote_engine_warmup(remote_engine: Any, warmup_request: dict[str, Any]) -> Any:
+    """Ask one prepared remote engine instance to warm a container for a prompt."""
+    warmup_method = getattr(remote_engine, "warmup_for_request", None)
+    if warmup_method is None:
+        logger.warning(
+            "Remote warmup method is unavailable for prompt=%s component=%s; skipping proactive warmup.",
+            warmup_request.get("prompt_id"),
+            warmup_request.get("component_id"),
+        )
+        return None
+    if hasattr(warmup_method, "remote"):
+        return warmup_method.remote(warmup_request)
+    return warmup_method(warmup_request)
+
+
+def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
+    """Warm one Modal container slot using deployed or ephemeral app state."""
+    if modal is None:
+        return None
+
+    lookup_error_types = _modal_lookup_error_types()
+    settings = get_settings()
+    if lookup_error_types:
+        try:
+            remote_engine = _lookup_deployed_remote_engine(warmup_request)
+            return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+        except lookup_error_types as exc:
+            if settings.auto_deploy:
+                _auto_deploy_modal_app(warmup_request, exc)
+                try:
+                    remote_engine = _lookup_deployed_remote_engine(warmup_request)
+                    return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+                except lookup_error_types as retry_exc:
+                    exc = retry_exc
+            if not settings.allow_ephemeral_fallback:
+                raise ModalRemoteInvocationError(
+                    "Proactive Modal warmup requires a deployed Modal app or a successful first-run auto-deploy. "
+                    f"Lookup failed for app={settings.app_name!r}: {exc}."
+                ) from exc
+    else:
+        remote_engine = _lookup_deployed_remote_engine(warmup_request)
+        return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+
+    cloud_module = _load_modal_cloud_module()
+    cloud_app = getattr(cloud_module, "app", None)
+    cloud_remote_engine = getattr(cloud_module, "RemoteEngine", None)
+    if cloud_app is None or cloud_remote_engine is None:
+        raise ModalRemoteInvocationError(
+            "Stable Modal cloud entry module did not expose app and RemoteEngine."
+        )
+    run_context = cloud_app.run() if hasattr(cloud_app, "run") else nullcontext()
+    with run_context:
+        remote_engine = cloud_remote_engine()
+        return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+
+
+def _run_prompt_warmup_slot(
+    prompt_id: str,
+    slot_index: int,
+    warmup_request: dict[str, Any],
+    reason: str,
+) -> None:
+    """Execute one proactive warmup slot and release it for retry on failure."""
+    try:
+        logger.info(
+            "Starting proactive Modal warmup for prompt=%s slot=%d component=%s reason=%s.",
+            prompt_id,
+            slot_index,
+            warmup_request.get("component_id"),
+            reason,
+        )
+        _invoke_modal_warmup_blocking(_warmup_slot_payload(warmup_request, slot_index))
+    except Exception:
+        with _PROMPT_WARMUP_STATES_LOCK:
+            warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+            if warmup_state is not None:
+                warmup_state.scheduled_slots.discard(slot_index)
+        logger.exception(
+            "Proactive Modal warmup failed for prompt=%s slot=%d component=%s.",
+            prompt_id,
+            slot_index,
+            warmup_request.get("component_id"),
+        )
+
+
+def ensure_remote_warm_capacity(
+    warmup_request: dict[str, Any],
+    *,
+    warmup_target: int,
+    reason: str,
+) -> int:
+    """Best-effort background warmup so enough Modal containers are ready for one prompt."""
+    settings = get_settings()
+    if not settings.enable_proactive_warmup:
+        return 0
+    if settings.execution_mode == "local" or modal is None:
+        return 0
+
+    prompt_id = _warmup_prompt_id(warmup_request)
+    if prompt_id is None:
+        return 0
+
+    clamped_target = _clamp_prompt_warmup_target(warmup_target)
+    if clamped_target <= 0:
+        return 0
+
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _ensure_prompt_warmup_state(prompt_id)
+        missing_slots = [
+            slot_index
+            for slot_index in range(clamped_target)
+            if slot_index not in warmup_state.scheduled_slots
+        ]
+        for slot_index in missing_slots:
+            warmup_state.scheduled_slots.add(slot_index)
+
+    if not missing_slots:
+        return clamped_target
+
+    logger.info(
+        "Scheduling proactive Modal warmup for prompt=%s target=%d missing_slots=%s component=%s reason=%s.",
+        prompt_id,
+        clamped_target,
+        missing_slots,
+        warmup_request.get("component_id"),
+        reason,
+    )
+    for slot_index in missing_slots:
+        _REMOTE_MODAL_WARMUP_EXECUTOR.submit(
+            _run_prompt_warmup_slot,
+            prompt_id,
+            slot_index,
+            copy.deepcopy(warmup_request),
+            reason,
+        )
+    return clamped_target
 
 
 def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException) -> None:
@@ -2260,6 +2552,11 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
                 return execute_subgraph_locally(payload, kwargs_payload)
             return execute_node_locally(payload, kwargs_payload)
 
+        @modal.method()
+        def warmup_for_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+            """No-op local warmup entrypoint for the simplified Modal runtime."""
+            return {"component_id": str(payload.get("component_id") or "modal-warmup")}
+
 else:
 
     class RemoteEngine:
@@ -2273,3 +2570,7 @@ else:
             if payload.get("payload_kind") == "subgraph":
                 return execute_subgraph_locally(payload, kwargs_payload)
             return execute_node_locally(payload, kwargs_payload)
+
+        def warmup_for_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+            """Return a local no-op warmup result when Modal is unavailable."""
+            return {"component_id": str(payload.get("component_id") or "modal-warmup")}

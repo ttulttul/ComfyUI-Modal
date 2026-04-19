@@ -96,6 +96,14 @@ class RewriteSummary:
     remote_node_ids: list[str] = field(default_factory=list)
     remote_component_ids: list[str] = field(default_factory=list)
     component_node_ids_by_representative: dict[str, list[str]] = field(default_factory=dict)
+    component_dependency_ids_by_representative: dict[str, list[str]] = field(default_factory=dict)
+    component_execution_stages: list[list[str]] = field(default_factory=list)
+    mapped_component_ids: list[str] = field(default_factory=list)
+    estimated_max_parallel_requests: int = 0
+    max_parallel_requests_upper_bound: int | None = None
+    requires_volume_reload: bool = False
+    volume_reload_marker: str | None = None
+    uploaded_volume_paths: list[str] = field(default_factory=list)
     rewritten_node_id_map: dict[str, str] = field(default_factory=dict)
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
@@ -638,36 +646,7 @@ def _component_topological_order(
     component_groups: dict[str, set[str]],
 ) -> list[list[str]]:
     """Return component node ids ordered from upstream to downstream."""
-    component_id_by_node_id: dict[str, str] = {}
-    for representative_node_id, component_node_ids in component_groups.items():
-        for node_id in component_node_ids:
-            component_id_by_node_id[node_id] = representative_node_id
-
-    dependency_edges: dict[str, set[str]] = {
-        representative_node_id: set()
-        for representative_node_id in component_groups
-    }
-    indegree_by_component_id: dict[str, int] = {
-        representative_node_id: 0
-        for representative_node_id in component_groups
-    }
-
-    for node_id, representative_node_id in component_id_by_node_id.items():
-        prompt_node = prompt.get(node_id)
-        if prompt_node is None:
-            continue
-        for input_value in (prompt_node.get("inputs") or {}).values():
-            if not _is_link(input_value):
-                continue
-            upstream_node_id = str(input_value[0])
-            upstream_component_id = component_id_by_node_id.get(upstream_node_id)
-            if upstream_component_id is None or upstream_component_id == representative_node_id:
-                continue
-            if representative_node_id in dependency_edges[upstream_component_id]:
-                continue
-            dependency_edges[upstream_component_id].add(representative_node_id)
-            indegree_by_component_id[representative_node_id] += 1
-
+    _, dependency_edges, indegree_by_component_id = _component_dependency_graph(prompt, component_groups)
     merged_component_groups = _merge_cyclic_component_groups(
         component_groups=component_groups,
         dependency_edges=dependency_edges,
@@ -707,6 +686,121 @@ def _component_topological_order(
             continue
         ordered_components.append(sorted(component_groups[component_id]))
     return ordered_components
+
+
+def _component_dependency_graph(
+    prompt: dict[str, Any],
+    component_groups: dict[str, set[str]],
+) -> tuple[dict[str, str], dict[str, set[str]], dict[str, int]]:
+    """Return component membership, downstream edges, and indegrees for the coarse component DAG."""
+    component_id_by_node_id: dict[str, str] = {}
+    for representative_node_id, component_node_ids in component_groups.items():
+        for node_id in component_node_ids:
+            component_id_by_node_id[node_id] = representative_node_id
+
+    dependency_edges: dict[str, set[str]] = {
+        representative_node_id: set()
+        for representative_node_id in component_groups
+    }
+    indegree_by_component_id: dict[str, int] = {
+        representative_node_id: 0
+        for representative_node_id in component_groups
+    }
+
+    for node_id, representative_node_id in component_id_by_node_id.items():
+        prompt_node = prompt.get(node_id)
+        if prompt_node is None:
+            continue
+        for input_value in (prompt_node.get("inputs") or {}).values():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            upstream_component_id = component_id_by_node_id.get(upstream_node_id)
+            if upstream_component_id is None or upstream_component_id == representative_node_id:
+                continue
+            if representative_node_id in dependency_edges[upstream_component_id]:
+                continue
+            dependency_edges[upstream_component_id].add(representative_node_id)
+            indegree_by_component_id[representative_node_id] += 1
+
+    return component_id_by_node_id, dependency_edges, indegree_by_component_id
+
+
+def _component_execution_stages(
+    prompt: dict[str, Any],
+    component_groups: dict[str, set[str]],
+) -> list[list[str]]:
+    """Return one best-effort stage decomposition for concurrent remote component execution."""
+    _, dependency_edges, indegree_by_component_id = _component_dependency_graph(prompt, component_groups)
+    merged_component_groups = _merge_cyclic_component_groups(
+        component_groups=component_groups,
+        dependency_edges=dependency_edges,
+    )
+    if merged_component_groups != component_groups:
+        return _component_execution_stages(prompt, merged_component_groups)
+
+    remaining_indegrees = dict(indegree_by_component_id)
+    ready_component_ids = sorted(
+        [
+            component_id
+            for component_id, indegree in remaining_indegrees.items()
+            if indegree == 0
+        ]
+    )
+    execution_stages: list[list[str]] = []
+    emitted_component_ids: set[str] = set()
+
+    while ready_component_ids:
+        current_stage = list(ready_component_ids)
+        execution_stages.append(current_stage)
+        next_ready_component_ids: set[str] = set()
+        for component_id in current_stage:
+            emitted_component_ids.add(component_id)
+            for downstream_component_id in sorted(dependency_edges.get(component_id, set())):
+                remaining_indegrees[downstream_component_id] -= 1
+                if remaining_indegrees[downstream_component_id] == 0:
+                    next_ready_component_ids.add(downstream_component_id)
+        ready_component_ids = sorted(
+            component_id
+            for component_id in next_ready_component_ids
+            if component_id not in emitted_component_ids
+        )
+
+    if len(emitted_component_ids) == len(component_groups):
+        return execution_stages
+
+    fallback_stage = [
+        component_id
+        for component_id in sorted(component_groups)
+        if component_id not in emitted_component_ids
+    ]
+    if fallback_stage:
+        logger.warning(
+            "Transport-aware execution-stage planning encountered a cycle or unresolved dependency; appending fallback stage %s.",
+            fallback_stage,
+        )
+        execution_stages.append(fallback_stage)
+    return execution_stages
+
+
+def _estimated_stage_parallelism(
+    execution_stages: list[list[str]],
+    mapped_component_ids: set[str],
+    *,
+    mapped_component_weight: int,
+    max_parallelism_cap: int | None = None,
+) -> int:
+    """Return the weighted best-effort parallelism estimate over staged remote execution."""
+    stage_parallelism = 0
+    for stage in execution_stages:
+        current_stage_parallelism = sum(
+            mapped_component_weight if component_id in mapped_component_ids else 1
+            for component_id in stage
+        )
+        stage_parallelism = max(stage_parallelism, current_stage_parallelism)
+    if max_parallelism_cap is not None:
+        return min(stage_parallelism, max_parallelism_cap)
+    return stage_parallelism
 
 
 def _merge_cyclic_component_groups(
@@ -1492,6 +1586,41 @@ def rewrite_prompt_for_modal(
         expanded_remote_node_ids,
         resolved_nodes_module,
     )
+    component_groups = {
+        component.representative_node_id: set(component.node_ids)
+        for component in components
+    }
+    _, dependency_edges, _ = _component_dependency_graph(rewritten_prompt, component_groups)
+    execution_stages = _component_execution_stages(rewritten_prompt, component_groups)
+    mapped_component_ids = {
+        component.representative_node_id
+        for component in components
+        if component.mapped_boundary_input_name
+    }
+    summary.component_dependency_ids_by_representative = {
+        representative_node_id: sorted(
+            upstream_component_id
+            for upstream_component_id, downstream_component_ids in dependency_edges.items()
+            if representative_node_id in downstream_component_ids
+        )
+        for representative_node_id in sorted(component_groups)
+    }
+    summary.component_execution_stages = [list(stage) for stage in execution_stages]
+    summary.mapped_component_ids = sorted(mapped_component_ids)
+    summary.estimated_max_parallel_requests = _estimated_stage_parallelism(
+        execution_stages,
+        mapped_component_ids,
+        mapped_component_weight=1,
+    )
+    if resolved_settings.max_containers is not None:
+        summary.max_parallel_requests_upper_bound = _estimated_stage_parallelism(
+            execution_stages,
+            mapped_component_ids,
+            mapped_component_weight=resolved_settings.max_containers,
+            max_parallelism_cap=resolved_settings.max_containers,
+        )
+    elif not mapped_component_ids:
+        summary.max_parallel_requests_upper_bound = summary.estimated_max_parallel_requests
     validate_remote_component_transport_compatibility(
         prompt=rewritten_prompt,
         components=components,
@@ -1534,6 +1663,18 @@ def rewrite_prompt_for_modal(
         volume_reload_marker,
         len(summary.synced_assets),
         bool(summary.custom_nodes_bundle is not None and summary.custom_nodes_bundle.uploaded),
+    )
+    summary.requires_volume_reload = requires_volume_reload
+    summary.volume_reload_marker = volume_reload_marker
+    summary.uploaded_volume_paths = [
+        asset.remote_path for asset in summary.synced_assets if asset.uploaded
+    ]
+    logger.info(
+        "Estimated remote parallelism for prompt rewrite: known_max_parallel_requests=%d max_parallel_requests_upper_bound=%s mapped_components=%s execution_stages=%s",
+        summary.estimated_max_parallel_requests,
+        summary.max_parallel_requests_upper_bound,
+        summary.mapped_component_ids,
+        summary.component_execution_stages,
     )
 
     for component in components:
@@ -1803,12 +1944,48 @@ def setup_modal_queue_route(
                 json_data.setdefault("extra_data", {}).setdefault("modal", {})
                 json_data["extra_data"]["modal"]["remote_node_ids"] = summary.remote_node_ids
                 json_data["extra_data"]["modal"]["remote_component_ids"] = summary.remote_component_ids
+                json_data["extra_data"]["modal"]["component_dependency_ids_by_representative"] = (
+                    summary.component_dependency_ids_by_representative
+                )
+                json_data["extra_data"]["modal"]["component_execution_stages"] = (
+                    summary.component_execution_stages
+                )
+                json_data["extra_data"]["modal"]["mapped_component_ids"] = summary.mapped_component_ids
+                json_data["extra_data"]["modal"]["estimated_max_parallel_requests"] = (
+                    summary.estimated_max_parallel_requests
+                )
+                json_data["extra_data"]["modal"]["max_parallel_requests_upper_bound"] = (
+                    summary.max_parallel_requests_upper_bound
+                )
                 json_data["extra_data"]["modal"]["synced_assets"] = [
                     asset.remote_path for asset in summary.synced_assets
                 ]
                 if summary.custom_nodes_bundle is not None:
                     json_data["extra_data"]["modal"]["custom_nodes_bundle"] = (
                         summary.custom_nodes_bundle.remote_path
+                    )
+                if summary.remote_component_ids:
+                    from .remote.modal_app import ensure_remote_warm_capacity
+
+                    warmup_target = (
+                        summary.max_parallel_requests_upper_bound
+                        or summary.estimated_max_parallel_requests
+                    )
+                    ensure_remote_warm_capacity(
+                        {
+                            "prompt_id": prompt_id,
+                            "component_id": summary.remote_component_ids[0],
+                            "requires_volume_reload": summary.requires_volume_reload,
+                            "volume_reload_marker": summary.volume_reload_marker,
+                            "uploaded_volume_paths": list(summary.uploaded_volume_paths),
+                            "custom_nodes_bundle": (
+                                summary.custom_nodes_bundle.remote_path
+                                if summary.custom_nodes_bundle is not None
+                                else None
+                            ),
+                        },
+                        warmup_target=warmup_target,
+                        reason="queue_time_structural_estimate",
                     )
                 _emit_modal_status(
                     prompt_server=prompt_server,
