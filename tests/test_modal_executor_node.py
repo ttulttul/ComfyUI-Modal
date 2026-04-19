@@ -66,6 +66,7 @@ def test_dynamic_proxy_node_preserves_output_signature(
     assert schema.node_id == proxy_id
     assert [output.display_name for output in schema.outputs] == ["image", "count"]
     assert [output.io_type for output in schema.outputs] == ["IMAGE", "INT"]
+    assert proxy_class.INPUT_IS_LIST is True
 
 
 def test_proxy_execution_uses_injected_remote_client(
@@ -108,6 +109,59 @@ def test_proxy_execution_uses_injected_remote_client(
         modal_executor_module.set_remote_executor_client_factory(None)
 
     assert result.result == ("OriginalNode::payload", 3)
+
+
+def test_proxy_execution_normalizes_input_is_list_kwargs(
+    modal_executor_module: Any,
+) -> None:
+    """Dynamic Modal proxies should unwrap singleton INPUT_IS_LIST wrappers before remote execution."""
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {"OriginalNode": _FakeOriginalNode},
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    proxy_id = modal_executor_module.ensure_modal_proxy_node_registered(
+        original_class_type="OriginalNode",
+        original_class=_FakeOriginalNode,
+        nodes_module=fake_nodes_module,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_id]
+    observed_kwargs: dict[str, Any] = {}
+
+    class FakeClient:
+        """Test client that records normalized proxy kwargs."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str, int]:
+            """Capture the kwargs forwarded by the proxy."""
+            del payload
+            observed_kwargs.update(kwargs)
+            return ("ok", 1)
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        result = asyncio.run(
+            proxy_class.execute(
+                original_node_data={"class_type": "OriginalNode"},
+                scalar_value=[3],
+                mapped_value=["a", "b", "c"],
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert result.result == ("ok", 1)
+    assert observed_kwargs == {
+        "scalar_value": 3,
+        "mapped_value": ["a", "b", "c"],
+    }
 
 
 def test_proxy_execution_wraps_sync_remote_clients(
