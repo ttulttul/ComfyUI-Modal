@@ -25,6 +25,7 @@ const ERROR_CLEAR_DELAY_MS = 5000;
 const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
 const modalNodeProgressLanes = new Map();
+const modalNodeBatchProgress = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
 const syntheticPromptUiStates = new Map();
@@ -221,6 +222,14 @@ function refreshGlobalStatusElement() {
   const dot = element.querySelector(".modal-status-dot");
   const text = element.querySelector(".modal-status-text");
   const nodeLabel = activeState.nodeCount === 1 ? "node" : "nodes";
+  const hasBatchProgress =
+    activeState.phase === EXECUTION_PHASE &&
+    Number(activeState.batchMax ?? 0) > 1;
+  const batchValue = hasBatchProgress
+    ? Math.max(0, Math.min(Number(activeState.batchMax), Number(activeState.batchValue ?? 0)))
+    : 0;
+  const batchMax = hasBatchProgress ? Math.max(1, Number(activeState.batchMax)) : 1;
+  const batchRatio = hasBatchProgress ? batchValue / batchMax : 0;
 
   element.style.display = "inline-flex";
   element.dataset.phase = activeState.phase;
@@ -241,11 +250,17 @@ function refreshGlobalStatusElement() {
     text.textContent = "Waiting for Modal startup";
   } else if (activeState.phase === EXECUTION_PHASE) {
     element.style.borderColor = "rgba(34, 197, 94, 0.55)";
-    element.style.background = "rgba(8, 49, 28, 0.94)";
+    element.style.background = hasBatchProgress
+      ? `linear-gradient(90deg, rgba(22, 163, 74, 0.92) 0%, rgba(22, 163, 74, 0.92) ${(
+          batchRatio * 100
+        ).toFixed(2)}%, rgba(8, 49, 28, 0.94) ${(batchRatio * 100).toFixed(2)}%, rgba(8, 49, 28, 0.94) 100%)`
+      : "rgba(8, 49, 28, 0.94)";
     dot.style.background = ACTIVE_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(34, 197, 94, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = `Modal workflow running on ${activeState.nodeCount} ${nodeLabel}`;
+    text.textContent = hasBatchProgress
+      ? `Modal workflow running on ${activeState.nodeCount} ${nodeLabel} · ${Math.round(batchValue)}/${Math.round(batchMax)}`
+      : `Modal workflow running on ${activeState.nodeCount} ${nodeLabel}`;
   } else if (activeState.phase === STATE_ERROR) {
     element.style.borderColor = "rgba(239, 68, 68, 0.55)";
     element.style.background = "rgba(69, 10, 10, 0.94)";
@@ -278,9 +293,35 @@ function setGlobalStatusPhase(promptId, phase, nodeCount) {
   if (!promptId) {
     return;
   }
+  const existingState = modalGlobalStatusStates.get(promptId);
   modalGlobalStatusStates.set(promptId, {
     phase: effectiveGlobalStatusPhase(promptId, phase),
     nodeCount: Math.max(1, Number(nodeCount) || 1),
+    batchValue: existingState?.batchValue ?? null,
+    batchMax: existingState?.batchMax ?? null,
+    updatedAt: nowMs(),
+  });
+  refreshGlobalStatusElement();
+}
+
+/**
+ * Record aggregate mapped-batch progress for one prompt's global Modal status pill.
+ * @param {string} promptId
+ * @param {number} value
+ * @param {number} maxValue
+ */
+function setGlobalStatusBatchProgress(promptId, value, maxValue) {
+  if (!promptId) {
+    return;
+  }
+  const existingState = modalGlobalStatusStates.get(promptId);
+  const safeMaxValue = Math.max(1, Number(maxValue) || 1);
+  const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
+  modalGlobalStatusStates.set(promptId, {
+    phase: effectiveGlobalStatusPhase(promptId, existingState?.phase ?? EXECUTION_PHASE),
+    nodeCount: Math.max(1, Number(existingState?.nodeCount) || 1),
+    batchValue: safeValue,
+    batchMax: safeMaxValue,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -583,6 +624,10 @@ function clearNodeProgress(nodeIdValue, promptId) {
     } else if (!promptId || progressState.promptId === promptId) {
       modalNodeProgress.delete(progressNodeId);
     }
+    const batchState = modalNodeBatchProgress.get(progressNodeId);
+    if (batchState && (!promptId || batchState.promptId === promptId)) {
+      modalNodeBatchProgress.delete(progressNodeId);
+    }
     const laneState = modalNodeProgressLanes.get(progressNodeId);
     if (!laneState) {
       continue;
@@ -592,6 +637,30 @@ function clearNodeProgress(nodeIdValue, promptId) {
     }
     modalNodeProgressLanes.delete(progressNodeId);
   }
+}
+
+/**
+ * Record aggregate mapped-batch progress on the representative remote node only.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @param {number} value
+ * @param {number} maxValue
+ */
+function setNodeBatchProgress(nodeIdValue, promptId, value, maxValue) {
+  const safeMaxValue = Math.max(1, Number(maxValue) || 1);
+  const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
+  const progressNodeId = String(nodeIdValue);
+  if (!shouldApplyPromptState(progressNodeId, promptId)) {
+    return;
+  }
+  modalNodeBatchProgress.set(progressNodeId, {
+    promptId,
+    value: safeValue,
+    max: safeMaxValue,
+    updatedAt: nowMs(),
+  });
+  ensureAnimationLoop();
+  app.graph?.setDirtyCanvas(true, true);
 }
 
 /**
@@ -1022,10 +1091,12 @@ function getRemoteVisualState(node) {
   const promptState = modalPromptStates.get(state.promptId);
   const progressState = modalNodeProgress.get(nodeId(node)) ?? null;
   const progressLaneState = modalNodeProgressLanes.get(nodeId(node)) ?? null;
+  const batchProgressState = modalNodeBatchProgress.get(nodeId(node)) ?? null;
   return {
     ...state,
     isActiveRemoteNode: promptState?.activeNodeId === nodeId(node),
     progress: progressState?.promptId === state.promptId ? progressState : null,
+    batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,
     progressLanes:
       progressLaneState?.promptId === state.promptId
         ? Array.from(progressLaneState.lanes.values()).sort(
@@ -1108,9 +1179,11 @@ function drawRemoteNodeDecoration(node, ctx) {
   ctx.restore();
 
   const progressLanes = Array.isArray(state?.progressLanes) ? state.progressLanes : [];
+  const batchProgress = state?.batchProgress ?? null;
   const hasAggregateProgress = Boolean(state?.progress && state.phase === STATE_ACTIVE);
   const hasLaneProgress = progressLanes.length > 0 && state?.phase === STATE_ACTIVE;
-  if (!hasAggregateProgress && !hasLaneProgress) {
+  const hasBatchBadge = Boolean(batchProgress && state?.phase === STATE_ACTIVE && !hasAggregateProgress);
+  if (!hasAggregateProgress && !hasLaneProgress && !hasBatchBadge) {
     return;
   }
 
@@ -1161,6 +1234,30 @@ function drawRemoteNodeDecoration(node, ctx) {
     ctx.textAlign = "right";
     ctx.textBaseline = "bottom";
     ctx.fillText(`${progressLanes.length}x`, node.size[0], progressY - 2 / scale);
+  }
+
+  if (hasBatchBadge) {
+    const completedItems = Math.round(batchProgress.value);
+    const totalItems = Math.round(batchProgress.max);
+    const badgeText = `${completedItems}/${totalItems}`;
+    ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
+    const badgePaddingX = 6 / scale;
+    const badgePaddingY = 4 / scale;
+    const badgeWidth = ctx.measureText(badgeText).width + badgePaddingX * 2;
+    const badgeHeight = 16 / scale;
+    const badgeX = Math.max(0, node.size[0] - badgeWidth - 4 / scale);
+    const badgeY = 6 / scale;
+    ctx.fillStyle = "rgba(15, 23, 42, 0.82)";
+    ctx.beginPath();
+    ctx.roundRect(badgeX, badgeY, badgeWidth, badgeHeight, 8 / scale);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(34, 197, 94, 0.55)";
+    ctx.lineWidth = 1 / scale;
+    ctx.stroke();
+    ctx.fillStyle = "#f8fafc";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(badgeText, badgeX + badgeWidth / 2, badgeY + badgeHeight / 2);
   }
   ctx.restore();
 }
@@ -1284,6 +1381,13 @@ function handleModalProgress(event) {
   const promptState = ensurePromptState(promptId);
   promptState.hasStreamedProgress = true;
   if (detail.aggregate_only) {
+    setGlobalStatusBatchProgress(promptId, Number(detail.value ?? 0), Number(detail.max ?? 1));
+    setNodeBatchProgress(
+      progressNodeId,
+      promptId,
+      Number(detail.value ?? 0),
+      Number(detail.max ?? 1),
+    );
     setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
     return;
   }
