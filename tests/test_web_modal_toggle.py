@@ -92,11 +92,13 @@ def test_queue_success_marks_all_remote_nodes_ready_before_component_execution()
     """Once the Modal route accepts the prompt, all remote nodes should flip from setup to ready."""
     source = _modal_toggle_source()
 
-    assert "const resolvedRemoteNodeIds =" in source
+    assert "const resolvedRemoteNodeIds = (responsePayload.modal_remote_node_ids ?? []).map((nodeIdValue) =>" in source
+    assert "const resolvedComponents = Array.isArray(responsePayload.modal_components)" in source
+    assert "registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);" in source
     assert "endSyntheticExecutionUi(promptId);" in source
-    assert 'setGlobalStatusPhase(promptId, STATE_WAITING, resolvedRemoteNodeIds.length, {' in source
+    assert 'setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {' in source
     assert 'message: "Waiting for Modal startup",' in source
-    assert "setNodesPhase(resolvedRemoteNodeIds, STATE_READY, promptId);" in source
+    assert "setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);" in source
 
 
 def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:

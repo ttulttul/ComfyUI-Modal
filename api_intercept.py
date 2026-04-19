@@ -1518,7 +1518,11 @@ def rewrite_prompt_for_modal(
     return rewritten_prompt, summary
 
 
-async def _queue_prompt_json(prompt_server: Any, json_data: dict[str, Any]) -> web.Response:
+async def _queue_prompt_json(
+    prompt_server: Any,
+    json_data: dict[str, Any],
+    modal_response_payload: dict[str, Any] | None = None,
+) -> web.Response:
     """Queue a possibly rewritten prompt using ComfyUI's native semantics."""
     execution = _get_execution_module()
     json_data = prompt_server.trigger_on_prompt(json_data)
@@ -1567,9 +1571,14 @@ async def _queue_prompt_json(prompt_server: Any, json_data: dict[str, Any]) -> w
     prompt_server.prompt_queue.put(
         (number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive)
     )
-    return web.json_response(
-        {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
-    )
+    response_payload: dict[str, Any] = {
+        "prompt_id": prompt_id,
+        "number": number,
+        "node_errors": valid[3],
+    }
+    if modal_response_payload:
+        response_payload.update(modal_response_payload)
+    return web.json_response(response_payload)
 
 
 def _analysis_route_path(route_path: str) -> str:
@@ -1754,7 +1763,26 @@ def setup_modal_queue_route(
                     component_node_ids_by_representative=summary.component_node_ids_by_representative,
                     status_message="Submitting Modal workflow",
                 )
-            response = await _queue_prompt_json(prompt_server, json_data)
+            response = await _queue_prompt_json(
+                prompt_server,
+                json_data,
+                modal_response_payload=(
+                    {
+                        "modal_remote_node_ids": list(summary.remote_node_ids),
+                        "modal_components": [
+                            {
+                                "representative_node_id": representative_node_id,
+                                "node_ids": list(component_node_ids),
+                            }
+                            for representative_node_id, component_node_ids in sorted(
+                                summary.component_node_ids_by_representative.items()
+                            )
+                        ],
+                    }
+                    if summary.remote_node_ids
+                    else None
+                ),
+            )
             logger.info(
                 "Modal queue request completed in %.3fs.",
                 time.perf_counter() - request_started_at,

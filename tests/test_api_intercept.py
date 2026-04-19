@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +118,83 @@ class _FakeLocalStringSinkNode:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("text",)
     OUTPUT_IS_LIST = (False,)
+
+
+def test_queue_prompt_json_includes_resolved_modal_metadata(
+    api_intercept_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Successful queue responses should include resolved remote nodes and component membership."""
+
+    class FakePromptQueue:
+        """Minimal prompt queue sink."""
+
+        def __init__(self) -> None:
+            """Initialize captured queue items."""
+            self.items: list[tuple[Any, ...]] = []
+
+        def put(self, item: tuple[Any, ...]) -> None:
+            """Record one queued prompt item."""
+            self.items.append(item)
+
+    class FakePromptServer:
+        """Minimal PromptServer double for queue-response tests."""
+
+        def __init__(self) -> None:
+            """Initialize queue state."""
+            self.number = 0
+            self.prompt_queue = FakePromptQueue()
+
+        def trigger_on_prompt(self, json_data: dict[str, Any]) -> dict[str, Any]:
+            """Return the prompt unchanged."""
+            return json_data
+
+    class FakeExecutionModule:
+        """Minimal execution module exposing prompt validation."""
+
+        SENSITIVE_EXTRA_DATA_KEYS: tuple[str, ...] = ()
+
+        @staticmethod
+        async def validate_prompt(
+            prompt_id: str,
+            prompt: dict[str, Any],
+            partial_execution_targets: Any,
+        ) -> tuple[bool, None, list[str], list[Any]]:
+            """Accept the supplied prompt with one fake execution target."""
+            return True, None, ["1"], []
+
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    prompt_server = FakePromptServer()
+
+    response = asyncio.run(
+        api_intercept_module._queue_prompt_json(
+            prompt_server,
+            {
+                "prompt_id": "prompt-1",
+                "prompt": {"1": {"class_type": "Anything", "inputs": {}}},
+                "extra_data": {},
+            },
+            modal_response_payload={
+                "modal_remote_node_ids": ["1", "2"],
+                "modal_components": [
+                    {
+                        "representative_node_id": "1",
+                        "node_ids": ["1", "2"],
+                    }
+                ],
+            },
+        )
+    )
+
+    response_payload = json.loads(response.text)
+    assert response_payload["prompt_id"] == "prompt-1"
+    assert response_payload["modal_remote_node_ids"] == ["1", "2"]
+    assert response_payload["modal_components"] == [
+        {
+            "representative_node_id": "1",
+            "node_ids": ["1", "2"],
+        }
+    ]
 
 
 def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
