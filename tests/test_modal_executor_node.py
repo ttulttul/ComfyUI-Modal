@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
 import threading
 import time
@@ -66,6 +67,7 @@ def test_dynamic_proxy_node_preserves_output_signature(
     assert schema.node_id == proxy_id
     assert [output.display_name for output in schema.outputs] == ["image", "count"]
     assert [output.io_type for output in schema.outputs] == ["IMAGE", "INT"]
+    assert proxy_class.INPUT_IS_LIST is True
 
 
 def test_proxy_execution_uses_injected_remote_client(
@@ -108,6 +110,60 @@ def test_proxy_execution_uses_injected_remote_client(
         modal_executor_module.set_remote_executor_client_factory(None)
 
     assert result.result == ("OriginalNode::payload", 3)
+
+
+def test_proxy_execution_normalizes_input_is_list_kwargs(
+    modal_executor_module: Any,
+) -> None:
+    """Dynamic Modal proxies should unwrap singleton INPUT_IS_LIST wrappers before remote execution."""
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {"OriginalNode": _FakeOriginalNode},
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    proxy_id = modal_executor_module.ensure_modal_proxy_node_registered(
+        original_class_type="OriginalNode",
+        original_class=_FakeOriginalNode,
+        nodes_module=fake_nodes_module,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_id]
+    observed_kwargs: dict[str, Any] = {}
+
+    class FakeClient:
+        """Test client that records normalized proxy kwargs."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str, int]:
+            """Capture the kwargs forwarded by the proxy."""
+            observed_kwargs["payload_kind"] = payload["payload_kind"]
+            observed_kwargs.update(kwargs)
+            return ("ok", 1)
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        result = asyncio.run(
+            proxy_class.execute(
+                original_node_data=[{"payload_kind": "subgraph", "class_type": "OriginalNode"}],
+                scalar_value=[3],
+                mapped_value=["a", "b", "c"],
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert result.result == ("ok", 1)
+    assert observed_kwargs == {
+        "payload_kind": "subgraph",
+        "scalar_value": 3,
+        "mapped_value": ["a", "b", "c"],
+    }
 
 
 def test_proxy_execution_wraps_sync_remote_clients(
@@ -893,6 +949,86 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     assert deploy_calls == [("comfy-modal-sync", None)]
 
 
+def test_load_modal_cloud_module_reloads_stale_partial_module(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Stale partially imported cloud modules should be discarded and reloaded."""
+    original_module = sys.modules.get(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME)
+    stale_module = types.SimpleNamespace(app=None)
+    sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = stale_module
+
+    loaded_module = types.SimpleNamespace(app="fresh-app")
+
+    class FakeLoader:
+        """Populate the fresh replacement module during exec."""
+
+        def create_module(self, spec: Any) -> None:
+            """Use the default module creation path."""
+            del spec
+            return None
+
+        def exec_module(self, module: Any) -> None:
+            """Install the expected deployable app onto the reloaded module."""
+            module.app = loaded_module.app
+
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: importlib.util.spec_from_loader(
+            remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+            FakeLoader(),
+        ),
+    )
+    try:
+        reloaded_module = remote_modal_app_module._load_modal_cloud_module()
+    finally:
+        sys.modules.pop(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME, None)
+        if original_module is not None:
+            sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = original_module
+
+    assert reloaded_module is not stale_module
+    assert getattr(reloaded_module, "app", None) == "fresh-app"
+
+
+def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Failed cloud-module imports should not leave a poisoned cache entry behind."""
+    original_module = sys.modules.get(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME)
+
+    class FakeLoader:
+        """Raise during module execution to simulate a partial import failure."""
+
+        def create_module(self, spec: Any) -> None:
+            """Use the default module creation path."""
+            del spec
+            return None
+
+        def exec_module(self, module: Any) -> None:
+            """Fail while the module is being initialized."""
+            module.app = None
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: importlib.util.spec_from_loader(
+            remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+            FakeLoader(),
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            remote_modal_app_module._load_modal_cloud_module()
+        assert remote_modal_app_module._MODAL_CLOUD_MODULE_NAME not in sys.modules
+    finally:
+        sys.modules.pop(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME, None)
+        if original_module is not None:
+            sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = original_module
+
+
 def test_remote_modal_consumes_streamed_progress_and_result(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -1608,6 +1744,72 @@ def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
     assert any(update.get("clear") is True for update in lane_updates)
 
 
+def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped remote execution should run static execute targets once and mapped targets per item."""
+    observed_execute_node_ids: list[tuple[str, tuple[str, ...]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        observed_execute_node_ids.append(
+            (
+                str(payload["component_id"]),
+                tuple(str(node_id) for node_id in payload.get("execute_node_ids", [])),
+            )
+        )
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        if str(payload["component_id"]).endswith("::static"):
+            assert tuple(payload.get("execute_node_ids", [])) == ("3",)
+            assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["3"]
+            return serialization_module.serialize_node_outputs(("static-output",))
+
+        assert tuple(payload.get("execute_node_ids", [])) == ("7",)
+        assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["7"]
+        return serialization_module.serialize_node_outputs((f"mapped:{hydrated_inputs['remote_input_1']}",))
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "1",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "boundary_outputs": [
+            {"node_id": "3", "io_type": "STRING", "is_list": False, "mapped_output": False},
+            {"node_id": "7", "io_type": "STRING", "is_list": False, "mapped_output": True},
+        ],
+        "execute_node_ids": ["3", "7"],
+        "static_execute_node_ids": ["3"],
+        "mapped_execute_node_ids": ["7"],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_mapped_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {"remote_input_1": ["a", "b"]}
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        "static-output",
+        ["mapped:a", "mapped:b"],
+    )
+    assert observed_execute_node_ids[0] == ("1::static", ("3",))
+    assert observed_execute_node_ids[1:] == [
+        ("1::item:0", ("7",)),
+        ("1::item:1", ("7",)),
+    ]
+
+
 def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_previews(
     remote_modal_app_module: Any,
     serialization_module: Any,
@@ -1694,6 +1896,107 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
             "client_id": "client-1",
             "preview_target_node_ids": ["9"],
             "image_value": ["preview"],
+        }
+    ]
+
+
+def test_consume_remote_payload_stream_filters_static_sibling_ui_events_from_mapped_items(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped item streams should not forward executed or preview events for static sibling nodes."""
+    executed_calls: list[dict[str, Any]] = []
+    preview_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_executed_output",
+        lambda **kwargs: executed_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_preview_image",
+        lambda **kwargs: preview_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "6::item:0",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["3", "6", "7"],
+        "execute_node_ids": ["7"],
+        "boundary_outputs": [
+            {"node_id": "7", "output_index": 0, "io_type": "IMAGE", "is_list": False}
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "suppress_status_stream": True,
+        "mapped_progress_lane_id": "0",
+        "mapped_progress_display_node_id": "6",
+        "map_item_index": 0,
+    }
+    preview_bytes = serialization_module.serialize_value(b"preview-bytes")
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "executed",
+                "node_id": "3",
+                "display_node_id": "3",
+                "output": serialization_module.serialize_value({"images": ["static"]}),
+            },
+            {
+                "kind": "progress",
+                "event_type": "preview",
+                "node_id": "3",
+                "display_node_id": "3",
+                "image_type": "PNG",
+                "image_bytes": preview_bytes,
+            },
+            {
+                "kind": "progress",
+                "event_type": "executed",
+                "node_id": "7",
+                "display_node_id": "7",
+                "output": serialization_module.serialize_value({"images": ["mapped"]}),
+            },
+            {
+                "kind": "progress",
+                "event_type": "preview",
+                "node_id": "7",
+                "display_node_id": "7",
+                "image_type": "PNG",
+                "image_bytes": preview_bytes,
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert executed_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "7",
+            "display_node_id": "7",
+            "output_payload": {"images": ["mapped"]},
+        }
+    ]
+    assert preview_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "7",
+            "display_node_id": "7",
+            "parent_node_id": None,
+            "real_node_id": None,
+            "image_type": "PNG",
+            "image_bytes": b"preview-bytes",
+            "max_size": None,
         }
     ]
 
@@ -2176,3 +2479,92 @@ def test_local_remote_app_executes_subgraph_payload(
     )
     outputs = serialization_module.deserialize_node_outputs(payload)
     assert outputs == (10,)
+
+
+def test_local_remote_app_normalizes_wrapped_subgraph_link_indexes(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+) -> None:
+    """The local fallback runner should canonicalize singleton-list prompt link indexes."""
+    payload = remote_modal_app_module.execute_subgraph_locally(
+        payload={
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "subgraph_prompt": {
+                "remote_1": {
+                    "class_type": "BoundarySource",
+                    "inputs": {"value": 0},
+                    "_meta": {},
+                },
+                "remote_2": {
+                    "class_type": "BoundarySink",
+                    "inputs": {"value": [[["remote_1", [0]]]]},
+                    "_meta": {},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_0",
+                    "targets": [{"node_id": "remote_1", "input_name": "value"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "remote_2_value",
+                    "node_id": "remote_2",
+                    "output_index": [[0]],
+                    "io_type": "INT",
+                    "is_list": False,
+                }
+            ],
+            "execute_node_ids": ["remote_2"],
+            "extra_data": {},
+            "custom_nodes_bundle": None,
+        },
+        kwargs_payload='{"remote_input_0": 4}',
+        node_mapping={
+            "BoundarySource": _BoundarySourceNode,
+            "BoundarySink": _BoundarySinkNode,
+        },
+    )
+    outputs = serialization_module.deserialize_node_outputs(payload)
+    assert outputs == (10,)
+
+
+def test_local_remote_app_normalizes_wrapped_scalar_prompt_inputs(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+) -> None:
+    """The local fallback runner should unwrap singleton-list scalar prompt inputs."""
+    payload = remote_modal_app_module.execute_subgraph_locally(
+        payload={
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "subgraph_prompt": {
+                "remote_1": {
+                    "class_type": "BoundarySource",
+                    "inputs": {"value": [4]},
+                    "_meta": {},
+                }
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "remote_1_value",
+                    "node_id": "remote_1",
+                    "output_index": 0,
+                    "io_type": "INT",
+                    "is_list": False,
+                }
+            ],
+            "execute_node_ids": [["remote_1"]],
+            "extra_data": {},
+            "custom_nodes_bundle": None,
+        },
+        kwargs_payload="{}",
+        node_mapping={
+            "BoundarySource": _BoundarySourceNode,
+        },
+    )
+    outputs = serialization_module.deserialize_node_outputs(payload)
+    assert outputs == (5,)
