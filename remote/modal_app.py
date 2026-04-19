@@ -44,6 +44,7 @@ _PROMPT_WARMUP_STATES_LOCK = threading.Lock()
 _PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
 _PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
 _PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
+_PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 
 
 @dataclass
@@ -294,12 +295,91 @@ def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
     return input_type_map
 
 
+def _coerce_primitive_prompt_input_value(
+    *,
+    node_id: str,
+    class_type: str,
+    input_name: str,
+    declared_type: str,
+    input_value: Any,
+) -> Any:
+    """Coerce one primitive prompt literal using ComfyUI's `validate_inputs` semantics."""
+    literal_value = (
+        input_value.get("__value__")
+        if isinstance(input_value, dict) and "__value__" in input_value
+        else input_value
+    )
+    if isinstance(literal_value, list):
+        return input_value
+
+    try:
+        if declared_type == "INT":
+            return int(literal_value)
+        if declared_type == "FLOAT":
+            return float(literal_value)
+        if declared_type == "STRING":
+            return str(literal_value)
+        if declared_type == "BOOLEAN":
+            return bool(literal_value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise RemoteSubgraphExecutionError(
+            "Remote subgraph input could not be coerced to the declared primitive socket type."
+            f" node_id={node_id!r} node_type={class_type!r}"
+            f" input_name={input_name!r} declared_type={declared_type!r}"
+            f" received_value={literal_value!r}"
+        ) from exc
+
+    return input_value
+
+
+def _coerce_prompt_primitive_input_values(
+    prompt: dict[str, Any],
+    node_mapping: dict[str, type[Any]],
+) -> None:
+    """Mutate prompt literals in-place to match ComfyUI's primitive widget coercion."""
+    for node_id, prompt_node in sorted(prompt.items()):
+        class_type = str(prompt_node.get("class_type"))
+        node_class = node_mapping.get(class_type)
+        if node_class is None:
+            continue
+        input_type_map = _node_input_type_map(node_class)
+        if not input_type_map:
+            continue
+        inputs = prompt_node.get("inputs") or {}
+        for input_name, input_value in list(inputs.items()):
+            declared_type = input_type_map.get(str(input_name))
+            if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
+                continue
+            if (
+                isinstance(input_value, list)
+                and len(input_value) == 2
+                and isinstance(input_value[0], str)
+            ):
+                continue
+            coerced_value = _coerce_primitive_prompt_input_value(
+                node_id=str(node_id),
+                class_type=class_type,
+                input_name=str(input_name),
+                declared_type=declared_type,
+                input_value=input_value,
+            )
+            if coerced_value is not input_value:
+                logger.debug(
+                    "Coerced remote primitive input %s.%s from %r to %r for type %s.",
+                    node_id,
+                    input_name,
+                    input_value,
+                    coerced_value,
+                    declared_type,
+                )
+                inputs[input_name] = coerced_value
+
+
 def _validate_prompt_input_shapes(
     prompt: dict[str, Any],
     node_mapping: dict[str, type[Any]],
 ) -> None:
     """Reject prompt inputs that still look invalid for primitive widget sockets."""
-    primitive_types = {"INT", "FLOAT", "BOOLEAN", "STRING"}
     for node_id, prompt_node in sorted(prompt.items()):
         class_type = str(prompt_node.get("class_type"))
         node_class = node_mapping.get(class_type)
@@ -310,7 +390,7 @@ def _validate_prompt_input_shapes(
             continue
         for input_name, input_value in (prompt_node.get("inputs") or {}).items():
             declared_type = input_type_map.get(str(input_name))
-            if declared_type not in primitive_types:
+            if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
                 continue
             if (
                 isinstance(input_value, list)
@@ -516,6 +596,7 @@ def _execute_subgraph_with_mapping(
         boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
         hydrated_inputs=hydrated_inputs,
     )
+    _coerce_prompt_primitive_input_values(prompt, node_mapping)
     _validate_prompt_input_shapes(prompt, node_mapping)
     required_node_ids = _resolve_required_subgraph_nodes(
         prompt=prompt,
@@ -609,6 +690,7 @@ def _execute_subgraph_prompt(
     )
     execution = _load_execution_module()
     resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
+    _coerce_prompt_primitive_input_values(prompt, resolved_node_mapping)
     _validate_prompt_input_shapes(prompt, resolved_node_mapping)
 
     with _temporary_node_mapping(node_mapping):
