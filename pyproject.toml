@@ -12,6 +12,17 @@ classifiers = [
 Repository = "https://github.com/ttulttul/ComfyUI-Modal"
 "Bug Tracker" = "https://github.com/ttulttul/ComfyUI-Modal/issues"
 
+[dependency-groups]
+test = [
+    "aiohttp",
+    "numpy",
+    "pillow",
+    "pytest",
+    "safetensors",
+    "torch",
+    "tqdm",
+]
+
 [tool.comfy]
 PublisherId = "ttulttul"
 DisplayName = "Modal Sync"
