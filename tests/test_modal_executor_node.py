@@ -521,7 +521,7 @@ def test_modal_cloud_retries_volume_reload_after_clearing_warm_state(
 
     assert volume.reload_calls == 3
     assert prepare_calls == ["prepared", "prepared"]
-    assert sleep_calls == [0.1, 0.25]
+    assert sleep_calls == [0.25, 0.5]
 
 
 def test_modal_cloud_raises_after_exhausting_open_file_reload_retries(
