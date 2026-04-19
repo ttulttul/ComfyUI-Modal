@@ -54,6 +54,7 @@ _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
+_MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
 
 try:
     import modal  # type: ignore
@@ -75,6 +76,9 @@ class _ReusablePromptExecutorState:
 
 _PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
 _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (0.0, 0.1, 0.25, 0.5, 1.0)
+_MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT = 256
+_MODAL_VOLUME_RELOAD_MARKERS: queue.SimpleQueue[str] | None = None
+_MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
 
 
 @dataclass
@@ -1481,7 +1485,43 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
 
 def _should_reload_modal_volume(payload: dict[str, Any]) -> bool:
     """Return whether this request needs the mounted Modal volume reloaded."""
-    return bool(payload.get("requires_volume_reload", True))
+    if not bool(payload.get("requires_volume_reload", True)):
+        return False
+    reload_marker = _modal_volume_reload_marker(payload)
+    if reload_marker is None:
+        return True
+    return not _has_seen_modal_volume_reload_marker(reload_marker)
+
+
+def _modal_volume_reload_marker(payload: dict[str, Any]) -> str | None:
+    """Return the per-request Modal volume reload marker attached to this payload."""
+    marker = payload.get("volume_reload_marker")
+    if marker is None:
+        return None
+    marker_text = str(marker).strip()
+    return marker_text or None
+
+
+def _has_seen_modal_volume_reload_marker(reload_marker: str) -> bool:
+    """Return whether this container already reloaded the volume for this marker."""
+    with _MODAL_VOLUME_RELOAD_MARKERS_LOCK:
+        return reload_marker in _MODAL_VOLUME_RELOAD_MARKER_SET
+
+
+def _record_modal_volume_reload_marker(reload_marker: str) -> None:
+    """Remember that this container has already reloaded the volume for one marker."""
+    global _MODAL_VOLUME_RELOAD_MARKERS
+
+    with _MODAL_VOLUME_RELOAD_MARKERS_LOCK:
+        if reload_marker in _MODAL_VOLUME_RELOAD_MARKER_SET:
+            return
+        if _MODAL_VOLUME_RELOAD_MARKERS is None:
+            _MODAL_VOLUME_RELOAD_MARKERS = queue.SimpleQueue()
+        _MODAL_VOLUME_RELOAD_MARKER_SET.add(reload_marker)
+        _MODAL_VOLUME_RELOAD_MARKERS.put(reload_marker)
+        while len(_MODAL_VOLUME_RELOAD_MARKER_SET) > _MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT:
+            expired_marker = _MODAL_VOLUME_RELOAD_MARKERS.get()
+            _MODAL_VOLUME_RELOAD_MARKER_SET.discard(expired_marker)
 
 
 def _clear_warm_remote_caches() -> None:
@@ -1519,7 +1559,11 @@ def _sleep_before_modal_volume_reload_retry(delay_seconds: float) -> None:
     time.sleep(delay_seconds)
 
 
-def _reload_modal_volume_for_request(volume: Any, component_id: str) -> None:
+def _reload_modal_volume_for_request(
+    volume: Any,
+    component_id: str,
+    reload_marker: str | None = None,
+) -> None:
     """Reload the Modal volume, retrying briefly while warm state releases open files."""
     with _timed_phase("modal_volume_reload", component=component_id):
         for attempt_index, retry_delay_seconds in enumerate(
@@ -1530,6 +1574,8 @@ def _reload_modal_volume_for_request(volume: Any, component_id: str) -> None:
                 _sleep_before_modal_volume_reload_retry(retry_delay_seconds)
             try:
                 volume.reload()
+                if reload_marker is not None:
+                    _record_modal_volume_reload_marker(reload_marker)
                 if attempt_index > 1:
                     _emit_cloud_info(
                         "Modal volume reload succeeded for component=%s after %d attempt(s).",
@@ -1550,6 +1596,22 @@ def _reload_modal_volume_for_request(volume: Any, component_id: str) -> None:
                     _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS[attempt_index],
                 )
                 _prepare_for_modal_volume_reload()
+
+
+def _emit_modal_volume_reload_skip(component_id: Any, payload: dict[str, Any]) -> None:
+    """Log why a request did not need a Modal volume reload."""
+    reload_marker = _modal_volume_reload_marker(payload)
+    if reload_marker is not None and _has_seen_modal_volume_reload_marker(reload_marker):
+        _emit_cloud_info(
+            "Skipping modal_volume_reload for component=%s because this container already reloaded marker=%s.",
+            component_id,
+            reload_marker,
+        )
+        return
+    _emit_cloud_info(
+        "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
+        component_id,
+    )
 
 
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
@@ -1609,6 +1671,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
             component_id = payload.get("component_id", "single-node")
+            reload_marker = _modal_volume_reload_marker(payload)
             with _registered_remote_execution(payload) as execution_control:
                 with _timed_phase(
                     "remote_engine_execute_payload",
@@ -1616,12 +1679,13 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     payload_kind=payload.get("payload_kind"),
                 ):
                     if _should_reload_modal_volume(payload):
-                        _reload_modal_volume_for_request(vol, str(component_id))
-                    else:
-                        _emit_cloud_info(
-                            "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
-                            component_id,
+                        _reload_modal_volume_for_request(
+                            vol,
+                            str(component_id),
+                            reload_marker=reload_marker,
                         )
+                    else:
+                        _emit_modal_volume_reload_skip(component_id, payload)
                     if payload.get("payload_kind") == "subgraph":
                         return execute_subgraph_locally(
                             payload,
@@ -1646,6 +1710,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         ) -> Iterator[dict[str, Any]]:
             """Stream progress envelopes and a final serialized result for one payload."""
             component_id = payload.get("component_id", "single-node")
+            reload_marker = _modal_volume_reload_marker(payload)
             with _registered_remote_execution(payload) as execution_control:
                 with _timed_phase(
                     "remote_engine_execute_payload",
@@ -1653,12 +1718,13 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     payload_kind=payload.get("payload_kind"),
                 ):
                     if _should_reload_modal_volume(payload):
-                        _reload_modal_volume_for_request(vol, str(component_id))
-                    else:
-                        _emit_cloud_info(
-                            "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
-                            component_id,
+                        _reload_modal_volume_for_request(
+                            vol,
+                            str(component_id),
+                            reload_marker=reload_marker,
                         )
+                    else:
+                        _emit_modal_volume_reload_skip(component_id, payload)
                     yield from _stream_remote_payload_events(
                         payload,
                         kwargs_payload,

@@ -445,6 +445,45 @@ def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
     assert modal_cloud_module._should_reload_modal_volume({}) is True
 
 
+def test_modal_cloud_skips_duplicate_reload_markers_in_same_container(
+    modal_cloud_module: Any,
+) -> None:
+    """One container should reload a given uploaded-asset marker only once."""
+
+    class FakeVolume:
+        """Simple Modal volume double that tracks reload calls."""
+
+        def __init__(self) -> None:
+            """Initialize the reload counter."""
+            self.reload_calls = 0
+
+        def reload(self) -> None:
+            """Record one reload attempt."""
+            self.reload_calls += 1
+
+    original_marker_queue = modal_cloud_module._MODAL_VOLUME_RELOAD_MARKERS
+    original_marker_set = set(modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET)
+    modal_cloud_module._MODAL_VOLUME_RELOAD_MARKERS = None
+    modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET.clear()
+    try:
+        payload = {"requires_volume_reload": True, "volume_reload_marker": "marker-1"}
+        assert modal_cloud_module._should_reload_modal_volume(payload) is True
+
+        volume = FakeVolume()
+        modal_cloud_module._reload_modal_volume_for_request(
+            volume,
+            "component-1",
+            reload_marker="marker-1",
+        )
+
+        assert volume.reload_calls == 1
+        assert modal_cloud_module._should_reload_modal_volume(payload) is False
+    finally:
+        modal_cloud_module._MODAL_VOLUME_RELOAD_MARKERS = original_marker_queue
+        modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET.clear()
+        modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET.update(original_marker_set)
+
+
 def test_modal_cloud_retries_volume_reload_after_clearing_warm_state(
     modal_cloud_module: Any,
     monkeypatch: Any,
