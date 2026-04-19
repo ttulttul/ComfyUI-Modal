@@ -92,6 +92,19 @@ class _RemoteExecutionControl:
     interrupt_flag_key: str
 
 
+def _meaningful_progress_values(node_state: dict[str, Any]) -> tuple[float, float] | None:
+    """Return numeric progress values only for node states that represent real progress."""
+    try:
+        progress_value = float(node_state.get("value", 0.0))
+        max_value = float(node_state.get("max", 1.0))
+    except (TypeError, ValueError):
+        return None
+
+    if max_value <= 1.0:
+        return None
+    return progress_value, max_value
+
+
 def _schedule_process_exit(delay_seconds: float, exit_code: int) -> None:
     """Exit the current process after a short delay to retire a bad Modal container."""
 
@@ -428,6 +441,17 @@ class _TracingPromptServer(_NullPromptServer):
             reported_node_id = display_node_id or real_node_id or tracked_node_state.get("node_id")
             if reported_node_id is None:
                 return
+            progress_values = _meaningful_progress_values(tracked_node_state)
+            if progress_values is None:
+                logger.debug(
+                    "Ignoring non-meaningful remote progress_state for node_id=%s state=%s value=%r max=%r.",
+                    reported_node_id,
+                    tracked_node_state.get("state"),
+                    tracked_node_state.get("value"),
+                    tracked_node_state.get("max"),
+                )
+                return
+            progress_value, max_value = progress_values
 
             self._status_callback(
                 {
@@ -436,8 +460,8 @@ class _TracingPromptServer(_NullPromptServer):
                     "display_node_id": (
                         str(display_node_id) if display_node_id is not None else None
                     ),
-                    "value": float(tracked_node_state.get("value", 0.0)),
-                    "max": float(tracked_node_state.get("max", 1.0)),
+                    "value": progress_value,
+                    "max": max_value,
                 }
             )
             return
