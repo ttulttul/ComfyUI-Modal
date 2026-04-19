@@ -24,6 +24,7 @@ const ERROR_CLEAR_DELAY_MS = 5000;
 
 const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
+const modalNodeProgressLanes = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
 const syntheticPromptUiStates = new Map();
@@ -578,12 +579,18 @@ function clearNodeProgress(nodeIdValue, promptId) {
   for (const progressNodeId of progressNodeIds) {
     const progressState = modalNodeProgress.get(progressNodeId);
     if (!progressState) {
+      modalNodeProgress.delete(progressNodeId);
+    } else if (!promptId || progressState.promptId === promptId) {
+      modalNodeProgress.delete(progressNodeId);
+    }
+    const laneState = modalNodeProgressLanes.get(progressNodeId);
+    if (!laneState) {
       continue;
     }
-    if (promptId && progressState.promptId !== promptId) {
+    if (promptId && laneState.promptId !== promptId) {
       continue;
     }
-    modalNodeProgress.delete(progressNodeId);
+    modalNodeProgressLanes.delete(progressNodeId);
   }
 }
 
@@ -609,6 +616,78 @@ function setNodeProgress(nodeIdValue, promptId, value, maxValue) {
       max: safeMaxValue,
       updatedAt: nowMs(),
     });
+  }
+
+  ensureAnimationLoop();
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+/**
+ * Record numeric progress for one worker lane on a node and its visible ancestors.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @param {string} laneId
+ * @param {number} value
+ * @param {number} maxValue
+ * @param {number | null | undefined} itemIndex
+ */
+function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex) {
+  const safeLaneId = String(laneId ?? "");
+  if (!safeLaneId) {
+    return;
+  }
+  const safeMaxValue = Math.max(1, Number(maxValue) || 1);
+  const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+
+  for (const progressNodeId of progressNodeIds) {
+    if (!shouldApplyPromptState(progressNodeId, promptId)) {
+      continue;
+    }
+    const existingLaneState = modalNodeProgressLanes.get(progressNodeId);
+    const laneState =
+      existingLaneState?.promptId === promptId
+        ? existingLaneState
+        : {
+            promptId,
+            lanes: new Map(),
+          };
+    laneState.lanes.set(safeLaneId, {
+      laneId: safeLaneId,
+      value: safeValue,
+      max: safeMaxValue,
+      itemIndex: Number.isFinite(Number(itemIndex)) ? Number(itemIndex) : null,
+      updatedAt: nowMs(),
+    });
+    modalNodeProgressLanes.set(progressNodeId, laneState);
+  }
+
+  ensureAnimationLoop();
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+/**
+ * Remove one worker lane progress bar from a node and its visible ancestors.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @param {string} laneId
+ */
+function clearNodeProgressLane(nodeIdValue, promptId, laneId) {
+  const safeLaneId = String(laneId ?? "");
+  if (!safeLaneId) {
+    return;
+  }
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+
+  for (const progressNodeId of progressNodeIds) {
+    const laneState = modalNodeProgressLanes.get(progressNodeId);
+    if (!laneState || laneState.promptId !== promptId) {
+      continue;
+    }
+    laneState.lanes.delete(safeLaneId);
+    if (laneState.lanes.size === 0) {
+      modalNodeProgressLanes.delete(progressNodeId);
+    }
   }
 
   ensureAnimationLoop();
@@ -942,10 +1021,17 @@ function getRemoteVisualState(node) {
   }
   const promptState = modalPromptStates.get(state.promptId);
   const progressState = modalNodeProgress.get(nodeId(node)) ?? null;
+  const progressLaneState = modalNodeProgressLanes.get(nodeId(node)) ?? null;
   return {
     ...state,
     isActiveRemoteNode: promptState?.activeNodeId === nodeId(node),
     progress: progressState?.promptId === state.promptId ? progressState : null,
+    progressLanes:
+      progressLaneState?.promptId === state.promptId
+        ? Array.from(progressLaneState.lanes.values()).sort(
+            (left, right) => Number(left.laneId) - Number(right.laneId),
+          )
+        : [],
   };
 }
 
@@ -1021,24 +1107,61 @@ function drawRemoteNodeDecoration(node, ctx) {
   );
   ctx.restore();
 
-  if (!state?.progress || state.phase !== STATE_ACTIVE) {
+  const progressLanes = Array.isArray(state?.progressLanes) ? state.progressLanes : [];
+  const hasAggregateProgress = Boolean(state?.progress && state.phase === STATE_ACTIVE);
+  const hasLaneProgress = progressLanes.length > 0 && state?.phase === STATE_ACTIVE;
+  if (!hasAggregateProgress && !hasLaneProgress) {
     return;
   }
 
-  const progressRatio = Math.max(0, Math.min(1, state.progress.value / state.progress.max));
-  const progressWidth = Math.max(0, (node.size[0] + borderWidth * 2) * progressRatio);
-  const progressY = node.size[1] - Math.max(10 / scale, borderWidth * 2);
-
   ctx.save();
-  ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-  ctx.fillRect(-borderWidth, progressY, node.size[0] + borderWidth * 2, 8 / scale);
-  ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
-  ctx.fillRect(-borderWidth, progressY, progressWidth, 8 / scale);
-  ctx.fillStyle = "#f8fafc";
-  ctx.font = `${Math.max(11 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
-  ctx.textAlign = "right";
-  ctx.textBaseline = "bottom";
-  ctx.fillText(`${Math.round(progressRatio * 100)}%`, node.size[0], progressY - 2 / scale);
+  const barWidth = node.size[0] + borderWidth * 2;
+  const aggregateHeight = 8 / scale;
+  const laneHeight = 5 / scale;
+  const laneGap = 2 / scale;
+  const progressY = node.size[1] - Math.max(10 / scale, borderWidth * 2);
+  const laneColors = [
+    "rgba(196, 181, 253, 0.94)",
+    "rgba(147, 197, 253, 0.94)",
+    "rgba(110, 231, 183, 0.94)",
+    "rgba(253, 224, 71, 0.94)",
+    "rgba(251, 146, 60, 0.94)",
+    "rgba(244, 114, 182, 0.94)",
+  ];
+
+  if (hasLaneProgress) {
+    const laneBlockHeight = progressLanes.length * laneHeight + (progressLanes.length - 1) * laneGap;
+    let laneY = progressY - laneGap - laneBlockHeight;
+    for (const [laneIndex, laneProgress] of progressLanes.entries()) {
+      const laneRatio = Math.max(0, Math.min(1, laneProgress.value / laneProgress.max));
+      const laneWidth = Math.max(0, barWidth * laneRatio);
+      ctx.fillStyle = "rgba(15, 23, 42, 0.66)";
+      ctx.fillRect(-borderWidth, laneY, barWidth, laneHeight);
+      ctx.fillStyle = laneColors[laneIndex % laneColors.length];
+      ctx.fillRect(-borderWidth, laneY, laneWidth, laneHeight);
+      laneY += laneHeight + laneGap;
+    }
+  }
+
+  if (hasAggregateProgress) {
+    const progressRatio = Math.max(0, Math.min(1, state.progress.value / state.progress.max));
+    const progressWidth = Math.max(0, barWidth * progressRatio);
+    ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+    ctx.fillRect(-borderWidth, progressY, barWidth, aggregateHeight);
+    ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
+    ctx.fillRect(-borderWidth, progressY, progressWidth, aggregateHeight);
+    ctx.fillStyle = "#f8fafc";
+    ctx.font = `${Math.max(11 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(`${Math.round(progressRatio * 100)}%`, node.size[0], progressY - 2 / scale);
+  } else if (hasLaneProgress) {
+    ctx.fillStyle = "#f8fafc";
+    ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(`${progressLanes.length}x`, node.size[0], progressY - 2 / scale);
+  }
   ctx.restore();
 }
 
@@ -1163,6 +1286,21 @@ function handleModalProgress(event) {
   setPromptActiveNode(promptId, progressNodeId);
   setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
   setNodesPhase([progressNodeId], STATE_ACTIVE, promptId);
+  if (detail.lane_id != null) {
+    if (detail.clear) {
+      clearNodeProgressLane(progressNodeId, promptId, String(detail.lane_id));
+      return;
+    }
+    setNodeProgressLane(
+      progressNodeId,
+      promptId,
+      String(detail.lane_id),
+      Number(detail.value ?? 0),
+      Number(detail.max ?? 1),
+      detail.item_index,
+    );
+    return;
+  }
   setNodeProgress(
     progressNodeId,
     promptId,
