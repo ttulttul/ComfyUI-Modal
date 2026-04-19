@@ -2,6 +2,7 @@
 
 ## 2026-04-19
 
+- Mapped remote outputs cannot always be reassembled by concatenating tensors along batch dimension `0`. A flow like `KSampler -> UpscaleLatentBy` with per-item upscale factors can produce latents with different spatial sizes, so the safe aggregation rule is "concatenate when shapes match, otherwise preserve the ordered list of per-item outputs."
 - The frontend cannot treat mapped execution like a prompt-wide single active node. Per-lane progress is the durable source of truth there: ordinary non-mapped runs can still use `activeNodeId`, but mapped remote styling should derive purple/active state from whichever nodes currently hold live lane or numeric progress, and lane ownership needs to move when one worker advances from node A to node B.
 - The test bootstrap should not hard-code `~/git/ComfyUI` as its only source of ComfyUI imports. Reading `COMFYUI_ROOT` first makes it easy to validate the extension against a disposable checkout in `/tmp` while preserving the old local-default behavior.
 - A usable `uv` test environment for this repo needs more than `pytest`. Importing current ComfyUI APIs during tests also requires `aiohttp`, `Pillow`, `torch`, `safetensors`, `numpy`, and `tqdm`, so those belong in the dedicated `test` dependency group instead of being installed ad hoc on one machine.

@@ -2288,6 +2288,51 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
     ]
 
 
+def test_invoke_mapped_remote_engine_async_keeps_heterogeneous_latents_as_list(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped LATENT outputs should remain a list when per-item spatial shapes differ."""
+    torch = pytest.importorskip("torch")
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        scale = int(hydrated_inputs["remote_input_0"])
+        latent = {
+            "samples": torch.zeros((1, 4, scale, scale), dtype=torch.float32),
+            "batch_index": [scale],
+        }
+        return serialization_module.serialize_node_outputs((latent,))
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "7",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "INT"},
+        "boundary_outputs": [{"io_type": "LATENT", "is_list": False}],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_mapped_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs({"remote_input_0": [32, 35]}),
+        )
+    )
+
+    outputs = serialization_module.deserialize_node_outputs(response)
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], list)
+    assert [item["samples"].shape for item in outputs[0]] == [(1, 4, 32, 32), (1, 4, 35, 35)]
+
+
 def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
     remote_modal_app_module: Any,
     serialization_module: Any,
