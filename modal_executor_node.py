@@ -96,6 +96,17 @@ def _output_spec(io_type: str, name: str, is_list: bool) -> io.Output:
     return comfy_type.Output(display_name=name, is_output_list=is_list)
 
 
+def _normalize_proxy_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert ComfyUI INPUT_IS_LIST proxy kwargs back into ordinary runtime values."""
+    normalized_kwargs: dict[str, Any] = {}
+    for input_name, input_value in kwargs.items():
+        if isinstance(input_value, list) and len(input_value) == 1:
+            normalized_kwargs[str(input_name)] = input_value[0]
+            continue
+        normalized_kwargs[str(input_name)] = input_value
+    return normalized_kwargs
+
+
 def _normalized_output_metadata(
     original_class: type[Any],
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[bool, ...]]:
@@ -162,6 +173,7 @@ def _build_proxy_node_class(
                     io.AnyType.Input(payload_input_name),
                 ],
                 outputs=outputs,
+                is_input_list=True,
                 accept_all_inputs=True,
                 is_dev_only=True,
                 is_experimental=True,
@@ -176,7 +188,13 @@ def _build_proxy_node_class(
             if not isinstance(payload, Mapping):
                 raise TypeError(f"{payload_input_name} must be a mapping or JSON object.")
 
-            outputs = tuple(await _execute_payload_async(get_remote_executor_client(), payload, kwargs))
+            outputs = tuple(
+                await _execute_payload_async(
+                    get_remote_executor_client(),
+                    payload,
+                    _normalize_proxy_kwargs(kwargs),
+                )
+            )
             logger.debug(
                 "Remote execution completed for payload kind=%s with %d outputs.",
                 payload.get("payload_kind"),

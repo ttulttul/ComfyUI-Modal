@@ -170,6 +170,7 @@ Current mapped-execution rules:
 - non-mapped boundary inputs are broadcast unchanged to every per-item execution
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
 - per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item
+- the proxy node itself now opts into ComfyUI `INPUT_IS_LIST` handling and unwraps singleton list wrappers before dispatch, so list-valued mapped inputs reach the internal Modal scheduler without causing the whole proxy node to be auto-mapped once per item
 
 ### 4. Queue the workflow
 
