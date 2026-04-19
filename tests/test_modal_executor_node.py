@@ -3445,6 +3445,41 @@ class _BoundarySinkNode:
         return (value * 2,)
 
 
+class _PrimitiveEchoNode:
+    """Simple node used to verify primitive widget coercion."""
+
+    RETURN_TYPES = ("INT", "FLOAT", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("steps", "cfg", "enabled", "label")
+    OUTPUT_IS_LIST = (False, False, False, False)
+    FUNCTION = "run"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str]]]:
+        """Return one primitive input of each V1 widget type."""
+        return {
+            "required": {
+                "steps": ("INT",),
+                "cfg": ("FLOAT",),
+                "enabled": ("BOOLEAN",),
+                "label": ("STRING",),
+            }
+        }
+
+    def run(
+        self,
+        steps: int,
+        cfg: float,
+        enabled: bool,
+        label: str,
+    ) -> tuple[int, float, bool, str]:
+        """Echo primitive inputs after asserting their coerced Python types."""
+        assert isinstance(steps, int)
+        assert isinstance(cfg, float)
+        assert isinstance(enabled, bool)
+        assert isinstance(label, str)
+        return (steps, cfg, enabled, label)
+
+
 def test_local_remote_app_executes_subgraph_payload(
     remote_modal_app_module: Any,
     serialization_module: Any,
@@ -3645,6 +3680,113 @@ def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
             prompt,
             {"BoundarySource": _BoundarySourceNode},
         )
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_coerce_prompt_primitive_input_values_matches_comfyui_semantics(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Remote runtimes should coerce primitive prompt literals the same way ComfyUI does."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    prompt = {
+        "remote_1": {
+            "class_type": "PrimitiveEcho",
+            "inputs": {
+                "steps": 18.0,
+                "cfg": 5,
+                "enabled": 1,
+                "label": 7,
+            },
+            "_meta": {},
+        }
+    }
+
+    target_module._coerce_prompt_primitive_input_values(
+        prompt,
+        {"PrimitiveEcho": _PrimitiveEchoNode},
+    )
+
+    assert prompt["remote_1"]["inputs"] == {
+        "steps": 18,
+        "cfg": 5.0,
+        "enabled": True,
+        "label": "7",
+    }
+    assert isinstance(prompt["remote_1"]["inputs"]["steps"], int)
+    assert isinstance(prompt["remote_1"]["inputs"]["cfg"], float)
+    assert isinstance(prompt["remote_1"]["inputs"]["enabled"], bool)
+    assert isinstance(prompt["remote_1"]["inputs"]["label"], str)
+
+
+def test_local_remote_app_coerces_primitive_widget_literals_before_execution(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+) -> None:
+    """The local fallback runner should coerce primitive widget literals before executing nodes."""
+    payload = remote_modal_app_module.execute_subgraph_locally(
+        payload={
+            "payload_kind": "subgraph",
+            "component_id": "component-primitive-coercion",
+            "subgraph_prompt": {
+                "remote_1": {
+                    "class_type": "PrimitiveEcho",
+                    "inputs": {
+                        "steps": 18.0,
+                        "cfg": 5,
+                        "enabled": 1,
+                        "label": 7,
+                    },
+                    "_meta": {},
+                }
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "steps",
+                    "node_id": "remote_1",
+                    "output_index": 0,
+                    "io_type": "INT",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "cfg",
+                    "node_id": "remote_1",
+                    "output_index": 1,
+                    "io_type": "FLOAT",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "enabled",
+                    "node_id": "remote_1",
+                    "output_index": 2,
+                    "io_type": "BOOLEAN",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "label",
+                    "node_id": "remote_1",
+                    "output_index": 3,
+                    "io_type": "STRING",
+                    "is_list": False,
+                },
+            ],
+            "execute_node_ids": ["remote_1"],
+            "extra_data": {},
+            "custom_nodes_bundle": None,
+        },
+        kwargs_payload="{}",
+        node_mapping={"PrimitiveEcho": _PrimitiveEchoNode},
+    )
+
+    outputs = serialization_module.deserialize_node_outputs(payload)
+    assert outputs == (18, 5.0, True, "7")
 
 
 @pytest.mark.parametrize(
