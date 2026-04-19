@@ -1764,6 +1764,107 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
     ]
 
 
+def test_consume_remote_payload_stream_filters_static_sibling_ui_events_from_mapped_items(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped item streams should not forward executed or preview events for static sibling nodes."""
+    executed_calls: list[dict[str, Any]] = []
+    preview_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_executed_output",
+        lambda **kwargs: executed_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_preview_image",
+        lambda **kwargs: preview_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "6::item:0",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["3", "6", "7"],
+        "execute_node_ids": ["7"],
+        "boundary_outputs": [
+            {"node_id": "7", "output_index": 0, "io_type": "IMAGE", "is_list": False}
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "suppress_status_stream": True,
+        "mapped_progress_lane_id": "0",
+        "mapped_progress_display_node_id": "6",
+        "map_item_index": 0,
+    }
+    preview_bytes = serialization_module.serialize_value(b"preview-bytes")
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "executed",
+                "node_id": "3",
+                "display_node_id": "3",
+                "output": serialization_module.serialize_value({"images": ["static"]}),
+            },
+            {
+                "kind": "progress",
+                "event_type": "preview",
+                "node_id": "3",
+                "display_node_id": "3",
+                "image_type": "PNG",
+                "image_bytes": preview_bytes,
+            },
+            {
+                "kind": "progress",
+                "event_type": "executed",
+                "node_id": "7",
+                "display_node_id": "7",
+                "output": serialization_module.serialize_value({"images": ["mapped"]}),
+            },
+            {
+                "kind": "progress",
+                "event_type": "preview",
+                "node_id": "7",
+                "display_node_id": "7",
+                "image_type": "PNG",
+                "image_bytes": preview_bytes,
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert executed_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "7",
+            "display_node_id": "7",
+            "output_payload": {"images": ["mapped"]},
+        }
+    ]
+    assert preview_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "7",
+            "display_node_id": "7",
+            "parent_node_id": None,
+            "real_node_id": None,
+            "image_type": "PNG",
+            "image_bytes": b"preview-bytes",
+            "max_size": None,
+        }
+    ]
+
+
 def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
     modal_cloud_module: Any,
     monkeypatch: Any,

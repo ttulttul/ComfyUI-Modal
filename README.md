@@ -169,7 +169,7 @@ Current mapped-execution rules:
 - mapped inputs may currently be Python lists, `IMAGE` batches, `LATENT` batches, and other batched tensors split on dimension `0`
 - non-mapped boundary inputs are broadcast unchanged to every per-item execution
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
-- per-item remote node status updates are suppressed, but preview images and boundary preview outputs still stream back as each item finishes
+- per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item
 
 ### 4. Queue the workflow
 
