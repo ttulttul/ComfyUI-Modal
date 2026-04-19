@@ -796,6 +796,7 @@ def _emit_local_modal_progress(
     value: float,
     max_value: float,
     display_node_id: str | None = None,
+    real_node_id: str | None = None,
     lane_id: str | None = None,
     clear: bool = False,
     item_index: int | None = None,
@@ -817,6 +818,8 @@ def _emit_local_modal_progress(
     }
     if display_node_id is not None:
         payload["display_node_id"] = display_node_id
+    if real_node_id is not None:
+        payload["real_node_id"] = real_node_id
     if lane_id is not None:
         payload["lane_id"] = lane_id
     if clear:
@@ -1155,12 +1158,19 @@ def _consume_remote_payload_stream(
                         if stream_event.get("display_node_id") is not None
                         else str(reported_node_id)
                     )
+                    real_node_id = (
+                        str(stream_event["real_node_id"])
+                        if stream_event.get("real_node_id") is not None
+                        else None
+                    )
+                    progress_node_id = real_node_id or display_node_id
                     if lane_id is not None:
-                        _remember_mapped_lane_node_id(payload, lane_id, display_node_id)
+                        _remember_mapped_lane_node_id(payload, lane_id, progress_node_id)
                     logger.debug(
-                        "Forwarding streamed Modal node progress for component=%s node_id=%s value=%s max=%s lane_id=%s.",
+                        "Forwarding streamed Modal node progress for component=%s node_id=%s real_node_id=%s value=%s max=%s lane_id=%s.",
                         payload.get("component_id"),
                         reported_node_id,
+                        real_node_id,
                         stream_event.get("value"),
                         stream_event.get("max"),
                         lane_id,
@@ -1172,6 +1182,7 @@ def _consume_remote_payload_stream(
                         value=float(stream_event.get("value", 0.0)),
                         max_value=float(stream_event.get("max", 1.0)),
                         display_node_id=display_node_id,
+                        real_node_id=real_node_id,
                         lane_id=lane_id,
                         item_index=(
                             int(payload["map_item_index"])

@@ -1597,6 +1597,7 @@ def test_modal_cloud_tracing_prompt_server_emits_numeric_node_progress(
         "event_type": "node_progress",
         "node_id": "7",
         "display_node_id": "7",
+        "real_node_id": "7",
         "value": 5.0,
         "max": 20.0,
     }
@@ -2409,6 +2410,7 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
             "value": 1.0,
             "max_value": 4.0,
             "display_node_id": "7",
+            "real_node_id": None,
             "lane_id": "1",
             "item_index": 0,
         }

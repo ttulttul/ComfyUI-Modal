@@ -396,7 +396,7 @@ function refreshModalUiAfterVisibilityChange() {
 /**
  * Return the prompt metadata bucket, creating it if needed.
  * @param {string} promptId
- * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]> }}
+ * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]> }}
  */
 function ensurePromptState(promptId) {
   if (!modalPromptStates.has(promptId)) {
@@ -404,6 +404,7 @@ function ensurePromptState(promptId) {
       startedAt: nowMs(),
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
+      componentNodeIdsByMember: new Map(),
       descendantNodeIdsByAncestor: new Map(),
       activeNodeId: null,
       hasStreamedProgress: false,
@@ -543,15 +544,21 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
   if (components.length > 0) {
     const mergedRemoteNodeIds = new Set(remoteNodeIds.map((nodeIdValue) => String(nodeIdValue)));
     promptState.componentsByRepresentative.clear();
+    promptState.componentNodeIdsByMember.clear();
     promptState.activeNodeId = null;
     promptState.hasStreamedProgress = false;
     for (const component of components) {
-      const componentNodeIds = component.node_ids.map((nodeIdValue) => String(nodeIdValue));
+      const componentNodeIds = Array.from(
+        new Set(component.node_ids.map((nodeIdValue) => String(nodeIdValue))),
+      );
+      const representativeNodeId = String(component.representative_node_id);
       promptState.componentsByRepresentative.set(
-        String(component.representative_node_id),
+        representativeNodeId,
         componentNodeIds,
       );
+      promptState.componentNodeIdsByMember.set(representativeNodeId, componentNodeIds);
       for (const componentNodeId of componentNodeIds) {
+        promptState.componentNodeIdsByMember.set(componentNodeId, componentNodeIds);
         mergedRemoteNodeIds.add(componentNodeId);
       }
     }
@@ -834,7 +841,14 @@ function resolveComponentNodeIds(promptId, representativeNodeId) {
   if (!promptState) {
     return null;
   }
-  return promptState.componentsByRepresentative.get(representativeNodeId) ?? null;
+  const candidateNodeId = String(representativeNodeId);
+  if (promptState.componentNodeIdsByMember.has(candidateNodeId)) {
+    return promptState.componentNodeIdsByMember.get(candidateNodeId) ?? null;
+  }
+  if (promptState.remoteNodeIds.includes(candidateNodeId)) {
+    return [candidateNodeId];
+  }
+  return null;
 }
 
 /**
@@ -1477,15 +1491,20 @@ function handleModalStatus(event) {
 function handleModalProgress(event) {
   const detail = eventDetail(event);
   const promptId = String(detail.prompt_id ?? "");
-  const progressNodeId = String(detail.display_node_id ?? detail.node_id ?? "");
+  const progressNodeId = String(detail.real_node_id ?? detail.display_node_id ?? detail.node_id ?? "");
   if (!promptId || !progressNodeId) {
     return;
   }
 
   endSyntheticExecutionUi(promptId);
   const promptState = ensurePromptState(promptId);
+  const componentNodeIds = resolveComponentNodeIds(promptId, progressNodeId);
+  const readyNodeIds = (componentNodeIds ?? []).filter((nodeIdValue) => nodeIdValue !== progressNodeId);
   promptState.hasStreamedProgress = true;
   if (detail.aggregate_only) {
+    if (componentNodeIds?.length) {
+      setNodesPhase(componentNodeIds, STATE_READY, promptId);
+    }
     setGlobalStatusBatchProgress(promptId, Number(detail.value ?? 0), Number(detail.max ?? 1));
     setNodeBatchProgress(
       progressNodeId,
@@ -1495,6 +1514,9 @@ function handleModalProgress(event) {
     );
     setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
     return;
+  }
+  if (readyNodeIds.length > 0) {
+    setNodesPhase(readyNodeIds, STATE_READY, promptId);
   }
   setPromptActiveNode(promptId, progressNodeId);
   setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);

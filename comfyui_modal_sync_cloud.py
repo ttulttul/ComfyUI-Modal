@@ -460,6 +460,7 @@ class _TracingPromptServer(_NullPromptServer):
                     "display_node_id": (
                         str(display_node_id) if display_node_id is not None else None
                     ),
+                    "real_node_id": str(real_node_id) if real_node_id is not None else None,
                     "value": progress_value,
                     "max": max_value,
                 }
