@@ -198,6 +198,8 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith("/assets/")
     assert payload["execute_node_ids"] == ["2"]
     assert payload["requires_volume_reload"] is True
+    assert isinstance(payload["volume_reload_marker"], str)
+    assert payload["volume_reload_marker"]
     assert payload["boundary_inputs"] == []
     assert payload["boundary_outputs"] == [
         {

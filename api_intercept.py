@@ -1198,6 +1198,7 @@ def _build_component_payload(
     requires_volume_reload = any(asset.uploaded for asset in synced_assets) or (
         custom_nodes_bundle is not None and custom_nodes_bundle.uploaded
     )
+    volume_reload_marker = uuid.uuid4().hex if requires_volume_reload else None
     payload = {
         "payload_kind": "mapped_subgraph" if component.mapped_boundary_input_name else "subgraph",
         "component_id": component.representative_node_id,
@@ -1228,6 +1229,7 @@ def _build_component_payload(
         "execute_node_ids": list(component.execute_node_ids),
         "extra_data": copy.deepcopy(extra_data or {}),
         "requires_volume_reload": requires_volume_reload,
+        "volume_reload_marker": volume_reload_marker,
         "custom_nodes_bundle": (
             custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
         ),
@@ -1248,9 +1250,10 @@ def _build_component_payload(
         payload["execute_node_ids"],
     )
     logger.info(
-        "Remote payload for component %s requires_volume_reload=%s",
+        "Remote payload for component %s requires_volume_reload=%s volume_reload_marker=%s",
         component.representative_node_id,
         requires_volume_reload,
+        volume_reload_marker,
     )
     return payload
 
