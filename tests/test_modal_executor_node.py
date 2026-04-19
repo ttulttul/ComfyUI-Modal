@@ -501,6 +501,60 @@ def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
     assert modal_cloud_module._should_reload_modal_volume({}) is True
 
 
+def test_modal_cloud_schedules_container_exit_for_remote_failures(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Unhandled remote execution failures should retire the current Modal container."""
+    scheduled_exits: list[tuple[float, int]] = []
+    original_flag = modal_cloud_module._CONTAINER_TERMINATION_SCHEDULED
+    monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", False)
+    monkeypatch.setattr(modal_cloud_module, "_is_modal_container_runtime", lambda: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_schedule_process_exit",
+        lambda delay_seconds, exit_code: scheduled_exits.append((delay_seconds, exit_code)),
+    )
+    try:
+        scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
+            {"component_id": "component-1", "terminate_container_on_error": True},
+            RuntimeError("boom"),
+        )
+    finally:
+        monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
+
+    assert scheduled is True
+    assert scheduled_exits == [(modal_cloud_module._REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS, 1)]
+
+
+def test_modal_cloud_does_not_schedule_container_exit_for_interruptions(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Expected interruption-style failures should not tear down the warm Modal container."""
+    scheduled_exits: list[tuple[float, int]] = []
+    original_flag = modal_cloud_module._CONTAINER_TERMINATION_SCHEDULED
+    monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", False)
+    monkeypatch.setattr(modal_cloud_module, "_is_modal_container_runtime", lambda: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_schedule_process_exit",
+        lambda delay_seconds, exit_code: scheduled_exits.append((delay_seconds, exit_code)),
+    )
+    try:
+        scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
+            {"component_id": "component-1", "terminate_container_on_error": True},
+            modal_cloud_module.RemoteSubgraphExecutionError(
+                "Remote subgraph execution was interrupted."
+            ),
+        )
+    finally:
+        monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
+
+    assert scheduled is False
+    assert scheduled_exits == []
+
+
 def test_modal_cloud_skips_duplicate_reload_markers_in_same_container(
     modal_cloud_module: Any,
 ) -> None:

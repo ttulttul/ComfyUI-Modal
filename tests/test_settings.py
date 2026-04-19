@@ -106,3 +106,18 @@ def test_settings_reads_interrupt_dict_name_override(
         settings_module.get_settings.cache_clear()
 
     assert settings.interrupt_dict_name == "custom-interrupt-store"
+
+
+def test_settings_reads_terminate_container_on_error_override(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote crash teardown should be configurable via environment variable."""
+    monkeypatch.setenv("COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR", "false")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.terminate_container_on_error is False
