@@ -1231,10 +1231,30 @@ def _extract_prompt_executor_error(executor: Any) -> str:
     """Extract a useful failure message from a PromptExecutor run."""
     for event, data in reversed(executor.status_messages):
         if event == "execution_error":
-            return str(data.get("exception_message") or "Remote subgraph execution failed.")
+            return _format_prompt_executor_error_payload(data)
         if event == "execution_interrupted":
             return "Remote subgraph execution was interrupted."
     return "Remote subgraph execution failed."
+
+
+def _format_prompt_executor_error_payload(data: Any) -> str:
+    """Return a richer human-readable PromptExecutor failure message when available."""
+    if not isinstance(data, dict):
+        return "Remote subgraph execution failed."
+
+    message = str(data.get("exception_message") or "Remote subgraph execution failed.")
+    node_id = data.get("node_id")
+    node_type = data.get("node_type")
+    current_inputs = data.get("current_inputs")
+    if node_id is None and node_type is None and not current_inputs:
+        return message
+
+    details: list[str] = [message]
+    if node_id is not None or node_type is not None:
+        details.append(f"node_id={node_id!r} node_type={node_type!r}")
+    if current_inputs:
+        details.append(f"current_inputs={current_inputs!r}")
+    return " | ".join(details)
 
 
 def _extract_prompt_executor_error_payload(executor: Any) -> dict[str, Any] | None:
@@ -1262,6 +1282,68 @@ def _summarize_suspicious_prompt_inputs(prompt: dict[str, Any]) -> list[str]:
             ):
                 findings.append(f"{node_id}.{input_name}={input_value!r}")
     return findings
+
+
+def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
+    """Return one node class's declared V1 input types keyed by input name."""
+    input_types_callable = getattr(node_class, "INPUT_TYPES", None)
+    if not callable(input_types_callable):
+        return {}
+
+    raw_input_types = input_types_callable()
+    if not isinstance(raw_input_types, dict):
+        return {}
+
+    input_type_map: dict[str, str] = {}
+    for section_name in ("required", "optional", "hidden"):
+        section = raw_input_types.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for input_name, input_config in section.items():
+            if not isinstance(input_config, tuple) or not input_config:
+                continue
+            declared_type = input_config[0]
+            if isinstance(declared_type, str):
+                input_type_map[str(input_name)] = declared_type
+    return input_type_map
+
+
+def _validate_prompt_input_shapes(
+    prompt: dict[str, Any],
+    node_mapping: dict[str, type[Any]],
+) -> None:
+    """Reject prompt inputs that still look invalid for primitive widget sockets."""
+    primitive_types = {"INT", "FLOAT", "BOOLEAN", "STRING"}
+    for node_id, prompt_node in sorted(prompt.items()):
+        class_type = str(prompt_node.get("class_type"))
+        node_class = node_mapping.get(class_type)
+        if node_class is None:
+            continue
+        input_type_map = _node_input_type_map(node_class)
+        if not input_type_map:
+            continue
+        for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+            declared_type = input_type_map.get(str(input_name))
+            if declared_type not in primitive_types:
+                continue
+            if (
+                isinstance(input_value, list)
+                and len(input_value) == 2
+                and isinstance(input_value[0], str)
+            ):
+                continue
+            literal_value = (
+                input_value.get("__value__")
+                if isinstance(input_value, dict) and "__value__" in input_value
+                else input_value
+            )
+            if isinstance(literal_value, list):
+                raise RemoteSubgraphExecutionError(
+                    "Remote subgraph input has an invalid list value for a primitive socket."
+                    f" node_id={node_id!r} node_type={class_type!r}"
+                    f" input_name={input_name!r} declared_type={declared_type!r}"
+                    f" received_value={literal_value!r}"
+                )
 
 
 def _log_prompt_executor_failure_details(
@@ -1478,6 +1560,8 @@ def _execute_subgraph_prompt(
     with _timed_phase("load_execution_module", component=component_id):
         execution = _load_execution_module()
         cache_type, cache_args = _prompt_executor_cache_config(execution)
+        resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
+    _validate_prompt_input_shapes(prompt, resolved_node_mapping)
 
     with (
         _temporary_node_mapping(None),
