@@ -2,6 +2,7 @@
 
 ## 2026-04-19
 
+- The frontend cannot treat mapped execution like a prompt-wide single active node. Per-lane progress is the durable source of truth there: ordinary non-mapped runs can still use `activeNodeId`, but mapped remote styling should derive purple/active state from whichever nodes currently hold live lane or numeric progress, and lane ownership needs to move when one worker advances from node A to node B.
 - The test bootstrap should not hard-code `~/git/ComfyUI` as its only source of ComfyUI imports. Reading `COMFYUI_ROOT` first makes it easy to validate the extension against a disposable checkout in `/tmp` while preserving the old local-default behavior.
 - A usable `uv` test environment for this repo needs more than `pytest`. Importing current ComfyUI APIs during tests also requires `aiohttp`, `Pillow`, `torch`, `safetensors`, `numpy`, and `tqdm`, so those belong in the dedicated `test` dependency group instead of being installed ad hoc on one machine.
 - On this host, `uv sync` worked reliably with `UV_PROJECT_ENVIRONMENT` and `UV_CACHE_DIR=/tmp/uv-cache`, but `uv run ...` crashed inside the installed `uv` binary with a macOS system-configuration panic. The environment itself was still valid, and invoking `/tmp/.../bin/python -m pytest` against that `uv`-managed environment was a workable fallback.
