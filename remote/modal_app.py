@@ -1704,7 +1704,6 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                 return
             if _local_processing_interrupted():
                 _raise_local_interrupt()
-            _emit_local_mapped_lane_progress_start(payload, lane_index, item_index)
             try:
                 item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
                 item_inputs = dict(broadcast_inputs)
@@ -1804,7 +1803,6 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
             item_index, item_value = queued_item
             if _local_processing_interrupted():
                 _raise_local_interrupt()
-            _emit_local_mapped_lane_progress_start(payload, lane_index, item_index)
             try:
                 item_payload = _build_mapped_item_payload(payload, item_index, lane_index)
                 item_inputs = dict(broadcast_inputs)
