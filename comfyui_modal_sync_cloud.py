@@ -1923,10 +1923,66 @@ def _sleep_before_modal_volume_reload_retry(delay_seconds: float) -> None:
     time.sleep(delay_seconds)
 
 
+def _iter_payload_input_strings(value: Any) -> Iterator[str]:
+    """Yield string literals nested inside one serialized prompt input value."""
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, list):
+        if len(value) == 2 and isinstance(value[0], str):
+            return
+        for item in value:
+            yield from _iter_payload_input_strings(item)
+        return
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            yield from _iter_payload_input_strings(nested_value)
+
+
+def _payload_volume_paths(payload: dict[str, Any]) -> set[Path]:
+    """Return mounted-volume paths referenced by this remote payload."""
+    remote_storage_root = Path(get_settings().remote_storage_root)
+    remote_storage_root_text = str(remote_storage_root).rstrip("/")
+    referenced_paths: set[Path] = set()
+
+    custom_nodes_bundle = payload.get("custom_nodes_bundle")
+    if isinstance(custom_nodes_bundle, str):
+        bundle_path = Path(custom_nodes_bundle)
+        if bundle_path.is_absolute():
+            referenced_paths.add(bundle_path)
+
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict):
+        return referenced_paths
+
+    for prompt_node in prompt.values():
+        if not isinstance(prompt_node, dict):
+            continue
+        inputs = prompt_node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        for input_value in inputs.values():
+            for candidate_path in _iter_payload_input_strings(input_value):
+                if candidate_path == remote_storage_root_text or candidate_path.startswith(
+                    f"{remote_storage_root_text}/"
+                ):
+                    referenced_paths.add(Path(candidate_path))
+    return referenced_paths
+
+
+def _payload_volume_paths_visible(payload: dict[str, Any]) -> bool:
+    """Return whether every mounted-volume path referenced by this payload is already visible."""
+    referenced_paths = _payload_volume_paths(payload)
+    if not referenced_paths:
+        return False
+    return all(path.exists() for path in referenced_paths)
+
+
 def _reload_modal_volume_for_request(
     volume: Any,
     component_id: str,
     reload_marker: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> None:
     """Reload the Modal volume, retrying briefly while warm state releases open files."""
     with _timed_phase("modal_volume_reload", component=component_id):
@@ -1951,6 +2007,16 @@ def _reload_modal_volume_for_request(
                 if not _is_modal_volume_open_files_error(exc):
                     raise
                 if attempt_index == len(_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS):
+                    if payload is not None and _payload_volume_paths_visible(payload):
+                        _emit_cloud_info(
+                            "Modal volume reload still reported open files for component=%s after %d attempt(s), "
+                            "but all referenced mounted-volume paths are already visible. Proceeding without reload.",
+                            component_id,
+                            attempt_index,
+                        )
+                        if reload_marker is not None:
+                            _record_modal_volume_reload_marker(reload_marker)
+                        return
                     raise
                 _emit_cloud_info(
                     "Modal volume reload hit open files for component=%s on attempt %d/%d; clearing warm caches and retrying after %.2fs.",
@@ -2048,6 +2114,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                                 vol,
                                 str(component_id),
                                 reload_marker=reload_marker,
+                                payload=payload,
                             )
                         else:
                             _emit_modal_volume_reload_skip(component_id, payload)
@@ -2091,6 +2158,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                                 vol,
                                 str(component_id),
                                 reload_marker=reload_marker,
+                                payload=payload,
                             )
                         else:
                             _emit_modal_volume_reload_skip(component_id, payload)
