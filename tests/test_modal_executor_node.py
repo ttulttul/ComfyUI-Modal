@@ -1497,6 +1497,46 @@ def test_modal_cloud_tracing_prompt_server_emits_numeric_node_progress(
     }
 
 
+def test_modal_cloud_tracing_prompt_server_ignores_trivial_node_progress(
+    modal_cloud_module: Any,
+) -> None:
+    """The cloud tracing prompt server should ignore 0/1 progress updates from non-progress nodes."""
+    observed_updates: list[dict[str, Any]] = []
+    server = modal_cloud_module._TracingPromptServer(
+        "component-1",
+        {"18": {"class_type": "CLIPTextEncode", "inputs": {}}},
+        status_callback=observed_updates.append,
+    )
+
+    server.send_sync("executing", {"node": "18"}, None)
+    server.send_sync(
+        "progress_state",
+        {
+            "prompt_id": "component-1",
+            "nodes": {
+                "18": {
+                    "node_id": "18",
+                    "display_node_id": "18",
+                    "real_node_id": "18",
+                    "state": "running",
+                    "value": 0,
+                    "max": 1,
+                }
+            },
+        },
+        None,
+    )
+
+    assert observed_updates == [
+        {
+            "phase": "executing",
+            "active_node_id": "18",
+            "active_node_class_type": "CLIPTextEncode",
+            "active_node_role": "conditioning",
+        }
+    ]
+
+
 def test_modal_cloud_tracing_prompt_server_emits_executed_outputs(
     modal_cloud_module: Any,
 ) -> None:
