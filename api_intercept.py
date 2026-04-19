@@ -83,6 +83,9 @@ class RemoteComponentPlan:
     contains_output_node: bool
     mapped_boundary_input_name: str | None = None
     mapped_boundary_input_io_type: str | None = None
+    mapped_node_ids: list[str] = field(default_factory=list)
+    mapped_execute_node_ids: list[str] = field(default_factory=list)
+    static_execute_node_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -983,25 +986,19 @@ def _build_component_plan(
             nodes_module=nodes_module,
         )
 
+    mapped_node_ids: list[str] = []
+    mapped_execute_node_ids: list[str] = []
+    static_execute_node_ids: list[str] = []
     if mapped_boundary_spec is not None:
         mapped_reachable_node_ids = _component_downstream_closure(
             seed_node_ids={target.node_id for target in mapped_boundary_spec.targets},
             component_node_id_set=component_node_id_set,
             consumers=consumers,
         )
-        invalid_execute_node_ids = sorted(output_execution_targets - mapped_reachable_node_ids)
-        if invalid_execute_node_ids:
-            invalid_node_descriptions = [
-                f"{node_id} ({prompt[node_id]['class_type']})"
-                for node_id in invalid_execute_node_ids
-                if node_id in prompt
-            ]
-            raise ModalPromptValidationError(
-                "Mapped remote execution cannot include execute nodes that do not depend on the Modal Map Input. "
-                "This graph shape currently appears when a mapped branch shares non-transportable upstream nodes with "
-                "an unmapped remote sibling branch. Unsupported execute nodes: "
-                f"{', '.join(invalid_node_descriptions or invalid_execute_node_ids)}."
-            )
+        mapped_node_ids = sorted(mapped_reachable_node_ids)
+        mapped_node_id_set = set(mapped_node_ids)
+        mapped_execute_node_ids = sorted(output_execution_targets & mapped_node_id_set)
+        static_execute_node_ids = sorted(output_execution_targets - mapped_node_id_set)
 
     component = RemoteComponentPlan(
         node_ids=component_node_ids,
@@ -1020,9 +1017,12 @@ def _build_component_plan(
             mapped_boundary_spec.proxy_input_name if mapped_boundary_spec is not None else None
         ),
         mapped_boundary_input_io_type=mapped_boundary_input_io_type,
+        mapped_node_ids=mapped_node_ids,
+        mapped_execute_node_ids=mapped_execute_node_ids,
+        static_execute_node_ids=static_execute_node_ids,
     )
     logger.info(
-        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s",
+        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s mapped_execute_nodes=%s static_execute_nodes=%s",
         component.representative_node_id,
         component.node_ids,
         len(component.boundary_inputs),
@@ -1030,6 +1030,8 @@ def _build_component_plan(
         component.execute_node_ids,
         component.contains_output_node,
         component.mapped_boundary_input_name,
+        component.mapped_execute_node_ids,
+        component.static_execute_node_ids,
     )
     return component
 
@@ -1256,17 +1258,31 @@ def _build_component_payload(
             for boundary_input in component.boundary_inputs
         ],
         "boundary_outputs": [
-            {
-                "proxy_output_name": boundary_output.proxy_output_name,
-                "node_id": boundary_output.source.node_id,
-                "output_index": boundary_output.source.output_index,
-                "io_type": boundary_output.io_type,
-                "is_list": boundary_output.is_list,
-                "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-            }
+            (
+                {
+                    "proxy_output_name": boundary_output.proxy_output_name,
+                    "node_id": boundary_output.source.node_id,
+                    "output_index": boundary_output.source.output_index,
+                    "io_type": boundary_output.io_type,
+                    "is_list": boundary_output.is_list,
+                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+                    "mapped_output": bool(boundary_output.source.node_id in set(component.mapped_node_ids)),
+                }
+                if component.mapped_boundary_input_name
+                else {
+                    "proxy_output_name": boundary_output.proxy_output_name,
+                    "node_id": boundary_output.source.node_id,
+                    "output_index": boundary_output.source.output_index,
+                    "io_type": boundary_output.io_type,
+                    "is_list": boundary_output.is_list,
+                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+                }
+            )
             for boundary_output in component.boundary_outputs
         ],
         "execute_node_ids": list(component.execute_node_ids),
+        "mapped_execute_node_ids": list(component.mapped_execute_node_ids),
+        "static_execute_node_ids": list(component.static_execute_node_ids),
         "extra_data": copy.deepcopy(extra_data or {}),
         "requires_volume_reload": requires_volume_reload,
         "volume_reload_marker": volume_reload_marker,
