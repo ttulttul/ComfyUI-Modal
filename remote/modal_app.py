@@ -1077,6 +1077,51 @@ def _request_remote_interrupt(payload: dict[str, Any]) -> bool:
     return True
 
 
+def _sync_local_interrupt_to_cancellation_event(
+    payload: dict[str, Any],
+    cancellation_event: threading.Event | None,
+) -> bool:
+    """Mirror ComfyUI's interrupt flag into the current Modal cancellation event."""
+    if cancellation_event is not None and cancellation_event.is_set():
+        return True
+    if not _local_processing_interrupted():
+        return False
+    if cancellation_event is not None and not cancellation_event.is_set():
+        logger.info(
+            "Observed local interrupt while Modal component=%s was running; requesting remote cancellation.",
+            payload.get("component_id"),
+        )
+        cancellation_event.set()
+    return True
+
+
+def _propagate_remote_interrupt_request(
+    payload: dict[str, Any],
+    interrupt_remote_call: Callable[[], Any] | None,
+) -> None:
+    """Send one best-effort remote cancellation request for an active Modal payload."""
+    prompt_id, component_id = _remote_interrupt_key(payload)
+    if interrupt_remote_call is None:
+        logger.warning(
+            "Local interrupt requested for component=%s, but no remote interrupt method is available.",
+            component_id,
+        )
+        return
+    try:
+        interrupt_remote_call()
+        logger.info(
+            "Propagated local interrupt to Modal prompt=%s component=%s.",
+            prompt_id,
+            component_id,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to propagate local interrupt to Modal prompt=%s component=%s.",
+            prompt_id,
+            component_id,
+        )
+
+
 def _invoke_remote_call_with_interrupts(
     *,
     payload: dict[str, Any],
@@ -1101,36 +1146,16 @@ def _invoke_remote_call_with_interrupts(
     )
     request_thread.start()
     interrupt_sent = False
-    prompt_id, component_id = _remote_interrupt_key(payload)
     try:
         while True:
             try:
                 result_kind, result_payload = result_queue.get(timeout=0.1)
             except queue.Empty:
                 if (
-                    cancellation_event is not None
-                    and cancellation_event.is_set()
+                    _sync_local_interrupt_to_cancellation_event(payload, cancellation_event)
                     and not interrupt_sent
                 ):
-                    if interrupt_remote_call is None:
-                        logger.warning(
-                            "Local interrupt requested for component=%s, but no remote interrupt method is available.",
-                            component_id,
-                        )
-                    else:
-                        try:
-                            interrupt_remote_call()
-                            logger.info(
-                                "Propagated local interrupt to Modal prompt=%s component=%s.",
-                                prompt_id,
-                                component_id,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Failed to propagate local interrupt to Modal prompt=%s component=%s.",
-                                prompt_id,
-                                component_id,
-                            )
+                    _propagate_remote_interrupt_request(payload, interrupt_remote_call)
                     interrupt_sent = True
                 continue
 
@@ -2426,12 +2451,7 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
                 response = future.result(timeout=0.1)
                 break
             except FutureTimeoutError:
-                if _local_processing_interrupted() and not cancellation_event.is_set():
-                    logger.info(
-                        "Observed local interrupt while Modal component=%s was running; requesting remote cancellation.",
-                        payload.get("component_id"),
-                    )
-                    cancellation_event.set()
+                _sync_local_interrupt_to_cancellation_event(payload, cancellation_event)
                 continue
     except Exception:
         if cancellation_event.is_set() or _local_processing_interrupted():
@@ -2490,12 +2510,7 @@ async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: by
                 response = await asyncio.wait_for(asyncio.shield(wrapped_future), timeout=0.1)
                 break
             except asyncio.TimeoutError:
-                if _local_processing_interrupted() and not cancellation_event.is_set():
-                    logger.info(
-                        "Observed local interrupt while async Modal component=%s was running; requesting remote cancellation.",
-                        payload.get("component_id"),
-                    )
-                    cancellation_event.set()
+                _sync_local_interrupt_to_cancellation_event(payload, cancellation_event)
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()

@@ -183,6 +183,7 @@ Remote runtime behavior:
 - Boundary inputs injected back into a remote subgraph are now normalized through the same singleton-wrapper cleanup path as stored prompt inputs, so a proxied scalar like `[4]` no longer reaches `PromptExecutor` as `int([4])`.
 - Before handing a remote prompt to `PromptExecutor`, Modal-Sync now preflights primitive widget inputs and rejects raw list values on `INT`/`FLOAT`/`BOOLEAN`/`STRING` sockets with a specific node/input error. When `PromptExecutor` still fails, the surfaced remote exception message now includes the failing node context and current inputs instead of only the inner exception string.
 - Remote cancellation now uses a shared Modal `Dict` control store instead of a second RPC lane into the execution class, so per-container execution concurrency can stay at `1` without losing interrupt propagation.
+- The blocking Modal request bridge now polls ComfyUI cancellation itself, including the streamed `execute_payload_stream.remote_gen(...)` path, so a local cancel still writes the shared interrupt flag even if the outer proxy wrapper has not noticed the interrupt yet.
 - If a remote execution crashes instead of being interrupted normally, the worker now schedules its own container process to exit after surfacing the exception. That retires the bad warm GPU container instead of leaving it idle and billable after a hard failure.
 - If a run is cancelled and restarted quickly, or a warm container is still releasing heavy model files, the remote worker now gives Modal volume reload a longer bounded retry window so recently released files can close before the next request needs a fresh `vol.reload()`.
 - Mapped remote execution now carries a per-request volume reload marker, so one warm container only performs `vol.reload()` once for that uploaded asset snapshot even if the local scheduler fans the component out into many per-item Modal calls.
@@ -295,7 +296,7 @@ The frontend shows remote state directly on the canvas:
 
 When a remote node reports numeric progress through ComfyUI's progress hooks, the active Modal-marked node now also shows an in-node progress bar and percentage locally while the remote work is running. That is especially useful for sampler-style nodes such as `KSampler`.
 
-Cancelling a prompt in local ComfyUI now propagates to the active Modal component as a targeted remote interrupt. In practice, long-running remote samplers no longer continue burning time after you hit cancel locally.
+Cancelling a prompt in local ComfyUI now propagates to the active Modal component as a targeted remote interrupt. In practice, long-running remote samplers, including streamed subgraph runs, no longer continue burning time after you hit cancel locally.
 
 Remote nodes that emit ComfyUI UI outputs also stream those `executed` payloads and preview frames back into the local PromptServer while the remote subgraph is still running. That means image previews can appear during a Modal run instead of only after the final proxy node returns.
 
