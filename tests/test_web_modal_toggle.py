@@ -91,6 +91,7 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
 
     assert 'api.addEventListener("modal_progress", handleModalProgress);' in source
     assert "function handleModalProgress(event)" in source
+    assert "if (detail.aggregate_only) {" in source
     assert "function setNodeProgress(nodeIdValue, promptId, value, maxValue)" in source
     assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex)" in source
     assert "function clearNodeProgressLane(nodeIdValue, promptId, laneId)" in source
