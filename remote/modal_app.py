@@ -266,19 +266,19 @@ def _is_link(value: Any) -> bool:
 
 def _normalize_link_output_index(value: Any) -> Any:
     """Unwrap a singleton list around a prompt-link output index when present."""
-    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], int | float):
-        return value[0]
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
     return value
 
 
 def _normalize_prompt_input_value(value: Any) -> Any:
     """Unwrap transport-added singleton lists around scalar prompt input values."""
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
     if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
         return [value[0], _normalize_link_output_index(value[1])]
-    if isinstance(value, list) and len(value) == 1:
-        candidate = value[0]
-        if candidate is None or isinstance(candidate, bool | int | float | str):
-            return candidate
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
     return value
 
 
