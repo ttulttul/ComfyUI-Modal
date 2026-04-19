@@ -2316,6 +2316,29 @@ def test_modal_cloud_materializes_synced_asset_paths(
         modal_cloud_module.get_settings.cache_clear()
 
 
+def test_modal_cloud_summarizes_suspicious_wrapped_prompt_inputs(
+    modal_cloud_module: Any,
+) -> None:
+    """Remote failure diagnostics should flag remaining singleton-list prompt wrappers."""
+    prompt = {
+        "12": {
+            "class_type": "ExampleNode",
+            "inputs": {
+                "steps": [20],
+                "latent": ["7", [0]],
+                "ok_link": ["8", 0],
+            },
+        }
+    }
+
+    findings = modal_cloud_module._summarize_suspicious_prompt_inputs(prompt)
+
+    assert findings == [
+        "12.steps=[20]",
+        "12.latent=['7', [0]]",
+    ]
+
+
 def test_modal_cloud_accepts_absolute_asset_paths_in_folder_lookup(
     modal_cloud_module: Any,
     monkeypatch: Any,

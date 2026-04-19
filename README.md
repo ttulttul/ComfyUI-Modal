@@ -80,6 +80,7 @@ Remote mode requires:
 The normal remote path is deployed-app lookup by name. On first remote use, the extension can auto-deploy the stable cloud entrypoint from [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py) if the configured app does not exist yet.
 If a previous attempt imported that cloud entrypoint only partially before failing, the loader now discards the stale cached module and retries the import cleanly before auto-deploy.
 The local and remote subgraph runners also canonicalize malformed singleton-list wrappers in rewritten prompts, including socket indexes like `["node", [0]]`, scalar inputs like `[4]`, and wrapped execute node ids like `["12"]`, before handing the prompt to ComfyUI.
+When the remote PromptExecutor still fails, the Modal worker now logs the normalized execute-node ids, boundary outputs, suspicious remaining wrapped prompt inputs, and the underlying ComfyUI `execution_error` payload to make the bad field visible.
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=remote
