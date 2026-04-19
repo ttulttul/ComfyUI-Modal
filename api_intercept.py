@@ -73,6 +73,17 @@ class BoundaryOutputSpec:
 
 
 @dataclass
+class StaticToMappedBoundarySpec:
+    """Describe one static-phase output injected into each mapped item run."""
+
+    proxy_name: str
+    source: LinkedOutputRef
+    io_type: str
+    is_list: bool
+    targets: list[InputTarget] = field(default_factory=list)
+
+
+@dataclass
 class RemoteComponentPlan:
     """Execution and rewrite plan for one connected remote component."""
 
@@ -84,9 +95,11 @@ class RemoteComponentPlan:
     contains_output_node: bool
     mapped_boundary_input_name: str | None = None
     mapped_boundary_input_io_type: str | None = None
+    static_node_ids: list[str] = field(default_factory=list)
     mapped_node_ids: list[str] = field(default_factory=list)
     mapped_execute_node_ids: list[str] = field(default_factory=list)
     static_execute_node_ids: list[str] = field(default_factory=list)
+    static_to_mapped_boundaries: list[StaticToMappedBoundarySpec] = field(default_factory=list)
 
 
 @dataclass
@@ -560,6 +573,29 @@ def _remote_output_io_type(
     if output_index < 0 or output_index >= len(output_types):
         return None
     return str(output_types[output_index])
+
+
+def _remote_output_is_list(
+    *,
+    prompt: dict[str, Any],
+    node_id: str,
+    output_index: int,
+    nodes_module: Any,
+) -> bool:
+    """Return whether one prompt node output is declared as a list output."""
+    prompt_node = prompt.get(node_id)
+    if prompt_node is None:
+        return False
+
+    class_type = str(prompt_node["class_type"])
+    node_class = nodes_module.NODE_CLASS_MAPPINGS.get(class_type)
+    if node_class is None:
+        return False
+
+    output_types, _output_names, output_is_list = _normalize_output_metadata(node_class)
+    if output_index < 0 or output_index >= len(output_types):
+        return False
+    return bool(output_is_list[output_index])
 
 
 def _remote_component_partition_groups(
@@ -1116,6 +1152,8 @@ def _build_component_plan(
     mapped_node_ids: list[str] = []
     mapped_execute_node_ids: list[str] = []
     static_execute_node_ids: list[str] = []
+    static_node_ids: list[str] = []
+    static_to_mapped_boundaries: list[StaticToMappedBoundarySpec] = []
     if mapped_boundary_spec is not None:
         mapped_reachable_node_ids = _component_downstream_closure(
             seed_node_ids={target.node_id for target in mapped_boundary_spec.targets},
@@ -1124,8 +1162,57 @@ def _build_component_plan(
         )
         mapped_node_ids = sorted(mapped_reachable_node_ids)
         mapped_node_id_set = set(mapped_node_ids)
+        static_node_ids = sorted(component_node_id_set - mapped_node_id_set)
+        static_to_mapped_boundaries_by_source: dict[LinkedOutputRef, StaticToMappedBoundarySpec] = {}
+        for mapped_node_id in mapped_node_ids:
+            prompt_node = prompt[mapped_node_id]
+            for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+                if not _is_link(input_value):
+                    continue
+                upstream_node_id = str(input_value[0])
+                if upstream_node_id not in component_node_id_set or upstream_node_id in mapped_node_id_set:
+                    continue
+                source = LinkedOutputRef(
+                    node_id=upstream_node_id,
+                    output_index=int(input_value[1]),
+                )
+                boundary_spec = static_to_mapped_boundaries_by_source.get(source)
+                if boundary_spec is None:
+                    boundary_spec = StaticToMappedBoundarySpec(
+                        proxy_name=f"static_input_{len(static_to_mapped_boundaries_by_source)}",
+                        source=source,
+                        io_type=str(
+                            _remote_output_io_type(
+                                prompt=prompt,
+                                node_id=source.node_id,
+                                output_index=source.output_index,
+                                nodes_module=nodes_module,
+                            )
+                            or "*"
+                        ),
+                        is_list=_remote_output_is_list(
+                            prompt=prompt,
+                            node_id=source.node_id,
+                            output_index=source.output_index,
+                            nodes_module=nodes_module,
+                        ),
+                    )
+                    static_to_mapped_boundaries_by_source[source] = boundary_spec
+                boundary_spec.targets.append(
+                    InputTarget(node_id=mapped_node_id, input_name=str(input_name))
+                )
+        static_to_mapped_boundaries = sorted(
+            static_to_mapped_boundaries_by_source.values(),
+            key=lambda spec: (spec.source.node_id, spec.source.output_index),
+        )
         mapped_execute_node_ids = sorted(output_execution_targets & mapped_node_id_set)
-        static_execute_node_ids = sorted(output_execution_targets - mapped_node_id_set)
+        static_execute_node_ids = sorted(
+            (output_execution_targets - mapped_node_id_set)
+            | {
+                boundary_spec.source.node_id
+                for boundary_spec in static_to_mapped_boundaries
+            }
+        )
 
     component = RemoteComponentPlan(
         node_ids=component_node_ids,
@@ -1144,12 +1231,14 @@ def _build_component_plan(
             mapped_boundary_spec.proxy_input_name if mapped_boundary_spec is not None else None
         ),
         mapped_boundary_input_io_type=mapped_boundary_input_io_type,
+        static_node_ids=static_node_ids,
         mapped_node_ids=mapped_node_ids,
         mapped_execute_node_ids=mapped_execute_node_ids,
         static_execute_node_ids=static_execute_node_ids,
+        static_to_mapped_boundaries=static_to_mapped_boundaries,
     )
     logger.info(
-        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s mapped_execute_nodes=%s static_execute_nodes=%s",
+        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s static_nodes=%s mapped_nodes=%s mapped_execute_nodes=%s static_execute_nodes=%s static_to_mapped_boundaries=%s",
         component.representative_node_id,
         component.node_ids,
         len(component.boundary_inputs),
@@ -1157,10 +1246,72 @@ def _build_component_plan(
         component.execute_node_ids,
         component.contains_output_node,
         component.mapped_boundary_input_name,
+        component.static_node_ids,
+        component.mapped_node_ids,
         component.mapped_execute_node_ids,
         component.static_execute_node_ids,
+        [
+            {
+                "proxy_name": boundary_spec.proxy_name,
+                "source": (boundary_spec.source.node_id, boundary_spec.source.output_index),
+                "targets": [
+                    (target.node_id, target.input_name)
+                    for target in boundary_spec.targets
+                ],
+            }
+            for boundary_spec in component.static_to_mapped_boundaries
+        ],
     )
     return component
+
+
+def _filter_boundary_inputs_for_node_ids(
+    boundary_inputs: list[BoundaryInputSpec],
+    allowed_node_ids: set[str],
+) -> list[BoundaryInputSpec]:
+    """Return boundary inputs whose targets belong to one node-id subset."""
+    filtered_boundary_inputs: list[BoundaryInputSpec] = []
+    for boundary_input in boundary_inputs:
+        filtered_targets = [
+            target
+            for target in boundary_input.targets
+            if target.node_id in allowed_node_ids
+        ]
+        if not filtered_targets:
+            continue
+        filtered_boundary_inputs.append(
+            BoundaryInputSpec(
+                proxy_input_name=boundary_input.proxy_input_name,
+                source=boundary_input.source,
+                io_type=boundary_input.io_type,
+                targets=filtered_targets,
+            )
+        )
+    return filtered_boundary_inputs
+
+
+def _filter_boundary_outputs_for_node_ids(
+    boundary_outputs: list[BoundaryOutputSpec],
+    allowed_node_ids: set[str],
+) -> list[BoundaryOutputSpec]:
+    """Return boundary outputs exported by one node-id subset."""
+    return [
+        boundary_output
+        for boundary_output in boundary_outputs
+        if boundary_output.source.node_id in allowed_node_ids
+    ]
+
+
+def _subset_component_prompt(
+    component_prompt: dict[str, Any],
+    node_ids: list[str],
+) -> dict[str, Any]:
+    """Return one deep-copied prompt subset for a phase-local node set."""
+    return {
+        node_id: copy.deepcopy(component_prompt[node_id])
+        for node_id in node_ids
+        if node_id in component_prompt
+    }
 
 
 def _preview_target_node_ids(
@@ -1447,6 +1598,117 @@ def _build_component_payload(
         requires_volume_reload,
         volume_reload_marker,
     )
+    if component.mapped_boundary_input_name:
+        static_node_id_set = set(component.static_node_ids)
+        mapped_node_id_set = set(component.mapped_node_ids)
+        static_boundary_inputs = _filter_boundary_inputs_for_node_ids(
+            component.boundary_inputs,
+            static_node_id_set,
+        )
+        mapped_boundary_inputs = _filter_boundary_inputs_for_node_ids(
+            component.boundary_inputs,
+            mapped_node_id_set,
+        )
+        static_boundary_outputs = _filter_boundary_outputs_for_node_ids(
+            component.boundary_outputs,
+            static_node_id_set,
+        )
+        mapped_boundary_outputs = _filter_boundary_outputs_for_node_ids(
+            component.boundary_outputs,
+            mapped_node_id_set,
+        )
+        static_bridge_outputs = [
+            {
+                "proxy_output_name": boundary_spec.proxy_name,
+                "node_id": boundary_spec.source.node_id,
+                "output_index": boundary_spec.source.output_index,
+                "io_type": boundary_spec.io_type,
+                "is_list": boundary_spec.is_list,
+                "preview_target_node_ids": [],
+            }
+            for boundary_spec in component.static_to_mapped_boundaries
+        ]
+        payload["static_to_mapped_boundaries"] = [
+            {
+                "proxy_name": boundary_spec.proxy_name,
+                "node_id": boundary_spec.source.node_id,
+                "output_index": boundary_spec.source.output_index,
+                "io_type": boundary_spec.io_type,
+                "is_list": boundary_spec.is_list,
+                "targets": [
+                    {"node_id": target.node_id, "input_name": target.input_name}
+                    for target in boundary_spec.targets
+                ],
+            }
+            for boundary_spec in component.static_to_mapped_boundaries
+        ]
+        payload["static_phase"] = {
+            "component_node_ids": list(component.static_node_ids),
+            "subgraph_prompt": _subset_component_prompt(component_prompt, component.static_node_ids),
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": boundary_input.proxy_input_name,
+                    "io_type": boundary_input.io_type,
+                    "targets": [
+                        {"node_id": target.node_id, "input_name": target.input_name}
+                        for target in boundary_input.targets
+                    ],
+                }
+                for boundary_input in static_boundary_inputs
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": boundary_output.proxy_output_name,
+                    "node_id": boundary_output.source.node_id,
+                    "output_index": boundary_output.source.output_index,
+                    "io_type": boundary_output.io_type,
+                    "is_list": boundary_output.is_list,
+                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+                }
+                for boundary_output in static_boundary_outputs
+            ]
+            + static_bridge_outputs,
+            "execute_node_ids": list(component.static_execute_node_ids),
+        }
+        payload["mapped_phase"] = {
+            "component_node_ids": list(component.mapped_node_ids),
+            "subgraph_prompt": _subset_component_prompt(component_prompt, component.mapped_node_ids),
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": boundary_input.proxy_input_name,
+                    "io_type": boundary_input.io_type,
+                    "targets": [
+                        {"node_id": target.node_id, "input_name": target.input_name}
+                        for target in boundary_input.targets
+                    ],
+                }
+                for boundary_input in mapped_boundary_inputs
+            ]
+            + [
+                {
+                    "proxy_input_name": boundary_spec.proxy_name,
+                    "io_type": boundary_spec.io_type,
+                    "targets": [
+                        {"node_id": target.node_id, "input_name": target.input_name}
+                        for target in boundary_spec.targets
+                    ],
+                }
+                for boundary_spec in component.static_to_mapped_boundaries
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": boundary_output.proxy_output_name,
+                    "node_id": boundary_output.source.node_id,
+                    "output_index": boundary_output.source.output_index,
+                    "io_type": boundary_output.io_type,
+                    "is_list": boundary_output.is_list,
+                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+                    "mapped_output": True,
+                }
+                for boundary_output in mapped_boundary_outputs
+            ],
+            "execute_node_ids": list(component.mapped_execute_node_ids),
+        }
     return payload
 
 
@@ -1613,13 +1875,11 @@ def rewrite_prompt_for_modal(
         mapped_component_weight=1,
     )
     if resolved_settings.max_containers is not None:
-        summary.max_parallel_requests_upper_bound = _estimated_stage_parallelism(
-            execution_stages,
-            mapped_component_ids,
-            mapped_component_weight=resolved_settings.max_containers,
-            max_parallelism_cap=resolved_settings.max_containers,
+        summary.max_parallel_requests_upper_bound = min(
+            summary.estimated_max_parallel_requests,
+            resolved_settings.max_containers,
         )
-    elif not mapped_component_ids:
+    else:
         summary.max_parallel_requests_upper_bound = summary.estimated_max_parallel_requests
     validate_remote_component_transport_compatibility(
         prompt=rewritten_prompt,

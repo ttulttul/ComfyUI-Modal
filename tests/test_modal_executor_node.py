@@ -2153,73 +2153,108 @@ def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_out
     assert interrupt_calls == ["interrupt"]
 
 
-def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
+def test_invoke_mapped_remote_engine_async_runs_explicit_mapped_phase_items(
     remote_modal_app_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Mapped remote execution should refill a local queue up to COMFY_MODAL_MAX_CONTAINERS."""
-    in_flight = 0
-    max_in_flight = 0
+    """Mapped remote execution should run the explicit mapped phase once per item in order."""
+    observed_calls: list[tuple[str, dict[str, Any]]] = []
     progress_updates: list[dict[str, Any]] = []
 
-    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
-        nonlocal in_flight, max_in_flight
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        node_mapping: Any = None,
+    ) -> tuple[str]:
         assert payload["payload_kind"] == "subgraph"
         assert payload["suppress_status_stream"] is True
-        assert payload["mapped_progress_lane_id"] in {"0", "1"}
-        mapped_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
-        item_value = mapped_inputs["remote_input_0"]
-        in_flight += 1
-        max_in_flight = max(max_in_flight, in_flight)
-        await asyncio.sleep(0.01)
-        in_flight -= 1
-        return serialization_module.serialize_node_outputs((f"done:{item_value}",))
+        observed_calls.append((str(payload["component_id"]), dict(hydrated_inputs)))
+        return (f"done:{hydrated_inputs['remote_input_0']}",)
 
-    monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "2")
-    remote_modal_app_module.get_settings.cache_clear()
     monkeypatch.setattr(
         remote_modal_app_module,
-        "invoke_remote_engine_async",
-        fake_invoke_remote_engine_async,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
     )
     monkeypatch.setattr(
         remote_modal_app_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_updates.append(kwargs),
     )
-    try:
-        payload = {
-            "payload_kind": "mapped_subgraph",
-            "component_id": "6",
-            "prompt_id": "prompt-1",
-            "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "STRING"},
-            "boundary_outputs": [{"io_type": "STRING", "is_list": False}],
-            "extra_data": {"client_id": "client-1"},
-        }
-        response = asyncio.run(
-            remote_modal_app_module._invoke_mapped_remote_engine_async(
-                payload,
-                serialization_module.serialize_node_inputs(
-                    {"remote_input_0": ["a", "b", "c", "d"]}
-                ),
-            )
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "6",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "STRING"},
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            }
+        ],
+        "static_to_mapped_boundaries": [],
+        "static_phase": {
+            "component_node_ids": [],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["7"],
+            "subgraph_prompt": {
+                "7": {
+                    "class_type": "RemoteStringEcho",
+                    "inputs": {"text": ["remote_input_0", 0]},
+                }
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_0",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "7", "input_name": "text"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "7_text",
+                    "node_id": "7",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["7"],
+        },
+        "extra_data": {"client_id": "client-1"},
+    }
+    response = asyncio.run(
+        remote_modal_app_module._invoke_mapped_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {"remote_input_0": ["a", "b", "c", "d"]}
+            ),
         )
-    finally:
-        remote_modal_app_module.get_settings.cache_clear()
+    )
 
     assert serialization_module.deserialize_node_outputs(response) == (
         ["done:a", "done:b", "done:c", "done:d"],
     )
-    assert max_in_flight == 2
+    assert observed_calls == [
+        ("6::item:0", {"remote_input_0": "a"}),
+        ("6::item:1", {"remote_input_0": "b"}),
+        ("6::item:2", {"remote_input_0": "c"}),
+        ("6::item:3", {"remote_input_0": "d"}),
+    ]
     assert progress_updates[0]["value"] == 0.0
     assert progress_updates[0].get("lane_id") is None
-    aggregate_updates = [update for update in progress_updates if update.get("lane_id") is None]
-    lane_updates = [update for update in progress_updates if update.get("lane_id") is not None]
-    assert aggregate_updates[-1]["value"] == 4.0
-    assert {update["lane_id"] for update in lane_updates} == {"0", "1"}
-    assert lane_updates
-    assert all(update.get("clear") is True for update in lane_updates)
+    assert progress_updates[-1]["value"] == 4.0
 
 
 def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
@@ -2227,30 +2262,37 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Mapped remote execution should run static execute targets once and mapped targets per item."""
+    """Mapped remote execution should run the explicit static phase once and inject its bridge outputs."""
     observed_execute_node_ids: list[tuple[str, tuple[str, ...]]] = []
 
-    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        node_mapping: Any = None,
+    ) -> tuple[str, ...]:
         observed_execute_node_ids.append(
             (
                 str(payload["component_id"]),
                 tuple(str(node_id) for node_id in payload.get("execute_node_ids", [])),
             )
         )
-        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
         if str(payload["component_id"]).endswith("::static"):
-            assert tuple(payload.get("execute_node_ids", [])) == ("3",)
-            assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["3"]
-            return serialization_module.serialize_node_outputs(("static-output",))
+            assert tuple(payload.get("execute_node_ids", [])) == ("1", "3")
+            assert [output["proxy_output_name"] for output in payload.get("boundary_outputs", [])] == [
+                "3_text",
+                "static_input_0",
+            ]
+            return ("static-output", "shared-model")
 
         assert tuple(payload.get("execute_node_ids", [])) == ("7",)
-        assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["7"]
-        return serialization_module.serialize_node_outputs((f"mapped:{hydrated_inputs['remote_input_1']}",))
+        assert hydrated_inputs["static_input_0"] == "shared-model"
+        assert [output["proxy_output_name"] for output in payload.get("boundary_outputs", [])] == ["7_text"]
+        return (f"mapped:{hydrated_inputs['remote_input_1']}",)
 
     monkeypatch.setattr(
         remote_modal_app_module,
-        "invoke_remote_engine_async",
-        fake_invoke_remote_engine_async,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
     )
 
     payload = {
@@ -2258,12 +2300,94 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
         "component_id": "1",
         "prompt_id": "prompt-1",
         "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "static_to_mapped_boundaries": [
+            {
+                "proxy_name": "static_input_0",
+                "node_id": "1",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "targets": [{"node_id": "7", "input_name": "model"}],
+            }
+        ],
+        "static_phase": {
+            "component_node_ids": ["1", "3"],
+            "subgraph_prompt": {
+                "1": {"class_type": "RemoteModel", "inputs": {}},
+                "3": {"class_type": "RemoteSampler", "inputs": {"model": ["1", 0]}},
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "3_text",
+                    "node_id": "3",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "static_input_0",
+                    "node_id": "1",
+                    "output_index": 0,
+                    "io_type": "MODEL",
+                    "is_list": False,
+                },
+            ],
+            "execute_node_ids": ["1", "3"],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["6", "7"],
+            "subgraph_prompt": {
+                "6": {"class_type": "ModalMapInput", "inputs": {"value": ["remote_input_1", 0]}},
+                "7": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"model": ["static_input_0", 0], "latent": ["6", 0]},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_1",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "6", "input_name": "value"}],
+                },
+                {
+                    "proxy_input_name": "static_input_0",
+                    "io_type": "MODEL",
+                    "targets": [{"node_id": "7", "input_name": "model"}],
+                },
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "7_text",
+                    "node_id": "7",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["7"],
+        },
         "boundary_outputs": [
-            {"node_id": "3", "io_type": "STRING", "is_list": False, "mapped_output": False},
-            {"node_id": "7", "io_type": "STRING", "is_list": False, "mapped_output": True},
+            {
+                "proxy_output_name": "3_text",
+                "node_id": "3",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": False,
+            },
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            },
         ],
         "execute_node_ids": ["3", "7"],
-        "static_execute_node_ids": ["3"],
+        "static_execute_node_ids": ["1", "3"],
         "mapped_execute_node_ids": ["7"],
         "extra_data": {"client_id": "client-1"},
     }
@@ -2281,10 +2405,154 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
         "static-output",
         ["mapped:a", "mapped:b"],
     )
-    assert observed_execute_node_ids[0] == ("1::static", ("3",))
+    assert observed_execute_node_ids[0] == ("1::static", ("1", "3"))
     assert observed_execute_node_ids[1:] == [
         ("1::item:0", ("7",)),
         ("1::item:1", ("7",)),
+    ]
+
+
+def test_modal_cloud_execute_mapped_subgraph_payload_injects_static_bridges(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The cloud runtime should execute the static phase once and feed its outputs into each mapped item."""
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        custom_nodes_root: Any,
+        status_callback: Any = None,
+        cancellation_event: Any = None,
+        interrupt_store: Any = None,
+        interrupt_flag_key: Any = None,
+    ) -> tuple[str, ...]:
+        observed_calls.append(
+            (
+                str(payload["component_id"]),
+                tuple(str(node_id) for node_id in payload.get("execute_node_ids", [])),
+                dict(hydrated_inputs),
+            )
+        )
+        if str(payload["component_id"]).endswith("::static"):
+            return ("static-output", "shared-model")
+        return (f"mapped:{hydrated_inputs['remote_input_1']}:{hydrated_inputs['static_input_0']}",)
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "cloud-1",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "static_to_mapped_boundaries": [
+            {
+                "proxy_name": "static_input_0",
+                "node_id": "1",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "targets": [{"node_id": "7", "input_name": "model"}],
+            }
+        ],
+        "static_phase": {
+            "component_node_ids": ["1", "3"],
+            "subgraph_prompt": {
+                "1": {"class_type": "RemoteModel", "inputs": {}},
+                "3": {"class_type": "RemoteSampler", "inputs": {"model": ["1", 0]}},
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "3_text",
+                    "node_id": "3",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "static_input_0",
+                    "node_id": "1",
+                    "output_index": 0,
+                    "io_type": "MODEL",
+                    "is_list": False,
+                },
+            ],
+            "execute_node_ids": ["1", "3"],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["6", "7"],
+            "subgraph_prompt": {
+                "6": {"class_type": "ModalMapInput", "inputs": {"value": ["remote_input_1", 0]}},
+                "7": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"model": ["static_input_0", 0], "latent": ["6", 0]},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_1",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "6", "input_name": "value"}],
+                },
+                {
+                    "proxy_input_name": "static_input_0",
+                    "io_type": "MODEL",
+                    "targets": [{"node_id": "7", "input_name": "model"}],
+                },
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "7_text",
+                    "node_id": "7",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["7"],
+        },
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "3_text",
+                "node_id": "3",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": False,
+            },
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            },
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    outputs = modal_cloud_module._execute_mapped_subgraph_payload(
+        payload,
+        {"remote_input_1": ["a", "b"]},
+        None,
+    )
+
+    assert outputs == (
+        "static-output",
+        ["mapped:a:shared-model", "mapped:b:shared-model"],
+    )
+    assert observed_calls == [
+        ("cloud-1::static", ("1", "3"), {}),
+        ("cloud-1::item:0", ("7",), {"static_input_0": "shared-model", "remote_input_1": "a"}),
+        ("cloud-1::item:1", ("7",), {"static_input_0": "shared-model", "remote_input_1": "b"}),
     ]
 
 
@@ -2607,7 +2875,9 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
             "display_node_id": "7",
             "real_node_id": None,
             "lane_id": "1",
+            "clear": False,
             "item_index": 0,
+            "aggregate_only": False,
         }
     ]
     assert status_calls == []

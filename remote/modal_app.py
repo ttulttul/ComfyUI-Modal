@@ -621,7 +621,10 @@ def _execute_subgraph_prompt(
         )
         executor.execute(
             prompt=prompt,
-            prompt_id=str(payload.get("component_id", "modal-subgraph")),
+            prompt_id=str(
+                payload.get("prompt_id")
+                or payload.get("component_id", "modal-subgraph")
+            ),
             extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
             execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
         )
@@ -997,7 +1000,7 @@ def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
     return (
-        payload.get("payload_kind") == "subgraph"
+        payload.get("payload_kind") in {"subgraph", "mapped_subgraph"}
         and isinstance(payload.get("prompt_id"), str)
         and bool(payload.get("prompt_id"))
         and isinstance(extra_data.get("client_id"), str)
@@ -1184,11 +1187,16 @@ def _consume_remote_payload_stream(
             event_type = str(stream_event.get("event_type", ""))
             if event_type == "node_progress":
                 lane_id = (
-                    str(payload["mapped_progress_lane_id"])
-                    if payload.get("mapped_progress_lane_id") is not None
-                    else None
+                    str(stream_event["lane_id"])
+                    if stream_event.get("lane_id") is not None
+                    else (
+                        str(payload["mapped_progress_lane_id"])
+                        if payload.get("mapped_progress_lane_id") is not None
+                        else None
+                    )
                 )
-                if suppress_status_stream and lane_id is None:
+                aggregate_only = bool(stream_event.get("aggregate_only", False))
+                if suppress_status_stream and lane_id is None and not aggregate_only:
                     continue
                 reported_node_id = stream_event.get("node_id")
                 if reported_node_id is not None:
@@ -1223,11 +1231,17 @@ def _consume_remote_payload_stream(
                         display_node_id=display_node_id,
                         real_node_id=real_node_id,
                         lane_id=lane_id,
+                        clear=bool(stream_event.get("clear", False)),
                         item_index=(
-                            int(payload["map_item_index"])
-                            if payload.get("map_item_index") is not None
-                            else None
+                            int(stream_event["item_index"])
+                            if stream_event.get("item_index") is not None
+                            else (
+                                int(payload["map_item_index"])
+                                if payload.get("map_item_index") is not None
+                                else None
+                            )
                         ),
+                        aggregate_only=aggregate_only,
                     )
                 continue
             if event_type == "executed":
@@ -1390,12 +1404,227 @@ def _mapped_execution_parallelism(item_count: int) -> int:
     return max(1, min(item_count, configured_limit))
 
 
+def _mapped_phase_definition(payload: dict[str, Any], phase_key: str) -> dict[str, Any] | None:
+    """Return one explicit mapped phase definition when queue-time planning provided it."""
+    phase_payload = payload.get(phase_key)
+    if isinstance(phase_payload, dict):
+        return phase_payload
+    return None
+
+
+def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the payload fields shared by every explicit mapped phase."""
+    return {
+        "prompt_id": payload.get("prompt_id"),
+        "extra_data": copy.deepcopy(payload.get("extra_data") or {}),
+        "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
+        "volume_reload_marker": payload.get("volume_reload_marker"),
+        "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
+        "terminate_container_on_error": bool(payload.get("terminate_container_on_error", True)),
+        "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
+    }
+
+
+def _build_phase_subgraph_payload(
+    payload: dict[str, Any],
+    phase_key: str,
+    component_id: str,
+    *,
+    suppress_status_stream: bool = False,
+    lane_id: str | None = None,
+    item_index: int | None = None,
+) -> dict[str, Any]:
+    """Return one explicit static or mapped subgraph payload."""
+    phase_definition = _mapped_phase_definition(payload, phase_key)
+    if phase_definition is None:
+        raise KeyError(f"Mapped payload is missing phase definition {phase_key!r}.")
+
+    phase_payload = {
+        "payload_kind": "subgraph",
+        "component_id": component_id,
+        **_shared_subgraph_payload_fields(payload),
+        "component_node_ids": [
+            str(node_id)
+            for node_id in phase_definition.get("component_node_ids", [])
+            if str(node_id)
+        ],
+        "subgraph_prompt": copy.deepcopy(phase_definition.get("subgraph_prompt", {})),
+        "boundary_inputs": copy.deepcopy(phase_definition.get("boundary_inputs", [])),
+        "boundary_outputs": copy.deepcopy(phase_definition.get("boundary_outputs", [])),
+        "execute_node_ids": [
+            str(node_id)
+            for node_id in phase_definition.get("execute_node_ids", [])
+            if str(node_id)
+        ],
+    }
+    if suppress_status_stream:
+        phase_payload["suppress_status_stream"] = True
+    if lane_id is not None:
+        phase_payload["mapped_progress_lane_id"] = str(lane_id)
+        phase_payload["mapped_progress_display_node_id"] = str(
+            payload.get("component_id", "modal-subgraph")
+        )
+    if item_index is not None:
+        phase_payload["map_item_index"] = int(item_index)
+    return phase_payload
+
+
+def _split_phase_outputs(
+    phase_outputs: tuple[Any, ...],
+    boundary_outputs: list[dict[str, Any]],
+    internal_output_names: set[str],
+) -> tuple[dict[str, Any], tuple[Any, ...]]:
+    """Split one phase result tuple into bridge values and external outputs."""
+    internal_outputs: dict[str, Any] = {}
+    external_outputs: list[Any] = []
+    for boundary_output, output_value in zip(boundary_outputs, phase_outputs, strict=True):
+        output_name = str(boundary_output.get("proxy_output_name") or "")
+        if output_name in internal_output_names:
+            internal_outputs[output_name] = output_value
+            continue
+        external_outputs.append(output_value)
+    return internal_outputs, tuple(external_outputs)
+
+
+def _execute_mapped_subgraph_payload(
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    node_mapping: dict[str, type[Any]] | None = None,
+) -> tuple[Any, ...]:
+    """Execute one mapped payload locally using explicit static and mapped phases."""
+    mapped_input = payload.get("mapped_input") or {}
+    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
+    if not mapped_input_name:
+        raise ModalRemoteInvocationError("Mapped remote payloads must define mapped_input.proxy_input_name.")
+    if mapped_input_name not in hydrated_inputs:
+        raise KeyError(f"Mapped remote payload input {mapped_input_name!r} was not provided.")
+
+    mapped_items = split_mapped_value(
+        hydrated_inputs[mapped_input_name],
+        str(mapped_input.get("io_type", "*")),
+    )
+    if not mapped_items:
+        raise ValueError("Mapped remote execution requires at least one input item.")
+
+    broadcast_inputs = dict(hydrated_inputs)
+    broadcast_inputs.pop(mapped_input_name, None)
+    static_to_mapped_boundaries = list(payload.get("static_to_mapped_boundaries", []))
+    bridge_output_names = {
+        str(boundary_spec.get("proxy_name") or "")
+        for boundary_spec in static_to_mapped_boundaries
+        if str(boundary_spec.get("proxy_name") or "")
+    }
+
+    static_outputs: tuple[Any, ...] = ()
+    static_phase_payload: dict[str, Any] | None = None
+    if payload.get("static_phase") is not None:
+        static_phase_payload = _build_phase_subgraph_payload(
+            payload,
+            "static_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::static",
+            suppress_status_stream=True,
+        )
+    elif payload.get("static_execute_node_ids"):
+        static_phase_payload = _build_static_mapped_payload(payload)
+
+    if static_phase_payload is not None:
+        if static_phase_payload.get("execute_node_ids"):
+            logger.info(
+                "Executing static mapped phase for component=%s with execute nodes=%s.",
+                payload.get("component_id"),
+                static_phase_payload.get("execute_node_ids", []),
+            )
+            static_phase_outputs = _execute_subgraph_prompt(
+                static_phase_payload,
+                dict(broadcast_inputs),
+                node_mapping,
+            )
+            bridge_inputs, static_outputs = _split_phase_outputs(
+                static_phase_outputs,
+                list(static_phase_payload.get("boundary_outputs", [])),
+                bridge_output_names,
+            )
+            broadcast_inputs.update(bridge_inputs)
+
+    total_items = len(mapped_items)
+    _emit_local_mapped_progress(payload, 0, total_items)
+    per_item_outputs: list[tuple[Any, ...]] = []
+    for item_index, item_value in enumerate(mapped_items):
+        if _local_processing_interrupted():
+            _raise_local_interrupt()
+        if payload.get("mapped_phase") is not None:
+            item_payload = _build_phase_subgraph_payload(
+                payload,
+                "mapped_phase",
+                f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}",
+                suppress_status_stream=True,
+                lane_id="0",
+                item_index=item_index,
+            )
+        else:
+            item_payload = _build_mapped_item_payload(payload, item_index, 0)
+        item_inputs = dict(broadcast_inputs)
+        item_inputs[mapped_input_name] = item_value
+        logger.info(
+            "Executing mapped item %d/%d for component=%s with execute nodes=%s.",
+            item_index + 1,
+            total_items,
+            payload.get("component_id"),
+            item_payload.get("execute_node_ids", []),
+        )
+        per_item_outputs.append(
+            _execute_subgraph_prompt(
+                item_payload,
+                item_inputs,
+                node_mapping,
+            )
+        )
+        _emit_local_mapped_progress(payload, item_index + 1, total_items)
+
+    if payload.get("mapped_phase") is not None:
+        mapped_phase_payload = _build_phase_subgraph_payload(
+            payload,
+            "mapped_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::mapped",
+        )
+    else:
+        mapped_phase_payload = {
+            **payload,
+            "boundary_outputs": [
+                boundary_output
+                for boundary_output in payload.get("boundary_outputs", [])
+                if _is_mapped_boundary_output(boundary_output, payload)
+            ],
+        }
+    mapped_outputs = _aggregate_mapped_outputs(
+        per_item_outputs,
+        {
+            **payload,
+            "boundary_outputs": list(mapped_phase_payload.get("boundary_outputs", [])),
+        },
+    )
+    return _merge_static_and_mapped_outputs(
+        static_outputs=static_outputs,
+        mapped_outputs=mapped_outputs,
+        payload=payload,
+    )
+
+
 def _build_mapped_item_payload(
     payload: dict[str, Any],
     item_index: int,
     lane_index: int,
 ) -> dict[str, Any]:
     """Return one per-item subgraph payload derived from a mapped remote component payload."""
+    if _mapped_phase_definition(payload, "mapped_phase") is not None:
+        return _build_phase_subgraph_payload(
+            payload,
+            "mapped_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}",
+            suppress_status_stream=True,
+            lane_id=str(lane_index),
+            item_index=item_index,
+        )
     item_payload = copy.deepcopy(payload)
     item_payload["payload_kind"] = "subgraph"
     item_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}"
@@ -1453,6 +1682,13 @@ def _is_mapped_boundary_output(boundary_output: dict[str, Any], payload: dict[st
 
 def _build_static_mapped_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Return the one-time static subgraph payload for a hybrid mapped component."""
+    if _mapped_phase_definition(payload, "static_phase") is not None:
+        return _build_phase_subgraph_payload(
+            payload,
+            "static_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::static",
+            suppress_status_stream=True,
+        )
     static_payload = copy.deepcopy(payload)
     static_payload["payload_kind"] = "subgraph"
     static_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::static"
@@ -1828,106 +2064,14 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
 
 
 async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
-    """Split one mapped boundary input, run per-item remote executions, and reassemble outputs."""
-    mapped_input = payload.get("mapped_input") or {}
-    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
-    if not mapped_input_name:
-        raise ModalRemoteInvocationError("Mapped remote payloads must define mapped_input.proxy_input_name.")
-
+    """Execute one mapped payload locally using explicit static and mapped phases."""
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-    if mapped_input_name not in hydrated_inputs:
-        raise KeyError(f"Mapped remote payload input {mapped_input_name!r} was not provided.")
-
-    mapped_items = split_mapped_value(
-        hydrated_inputs[mapped_input_name],
-        str(mapped_input.get("io_type", "*")),
-    )
-    if not mapped_items:
-        raise ValueError("Mapped remote execution requires at least one input item.")
-
-    broadcast_inputs = dict(hydrated_inputs)
-    broadcast_inputs.pop(mapped_input_name, None)
-    total_items = len(mapped_items)
-    parallelism = _mapped_execution_parallelism(total_items)
-    refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
-    ensure_remote_warm_capacity(
-        _build_prompt_warmup_request(payload),
-        warmup_target=refined_prompt_warmup_target,
-        reason="mapped_component_exact_parallelism",
-    )
-    logger.info(
-        "Scheduling mapped Modal component=%s for %d item(s) with local parallelism=%d prompt_warmup_target=%d.",
-        payload.get("component_id"),
-        total_items,
-        parallelism,
-        refined_prompt_warmup_target,
-    )
-    _emit_local_mapped_progress(payload, 0, total_items)
-
-    static_outputs: tuple[Any, ...] = ()
-    if payload.get("static_execute_node_ids"):
-        static_response = await invoke_remote_engine_async(
-            _build_static_mapped_payload(payload),
-            kwargs_payload,
-        )
-        static_outputs = deserialize_node_outputs(static_response)
-
-    per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
-    completed_items = 0
-    item_queue: asyncio.Queue[tuple[int, Any] | None] = asyncio.Queue()
-    for item_index, item_value in enumerate(mapped_items):
-        item_queue.put_nowait((item_index, item_value))
-    for _ in range(parallelism):
-        item_queue.put_nowait(None)
-
-    async def run_worker(lane_index: int) -> None:
-        """Execute queued mapped items through one stable local worker lane."""
-        nonlocal completed_items
-        while True:
-            queued_item = await item_queue.get()
-            if queued_item is None:
-                return
-            item_index, item_value = queued_item
-            if _local_processing_interrupted():
-                _raise_local_interrupt()
-            try:
-                item_payload = _build_mapped_item_payload(payload, item_index, lane_index)
-                item_inputs = dict(broadcast_inputs)
-                item_inputs[mapped_input_name] = item_value
-                item_response = await invoke_remote_engine_async(
-                    item_payload,
-                    serialize_node_inputs(item_inputs),
-                )
-                per_item_outputs[item_index] = deserialize_node_outputs(item_response)
-                completed_items += 1
-                _emit_local_mapped_progress(payload, completed_items, total_items)
-            finally:
-                _clear_local_mapped_lane_progress(payload, lane_index, item_index)
-
-    tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
-    try:
-        await asyncio.gather(*tasks)
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-    return serialize_node_outputs(
-        _merge_static_and_mapped_outputs(
-            static_outputs=static_outputs,
-            mapped_outputs=_aggregate_mapped_outputs(
-                [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
-                {
-                    **payload,
-                    "boundary_outputs": [
-                        boundary_output
-                        for boundary_output in payload.get("boundary_outputs", [])
-                        if _is_mapped_boundary_output(boundary_output, payload)
-                    ],
-                },
-            ),
-            payload=payload,
+    return await asyncio.to_thread(
+        lambda: serialize_node_outputs(
+            _execute_mapped_subgraph_payload(
+                payload,
+                hydrated_inputs,
+            )
         )
     )
 
@@ -2420,14 +2564,17 @@ def _invoke_modal_payload_blocking(
 
 def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal when configured, or fall back to local in-process execution."""
+    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if payload.get("payload_kind") == "mapped_subgraph":
-        return asyncio.run(_invoke_mapped_remote_engine_async(payload, kwargs_payload))
+        if execution_mode == "local" or modal is None:
+            hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+            return serialize_node_outputs(
+                _execute_mapped_subgraph_payload(payload, hydrated_inputs)
+            )
     if payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
             return asyncio.run(_invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload))
-
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
         if payload.get("payload_kind") == "subgraph":
             return execute_subgraph_locally(payload, kwargs_payload)
@@ -2480,14 +2627,14 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
 
 async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
+    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if payload.get("payload_kind") == "mapped_subgraph":
-        return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
+        if execution_mode == "local" or modal is None:
+            return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
     if payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
             return await _invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload)
-
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
         return await asyncio.to_thread(invoke_remote_engine, payload, kwargs_payload)
 
@@ -2563,6 +2710,11 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
+            if payload.get("payload_kind") == "mapped_subgraph":
+                hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+                return serialize_node_outputs(
+                    _execute_mapped_subgraph_payload(payload, hydrated_inputs)
+                )
             if payload.get("payload_kind") == "subgraph":
                 return execute_subgraph_locally(payload, kwargs_payload)
             return execute_node_locally(payload, kwargs_payload)
@@ -2582,6 +2734,11 @@ else:
 
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute the proxied node or subgraph locally."""
+            if payload.get("payload_kind") == "mapped_subgraph":
+                hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+                return serialize_node_outputs(
+                    _execute_mapped_subgraph_payload(payload, hydrated_inputs)
+                )
             if payload.get("payload_kind") == "subgraph":
                 return execute_subgraph_locally(payload, kwargs_payload)
             return execute_node_locally(payload, kwargs_payload)
