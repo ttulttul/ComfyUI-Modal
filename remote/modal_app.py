@@ -790,6 +790,7 @@ def _emit_local_modal_progress(
     lane_id: str | None = None,
     clear: bool = False,
     item_index: int | None = None,
+    aggregate_only: bool = False,
 ) -> None:
     """Forward remote numeric node progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -813,6 +814,8 @@ def _emit_local_modal_progress(
         payload["clear"] = True
     if item_index is not None:
         payload["item_index"] = int(item_index)
+    if aggregate_only:
+        payload["aggregate_only"] = True
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 
@@ -1448,6 +1451,7 @@ def _emit_local_mapped_progress(
         value=float(completed_items),
         max_value=float(total_items),
         display_node_id=display_node_id,
+        aggregate_only=True,
     )
 
 

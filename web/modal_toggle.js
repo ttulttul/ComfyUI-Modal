@@ -1283,6 +1283,10 @@ function handleModalProgress(event) {
   endSyntheticExecutionUi(promptId);
   const promptState = ensurePromptState(promptId);
   promptState.hasStreamedProgress = true;
+  if (detail.aggregate_only) {
+    setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
+    return;
+  }
   setPromptActiveNode(promptId, progressNodeId);
   setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
   setNodesPhase([progressNodeId], STATE_ACTIVE, promptId);
