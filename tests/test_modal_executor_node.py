@@ -2730,3 +2730,38 @@ def test_local_remote_app_normalizes_wrapped_scalar_prompt_inputs(
     )
     outputs = serialization_module.deserialize_node_outputs(payload)
     assert outputs == (5,)
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_apply_boundary_inputs_normalizes_wrapped_scalar_values(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Boundary input hydration should unwrap singleton-list scalar wrappers before PromptExecutor sees them."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    prompt = {
+        "remote_1": {
+            "class_type": "BoundarySource",
+            "inputs": {"value": 0},
+            "_meta": {},
+        }
+    }
+
+    target_module._apply_boundary_inputs(
+        prompt=prompt,
+        boundary_input_specs=[
+            {
+                "proxy_input_name": "remote_input_0",
+                "targets": [{"node_id": "remote_1", "input_name": "value"}],
+            }
+        ],
+        hydrated_inputs={"remote_input_0": [4]},
+    )
+
+    assert prompt["remote_1"]["inputs"]["value"] == 4
