@@ -1803,14 +1803,23 @@ function patchQueuePrompt() {
 
       const responsePayload = await response.json();
       if (remoteNodeIds.length > 0) {
+        const resolvedRemoteNodeIds = (responsePayload.modal_remote_node_ids ?? []).map((nodeIdValue) =>
+          String(nodeIdValue),
+        );
+        const resolvedComponents = Array.isArray(responsePayload.modal_components)
+          ? responsePayload.modal_components
+          : [];
+        if (resolvedRemoteNodeIds.length > 0 || resolvedComponents.length > 0) {
+          registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);
+        }
         const promptState = ensurePromptState(promptId);
-        const resolvedRemoteNodeIds =
+        const acceptedRemoteNodeIds =
           promptState.remoteNodeIds.length > 0 ? promptState.remoteNodeIds : remoteNodeIds;
         endSyntheticExecutionUi(promptId);
-        setGlobalStatusPhase(promptId, STATE_WAITING, resolvedRemoteNodeIds.length, {
+        setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
           message: "Waiting for Modal startup",
         });
-        setNodesPhase(resolvedRemoteNodeIds, STATE_READY, promptId);
+        setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);
       }
 
       return responsePayload;
