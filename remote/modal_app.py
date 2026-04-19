@@ -696,6 +696,36 @@ def _emit_local_preview_boundary_output(
         )
 
 
+def _allowed_suppressed_stream_node_ids(payload: dict[str, Any]) -> set[str]:
+    """Return the node ids that may surface UI events for a suppressed mapped/static stream."""
+    allowed_node_ids = {
+        str(node_id)
+        for node_id in payload.get("execute_node_ids", [])
+        if str(node_id)
+    }
+    allowed_node_ids.update(
+        str(boundary_output["node_id"])
+        for boundary_output in payload.get("boundary_outputs", [])
+        if boundary_output.get("node_id") is not None and str(boundary_output["node_id"])
+    )
+    return allowed_node_ids
+
+
+def _should_forward_suppressed_stream_event(
+    payload: dict[str, Any],
+    reported_node_id: Any,
+) -> bool:
+    """Return whether a suppressed mapped/static stream event belongs to this payload."""
+    if not bool(payload.get("suppress_status_stream")):
+        return True
+    if reported_node_id is None:
+        return False
+    allowed_node_ids = _allowed_suppressed_stream_node_ids(payload)
+    if not allowed_node_ids:
+        return True
+    return str(reported_node_id) in allowed_node_ids
+
+
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
@@ -904,6 +934,13 @@ def _consume_remote_payload_stream(
             if event_type == "executed":
                 reported_node_id = stream_event.get("node_id")
                 if reported_node_id is not None:
+                    if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                        logger.debug(
+                            "Suppressing streamed Modal executed output for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                            payload.get("component_id"),
+                            reported_node_id,
+                        )
+                        continue
                     logger.debug(
                         "Forwarding streamed Modal executed output for component=%s node_id=%s.",
                         payload.get("component_id"),
@@ -925,6 +962,13 @@ def _consume_remote_payload_stream(
                 reported_node_id = stream_event.get("node_id")
                 image_bytes = deserialize_value(stream_event.get("image_bytes"))
                 if reported_node_id is not None and isinstance(image_bytes, bytes):
+                    if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                        logger.debug(
+                            "Suppressing streamed Modal preview image for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                            payload.get("component_id"),
+                            reported_node_id,
+                        )
+                        continue
                     logger.debug(
                         "Forwarding streamed Modal preview image for component=%s node_id=%s.",
                         payload.get("component_id"),
