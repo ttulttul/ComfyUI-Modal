@@ -1928,6 +1928,96 @@ def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Implicit subgraph batching still reruns static sibling samplers that share a MODEL "
+        "with the batched sampler instead of separating one-time and per-item execute nodes."
+    ),
+)
+def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_run(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A shared MODEL with mixed batch-size INT seeds should run sampler 4 once and sampler 12 four times."""
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+
+        if execute_node_ids == ("4",):
+            return serialization_module.serialize_node_outputs(("sampler-4",))
+        if execute_node_ids == ("12",):
+            return serialization_module.serialize_node_outputs((f"sampler-12:{hydrated_inputs['remote_input_0']}",))
+        raise AssertionError(f"Unexpected execute nodes for implicit mapped regression: {execute_node_ids!r}")
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["4", "12", "17"],
+        "execute_node_ids": ["4", "12"],
+        "subgraph_prompt": {
+            "17": {"class_type": "LoraLoaderModelOnly", "inputs": {}},
+            "4": {"class_type": "KSampler", "inputs": {"model": ["17", 0], "seed": ["remote_input_1", 0]}},
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {"model": ["17", 0], "seed": ["remote_input_0", 0]},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "4", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "4", "io_type": "STRING", "is_list": False},
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": [10, 11, 12, 13],
+                    "remote_input_1": [28],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        "sampler-4",
+        ["sampler-12:10", "sampler-12:11", "sampler-12:12", "sampler-12:13"],
+    )
+    assert observed_calls == [
+        ("17::static", ("4",), {"remote_input_1": 28}),
+        ("17::item:0", ("12",), {"remote_input_0": 10}),
+        ("17::item:1", ("12",), {"remote_input_0": 11}),
+        ("17::item:2", ("12",), {"remote_input_0": 12}),
+        ("17::item:3", ("12",), {"remote_input_0": 13}),
+    ]
+
+
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
