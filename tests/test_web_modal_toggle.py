@@ -38,6 +38,8 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "Waiting for Modal startup" in source
     assert "Modal workflow running on" in source
     assert "setGlobalStatusBatchProgress(promptId, value, maxValue)" in source
+    assert "batchValue: state.batchValue ?? null," in source
+    assert "batchMax: state.batchMax ?? null," in source
     assert "linear-gradient(90deg" in source
     assert "installGlobalStatusStyles()" in source
     assert "function pruneGlobalStatusStates()" in source
@@ -146,6 +148,15 @@ def test_modal_context_menu_marks_nodes_across_subgraphs() -> None:
     assert "candidate.subgraph?.id === subgraphId" in source
     assert "function markWorkflowNodePathsRemote(workflowNodePaths)" in source
     assert "setRemoteFlag(node, true);" in source
+
+
+def test_prompt_component_registration_does_not_shrink_remote_node_count() -> None:
+    """Per-component status updates should not overwrite the prompt-wide remote node list."""
+    source = _modal_toggle_source()
+
+    assert "const mergedRemoteNodeIds = new Set(remoteNodeIds.map((nodeIdValue) => String(nodeIdValue)));" in source
+    assert "if (promptState.remoteNodeIds.length === 0) {" in source
+    assert "const mergedRemoteNodeIds = new Set(promptState.remoteNodeIds);" in source
 
 
 def test_prompt_cleanup_prunes_orphaned_global_status_entries() -> None:
