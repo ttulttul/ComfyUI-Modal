@@ -31,6 +31,7 @@ class ModalSyncSettings:
     comfyui_root: Path | None
     custom_nodes_dir: Path | None
     interrupt_dict_name: str = "comfy-modal-sync-interrupts"
+    terminate_container_on_error: bool = True
     modal_gpu: str = "A100"
     scaledown_window_seconds: int = 600
     min_containers: int = 0
@@ -169,6 +170,8 @@ def get_settings() -> ModalSyncSettings:
             "COMFY_MODAL_INTERRUPT_DICT_NAME",
             f"{app_name}-interrupts",
         ),
+        terminate_container_on_error=_read_bool_env("COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR")
+        is not False,
         modal_gpu=os.getenv("COMFY_MODAL_GPU", "A100").strip() or "A100",
         scaledown_window_seconds=_read_int_env("COMFY_MODAL_SCALEDOWN_WINDOW", 600),
         min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),

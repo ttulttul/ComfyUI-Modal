@@ -1239,6 +1239,7 @@ def _build_component_payload(
     requires_volume_reload: bool,
     volume_reload_marker: str | None,
     custom_nodes_bundle: SyncedAsset | None,
+    terminate_container_on_error: bool,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
     payload = {
@@ -1286,6 +1287,7 @@ def _build_component_payload(
         "extra_data": copy.deepcopy(extra_data or {}),
         "requires_volume_reload": requires_volume_reload,
         "volume_reload_marker": volume_reload_marker,
+        "terminate_container_on_error": terminate_container_on_error,
         "custom_nodes_bundle": (
             custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
         ),
@@ -1475,6 +1477,7 @@ def rewrite_prompt_for_modal(
             requires_volume_reload=requires_volume_reload,
             volume_reload_marker=volume_reload_marker,
             custom_nodes_bundle=summary.custom_nodes_bundle,
+            terminate_container_on_error=resolved_settings.terminate_container_on_error,
         )
         _rewrite_component_into_proxy(
             component=component,

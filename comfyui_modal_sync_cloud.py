@@ -55,6 +55,7 @@ _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
+_CONTAINER_TERMINATION_LOCK = threading.Lock()
 
 try:
     import modal  # type: ignore
@@ -79,6 +80,8 @@ _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (0.0, 0.25, 0.5, 1.0, 2.0,
 _MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT = 256
 _MODAL_VOLUME_RELOAD_MARKERS: queue.SimpleQueue[str] | None = None
 _MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
+_REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS = 1.0
+_CONTAINER_TERMINATION_SCHEDULED = False
 
 
 @dataclass
@@ -87,6 +90,57 @@ class _RemoteExecutionControl:
 
     cancellation_event: threading.Event
     interrupt_flag_key: str
+
+
+def _schedule_process_exit(delay_seconds: float, exit_code: int) -> None:
+    """Exit the current process after a short delay to retire a bad Modal container."""
+
+    def exit_later() -> None:
+        """Sleep briefly so Modal can ship the error response before exiting the worker."""
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        logger.error("Exiting Modal container process with code=%s after remote failure.", exit_code)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
+
+    threading.Thread(
+        target=exit_later,
+        name="modal-container-exit",
+        daemon=True,
+    ).start()
+
+
+def _is_interrupt_like_failure(exc: Exception) -> bool:
+    """Return whether one remote failure represents an expected interruption rather than a crash."""
+    return "interrupt" in str(exc).lower()
+
+
+def _maybe_schedule_container_termination_on_error(
+    payload: dict[str, Any],
+    exc: Exception,
+) -> bool:
+    """Retire the current Modal container after a remote execution crash when configured."""
+    if not _is_modal_container_runtime():
+        return False
+    if not bool(payload.get("terminate_container_on_error", True)):
+        return False
+    if _is_interrupt_like_failure(exc):
+        return False
+
+    global _CONTAINER_TERMINATION_SCHEDULED
+    with _CONTAINER_TERMINATION_LOCK:
+        if _CONTAINER_TERMINATION_SCHEDULED:
+            return False
+        _CONTAINER_TERMINATION_SCHEDULED = True
+
+    logger.error(
+        "Scheduling Modal container termination after remote execution failure for component=%s.",
+        payload.get("component_id"),
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    _schedule_process_exit(_REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS, 1)
+    return True
 
 
 class _NullPromptServer:
@@ -1898,35 +1952,39 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             """Execute a proxied node or subgraph inside the Modal container."""
             component_id = payload.get("component_id", "single-node")
             reload_marker = _modal_volume_reload_marker(payload)
-            with _registered_remote_execution(payload) as execution_control:
-                with _timed_phase(
-                    "remote_engine_execute_payload",
-                    component=component_id,
-                    payload_kind=payload.get("payload_kind"),
-                ):
-                    if _should_reload_modal_volume(payload):
-                        _reload_modal_volume_for_request(
-                            vol,
-                            str(component_id),
-                            reload_marker=reload_marker,
-                        )
-                    else:
-                        _emit_modal_volume_reload_skip(component_id, payload)
-                    if payload.get("payload_kind") == "subgraph":
-                        return execute_subgraph_locally(
+            try:
+                with _registered_remote_execution(payload) as execution_control:
+                    with _timed_phase(
+                        "remote_engine_execute_payload",
+                        component=component_id,
+                        payload_kind=payload.get("payload_kind"),
+                    ):
+                        if _should_reload_modal_volume(payload):
+                            _reload_modal_volume_for_request(
+                                vol,
+                                str(component_id),
+                                reload_marker=reload_marker,
+                            )
+                        else:
+                            _emit_modal_volume_reload_skip(component_id, payload)
+                        if payload.get("payload_kind") == "subgraph":
+                            return execute_subgraph_locally(
+                                payload,
+                                kwargs_payload,
+                                cancellation_event=execution_control.cancellation_event,
+                                interrupt_store=interrupt_flags,
+                                interrupt_flag_key=execution_control.interrupt_flag_key,
+                            )
+                        return execute_node_locally(
                             payload,
                             kwargs_payload,
                             cancellation_event=execution_control.cancellation_event,
                             interrupt_store=interrupt_flags,
                             interrupt_flag_key=execution_control.interrupt_flag_key,
                         )
-                    return execute_node_locally(
-                        payload,
-                        kwargs_payload,
-                        cancellation_event=execution_control.cancellation_event,
-                        interrupt_store=interrupt_flags,
-                        interrupt_flag_key=execution_control.interrupt_flag_key,
-                    )
+            except Exception as exc:
+                _maybe_schedule_container_termination_on_error(payload, exc)
+                raise
 
         @modal.method()
         def execute_payload_stream(
@@ -1937,27 +1995,31 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             """Stream progress envelopes and a final serialized result for one payload."""
             component_id = payload.get("component_id", "single-node")
             reload_marker = _modal_volume_reload_marker(payload)
-            with _registered_remote_execution(payload) as execution_control:
-                with _timed_phase(
-                    "remote_engine_execute_payload",
-                    component=component_id,
-                    payload_kind=payload.get("payload_kind"),
-                ):
-                    if _should_reload_modal_volume(payload):
-                        _reload_modal_volume_for_request(
-                            vol,
-                            str(component_id),
-                            reload_marker=reload_marker,
+            try:
+                with _registered_remote_execution(payload) as execution_control:
+                    with _timed_phase(
+                        "remote_engine_execute_payload",
+                        component=component_id,
+                        payload_kind=payload.get("payload_kind"),
+                    ):
+                        if _should_reload_modal_volume(payload):
+                            _reload_modal_volume_for_request(
+                                vol,
+                                str(component_id),
+                                reload_marker=reload_marker,
+                            )
+                        else:
+                            _emit_modal_volume_reload_skip(component_id, payload)
+                        yield from _stream_remote_payload_events(
+                            payload,
+                            kwargs_payload,
+                            cancellation_event=execution_control.cancellation_event,
+                            interrupt_store=interrupt_flags,
+                            interrupt_flag_key=execution_control.interrupt_flag_key,
                         )
-                    else:
-                        _emit_modal_volume_reload_skip(component_id, payload)
-                    yield from _stream_remote_payload_events(
-                        payload,
-                        kwargs_payload,
-                        cancellation_event=execution_control.cancellation_event,
-                        interrupt_store=interrupt_flags,
-                        interrupt_flag_key=execution_control.interrupt_flag_key,
-                    )
+            except Exception as exc:
+                _maybe_schedule_container_termination_on_error(payload, exc)
+                raise
 
 else:
     app = None

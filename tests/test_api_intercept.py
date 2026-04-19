@@ -208,6 +208,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert payload["requires_volume_reload"] is True
     assert isinstance(payload["volume_reload_marker"], str)
     assert payload["volume_reload_marker"]
+    assert payload["terminate_container_on_error"] is True
     assert payload["boundary_inputs"] == []
     assert payload["boundary_outputs"] == [
         {

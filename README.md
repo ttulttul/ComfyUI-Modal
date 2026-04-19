@@ -180,6 +180,7 @@ Remote runtime behavior:
 - Hybrid mapped sub-runs now trim their prompt down to the dependency closure of the specific `execute_node_ids` they are about to run. That keeps a static-only sub-run from validating or executing the unrelated mapped branch just because both branches originally lived in the same coarse remote component.
 - Hybrid sub-run trimming also tolerates stale execute target ids that are no longer present in the current subgraph prompt. Those ids are now dropped before dependency resolution instead of crashing the remote worker with a `KeyError`.
 - Remote cancellation now uses a shared Modal `Dict` control store instead of a second RPC lane into the execution class, so per-container execution concurrency can stay at `1` without losing interrupt propagation.
+- If a remote execution crashes instead of being interrupted normally, the worker now schedules its own container process to exit after surfacing the exception. That retires the bad warm GPU container instead of leaving it idle and billable after a hard failure.
 - If a run is cancelled and restarted quickly, or a warm container is still releasing heavy model files, the remote worker now gives Modal volume reload a longer bounded retry window so recently released files can close before the next request needs a fresh `vol.reload()`.
 - Mapped remote execution now carries a per-request volume reload marker, so one warm container only performs `vol.reload()` once for that uploaded asset snapshot even if the local scheduler fans the component out into many per-item Modal calls.
 - Volume reload dedupe is now request-wide, not component-wide. If one queued workflow rewrites into several remote components, they all share the same reload marker so a warm container only reloads once for that overall synced asset set instead of once per component.
@@ -317,6 +318,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_EXECUTION_MODE`: Set to `local` for in-process fallback execution. Default: `local`.
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
 - `COMFY_MODAL_INTERRUPT_DICT_NAME`: Override the shared Modal `Dict` used for remote cancellation flags. Default: `<app_name>-interrupts`.
+- `COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR`: When true, a remote execution crash makes the worker exit its own container after returning the error. Default: `true`.
 - `COMFY_MODAL_AUTO_DEPLOY`: Automatically deploy the Modal app on first remote invocation when lookup fails. Default: `true`.
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
 
