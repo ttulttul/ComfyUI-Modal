@@ -190,6 +190,8 @@ function currentGlobalStatus() {
     promptId,
     phase: effectiveGlobalStatusPhase(promptId, state.phase),
     nodeCount: state.nodeCount,
+    batchValue: state.batchValue ?? null,
+    batchMax: state.batchMax ?? null,
     updatedAt: state.updatedAt,
   }));
   phases.sort((left, right) => right.updatedAt - left.updatedAt);
@@ -497,19 +499,36 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
  */
 function registerPromptComponents(promptId, remoteNodeIds, components) {
   const promptState = ensurePromptState(promptId);
-  if (remoteNodeIds.length > 0) {
-    promptState.remoteNodeIds = [...remoteNodeIds];
-  }
-  rebuildPromptAncestorMap(promptState);
   if (components.length > 0) {
+    const mergedRemoteNodeIds = new Set(remoteNodeIds.map((nodeIdValue) => String(nodeIdValue)));
     promptState.componentsByRepresentative.clear();
     promptState.activeNodeId = null;
     promptState.hasStreamedProgress = false;
     for (const component of components) {
+      const componentNodeIds = component.node_ids.map((nodeIdValue) => String(nodeIdValue));
       promptState.componentsByRepresentative.set(
         String(component.representative_node_id),
-        component.node_ids.map((nodeIdValue) => String(nodeIdValue)),
+        componentNodeIds,
       );
+      for (const componentNodeId of componentNodeIds) {
+        mergedRemoteNodeIds.add(componentNodeId);
+      }
+    }
+    if (mergedRemoteNodeIds.size > 0) {
+      promptState.remoteNodeIds = Array.from(mergedRemoteNodeIds);
+    }
+    rebuildPromptAncestorMap(promptState);
+    return;
+  }
+  if (remoteNodeIds.length > 0) {
+    if (promptState.remoteNodeIds.length === 0) {
+      promptState.remoteNodeIds = [...remoteNodeIds];
+    } else {
+      const mergedRemoteNodeIds = new Set(promptState.remoteNodeIds);
+      for (const remoteNodeId of remoteNodeIds) {
+        mergedRemoteNodeIds.add(String(remoteNodeId));
+      }
+      promptState.remoteNodeIds = Array.from(mergedRemoteNodeIds);
     }
     rebuildPromptAncestorMap(promptState);
   }
