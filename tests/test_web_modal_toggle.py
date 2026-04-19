@@ -36,10 +36,14 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert 'element.id = "comfy-modal-global-status";' in source
     assert "Syncing graph with Modal" in source
     assert "Waiting for Modal startup" in source
+    assert "Receiving Modal outputs" in source
     assert "Modal workflow running on" in source
     assert "setGlobalStatusBatchProgress(promptId, value, maxValue)" in source
     assert "batchValue: state.batchValue ?? null," in source
     assert "batchMax: state.batchMax ?? null," in source
+    assert "statusMessage: state.statusMessage ?? null," in source
+    assert "statusCurrent: state.statusCurrent ?? null," in source
+    assert "statusTotal: state.statusTotal ?? null," in source
     assert "linear-gradient(90deg" in source
     assert "installGlobalStatusStyles()" in source
     assert "function pruneGlobalStatusStates()" in source
@@ -66,9 +70,22 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert 'const ACTIVE_BORDER_COLOR = "#a855f7";' in source
     assert 'const COMPLETE_BORDER_COLOR = "#16a34a";' in source
     assert 'const STATE_WAITING = "waiting";' in source
+    assert 'const STATE_FINALIZING = "finalizing";' in source
     assert 'const STATE_READY = "ready";' in source
     assert 'const STATE_ACTIVE = "active";' in source
     assert 'detail.phase === "execution_success"' in source
+
+
+def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> None:
+    """The frontend should surface detailed setup and result-receive messages in the global pill."""
+    source = _modal_toggle_source()
+
+    assert "detail.status_message ?? null" in source
+    assert "detail.status_current ?? null" in source
+    assert "detail.status_total ?? null" in source
+    assert "setGlobalStatusPhase(promptId, STATE_SETUP, nodeIds.length, {" in source
+    assert "if (detail.phase === STATE_FINALIZING) {" in source
+    assert 'text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";' in source
 
 
 def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:

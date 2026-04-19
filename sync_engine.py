@@ -12,12 +12,13 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
 _MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+SyncStatusCallback = Callable[[str, int | None, int | None], None]
 
 _SYNC_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".vae"}
 _SKIP_DIRS = {
@@ -45,6 +46,30 @@ try:
     import modal  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - exercised when Modal SDK is unavailable.
     modal = None
+
+
+def _emit_sync_status(
+    status_callback: SyncStatusCallback | None,
+    message: str,
+    current: int | None = None,
+    total: int | None = None,
+) -> None:
+    """Emit one human-readable sync status update when a callback is available."""
+    if status_callback is None:
+        return
+    status_callback(message, current, total)
+
+
+def _format_asset_upload_status(
+    asset_name: str,
+    *,
+    item_index: int | None,
+    total_items: int | None,
+) -> str:
+    """Return the global-status message for one asset upload."""
+    if item_index is not None and total_items is not None and total_items > 1:
+        return f"Uploading asset {item_index}/{total_items} to Modal: {asset_name}"
+    return f"Uploading asset to Modal: {asset_name}"
 
 
 class VolumeBackend(Protocol):
@@ -207,7 +232,15 @@ class ModalAssetSyncEngine:
             backend = LocalMirrorVolume(resolved_settings.local_storage_root)
         return cls(volume=backend, settings=resolved_settings)
 
-    def sync_file(self, local_path: Path, remote_folder: str = "/assets") -> SyncedAsset:
+    def sync_file(
+        self,
+        local_path: Path,
+        remote_folder: str = "/assets",
+        *,
+        status_callback: SyncStatusCallback | None = None,
+        item_index: int | None = None,
+        total_items: int | None = None,
+    ) -> SyncedAsset:
         """Sync a file into content-addressable remote storage."""
         resolved_path = local_path.expanduser().resolve()
         if not resolved_path.is_file():
@@ -221,6 +254,14 @@ class ModalAssetSyncEngine:
             remote_path=remote_path,
             marker_path=marker_path,
             source_description=str(resolved_path),
+            status_callback=status_callback,
+            upload_status_message=_format_asset_upload_status(
+                resolved_path.name,
+                item_index=item_index,
+                total_items=total_items,
+            ),
+            status_current=item_index,
+            status_total=total_items,
         )
 
         return SyncedAsset(
@@ -230,17 +271,31 @@ class ModalAssetSyncEngine:
             uploaded=uploaded,
         )
 
-    def sync_prompt_inputs(self, inputs: dict[str, Any]) -> tuple[dict[str, Any], list[SyncedAsset]]:
+    def sync_prompt_inputs(
+        self,
+        inputs: dict[str, Any],
+        *,
+        status_callback: SyncStatusCallback | None = None,
+    ) -> tuple[dict[str, Any], list[SyncedAsset]]:
         """Rewrite file-like prompt inputs to mirrored storage paths."""
         synced_assets: list[SyncedAsset] = []
         sync_started_at = time.perf_counter()
         logger.info("Scanning prompt inputs for syncable assets.")
+        syncable_asset_paths = self._collect_syncable_asset_paths(inputs)
+        syncable_asset_index = 0
 
         def rewrite(value: Any) -> Any:
+            nonlocal syncable_asset_index
             if isinstance(value, str):
                 maybe_path = self._resolve_model_path(value)
                 if maybe_path is not None:
-                    synced_asset = self.sync_file(maybe_path)
+                    syncable_asset_index += 1
+                    synced_asset = self.sync_file(
+                        maybe_path,
+                        status_callback=status_callback,
+                        item_index=syncable_asset_index,
+                        total_items=len(syncable_asset_paths),
+                    )
                     synced_assets.append(synced_asset)
                     return synced_asset.remote_path
                 return value
@@ -258,7 +313,11 @@ class ModalAssetSyncEngine:
         )
         return rewritten_inputs, synced_assets
 
-    def sync_custom_nodes_directory(self) -> SyncedAsset | None:
+    def sync_custom_nodes_directory(
+        self,
+        *,
+        status_callback: SyncStatusCallback | None = None,
+    ) -> SyncedAsset | None:
         """Zip and mirror the local custom_nodes directory when available."""
         custom_nodes_dir = self.settings.custom_nodes_dir
         if custom_nodes_dir is None or not custom_nodes_dir.exists():
@@ -313,6 +372,7 @@ class ModalAssetSyncEngine:
             logger.info("Reusing cached custom_nodes archive %s for digest %s.", archive_path, directory_hash)
         else:
             archive_started_at = time.perf_counter()
+            _emit_sync_status(status_callback, "Packaging custom nodes ZIP for Modal")
             logger.info("Creating custom_nodes archive for %s", custom_nodes_dir)
             self._create_archive(custom_nodes_dir, archive_path)
             logger.info(
@@ -326,6 +386,8 @@ class ModalAssetSyncEngine:
             remote_path=remote_path,
             marker_path=marker_path,
             source_description=str(custom_nodes_dir),
+            status_callback=status_callback,
+            upload_status_message="Uploading custom nodes ZIP to Modal",
         )
 
         logger.info(
@@ -347,6 +409,10 @@ class ModalAssetSyncEngine:
         remote_path: str,
         marker_path: str,
         source_description: str,
+        status_callback: SyncStatusCallback | None = None,
+        upload_status_message: str | None = None,
+        status_current: int | None = None,
+        status_total: int | None = None,
     ) -> bool:
         """Upload one deterministic file only when neither the file nor its marker already exists."""
         if self.volume.exists(marker_path):
@@ -363,6 +429,12 @@ class ModalAssetSyncEngine:
             return False
 
         logger.info("Syncing %s to %s", source_description, remote_path)
+        _emit_sync_status(
+            status_callback,
+            upload_status_message or f"Uploading {Path(source_description).name} to Modal",
+            status_current,
+            status_total,
+        )
         self.volume.put_file(local_path, remote_path)
         self._write_sync_marker(source_description=source_description, remote_path=remote_path, marker_path=marker_path)
         return True
@@ -422,6 +494,27 @@ class ModalAssetSyncEngine:
 
         self._path_resolution_cache[value] = None
         return None
+
+    def _collect_syncable_asset_paths(self, value: Any) -> list[Path]:
+        """Return all prompt asset paths that resolve to syncable local files."""
+        collected_paths: list[Path] = []
+
+        def visit(item: Any) -> None:
+            if isinstance(item, str):
+                resolved_path = self._resolve_model_path(item)
+                if resolved_path is not None:
+                    collected_paths.append(resolved_path)
+                return
+            if isinstance(item, list):
+                for child in item:
+                    visit(child)
+                return
+            if isinstance(item, dict):
+                for child in item.values():
+                    visit(child)
+
+        visit(value)
+        return collected_paths
 
     def _hash_file(self, path: Path) -> str:
         """Compute the SHA256 digest for a file."""
