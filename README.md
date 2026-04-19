@@ -245,6 +245,7 @@ Current mapped-execution rules:
 - one `Modal Map Input` boundary per remote component
 - downstream remote nodes reachable from that map marker stay in the same mapped remote component
 - mapped inputs may currently be Python lists, `IMAGE` batches, `LATENT` batches, and other batched tensors split on dimension `0`
+- ordinary remote components without `Modal Map Input` still preserve ComfyUI's usual zipped batch semantics at the remote boundary: if multiple boundary inputs arrive as compatible batches, Modal-Sync fans that component out per item instead of injecting the raw list into primitive widget sockets like `seed: INT`
 - non-mapped boundary inputs are broadcast unchanged to every per-item execution
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
 - per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item

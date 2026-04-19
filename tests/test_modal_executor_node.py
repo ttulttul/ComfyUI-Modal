@@ -1864,6 +1864,70 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
     ]
 
 
+def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Ordinary remote subgraphs should fan out when multiple boundary inputs arrive batched."""
+    observed_inputs: list[dict[str, Any]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        assert payload["payload_kind"] == "subgraph"
+        assert payload["suppress_status_stream"] is True
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        observed_inputs.append(hydrated_inputs)
+        return serialization_module.serialize_node_outputs(
+            (f"{hydrated_inputs['remote_input_0']}:{hydrated_inputs['remote_input_1']}",)
+        )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "12",
+        "prompt_id": "prompt-1",
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "LATENT",
+                "targets": [{"node_id": "12", "input_name": "latent_image"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [{"node_id": "12", "io_type": "STRING", "is_list": False}],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": ["latent-a", "latent-b"],
+                    "remote_input_1": [10, 11],
+                }
+            ),
+        )
+    )
+
+    assert observed_inputs == [
+        {"remote_input_0": "latent-a", "remote_input_1": 10},
+        {"remote_input_0": "latent-b", "remote_input_1": 11},
+    ]
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["latent-a:10", "latent-b:11"],
+    )
+
+
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
