@@ -2529,3 +2529,42 @@ def test_local_remote_app_normalizes_wrapped_subgraph_link_indexes(
     )
     outputs = serialization_module.deserialize_node_outputs(payload)
     assert outputs == (10,)
+
+
+def test_local_remote_app_normalizes_wrapped_scalar_prompt_inputs(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+) -> None:
+    """The local fallback runner should unwrap singleton-list scalar prompt inputs."""
+    payload = remote_modal_app_module.execute_subgraph_locally(
+        payload={
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "subgraph_prompt": {
+                "remote_1": {
+                    "class_type": "BoundarySource",
+                    "inputs": {"value": [4]},
+                    "_meta": {},
+                }
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "remote_1_value",
+                    "node_id": "remote_1",
+                    "output_index": 0,
+                    "io_type": "INT",
+                    "is_list": False,
+                }
+            ],
+            "execute_node_ids": [["remote_1"]],
+            "extra_data": {},
+            "custom_nodes_bundle": None,
+        },
+        kwargs_payload="{}",
+        node_mapping={
+            "BoundarySource": _BoundarySourceNode,
+        },
+    )
+    outputs = serialization_module.deserialize_node_outputs(payload)
+    assert outputs == (5,)

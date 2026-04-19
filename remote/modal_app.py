@@ -271,6 +271,17 @@ def _normalize_link_output_index(value: Any) -> Any:
     return value
 
 
+def _normalize_prompt_input_value(value: Any) -> Any:
+    """Unwrap transport-added singleton lists around scalar prompt input values."""
+    if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+        return [value[0], _normalize_link_output_index(value[1])]
+    if isinstance(value, list) and len(value) == 1:
+        candidate = value[0]
+        if candidate is None or isinstance(candidate, bool | int | float | str):
+            return candidate
+    return value
+
+
 def _normalize_subgraph_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Return a subgraph payload with canonical prompt-link and output-index shapes."""
     normalized_payload = copy.deepcopy(payload)
@@ -278,20 +289,20 @@ def _normalize_subgraph_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for node_info in normalized_payload.get("subgraph_prompt", {}).values():
         inputs = node_info.get("inputs") or {}
         for input_name, input_value in list(inputs.items()):
-            if not isinstance(input_value, list) or len(input_value) != 2:
-                continue
-            if not isinstance(input_value[0], str):
-                continue
-            inputs[input_name] = [
-                input_value[0],
-                _normalize_link_output_index(input_value[1]),
-            ]
+            inputs[input_name] = _normalize_prompt_input_value(input_value)
 
     for boundary_output in normalized_payload.get("boundary_outputs", []):
+        if "node_id" in boundary_output and isinstance(boundary_output["node_id"], list):
+            boundary_output["node_id"] = _normalize_prompt_input_value(boundary_output["node_id"])
         if "output_index" in boundary_output:
             boundary_output["output_index"] = _normalize_link_output_index(
                 boundary_output["output_index"]
             )
+
+    normalized_payload["execute_node_ids"] = [
+        _normalize_prompt_input_value(node_id)
+        for node_id in normalized_payload.get("execute_node_ids", [])
+    ]
 
     return normalized_payload
 
