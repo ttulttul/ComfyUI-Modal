@@ -572,7 +572,7 @@ def test_rewrite_reports_mapped_parallelism_upper_bound(
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Mapped components should report a higher queue-time upper bound when a container cap is configured."""
+    """Mapped components should warm only the single container needed for one in-process mapped run."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -632,7 +632,7 @@ def test_rewrite_reports_mapped_parallelism_upper_bound(
     assert summary.component_execution_stages == [["2"]]
     assert summary.mapped_component_ids == ["2"]
     assert summary.estimated_max_parallel_requests == 1
-    assert summary.max_parallel_requests_upper_bound == 5
+    assert summary.max_parallel_requests_upper_bound == 1
 
 
 def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
@@ -947,6 +947,41 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
             "targets": [{"node_id": "2", "input_name": "value"}],
         }
     ]
+    assert payload["static_to_mapped_boundaries"] == []
+    assert payload["static_phase"] == {
+        "component_node_ids": [],
+        "subgraph_prompt": {},
+        "boundary_inputs": [],
+        "boundary_outputs": [],
+        "execute_node_ids": [],
+    }
+    assert payload["mapped_phase"] == {
+        "component_node_ids": ["2", "3", "5"],
+        "subgraph_prompt": {
+            "2": prompt["2"],
+            "3": prompt["3"],
+            "5": prompt["5"],
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "STRING",
+                "targets": [{"node_id": "2", "input_name": "value"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "5_text",
+                "node_id": "5",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "preview_target_node_ids": [],
+                "mapped_output": True,
+            }
+        ],
+        "execute_node_ids": ["5"],
+    }
     assert rewritten_prompt["4"]["inputs"]["text"] == ["2", 0]
 
 
@@ -1058,11 +1093,85 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
     assert payload["payload_kind"] == "mapped_subgraph"
     assert payload["component_node_ids"] == ["1", "3", "6", "7"]
     assert payload["execute_node_ids"] == ["3", "7"]
-    assert payload["static_execute_node_ids"] == ["3"]
+    assert payload["static_execute_node_ids"] == ["1", "3"]
     assert payload["mapped_execute_node_ids"] == ["7"]
     assert payload["mapped_input"] == {
         "proxy_input_name": "remote_input_1",
         "io_type": "LATENT",
+    }
+    assert payload["static_to_mapped_boundaries"] == [
+        {
+            "proxy_name": "static_input_0",
+            "node_id": "1",
+            "output_index": 0,
+            "io_type": "MODEL",
+            "is_list": False,
+            "targets": [{"node_id": "7", "input_name": "model"}],
+        }
+    ]
+    assert payload["static_phase"] == {
+        "component_node_ids": ["1", "3"],
+        "subgraph_prompt": {
+            "1": prompt["1"],
+            "3": prompt["3"],
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "LATENT",
+                "targets": [{"node_id": "3", "input_name": "latent"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "3_latent",
+                "node_id": "3",
+                "output_index": 0,
+                "io_type": "LATENT",
+                "is_list": False,
+                "preview_target_node_ids": [],
+            },
+            {
+                "proxy_output_name": "static_input_0",
+                "node_id": "1",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "preview_target_node_ids": [],
+            },
+        ],
+        "execute_node_ids": ["1", "3"],
+    }
+    assert payload["mapped_phase"] == {
+        "component_node_ids": ["6", "7"],
+        "subgraph_prompt": {
+            "6": prompt["6"],
+            "7": prompt["7"],
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "LATENT",
+                "targets": [{"node_id": "6", "input_name": "value"}],
+            },
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "7", "input_name": "model"}],
+            },
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "7_latent",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "LATENT",
+                "is_list": False,
+                "preview_target_node_ids": [],
+                "mapped_output": True,
+            }
+        ],
+        "execute_node_ids": ["7"],
     }
     assert payload["boundary_outputs"] == [
         {

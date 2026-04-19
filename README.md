@@ -64,7 +64,7 @@ The list above is the shortest accurate summary. If you want the execution path 
   - The proxy node serializes its boundary inputs.
   - It checks the payload kind.
     - If the payload is a normal remote component, it dispatches a `subgraph` payload.
-    - If the payload uses `ModalMapInput`, it dispatches a `mapped_subgraph` payload and fans out per-item executions.
+    - If the payload uses `ModalMapInput`, it dispatches one `mapped_subgraph` payload whose explicit static and mapped phases are executed inside a single runtime.
 
 - **4. Dispatch decision**
   1. Check `COMFY_MODAL_EXECUTION_MODE`.
@@ -174,10 +174,12 @@ Remote runtime behavior:
 - Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.
 - Remote proxy nodes now execute through ComfyUI's async node path, so independent Modal-backed components can overlap instead of being forced through one blocking local proxy at a time.
 - The local Modal call executor keeps multiple worker threads available, which removes the previous `max_workers=1` bottleneck when several remote components are ready at once.
-- `ModalMapInput` can turn one remote component boundary into a locally scheduled mapped execution. List inputs and batched tensors fan out into multiple per-item Modal subgraph calls, and the local scheduler refills that queue up to the configured `COMFY_MODAL_MAX_CONTAINERS`.
-- When a mapped remote component has several Modal workers running at once, the local node overlay now shows one progress lane per active worker plus the aggregate completion bar, instead of letting concurrent runs overwrite a single progress bar.
+- `ModalMapInput` now rewrites one remote component into an explicit static phase plus a mapped phase. The runtime executes the static phase once, keeps those outputs in-process, and then runs the mapped phase once per item against the injected static boundaries.
+- That mapped execution now stays inside one local or remote runtime invocation instead of dispatching one Modal RPC per item. This matches ComfyUI's effective-input caching model and avoids trying to persist arbitrary remote-only runtime objects such as `MODEL` or `CLIP`.
+- Mapped progress still exposes per-item lane metadata and aggregate completion, but it is now emitted by the single mapped runtime rather than by a local fan-out queue of separate remote calls.
 - The remote worker only forwards numeric node progress for meaningful progress states. Trivial `0/1` updates from ordinary upstream nodes are ignored so sampler-style progress bars stay attached to nodes like `KSampler` instead of appearing on loaders or text encoders.
 - Mapped remote components can now contain both one-time execute targets and per-item execute targets. A common case is two remote `KSampler` nodes sharing one upstream `Load Diffusion Model`, where only the sampler fed by `ModalMapInput` should fan out per latent while the sibling sampler still runs exactly once.
+- Queue-time rewrite now materializes explicit static-to-mapped boundaries for invariant upstream outputs. That lets the mapped phase consume only the values it really depends on instead of carrying the whole coarse component prompt back through every item run.
 - Hybrid mapped sub-runs now trim their prompt down to the dependency closure of the specific `execute_node_ids` they are about to run. That keeps a static-only sub-run from validating or executing the unrelated mapped branch just because both branches originally lived in the same coarse remote component.
 - Hybrid sub-run trimming also tolerates stale execute target ids that are no longer present in the current subgraph prompt. Those ids are now dropped before dependency resolution instead of crashing the remote worker with a `KeyError`.
 - Boundary inputs injected back into a remote subgraph are now normalized through the same singleton-wrapper cleanup path as stored prompt inputs, so a proxied scalar like `[4]` no longer reaches `PromptExecutor` as `int([4])`.
@@ -352,7 +354,6 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle containers warm for this many seconds. Default: `600`.
 - `COMFY_MODAL_MIN_CONTAINERS`: Keep at least this many containers warm. Default: `0`.
 - `COMFY_MODAL_MAX_CONTAINERS`: Optional upper bound on simultaneously scaled Modal containers.
-- `COMFY_MODAL_MAX_CONTAINERS` also caps the local mapped-execution worker queue driven by `ModalMapInput`.
 - `COMFY_MODAL_BUFFER_CONTAINERS`: Optional number of spare warm containers Modal should try to keep ready above current load.
 - `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP`: Start best-effort background warmup RPCs based on queue-time and runtime parallelism estimates. Default: `true`.
 

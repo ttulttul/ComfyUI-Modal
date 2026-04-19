@@ -2,6 +2,7 @@
 
 ## 2026-04-19
 
+- Mapped remote execution cannot hoist invariant upstream work safely by caching `{prompt_id}:{node_id}` outputs or by replaying per-item subgraph RPCs. The queue-time rewrite has to split the component into explicit static and mapped phase prompts, expose static-to-mapped boundaries, and let one runtime invocation execute both phases so non-transportable objects like `MODEL` stay in-process while `PromptExecutor` still decides reuse from effective inputs and dependencies.
 - The frontend cannot treat mapped execution like a prompt-wide single active node. Per-lane progress is the durable source of truth there: ordinary non-mapped runs can still use `activeNodeId`, but mapped remote styling should derive purple/active state from whichever nodes currently hold live lane or numeric progress, and lane ownership needs to move when one worker advances from node A to node B.
 - The test bootstrap should not hard-code `~/git/ComfyUI` as its only source of ComfyUI imports. Reading `COMFYUI_ROOT` first makes it easy to validate the extension against a disposable checkout in `/tmp` while preserving the old local-default behavior.
 - A usable `uv` test environment for this repo needs more than `pytest`. Importing current ComfyUI APIs during tests also requires `aiohttp`, `Pillow`, `torch`, `safetensors`, `numpy`, and `tqdm`, so those belong in the dedicated `test` dependency group instead of being installed ad hoc on one machine.

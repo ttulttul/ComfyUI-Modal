@@ -106,7 +106,9 @@ def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None
             "display_node_id": "component-1",
             "real_node_id": "node-b",
             "lane_id": "7",
+            "clear": False,
             "item_index": 3,
+            "aggregate_only": False,
         }
     ]
     with modal_app._MAPPED_PROGRESS_NODE_IDS_LOCK:
