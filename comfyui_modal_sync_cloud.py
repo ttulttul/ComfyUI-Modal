@@ -1236,6 +1236,36 @@ def _log_prompt_executor_failure_details(
     )
 
 
+def _resolve_required_subgraph_nodes(
+    prompt: dict[str, Any],
+    execute_node_ids: list[str],
+) -> list[str]:
+    """Return the dependency closure needed to execute the requested subgraph nodes."""
+    required: set[str] = set()
+    pending = list(execute_node_ids)
+    logger.info("Resolving dependency closure for remote execute targets: %s", execute_node_ids)
+    while pending:
+        node_id = str(pending.pop())
+        if node_id in required:
+            continue
+        required.add(node_id)
+        for input_value in (prompt[node_id].get("inputs") or {}).values():
+            if _is_link(input_value):
+                pending.append(str(input_value[0]))
+    resolved = sorted(required)
+    logger.info("Resolved remote dependency closure: %s", resolved)
+    return resolved
+
+
+def _is_link(value: Any) -> bool:
+    """Return whether a prompt input value is a ComfyUI link."""
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(not isinstance(item, dict) for item in value)
+    )
+
+
 def _normalize_link_output_index(value: Any) -> Any:
     """Unwrap a singleton list around a prompt-link output index when present."""
     while isinstance(value, list) and len(value) == 1:
@@ -1279,6 +1309,76 @@ def _normalize_subgraph_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return normalized_payload
 
 
+def _trim_subgraph_payload_to_required_nodes(payload: dict[str, Any]) -> dict[str, Any]:
+    """Trim a subgraph payload down to the dependency closure of its execute targets."""
+    trimmed_payload = copy.deepcopy(payload)
+    prompt = trimmed_payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict):
+        return trimmed_payload
+
+    required_node_ids = set(
+        _resolve_required_subgraph_nodes(
+            prompt=prompt,
+            execute_node_ids=[
+                str(node_id) for node_id in trimmed_payload.get("execute_node_ids", [])
+            ],
+        )
+    )
+    if not required_node_ids:
+        return trimmed_payload
+
+    original_node_ids = list(prompt.keys())
+    trimmed_payload["subgraph_prompt"] = {
+        str(node_id): prompt[node_id]
+        for node_id in original_node_ids
+        if str(node_id) in required_node_ids
+    }
+    trimmed_payload["boundary_inputs"] = [
+        {
+            **copy.deepcopy(boundary_input),
+            "targets": [
+                copy.deepcopy(target)
+                for target in boundary_input.get("targets", [])
+                if str(target.get("node_id")) in required_node_ids
+            ],
+        }
+        for boundary_input in trimmed_payload.get("boundary_inputs", [])
+        if any(str(target.get("node_id")) in required_node_ids for target in boundary_input.get("targets", []))
+    ]
+    trimmed_payload["boundary_outputs"] = [
+        copy.deepcopy(boundary_output)
+        for boundary_output in trimmed_payload.get("boundary_outputs", [])
+        if str(boundary_output.get("node_id")) in required_node_ids
+    ]
+    trimmed_payload["component_node_ids"] = [
+        str(node_id)
+        for node_id in trimmed_payload.get("component_node_ids", [])
+        if str(node_id) in required_node_ids
+    ]
+    trimmed_payload["execute_node_ids"] = [
+        str(node_id)
+        for node_id in trimmed_payload.get("execute_node_ids", [])
+        if str(node_id) in required_node_ids
+    ]
+    trimmed_payload["mapped_execute_node_ids"] = [
+        str(node_id)
+        for node_id in trimmed_payload.get("mapped_execute_node_ids", [])
+        if str(node_id) in required_node_ids
+    ]
+    trimmed_payload["static_execute_node_ids"] = [
+        str(node_id)
+        for node_id in trimmed_payload.get("static_execute_node_ids", [])
+        if str(node_id) in required_node_ids
+    ]
+    logger.info(
+        "Trimmed remote subgraph payload %s from %d prompt nodes to %d required nodes.",
+        payload.get("component_id"),
+        len(original_node_ids),
+        len(trimmed_payload["subgraph_prompt"]),
+    )
+    return trimmed_payload
+
+
 def _execute_subgraph_prompt(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
@@ -1290,7 +1390,9 @@ def _execute_subgraph_prompt(
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
-    normalized_payload = _normalize_subgraph_payload(payload)
+    normalized_payload = _trim_subgraph_payload_to_required_nodes(
+        _normalize_subgraph_payload(payload)
+    )
     with _timed_phase("prepare_subgraph_prompt", component=component_id):
         prompt = _rewrite_modal_asset_references(copy.deepcopy(normalized_payload["subgraph_prompt"]))
         _apply_boundary_inputs(
