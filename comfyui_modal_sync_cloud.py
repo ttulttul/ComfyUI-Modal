@@ -1183,6 +1183,59 @@ def _extract_prompt_executor_error(executor: Any) -> str:
     return "Remote subgraph execution failed."
 
 
+def _extract_prompt_executor_error_payload(executor: Any) -> dict[str, Any] | None:
+    """Return the most recent PromptExecutor execution_error payload when present."""
+    for event, data in reversed(executor.status_messages):
+        if event == "execution_error" and isinstance(data, dict):
+            return data
+    return None
+
+
+def _summarize_suspicious_prompt_inputs(prompt: dict[str, Any]) -> list[str]:
+    """Return compact descriptions of prompt inputs that still look list-wrapped."""
+    findings: list[str] = []
+    for node_id, node_info in sorted(prompt.items()):
+        inputs = node_info.get("inputs") or {}
+        for input_name, input_value in inputs.items():
+            if isinstance(input_value, list) and len(input_value) == 1:
+                findings.append(f"{node_id}.{input_name}={input_value!r}")
+                continue
+            if (
+                isinstance(input_value, list)
+                and len(input_value) == 2
+                and isinstance(input_value[0], str)
+                and isinstance(input_value[1], list)
+            ):
+                findings.append(f"{node_id}.{input_name}={input_value!r}")
+    return findings
+
+
+def _log_prompt_executor_failure_details(
+    *,
+    component_id: str,
+    prompt: dict[str, Any],
+    normalized_payload: dict[str, Any],
+    executor: Any,
+) -> None:
+    """Emit high-signal diagnostics for one remote PromptExecutor failure."""
+    error_payload = _extract_prompt_executor_error_payload(executor)
+    suspicious_inputs = _summarize_suspicious_prompt_inputs(prompt)
+    logger.error(
+        "Remote PromptExecutor failed for component=%s execute_node_ids=%s boundary_outputs=%s suspicious_inputs=%s error_payload=%s",
+        component_id,
+        normalized_payload.get("execute_node_ids", []),
+        [
+            {
+                "node_id": boundary_output.get("node_id"),
+                "output_index": boundary_output.get("output_index"),
+            }
+            for boundary_output in normalized_payload.get("boundary_outputs", [])
+        ],
+        suspicious_inputs,
+        error_payload,
+    )
+
+
 def _normalize_link_output_index(value: Any) -> Any:
     """Unwrap a singleton list around a prompt-link output index when present."""
     while isinstance(value, list) and len(value) == 1:
@@ -1293,6 +1346,12 @@ def _execute_subgraph_prompt(
                 )
             executor = executor_state.executor
         if not executor.success:
+            _log_prompt_executor_failure_details(
+                component_id=component_id,
+                prompt=prompt,
+                normalized_payload=normalized_payload,
+                executor=executor,
+            )
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
 
         outputs: list[Any] = []
