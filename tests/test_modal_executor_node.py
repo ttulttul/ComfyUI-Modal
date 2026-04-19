@@ -680,6 +680,88 @@ def test_modal_cloud_raises_after_exhausting_open_file_reload_retries(
     )
 
 
+def test_modal_cloud_proceeds_when_referenced_volume_paths_are_already_visible(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Persistent open-file reload errors may be ignored when the payload's mounted files are already visible."""
+
+    class FakeVolume:
+        """Simple Modal volume double that always fails with open files."""
+
+        def __init__(self) -> None:
+            """Initialize the reload attempt counter."""
+            self.reload_calls = 0
+
+        def reload(self) -> None:
+            """Always fail with the same open-file reload error."""
+            self.reload_calls += 1
+            raise RuntimeError("there are open files preventing the operation")
+
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    asset_path = storage_root / "assets" / "hash_model.safetensors"
+    asset_path.parent.mkdir(parents=True, exist_ok=True)
+    asset_path.write_bytes(b"weights")
+    bundle_path = storage_root / "custom_nodes" / "hash_bundle.zip"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_bytes(b"bundle")
+
+    recorded_markers: list[str] = []
+    prepare_calls: list[str] = []
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_prepare_for_modal_volume_reload",
+        lambda: prepare_calls.append("prepared"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_sleep_before_modal_volume_reload_retry",
+        lambda delay_seconds: sleep_calls.append(delay_seconds),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_record_modal_volume_reload_marker",
+        lambda marker: recorded_markers.append(marker),
+    )
+
+    payload = {
+        "custom_nodes_bundle": str(bundle_path),
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": str(asset_path)},
+            }
+        },
+    }
+
+    volume = FakeVolume()
+    modal_cloud_module._reload_modal_volume_for_request(
+        volume,
+        "component-1",
+        reload_marker="marker-1",
+        payload=payload,
+    )
+
+    assert volume.reload_calls == len(
+        modal_cloud_module._MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS
+    )
+    assert recorded_markers == ["marker-1"]
+    assert prepare_calls == ["prepared"] * (
+        len(modal_cloud_module._MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS) - 1
+    )
+    assert sleep_calls == list(
+        modal_cloud_module._MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS[1:]
+    )
+
+
 def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
     modal_cloud_module: Any,
     monkeypatch: Any,
