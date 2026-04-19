@@ -251,6 +251,7 @@ Current mapped-execution rules:
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible
 - per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item
 - streamed per-item progress lanes now follow the real executing node id instead of being forced onto the component representative node, so concurrent remote samplers no longer all paint their progress bars onto the first node in the remote island
+- worker lanes no longer emit a placeholder progress bar on the component representative node before real node progress arrives, which avoids leaving stray lane bars behind on the first node in the remote island
 - the proxy node itself now opts into ComfyUI `INPUT_IS_LIST` handling and unwraps singleton list wrappers on both `original_node_data` and ordinary inputs before dispatch, so list-valued mapped inputs reach the internal Modal scheduler without causing the whole proxy node to be auto-mapped once per item
 - static and per-item sub-runs prune the rewritten prompt to only the nodes they actually depend on before handing it to `PromptExecutor`, so shared-upstream hybrid components do not validate the other branch's batched inputs during the wrong sub-run
 

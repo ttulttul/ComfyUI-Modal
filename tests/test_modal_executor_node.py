@@ -1795,7 +1795,8 @@ def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
     lane_updates = [update for update in progress_updates if update.get("lane_id") is not None]
     assert aggregate_updates[-1]["value"] == 4.0
     assert {update["lane_id"] for update in lane_updates} == {"0", "1"}
-    assert any(update.get("clear") is True for update in lane_updates)
+    assert lane_updates
+    assert all(update.get("clear") is True for update in lane_updates)
 
 
 def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
