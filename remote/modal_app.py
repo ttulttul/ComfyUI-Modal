@@ -244,6 +244,12 @@ def _resolve_required_subgraph_nodes(
     logger.info("Resolving dependency closure for remote execute targets: %s", execute_node_ids)
     while pending:
         node_id = str(pending.pop())
+        if node_id not in prompt:
+            logger.warning(
+                "Skipping missing remote execute target %s while resolving dependency closure.",
+                node_id,
+            )
+            continue
         if node_id in required:
             continue
         required.add(node_id)
@@ -262,12 +268,27 @@ def _trim_subgraph_payload_to_required_nodes(payload: dict[str, Any]) -> dict[st
     if not isinstance(prompt, dict):
         return trimmed_payload
 
+    prompt_node_ids = {str(node_id) for node_id in prompt}
+    requested_execute_node_ids = [
+        str(node_id) for node_id in trimmed_payload.get("execute_node_ids", [])
+    ]
+    available_execute_node_ids = [
+        node_id for node_id in requested_execute_node_ids if node_id in prompt_node_ids
+    ]
+    dropped_execute_node_ids = [
+        node_id for node_id in requested_execute_node_ids if node_id not in prompt_node_ids
+    ]
+    if dropped_execute_node_ids:
+        logger.warning(
+            "Dropping remote execute targets absent from subgraph prompt for component=%s: %s",
+            payload.get("component_id"),
+            dropped_execute_node_ids,
+        )
+
     required_node_ids = set(
         _resolve_required_subgraph_nodes(
             prompt=prompt,
-            execute_node_ids=[
-                str(node_id) for node_id in trimmed_payload.get("execute_node_ids", [])
-            ],
+            execute_node_ids=available_execute_node_ids,
         )
     )
     if not required_node_ids:

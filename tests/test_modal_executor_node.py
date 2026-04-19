@@ -1857,6 +1857,44 @@ def test_trim_subgraph_payload_to_required_nodes_drops_unrelated_mapped_branch(
     assert trimmed_payload["static_execute_node_ids"] == ["3"]
 
 
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_trim_subgraph_payload_to_required_nodes_drops_stale_execute_targets(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Trimmed subgraph payloads should ignore execute targets that are absent from the current prompt."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    payload = {
+        "component_id": "1::static",
+        "component_node_ids": ["1", "3"],
+        "subgraph_prompt": {
+            "1": {"class_type": "LoadDiffusionModel", "inputs": {}},
+            "3": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "steps": 20}},
+        },
+        "boundary_inputs": [],
+        "boundary_outputs": [
+            {"node_id": "3", "output_index": 0, "io_type": "LATENT", "is_list": False},
+        ],
+        "execute_node_ids": ["3", "5"],
+        "mapped_execute_node_ids": [],
+        "static_execute_node_ids": ["3", "5"],
+    }
+
+    trimmed_payload = target_module._trim_subgraph_payload_to_required_nodes(payload)
+
+    assert trimmed_payload["component_node_ids"] == ["1", "3"]
+    assert list(trimmed_payload["subgraph_prompt"].keys()) == ["1", "3"]
+    assert trimmed_payload["execute_node_ids"] == ["3"]
+    assert trimmed_payload["mapped_execute_node_ids"] == []
+    assert trimmed_payload["static_execute_node_ids"] == ["3"]
+
+
 def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_previews(
     remote_modal_app_module: Any,
     serialization_module: Any,
