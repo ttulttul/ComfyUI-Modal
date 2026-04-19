@@ -1183,6 +1183,38 @@ def _extract_prompt_executor_error(executor: Any) -> str:
     return "Remote subgraph execution failed."
 
 
+def _normalize_link_output_index(value: Any) -> Any:
+    """Unwrap a singleton list around a prompt-link output index when present."""
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], int | float):
+        return value[0]
+    return value
+
+
+def _normalize_subgraph_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a subgraph payload with canonical prompt-link and output-index shapes."""
+    normalized_payload = copy.deepcopy(payload)
+
+    for node_info in normalized_payload.get("subgraph_prompt", {}).values():
+        inputs = node_info.get("inputs") or {}
+        for input_name, input_value in list(inputs.items()):
+            if not isinstance(input_value, list) or len(input_value) != 2:
+                continue
+            if not isinstance(input_value[0], str):
+                continue
+            inputs[input_name] = [
+                input_value[0],
+                _normalize_link_output_index(input_value[1]),
+            ]
+
+    for boundary_output in normalized_payload.get("boundary_outputs", []):
+        if "output_index" in boundary_output:
+            boundary_output["output_index"] = _normalize_link_output_index(
+                boundary_output["output_index"]
+            )
+
+    return normalized_payload
+
+
 def _execute_subgraph_prompt(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
@@ -1194,11 +1226,12 @@ def _execute_subgraph_prompt(
 ) -> tuple[Any, ...]:
     """Execute a remote component prompt and return its exported outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
+    normalized_payload = _normalize_subgraph_payload(payload)
     with _timed_phase("prepare_subgraph_prompt", component=component_id):
-        prompt = _rewrite_modal_asset_references(copy.deepcopy(payload["subgraph_prompt"]))
+        prompt = _rewrite_modal_asset_references(copy.deepcopy(normalized_payload["subgraph_prompt"]))
         _apply_boundary_inputs(
             prompt=prompt,
-            boundary_input_specs=list(payload.get("boundary_inputs", [])),
+            boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
             hydrated_inputs=hydrated_inputs,
         )
     with _timed_phase("load_execution_module", component=component_id):
@@ -1231,7 +1264,7 @@ def _execute_subgraph_prompt(
                 custom_nodes_root=custom_nodes_root,
             )
         prompt_server.configure_boundary_output_stream(
-            boundary_outputs=list(payload.get("boundary_outputs", [])),
+            boundary_outputs=list(normalized_payload.get("boundary_outputs", [])),
             lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
         )
         with executor_state.lock:
@@ -1239,13 +1272,13 @@ def _execute_subgraph_prompt(
             with _timed_phase(
                 "prompt_executor_execute",
                 component=component_id,
-                execute_nodes=list(payload.get("execute_node_ids", [])),
+                execute_nodes=list(normalized_payload.get("execute_node_ids", [])),
             ):
                 executor_state.executor.execute(
                     prompt=prompt,
                     prompt_id=component_id,
-                    extra_data=copy.deepcopy(payload.get("extra_data") or {}),
-                    execute_outputs=list(payload.get("execute_node_ids", [])),
+                    extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
+                    execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
                 )
             executor = executor_state.executor
         if not executor.success:
@@ -1255,9 +1288,9 @@ def _execute_subgraph_prompt(
         with _timed_phase(
             "collect_boundary_outputs",
             component=component_id,
-            output_count=len(payload.get("boundary_outputs", [])),
+            output_count=len(normalized_payload.get("boundary_outputs", [])),
         ):
-            for boundary_output in payload.get("boundary_outputs", []):
+            for boundary_output in normalized_payload.get("boundary_outputs", []):
                 node_id = str(boundary_output["node_id"])
                 output_index = int(boundary_output["output_index"])
                 cache_entry = executor.caches.outputs.get(node_id)
