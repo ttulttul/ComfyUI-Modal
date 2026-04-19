@@ -2498,7 +2498,7 @@ def test_local_remote_app_normalizes_wrapped_subgraph_link_indexes(
                 },
                 "remote_2": {
                     "class_type": "BoundarySink",
-                    "inputs": {"value": ["remote_1", [0]]},
+                    "inputs": {"value": [[["remote_1", [0]]]]},
                     "_meta": {},
                 },
             },
@@ -2512,7 +2512,7 @@ def test_local_remote_app_normalizes_wrapped_subgraph_link_indexes(
                 {
                     "proxy_output_name": "remote_2_value",
                     "node_id": "remote_2",
-                    "output_index": [0],
+                    "output_index": [[0]],
                     "io_type": "INT",
                     "is_list": False,
                 }
