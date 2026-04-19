@@ -1191,14 +1191,11 @@ def _build_component_payload(
     component: RemoteComponentPlan,
     component_prompt: dict[str, Any],
     extra_data: dict[str, Any] | None,
-    synced_assets: list[SyncedAsset],
+    requires_volume_reload: bool,
+    volume_reload_marker: str | None,
     custom_nodes_bundle: SyncedAsset | None,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
-    requires_volume_reload = any(asset.uploaded for asset in synced_assets) or (
-        custom_nodes_bundle is not None and custom_nodes_bundle.uploaded
-    )
-    volume_reload_marker = uuid.uuid4().hex if requires_volume_reload else None
     payload = {
         "payload_kind": "mapped_subgraph" if component.mapped_boundary_input_name else "subgraph",
         "component_id": component.representative_node_id,
@@ -1377,6 +1374,28 @@ def rewrite_prompt_for_modal(
             resolved_settings.execution_mode,
         )
 
+    synced_component_prompts: dict[str, dict[str, Any]] = {}
+    for component in components:
+        component_prompt, synced_assets = _sync_component_prompt_inputs(
+            component=component,
+            rewritten_prompt=rewritten_prompt,
+            sync_engine=resolved_sync_engine,
+        )
+        synced_component_prompts[component.representative_node_id] = component_prompt
+        summary.synced_assets.extend(synced_assets)
+
+    requires_volume_reload = any(asset.uploaded for asset in summary.synced_assets) or (
+        summary.custom_nodes_bundle is not None and summary.custom_nodes_bundle.uploaded
+    )
+    volume_reload_marker = uuid.uuid4().hex if requires_volume_reload else None
+    logger.info(
+        "Resolved request-wide Modal volume reload requirement: requires_volume_reload=%s volume_reload_marker=%s synced_assets=%d custom_nodes_uploaded=%s",
+        requires_volume_reload,
+        volume_reload_marker,
+        len(summary.synced_assets),
+        bool(summary.custom_nodes_bundle is not None and summary.custom_nodes_bundle.uploaded),
+    )
+
     for component in components:
         summary.remote_component_ids.append(component.representative_node_id)
         summary.component_node_ids_by_representative[component.representative_node_id] = list(
@@ -1390,17 +1409,12 @@ def rewrite_prompt_for_modal(
             component.representative_node_id,
             component.node_ids,
         )
-        component_prompt, synced_assets = _sync_component_prompt_inputs(
-            component=component,
-            rewritten_prompt=rewritten_prompt,
-            sync_engine=resolved_sync_engine,
-        )
-        summary.synced_assets.extend(synced_assets)
         payload = _build_component_payload(
             component=component,
-            component_prompt=component_prompt,
+            component_prompt=synced_component_prompts[component.representative_node_id],
             extra_data=extra_data,
-            synced_assets=synced_assets,
+            requires_volume_reload=requires_volume_reload,
+            volume_reload_marker=volume_reload_marker,
             custom_nodes_bundle=summary.custom_nodes_bundle,
         )
         _rewrite_component_into_proxy(

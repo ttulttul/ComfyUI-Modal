@@ -409,6 +409,113 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
     assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 
 
+def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """All components in one rewritten prompt should share one reload marker and decision."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteImage": _FakeRemoteImageNode,
+                "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteImage",
+            "inputs": {},
+            "_meta": {"title": "Remote Image"},
+        },
+        "2": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["1", 0]},
+            "_meta": {"title": "Remote Image Consumer"},
+        },
+        "3": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["2", 0]},
+            "_meta": {"title": "Local Sink"},
+        },
+    }
+
+    uploaded_asset = sync_engine_module.SyncedAsset(
+        local_path=tmp_path / "uploaded.bin",
+        remote_path="/assets/uploaded.bin",
+        sha256="uploaded",
+        uploaded=True,
+    )
+
+    def fake_sync_component_prompt_inputs(
+        *,
+        component: Any,
+        rewritten_prompt: dict[str, Any],
+        sync_engine: Any,
+    ) -> tuple[dict[str, Any], list[Any]]:
+        if component.representative_node_id == "1":
+            return {"1": rewritten_prompt["1"]}, []
+        return {"2": rewritten_prompt["2"]}, [uploaded_asset]
+
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_sync_component_prompt_inputs",
+        fake_sync_component_prompt_inputs,
+    )
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    first_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    second_payload = rewritten_prompt["2"]["inputs"]["original_node_data"]
+
+    assert summary.remote_component_ids == ["1", "2"]
+    assert summary.synced_assets == [uploaded_asset]
+    assert first_payload["requires_volume_reload"] is True
+    assert second_payload["requires_volume_reload"] is True
+    assert isinstance(first_payload["volume_reload_marker"], str)
+    assert first_payload["volume_reload_marker"]
+    assert first_payload["volume_reload_marker"] == second_payload["volume_reload_marker"]
+
+
 def test_rewrite_merges_cyclic_coarse_components_back_into_single_proxy(
     api_intercept_module: Any,
     settings_module: Any,
