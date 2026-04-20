@@ -41,5 +41,6 @@ Partial-completion semantics for one proxy would require ComfyUI scheduler behav
 ### Remaining work
 
 - Online testing confirmed that `RemoteEngine(session_affinity_key)` kept the split static and mapped proxies on the same deployed Modal worker for the tested workflow.
+- Online testing also exposed one implicit-mapped runtime edge: list-backed `CONDITIONING` inputs must stay broadcast across mapped item runs. That regression is now covered so future batching changes do not reintroduce the `convert_cond` failure shape.
 - Run with `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS=true` during broader production workflows and watch the mirrored session lifecycle logs for any real session misses under scale-out.
 - If production logs ever show split-proxy session misses under real scale-out, add a stronger affinity fallback or explicit leased-worker/session routing instead of relying on best-effort class-instance affinity.

@@ -3529,6 +3529,93 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
     ]
 
 
+def test_implicitly_mapped_subgraph_keeps_conditioning_lists_broadcast(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit mapped execution must not split list-backed CONDITIONING inputs per item."""
+    conditioning = [
+        ["cond-a", {"pooled_output": "pool-a"}],
+        ["cond-b", {"pooled_output": "pool-b"}],
+    ]
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+
+        if execute_node_ids != ("12",):
+            raise AssertionError(
+                f"Unexpected execute nodes for conditioning implicit mapped regression: {execute_node_ids!r}"
+            )
+        return serialization_module.serialize_node_outputs(
+            (f"{hydrated_inputs['remote_input_1']}:{len(hydrated_inputs['remote_input_0'])}",)
+        )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "positive": 0,
+                    "seed": 0,
+                },
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "12", "input_name": "positive"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": conditioning,
+                    "remote_input_1": [10, 11, 12, 13],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["10:2", "11:2", "12:2", "13:2"],
+    )
+    assert observed_calls == [
+        ("17::item:0", ("12",), {"remote_input_0": conditioning, "remote_input_1": 10}),
+        ("17::item:1", ("12",), {"remote_input_0": conditioning, "remote_input_1": 11}),
+        ("17::item:2", ("12",), {"remote_input_0": conditioning, "remote_input_1": 12}),
+        ("17::item:3", ("12",), {"remote_input_0": conditioning, "remote_input_1": 13}),
+    ]
+
+
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [

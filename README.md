@@ -390,6 +390,7 @@ COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
 - Before publishing, create a Comfy Registry publisher and API key, then store the token in the GitHub Actions secret `REGISTRY_ACCESS_TOKEN`.
 - The registry pack name is `modal-sync`, the display name is `Modal Sync`, and the current publisher id is set to `ttulttul` to match the GitHub origin owner.
 - [`modal_test_workflow.json`](modal_test_workflow.json) is a checked-in smoke artifact from a successful Modal-path run, not a pristine authoring workflow.
+- Implicit mapped execution only treats explicitly batchable transport types and list-wrapped primitive sockets as per-item inputs. List-backed semantic types like `CONDITIONING` stay broadcast across mapped item runs so the remote worker does not accidentally slice them into invalid fragments.
 
 ## Current limitations
 
