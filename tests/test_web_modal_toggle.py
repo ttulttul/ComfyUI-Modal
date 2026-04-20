@@ -153,6 +153,8 @@ def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     assert "const laneColors = [" in source
     assert 'const badgeText = hasBatchBadge' in source
     assert 'const badgeY = panelY + panelPaddingY;' in source
+    assert "if (detail.clear) {" in source
+    assert "clearNodeProgress(progressNodeId, promptId);" in source
     assert 'let laneY = barY;' in source
     assert "laneNodeIdsByLane: new Map()," in source
     assert "function deleteNodeProgressLane(nodeIdValue, promptId, laneId)" in source

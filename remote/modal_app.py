@@ -1093,6 +1093,34 @@ def _progress_stream_event_node_id(stream_event: dict[str, Any]) -> str | None:
     return None
 
 
+def _progress_stream_event_metadata(stream_event: dict[str, Any]) -> dict[str, str | None] | None:
+    """Return normalized metadata for one streamed progress event."""
+    reported_node_id = (
+        str(stream_event["node_id"])
+        if stream_event.get("node_id") is not None
+        else None
+    )
+    display_node_id = (
+        str(stream_event["display_node_id"])
+        if stream_event.get("display_node_id") is not None
+        else reported_node_id
+    )
+    real_node_id = (
+        str(stream_event["real_node_id"])
+        if stream_event.get("real_node_id") is not None
+        else None
+    )
+    filter_node_id = real_node_id or reported_node_id or display_node_id
+    if filter_node_id is None:
+        return None
+    return {
+        "node_id": reported_node_id or filter_node_id,
+        "display_node_id": display_node_id,
+        "real_node_id": real_node_id,
+        "filter_node_id": filter_node_id,
+    }
+
+
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
@@ -1277,13 +1305,17 @@ def _consume_remote_payload_stream(
     node_ids = [str(node_id) for node_id in payload.get("component_node_ids", [])]
     suppress_status_stream = bool(payload.get("suppress_status_stream"))
     result_payload: bytes | bytearray | None = None
+    suppressed_progress_node_metadata: dict[str, dict[str, str | None]] = {}
 
     for stream_event in stream_events:
         event_kind = str(stream_event.get("kind", ""))
         if event_kind == "progress":
             event_type = str(stream_event.get("event_type", ""))
             if event_type == "node_progress":
-                filter_node_id = _progress_stream_event_node_id(stream_event)
+                progress_metadata = _progress_stream_event_metadata(stream_event)
+                filter_node_id = (
+                    progress_metadata["filter_node_id"] if progress_metadata is not None else None
+                )
                 lane_id = (
                     str(stream_event["lane_id"])
                     if stream_event.get("lane_id") is not None
@@ -1307,23 +1339,27 @@ def _consume_remote_payload_stream(
                         stream_event.get("real_node_id"),
                     )
                     continue
-                reported_node_id = stream_event.get("node_id")
-                if reported_node_id is None:
-                    reported_node_id = filter_node_id
+                reported_node_id = (
+                    progress_metadata["node_id"] if progress_metadata is not None else None
+                )
                 if reported_node_id is not None:
                     display_node_id = (
-                        str(stream_event["display_node_id"])
-                        if stream_event.get("display_node_id") is not None
+                        progress_metadata["display_node_id"]
+                        if progress_metadata is not None
                         else str(reported_node_id)
                     )
                     real_node_id = (
-                        str(stream_event["real_node_id"])
-                        if stream_event.get("real_node_id") is not None
-                        else None
+                        progress_metadata["real_node_id"] if progress_metadata is not None else None
                     )
                     progress_node_id = real_node_id or display_node_id
                     if lane_id is not None:
                         _remember_mapped_lane_node_id(payload, lane_id, progress_node_id)
+                    elif suppress_status_stream and not aggregate_only and progress_metadata is not None:
+                        suppressed_progress_node_metadata[str(progress_metadata["filter_node_id"])] = {
+                            "node_id": str(reported_node_id),
+                            "display_node_id": display_node_id,
+                            "real_node_id": real_node_id,
+                        }
                     logger.debug(
                         "Forwarding streamed Modal node progress for component=%s node_id=%s real_node_id=%s value=%s max=%s lane_id=%s.",
                         payload.get("component_id"),
@@ -1453,6 +1489,20 @@ def _consume_remote_payload_stream(
                 stream_event.get("active_node_id"),
             )
             if suppress_status_stream:
+                remote_phase = str(stream_event.get("phase", "executing"))
+                if remote_phase in {"execution_success", "execution_error", "execution_interrupted"}:
+                    for progress_metadata in suppressed_progress_node_metadata.values():
+                        _emit_local_modal_progress(
+                            prompt_id=prompt_id,
+                            client_id=client_id,
+                            node_id=str(progress_metadata["node_id"]),
+                            value=0.0,
+                            max_value=1.0,
+                            display_node_id=progress_metadata["display_node_id"],
+                            real_node_id=progress_metadata["real_node_id"],
+                            clear=True,
+                        )
+                    suppressed_progress_node_metadata.clear()
                 continue
             remote_phase = str(stream_event.get("phase", "executing"))
             if remote_phase == "execution_success":

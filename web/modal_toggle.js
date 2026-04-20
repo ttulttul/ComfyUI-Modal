@@ -1613,6 +1613,10 @@ function handleModalProgress(event) {
     );
     return;
   }
+  if (detail.clear) {
+    clearNodeProgress(progressNodeId, promptId);
+    return;
+  }
   if (readyNodeIds.length > 0) {
     setNodesPhase(readyNodeIds, STATE_READY, promptId);
   }
