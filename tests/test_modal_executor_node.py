@@ -3653,6 +3653,88 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
     ]
 
 
+def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit fan-out should not split components whose list boundary lands on INPUT_IS_LIST nodes."""
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "ImplicitBatchListSource": _ImplicitBatchListSourceNode,
+                "ImplicitBatchScalarConsumer": _ImplicitBatchScalarConsumerNode,
+                "ImplicitBatchListConsumer": _ImplicitBatchListConsumerNode,
+            }
+        },
+    )()
+    monkeypatch.setattr(remote_modal_app_module, "_load_nodes_module", lambda: fake_nodes_module)
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+        return serialization_module.serialize_node_outputs(
+            ("scalar-output", ["list-output:0", "list-output:1", "list-output:2"])
+        )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["4", "12", "17"],
+        "execute_node_ids": ["4", "12"],
+        "subgraph_prompt": {
+            "17": {"class_type": "ImplicitBatchListSource", "inputs": {"values": 0}},
+            "4": {
+                "class_type": "ImplicitBatchScalarConsumer",
+                "inputs": {"value": ["17", 0]},
+            },
+            "12": {
+                "class_type": "ImplicitBatchListConsumer",
+                "inputs": {"values": ["17", 1]},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "17", "input_name": "values"}],
+            }
+        ],
+        "boundary_outputs": [
+            {"node_id": "4", "io_type": "STRING", "is_list": False},
+            {"node_id": "12", "io_type": "STRING", "is_list": True},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs({"remote_input_0": [10, 11, 12]}),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        "scalar-output",
+        ["list-output:0", "list-output:1", "list-output:2"],
+    )
+    assert observed_calls == [
+        ("17", ("4", "12"), {"remote_input_0": [10, 11, 12]}),
+    ]
+
+
 def test_implicitly_mapped_subgraph_clears_remote_session_once_after_all_items_finish(
     remote_modal_app_module: Any,
     serialization_module: Any,
@@ -5256,6 +5338,35 @@ class _PrimitiveEchoNode:
         assert isinstance(enabled, bool)
         assert isinstance(label, str)
         return (steps, cfg, enabled, label)
+
+
+class _ImplicitBatchListSourceNode:
+    """Fake node that consumes a whole list once and emits scalar and list outputs."""
+
+    RETURN_TYPES = ("INT", "INT")
+    RETURN_NAMES = ("first_value", "all_values")
+    OUTPUT_IS_LIST = (False, True)
+    INPUT_IS_LIST = True
+    FUNCTION = "run"
+
+
+class _ImplicitBatchScalarConsumerNode:
+    """Fake scalar consumer used for outer implicit batch regressions."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "run"
+
+
+class _ImplicitBatchListConsumerNode:
+    """Fake list-aware consumer used for outer implicit batch regressions."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (True,)
+    INPUT_IS_LIST = True
+    FUNCTION = "run"
 
 
 def test_local_remote_app_executes_subgraph_payload(

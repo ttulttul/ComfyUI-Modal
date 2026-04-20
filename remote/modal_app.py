@@ -2587,6 +2587,43 @@ def _split_batch_boundary_inputs(
     return split_inputs, next(iter(unique_counts))
 
 
+def _implicit_batch_input_is_list_target_node_ids(
+    payload: dict[str, Any],
+    split_inputs: dict[str, list[Any]],
+) -> list[str]:
+    """Return split-boundary target nodes that must consume the full list in one execution."""
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict):
+        return []
+
+    try:
+        resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
+    except ModuleNotFoundError:
+        logger.debug(
+            "Skipping INPUT_IS_LIST detection for implicit batching because ComfyUI nodes are unavailable."
+        )
+        return []
+    target_node_ids: set[str] = set()
+    for boundary_input in payload.get("boundary_inputs", []):
+        proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
+        if proxy_input_name not in split_inputs:
+            continue
+        for target in boundary_input.get("targets", []):
+            target_node_id = str(target.get("node_id") or "")
+            if not target_node_id:
+                continue
+            prompt_node = prompt.get(target_node_id)
+            if prompt_node is None:
+                continue
+            class_type = str(prompt_node.get("class_type"))
+            node_class = resolved_node_mapping.get(class_type)
+            if node_class is None:
+                continue
+            if bool(getattr(node_class, "INPUT_IS_LIST", False)):
+                target_node_ids.add(target_node_id)
+    return sorted(target_node_ids)
+
+
 def _partition_implicit_batched_execute_nodes(
     payload: dict[str, Any],
     split_inputs: dict[str, list[Any]],
@@ -2675,6 +2712,18 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         )
 
     split_inputs, total_items = split_batch_inputs
+    input_is_list_target_node_ids = _implicit_batch_input_is_list_target_node_ids(
+        payload,
+        split_inputs,
+    )
+    if input_is_list_target_node_ids:
+        logger.info(
+            "Executing implicitly batched Modal component=%s as one ordinary subgraph because split boundary inputs target INPUT_IS_LIST nodes=%s.",
+            payload.get("component_id"),
+            input_is_list_target_node_ids,
+        )
+        return await invoke_remote_engine_async(payload, kwargs_payload)
+
     parallelism = _mapped_execution_parallelism(total_items)
     refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
     ensure_remote_warm_capacity(
