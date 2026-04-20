@@ -1181,6 +1181,13 @@ def _node_output_cache_store() -> Any | None:
     return globals().get("node_output_cache")
 
 
+def _node_output_cache_key_preview(cache_key: str | None, *, max_chars: int = 32) -> str:
+    """Return a short human-readable prefix of one persisted node-cache key."""
+    if cache_key is None:
+        return "<none>"
+    return cache_key[:max_chars]
+
+
 def _canonicalize_node_output_cache_key_part(value: Any) -> Any | None:
     """Return a JSON-stable representation of one CacheKeySetInputSignature fragment."""
     value_type_name = type(value).__name__
@@ -1394,14 +1401,38 @@ async def _restore_persisted_node_output_cache_entries(
     restored_node_ids: list[str] = []
     for node_id in prompt:
         if outputs_cache.get(node_id) is not None:
+            _emit_cloud_info(
+                "Node output cache lookup node=%s result=local-hit",
+                node_id,
+            )
             continue
         cache_key = _node_output_cache_key(outputs_cache.cache_key_set.get_data_key(node_id))
         if cache_key is None:
+            _emit_cloud_info(
+                "Node output cache lookup node=%s key_prefix=%s result=skip reason=key-unhashable",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
             continue
-        cache_entry = _deserialize_node_output_cache_entry(execution, cache_store.get(cache_key))
+        raw_record = cache_store.get(cache_key)
+        cache_entry = _deserialize_node_output_cache_entry(execution, raw_record)
         if cache_entry is None:
+            result = "miss"
+            if raw_record is not None:
+                result = "miss-invalid"
+            _emit_cloud_info(
+                "Node output cache lookup node=%s key_prefix=%s result=%s",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+                result,
+            )
             continue
         outputs_cache.set(node_id, cache_entry)
+        _emit_cloud_info(
+            "Node output cache lookup node=%s key_prefix=%s result=hit",
+            node_id,
+            _node_output_cache_key_preview(cache_key),
+        )
         restored_node_ids.append(str(node_id))
     return restored_node_ids
 
@@ -1426,14 +1457,34 @@ def _persist_node_output_cache_entries(
     for node_id in prompt:
         cache_entry = outputs_cache.get(node_id)
         if cache_entry is None:
+            _emit_cloud_info(
+                "Node output cache write node=%s result=skip reason=no-local-cache-entry",
+                node_id,
+            )
             continue
         cache_key = _node_output_cache_key(cache_key_set.get_data_key(node_id))
         if cache_key is None:
+            _emit_cloud_info(
+                "Node output cache write node=%s key_prefix=%s result=skip reason=key-unhashable",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
             continue
         record = _serialize_node_output_cache_entry(cache_entry, max_bytes=max_bytes)
         if record is None:
+            _emit_cloud_info(
+                "Node output cache write node=%s key_prefix=%s result=skip reason=ineligible-or-oversize",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
             continue
         cache_store[cache_key] = record
+        _emit_cloud_info(
+            "Node output cache write node=%s key_prefix=%s result=write outputs_size_bytes=%s",
+            node_id,
+            _node_output_cache_key_preview(cache_key),
+            record.get("outputs_size_bytes"),
+        )
         persisted_node_ids.append(str(node_id))
     return persisted_node_ids
 
