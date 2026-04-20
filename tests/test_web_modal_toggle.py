@@ -106,7 +106,7 @@ def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
     source = _modal_toggle_source()
 
     assert "promptState.hasStreamedProgress = true;" in source
-    assert "if (promptState.hasStreamedProgress && phase !== STATE_ERROR)" in source
+    assert "if (promptState.hasStreamedProgress && phase === EXECUTION_PHASE)" in source
 
 
 def test_streamed_modal_execution_ends_synthetic_setup_without_waiting_for_final_executed() -> None:
@@ -157,8 +157,10 @@ def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     assert "clearNodeProgress(progressNodeId, promptId);" in source
     assert 'let laneY = barY;' in source
     assert "laneNodeIdsByLane: new Map()," in source
+    assert "representativeNodeIdByMember: new Map()," in source
     assert "function deleteNodeProgressLane(nodeIdValue, promptId, laneId)" in source
-    assert "promptState.laneNodeIdsByLane.set(safeLaneId, safeNodeIdValue);" in source
+    assert "function laneOwnerKey(promptId, nodeIdValue, laneId)" in source
+    assert "promptState.laneNodeIdsByLane.set(safeLaneKey, safeNodeIdValue);" in source
 
 
 def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
