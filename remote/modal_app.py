@@ -2522,8 +2522,17 @@ def _split_batch_boundary_inputs(
             continue
         io_type = str(boundary_input.get("io_type", "*"))
         input_value = hydrated_inputs[proxy_input_name]
-        if isinstance(input_value, list) and io_type not in (
+        is_session_ref_list = (
+            isinstance(input_value, list)
+            and len(input_value) > 0
+            and all(is_remote_session_value_ref_payload(item) for item in input_value)
+        )
+        if (
+            isinstance(input_value, list)
+            and not is_session_ref_list
+            and io_type not in (
             implicitly_batchable_scalar_io_types | implicitly_batchable_transport_io_types
+            )
         ):
             logger.info(
                 "Skipping implicit batch split for boundary input %s io_type=%s because list-backed non-scalar values stay broadcast.",
