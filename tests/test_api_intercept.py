@@ -1168,6 +1168,176 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
     assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]
 
 
+def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_upstream(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Unmapped remote execute siblings should become ordered proxies when they only share remote-only upstream state."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRemoteModelNode,
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "LatentSource": _FakeLatentSourceNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+            {"id": 5, "properties": {"is_modal_remote": False}},
+            {"id": 6, "properties": {"is_modal_remote": True}},
+            {"id": 7, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {},
+            "_meta": {"title": "Shared Model"},
+        },
+        "2": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Latent A"},
+        },
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["2", 0]},
+            "_meta": {"title": "Sampler A"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["3", 0]},
+            "_meta": {"title": "Sink A"},
+        },
+        "5": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Latent B"},
+        },
+        "6": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["5", 0]},
+            "_meta": {"title": "Sampler B"},
+        },
+        "7": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["6", 0]},
+            "_meta": {"title": "Sink B"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert set(rewritten_prompt) == {"2", "3", "4", "5", "6", "7"}
+    assert summary.remote_component_ids == ["3", "6"]
+    assert summary.component_node_ids_by_representative == {
+        "3": ["1", "3"],
+        "6": ["6"],
+    }
+    assert summary.component_dependency_ids_by_representative == {
+        "3": [],
+        "6": ["3"],
+    }
+    assert summary.component_execution_stages == [["3"], ["6"]]
+    assert summary.rewritten_node_id_map["1"] == "3"
+    assert summary.rewritten_node_id_map["3"] == "3"
+    assert summary.rewritten_node_id_map["6"] == "6"
+
+    first_payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
+    second_payload = rewritten_prompt["6"]["inputs"]["original_node_data"]
+
+    assert first_payload["payload_kind"] == "subgraph"
+    assert first_payload["component_node_ids"] == ["1", "3"]
+    assert first_payload["boundary_inputs"] == [
+        {
+            "proxy_input_name": "remote_input_0",
+            "io_type": "LATENT",
+            "targets": [{"node_id": "3", "input_name": "latent"}],
+        }
+    ]
+    assert first_payload["boundary_outputs"][0] == {
+        "proxy_output_name": "3_latent",
+        "node_id": "3",
+        "output_index": 0,
+        "io_type": "LATENT",
+        "is_list": False,
+        "preview_target_node_ids": [],
+    }
+    assert first_payload["boundary_outputs"][1]["node_id"] == "1"
+    assert first_payload["boundary_outputs"][1]["output_index"] == 0
+    assert first_payload["boundary_outputs"][1]["io_type"] == "MODEL"
+    assert first_payload["boundary_outputs"][1]["session_output"] is True
+    assert first_payload["execute_node_ids"] == ["3"]
+    assert first_payload["remote_session"]["owner_component_id"] == "1"
+
+    assert second_payload["payload_kind"] == "subgraph"
+    assert second_payload["component_node_ids"] == ["6"]
+    assert second_payload["boundary_inputs"] == [
+        {
+            "proxy_input_name": "remote_input_1",
+            "io_type": "LATENT",
+            "targets": [{"node_id": "6", "input_name": "latent"}],
+        },
+        {
+            "proxy_input_name": first_payload["boundary_outputs"][1]["proxy_output_name"],
+            "io_type": "MODEL",
+            "targets": [{"node_id": "6", "input_name": "model"}],
+        },
+    ]
+    assert second_payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "6_latent",
+            "node_id": "6",
+            "output_index": 0,
+            "io_type": "LATENT",
+            "is_list": False,
+            "preview_target_node_ids": [],
+        }
+    ]
+    assert second_payload["execute_node_ids"] == ["6"]
+    assert second_payload["clear_remote_session"] is True
+    assert second_payload["remote_session"]["session_id"] == first_payload["remote_session"]["session_id"]
+    assert rewritten_prompt["6"]["inputs"][first_payload["boundary_outputs"][1]["proxy_output_name"]] == ["3", 1]
+    assert rewritten_prompt["4"]["inputs"]["image"] == ["3", 0]
+    assert rewritten_prompt["7"]["inputs"]["image"] == ["6", 0]
+
+
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
     api_intercept_module: Any,
     settings_module: Any,

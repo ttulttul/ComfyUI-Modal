@@ -84,6 +84,17 @@ class StaticToMappedBoundarySpec:
     targets: list[InputTarget] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ProducedPhaseOutputSpec:
+    """Describe one output published by an earlier split-proxy phase."""
+
+    proxy_output_name: str
+    source: LinkedOutputRef
+    io_type: str
+    is_list: bool
+    session_output: bool = False
+
+
 @dataclass
 class RemoteComponentPlan:
     """Execution and rewrite plan for one connected remote component."""
@@ -1355,6 +1366,83 @@ def _component_downstream_closure(
     return reachable_node_ids
 
 
+def _component_upstream_closure(
+    *,
+    prompt: dict[str, Any],
+    seed_node_ids: set[str],
+    candidate_node_ids: set[str],
+) -> set[str]:
+    """Return one candidate-local upstream closure for the supplied seed nodes."""
+    reachable_node_ids: set[str] = set()
+    pending_node_ids = list(sorted(seed_node_ids))
+
+    while pending_node_ids:
+        current_node_id = pending_node_ids.pop()
+        if current_node_id in reachable_node_ids or current_node_id not in candidate_node_ids:
+            continue
+        reachable_node_ids.add(current_node_id)
+        prompt_node = prompt.get(current_node_id)
+        if prompt_node is None:
+            continue
+        for input_value in (prompt_node.get("inputs") or {}).values():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            if upstream_node_id in candidate_node_ids:
+                pending_node_ids.append(upstream_node_id)
+    return reachable_node_ids
+
+
+def _subgraph_topological_node_order(
+    prompt: dict[str, Any],
+    node_ids: set[str],
+) -> list[str]:
+    """Return one best-effort topological order for a prompt node subset."""
+    indegree_by_node_id: dict[str, int] = {node_id: 0 for node_id in node_ids}
+    downstream_node_ids_by_node_id: dict[str, set[str]] = {
+        node_id: set() for node_id in node_ids
+    }
+
+    for node_id in sorted(node_ids):
+        prompt_node = prompt.get(node_id)
+        if prompt_node is None:
+            continue
+        for input_value in (prompt_node.get("inputs") or {}).values():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            if upstream_node_id not in node_ids:
+                continue
+            if node_id in downstream_node_ids_by_node_id[upstream_node_id]:
+                continue
+            downstream_node_ids_by_node_id[upstream_node_id].add(node_id)
+            indegree_by_node_id[node_id] += 1
+
+    ready_node_ids = deque(sorted(
+        node_id
+        for node_id, indegree in indegree_by_node_id.items()
+        if indegree == 0
+    ))
+    ordered_node_ids: list[str] = []
+
+    while ready_node_ids:
+        node_id = ready_node_ids.popleft()
+        ordered_node_ids.append(node_id)
+        for downstream_node_id in sorted(downstream_node_ids_by_node_id[node_id]):
+            indegree_by_node_id[downstream_node_id] -= 1
+            if indegree_by_node_id[downstream_node_id] == 0:
+                ready_node_ids.append(downstream_node_id)
+
+    if len(ordered_node_ids) == len(node_ids):
+        return ordered_node_ids
+
+    logger.warning(
+        "Component phase planning encountered a node-level cycle; falling back to stable node order for %s.",
+        sorted(node_ids),
+    )
+    return sorted(node_ids)
+
+
 def _build_component_plans(
     prompt: dict[str, Any],
     remote_node_ids: set[str],
@@ -1524,6 +1612,7 @@ def _build_component_payload(
     custom_nodes_bundle: SyncedAsset | None,
     uploaded_volume_paths: list[str],
     terminate_container_on_error: bool,
+    nodes_module: Any,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
     prompt_id = (extra_data or {}).get("prompt_id")
@@ -1576,6 +1665,216 @@ def _build_component_payload(
         if mapped_progress_display_node_id is not None:
             payload["mapped_progress_display_node_id"] = mapped_progress_display_node_id
         return payload
+
+    def build_phase_payloads_for_transportable_splits() -> list[dict[str, Any]] | None:
+        """Return ordered split-proxy phase payloads for a non-mapped coarse component."""
+        if component.mapped_boundary_input_name is not None or len(component.execute_node_ids) <= 1:
+            return None
+
+        component_node_id_set = set(component.node_ids)
+        topological_node_ids = _subgraph_topological_node_order(component_prompt, component_node_id_set)
+        remaining_node_ids = set(component.node_ids)
+        remaining_execute_node_ids = [
+            node_id
+            for node_id in topological_node_ids
+            if node_id in set(component.execute_node_ids)
+        ]
+        if len(remaining_execute_node_ids) <= 1:
+            return None
+
+        phase_payloads: list[dict[str, Any]] = []
+        produced_outputs_by_source: dict[LinkedOutputRef, ProducedPhaseOutputSpec] = {}
+        local_boundary_outputs_by_source = {
+            boundary_output.source: boundary_output
+            for boundary_output in component.boundary_outputs
+        }
+        bridge_output_counter = 0
+
+        while remaining_execute_node_ids:
+            target_node_id = remaining_execute_node_ids[0]
+            phase_node_ids = sorted(
+                _component_upstream_closure(
+                    prompt=component_prompt,
+                    seed_node_ids={target_node_id},
+                    candidate_node_ids=remaining_node_ids,
+                )
+            )
+            phase_node_id_set = set(phase_node_ids)
+            if not phase_node_ids:
+                raise ModalPromptValidationError(
+                    f"Unable to derive split phase nodes for remote component {component.representative_node_id}."
+                )
+
+            phase_boundary_inputs = _filter_boundary_inputs_for_node_ids(
+                component.boundary_inputs,
+                phase_node_id_set,
+            )
+            phase_boundary_inputs_by_name = {
+                boundary_input.proxy_input_name: boundary_input
+                for boundary_input in phase_boundary_inputs
+            }
+            for phase_node_id in phase_node_ids:
+                prompt_node = component_prompt.get(phase_node_id)
+                if prompt_node is None:
+                    continue
+                for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+                    if not _is_link(input_value):
+                        continue
+                    source = LinkedOutputRef(
+                        node_id=str(input_value[0]),
+                        output_index=int(input_value[1]),
+                    )
+                    if source.node_id in phase_node_id_set:
+                        continue
+                    produced_output = produced_outputs_by_source.get(source)
+                    if produced_output is None:
+                        continue
+                    boundary_input = phase_boundary_inputs_by_name.get(produced_output.proxy_output_name)
+                    if boundary_input is None:
+                        boundary_input = BoundaryInputSpec(
+                            proxy_input_name=produced_output.proxy_output_name,
+                            source=source,
+                            io_type=produced_output.io_type,
+                        )
+                        phase_boundary_inputs.append(boundary_input)
+                        phase_boundary_inputs_by_name[boundary_input.proxy_input_name] = boundary_input
+                    boundary_input.targets.append(
+                        InputTarget(node_id=phase_node_id, input_name=str(input_name))
+                    )
+
+            phase_boundary_outputs: list[dict[str, Any]] = []
+            phase_output_names_by_source: dict[LinkedOutputRef, str] = {}
+            for boundary_output in _filter_boundary_outputs_for_node_ids(
+                component.boundary_outputs,
+                phase_node_id_set,
+            ):
+                phase_boundary_outputs.append(
+                    {
+                        "proxy_output_name": boundary_output.proxy_output_name,
+                        "node_id": boundary_output.source.node_id,
+                        "output_index": boundary_output.source.output_index,
+                        "io_type": boundary_output.io_type,
+                        "is_list": boundary_output.is_list,
+                        "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+                    }
+                )
+                phase_output_names_by_source[boundary_output.source] = boundary_output.proxy_output_name
+
+            pending_node_ids = remaining_node_ids - phase_node_id_set
+            for pending_node_id in sorted(pending_node_ids):
+                prompt_node = component_prompt.get(pending_node_id)
+                if prompt_node is None:
+                    continue
+                for input_value in (prompt_node.get("inputs") or {}).values():
+                    if not _is_link(input_value):
+                        continue
+                    source = LinkedOutputRef(
+                        node_id=str(input_value[0]),
+                        output_index=int(input_value[1]),
+                    )
+                    if source.node_id not in phase_node_id_set or source in produced_outputs_by_source:
+                        continue
+                    local_boundary_output = local_boundary_outputs_by_source.get(source)
+                    io_type = (
+                        local_boundary_output.io_type
+                        if local_boundary_output is not None
+                        else str(
+                            _remote_output_io_type(
+                                prompt=component_prompt,
+                                node_id=source.node_id,
+                                output_index=source.output_index,
+                                nodes_module=nodes_module,
+                            )
+                            or "*"
+                        )
+                    )
+                    is_list = (
+                        local_boundary_output.is_list
+                        if local_boundary_output is not None
+                        else _remote_output_is_list(
+                            prompt=component_prompt,
+                            node_id=source.node_id,
+                            output_index=source.output_index,
+                            nodes_module=nodes_module,
+                        )
+                    )
+                    proxy_output_name = phase_output_names_by_source.get(source)
+                    if proxy_output_name is None:
+                        proxy_output_name = f"phase_bridge_{bridge_output_counter}"
+                        bridge_output_counter += 1
+                        phase_boundary_outputs.append(
+                            {
+                                "proxy_output_name": proxy_output_name,
+                                "node_id": source.node_id,
+                                "output_index": source.output_index,
+                                "io_type": io_type,
+                                "is_list": is_list,
+                                "preview_target_node_ids": [],
+                                "session_output": not _is_transportable_output_type(io_type),
+                            }
+                        )
+                        phase_output_names_by_source[source] = proxy_output_name
+                    produced_outputs_by_source[source] = ProducedPhaseOutputSpec(
+                        proxy_output_name=proxy_output_name,
+                        source=source,
+                        io_type=io_type,
+                        is_list=is_list,
+                        session_output=not _is_transportable_output_type(io_type),
+                    )
+
+            phase_execute_node_ids = [
+                node_id
+                for node_id in component.execute_node_ids
+                if node_id in phase_node_id_set
+            ]
+            phase_payloads.append(
+                build_subgraph_payload(
+                    component_id=str(target_node_id),
+                    component_node_ids=phase_node_ids,
+                    boundary_inputs=phase_boundary_inputs,
+                    boundary_outputs=phase_boundary_outputs,
+                    execute_node_ids=phase_execute_node_ids,
+                )
+            )
+            remaining_node_ids -= phase_node_id_set
+            remaining_execute_node_ids = [
+                node_id for node_id in remaining_execute_node_ids if node_id not in phase_node_id_set
+            ]
+
+        has_session_bridges = any(
+            bool(boundary_output.get("session_output"))
+            for phase_payload in phase_payloads
+            for boundary_output in phase_payload.get("boundary_outputs", [])
+        )
+        if not phase_payloads or len(phase_payloads) <= 1:
+            return None
+        if has_session_bridges:
+            remote_session = RemoteSessionHandle(
+                session_id=uuid.uuid4().hex,
+                prompt_id=(str(prompt_id) if prompt_id is not None else None),
+                owner_component_id=component.representative_node_id,
+            ).to_payload()
+            for phase_index, phase_payload in enumerate(phase_payloads):
+                phase_payload["remote_session"] = copy.deepcopy(remote_session)
+                if phase_index == len(phase_payloads) - 1:
+                    phase_payload["clear_remote_session"] = True
+        logger.info(
+            "Split ordinary remote component %s into ordered phases: %s",
+            component.representative_node_id,
+            [
+                {
+                    "component_id": phase_payload["component_id"],
+                    "component_node_ids": phase_payload["component_node_ids"],
+                    "execute_node_ids": phase_payload["execute_node_ids"],
+                }
+                for phase_payload in phase_payloads
+            ],
+        )
+        return phase_payloads
+
+    split_phase_payloads = build_phase_payloads_for_transportable_splits()
+    if split_phase_payloads is not None:
+        return {"split_proxy_payloads": split_phase_payloads}
 
     payload = {
         "payload_kind": "mapped_subgraph" if component.mapped_boundary_input_name else "subgraph",
@@ -1924,6 +2223,80 @@ def _rewrite_component_into_proxy(
 
     split_proxy_payloads = payload.get("split_proxy_payloads")
     component_node_id_set = set(component.node_ids)
+    if isinstance(split_proxy_payloads, list):
+        phase_payloads = [dict(phase_payload) for phase_payload in split_proxy_payloads]
+        phase_proxy_node_ids: list[str] = []
+        produced_output_indices_by_name: dict[str, list[Any]] = {}
+        replacement_output_indices: dict[LinkedOutputRef, list[Any]] = {}
+        component_proxy_node_ids: set[str] = set()
+        phase_proxy_inputs_by_node_id: dict[str, dict[str, Any]] = {}
+        phase_proxy_meta_by_node_id: dict[str, dict[str, Any]] = {}
+
+        for phase_payload in phase_payloads:
+            phase_proxy_node_id = str(phase_payload["component_id"])
+            while phase_proxy_node_id in rewritten_prompt and phase_proxy_node_id not in component_node_id_set:
+                phase_proxy_node_id = f"{phase_proxy_node_id}_proxy"
+            phase_payload["component_id"] = phase_proxy_node_id
+            phase_proxy_node_ids.append(phase_proxy_node_id)
+            component_proxy_node_ids.add(phase_proxy_node_id)
+
+        for phase_payload in phase_payloads:
+            phase_proxy_node_id = str(phase_payload["component_id"])
+            phase_proxy_inputs = proxy_inputs_for_boundary_inputs(list(phase_payload["boundary_inputs"]))
+            for boundary_input in phase_payload.get("boundary_inputs", []):
+                proxy_input_name = str(boundary_input["proxy_input_name"])
+                produced_output_index = produced_output_indices_by_name.get(proxy_input_name)
+                if produced_output_index is None:
+                    continue
+                phase_proxy_inputs[proxy_input_name] = list(produced_output_index)
+
+            first_phase_node_id = str(phase_payload["component_node_ids"][0])
+            phase_proxy_meta = copy.deepcopy(rewritten_prompt[first_phase_node_id].get("_meta", {}))
+            phase_proxy_inputs_by_node_id[phase_proxy_node_id] = phase_proxy_inputs
+            phase_proxy_meta_by_node_id[phase_proxy_node_id] = phase_proxy_meta
+
+            for output_index, boundary_output in enumerate(phase_payload.get("boundary_outputs", [])):
+                proxy_output_name = str(boundary_output["proxy_output_name"])
+                produced_output_indices_by_name[proxy_output_name] = [phase_proxy_node_id, output_index]
+                if bool(boundary_output.get("session_output")):
+                    continue
+                replacement_output_indices[
+                    LinkedOutputRef(
+                        node_id=str(boundary_output["node_id"]),
+                        output_index=int(boundary_output["output_index"]),
+                    )
+                ] = [phase_proxy_node_id, output_index]
+
+        for node_id in component.node_ids:
+            rewritten_prompt.pop(node_id, None)
+
+        for phase_payload in phase_payloads:
+            phase_proxy_node_id = str(phase_payload["component_id"])
+            register_proxy_node(
+                prompt_node_id=phase_proxy_node_id,
+                payload_mapping=phase_payload,
+                proxy_inputs=phase_proxy_inputs_by_node_id[phase_proxy_node_id],
+                meta=phase_proxy_meta_by_node_id[phase_proxy_node_id],
+                is_output_node=contains_output_node(list(phase_payload["component_node_ids"])),
+            )
+
+        for node_id, prompt_node in list(rewritten_prompt.items()):
+            if node_id in component_proxy_node_ids:
+                continue
+            for input_name, input_value in list((prompt_node.get("inputs") or {}).items()):
+                if not _is_link(input_value):
+                    continue
+                source = LinkedOutputRef(node_id=str(input_value[0]), output_index=int(input_value[1]))
+                if source in replacement_output_indices:
+                    prompt_node["inputs"][input_name] = list(replacement_output_indices[source])
+
+        logger.info(
+            "Rewrote remote component %s into ordered proxies %s.",
+            component.representative_node_id,
+            phase_proxy_node_ids,
+        )
+        return phase_proxy_node_ids
+
     if isinstance(split_proxy_payloads, dict):
         static_payload = dict(split_proxy_payloads["static"])
         mapped_payload = dict(split_proxy_payloads["mapped"])
@@ -2148,6 +2521,7 @@ def rewrite_prompt_for_modal(
             custom_nodes_bundle=summary.custom_nodes_bundle,
             uploaded_volume_paths=uploaded_volume_paths,
             terminate_container_on_error=resolved_settings.terminate_container_on_error,
+            nodes_module=resolved_nodes_module,
         )
         proxy_node_ids = _rewrite_component_into_proxy(
             component=component,
@@ -2155,7 +2529,8 @@ def rewrite_prompt_for_modal(
             payload=payload,
             nodes_module=resolved_nodes_module,
         )
-        if "split_proxy_payloads" in payload:
+        split_proxy_payloads = payload.get("split_proxy_payloads")
+        if isinstance(split_proxy_payloads, dict):
             static_proxy_node_id, mapped_proxy_node_id = proxy_node_ids
             summary.remote_component_ids.extend(proxy_node_ids)
             summary.component_node_ids_by_representative[static_proxy_node_id] = list(
@@ -2169,6 +2544,15 @@ def rewrite_prompt_for_modal(
             for node_id in component.mapped_node_ids:
                 summary.rewritten_node_id_map[node_id] = mapped_proxy_node_id
             mapped_proxy_component_ids.add(mapped_proxy_node_id)
+            continue
+        if isinstance(split_proxy_payloads, list):
+            summary.remote_component_ids.extend(proxy_node_ids)
+            for phase_payload in split_proxy_payloads:
+                phase_proxy_node_id = str(phase_payload["component_id"])
+                phase_component_node_ids = [str(node_id) for node_id in phase_payload["component_node_ids"]]
+                summary.component_node_ids_by_representative[phase_proxy_node_id] = phase_component_node_ids
+                for node_id in phase_component_node_ids:
+                    summary.rewritten_node_id_map[node_id] = phase_proxy_node_id
             continue
 
         summary.remote_component_ids.extend(proxy_node_ids)
