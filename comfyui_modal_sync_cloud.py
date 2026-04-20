@@ -1199,6 +1199,14 @@ def _node_output_cache_value_preview(value: Any, *, max_chars: int = 160) -> str
     return f"{rendered[:max_chars]}..."
 
 
+async def _node_output_cache_store_get(cache_store: Any, cache_key: str) -> Any:
+    """Return one persisted node-cache record, preferring Modal's async Dict interface."""
+    aio_get = getattr(getattr(cache_store, "get", None), "aio", None)
+    if callable(aio_get):
+        return await aio_get(cache_key)
+    return cache_store.get(cache_key)
+
+
 def _canonicalize_node_output_cache_key_part(
     value: Any,
     *,
@@ -1230,14 +1238,18 @@ def _canonicalize_node_output_cache_key_part(
     if isinstance(value, tuple):
         items = []
         for index, item in enumerate(value):
+            child_path = f"{path}[{index}]"
             canonical_item = _canonicalize_node_output_cache_key_part(
                 item,
-                path=f"{path}[{index}]",
+                path=child_path,
             )
             if canonical_item is None:
                 _emit_cloud_info(
-                    "Node output cache canonicalization path=%s result=unhashable reason=tuple-child",
+                    "Node output cache canonicalization path=%s result=unhashable reason=tuple-child child_path=%s parent_type=%s parent_value=%s",
                     path,
+                    child_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
                 )
                 return None
             items.append(canonical_item)
@@ -1245,14 +1257,18 @@ def _canonicalize_node_output_cache_key_part(
     if isinstance(value, list):
         items = []
         for index, item in enumerate(value):
+            child_path = f"{path}[{index}]"
             canonical_item = _canonicalize_node_output_cache_key_part(
                 item,
-                path=f"{path}[{index}]",
+                path=child_path,
             )
             if canonical_item is None:
                 _emit_cloud_info(
-                    "Node output cache canonicalization path=%s result=unhashable reason=list-child",
+                    "Node output cache canonicalization path=%s result=unhashable reason=list-child child_path=%s parent_type=%s parent_value=%s",
                     path,
+                    child_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
                 )
                 return None
             items.append(canonical_item)
@@ -1260,25 +1276,34 @@ def _canonicalize_node_output_cache_key_part(
     if isinstance(value, dict):
         items: list[dict[str, Any]] = []
         for key in sorted(value):
+            rendered_key = _node_output_cache_value_preview(key, max_chars=48)
+            key_path = f"{path}.key[{rendered_key}]"
+            value_path = f"{path}[{rendered_key}]"
             canonical_key = _canonicalize_node_output_cache_key_part(
                 key,
-                path=f"{path}.key[{_node_output_cache_value_preview(key, max_chars=48)}]",
+                path=key_path,
             )
             canonical_value = _canonicalize_node_output_cache_key_part(
                 value[key],
-                path=f"{path}[{_node_output_cache_value_preview(key, max_chars=48)}]",
+                path=value_path,
             )
             if canonical_key is None:
                 _emit_cloud_info(
-                    "Node output cache canonicalization path=%s result=unhashable reason=dict-key",
+                    "Node output cache canonicalization path=%s result=unhashable reason=dict-key child_path=%s parent_type=%s parent_value=%s",
                     path,
+                    key_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
                 )
                 return None
             if canonical_value is None:
                 _emit_cloud_info(
-                    "Node output cache canonicalization path=%s result=unhashable reason=dict-value key=%s",
+                    "Node output cache canonicalization path=%s result=unhashable reason=dict-value key=%s child_path=%s parent_type=%s parent_value=%s",
                     path,
-                    _node_output_cache_value_preview(key, max_chars=48),
+                    rendered_key,
+                    value_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
                 )
                 return None
             items.append({"key": canonical_key, "value": canonical_value})
@@ -1291,14 +1316,18 @@ def _canonicalize_node_output_cache_key_part(
                 key=lambda item: _node_output_cache_value_preview(item, max_chars=120),
             )
         ):
+            child_path = f"{path}{{{index}}}"
             canonical_item = _canonicalize_node_output_cache_key_part(
                 item,
-                path=f"{path}{{{index}}}",
+                path=child_path,
             )
             if canonical_item is None:
                 _emit_cloud_info(
-                    "Node output cache canonicalization path=%s result=unhashable reason=frozenset-child",
+                    "Node output cache canonicalization path=%s result=unhashable reason=frozenset-child child_path=%s parent_type=%s parent_value=%s",
                     path,
+                    child_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
                 )
                 return None
             canonical_items.append(canonical_item)
@@ -1484,7 +1513,7 @@ async def _restore_persisted_node_output_cache_entries(
                 _node_output_cache_key_preview(cache_key),
             )
             continue
-        raw_record = cache_store.get(cache_key)
+        raw_record = await _node_output_cache_store_get(cache_store, cache_key)
         cache_entry = _deserialize_node_output_cache_entry(execution, raw_record)
         if cache_entry is None:
             result = "miss"
