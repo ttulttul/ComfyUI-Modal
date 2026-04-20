@@ -1088,92 +1088,32 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
         nodes_module=fake_nodes_module,
     )
 
-    assert summary.remote_component_ids == ["1"]
-    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
-    assert payload["payload_kind"] == "mapped_subgraph"
-    assert payload["component_node_ids"] == ["1", "3", "6", "7"]
-    assert payload["execute_node_ids"] == ["3", "7"]
-    assert payload["static_execute_node_ids"] == ["1", "3"]
-    assert payload["mapped_execute_node_ids"] == ["7"]
-    assert payload["mapped_input"] == {
-        "proxy_input_name": "remote_input_1",
-        "io_type": "LATENT",
+    assert set(rewritten_prompt) == {"1", "1__mapped", "2", "4", "5", "8"}
+    assert summary.remote_component_ids == ["1", "1__mapped"]
+    assert summary.component_node_ids_by_representative == {
+        "1": ["1", "3"],
+        "1__mapped": ["6", "7"],
     }
-    assert payload["static_to_mapped_boundaries"] == [
+    assert summary.component_dependency_ids_by_representative == {
+        "1": [],
+        "1__mapped": ["1"],
+    }
+    assert summary.component_execution_stages == [["1"], ["1__mapped"]]
+    assert summary.mapped_component_ids == ["1__mapped"]
+
+    static_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    mapped_payload = rewritten_prompt["1__mapped"]["inputs"]["original_node_data"]
+
+    assert static_payload["payload_kind"] == "subgraph"
+    assert static_payload["component_node_ids"] == ["1", "3"]
+    assert static_payload["boundary_inputs"] == [
         {
-            "proxy_name": "static_input_0",
-            "node_id": "1",
-            "output_index": 0,
-            "io_type": "MODEL",
-            "is_list": False,
-            "targets": [{"node_id": "7", "input_name": "model"}],
+            "proxy_input_name": "remote_input_0",
+            "io_type": "LATENT",
+            "targets": [{"node_id": "3", "input_name": "latent"}],
         }
     ]
-    assert payload["static_phase"] == {
-        "component_node_ids": ["1", "3"],
-        "subgraph_prompt": {
-            "1": prompt["1"],
-            "3": prompt["3"],
-        },
-        "boundary_inputs": [
-            {
-                "proxy_input_name": "remote_input_0",
-                "io_type": "LATENT",
-                "targets": [{"node_id": "3", "input_name": "latent"}],
-            }
-        ],
-        "boundary_outputs": [
-            {
-                "proxy_output_name": "3_latent",
-                "node_id": "3",
-                "output_index": 0,
-                "io_type": "LATENT",
-                "is_list": False,
-                "preview_target_node_ids": [],
-            },
-            {
-                "proxy_output_name": "static_input_0",
-                "node_id": "1",
-                "output_index": 0,
-                "io_type": "MODEL",
-                "is_list": False,
-                "preview_target_node_ids": [],
-            },
-        ],
-        "execute_node_ids": ["1", "3"],
-    }
-    assert payload["mapped_phase"] == {
-        "component_node_ids": ["6", "7"],
-        "subgraph_prompt": {
-            "6": prompt["6"],
-            "7": prompt["7"],
-        },
-        "boundary_inputs": [
-            {
-                "proxy_input_name": "remote_input_1",
-                "io_type": "LATENT",
-                "targets": [{"node_id": "6", "input_name": "value"}],
-            },
-            {
-                "proxy_input_name": "static_input_0",
-                "io_type": "MODEL",
-                "targets": [{"node_id": "7", "input_name": "model"}],
-            },
-        ],
-        "boundary_outputs": [
-            {
-                "proxy_output_name": "7_latent",
-                "node_id": "7",
-                "output_index": 0,
-                "io_type": "LATENT",
-                "is_list": False,
-                "preview_target_node_ids": [],
-                "mapped_output": True,
-            }
-        ],
-        "execute_node_ids": ["7"],
-    }
-    assert payload["boundary_outputs"] == [
+    assert static_payload["boundary_outputs"] == [
         {
             "proxy_output_name": "3_latent",
             "node_id": "3",
@@ -1181,8 +1121,35 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
             "io_type": "LATENT",
             "is_list": False,
             "preview_target_node_ids": [],
-            "mapped_output": False,
         },
+        {
+            "proxy_output_name": "static_input_0",
+            "node_id": "1",
+            "output_index": 0,
+            "io_type": "MODEL",
+            "is_list": False,
+            "preview_target_node_ids": [],
+            "session_output": True,
+        },
+    ]
+    assert static_payload["execute_node_ids"] == ["1", "3"]
+    assert static_payload["remote_session"]["owner_component_id"] == "1"
+
+    assert mapped_payload["payload_kind"] == "subgraph"
+    assert mapped_payload["component_node_ids"] == ["6", "7"]
+    assert mapped_payload["boundary_inputs"] == [
+        {
+            "proxy_input_name": "remote_input_1",
+            "io_type": "LATENT",
+            "targets": [{"node_id": "6", "input_name": "value"}],
+        },
+        {
+            "proxy_input_name": "static_input_0",
+            "io_type": "MODEL",
+            "targets": [{"node_id": "7", "input_name": "model"}],
+        },
+    ]
+    assert mapped_payload["boundary_outputs"] == [
         {
             "proxy_output_name": "7_latent",
             "node_id": "7",
@@ -1190,9 +1157,15 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
             "io_type": "LATENT",
             "is_list": False,
             "preview_target_node_ids": [],
-            "mapped_output": True,
-        },
+        }
     ]
+    assert mapped_payload["execute_node_ids"] == ["7"]
+    assert mapped_payload["clear_remote_session"] is True
+    assert mapped_payload["mapped_progress_display_node_id"] == "1"
+    assert mapped_payload["remote_session"]["session_id"] == static_payload["remote_session"]["session_id"]
+    assert rewritten_prompt["1__mapped"]["inputs"]["static_input_0"] == ["1", 1]
+    assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
+    assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]
 
 
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(

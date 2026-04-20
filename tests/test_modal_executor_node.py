@@ -43,6 +43,32 @@ class _CloneableCacheValue:
         return _CloneableCacheValue(self.value)
 
 
+class _FakeSessionValueNode:
+    """Fake node that produces one remote-only STRING value."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "execute"
+
+    def execute(self) -> tuple[str]:
+        """Return a deterministic value that can be stored in session state."""
+        return ("shared-session-value",)
+
+
+class _FakeSessionEchoNode:
+    """Fake node that echoes a STRING input back to the caller."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "execute"
+
+    def execute(self, text: str) -> tuple[str]:
+        """Return the supplied input unchanged for session-ref resolution tests."""
+        return (text,)
+
+
 def test_dynamic_proxy_node_preserves_output_signature(
     modal_executor_module: Any,
 ) -> None:
@@ -2805,6 +2831,100 @@ def test_modal_cloud_execute_mapped_subgraph_payload_preserves_assigned_lane_id(
         and event.get("lane_id") == "3"
         for event in observed_progress_events
     )
+
+
+def test_execute_subgraph_locally_round_trips_remote_session_refs(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    session_state_module: Any,
+) -> None:
+    """Split proxy subgraphs should store remote-only outputs in-session and resolve them later."""
+    static_payload = {
+        "payload_kind": "subgraph",
+        "component_id": "1",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["1"],
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "SessionValueNode",
+                "inputs": {},
+            }
+        },
+        "boundary_inputs": [],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "static_input_0",
+                "node_id": "1",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "session_output": True,
+            }
+        ],
+        "execute_node_ids": ["1"],
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-runtime-1",
+            prompt_id="prompt-1",
+            owner_component_id="1",
+        ).to_payload(),
+    }
+
+    static_outputs = serialization_module.deserialize_node_outputs(
+        remote_modal_app_module.execute_subgraph_locally(
+            static_payload,
+            serialization_module.serialize_node_inputs({}),
+            node_mapping={"SessionValueNode": _FakeSessionValueNode},
+        )
+    )
+    assert session_state_module.is_remote_session_value_ref_payload(static_outputs[0])
+
+    mapped_payload = {
+        "payload_kind": "subgraph",
+        "component_id": "1__mapped",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["7"],
+        "subgraph_prompt": {
+            "7": {
+                "class_type": "SessionEchoNode",
+                "inputs": {"text": ["static_input_0", 0]},
+            }
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "7", "input_name": "text"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+            }
+        ],
+        "execute_node_ids": ["7"],
+        "remote_session": static_payload["remote_session"],
+        "clear_remote_session": True,
+    }
+
+    mapped_outputs = serialization_module.deserialize_node_outputs(
+        remote_modal_app_module.execute_subgraph_locally(
+            mapped_payload,
+            serialization_module.serialize_node_inputs({"static_input_0": static_outputs[0]}),
+            node_mapping={"SessionEchoNode": _FakeSessionEchoNode},
+        )
+    )
+
+    assert mapped_outputs == ("shared-session-value",)
+    with pytest.raises(session_state_module.RemoteSessionStateError):
+        remote_modal_app_module._execute_subgraph_prompt(
+            mapped_payload,
+            {"static_input_0": static_outputs[0]},
+            {"SessionEchoNode": _FakeSessionEchoNode},
+        )
 
 
 def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(

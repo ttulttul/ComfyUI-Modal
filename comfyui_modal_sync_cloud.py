@@ -53,6 +53,12 @@ from serialization import (
     serialize_node_outputs,
     serialize_value,
 )
+from session_state import (
+    InMemoryRemoteSessionStore,
+    RemoteSessionHandle,
+    RemoteSessionStateError,
+    is_remote_session_handle_payload,
+)
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -78,6 +84,22 @@ except ModuleNotFoundError:  # pragma: no cover - remote entrypoint only.
 
 class RemoteSubgraphExecutionError(RuntimeError):
     """Raised when remote subgraph execution fails."""
+
+
+def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHandle | None:
+    """Return the decoded prompt-scoped remote session handle for one payload."""
+    remote_session = payload.get("remote_session")
+    if not is_remote_session_handle_payload(remote_session):
+        return None
+    return RemoteSessionHandle.from_payload(remote_session)
+
+
+def _resolve_remote_session_inputs(hydrated_inputs: dict[str, Any]) -> dict[str, Any]:
+    """Resolve any remote-session value refs embedded in boundary inputs."""
+    return {
+        input_name: _REMOTE_SESSION_STORE.resolve_value(input_value)
+        for input_name, input_value in hydrated_inputs.items()
+    }
 
 
 @dataclass
@@ -115,6 +137,7 @@ _MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
 _REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS = 1.0
 _CONTAINER_TERMINATION_SCHEDULED = False
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
+_REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 
 
 @dataclass
@@ -2374,12 +2397,14 @@ def _execute_subgraph_prompt(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
+    resolved_inputs = _resolve_remote_session_inputs(dict(hydrated_inputs))
+    session_handle = _payload_remote_session_handle(normalized_payload)
     with _timed_phase("prepare_subgraph_prompt", component=component_id):
         prompt = _rewrite_modal_asset_references(copy.deepcopy(normalized_payload["subgraph_prompt"]))
         _apply_boundary_inputs(
             prompt=prompt,
             boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
-            hydrated_inputs=hydrated_inputs,
+            hydrated_inputs=resolved_inputs,
         )
     with _timed_phase("load_execution_module", component=component_id):
         execution = _load_execution_module()
@@ -2505,12 +2530,22 @@ def _execute_subgraph_prompt(
                     raise RemoteSubgraphExecutionError(
                         f"Remote subgraph output index {output_index} is missing for node {node_id}."
                     )
-                outputs.append(
-                    _collapse_cache_slot(
-                        slot_values=cache_entry.outputs[output_index],
-                        is_list=bool(boundary_output.get("is_list", False)),
-                    )
+                output_value = _collapse_cache_slot(
+                    slot_values=cache_entry.outputs[output_index],
+                    is_list=bool(boundary_output.get("is_list", False)),
                 )
+                if bool(boundary_output.get("session_output")):
+                    if session_handle is None:
+                        raise RemoteSessionStateError(
+                            "Session-backed boundary outputs require payload.remote_session."
+                        )
+                    output_value = _REMOTE_SESSION_STORE.put_output(
+                        session_handle,
+                        node_id=node_id,
+                        output_index=output_index,
+                        value=output_value,
+                    ).to_payload()
+                outputs.append(output_value)
         return tuple(outputs)
 
 
@@ -2524,24 +2559,29 @@ def execute_subgraph_locally(
 ) -> bytes:
     """Execute a rewritten remote component in-process and return serialized outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
+    session_handle = _payload_remote_session_handle(payload)
     with _timed_phase("execute_subgraph_locally", component=component_id):
         custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
         _ensure_comfy_runtime_initialized(custom_nodes_root)
         with _timed_phase("deserialize_boundary_inputs", component=component_id):
             hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-        with _timed_phase("subgraph_worker_roundtrip", component=component_id):
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    _execute_subgraph_prompt,
-                    payload,
-                    hydrated_inputs,
-                    custom_nodes_root,
-                    status_callback,
-                    cancellation_event,
-                    interrupt_store,
-                    interrupt_flag_key,
-                )
-                outputs = future.result()
+        try:
+            with _timed_phase("subgraph_worker_roundtrip", component=component_id):
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        _execute_subgraph_prompt,
+                        payload,
+                        hydrated_inputs,
+                        custom_nodes_root,
+                        status_callback,
+                        cancellation_event,
+                        interrupt_store,
+                        interrupt_flag_key,
+                    )
+                    outputs = future.result()
+        finally:
+            if bool(payload.get("clear_remote_session")) and session_handle is not None:
+                _REMOTE_SESSION_STORE.clear_session(session_handle)
         with _timed_phase("serialize_boundary_outputs", component=component_id):
             return serialize_node_outputs(outputs)
 
@@ -3382,19 +3422,29 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
 
+        def __init__(self, session_affinity_key: str | None = None) -> None:
+            """Record the optional session-affinity key for split-proxy reuse."""
+            self.session_affinity_key = session_affinity_key
+
         @modal.enter(snap=True)
         def setup_snapshot_state(self) -> None:
             """Prepare snapshot-friendly runtime state before Modal captures memory."""
             with _timed_phase("remote_engine_setup_snapshot"):
                 _prewarm_snapshot_state(settings)
-                logger.info("RemoteEngine snapshot setup complete.")
+                logger.info(
+                    "RemoteEngine snapshot setup complete for session_affinity_key=%s.",
+                    self.session_affinity_key,
+                )
 
         @modal.enter(snap=False)
         def setup_restored_runtime(self) -> None:
             """Prepare request-serving runtime state after a fresh boot or snapshot restore."""
             with _timed_phase("remote_engine_setup_restored"):
                 _prewarm_restored_runtime()
-                logger.info("RemoteEngine restored-runtime setup complete.")
+                logger.info(
+                    "RemoteEngine restored-runtime setup complete for session_affinity_key=%s.",
+                    self.session_affinity_key,
+                )
 
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:

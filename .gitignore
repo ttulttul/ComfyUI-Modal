@@ -12,6 +12,7 @@
 !/modal_executor_node.py
 !/serialization.py
 !/settings.py
+!/session_state.py
 !/sync_engine.py
 
 !/remote/
@@ -21,3 +22,7 @@
 !/web/
 /web/*
 !/web/*.js
+
+!/tests/
+/tests/*
+!/tests/*.py

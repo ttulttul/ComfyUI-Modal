@@ -119,6 +119,12 @@ def settings_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def session_state_module(extension_package: object) -> object:
+    """Return the prompt-scoped remote session helpers module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.session_state")
+
+
+@pytest.fixture(scope="session")
 def sync_engine_module(extension_package: object) -> object:
     """Return the sync engine module."""
     return importlib.import_module(f"{PACKAGE_NAME}.sync_engine")
