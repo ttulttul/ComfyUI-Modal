@@ -1767,6 +1767,14 @@ def _build_component_payload(
             prompt_id=(str(prompt_id) if prompt_id is not None else None),
             owner_component_id=component.representative_node_id,
         ).to_payload()
+        logger.info(
+            "Split hybrid component %s into static nodes=%s and mapped nodes=%s using remote_session session_id=%s with %d static bridge outputs.",
+            component.representative_node_id,
+            component.static_node_ids,
+            component.mapped_node_ids,
+            remote_session["session_id"],
+            len(static_bridge_outputs),
+        )
         payload = {
             "split_proxy_payloads": {
                 "static": build_subgraph_payload(

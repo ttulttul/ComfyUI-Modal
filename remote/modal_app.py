@@ -35,6 +35,7 @@ from ..session_state import (
     RemoteSessionHandle,
     RemoteSessionStateError,
     is_remote_session_handle_payload,
+    is_remote_session_value_ref_payload,
 )
 from ..settings import get_settings
 
@@ -93,8 +94,24 @@ def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHand
     return RemoteSessionHandle.from_payload(remote_session)
 
 
-def _resolve_remote_session_inputs(hydrated_inputs: dict[str, Any]) -> dict[str, Any]:
+def _resolve_remote_session_inputs(
+    hydrated_inputs: dict[str, Any],
+    *,
+    component_id: str | None = None,
+) -> dict[str, Any]:
     """Resolve any remote-session value refs embedded in boundary inputs."""
+    ref_input_names = [
+        input_name
+        for input_name, input_value in hydrated_inputs.items()
+        if is_remote_session_value_ref_payload(input_value)
+    ]
+    if ref_input_names:
+        logger.info(
+            "Resolving %d remote session input refs for component=%s inputs=%s.",
+            len(ref_input_names),
+            component_id or "<unknown>",
+            sorted(ref_input_names),
+        )
     return {
         input_name: _REMOTE_SESSION_STORE.resolve_value(input_value)
         for input_name, input_value in hydrated_inputs.items()
@@ -616,8 +633,19 @@ def _execute_subgraph_with_mapping(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
-    resolved_inputs = _resolve_remote_session_inputs(dict(hydrated_inputs))
+    resolved_inputs = _resolve_remote_session_inputs(
+        dict(hydrated_inputs),
+        component_id=str(payload.get("component_id") or ""),
+    )
     session_handle = _payload_remote_session_handle(normalized_payload)
+    if session_handle is not None:
+        logger.info(
+            "Executing mapped remote subgraph %s with remote_session session_id=%s prompt_id=%s owner_component_id=%s.",
+            payload.get("component_id"),
+            session_handle.session_id,
+            session_handle.prompt_id,
+            session_handle.owner_component_id,
+        )
     prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s via test mapping with %d prompt nodes.",
@@ -720,8 +748,19 @@ def _execute_subgraph_prompt(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
-    resolved_inputs = _resolve_remote_session_inputs(dict(hydrated_inputs))
+    resolved_inputs = _resolve_remote_session_inputs(
+        dict(hydrated_inputs),
+        component_id=str(payload.get("component_id") or ""),
+    )
     session_handle = _payload_remote_session_handle(normalized_payload)
+    if session_handle is not None:
+        logger.info(
+            "Executing PromptExecutor remote subgraph %s with remote_session session_id=%s prompt_id=%s owner_component_id=%s.",
+            payload.get("component_id"),
+            session_handle.session_id,
+            session_handle.prompt_id,
+            session_handle.owner_component_id,
+        )
     prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s through PromptExecutor with %d prompt nodes, %d boundary inputs, and %d exported outputs.",
@@ -821,9 +860,11 @@ def execute_subgraph_locally(
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
     session_handle = _payload_remote_session_handle(payload)
     logger.info(
-        "Executing local fallback subgraph %s with %d hydrated inputs.",
+        "Executing local fallback subgraph %s with %d hydrated inputs session_id=%s clear_remote_session=%s.",
         payload.get("component_id"),
         len(hydrated_inputs),
+        session_handle.session_id if session_handle is not None else None,
+        bool(payload.get("clear_remote_session")),
     )
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -838,6 +879,11 @@ def execute_subgraph_locally(
                 raise
     finally:
         if bool(payload.get("clear_remote_session")) and session_handle is not None:
+            logger.info(
+                "Clearing remote session after component=%s session_id=%s.",
+                payload.get("component_id"),
+                session_handle.session_id,
+            )
             _REMOTE_SESSION_STORE.clear_session(session_handle)
     logger.info(
         "Local fallback subgraph %s completed with %d outputs.",
