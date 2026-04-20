@@ -2719,6 +2719,104 @@ def test_invoke_mapped_remote_engine_async_runs_explicit_mapped_phase_items(
     assert progress_updates[-1]["value"] == 4.0
 
 
+def test_invoke_mapped_remote_engine_async_splits_int_inputs_for_direct_targets(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped remote execution should itemize list(INT) inputs even when ModalMapInput stays local."""
+    observed_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        node_mapping: Any = None,
+    ) -> tuple[str]:
+        observed_calls.append((str(payload["component_id"]), dict(hydrated_inputs)))
+        return (f"seed:{hydrated_inputs['remote_input_0']}",)
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "12",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "INT"},
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "12_latent",
+                "node_id": "12",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            }
+        ],
+        "static_to_mapped_boundaries": [],
+        "static_phase": {
+            "component_node_ids": [],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["12"],
+            "subgraph_prompt": {
+                "12": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"seed": ["remote_input_0", 0]},
+                }
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_0",
+                    "io_type": "INT",
+                    "targets": [{"node_id": "12", "input_name": "seed"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "12_latent",
+                    "node_id": "12",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["12"],
+        },
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_mapped_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {"remote_input_0": [10, 11, 12]}
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        [
+            "seed:10",
+            "seed:11",
+            "seed:12",
+        ],
+    )
+    assert observed_calls == [
+        ("12::item:0", {"remote_input_0": 10}),
+        ("12::item:1", {"remote_input_0": 11}),
+        ("12::item:2", {"remote_input_0": 12}),
+    ]
+
+
 def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
     remote_modal_app_module: Any,
     serialization_module: Any,

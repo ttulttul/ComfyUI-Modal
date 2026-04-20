@@ -985,6 +985,128 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
     assert rewritten_prompt["4"]["inputs"]["text"] == ["2", 0]
 
 
+def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A local ModalMapInput feeding a remote node should still rewrite to mapped remote execution."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "PromptList": _FakePromptListNode,
+                "ModalMapInput": _FakeModalMapInputNode,
+                "RemoteStringEcho": _FakeRemoteStringEchoNode,
+                "LocalStringSink": _FakeLocalStringSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": False}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "PromptList",
+            "inputs": {},
+            "_meta": {"title": "Prompt List"},
+        },
+        "2": {
+            "class_type": "ModalMapInput",
+            "inputs": {"value": ["1", 0]},
+            "_meta": {"title": "Map Input"},
+        },
+        "3": {
+            "class_type": "RemoteStringEcho",
+            "inputs": {"text": ["2", 0]},
+            "_meta": {"title": "Remote Echo"},
+        },
+        "4": {
+            "class_type": "LocalStringSink",
+            "inputs": {"text": ["3", 0]},
+            "_meta": {"title": "Local Sink"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert set(rewritten_prompt) == {"1", "2", "3", "4"}
+    assert summary.remote_component_ids == ["3"]
+    payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
+    assert payload["payload_kind"] == "mapped_subgraph"
+    assert payload["component_node_ids"] == ["3"]
+    assert payload["mapped_input"] == {
+        "proxy_input_name": "remote_input_0",
+        "io_type": "STRING",
+    }
+    assert payload["boundary_inputs"] == [
+        {
+            "proxy_input_name": "remote_input_0",
+            "io_type": "*",
+            "targets": [{"node_id": "3", "input_name": "text"}],
+        }
+    ]
+    assert payload["mapped_phase"] == {
+        "component_node_ids": ["3"],
+        "subgraph_prompt": {
+            "3": prompt["3"],
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "*",
+                "targets": [{"node_id": "3", "input_name": "text"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "3_text",
+                "node_id": "3",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "preview_target_node_ids": [],
+                "mapped_output": True,
+            }
+        ],
+        "execute_node_ids": ["3"],
+    }
+    assert rewritten_prompt["4"]["inputs"]["text"] == ["3", 0]
+
+
 def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_with_unmapped_sibling(
     api_intercept_module: Any,
     settings_module: Any,

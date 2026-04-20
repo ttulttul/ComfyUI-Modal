@@ -1138,14 +1138,21 @@ def _build_component_plan(
     mapped_boundary_spec: BoundaryInputSpec | None = None
     mapped_boundary_input_io_type: str | None = None
     for boundary_input in boundary_inputs_by_source.values():
+        source_prompt_node = prompt.get(boundary_input.source.node_id)
+        source_class_type = (
+            str(source_prompt_node.get("class_type"))
+            if source_prompt_node is not None
+            else None
+        )
         mapped_targets = [
             target
             for target in boundary_input.targets
             if str(prompt[target.node_id]["class_type"]) == MODAL_MAP_INPUT_NODE_ID
         ]
-        if not mapped_targets:
+        source_is_modal_map_input = source_class_type == MODAL_MAP_INPUT_NODE_ID
+        if not mapped_targets and not source_is_modal_map_input:
             continue
-        if len(mapped_targets) != len(boundary_input.targets):
+        if mapped_targets and len(mapped_targets) != len(boundary_input.targets):
             raise ModalPromptValidationError(
                 "Mapped remote execution requires the mapped boundary input to feed only ModalMapInput nodes."
             )
@@ -1154,11 +1161,10 @@ def _build_component_plan(
                 "Remote components currently support only one mapped ModalMapInput boundary."
             )
         mapped_boundary_spec = boundary_input
-        mapped_boundary_input_io_type = _remote_output_io_type(
-            prompt=prompt,
-            node_id=boundary_input.source.node_id,
-            output_index=boundary_input.source.output_index,
-            nodes_module=nodes_module,
+        mapped_boundary_input_io_type = _mapped_boundary_origin_io_type(
+            prompt,
+            boundary_input,
+            nodes_module,
         )
 
     mapped_node_ids: list[str] = []
@@ -1455,6 +1461,36 @@ def _build_component_plans(
         _build_component_plan(component, prompt, consumers, nodes_module)
         for component in components
     ]
+
+
+def _mapped_boundary_origin_io_type(
+    prompt: dict[str, Any],
+    boundary_input: BoundaryInputSpec,
+    nodes_module: Any,
+) -> str | None:
+    """Return the effective io_type for one mapped boundary, unwrapping local ModalMapInput markers."""
+    source_prompt_node = prompt.get(boundary_input.source.node_id)
+    if source_prompt_node is None:
+        return boundary_input.io_type
+
+    if str(source_prompt_node.get("class_type")) != MODAL_MAP_INPUT_NODE_ID:
+        return _remote_output_io_type(
+            prompt=prompt,
+            node_id=boundary_input.source.node_id,
+            output_index=boundary_input.source.output_index,
+            nodes_module=nodes_module,
+        )
+
+    mapped_value = (source_prompt_node.get("inputs") or {}).get("value")
+    if not _is_link(mapped_value):
+        return boundary_input.io_type
+
+    return _remote_output_io_type(
+        prompt=prompt,
+        node_id=str(mapped_value[0]),
+        output_index=int(mapped_value[1]),
+        nodes_module=nodes_module,
+    )
 
 
 def _describe_output_boundary_error(

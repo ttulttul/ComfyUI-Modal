@@ -394,6 +394,7 @@ COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
 - Remote primitive-socket validation only rejects raw widget list literals now. If a primitive socket like `INT` is hydrated from a boundary input or upstream output and carries a list value, the runtime leaves it alone so ComfyUI can apply its normal over-list execution semantics for nodes like `NextSeeds`.
 - Boundary input normalization only unwraps singleton wrappers for scalar-like values and true prompt links. Single-entry semantic lists like `CONDITIONING` must stay wrapped as lists, or ComfyUI will misread `[[tensor, meta]]` as `[tensor, meta]` and crash during conditioning conversion.
 - Prompt-scoped remote session misses are treated as routing/state errors now, not poisoned-container crashes. If a split proxy lands on the wrong Modal container and its session bucket is missing, the worker logs the miss but does not self-terminate; the real fix for that class of failure is stronger container affinity or leased session routing.
+- `ModalMapInput` is a queue-time mapping marker even when the marker node itself stays local. If a local `ModalMapInput` feeds a remote node, rewrite should still produce a `mapped_subgraph` so list(INT) values like `NextSeeds` outputs are itemized before the remote sampler runs.
 
 ## Current limitations
 
