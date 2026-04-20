@@ -1199,6 +1199,20 @@ def _node_output_cache_value_preview(value: Any, *, max_chars: int = 160) -> str
     return f"{rendered[:max_chars]}..."
 
 
+def _tensor_cache_key_digest(value: Any) -> dict[str, Any]:
+    """Return a stable digest payload for one tensor used inside a cache key."""
+    from safetensors.torch import save
+
+    tensor = value.detach().contiguous().cpu()
+    tensor_bytes = save({"value": tensor})
+    return {
+        "kind": "tensor",
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "sha256": hashlib.sha256(tensor_bytes).hexdigest(),
+    }
+
+
 async def _node_output_cache_store_get(cache_store: Any, cache_key: str) -> Any:
     """Return one persisted node-cache record, preferring Modal's async Dict interface."""
     aio_get = getattr(getattr(cache_store, "get", None), "aio", None)
@@ -1235,6 +1249,12 @@ def _canonicalize_node_output_cache_key_part(
             "kind": "bytes",
             "value": base64.b64encode(value).decode("ascii"),
         }
+    try:
+        import torch
+    except ModuleNotFoundError:
+        torch = None
+    if torch is not None and isinstance(value, torch.Tensor):
+        return _tensor_cache_key_digest(value)
     if isinstance(value, tuple):
         items = []
         for index, item in enumerate(value):
