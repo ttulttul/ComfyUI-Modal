@@ -1376,6 +1376,114 @@ def test_modal_cloud_node_cache_key_rebuilds_input_signature_before_unhashable_c
     assert direct_bad_key is None
 
 
+def test_modal_cloud_node_cache_key_uses_boundary_source_signature_for_unhashable_inputs(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Boundary-fed runtime objects should hash by stable source provenance instead of object identity."""
+
+    class FakeDynPrompt:
+        """Minimal dynamic prompt wrapper backed by one mutable prompt dict."""
+
+        def __init__(self, prompt: dict[str, Any]) -> None:
+            """Store the prompt used by the cache-key rebuild."""
+            self._prompt = prompt
+
+        def has_node(self, node_id: str) -> bool:
+            """Return whether the requested node exists in the prompt."""
+            return str(node_id) in self._prompt
+
+        def get_node(self, node_id: str) -> dict[str, Any]:
+            """Return the stored node payload."""
+            return self._prompt[str(node_id)]
+
+    class FakeModelPatcher:
+        """Stand-in for ComfyUI's unhashable `ModelPatcher` runtime object."""
+
+    prompt_one = {
+        "39": {
+            "class_type": "FakeSampler",
+            "inputs": {},
+        }
+    }
+    prompt_two = {
+        "39": {
+            "class_type": "FakeSampler",
+            "inputs": {},
+        }
+    }
+    prompt_three = {
+        "39": {
+            "class_type": "FakeSampler",
+            "inputs": {},
+        }
+    }
+    boundary_spec_one = [
+        {
+            "proxy_input_name": "remote_input_0",
+            "io_type": "MODEL",
+            "source_signature": "SRC_same_model",
+            "targets": [{"node_id": "39", "input_name": "model"}],
+        }
+    ]
+    boundary_spec_three = [
+        {
+            "proxy_input_name": "remote_input_0",
+            "io_type": "MODEL",
+            "source_signature": "SRC_other_model",
+            "targets": [{"node_id": "39", "input_name": "model"}],
+        }
+    ]
+    modal_cloud_module._apply_boundary_inputs(
+        prompt_one,
+        boundary_spec_one,
+        {"remote_input_0": FakeModelPatcher()},
+    )
+    modal_cloud_module._apply_boundary_inputs(
+        prompt_two,
+        boundary_spec_one,
+        {"remote_input_0": FakeModelPatcher()},
+    )
+    modal_cloud_module._apply_boundary_inputs(
+        prompt_three,
+        boundary_spec_three,
+        {"remote_input_0": FakeModelPatcher()},
+    )
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_nodes_module",
+        lambda: types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_include_unique_id_in_input_signature",
+        lambda class_type: False,
+    )
+
+    def cache_key_for(prompt: dict[str, Any]) -> str | None:
+        """Build one distributed cache key for the prepared prompt."""
+        cache_key_set = types.SimpleNamespace(
+            dynprompt=FakeDynPrompt(prompt),
+            is_changed_cache=types.SimpleNamespace(is_changed={"39": False}),
+            get_ordered_ancestry=lambda current_dynprompt, node_id: ([], {}),
+            include_node_id_in_input=lambda: False,
+            get_data_key=lambda node_id: None,
+        )
+        return modal_cloud_module._node_output_cache_key_from_key_set_sync(cache_key_set, "39")
+
+    first_key = cache_key_for(prompt_one)
+    second_key = cache_key_for(prompt_two)
+    different_key = cache_key_for(prompt_three)
+
+    assert isinstance(first_key, str)
+    assert first_key.startswith("NC_")
+    assert second_key == first_key
+    assert different_key != first_key
+
+
 def test_modal_cloud_ignores_heavy_comfyui_paths(
     modal_cloud_module: Any,
 ) -> None:

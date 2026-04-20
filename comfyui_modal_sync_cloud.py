@@ -70,6 +70,7 @@ _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
+_BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
@@ -1331,6 +1332,7 @@ def _build_node_output_cache_immediate_signature(
         signature.append(node_id)
 
     inputs = node["inputs"]
+    boundary_input_signatures = node.get(_BOUNDARY_INPUT_SIGNATURES_KEY)
     for key in sorted(inputs.keys()):
         input_value = inputs[key]
         if _is_link(input_value):
@@ -1339,7 +1341,15 @@ def _build_node_output_cache_immediate_signature(
             ancestor_index = int(ancestor_order_mapping[ancestor_id])
             signature.append((key, ("ANCESTOR", ancestor_index, ancestor_socket)))
         else:
-            signature.append((key, input_value))
+            boundary_signature = None
+            if isinstance(boundary_input_signatures, dict):
+                candidate_signature = boundary_input_signatures.get(str(key))
+                if isinstance(candidate_signature, str) and candidate_signature:
+                    boundary_signature = candidate_signature
+            if boundary_signature is not None:
+                signature.append((key, ("BOUNDARY_SOURCE", boundary_signature)))
+            else:
+                signature.append((key, input_value))
     return signature
 
 
@@ -2015,10 +2025,16 @@ def _apply_boundary_inputs(
         for target in boundary_input.get("targets", []):
             node_id = str(target["node_id"])
             input_name = str(target["input_name"])
-            prompt[node_id]["inputs"][input_name] = _normalize_prompt_input_value(
+            prompt_node = prompt[node_id]
+            prompt_node["inputs"][input_name] = _normalize_prompt_input_value(
                 value,
                 io_type=io_type,
             )
+            source_signature = boundary_input.get("source_signature")
+            if isinstance(source_signature, str) and source_signature:
+                boundary_signatures = prompt_node.setdefault(_BOUNDARY_INPUT_SIGNATURES_KEY, {})
+                if isinstance(boundary_signatures, dict):
+                    boundary_signatures[input_name] = source_signature
 
 
 def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
