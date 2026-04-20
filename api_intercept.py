@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import logging
 import time
 import uuid
@@ -251,6 +253,160 @@ def _is_link(value: Any) -> bool:
         and len(value) == 2
         and all(not isinstance(item, dict) for item in value)
     )
+
+
+def _prompt_value_signature_fragment(
+    prompt: dict[str, Any],
+    value: Any,
+    *,
+    memo: dict[str, str],
+) -> Any:
+    """Return a stable structural signature fragment for one prompt input value."""
+    if _is_link(value):
+        source_node_id = str(value[0])
+        return {
+            "kind": "link",
+            "source_node_id": source_node_id,
+            "output_index": int(value[1]),
+            "source_digest": _prompt_node_signature_digest(
+                prompt,
+                source_node_id,
+                memo=memo,
+            ),
+        }
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if value != value:
+            return {"kind": "float", "value": "nan"}
+        if value == float("inf"):
+            return {"kind": "float", "value": "inf"}
+        if value == float("-inf"):
+            return {"kind": "float", "value": "-inf"}
+        return value
+    if isinstance(value, list):
+        return {
+            "kind": "list",
+            "items": [
+                _prompt_value_signature_fragment(prompt, item, memo=memo)
+                for item in value
+            ],
+        }
+    if isinstance(value, tuple):
+        return {
+            "kind": "tuple",
+            "items": [
+                _prompt_value_signature_fragment(prompt, item, memo=memo)
+                for item in value
+            ],
+        }
+    if isinstance(value, dict):
+        return {
+            "kind": "dict",
+            "items": [
+                {
+                    "key": str(key),
+                    "value": _prompt_value_signature_fragment(prompt, value[key], memo=memo),
+                }
+                for key in sorted(value)
+            ],
+        }
+    return {
+        "kind": "repr",
+        "type": type(value).__name__,
+        "value": repr(value),
+    }
+
+
+def _prompt_node_signature_digest(
+    prompt: dict[str, Any],
+    node_id: str,
+    *,
+    memo: dict[str, str],
+) -> str:
+    """Return a stable digest for one prompt node and its upstream prompt inputs."""
+    if node_id in memo:
+        return memo[node_id]
+
+    prompt_node = prompt.get(str(node_id))
+    if prompt_node is None:
+        digest = hashlib.sha256(
+            json.dumps(
+                {"kind": "missing-node", "node_id": str(node_id)},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        memo[str(node_id)] = digest
+        return digest
+
+    payload = {
+        "kind": "prompt-node",
+        "node_id": str(node_id),
+        "class_type": str(prompt_node.get("class_type", "")),
+        "inputs": [
+            {
+                "name": str(input_name),
+                "value": _prompt_value_signature_fragment(
+                    prompt,
+                    input_value,
+                    memo=memo,
+                ),
+            }
+            for input_name, input_value in sorted((prompt_node.get("inputs") or {}).items())
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    memo[str(node_id)] = digest
+    return digest
+
+
+def _boundary_source_signature(
+    prompt: dict[str, Any],
+    source: LinkedOutputRef,
+) -> str:
+    """Return a stable prompt-structural fingerprint for one boundary source output."""
+    payload = {
+        "kind": "boundary-source",
+        "source_node_id": source.node_id,
+        "output_index": int(source.output_index),
+        "source_digest": _prompt_node_signature_digest(
+            prompt,
+            source.node_id,
+            memo={},
+        ),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"SRC_{digest}"
+
+
+def _serialize_boundary_input_specs(
+    boundary_inputs: list[BoundaryInputSpec],
+    *,
+    signature_prompt: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return serialized boundary input payloads with stable provenance for non-transportable inputs."""
+    serialized_boundary_inputs: list[dict[str, Any]] = []
+    for boundary_input in boundary_inputs:
+        serialized_boundary_input = {
+            "proxy_input_name": boundary_input.proxy_input_name,
+            "io_type": boundary_input.io_type,
+            "targets": [
+                {"node_id": target.node_id, "input_name": target.input_name}
+                for target in boundary_input.targets
+            ],
+        }
+        if not _is_transportable_output_type(boundary_input.io_type):
+            serialized_boundary_input["source_signature"] = _boundary_source_signature(
+                signature_prompt,
+                boundary_input.source,
+            )
+        serialized_boundary_inputs.append(serialized_boundary_input)
+    return serialized_boundary_inputs
 
 
 def _iter_payload_input_strings(value: Any) -> Iterator[str]:
@@ -1646,6 +1802,7 @@ def _sync_component_prompt_inputs(
 def _build_component_payload(
     component: RemoteComponentPlan,
     component_prompt: dict[str, Any],
+    signature_prompt: dict[str, Any],
     extra_data: dict[str, Any] | None,
     requires_volume_reload: bool,
     volume_reload_marker: str | None,
@@ -1678,17 +1835,10 @@ def _build_component_payload(
             "prompt_id": prompt_id,
             "component_node_ids": list(component_node_ids),
             "subgraph_prompt": _subset_component_prompt(component_prompt, component_node_ids),
-            "boundary_inputs": [
-                {
-                    "proxy_input_name": boundary_input.proxy_input_name,
-                    "io_type": boundary_input.io_type,
-                    "targets": [
-                        {"node_id": target.node_id, "input_name": target.input_name}
-                        for target in boundary_input.targets
-                    ],
-                }
-                for boundary_input in boundary_inputs
-            ],
+            "boundary_inputs": _serialize_boundary_input_specs(
+                boundary_inputs,
+                signature_prompt=signature_prompt,
+            ),
             "boundary_outputs": copy.deepcopy(boundary_outputs),
             "execute_node_ids": list(execute_node_ids),
             "extra_data": copy.deepcopy(extra_data or {}),
@@ -1922,17 +2072,10 @@ def _build_component_payload(
         "prompt_id": prompt_id,
         "component_node_ids": list(component.node_ids),
         "subgraph_prompt": component_prompt,
-        "boundary_inputs": [
-            {
-                "proxy_input_name": boundary_input.proxy_input_name,
-                "io_type": boundary_input.io_type,
-                "targets": [
-                    {"node_id": target.node_id, "input_name": target.input_name}
-                    for target in boundary_input.targets
-                ],
-            }
-            for boundary_input in component.boundary_inputs
-        ],
+        "boundary_inputs": _serialize_boundary_input_specs(
+            component.boundary_inputs,
+            signature_prompt=signature_prompt,
+        ),
         "boundary_outputs": [
             (
                 {
@@ -2035,17 +2178,10 @@ def _build_component_payload(
         payload["static_phase"] = {
             "component_node_ids": list(component.static_node_ids),
             "subgraph_prompt": _subset_component_prompt(component_prompt, component.static_node_ids),
-            "boundary_inputs": [
-                {
-                    "proxy_input_name": boundary_input.proxy_input_name,
-                    "io_type": boundary_input.io_type,
-                    "targets": [
-                        {"node_id": target.node_id, "input_name": target.input_name}
-                        for target in boundary_input.targets
-                    ],
-                }
-                for boundary_input in static_boundary_inputs
-            ],
+            "boundary_inputs": _serialize_boundary_input_specs(
+                static_boundary_inputs,
+                signature_prompt=signature_prompt,
+            ),
             "boundary_outputs": [
                 {
                     "proxy_output_name": boundary_output.proxy_output_name,
@@ -2063,28 +2199,19 @@ def _build_component_payload(
         payload["mapped_phase"] = {
             "component_node_ids": list(component.mapped_node_ids),
             "subgraph_prompt": _subset_component_prompt(component_prompt, component.mapped_node_ids),
-            "boundary_inputs": [
-                {
-                    "proxy_input_name": boundary_input.proxy_input_name,
-                    "io_type": boundary_input.io_type,
-                    "targets": [
-                        {"node_id": target.node_id, "input_name": target.input_name}
-                        for target in boundary_input.targets
-                    ],
-                }
-                for boundary_input in mapped_boundary_inputs
-            ]
-            + [
-                {
-                    "proxy_input_name": boundary_spec.proxy_name,
-                    "io_type": boundary_spec.io_type,
-                    "targets": [
-                        {"node_id": target.node_id, "input_name": target.input_name}
-                        for target in boundary_spec.targets
-                    ],
-                }
-                for boundary_spec in component.static_to_mapped_boundaries
-            ],
+            "boundary_inputs": _serialize_boundary_input_specs(
+                mapped_boundary_inputs
+                + [
+                    BoundaryInputSpec(
+                        proxy_input_name=boundary_spec.proxy_name,
+                        source=boundary_spec.source,
+                        io_type=boundary_spec.io_type,
+                        targets=list(boundary_spec.targets),
+                    )
+                    for boundary_spec in component.static_to_mapped_boundaries
+                ],
+                signature_prompt=signature_prompt,
+            ),
             "boundary_outputs": [
                 {
                     "proxy_output_name": boundary_output.proxy_output_name,
@@ -2561,6 +2688,7 @@ def rewrite_prompt_for_modal(
         payload = _build_component_payload(
             component=component,
             component_prompt=synced_component_prompts[component.representative_node_id],
+            signature_prompt=prompt,
             extra_data=extra_data,
             requires_volume_reload=bool(uploaded_volume_paths),
             volume_reload_marker=volume_reload_marker,

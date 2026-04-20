@@ -1344,6 +1344,10 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
             "proxy_input_name": "static_input_0",
             "io_type": "MODEL",
             "targets": [{"node_id": "7", "input_name": "model"}],
+            "source_signature": api_intercept_module._boundary_source_signature(
+                prompt,
+                api_intercept_module.LinkedOutputRef(node_id="1", output_index=0),
+            ),
         },
     ]
     assert mapped_payload["boundary_outputs"] == [
@@ -1515,6 +1519,10 @@ def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_up
             "proxy_input_name": first_payload["boundary_outputs"][1]["proxy_output_name"],
             "io_type": "MODEL",
             "targets": [{"node_id": "6", "input_name": "model"}],
+            "source_signature": api_intercept_module._boundary_source_signature(
+                prompt,
+                api_intercept_module.LinkedOutputRef(node_id="1", output_index=0),
+            ),
         },
     ]
     assert second_payload["boundary_outputs"] == [
@@ -1533,6 +1541,40 @@ def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_up
     assert rewritten_prompt["6"]["inputs"][first_payload["boundary_outputs"][1]["proxy_output_name"]] == ["3", 1]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["3", 0]
     assert rewritten_prompt["7"]["inputs"]["image"] == ["6", 0]
+
+
+def test_boundary_source_signature_changes_with_upstream_prompt_structure(
+    api_intercept_module: Any,
+) -> None:
+    """Non-transportable boundary provenance should change when the upstream prompt changes."""
+    source = api_intercept_module.LinkedOutputRef(node_id="2", output_index=0)
+    base_prompt = {
+        "1": {
+            "class_type": "CheckpointLoader",
+            "inputs": {"ckpt_name": "base.safetensors"},
+        },
+        "2": {
+            "class_type": "LoraLoader",
+            "inputs": {"model": ["1", 0], "strength_model": 0.8},
+        },
+    }
+    changed_prompt = {
+        "1": {
+            "class_type": "CheckpointLoader",
+            "inputs": {"ckpt_name": "base.safetensors"},
+        },
+        "2": {
+            "class_type": "LoraLoader",
+            "inputs": {"model": ["1", 0], "strength_model": 0.5},
+        },
+    }
+
+    first_signature = api_intercept_module._boundary_source_signature(base_prompt, source)
+    second_signature = api_intercept_module._boundary_source_signature(base_prompt, source)
+    changed_signature = api_intercept_module._boundary_source_signature(changed_prompt, source)
+
+    assert first_signature == second_signature
+    assert changed_signature != first_signature
 
 
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(

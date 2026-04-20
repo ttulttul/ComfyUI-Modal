@@ -55,6 +55,7 @@ _PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
 _PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
 _PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
+_BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()
 _REMOTE_CONTAINER_LOG_STREAMS: dict[str, "_RemoteContainerLogStreamState"] = {}
 _REMOTE_CONTAINER_LOG_STDERR_LOCK = threading.Lock()
@@ -616,10 +617,16 @@ def _apply_boundary_inputs(
         for target in boundary_input.get("targets", []):
             node_id = str(target["node_id"])
             input_name = str(target["input_name"])
-            prompt[node_id]["inputs"][input_name] = _normalize_prompt_input_value(
+            prompt_node = prompt[node_id]
+            prompt_node["inputs"][input_name] = _normalize_prompt_input_value(
                 value,
                 io_type=io_type,
             )
+            source_signature = boundary_input.get("source_signature")
+            if isinstance(source_signature, str) and source_signature:
+                boundary_signatures = prompt_node.setdefault(_BOUNDARY_INPUT_SIGNATURES_KEY, {})
+                if isinstance(boundary_signatures, dict):
+                    boundary_signatures[input_name] = source_signature
 
 
 def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
