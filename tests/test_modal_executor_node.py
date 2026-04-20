@@ -3553,6 +3553,75 @@ def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instan
     assert restored_entry == cache_entry
 
 
+def test_modal_cloud_installs_persisted_cache_restore_after_live_set_prompt(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Persisted-cache restore should run after PromptExecutor prepares the active outputs cache."""
+
+    class FakeOutputsCache:
+        """Minimal outputs-cache stub with a mutable cache-key-set marker."""
+
+        def __init__(self) -> None:
+            """Initialize the fake cache-key-set marker."""
+            self.cache_key_set = None
+
+        async def set_prompt(self, dynprompt: Any, node_ids: Any, is_changed_cache: Any) -> None:
+            """Simulate ComfyUI assigning the live cache-key set during prompt setup."""
+            del dynprompt, node_ids, is_changed_cache
+            self.cache_key_set = "live-cache-key-set"
+
+    outputs_cache = FakeOutputsCache()
+    executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=outputs_cache))
+    observed_events: list[tuple[str, Any]] = []
+
+    async def fake_restore(
+        execution: Any,
+        prepared_outputs_cache: Any,
+        *,
+        prompt: dict[str, Any],
+        cache_store: Any,
+    ) -> list[str]:
+        """Record the cache-key-set marker visible at restore time."""
+        del execution
+        observed_events.append(
+            (
+                "restore",
+                prepared_outputs_cache.cache_key_set,
+                tuple(sorted(prompt)),
+                cache_store,
+            )
+        )
+        return ["12"]
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_restore_persisted_node_output_cache_entries_into_prepared_cache",
+        fake_restore,
+    )
+
+    restored_node_ids, restore_original_method = (
+        modal_cloud_module._install_prompt_executor_persisted_cache_restore(
+            object(),
+            executor,
+            component_id="component-1",
+            prompt={"12": {"class_type": "PersistentCacheNode", "inputs": {}}},
+            cache_store={"NC_example": {"version": 1}},
+        )
+    )
+
+    try:
+        asyncio.run(outputs_cache.set_prompt(object(), ["12"], object()))
+    finally:
+        restore_original_method()
+
+    assert restored_node_ids == ["12"]
+    assert observed_events == [
+        ("restore", "live-cache-key-set", ("12",), {"NC_example": {"version": 1}})
+    ]
+    assert outputs_cache.set_prompt.__func__ is FakeOutputsCache.set_prompt
+
+
 def test_modal_cloud_materializes_synced_asset_paths(
     modal_cloud_module: Any,
     monkeypatch: Any,

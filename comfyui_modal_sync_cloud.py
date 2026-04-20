@@ -1660,6 +1660,22 @@ async def _restore_persisted_node_output_cache_entries(
     await outputs_cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
     outputs_cache.clean_unused()
 
+    return await _restore_persisted_node_output_cache_entries_into_prepared_cache(
+        execution,
+        outputs_cache,
+        prompt=prompt,
+        cache_store=cache_store,
+    )
+
+
+async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
+    execution: Any,
+    outputs_cache: Any,
+    *,
+    prompt: dict[str, Any],
+    cache_store: Any,
+) -> list[str]:
+    """Hydrate one already-prepared PromptExecutor outputs cache from the shared Modal Dict."""
     restored_node_ids: list[str] = []
     for node_id in prompt:
         if outputs_cache.get(node_id) is not None:
@@ -1697,6 +1713,37 @@ async def _restore_persisted_node_output_cache_entries(
         )
         restored_node_ids.append(str(node_id))
     return restored_node_ids
+
+
+def _install_prompt_executor_persisted_cache_restore(
+    execution: Any,
+    executor: Any,
+    *,
+    component_id: str,
+    prompt: dict[str, Any],
+    cache_store: Any,
+) -> tuple[list[str], Callable[[], None]]:
+    """Patch one executor so persisted-cache restore runs after its live `set_prompt()` call."""
+    restored_node_ids: list[str] = []
+    outputs_cache = executor.caches.outputs
+    original_set_prompt = outputs_cache.set_prompt
+
+    async def wrapped_set_prompt(dynprompt: Any, node_ids: Any, is_changed_cache: Any) -> None:
+        await original_set_prompt(dynprompt, node_ids, is_changed_cache)
+        with _timed_phase("restore_persisted_node_cache", component=component_id):
+            restored_node_ids[:] = await _restore_persisted_node_output_cache_entries_into_prepared_cache(
+                execution,
+                outputs_cache,
+                prompt=prompt,
+                cache_store=cache_store,
+            )
+
+    outputs_cache.set_prompt = wrapped_set_prompt
+
+    def restore_original_method() -> None:
+        outputs_cache.set_prompt = original_set_prompt
+
+    return restored_node_ids, restore_original_method
 
 
 def _persist_node_output_cache_entries(
@@ -2301,46 +2348,47 @@ def _execute_subgraph_prompt(
         with executor_state.lock:
             _reset_prompt_executor_request_state(executor_state.executor, prompt_server)
             restored_node_ids: list[str] = []
+            restore_prompt_executor_cache_hook: Callable[[], None] | None = None
             if cache_store is not None and get_settings().node_output_cache_max_bytes > 0:
-                with _timed_phase("restore_persisted_node_cache", component=component_id):
-                    restored_node_ids = asyncio.run(
-                        _restore_persisted_node_output_cache_entries(
-                            execution,
-                            executor_state.executor,
-                            prompt_id=str(
-                                payload.get("prompt_id")
-                                or component_id
-                            ),
-                            prompt=prompt,
-                            cache_store=cache_store,
-                        )
+                restored_node_ids, restore_prompt_executor_cache_hook = (
+                    _install_prompt_executor_persisted_cache_restore(
+                        execution,
+                        executor_state.executor,
+                        component_id=component_id,
+                        prompt=prompt,
+                        cache_store=cache_store,
                     )
-                if restored_node_ids:
-                    _emit_cloud_info(
-                        "Restored %d persisted node cache entries for component=%s: %s",
-                        len(restored_node_ids),
-                        component_id,
-                        restored_node_ids,
-                    )
+                )
             prompt_server.configure_boundary_output_stream(
                 boundary_outputs=list(normalized_payload.get("boundary_outputs", [])),
                 lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
             )
-            with _timed_phase(
-                "prompt_executor_execute",
-                component=component_id,
-                execute_nodes=list(normalized_payload.get("execute_node_ids", [])),
-            ):
-                executor_state.executor.execute(
-                    prompt=prompt,
-                    prompt_id=str(
-                        payload.get("prompt_id")
-                        or component_id
-                    ),
-                    extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
-                    execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
-                )
+            try:
+                with _timed_phase(
+                    "prompt_executor_execute",
+                    component=component_id,
+                    execute_nodes=list(normalized_payload.get("execute_node_ids", [])),
+                ):
+                    executor_state.executor.execute(
+                        prompt=prompt,
+                        prompt_id=str(
+                            payload.get("prompt_id")
+                            or component_id
+                        ),
+                        extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
+                        execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
+                    )
+            finally:
+                if restore_prompt_executor_cache_hook is not None:
+                    restore_prompt_executor_cache_hook()
             executor = executor_state.executor
+            if restored_node_ids:
+                _emit_cloud_info(
+                    "Restored %d persisted node cache entries for component=%s: %s",
+                    len(restored_node_ids),
+                    component_id,
+                    restored_node_ids,
+                )
         if not executor.success:
             _log_prompt_executor_failure_details(
                 component_id=component_id,
