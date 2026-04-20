@@ -3938,6 +3938,130 @@ def test_modal_cloud_skips_rewriting_restored_distributed_cache_entries(
     )
 
 
+def test_modal_cloud_skips_restored_hit_before_cache_entry_serialization(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Persist should avoid cache-entry serialization entirely for restored-hit keys."""
+    cache_entry = object()
+
+    class FakeOutputsCache:
+        """Minimal outputs cache stub for persist fast-path tests."""
+
+        def __init__(self) -> None:
+            """Expose a cache-key-set marker for sync key generation."""
+            self.cache_key_set = object()
+
+        def get(self, node_id: str) -> Any:
+            """Return a placeholder cache entry for the target node."""
+            if node_id == "node_1":
+                return cache_entry
+            return None
+
+    executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=FakeOutputsCache()))
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_key_from_key_set_sync",
+        lambda cache_key_set, node_id: "NC_existing" if node_id == "node_1" else None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_serialize_node_output_cache_entry",
+        lambda cache_entry, max_bytes: (_ for _ in ()).throw(
+            AssertionError("restored-hit should skip before serialization")
+        ),
+    )
+
+    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
+        executor,
+        prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
+        cache_store={},
+        restored_cache_keys_by_node_id={"node_1": "NC_existing"},
+    )
+
+    assert persisted_nodes == []
+
+
+def test_modal_cloud_restores_persisted_node_cache_entries_in_parallel(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Prepared-cache restore should overlap independent distributed lookups."""
+    in_flight_gets = 0
+    max_in_flight_gets = 0
+    restored_values: dict[str, Any] = {}
+
+    class FakeOutputsCache:
+        """Minimal outputs cache stub for restore concurrency tests."""
+
+        def __init__(self) -> None:
+            """Expose the cache-key-set marker read by restore."""
+            self.cache_key_set = object()
+
+        def get(self, node_id: str) -> Any:
+            """Return any previously restored entry."""
+            return restored_values.get(node_id)
+
+        def set(self, node_id: str, cache_entry: Any) -> None:
+            """Record one restored cache entry."""
+            restored_values[node_id] = cache_entry
+
+    async def fake_key_from_key_set(cache_key_set: Any, node_id: str) -> str:
+        """Yield briefly so multiple node lookups can queue together."""
+        del cache_key_set
+        await asyncio.sleep(0)
+        return f"NC_{node_id}"
+
+    async def fake_store_get(cache_store: Any, cache_key: str) -> Any:
+        """Track how many distributed cache reads overlap."""
+        nonlocal in_flight_gets, max_in_flight_gets
+        del cache_store
+        in_flight_gets += 1
+        max_in_flight_gets = max(max_in_flight_gets, in_flight_gets)
+        await asyncio.sleep(0.01)
+        in_flight_gets -= 1
+        return {"cache_key": cache_key}
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_key_from_key_set_async",
+        fake_key_from_key_set,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_store_get",
+        fake_store_get,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_deserialize_node_output_cache_entry",
+        lambda execution, record: record,
+    )
+    monkeypatch.setattr(modal_cloud_module, "_emit_cloud_info", lambda *args: None)
+
+    outputs_cache = FakeOutputsCache()
+    restored_node_ids = asyncio.run(
+        modal_cloud_module._restore_persisted_node_output_cache_entries_into_prepared_cache(
+            object(),
+            outputs_cache,
+            prompt={
+                "node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 1}},
+                "node_2": {"class_type": "PersistentCacheNode", "inputs": {"value": 2}},
+                "node_3": {"class_type": "PersistentCacheNode", "inputs": {"value": 3}},
+            },
+            cache_store={},
+        )
+    )
+
+    assert restored_node_ids == ["node_1", "node_2", "node_3"]
+    assert max_in_flight_gets >= 2
+    assert restored_values == {
+        "node_1": {"cache_key": "NC_node_1"},
+        "node_2": {"cache_key": "NC_node_2"},
+        "node_3": {"cache_key": "NC_node_3"},
+    }
+
+
 def test_modal_cloud_materializes_synced_asset_paths(
     modal_cloud_module: Any,
     monkeypatch: Any,
