@@ -2467,15 +2467,28 @@ def _split_batch_boundary_inputs(
     hydrated_inputs: dict[str, Any],
 ) -> tuple[dict[str, list[Any]], int] | None:
     """Return zipped per-item boundary inputs when an ordinary subgraph receives batched values."""
+    implicitly_batchable_scalar_io_types = frozenset({"BOOLEAN", "FLOAT", "INT", "STRING"})
+    implicitly_batchable_transport_io_types = frozenset({"IMAGE", "LATENT", "MASK", "NOISE", "SIGMAS"})
     split_inputs: dict[str, list[Any]] = {}
     for boundary_input in payload.get("boundary_inputs", []):
         proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
         if not proxy_input_name or proxy_input_name not in hydrated_inputs:
             continue
+        io_type = str(boundary_input.get("io_type", "*"))
+        input_value = hydrated_inputs[proxy_input_name]
+        if isinstance(input_value, list) and io_type not in (
+            implicitly_batchable_scalar_io_types | implicitly_batchable_transport_io_types
+        ):
+            logger.info(
+                "Skipping implicit batch split for boundary input %s io_type=%s because list-backed non-scalar values stay broadcast.",
+                proxy_input_name,
+                io_type,
+            )
+            continue
         try:
             items = split_mapped_value(
-                hydrated_inputs[proxy_input_name],
-                str(boundary_input.get("io_type", "*")),
+                input_value,
+                io_type,
             )
         except (TypeError, ValueError):
             continue
