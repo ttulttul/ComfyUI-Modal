@@ -128,6 +128,14 @@ class InMemoryRemoteSessionStore:
                     handle.owner_component_id,
                 )
                 return handle
+            logger.info(
+                "Reusing remote session session_id=%s prompt_id=%s owner_component_id=%s age_seconds=%.3f value_count=%d.",
+                bucket.handle.session_id,
+                bucket.handle.prompt_id,
+                bucket.handle.owner_component_id,
+                max(0.0, time.time() - bucket.created_at),
+                len(bucket.values),
+            )
             return bucket.handle
 
     def put_output(
@@ -146,12 +154,18 @@ class InMemoryRemoteSessionStore:
             output_index=int(output_index),
         )
         with self._lock:
-            self._sessions[handle.session_id].values[(ref.node_id, ref.output_index)] = value
+            bucket = self._sessions[handle.session_id]
+            value_key = (ref.node_id, ref.output_index)
+            replacing_existing = value_key in bucket.values
+            bucket.values[value_key] = value
         logger.info(
-            "Stored remote session value session_id=%s node_id=%s output_index=%d.",
+            "Stored remote session value session_id=%s node_id=%s output_index=%d result=%s value_type=%s total_value_count=%d.",
             ref.session_id,
             ref.node_id,
             ref.output_index,
+            "replace" if replacing_existing else "create",
+            type(value).__name__,
+            len(bucket.values),
         )
         return ref
 
@@ -160,16 +174,38 @@ class InMemoryRemoteSessionStore:
         with self._lock:
             bucket = self._sessions.get(ref.session_id)
             if bucket is None:
+                logger.warning(
+                    "Remote session lookup missed session_id=%s node_id=%s output_index=%d reason=session-missing.",
+                    ref.session_id,
+                    ref.node_id,
+                    ref.output_index,
+                )
                 raise RemoteSessionStateError(
                     f"Remote session {ref.session_id!r} was not found."
                 )
             value_key = (ref.node_id, ref.output_index)
             if value_key not in bucket.values:
+                logger.warning(
+                    "Remote session lookup missed session_id=%s node_id=%s output_index=%d reason=value-missing age_seconds=%.3f value_count=%d.",
+                    ref.session_id,
+                    ref.node_id,
+                    ref.output_index,
+                    max(0.0, time.time() - bucket.created_at),
+                    len(bucket.values),
+                )
                 raise RemoteSessionStateError(
                     "Remote session value was not found for "
                     f"session_id={ref.session_id!r} node_id={ref.node_id!r} "
                     f"output_index={ref.output_index}."
                 )
+            logger.info(
+                "Resolved remote session value session_id=%s node_id=%s output_index=%d age_seconds=%.3f value_count=%d.",
+                ref.session_id,
+                ref.node_id,
+                ref.output_index,
+                max(0.0, time.time() - bucket.created_at),
+                len(bucket.values),
+            )
             return bucket.values[value_key]
 
     def clear_session(self, handle: RemoteSessionHandle) -> None:
@@ -178,15 +214,30 @@ class InMemoryRemoteSessionStore:
             removed = self._sessions.pop(handle.session_id, None)
         if removed is not None:
             logger.info(
-                "Cleared remote session session_id=%s prompt_id=%s owner_component_id=%s value_count=%d.",
+                "Cleared remote session session_id=%s prompt_id=%s owner_component_id=%s age_seconds=%.3f value_count=%d.",
                 handle.session_id,
                 removed.handle.prompt_id,
                 removed.handle.owner_component_id,
+                max(0.0, time.time() - removed.created_at),
                 len(removed.values),
             )
+            return
+        logger.warning(
+            "Remote session clear skipped session_id=%s prompt_id=%s owner_component_id=%s reason=session-missing.",
+            handle.session_id,
+            handle.prompt_id,
+            handle.owner_component_id,
+        )
 
     def resolve_value(self, value: Any) -> Any:
         """Resolve one possible session reference back into the underlying live value."""
         if not is_remote_session_value_ref_payload(value):
             return value
-        return self.get_output(RemoteSessionValueRef.from_payload(value))
+        ref = RemoteSessionValueRef.from_payload(value)
+        logger.info(
+            "Resolving remote session ref session_id=%s node_id=%s output_index=%d.",
+            ref.session_id,
+            ref.node_id,
+            ref.output_index,
+        )
+        return self.get_output(ref)

@@ -8,6 +8,8 @@
 - Prompt-scoped remote state is only useful if both halves of the split can reach the same worker. The current implementation now passes a session-affinity key into deployed `RemoteEngine` lookup, but that still needs live Modal verification under real scale-out before it should be treated as fully proven.
 - Online deployed testing confirmed the prompt-scoped session-affinity path for the tested hybrid workflow: the mapped proxy successfully reused the static proxy's remote-only state on the same worker instead of failing with a missing session/value-ref.
 - The cheapest durable regression for this feature is a proxy-level scheduling test, not a full ComfyUI integration harness. If the rewrite produces separate static and mapped proxies, and a local downstream consumer can run off the static proxy result while the mapped proxy task is still awaiting completion, that already protects the core early-unblock behavior.
+- It is still worth keeping one checked-in workflow-shaped artifact for this feature family. A JSON fixture that carries both the saved workflow metadata and the queued prompt shape catches rewrite drift that pure unit tests can miss, especially around proxy ids, downstream rewiring, and shared session ids.
+- Session observability is most useful when the store and the runtimes both log. Store-level logs explain create/reuse/resolve/cleanup semantics, while runtime-level logs tie those session ids back to concrete component executions and `clear_remote_session` boundaries.
 
 ## 2026-04-19
 
