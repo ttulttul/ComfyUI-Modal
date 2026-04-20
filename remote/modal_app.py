@@ -1078,6 +1078,21 @@ def _should_forward_suppressed_stream_event(
     return str(reported_node_id) in allowed_node_ids
 
 
+def _progress_stream_event_node_id(stream_event: dict[str, Any]) -> str | None:
+    """Return the best node id to use for progress filtering and forwarding."""
+    for candidate in (
+        stream_event.get("real_node_id"),
+        stream_event.get("node_id"),
+        stream_event.get("display_node_id"),
+    ):
+        if candidate is None:
+            continue
+        candidate_text = str(candidate)
+        if candidate_text:
+            return candidate_text
+    return None
+
+
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
@@ -1268,6 +1283,7 @@ def _consume_remote_payload_stream(
         if event_kind == "progress":
             event_type = str(stream_event.get("event_type", ""))
             if event_type == "node_progress":
+                filter_node_id = _progress_stream_event_node_id(stream_event)
                 lane_id = (
                     str(stream_event["lane_id"])
                     if stream_event.get("lane_id") is not None
@@ -1278,9 +1294,22 @@ def _consume_remote_payload_stream(
                     )
                 )
                 aggregate_only = bool(stream_event.get("aggregate_only", False))
-                if suppress_status_stream and lane_id is None and not aggregate_only:
+                if (
+                    suppress_status_stream
+                    and lane_id is None
+                    and not aggregate_only
+                    and not _should_forward_suppressed_stream_event(payload, filter_node_id)
+                ):
+                    logger.debug(
+                        "Suppressing streamed Modal node progress for component=%s node_id=%s real_node_id=%s because it does not belong to this mapped/static payload.",
+                        payload.get("component_id"),
+                        stream_event.get("node_id"),
+                        stream_event.get("real_node_id"),
+                    )
                     continue
                 reported_node_id = stream_event.get("node_id")
+                if reported_node_id is None:
+                    reported_node_id = filter_node_id
                 if reported_node_id is not None:
                     display_node_id = (
                         str(stream_event["display_node_id"])
