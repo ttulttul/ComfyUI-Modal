@@ -1188,10 +1188,31 @@ def _node_output_cache_key_preview(cache_key: str | None, *, max_chars: int = 32
     return cache_key[:max_chars]
 
 
-def _canonicalize_node_output_cache_key_part(value: Any) -> Any | None:
+def _node_output_cache_value_preview(value: Any, *, max_chars: int = 160) -> str:
+    """Return a truncated repr for node-cache debug logging."""
+    try:
+        rendered = repr(value)
+    except Exception as exc:  # pragma: no cover - defensive logging path.
+        rendered = f"<repr failed: {type(exc).__name__}: {exc}>"
+    if len(rendered) <= max_chars:
+        return rendered
+    return f"{rendered[:max_chars]}..."
+
+
+def _canonicalize_node_output_cache_key_part(
+    value: Any,
+    *,
+    path: str = "root",
+) -> Any | None:
     """Return a JSON-stable representation of one CacheKeySetInputSignature fragment."""
     value_type_name = type(value).__name__
     if value_type_name == "Unhashable":
+        _emit_cloud_info(
+            "Node output cache canonicalization path=%s result=unhashable reason=comfy-unhashable-marker type=%s value=%s",
+            path,
+            value_type_name,
+            _node_output_cache_value_preview(value),
+        )
         return None
     if value is None or isinstance(value, bool | int | str):
         return value
@@ -1208,34 +1229,77 @@ def _canonicalize_node_output_cache_key_part(value: Any) -> Any | None:
         }
     if isinstance(value, tuple):
         items = []
-        for item in value:
-            canonical_item = _canonicalize_node_output_cache_key_part(item)
+        for index, item in enumerate(value):
+            canonical_item = _canonicalize_node_output_cache_key_part(
+                item,
+                path=f"{path}[{index}]",
+            )
             if canonical_item is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=tuple-child",
+                    path,
+                )
                 return None
             items.append(canonical_item)
         return {"kind": "tuple", "items": items}
     if isinstance(value, list):
         items = []
-        for item in value:
-            canonical_item = _canonicalize_node_output_cache_key_part(item)
+        for index, item in enumerate(value):
+            canonical_item = _canonicalize_node_output_cache_key_part(
+                item,
+                path=f"{path}[{index}]",
+            )
             if canonical_item is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=list-child",
+                    path,
+                )
                 return None
             items.append(canonical_item)
         return {"kind": "list", "items": items}
     if isinstance(value, dict):
         items: list[dict[str, Any]] = []
         for key in sorted(value):
-            canonical_key = _canonicalize_node_output_cache_key_part(key)
-            canonical_value = _canonicalize_node_output_cache_key_part(value[key])
-            if canonical_key is None or canonical_value is None:
+            canonical_key = _canonicalize_node_output_cache_key_part(
+                key,
+                path=f"{path}.key[{_node_output_cache_value_preview(key, max_chars=48)}]",
+            )
+            canonical_value = _canonicalize_node_output_cache_key_part(
+                value[key],
+                path=f"{path}[{_node_output_cache_value_preview(key, max_chars=48)}]",
+            )
+            if canonical_key is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=dict-key",
+                    path,
+                )
+                return None
+            if canonical_value is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=dict-value key=%s",
+                    path,
+                    _node_output_cache_value_preview(key, max_chars=48),
+                )
                 return None
             items.append({"key": canonical_key, "value": canonical_value})
         return {"kind": "dict", "items": items}
     if isinstance(value, frozenset):
         canonical_items: list[Any] = []
-        for item in value:
-            canonical_item = _canonicalize_node_output_cache_key_part(item)
+        for index, item in enumerate(
+            sorted(
+                value,
+                key=lambda item: _node_output_cache_value_preview(item, max_chars=120),
+            )
+        ):
+            canonical_item = _canonicalize_node_output_cache_key_part(
+                item,
+                path=f"{path}{{{index}}}",
+            )
             if canonical_item is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=frozenset-child",
+                    path,
+                )
                 return None
             canonical_items.append(canonical_item)
         canonical_items.sort(
@@ -1246,6 +1310,12 @@ def _canonicalize_node_output_cache_key_part(value: Any) -> Any | None:
             )
         )
         return {"kind": "frozenset", "items": canonical_items}
+    _emit_cloud_info(
+        "Node output cache canonicalization path=%s result=unhashable reason=unsupported-type type=%s value=%s",
+        path,
+        value_type_name,
+        _node_output_cache_value_preview(value),
+    )
     return None
 
 
