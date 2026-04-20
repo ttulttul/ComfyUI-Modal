@@ -176,6 +176,7 @@ Remote runtime behavior:
 - The local Modal call executor keeps multiple worker threads available, which removes the previous `max_workers=1` bottleneck when several remote components are ready at once.
 - Pure `ModalMapInput` components still use one explicit `mapped_subgraph` payload when the whole remote island is per-item work.
 - Hybrid `ModalMapInput` components with a one-time static branch now rewrite into two ordinary proxy nodes: a static `subgraph` proxy that can return transportable outputs early, and a mapped `subgraph` proxy that reuses the static branch's remote-only values through prompt-scoped session refs.
+- Ordinary remote components can now also split into ordered `subgraph` proxies when multiple execute branches only share remote-only upstream state. That lets one branch unblock local downstream work as soon as its transportable outputs are ready while later remote phases reconnect to shared remote-only values through prompt-scoped session refs.
 - Those session refs keep values like `MODEL` remote-only while still letting the mapped proxy reconnect to them later, and the mapped proxy clears the prompt-scoped session once it finishes.
 - Deployed split proxies now also pass a session-affinity key into `RemoteEngine` lookup so the static and mapped halves can reuse that prompt-scoped remote state on the same worker.
 - Session observability now logs the full prompt-scoped lifecycle for split proxies: session creation, reuse, ref resolution, value storage, and cleanup in both local and cloud runtime paths.

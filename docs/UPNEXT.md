@@ -24,6 +24,7 @@ Desired behavior:
 ### Implemented
 
 - Hybrid components with both static and mapped remote subsets now rewrite into two ordinary `subgraph` proxies instead of one hybrid `mapped_subgraph` proxy.
+- Ordinary remote components with multiple local-exporting execute branches can now also rewrite into ordered ordinary `subgraph` proxies when they only share remote-only upstream state.
 - The static proxy returns normal transportable outputs immediately to local consumers.
 - Static-to-mapped non-transportable boundaries now return opaque session refs instead of raw runtime objects.
 - The remote runtime stores those bridge values in a prompt-scoped in-memory session and resolves them when the mapped proxy runs.

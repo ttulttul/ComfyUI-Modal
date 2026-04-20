@@ -12,6 +12,7 @@
 - Session observability is most useful when the store and the runtimes both log. Store-level logs explain create/reuse/resolve/cleanup semantics, while runtime-level logs tie those session ids back to concrete component executions and `clear_remote_session` boundaries.
 - Modal's own `modal container logs` path is just a thin wrapper over the SDK's `AppGetLogs` stream, so local observability does not need a separate sidecar. The remote worker can surface its `MODAL_TASK_ID` in the existing streamed payload channel, and the local ComfyUI side can mirror that task's container logs directly into local stderr with a CLI fallback when the Python SDK is unavailable.
 - In practice, the local Python SDK log stream can emit Modal client task-context warnings when called from ComfyUI's own worker threads. Preferring the `modal container logs` subprocess path avoids that noise while still preserving an SDK fallback for environments that only have the Python package installed.
+- The hybrid split-proxy pattern is useful beyond `ModalMapInput`. If a coarse remote component has several execute branches that only share a remote-only upstream value like `MODEL`, rewriting that component into ordered ordinary subgraph proxies gives ComfyUI real early completion points without needing partial-result semantics inside one proxy.
 
 ## 2026-04-19
 
