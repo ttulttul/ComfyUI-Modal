@@ -1098,6 +1098,72 @@ def test_modal_cloud_node_cache_key_hashes_boundary_tensors(
     assert different_key != first_key
 
 
+def test_modal_cloud_node_cache_key_rebuilds_input_signature_before_unhashable_conversion(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Distributed node caching should bypass ComfyUI's precomputed `Unhashable` data key."""
+    torch = pytest.importorskip("torch")
+
+    class FakeDynPrompt:
+        """Minimal dynamic-prompt stub for input-signature reconstruction."""
+
+        def __init__(self, node: dict[str, Any]) -> None:
+            """Store one node payload under id `12`."""
+            self._node = node
+
+        def has_node(self, node_id: str) -> bool:
+            """Return whether the requested node exists."""
+            return str(node_id) == "12"
+
+        def get_node(self, node_id: str) -> dict[str, Any]:
+            """Return the stored node payload."""
+            if not self.has_node(node_id):
+                raise KeyError(node_id)
+            return self._node
+
+    class FakeUnhashable:
+        """Stand-in for ComfyUI's `Unhashable` marker."""
+
+    tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+    dynprompt = FakeDynPrompt(
+        {
+            "class_type": "FakeSampler",
+            "inputs": {
+                "latent_image": {"samples": tensor},
+                "steps": 18,
+            },
+        }
+    )
+    cache_key_set = types.SimpleNamespace(
+        dynprompt=dynprompt,
+        is_changed_cache=types.SimpleNamespace(is_changed={"12": False}),
+        get_ordered_ancestry=lambda current_dynprompt, node_id: ([], {}),
+        include_node_id_in_input=lambda: False,
+        get_data_key=lambda node_id: frozenset({("latent_image", FakeUnhashable())}),
+    )
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_nodes_module",
+        lambda: types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_include_unique_id_in_input_signature",
+        lambda class_type: False,
+    )
+
+    rebuilt_key = modal_cloud_module._node_output_cache_key_from_key_set_sync(cache_key_set, "12")
+    direct_bad_key = modal_cloud_module._node_output_cache_key(cache_key_set.get_data_key("12"))
+
+    assert isinstance(rebuilt_key, str)
+    assert rebuilt_key.startswith("NC_")
+    assert direct_bad_key is None
+
+
 def test_modal_cloud_ignores_heavy_comfyui_paths(
     modal_cloud_module: Any,
 ) -> None:

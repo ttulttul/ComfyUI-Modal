@@ -1221,6 +1221,125 @@ async def _node_output_cache_store_get(cache_store: Any, cache_key: str) -> Any:
     return cache_store.get(cache_key)
 
 
+def _is_input_signature_cache_key_set(cache_key_set: Any) -> bool:
+    """Return whether one cache-key set uses ComfyUI input-signature semantics."""
+    return all(
+        hasattr(cache_key_set, attribute)
+        for attribute in ("dynprompt", "is_changed_cache", "get_ordered_ancestry", "include_node_id_in_input")
+    )
+
+
+def _include_unique_id_in_input_signature(class_type: str) -> bool:
+    """Return whether ComfyUI includes the unique node id in this input signature."""
+    from comfy_execution.caching import include_unique_id_in_input
+
+    return bool(include_unique_id_in_input(class_type))
+
+
+def _build_node_output_cache_immediate_signature(
+    cache_key_set: Any,
+    *,
+    dynprompt: Any,
+    node_id: str,
+    ancestor_order_mapping: dict[str, int],
+    is_changed_value: Any,
+) -> list[Any]:
+    """Return one raw ComfyUI input-signature fragment before `to_hashable()` runs."""
+    if not dynprompt.has_node(node_id):
+        return [float("NaN")]
+
+    node = dynprompt.get_node(node_id)
+    class_type = node["class_type"]
+    class_def = _load_nodes_module().NODE_CLASS_MAPPINGS[class_type]
+    signature: list[Any] = [class_type, is_changed_value]
+    if (
+        cache_key_set.include_node_id_in_input()
+        or (hasattr(class_def, "NOT_IDEMPOTENT") and class_def.NOT_IDEMPOTENT)
+        or _include_unique_id_in_input_signature(class_type)
+    ):
+        signature.append(node_id)
+
+    inputs = node["inputs"]
+    for key in sorted(inputs.keys()):
+        input_value = inputs[key]
+        if _is_link(input_value):
+            ancestor_id = str(input_value[0])
+            ancestor_socket = int(input_value[1])
+            ancestor_index = int(ancestor_order_mapping[ancestor_id])
+            signature.append((key, ("ANCESTOR", ancestor_index, ancestor_socket)))
+        else:
+            signature.append((key, input_value))
+    return signature
+
+
+async def _build_node_output_cache_signature_from_key_set_async(
+    cache_key_set: Any,
+    node_id: str,
+) -> Any:
+    """Return one distributed cache signature derived from a live ComfyUI cache-key set."""
+    if not _is_input_signature_cache_key_set(cache_key_set):
+        return cache_key_set.get_data_key(node_id)
+
+    dynprompt = cache_key_set.dynprompt
+    ancestors, order_mapping = cache_key_set.get_ordered_ancestry(dynprompt, node_id)
+    signature = [
+        _build_node_output_cache_immediate_signature(
+            cache_key_set,
+            dynprompt=dynprompt,
+            node_id=node_id,
+            ancestor_order_mapping=order_mapping,
+            is_changed_value=await cache_key_set.is_changed_cache.get(node_id),
+        )
+    ]
+    for ancestor_id in ancestors:
+        signature.append(
+            _build_node_output_cache_immediate_signature(
+                cache_key_set,
+                dynprompt=dynprompt,
+                node_id=str(ancestor_id),
+                ancestor_order_mapping=order_mapping,
+                is_changed_value=await cache_key_set.is_changed_cache.get(ancestor_id),
+            )
+        )
+    return signature
+
+
+def _build_node_output_cache_signature_from_key_set_sync(
+    cache_key_set: Any,
+    node_id: str,
+) -> Any | None:
+    """Return one distributed cache signature using cached `is_changed` values only."""
+    if not _is_input_signature_cache_key_set(cache_key_set):
+        return cache_key_set.get_data_key(node_id)
+
+    cached_is_changed = getattr(cache_key_set.is_changed_cache, "is_changed", None)
+    if not isinstance(cached_is_changed, dict):
+        return None
+
+    dynprompt = cache_key_set.dynprompt
+    ancestors, order_mapping = cache_key_set.get_ordered_ancestry(dynprompt, node_id)
+    all_node_ids = [str(node_id), *[str(ancestor_id) for ancestor_id in ancestors]]
+    missing_node_ids = [candidate for candidate in all_node_ids if candidate not in cached_is_changed]
+    if missing_node_ids:
+        _emit_cloud_info(
+            "Node output cache signature rebuild node=%s result=skip reason=missing-is-changed values=%s",
+            node_id,
+            missing_node_ids,
+        )
+        return None
+
+    return [
+        _build_node_output_cache_immediate_signature(
+            cache_key_set,
+            dynprompt=dynprompt,
+            node_id=candidate,
+            ancestor_order_mapping=order_mapping,
+            is_changed_value=cached_is_changed[candidate],
+        )
+        for candidate in all_node_ids
+    ]
+
+
 def _canonicalize_node_output_cache_key_part(
     value: Any,
     *,
@@ -1382,6 +1501,30 @@ def _node_output_cache_key(signature: Any) -> str | None:
     return f"{_NODE_OUTPUT_CACHE_KEY_PREFIX}{signature_digest}"
 
 
+async def _node_output_cache_key_from_key_set_async(
+    cache_key_set: Any,
+    node_id: str,
+) -> str | None:
+    """Return the persisted Modal Dict key for one live ComfyUI cache-key-set node."""
+    return _node_output_cache_key(
+        await _build_node_output_cache_signature_from_key_set_async(
+            cache_key_set,
+            node_id,
+        )
+    )
+
+
+def _node_output_cache_key_from_key_set_sync(
+    cache_key_set: Any,
+    node_id: str,
+) -> str | None:
+    """Return the persisted Modal Dict key for one executed ComfyUI cache-key-set node."""
+    signature = _build_node_output_cache_signature_from_key_set_sync(cache_key_set, node_id)
+    if signature is None:
+        return None
+    return _node_output_cache_key(signature)
+
+
 def _estimate_node_output_cache_value_size_bytes(
     value: Any,
     *,
@@ -1525,7 +1668,7 @@ async def _restore_persisted_node_output_cache_entries(
                 node_id,
             )
             continue
-        cache_key = _node_output_cache_key(outputs_cache.cache_key_set.get_data_key(node_id))
+        cache_key = await _node_output_cache_key_from_key_set_async(outputs_cache.cache_key_set, str(node_id))
         if cache_key is None:
             _emit_cloud_info(
                 "Node output cache lookup node=%s key_prefix=%s result=skip reason=key-unhashable",
@@ -1581,7 +1724,7 @@ def _persist_node_output_cache_entries(
                 node_id,
             )
             continue
-        cache_key = _node_output_cache_key(cache_key_set.get_data_key(node_id))
+        cache_key = _node_output_cache_key_from_key_set_sync(cache_key_set, str(node_id))
         if cache_key is None:
             _emit_cloud_info(
                 "Node output cache write node=%s key_prefix=%s result=skip reason=key-unhashable",
