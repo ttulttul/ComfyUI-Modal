@@ -396,6 +396,7 @@ COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
 - Prompt-scoped remote session misses are treated as routing/state errors now, not poisoned-container crashes. If a split proxy lands on the wrong Modal container and its session bucket is missing, the worker logs the miss but does not self-terminate; the real fix for that class of failure is stronger container affinity or leased session routing.
 - `ModalMapInput` is a queue-time mapping marker even when the marker node itself stays local. If a local `ModalMapInput` feeds a remote node, rewrite should still produce a `mapped_subgraph` so list(INT) values like `NextSeeds` outputs are itemized before the remote sampler runs.
 - Implicit mapped execution distinguishes semantic lists from lists of remote session refs. Raw `CONDITIONING` lists stay broadcast, but a list of prompt-scoped session refs for `MODEL`/`CONDITIONING` is treated as per-item mapped state and split item-by-item before the downstream remote node executes.
+- Implicit mapped execution cannot let each static or per-item sub-run inherit `clear_remote_session=True`. Shared prompt-scoped sessions now stay alive across all sibling mapped items and are cleared exactly once through a dedicated final cleanup payload, which prevents later item runs from seeing `RemoteSessionStateError` after an earlier sibling finishes first.
 
 ## Current limitations
 

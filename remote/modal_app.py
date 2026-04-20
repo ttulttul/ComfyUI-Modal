@@ -2300,6 +2300,7 @@ def _build_mapped_item_payload(
     item_payload["mapped_progress_display_node_id"] = str(
         payload.get("component_id", "modal-subgraph")
     )
+    item_payload.pop("clear_remote_session", None)
     item_payload["execute_node_ids"] = list(
         payload.get("mapped_execute_node_ids") or payload.get("execute_node_ids", [])
     )
@@ -2337,6 +2338,27 @@ def _aggregate_mapped_outputs(
     return tuple(aggregated_outputs)
 
 
+def _build_remote_session_cleanup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a dedicated cleanup payload that clears one shared remote session once."""
+    remote_session = payload.get("remote_session")
+    if not bool(payload.get("clear_remote_session")) or not is_remote_session_handle_payload(remote_session):
+        return None
+    return {
+        "payload_kind": "subgraph",
+        "component_id": f"{payload.get('component_id', 'modal-subgraph')}::cleanup",
+        **_shared_subgraph_payload_fields(payload),
+        "component_node_ids": [],
+        "subgraph_prompt": {},
+        "boundary_inputs": [],
+        "boundary_outputs": [],
+        "execute_node_ids": [],
+        "remote_session": copy.deepcopy(remote_session),
+        "clear_remote_session": True,
+        "suppress_status_stream": True,
+        "terminate_container_on_error": False,
+    }
+
+
 def _is_mapped_boundary_output(boundary_output: dict[str, Any], payload: dict[str, Any]) -> bool:
     """Return whether one boundary output belongs to the mapped per-item branch."""
     mapped_output = boundary_output.get("mapped_output")
@@ -2359,6 +2381,7 @@ def _build_static_mapped_payload(payload: dict[str, Any]) -> dict[str, Any]:
     static_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::static"
     static_payload["mapped_input"] = None
     static_payload["suppress_status_stream"] = True
+    static_payload.pop("clear_remote_session", None)
     static_payload["execute_node_ids"] = list(payload.get("static_execute_node_ids") or [])
     static_payload["boundary_outputs"] = [
         copy.deepcopy(boundary_output)
@@ -2685,73 +2708,81 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         payload,
         mapped_execute_node_ids,
     )
+    cleanup_payload = _build_remote_session_cleanup_payload(hybrid_payload)
 
     static_outputs: tuple[Any, ...] = ()
-    if static_execute_node_ids:
-        static_response = await invoke_remote_engine_async(
-            _build_static_mapped_payload(hybrid_payload),
-            serialize_node_inputs(broadcast_inputs),
-        )
-        static_outputs = deserialize_node_outputs(static_response)
-
-    per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
-    completed_items = 0
-    item_queue: asyncio.Queue[int | None] = asyncio.Queue()
-    for item_index in range(total_items):
-        item_queue.put_nowait(item_index)
-    for _ in range(parallelism):
-        item_queue.put_nowait(None)
-
-    async def run_worker(lane_index: int) -> None:
-        """Execute queued implicit mapped items through one stable local worker lane."""
-        nonlocal completed_items
-        while True:
-            item_index = await item_queue.get()
-            if item_index is None:
-                return
-            if _local_processing_interrupted():
-                _raise_local_interrupt()
-            try:
-                item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
-                item_inputs = dict(broadcast_inputs)
-                for input_name, items in split_inputs.items():
-                    item_inputs[input_name] = items[item_index]
-                item_response = await invoke_remote_engine_async(
-                    item_payload,
-                    serialize_node_inputs(item_inputs),
-                )
-                per_item_outputs[item_index] = deserialize_node_outputs(item_response)
-                completed_items += 1
-                _emit_local_mapped_progress(payload, completed_items, total_items)
-            finally:
-                _clear_local_mapped_lane_progress(payload, lane_index, item_index)
-
-    tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
     try:
-        await asyncio.gather(*tasks)
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        if static_execute_node_ids:
+            static_response = await invoke_remote_engine_async(
+                _build_static_mapped_payload(hybrid_payload),
+                serialize_node_inputs(broadcast_inputs),
+            )
+            static_outputs = deserialize_node_outputs(static_response)
 
-    return serialize_node_outputs(
-        _merge_static_and_mapped_outputs(
-            static_outputs=static_outputs,
-            mapped_outputs=_aggregate_mapped_outputs(
-                [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
-                {
-                    **hybrid_payload,
-                    "boundary_outputs": [
-                        boundary_output
-                        for boundary_output in hybrid_payload.get("boundary_outputs", [])
-                        if _is_mapped_boundary_output(boundary_output, hybrid_payload)
-                    ],
-                },
-            ),
-            payload=hybrid_payload,
+        per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
+        completed_items = 0
+        item_queue: asyncio.Queue[int | None] = asyncio.Queue()
+        for item_index in range(total_items):
+            item_queue.put_nowait(item_index)
+        for _ in range(parallelism):
+            item_queue.put_nowait(None)
+
+        async def run_worker(lane_index: int) -> None:
+            """Execute queued implicit mapped items through one stable local worker lane."""
+            nonlocal completed_items
+            while True:
+                item_index = await item_queue.get()
+                if item_index is None:
+                    return
+                if _local_processing_interrupted():
+                    _raise_local_interrupt()
+                try:
+                    item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
+                    item_inputs = dict(broadcast_inputs)
+                    for input_name, items in split_inputs.items():
+                        item_inputs[input_name] = items[item_index]
+                    item_response = await invoke_remote_engine_async(
+                        item_payload,
+                        serialize_node_inputs(item_inputs),
+                    )
+                    per_item_outputs[item_index] = deserialize_node_outputs(item_response)
+                    completed_items += 1
+                    _emit_local_mapped_progress(payload, completed_items, total_items)
+                finally:
+                    _clear_local_mapped_lane_progress(payload, lane_index, item_index)
+
+        tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        return serialize_node_outputs(
+            _merge_static_and_mapped_outputs(
+                static_outputs=static_outputs,
+                mapped_outputs=_aggregate_mapped_outputs(
+                    [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+                    {
+                        **hybrid_payload,
+                        "boundary_outputs": [
+                            boundary_output
+                            for boundary_output in hybrid_payload.get("boundary_outputs", [])
+                            if _is_mapped_boundary_output(boundary_output, hybrid_payload)
+                        ],
+                    },
+                ),
+                payload=hybrid_payload,
+            )
         )
-    )
+    finally:
+        if cleanup_payload is not None:
+            await invoke_remote_engine_async(
+                cleanup_payload,
+                serialize_node_inputs({}),
+            )
 
 
 async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
