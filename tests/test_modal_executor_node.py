@@ -3653,6 +3653,121 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
     ]
 
 
+def test_implicitly_mapped_subgraph_clears_remote_session_once_after_all_items_finish(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    session_state_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit mapped execution should reserve remote-session cleanup for one final cleanup payload."""
+    observed_calls: list[tuple[str, bool, tuple[str, ...], dict[str, Any]]] = []
+    session_cleared = False
+
+    monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        nonlocal session_cleared
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        clear_remote_session = bool(payload.get("clear_remote_session"))
+        observed_calls.append(
+            (str(payload["component_id"]), clear_remote_session, execute_node_ids, hydrated_inputs)
+        )
+
+        if clear_remote_session:
+            session_cleared = True
+        elif session_cleared:
+            raise session_state_module.RemoteSessionStateError(
+                "Remote session 'session-1' was not found."
+            )
+
+        if execute_node_ids == ("4",):
+            return serialization_module.serialize_node_outputs(("sampler-4",))
+        if execute_node_ids == ("12",):
+            return serialization_module.serialize_node_outputs((f"sampler-12:{hydrated_inputs['remote_input_0']}",))
+        if execute_node_ids == ():
+            return serialization_module.serialize_node_outputs(())
+        raise AssertionError(f"Unexpected execute nodes for implicit cleanup regression: {execute_node_ids!r}")
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["4", "12", "17"],
+        "execute_node_ids": ["4", "12"],
+        "subgraph_prompt": {
+            "17": {"class_type": "LoraLoaderModelOnly", "inputs": {}},
+            "4": {"class_type": "KSampler", "inputs": {"model": ["17", 0], "seed": 0}},
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {"model": ["17", 0], "seed": 0},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "4", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "4", "io_type": "STRING", "is_list": False},
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-1",
+            prompt_id="prompt-1",
+            owner_component_id="17",
+        ).to_payload(),
+        "clear_remote_session": True,
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": [10, 11, 12],
+                    "remote_input_1": [28],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        "sampler-4",
+        ["sampler-12:10", "sampler-12:11", "sampler-12:12"],
+    )
+    assert [
+        (component_id, execute_node_ids)
+        for component_id, _, execute_node_ids, _ in observed_calls
+    ] == [
+        ("17::static", ("4",)),
+        ("17::item:0", ("12",)),
+        ("17::item:1", ("12",)),
+        ("17::item:2", ("12",)),
+        ("17::cleanup", ()),
+    ]
+    assert all(
+        not clear_remote_session
+        for component_id, clear_remote_session, _, _ in observed_calls
+        if component_id != "17::cleanup"
+    )
+    assert observed_calls[-1] == ("17::cleanup", True, (), {})
+
+
 def test_implicitly_mapped_subgraph_keeps_conditioning_lists_broadcast(
     remote_modal_app_module: Any,
     serialization_module: Any,
