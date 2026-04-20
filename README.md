@@ -392,6 +392,7 @@ COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
 - [`modal_test_workflow.json`](modal_test_workflow.json) is a checked-in smoke artifact from a successful Modal-path run, not a pristine authoring workflow.
 - Implicit mapped execution only treats explicitly batchable transport types and list-wrapped primitive sockets as per-item inputs. List-backed semantic types like `CONDITIONING` stay broadcast across mapped item runs so the remote worker does not accidentally slice them into invalid fragments.
 - Remote primitive-socket validation only rejects raw widget list literals now. If a primitive socket like `INT` is hydrated from a boundary input or upstream output and carries a list value, the runtime leaves it alone so ComfyUI can apply its normal over-list execution semantics for nodes like `NextSeeds`.
+- Boundary input normalization only unwraps singleton wrappers for scalar-like values and true prompt links. Single-entry semantic lists like `CONDITIONING` must stay wrapped as lists, or ComfyUI will misread `[[tensor, meta]]` as `[tensor, meta]` and crash during conditioning conversion.
 
 ## Current limitations
 
