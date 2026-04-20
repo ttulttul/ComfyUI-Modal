@@ -305,6 +305,8 @@ Remote nodes that emit ComfyUI UI outputs also stream those `executed` payloads 
 
 For direct local `PreviewImage` consumers of a remote boundary `IMAGE` output, the relay also synthesizes the local preview-node UI event as soon as that remote boundary image is ready. This improves the common "remote decode -> local preview" case even though the proxy node itself still returns its formal outputs only when the remote component finishes.
 
+Remote subgraph runs also persist transport-safe node outputs into a shared Modal `Dict` using ComfyUI's `CacheKeySetInputSignature` semantics. In practice that lets later workflow runs reuse small and medium cached outputs, including image tensors, even after Modal scales down and starts a fresh container, while still skipping non-serializable outputs and entries above the configured size cap.
+
 The extension also keeps a global activity badge visible during queue-time sync and remote execution, including the period before the prompt is formally queued. During setup it now surfaces more specific stages such as packaging the `custom_nodes` ZIP and uploading named assets, and after remote execution finishes it can briefly report that it is still receiving Modal outputs before the local proxy returns.
 
 ### 6. Asset sync expectations
@@ -342,6 +344,8 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_EXECUTION_MODE`: Set to `local` for in-process fallback execution. Default: `local`.
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
 - `COMFY_MODAL_INTERRUPT_DICT_NAME`: Override the shared Modal `Dict` used for remote cancellation flags. Default: `<app_name>-interrupts`.
+- `COMFY_MODAL_NODE_CACHE_DICT_NAME`: Override the shared Modal `Dict` used for persisted transport-safe node outputs. Default: `<app_name>-node-cache`.
+- `COMFY_MODAL_NODE_CACHE_MAX_BYTES`: Maximum raw output size eligible for persisted node caching. Default: `52428800` (50 MiB). Set to `0` to disable the persisted node-output cache.
 - `COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR`: When true, a remote execution crash makes the worker exit its own container after returning the error. Default: `true`.
 - `COMFY_MODAL_AUTO_DEPLOY`: Automatically deploy the Modal app on first remote invocation when lookup fails. Default: `true`.
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import gc
 import hashlib
 import importlib.util
 from io import BytesIO
-import json
 import inspect
+import json
 import logging
+import math
 import os
 import queue
 import sys
@@ -18,6 +20,7 @@ import tempfile
 import threading
 import time
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -41,7 +44,15 @@ for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_CO
     if candidate_exists and candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-from serialization import coerce_serialized_node_outputs, deserialize_node_inputs, serialize_mapping, serialize_node_outputs
+from serialization import (
+    coerce_serialized_node_outputs,
+    deserialize_node_inputs,
+    deserialize_node_outputs,
+    deserialize_value,
+    serialize_mapping,
+    serialize_node_outputs,
+    serialize_value,
+)
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -53,6 +64,8 @@ _EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
 _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
+_NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
+_NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
@@ -1161,6 +1174,270 @@ def _get_or_create_prompt_executor_state(
         return state
 
 
+def _node_output_cache_store() -> Any | None:
+    """Return the shared Modal Dict used for persisted transport-safe node outputs."""
+    if modal is None:
+        return None
+    return globals().get("node_output_cache")
+
+
+def _canonicalize_node_output_cache_key_part(value: Any) -> Any | None:
+    """Return a JSON-stable representation of one CacheKeySetInputSignature fragment."""
+    value_type_name = type(value).__name__
+    if value_type_name == "Unhashable":
+        return None
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"kind": "float", "value": "nan"}
+        if math.isinf(value):
+            return {"kind": "float", "value": "inf" if value > 0 else "-inf"}
+        return value
+    if isinstance(value, bytes):
+        return {
+            "kind": "bytes",
+            "value": base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, tuple):
+        items = []
+        for item in value:
+            canonical_item = _canonicalize_node_output_cache_key_part(item)
+            if canonical_item is None:
+                return None
+            items.append(canonical_item)
+        return {"kind": "tuple", "items": items}
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            canonical_item = _canonicalize_node_output_cache_key_part(item)
+            if canonical_item is None:
+                return None
+            items.append(canonical_item)
+        return {"kind": "list", "items": items}
+    if isinstance(value, dict):
+        items: list[dict[str, Any]] = []
+        for key in sorted(value):
+            canonical_key = _canonicalize_node_output_cache_key_part(key)
+            canonical_value = _canonicalize_node_output_cache_key_part(value[key])
+            if canonical_key is None or canonical_value is None:
+                return None
+            items.append({"key": canonical_key, "value": canonical_value})
+        return {"kind": "dict", "items": items}
+    if isinstance(value, frozenset):
+        canonical_items: list[Any] = []
+        for item in value:
+            canonical_item = _canonicalize_node_output_cache_key_part(item)
+            if canonical_item is None:
+                return None
+            canonical_items.append(canonical_item)
+        canonical_items.sort(
+            key=lambda item: json.dumps(
+                item,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return {"kind": "frozenset", "items": canonical_items}
+    return None
+
+
+def _node_output_cache_key(signature: Any) -> str | None:
+    """Return the persisted Modal Dict key for one ComfyUI cache signature."""
+    canonical_signature = _canonicalize_node_output_cache_key_part(signature)
+    if canonical_signature is None:
+        return None
+    signature_payload = json.dumps(
+        canonical_signature,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature_digest = hashlib.sha256(signature_payload).hexdigest()
+    return f"{_NODE_OUTPUT_CACHE_KEY_PREFIX}{signature_digest}"
+
+
+def _estimate_node_output_cache_value_size_bytes(
+    value: Any,
+    *,
+    byte_limit: int,
+) -> int | None:
+    """Return a best-effort raw-size estimate for one transport-safe value."""
+    if byte_limit < 0:
+        return None
+    if value is None or isinstance(value, bool):
+        return 1
+    if isinstance(value, int):
+        return 8
+    if isinstance(value, float):
+        return 8
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, bytes):
+        return len(value)
+
+    try:
+        import torch
+    except ModuleNotFoundError:
+        torch = None
+
+    if torch is not None and isinstance(value, torch.Tensor):
+        return int(value.numel()) * int(value.element_size())
+
+    if isinstance(value, tuple | list):
+        total_size = 0
+        for item in value:
+            item_size = _estimate_node_output_cache_value_size_bytes(item, byte_limit=byte_limit)
+            if item_size is None:
+                return None
+            total_size += item_size
+            if total_size > byte_limit:
+                return total_size
+        return total_size
+
+    if isinstance(value, dict):
+        total_size = 0
+        for key, item in value.items():
+            total_size += len(str(key).encode("utf-8"))
+            if total_size > byte_limit:
+                return total_size
+            item_size = _estimate_node_output_cache_value_size_bytes(item, byte_limit=byte_limit)
+            if item_size is None:
+                return None
+            total_size += item_size
+            if total_size > byte_limit:
+                return total_size
+        return total_size
+
+    return None
+
+
+def _serialize_node_output_cache_entry(
+    cache_entry: Any,
+    *,
+    max_bytes: int,
+) -> dict[str, Any] | None:
+    """Return a persisted node-cache record when the outputs are safe and small enough."""
+    if max_bytes <= 0:
+        return None
+
+    outputs_size = _estimate_node_output_cache_value_size_bytes(
+        list(getattr(cache_entry, "outputs", [])),
+        byte_limit=max_bytes,
+    )
+    if outputs_size is None or outputs_size > max_bytes:
+        return None
+
+    try:
+        serialized_outputs = serialize_node_outputs(tuple(getattr(cache_entry, "outputs", [])))
+    except TypeError:
+        return None
+
+    ui_payload: Any | None = None
+    ui_value = getattr(cache_entry, "ui", None)
+    if ui_value is not None:
+        ui_size = _estimate_node_output_cache_value_size_bytes(ui_value, byte_limit=max_bytes)
+        if ui_size is not None and ui_size <= max_bytes:
+            try:
+                ui_payload = serialize_value(ui_value)
+            except TypeError:
+                ui_payload = None
+
+    return {
+        "version": _NODE_OUTPUT_CACHE_RECORD_VERSION,
+        "outputs_zlib": zlib.compress(serialized_outputs),
+        "outputs_size_bytes": outputs_size,
+        "ui": ui_payload,
+    }
+
+
+def _deserialize_node_output_cache_entry(
+    execution: Any,
+    record: Any,
+) -> Any | None:
+    """Return a ComfyUI CacheEntry reconstructed from one persisted Modal Dict record."""
+    if not isinstance(record, dict):
+        return None
+    if int(record.get("version", -1)) != _NODE_OUTPUT_CACHE_RECORD_VERSION:
+        return None
+    compressed_outputs = record.get("outputs_zlib")
+    if not isinstance(compressed_outputs, (bytes, bytearray)):
+        return None
+
+    try:
+        outputs = list(deserialize_node_outputs(zlib.decompress(bytes(compressed_outputs))))
+    except (TypeError, ValueError, zlib.error):
+        return None
+
+    ui_payload = record.get("ui")
+    try:
+        ui_value = deserialize_value(ui_payload) if ui_payload is not None else None
+    except TypeError:
+        ui_value = None
+    return execution.CacheEntry(ui=ui_value, outputs=outputs)
+
+
+async def _restore_persisted_node_output_cache_entries(
+    execution: Any,
+    executor: Any,
+    *,
+    prompt_id: str,
+    prompt: dict[str, Any],
+    cache_store: Any,
+) -> list[str]:
+    """Hydrate PromptExecutor output-cache misses from the shared Modal Dict."""
+    outputs_cache = executor.caches.outputs
+    dynamic_prompt = execution.DynamicPrompt(prompt)
+    is_changed_cache = execution.IsChangedCache(prompt_id, dynamic_prompt, outputs_cache)
+    await outputs_cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
+    outputs_cache.clean_unused()
+
+    restored_node_ids: list[str] = []
+    for node_id in prompt:
+        if outputs_cache.get(node_id) is not None:
+            continue
+        cache_key = _node_output_cache_key(outputs_cache.cache_key_set.get_data_key(node_id))
+        if cache_key is None:
+            continue
+        cache_entry = _deserialize_node_output_cache_entry(execution, cache_store.get(cache_key))
+        if cache_entry is None:
+            continue
+        outputs_cache.set(node_id, cache_entry)
+        restored_node_ids.append(str(node_id))
+    return restored_node_ids
+
+
+def _persist_node_output_cache_entries(
+    executor: Any,
+    *,
+    prompt: dict[str, Any],
+    cache_store: Any,
+) -> list[str]:
+    """Persist eligible PromptExecutor cache entries into the shared Modal Dict."""
+    max_bytes = get_settings().node_output_cache_max_bytes
+    if max_bytes <= 0:
+        return []
+
+    outputs_cache = executor.caches.outputs
+    cache_key_set = getattr(outputs_cache, "cache_key_set", None)
+    if cache_key_set is None:
+        return []
+
+    persisted_node_ids: list[str] = []
+    for node_id in prompt:
+        cache_entry = outputs_cache.get(node_id)
+        if cache_entry is None:
+            continue
+        cache_key = _node_output_cache_key(cache_key_set.get_data_key(node_id))
+        if cache_key is None:
+            continue
+        record = _serialize_node_output_cache_entry(cache_entry, max_bytes=max_bytes)
+        if record is None:
+            continue
+        cache_store[cache_key] = record
+        persisted_node_ids.append(str(node_id))
+    return persisted_node_ids
+
+
 def _invoke_original_node(
     node_class: type[Any],
     node_data: dict[str, Any],
@@ -1707,12 +1984,35 @@ def _execute_subgraph_prompt(
                 cache_args=cache_args,
                 custom_nodes_root=custom_nodes_root,
             )
-        prompt_server.configure_boundary_output_stream(
-            boundary_outputs=list(normalized_payload.get("boundary_outputs", [])),
-            lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
-        )
+        cache_store = _node_output_cache_store()
         with executor_state.lock:
             _reset_prompt_executor_request_state(executor_state.executor, prompt_server)
+            restored_node_ids: list[str] = []
+            if cache_store is not None and get_settings().node_output_cache_max_bytes > 0:
+                with _timed_phase("restore_persisted_node_cache", component=component_id):
+                    restored_node_ids = asyncio.run(
+                        _restore_persisted_node_output_cache_entries(
+                            execution,
+                            executor_state.executor,
+                            prompt_id=str(
+                                payload.get("prompt_id")
+                                or component_id
+                            ),
+                            prompt=prompt,
+                            cache_store=cache_store,
+                        )
+                    )
+                if restored_node_ids:
+                    _emit_cloud_info(
+                        "Restored %d persisted node cache entries for component=%s: %s",
+                        len(restored_node_ids),
+                        component_id,
+                        restored_node_ids,
+                    )
+            prompt_server.configure_boundary_output_stream(
+                boundary_outputs=list(normalized_payload.get("boundary_outputs", [])),
+                lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
+            )
             with _timed_phase(
                 "prompt_executor_execute",
                 component=component_id,
@@ -1736,6 +2036,21 @@ def _execute_subgraph_prompt(
                 executor=executor,
             )
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
+
+        if cache_store is not None and get_settings().node_output_cache_max_bytes > 0:
+            with _timed_phase("persist_node_cache", component=component_id):
+                persisted_node_ids = _persist_node_output_cache_entries(
+                    executor,
+                    prompt=prompt,
+                    cache_store=cache_store,
+                )
+            if persisted_node_ids:
+                _emit_cloud_info(
+                    "Persisted %d node cache entries for component=%s: %s",
+                    len(persisted_node_ids),
+                    component_id,
+                    persisted_node_ids,
+                )
 
         outputs: list[Any] = []
         with _timed_phase(
@@ -2594,6 +2909,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)
     interrupt_flags = modal.Dict.from_name(
         settings.interrupt_dict_name,
+        create_if_missing=True,
+    )
+    node_output_cache = modal.Dict.from_name(
+        settings.node_output_cache_dict_name,
         create_if_missing=True,
     )
     image = (

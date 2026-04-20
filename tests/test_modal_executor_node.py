@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import sys
 import threading
@@ -3284,6 +3285,126 @@ def test_modal_cloud_separates_prompt_executor_cache_scopes_by_custom_nodes_root
 
     assert FakePromptExecutor.instances_created == 2
     assert first_state is not second_state
+
+
+class _PersistentCacheNode:
+    """Simple node used to verify persisted node-cache reuse across prompt runs."""
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("value",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "run"
+    invocation_count = 0
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str]]]:
+        """Return the minimal V1 schema needed for cache-key generation."""
+        return {"required": {"value": ("INT",)}}
+
+    def run(self, value: int) -> tuple[int]:
+        """Count real executions so persisted cache hits are visible to the test."""
+        type(self).invocation_count += 1
+        return (value + 1,)
+
+
+def test_modal_cloud_serializes_only_small_transport_safe_node_outputs(
+    modal_cloud_module: Any,
+) -> None:
+    """Persisted node-cache records should keep small tensor outputs and skip oversized ones."""
+    import torch
+
+    execution = modal_cloud_module._load_execution_module()
+    small_entry = execution.CacheEntry(ui=None, outputs=[[torch.zeros((8,), dtype=torch.float32)]])
+    large_entry = execution.CacheEntry(ui=None, outputs=[[torch.zeros((512,), dtype=torch.float32)]])
+
+    small_record = modal_cloud_module._serialize_node_output_cache_entry(
+        small_entry,
+        max_bytes=1024,
+    )
+    large_record = modal_cloud_module._serialize_node_output_cache_entry(
+        large_entry,
+        max_bytes=1024,
+    )
+
+    assert small_record is not None
+    assert large_record is None
+
+
+def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instances(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A fresh PromptExecutor cache should round-trip persisted node outputs through Modal Dict state."""
+    monkeypatch.setitem(sys.modules, "torchsde", types.ModuleType("torchsde"))
+    modal_cloud_module._ensure_comfy_runtime_initialized(None)
+    import comfy_execution.caching as comfy_caching
+
+    execution = modal_cloud_module._load_execution_module()
+    nodes_module = modal_cloud_module._load_nodes_module()
+    cache_store: dict[str, Any] = {}
+    prompt = {
+        "node_1": {
+            "class_type": "PersistentCacheNode",
+            "inputs": {"value": 4},
+            "_meta": {},
+        }
+    }
+
+    _PersistentCacheNode.invocation_count = 0
+    monkeypatch.setitem(nodes_module.NODE_CLASS_MAPPINGS, "PersistentCacheNode", _PersistentCacheNode)
+    monkeypatch.setitem(
+        comfy_caching.nodes.NODE_CLASS_MAPPINGS,
+        "PersistentCacheNode",
+        _PersistentCacheNode,
+    )
+    monkeypatch.setitem(
+        nodes_module.NODE_DISPLAY_NAME_MAPPINGS,
+        "PersistentCacheNode",
+        "PersistentCacheNode",
+    )
+    cache_entry = execution.CacheEntry(ui={"output": {"value": [5]}}, outputs=[[5]])
+    first_executor = execution.PromptExecutor(
+        modal_cloud_module._NullPromptServer(),
+        cache_type=execution.CacheType.CLASSIC,
+        cache_args={"lru": 0, "ram": 0.0},
+    )
+    restored_first = asyncio.run(
+        modal_cloud_module._restore_persisted_node_output_cache_entries(
+            execution,
+            first_executor,
+            prompt_id="prompt-a",
+            prompt=copy.deepcopy(prompt),
+            cache_store=cache_store,
+        )
+    )
+    first_executor.caches.outputs.set("node_1", cache_entry)
+    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
+        first_executor,
+        prompt=copy.deepcopy(prompt),
+        cache_store=cache_store,
+    )
+
+    second_executor = execution.PromptExecutor(
+        modal_cloud_module._NullPromptServer(),
+        cache_type=execution.CacheType.CLASSIC,
+        cache_args={"lru": 0, "ram": 0.0},
+    )
+    restored_second = asyncio.run(
+        modal_cloud_module._restore_persisted_node_output_cache_entries(
+            execution,
+            second_executor,
+            prompt_id="prompt-b",
+            prompt=copy.deepcopy(prompt),
+            cache_store=cache_store,
+        )
+    )
+    restored_entry = second_executor.caches.outputs.get("node_1")
+
+    assert restored_first == []
+    assert persisted_nodes == ["node_1"]
+    assert restored_second == ["node_1"]
+    assert list(cache_store) and all(key.startswith("NC_") for key in cache_store)
+    assert restored_entry == cache_entry
 
 
 def test_modal_cloud_materializes_synced_asset_paths(
