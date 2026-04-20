@@ -3464,10 +3464,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     @modal.concurrent(max_inputs=1)
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
-
-        def __init__(self, session_affinity_key: str | None = None) -> None:
-            """Record the optional session-affinity key for split-proxy reuse."""
-            self.session_affinity_key = session_affinity_key
+        session_affinity_key: str = modal.parameter(default="")
 
         @modal.enter(snap=True)
         def setup_snapshot_state(self) -> None:
@@ -3476,7 +3473,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 _prewarm_snapshot_state(settings)
                 logger.info(
                     "RemoteEngine snapshot setup complete for session_affinity_key=%s.",
-                    self.session_affinity_key,
+                    self.session_affinity_key or None,
                 )
 
         @modal.enter(snap=False)
@@ -3486,7 +3483,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 _prewarm_restored_runtime()
                 logger.info(
                     "RemoteEngine restored-runtime setup complete for session_affinity_key=%s.",
-                    self.session_affinity_key,
+                    self.session_affinity_key or None,
                 )
 
         @modal.method()

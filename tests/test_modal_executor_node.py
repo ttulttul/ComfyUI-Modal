@@ -1541,7 +1541,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
                 """Return a deployed class after the first auto-deploy."""
                 if not FakeModal.deployed:
                     raise FakeLookupError("not deployed")
-                return lambda: FakeRemoteEngine()
+                return lambda **kwargs: FakeRemoteEngine()
 
         @staticmethod
         def enable_output() -> Any:
@@ -1568,6 +1568,49 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", None)]
+
+
+def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Deployed Modal lookups should use keyword parameterization for affinity-key routing."""
+    observed_kwargs: list[dict[str, Any]] = []
+
+    class FakeModal:
+        """Minimal modal SDK double that captures class construction kwargs."""
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a factory that records the provided class parameters."""
+                assert app_name == "comfy-modal-sync"
+                assert class_name == "RemoteEngine"
+
+                def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
+                    """Record one synthesized Modal class constructor call."""
+                    observed_kwargs.append(kwargs)
+                    return kwargs
+
+                return build_remote_engine
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+
+    result = remote_modal_app_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            "remote_session": remote_modal_app_module.RemoteSessionHandle(
+                session_id="session-123",
+                prompt_id="prompt-1",
+                owner_component_id="component-1",
+            ).to_payload(),
+        }
+    )
+
+    assert result == {"session_affinity_key": "session-123"}
+    assert observed_kwargs == [{"session_affinity_key": "session-123"}]
 
 
 def test_load_modal_cloud_module_reloads_stale_partial_module(
@@ -1794,32 +1837,33 @@ def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
     """CLI-backed container log streaming should mirror complete prefixed lines into local stderr."""
 
     class FakeStdout:
-        """Expose a deterministic readline interface for the fake Modal CLI process."""
+        """Expose a deterministic binary read interface for the fake Modal CLI process."""
 
-        def __init__(self, lines: list[str]) -> None:
-            """Store the lines that should be returned to the caller."""
-            self._lines = lines
+        def __init__(self, chunks: list[bytes]) -> None:
+            """Store the binary chunks that should be returned to the caller."""
+            self._chunks = chunks
             self._index = 0
 
-        def readline(self) -> str:
-            """Return one queued log line or EOF when exhausted."""
-            if self._index >= len(self._lines):
-                return ""
-            line = self._lines[self._index]
+        def read(self, size: int = -1) -> bytes:
+            """Return one queued binary chunk or EOF when exhausted."""
+            del size
+            if self._index >= len(self._chunks):
+                return b""
+            chunk = self._chunks[self._index]
             self._index += 1
-            return line
+            return chunk
 
     class FakeProcess:
         """Minimal subprocess stub used to emulate `modal container logs -f`."""
 
         def __init__(self) -> None:
             """Expose a stdout pipe and process lifecycle methods."""
-            self.stdout = FakeStdout(["session reuse\n", "session miss\n"])
+            self.stdout = FakeStdout([b"session reuse\n", b"session miss\n"])
             self.returncode: int | None = None
 
         def poll(self) -> int | None:
             """Report process completion after all fake lines have been read."""
-            if self.stdout._index >= len(self.stdout._lines):
+            if self.stdout._index >= len(self.stdout._chunks):
                 self.returncode = 0
             return self.returncode
 
@@ -1839,6 +1883,15 @@ def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
     stderr_buffer = StringIO()
     monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda name: "/usr/bin/modal")
     monkeypatch.setattr(remote_modal_app_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(
+        remote_modal_app_module.select,
+        "select",
+        lambda streams, _write, _error, _timeout: (
+            streams if streams[0]._index < len(streams[0]._chunks) else [],
+            [],
+            [],
+        ),
+    )
     monkeypatch.setattr(remote_modal_app_module.sys, "stderr", stderr_buffer)
 
     result = remote_modal_app_module._stream_remote_container_logs_via_modal_cli(
@@ -1851,6 +1904,29 @@ def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
         "[modal:ta-123] session reuse\n"
         "[modal:ta-123] session miss\n"
     )
+
+
+def test_remote_modal_log_stream_prefers_cli_before_sdk(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local log watcher should avoid the SDK path when the Modal CLI is available."""
+    backend_calls: list[str] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_stream_remote_container_logs_via_modal_cli",
+        lambda task_id, stop_event: backend_calls.append(f"cli:{task_id}") or True,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_stream_remote_container_logs_via_modal_sdk",
+        lambda task_id, stop_event: backend_calls.append(f"sdk:{task_id}") or True,
+    )
+
+    remote_modal_app_module._run_remote_container_log_stream("ta-123", threading.Event())
+
+    assert backend_calls == ["cli:ta-123"]
 
 
 def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
