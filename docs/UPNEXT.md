@@ -31,6 +31,7 @@ Desired behavior:
 - Prompt metadata is recomputed after rewrite so execution stages and dependency edges reflect the real split proxies.
 - A checked-in workflow-shaped regression artifact now locks the split static-plus-mapped rewrite behavior against future drift.
 - Session create, reuse, resolve, storage, and cleanup now emit explicit observability logs in the shared store and both runtime entrypoints.
+- Streamed remote executions now also surface their `MODAL_TASK_ID`, and the local runtime can optionally mirror that container's live logs into local stderr via the Modal SDK or `modal container logs -f` fallback.
 
 ### Why this shape
 
@@ -39,5 +40,5 @@ Partial-completion semantics for one proxy would require ComfyUI scheduler behav
 ### Remaining work
 
 - Online testing confirmed that `RemoteEngine(session_affinity_key)` kept the split static and mapped proxies on the same deployed Modal worker for the tested workflow.
-- Watch live logs for session create/reuse/cleanup and add a fallback path if deployed affinity turns out not to be sticky enough.
+- Run with `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS=true` during broader production workflows and watch the mirrored session lifecycle logs for any real session misses under scale-out.
 - If production logs ever show split-proxy session misses under real scale-out, add a stronger affinity fallback or explicit leased-worker/session routing instead of relying on best-effort class-instance affinity.

@@ -2929,6 +2929,7 @@ def _stream_remote_payload_events(
 ) -> Iterator[dict[str, Any]]:
     """Yield progress and result events for one remote payload execution."""
     event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+    task_id = os.getenv("MODAL_TASK_ID")
 
     def publish_status(progress_state: dict[str, Any]) -> None:
         """Queue a progress envelope for the remote caller."""
@@ -2986,6 +2987,8 @@ def _stream_remote_payload_events(
         name=f"modal-stream-{payload.get('component_id', 'payload')}",
         daemon=True,
     )
+    if task_id:
+        yield {"kind": "remote_logs", "task_id": task_id}
     worker_thread.start()
     try:
         while True:

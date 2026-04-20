@@ -10,7 +10,7 @@ import threading
 import time
 import types
 from contextlib import nullcontext
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 import logging
 from typing import Any, Iterator
@@ -583,6 +583,45 @@ def test_modal_cloud_streams_progress_and_result_events(
         {
             "kind": "progress",
             "phase": "execution_success",
+        },
+        {
+            "kind": "result",
+            "outputs": b"serialized-outputs",
+        },
+    ]
+
+
+def test_modal_cloud_streams_remote_log_task_id_before_progress(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote streamed payloads should surface the current Modal task id for local log mirroring."""
+
+    def fake_execute_subgraph_locally(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        status_callback: Any = None,
+    ) -> bytes:
+        if status_callback is not None:
+            status_callback({"phase": "executing", "active_node_id": "7"})
+        return b"serialized-outputs"
+
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-remote-123")
+    monkeypatch.setattr(modal_cloud_module, "execute_subgraph_locally", fake_execute_subgraph_locally)
+
+    events = list(
+        modal_cloud_module._stream_remote_payload_events(
+            {"payload_kind": "subgraph", "component_id": "component-1"},
+            b"{}",
+        )
+    )
+
+    assert events[0] == {"kind": "remote_logs", "task_id": "ta-remote-123"}
+    assert events[1:] == [
+        {
+            "kind": "progress",
+            "phase": "executing",
+            "active_node_id": "7",
         },
         {
             "kind": "result",
@@ -1704,6 +1743,114 @@ def test_remote_modal_consumes_streamed_progress_and_result(
             "client-1",
         ),
     ]
+
+
+def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Stream consumers should retain and release one container-log watcher per remote payload."""
+    log_stream_calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(stream_remote_container_logs=True),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_retain_remote_container_log_stream",
+        lambda task_id: log_stream_calls.append(("retain", task_id)) or task_id,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_release_remote_container_log_stream",
+        lambda task_id: log_stream_calls.append(("release", task_id)),
+    )
+
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "component-1",
+            "component_node_ids": ["7"],
+            "extra_data": {"client_id": "client-1"},
+        },
+        iter(
+            [
+                {"kind": "remote_logs", "task_id": "ta-123"},
+                {"kind": "result", "outputs": b"serialized-outputs"},
+            ]
+        ),
+    )
+
+    assert result == b"serialized-outputs"
+    assert log_stream_calls == [("retain", "ta-123"), ("release", "ta-123")]
+
+
+def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """CLI-backed container log streaming should mirror complete prefixed lines into local stderr."""
+
+    class FakeStdout:
+        """Expose a deterministic readline interface for the fake Modal CLI process."""
+
+        def __init__(self, lines: list[str]) -> None:
+            """Store the lines that should be returned to the caller."""
+            self._lines = lines
+            self._index = 0
+
+        def readline(self) -> str:
+            """Return one queued log line or EOF when exhausted."""
+            if self._index >= len(self._lines):
+                return ""
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+
+    class FakeProcess:
+        """Minimal subprocess stub used to emulate `modal container logs -f`."""
+
+        def __init__(self) -> None:
+            """Expose a stdout pipe and process lifecycle methods."""
+            self.stdout = FakeStdout(["session reuse\n", "session miss\n"])
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            """Report process completion after all fake lines have been read."""
+            if self.stdout._index >= len(self.stdout._lines):
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self) -> None:
+            """Mark the fake process as stopped."""
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Return the final process exit code."""
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            """Mark the fake process as killed."""
+            self.returncode = 0
+
+    stderr_buffer = StringIO()
+    monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda name: "/usr/bin/modal")
+    monkeypatch.setattr(remote_modal_app_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(remote_modal_app_module.sys, "stderr", stderr_buffer)
+
+    result = remote_modal_app_module._stream_remote_container_logs_via_modal_cli(
+        "ta-123",
+        threading.Event(),
+    )
+
+    assert result is True
+    assert stderr_buffer.getvalue() == (
+        "[modal:ta-123] session reuse\n"
+        "[modal:ta-123] session miss\n"
+    )
 
 
 def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
