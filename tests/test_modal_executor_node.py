@@ -5117,6 +5117,39 @@ def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
         ("modal_cloud_module",),
     ],
 )
+def test_validate_prompt_input_shapes_allows_boundary_supplied_list_on_primitive_socket(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Boundary-fed primitive lists should pass through so ComfyUI can map over them normally."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    prompt = {
+        "remote_1": {
+            "class_type": "BoundarySource",
+            "inputs": {"value": [4, 5]},
+            "_meta": {},
+        }
+    }
+
+    target_module._validate_prompt_input_shapes(
+        prompt,
+        {"BoundarySource": _BoundarySourceNode},
+        [
+            {
+                "proxy_input_name": "remote_input_0",
+                "targets": [{"node_id": "remote_1", "input_name": "value"}],
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
 def test_coerce_prompt_primitive_input_values_matches_comfyui_semantics(
     request: Any,
     module_fixture_name: str,

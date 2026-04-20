@@ -2174,8 +2174,15 @@ def _coerce_prompt_primitive_input_values(
 def _validate_prompt_input_shapes(
     prompt: dict[str, Any],
     node_mapping: dict[str, type[Any]],
+    boundary_input_specs: list[dict[str, Any]] | None = None,
 ) -> None:
     """Reject prompt inputs that still look invalid for primitive widget sockets."""
+    boundary_targets = {
+        (str(target.get("node_id")), str(target.get("input_name")))
+        for boundary_input in (boundary_input_specs or [])
+        for target in boundary_input.get("targets", [])
+        if target.get("node_id") is not None and target.get("input_name") is not None
+    }
     for node_id, prompt_node in sorted(prompt.items()):
         class_type = str(prompt_node.get("class_type"))
         node_class = node_mapping.get(class_type)
@@ -2193,6 +2200,8 @@ def _validate_prompt_input_shapes(
                 and len(input_value) == 2
                 and isinstance(input_value[0], str)
             ):
+                continue
+            if (str(node_id), str(input_name)) in boundary_targets:
                 continue
             literal_value = (
                 input_value.get("__value__")
@@ -2437,7 +2446,11 @@ def _execute_subgraph_prompt(
         cache_type, cache_args = _prompt_executor_cache_config(execution)
         resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
     _coerce_prompt_primitive_input_values(prompt, resolved_node_mapping)
-    _validate_prompt_input_shapes(prompt, resolved_node_mapping)
+    _validate_prompt_input_shapes(
+        prompt,
+        resolved_node_mapping,
+        list(normalized_payload.get("boundary_inputs", [])),
+    )
 
     with (
         _temporary_node_mapping(None),
