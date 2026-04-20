@@ -6,6 +6,8 @@
 - The bridge between those split proxies cannot be a normal transport value when the shared upstream output is something like `MODEL`. The workable shape is an opaque session-ref payload: the static proxy returns a JSON-safe reference, the remote runtime stores the live object in a prompt-scoped session, and the mapped proxy resolves that ref back into the live object when it runs.
 - Rewriting a component into multiple proxies means the old queue-time dependency metadata is stale. Execution stages, dependency edges, and partial-target remapping all need to be derived from the final rewritten proxy graph, not from the pre-rewrite coarse component plan.
 - Prompt-scoped remote state is only useful if both halves of the split can reach the same worker. The current implementation now passes a session-affinity key into deployed `RemoteEngine` lookup, but that still needs live Modal verification under real scale-out before it should be treated as fully proven.
+- Online deployed testing confirmed the prompt-scoped session-affinity path for the tested hybrid workflow: the mapped proxy successfully reused the static proxy's remote-only state on the same worker instead of failing with a missing session/value-ref.
+- The cheapest durable regression for this feature is a proxy-level scheduling test, not a full ComfyUI integration harness. If the rewrite produces separate static and mapped proxies, and a local downstream consumer can run off the static proxy result while the mapped proxy task is still awaiting completion, that already protects the core early-unblock behavior.
 
 ## 2026-04-19
 

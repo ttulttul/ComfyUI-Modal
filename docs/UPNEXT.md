@@ -36,6 +36,6 @@ Partial-completion semantics for one proxy would require ComfyUI scheduler behav
 
 ### Remaining work
 
-- Verify that `RemoteEngine(session_affinity_key)` actually keeps split static/mapped calls on the same deployed Modal worker under real scale-out, not just in local and test paths.
-- Add an end-to-end workflow regression that proves `Node9_Local` starts before the mapped sibling proxy finishes.
+- Online testing confirmed that `RemoteEngine(session_affinity_key)` kept the split static and mapped proxies on the same deployed Modal worker for the tested workflow.
+- Add a broader workflow-level regression on top of the new proxy-level test coverage if we need full scheduler-path protection beyond the current split-proxy execution test.
 - Watch live logs for session create/reuse/cleanup and add a fallback path if deployed affinity turns out not to be sticky enough.
