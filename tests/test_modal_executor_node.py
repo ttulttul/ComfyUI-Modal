@@ -2703,6 +2703,110 @@ def test_modal_cloud_execute_mapped_subgraph_payload_injects_static_bridges(
     ]
 
 
+def test_modal_cloud_execute_mapped_subgraph_payload_preserves_assigned_lane_id(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped cloud progress should keep the caller-assigned lane id instead of collapsing to `0`."""
+    observed_progress_events: list[dict[str, Any]] = []
+
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        custom_nodes_root: Any,
+        status_callback: Any = None,
+        cancellation_event: Any = None,
+        interrupt_store: Any = None,
+        interrupt_flag_key: Any = None,
+    ) -> tuple[str, ...]:
+        del custom_nodes_root, cancellation_event, interrupt_store, interrupt_flag_key
+        if status_callback is not None:
+            status_callback(
+                {
+                    "event_type": "node_progress",
+                    "node_id": "12",
+                    "display_node_id": "12",
+                    "real_node_id": "12",
+                    "value": 3.0,
+                    "max": 9.0,
+                }
+            )
+        return (f"mapped:{hydrated_inputs['remote_input_1']}",)
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "cloud-2",
+        "prompt_id": "prompt-1",
+        "mapped_progress_lane_id": "3",
+        "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "static_to_mapped_boundaries": [],
+        "mapped_phase": {
+            "component_node_ids": ["12", "39"],
+            "subgraph_prompt": {
+                "39": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"latent": ["remote_input_1", 0]},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_1",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "39", "input_name": "latent"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "39_text",
+                    "node_id": "39",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["39"],
+        },
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "39_text",
+                "node_id": "39",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            },
+        ],
+    }
+
+    outputs = modal_cloud_module._execute_mapped_subgraph_payload(
+        payload,
+        {"remote_input_1": ["a"]},
+        None,
+        status_callback=lambda event: observed_progress_events.append(dict(event)),
+    )
+
+    assert outputs == (["mapped:a"],)
+    assert any(
+        event.get("event_type") == "node_progress"
+        and event.get("real_node_id") == "12"
+        and event.get("lane_id") == "3"
+        for event in observed_progress_events
+    )
+    assert any(
+        event.get("event_type") == "node_progress"
+        and event.get("clear") is True
+        and event.get("lane_id") == "3"
+        for event in observed_progress_events
+    )
+
+
 def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
     remote_modal_app_module: Any,
     serialization_module: Any,

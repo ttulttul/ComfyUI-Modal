@@ -2685,6 +2685,7 @@ def _execute_mapped_subgraph_payload(
     per_item_outputs: list[tuple[Any, ...]] = []
     for item_index, item_value in enumerate(mapped_items):
         last_lane_node_id: str | None = None
+        lane_id = str(payload.get("mapped_progress_lane_id") or item_index)
 
         def publish_item_status(progress_state: dict[str, Any]) -> None:
             """Attach mapped-lane metadata to one per-item progress event."""
@@ -2699,7 +2700,7 @@ def _execute_mapped_subgraph_payload(
                 status_callback(
                     {
                         **progress_state,
-                        "lane_id": "0",
+                        "lane_id": lane_id,
                         "item_index": item_index,
                     }
                 )
@@ -2733,7 +2734,7 @@ def _execute_mapped_subgraph_payload(
                     "display_node_id": last_lane_node_id or str(payload.get("component_id") or "modal-subgraph"),
                     "value": 0.0,
                     "max": 1.0,
-                    "lane_id": "0",
+                    "lane_id": lane_id,
                     "item_index": item_index,
                     "clear": True,
                 }
