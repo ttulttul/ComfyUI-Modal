@@ -97,6 +97,16 @@ class _PersistedNodeCacheRestoreState:
     restore_original_method: Callable[[], None]
 
 
+@dataclass(frozen=True)
+class _NodeOutputCacheLookupResult:
+    """Hold one distributed cache lookup result before hydration into the live outputs cache."""
+
+    node_id: str
+    cache_key: str | None
+    raw_record: Any | None
+    cache_entry: Any | None
+
+
 _PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
 _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 _MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT = 256
@@ -1689,6 +1699,26 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
 ) -> list[str]:
     """Hydrate one already-prepared PromptExecutor outputs cache from the shared Modal Dict."""
     restored_node_ids: list[str] = []
+    pending_lookup_tasks: list[asyncio.Task[_NodeOutputCacheLookupResult]] = []
+
+    async def lookup_node(node_id: str) -> _NodeOutputCacheLookupResult:
+        """Resolve one distributed cache candidate without mutating the live outputs cache."""
+        cache_key = await _node_output_cache_key_from_key_set_async(outputs_cache.cache_key_set, node_id)
+        if cache_key is None:
+            return _NodeOutputCacheLookupResult(
+                node_id=node_id,
+                cache_key=None,
+                raw_record=None,
+                cache_entry=None,
+            )
+        raw_record = await _node_output_cache_store_get(cache_store, cache_key)
+        return _NodeOutputCacheLookupResult(
+            node_id=node_id,
+            cache_key=cache_key,
+            raw_record=raw_record,
+            cache_entry=_deserialize_node_output_cache_entry(execution, raw_record),
+        )
+
     for node_id in prompt:
         if outputs_cache.get(node_id) is not None:
             _emit_cloud_info(
@@ -1696,7 +1726,14 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
                 node_id,
             )
             continue
-        cache_key = await _node_output_cache_key_from_key_set_async(outputs_cache.cache_key_set, str(node_id))
+        pending_lookup_tasks.append(asyncio.create_task(lookup_node(str(node_id))))
+
+    if not pending_lookup_tasks:
+        return restored_node_ids
+
+    for lookup_result in await asyncio.gather(*pending_lookup_tasks):
+        node_id = lookup_result.node_id
+        cache_key = lookup_result.cache_key
         if cache_key is None:
             _emit_cloud_info(
                 "Node output cache lookup node=%s key_prefix=%s result=skip reason=key-unhashable",
@@ -1704,8 +1741,8 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
                 _node_output_cache_key_preview(cache_key),
             )
             continue
-        raw_record = await _node_output_cache_store_get(cache_store, cache_key)
-        cache_entry = _deserialize_node_output_cache_entry(execution, raw_record)
+        raw_record = lookup_result.raw_record
+        cache_entry = lookup_result.cache_entry
         if cache_entry is None:
             result = "miss"
             if raw_record is not None:
@@ -1801,20 +1838,20 @@ def _persist_node_output_cache_entries(
                 _node_output_cache_key_preview(cache_key),
             )
             continue
-        record = _serialize_node_output_cache_entry(cache_entry, max_bytes=max_bytes)
-        if record is None:
-            _emit_cloud_info(
-                "Node output cache write node=%s key_prefix=%s result=skip reason=ineligible-or-oversize",
-                node_id,
-                _node_output_cache_key_preview(cache_key),
-            )
-            continue
         restored_cache_key = None
         if restored_cache_keys_by_node_id is not None:
             restored_cache_key = restored_cache_keys_by_node_id.get(str(node_id))
         if restored_cache_key == cache_key:
             _emit_cloud_info(
                 "Node output cache write node=%s key_prefix=%s result=skip reason=restored-hit",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
+            continue
+        record = _serialize_node_output_cache_entry(cache_entry, max_bytes=max_bytes)
+        if record is None:
+            _emit_cloud_info(
+                "Node output cache write node=%s key_prefix=%s result=skip reason=ineligible-or-oversize",
                 node_id,
                 _node_output_cache_key_preview(cache_key),
             )
