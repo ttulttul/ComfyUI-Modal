@@ -348,7 +348,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
 - `COMFY_MODAL_INTERRUPT_DICT_NAME`: Override the shared Modal `Dict` used for remote cancellation flags. Default: `<app_name>-interrupts`.
 - `COMFY_MODAL_NODE_CACHE_DICT_NAME`: Override the shared Modal `Dict` used for persisted transport-safe node outputs. Default: `<app_name>-node-cache`.
-- `COMFY_MODAL_NODE_CACHE_MAX_BYTES`: Maximum raw output size eligible for persisted node caching. Default: `52428800` (50 MiB). Set to `0` to disable the persisted node-output cache.
+- `COMFY_MODAL_NODE_CACHE_MAX_BYTES`: Maximum raw output size eligible for persisted node caching. Default: `5242880` (5 MiB). Set to `0` to disable the persisted node-output cache.
 - `COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR`: When true, a remote execution crash makes the worker exit its own container after returning the error. Default: `true`.
 - `COMFY_MODAL_AUTO_DEPLOY`: Automatically deploy the Modal app on first remote invocation when lookup fails. Default: `true`.
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
