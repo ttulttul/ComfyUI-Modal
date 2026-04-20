@@ -12,7 +12,11 @@ from typing import Any, Iterator
 
 from aiohttp import web
 
-from .modal_executor_node import MODAL_MAP_INPUT_NODE_ID, ensure_modal_component_proxy_node_registered
+from .modal_executor_node import (
+    MODAL_MAP_INPUT_NODE_ID,
+    ensure_modal_component_proxy_node_registered,
+    register_cache_friendly_proxy_payload,
+)
 from .session_state import RemoteSessionHandle
 from .settings import ModalSyncSettings, get_settings
 from .sync_engine import ModalAssetSyncEngine, SyncedAsset
@@ -2250,7 +2254,10 @@ def _rewrite_component_into_proxy(
             nodes_module=nodes_module,
             is_output_node=is_output_node,
         )
-        proxy_inputs["original_node_data"] = payload_mapping
+        proxy_inputs["original_node_data"] = register_cache_friendly_proxy_payload(
+            prompt_node_id,
+            payload_mapping,
+        )
         rewritten_prompt[prompt_node_id] = {
             "class_type": proxy_node_id,
             "inputs": proxy_inputs,
@@ -2423,9 +2430,12 @@ def _rewrite_component_into_proxy(
         nodes_module=nodes_module,
         is_output_node=component.contains_output_node,
     )
-    proxy_inputs = proxy_inputs_for_boundary_inputs(list(payload.get("boundary_inputs", [])))
-    proxy_inputs["original_node_data"] = payload
     representative_node_id = component.representative_node_id
+    proxy_inputs = proxy_inputs_for_boundary_inputs(list(payload.get("boundary_inputs", [])))
+    proxy_inputs["original_node_data"] = register_cache_friendly_proxy_payload(
+        representative_node_id,
+        payload,
+    )
     representative_meta = copy.deepcopy(rewritten_prompt[representative_node_id].get("_meta", {}))
     rewritten_prompt[representative_node_id] = {
         "class_type": proxy_node_id,

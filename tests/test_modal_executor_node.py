@@ -233,6 +233,87 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
     }
 
 
+def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
+    modal_executor_module: Any,
+) -> None:
+    """Cache-friendly proxy payloads should strip prompt_id from inputs and restore it when they execute."""
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {"OriginalNode": _FakeOriginalNode},
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    proxy_id = modal_executor_module.ensure_modal_proxy_node_registered(
+        original_class_type="OriginalNode",
+        original_class=_FakeOriginalNode,
+        nodes_module=fake_nodes_module,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_id]
+
+    payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-1",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "prompt_id": "prompt-1",
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+    )
+
+    class FakeClient:
+        """Test client that captures the rehydrated payload."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str, int]:
+            """Return values derived from the restored prompt id."""
+            return (str(payload.get("prompt_id")), len(kwargs))
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        result = asyncio.run(
+            proxy_class.execute(
+                original_node_data=payload,
+                unique_id="node-1",
+                value="payload",
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert "prompt_id" not in payload
+    assert result.result == ("prompt-1", 1)
+
+
+def test_register_cache_friendly_proxy_payload_preserves_session_backed_prompt_id(
+    modal_executor_module: Any,
+) -> None:
+    """Session-backed proxy payloads should stay prompt-scoped and skip cache-surface stripping."""
+    payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-1",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "prompt_id": "prompt-1",
+            "remote_session": {
+                "session_id": "session-1",
+                "prompt_id": "prompt-1",
+                "owner_component_id": "component-1",
+            },
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+    )
+
+    assert payload["prompt_id"] == "prompt-1"
+
+
 def test_proxy_execution_wraps_sync_remote_clients(
     modal_executor_module: Any,
 ) -> None:

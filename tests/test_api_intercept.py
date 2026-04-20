@@ -280,7 +280,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     payload = rewritten_node["inputs"]["original_node_data"]
     assert rewritten_node["class_type"].startswith("ModalUniversalExecutor_")
     assert payload["payload_kind"] == "subgraph"
-    assert payload["prompt_id"] is None
+    assert "prompt_id" not in payload
     assert payload["component_node_ids"] == ["1", "2"]
     assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith("/assets/")
     assert payload["execute_node_ids"] == ["2"]
@@ -307,6 +307,81 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
     assert len(summary.synced_assets) == 1
     assert summary.synced_assets[0].uploaded is True
+
+
+def test_rewrite_strips_prompt_id_from_cache_safe_proxy_payload(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Cache-safe remote proxies should not bake prompt_id into original_node_data inputs."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRemoteModelNode,
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {},
+            "_meta": {"title": "Model"},
+        },
+        "2": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0]},
+            "_meta": {"title": "Sampler"},
+        },
+        "3": {
+            "class_type": "LocalSink",
+            "inputs": {"latent": ["2", 0]},
+            "_meta": {"title": "Sink"},
+        },
+    }
+
+    rewritten_prompt, _summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+        extra_data={"prompt_id": "prompt-1", "client_id": "client-1"},
+    )
+
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert "prompt_id" not in payload
 
 
 def test_rewrite_records_local_preview_targets_for_remote_boundary_images(
