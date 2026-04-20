@@ -13,6 +13,7 @@ from typing import Any, Iterator
 from aiohttp import web
 
 from .modal_executor_node import MODAL_MAP_INPUT_NODE_ID, ensure_modal_component_proxy_node_registered
+from .session_state import RemoteSessionHandle
 from .settings import ModalSyncSettings, get_settings
 from .sync_engine import ModalAssetSyncEngine, SyncedAsset
 
@@ -1525,10 +1526,61 @@ def _build_component_payload(
     terminate_container_on_error: bool,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
+    prompt_id = (extra_data or {}).get("prompt_id")
+    custom_nodes_bundle_path = (
+        custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
+    )
+
+    def build_subgraph_payload(
+        *,
+        component_id: str,
+        component_node_ids: list[str],
+        boundary_inputs: list[BoundaryInputSpec],
+        boundary_outputs: list[dict[str, Any]],
+        execute_node_ids: list[str],
+        remote_session: dict[str, Any] | None = None,
+        clear_remote_session: bool = False,
+        mapped_progress_display_node_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Build one ordinary subgraph payload for a proxy node."""
+        payload = {
+            "payload_kind": "subgraph",
+            "component_id": component_id,
+            "prompt_id": prompt_id,
+            "component_node_ids": list(component_node_ids),
+            "subgraph_prompt": _subset_component_prompt(component_prompt, component_node_ids),
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": boundary_input.proxy_input_name,
+                    "io_type": boundary_input.io_type,
+                    "targets": [
+                        {"node_id": target.node_id, "input_name": target.input_name}
+                        for target in boundary_input.targets
+                    ],
+                }
+                for boundary_input in boundary_inputs
+            ],
+            "boundary_outputs": copy.deepcopy(boundary_outputs),
+            "execute_node_ids": list(execute_node_ids),
+            "extra_data": copy.deepcopy(extra_data or {}),
+            "requires_volume_reload": requires_volume_reload,
+            "volume_reload_marker": volume_reload_marker,
+            "uploaded_volume_paths": list(uploaded_volume_paths),
+            "terminate_container_on_error": terminate_container_on_error,
+            "custom_nodes_bundle": custom_nodes_bundle_path,
+        }
+        if remote_session is not None:
+            payload["remote_session"] = copy.deepcopy(remote_session)
+        if clear_remote_session:
+            payload["clear_remote_session"] = True
+        if mapped_progress_display_node_id is not None:
+            payload["mapped_progress_display_node_id"] = mapped_progress_display_node_id
+        return payload
+
     payload = {
         "payload_kind": "mapped_subgraph" if component.mapped_boundary_input_name else "subgraph",
         "component_id": component.representative_node_id,
-        "prompt_id": (extra_data or {}).get("prompt_id"),
+        "prompt_id": prompt_id,
         "component_node_ids": list(component.node_ids),
         "subgraph_prompt": component_prompt,
         "boundary_inputs": [
@@ -1573,9 +1625,7 @@ def _build_component_payload(
         "volume_reload_marker": volume_reload_marker,
         "uploaded_volume_paths": list(uploaded_volume_paths),
         "terminate_container_on_error": terminate_container_on_error,
-        "custom_nodes_bundle": (
-            custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
-        ),
+        "custom_nodes_bundle": custom_nodes_bundle_path,
         "mapped_input": (
             {
                 "proxy_input_name": component.mapped_boundary_input_name,
@@ -1625,6 +1675,7 @@ def _build_component_payload(
                 "io_type": boundary_spec.io_type,
                 "is_list": boundary_spec.is_list,
                 "preview_target_node_ids": [],
+                "session_output": True,
             }
             for boundary_spec in component.static_to_mapped_boundaries
         ]
@@ -1709,6 +1760,65 @@ def _build_component_payload(
             ],
             "execute_node_ids": list(component.mapped_execute_node_ids),
         }
+        if not component.static_node_ids:
+            return payload
+        remote_session = RemoteSessionHandle(
+            session_id=uuid.uuid4().hex,
+            prompt_id=(str(prompt_id) if prompt_id is not None else None),
+            owner_component_id=component.representative_node_id,
+        ).to_payload()
+        payload = {
+            "split_proxy_payloads": {
+                "static": build_subgraph_payload(
+                    component_id=component.static_node_ids[0],
+                    component_node_ids=list(component.static_node_ids),
+                    boundary_inputs=static_boundary_inputs,
+                    boundary_outputs=[
+                        {
+                            "proxy_output_name": boundary_output.proxy_output_name,
+                            "node_id": boundary_output.source.node_id,
+                            "output_index": boundary_output.source.output_index,
+                            "io_type": boundary_output.io_type,
+                            "is_list": boundary_output.is_list,
+                            "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+                        }
+                        for boundary_output in static_boundary_outputs
+                    ]
+                    + static_bridge_outputs,
+                    execute_node_ids=list(component.static_execute_node_ids),
+                    remote_session=remote_session,
+                ),
+                "mapped": build_subgraph_payload(
+                    component_id=f"{component.representative_node_id}__mapped",
+                    component_node_ids=list(component.mapped_node_ids),
+                    boundary_inputs=mapped_boundary_inputs
+                    + [
+                        BoundaryInputSpec(
+                            proxy_input_name=boundary_spec.proxy_name,
+                            source=boundary_spec.source,
+                            io_type=boundary_spec.io_type,
+                            targets=list(boundary_spec.targets),
+                        )
+                        for boundary_spec in component.static_to_mapped_boundaries
+                    ],
+                    boundary_outputs=[
+                        {
+                            "proxy_output_name": boundary_output.proxy_output_name,
+                            "node_id": boundary_output.source.node_id,
+                            "output_index": boundary_output.source.output_index,
+                            "io_type": boundary_output.io_type,
+                            "is_list": boundary_output.is_list,
+                            "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+                        }
+                        for boundary_output in mapped_boundary_outputs
+                    ],
+                    execute_node_ids=list(component.mapped_execute_node_ids),
+                    remote_session=remote_session,
+                    clear_remote_session=True,
+                    mapped_progress_display_node_id=component.static_node_ids[0],
+                ),
+            }
+        }
     return payload
 
 
@@ -1747,38 +1857,157 @@ def _rewrite_component_into_proxy(
     rewritten_prompt: dict[str, Any],
     payload: dict[str, Any],
     nodes_module: Any,
-) -> str:
+) -> list[str]:
     """Replace a remote component with a single proxy node in the prompt."""
-    output_types = tuple(spec.io_type for spec in component.boundary_outputs)
-    output_names = tuple(spec.proxy_output_name for spec in component.boundary_outputs)
-    output_is_list = tuple(spec.is_list for spec in component.boundary_outputs)
+    def contains_output_node(node_ids: list[str]) -> bool:
+        """Return whether one node subset contains an output node."""
+        for node_id in node_ids:
+            prompt_node = rewritten_prompt.get(node_id)
+            if prompt_node is None:
+                continue
+            node_class = nodes_module.NODE_CLASS_MAPPINGS.get(str(prompt_node["class_type"]))
+            if node_class is not None and getattr(node_class, "OUTPUT_NODE", False):
+                return True
+        return False
+
+    def proxy_inputs_for_boundary_inputs(boundary_inputs: list[dict[str, Any]]) -> dict[str, Any]:
+        """Resolve one proxy input mapping from the current prompt graph."""
+        proxy_inputs: dict[str, Any] = {}
+        for boundary_input in boundary_inputs:
+            current_input_value: Any = None
+            for target in boundary_input.get("targets", []):
+                target_prompt_node = rewritten_prompt.get(str(target["node_id"]))
+                if target_prompt_node is None:
+                    continue
+                target_input_value = (target_prompt_node.get("inputs") or {}).get(str(target["input_name"]))
+                if _is_link(target_input_value):
+                    current_input_value = list(target_input_value)
+                    break
+            if current_input_value is None:
+                raise ModalPromptValidationError(
+                    "Unable to resolve proxy boundary input wiring while rewriting split Modal proxies."
+                )
+            proxy_inputs[str(boundary_input["proxy_input_name"])] = current_input_value
+        return proxy_inputs
+
+    def register_proxy_node(
+        *,
+        prompt_node_id: str,
+        payload_mapping: dict[str, Any],
+        proxy_inputs: dict[str, Any],
+        meta: dict[str, Any],
+        is_output_node: bool,
+    ) -> None:
+        """Insert one dynamic proxy node into the rewritten prompt."""
+        boundary_outputs = list(payload_mapping.get("boundary_outputs", []))
+        proxy_node_id = ensure_modal_component_proxy_node_registered(
+            output_types=tuple(str(output["io_type"]) for output in boundary_outputs),
+            output_names=tuple(str(output["proxy_output_name"]) for output in boundary_outputs),
+            output_is_list=tuple(bool(output.get("is_list", False)) for output in boundary_outputs),
+            nodes_module=nodes_module,
+            is_output_node=is_output_node,
+        )
+        proxy_inputs["original_node_data"] = payload_mapping
+        rewritten_prompt[prompt_node_id] = {
+            "class_type": proxy_node_id,
+            "inputs": proxy_inputs,
+            "_meta": copy.deepcopy(meta),
+        }
+
+    split_proxy_payloads = payload.get("split_proxy_payloads")
+    component_node_id_set = set(component.node_ids)
+    if isinstance(split_proxy_payloads, dict):
+        static_payload = dict(split_proxy_payloads["static"])
+        mapped_payload = dict(split_proxy_payloads["mapped"])
+        static_proxy_node_id = str(static_payload["component_id"])
+        mapped_proxy_node_id = str(mapped_payload["component_id"])
+        while mapped_proxy_node_id in rewritten_prompt and mapped_proxy_node_id not in component_node_id_set:
+            mapped_proxy_node_id = f"{mapped_proxy_node_id}_proxy"
+        mapped_payload["component_id"] = mapped_proxy_node_id
+
+        static_proxy_inputs = proxy_inputs_for_boundary_inputs(list(static_payload["boundary_inputs"]))
+        static_boundary_outputs = list(static_payload["boundary_outputs"])
+        static_proxy_meta = copy.deepcopy(rewritten_prompt[static_proxy_node_id].get("_meta", {}))
+        mapped_proxy_meta = copy.deepcopy(
+            rewritten_prompt[component.mapped_node_ids[0]].get("_meta", {})
+        )
+        bridge_output_indices = {
+            str(boundary_output["proxy_output_name"]): output_index
+            for output_index, boundary_output in enumerate(static_boundary_outputs)
+            if bool(boundary_output.get("session_output"))
+        }
+        mapped_proxy_inputs = proxy_inputs_for_boundary_inputs(list(mapped_payload["boundary_inputs"]))
+        for boundary_input in mapped_payload.get("boundary_inputs", []):
+            proxy_input_name = str(boundary_input["proxy_input_name"])
+            if proxy_input_name not in bridge_output_indices:
+                continue
+            mapped_proxy_inputs[proxy_input_name] = [
+                static_proxy_node_id,
+                bridge_output_indices[proxy_input_name],
+            ]
+
+        replacement_output_indices = {
+            LinkedOutputRef(
+                node_id=str(boundary_output["node_id"]),
+                output_index=int(boundary_output["output_index"]),
+            ): [static_proxy_node_id, output_index]
+            for output_index, boundary_output in enumerate(static_boundary_outputs)
+            if not bool(boundary_output.get("session_output"))
+        }
+        replacement_output_indices.update(
+            {
+                LinkedOutputRef(
+                    node_id=str(boundary_output["node_id"]),
+                    output_index=int(boundary_output["output_index"]),
+                ): [mapped_proxy_node_id, output_index]
+                for output_index, boundary_output in enumerate(mapped_payload.get("boundary_outputs", []))
+            }
+        )
+
+        for node_id in component.node_ids:
+            rewritten_prompt.pop(node_id, None)
+        register_proxy_node(
+            prompt_node_id=static_proxy_node_id,
+            payload_mapping=static_payload,
+            proxy_inputs=static_proxy_inputs,
+            meta=static_proxy_meta,
+            is_output_node=contains_output_node(component.static_node_ids),
+        )
+        register_proxy_node(
+            prompt_node_id=mapped_proxy_node_id,
+            payload_mapping=mapped_payload,
+            proxy_inputs=mapped_proxy_inputs,
+            meta=mapped_proxy_meta,
+            is_output_node=contains_output_node(component.mapped_node_ids),
+        )
+
+        for node_id, prompt_node in list(rewritten_prompt.items()):
+            if node_id in {static_proxy_node_id, mapped_proxy_node_id}:
+                continue
+            for input_name, input_value in list((prompt_node.get("inputs") or {}).items()):
+                if not _is_link(input_value):
+                    continue
+                source = LinkedOutputRef(node_id=str(input_value[0]), output_index=int(input_value[1]))
+                if source in replacement_output_indices:
+                    prompt_node["inputs"][input_name] = list(replacement_output_indices[source])
+
+        logger.info(
+            "Rewrote hybrid remote component %s into static proxy %s and mapped proxy %s.",
+            component.representative_node_id,
+            static_proxy_node_id,
+            mapped_proxy_node_id,
+        )
+        return [static_proxy_node_id, mapped_proxy_node_id]
+
     proxy_node_id = ensure_modal_component_proxy_node_registered(
-        output_types=output_types,
-        output_names=output_names,
-        output_is_list=output_is_list,
+        output_types=tuple(spec.io_type for spec in component.boundary_outputs),
+        output_names=tuple(spec.proxy_output_name for spec in component.boundary_outputs),
+        output_is_list=tuple(spec.is_list for spec in component.boundary_outputs),
         nodes_module=nodes_module,
         is_output_node=component.contains_output_node,
     )
-
-    proxy_inputs: dict[str, Any] = {}
-    for boundary_input in component.boundary_inputs:
-        current_input_value: Any = None
-        for target in boundary_input.targets:
-            target_prompt_node = rewritten_prompt.get(target.node_id)
-            if target_prompt_node is None:
-                continue
-            target_input_value = (target_prompt_node.get("inputs") or {}).get(target.input_name)
-            if _is_link(target_input_value):
-                current_input_value = list(target_input_value)
-                break
-        if current_input_value is None:
-            current_input_value = [
-                boundary_input.source.node_id,
-                boundary_input.source.output_index,
-            ]
-        proxy_inputs[boundary_input.proxy_input_name] = current_input_value
+    proxy_inputs = proxy_inputs_for_boundary_inputs(list(payload.get("boundary_inputs", [])))
     proxy_inputs["original_node_data"] = payload
-
     representative_node_id = component.representative_node_id
     representative_meta = copy.deepcopy(rewritten_prompt[representative_node_id].get("_meta", {}))
     rewritten_prompt[representative_node_id] = {
@@ -1786,34 +2015,28 @@ def _rewrite_component_into_proxy(
         "inputs": proxy_inputs,
         "_meta": representative_meta,
     }
-
     boundary_output_indices = {
         spec.source: index for index, spec in enumerate(component.boundary_outputs)
     }
-    component_node_id_set = set(component.node_ids)
-
     for node_id, prompt_node in list(rewritten_prompt.items()):
         if node_id in component_node_id_set and node_id != representative_node_id:
             del rewritten_prompt[node_id]
             continue
         if node_id == representative_node_id:
             continue
-
         for input_name, input_value in list((prompt_node.get("inputs") or {}).items()):
             if not _is_link(input_value):
                 continue
             source = LinkedOutputRef(node_id=str(input_value[0]), output_index=int(input_value[1]))
-            if source not in boundary_output_indices:
-                continue
-            prompt_node["inputs"][input_name] = [representative_node_id, boundary_output_indices[source]]
-
+            if source in boundary_output_indices:
+                prompt_node["inputs"][input_name] = [representative_node_id, boundary_output_indices[source]]
     logger.info(
         "Rewrote remote component %s with %d nodes to Modal proxy %s.",
         representative_node_id,
         len(component.node_ids),
         proxy_node_id,
     )
-    return representative_node_id
+    return [representative_node_id]
 
 
 def rewrite_prompt_for_modal(
@@ -1848,39 +2071,6 @@ def rewrite_prompt_for_modal(
         expanded_remote_node_ids,
         resolved_nodes_module,
     )
-    component_groups = {
-        component.representative_node_id: set(component.node_ids)
-        for component in components
-    }
-    _, dependency_edges, _ = _component_dependency_graph(rewritten_prompt, component_groups)
-    execution_stages = _component_execution_stages(rewritten_prompt, component_groups)
-    mapped_component_ids = {
-        component.representative_node_id
-        for component in components
-        if component.mapped_boundary_input_name
-    }
-    summary.component_dependency_ids_by_representative = {
-        representative_node_id: sorted(
-            upstream_component_id
-            for upstream_component_id, downstream_component_ids in dependency_edges.items()
-            if representative_node_id in downstream_component_ids
-        )
-        for representative_node_id in sorted(component_groups)
-    }
-    summary.component_execution_stages = [list(stage) for stage in execution_stages]
-    summary.mapped_component_ids = sorted(mapped_component_ids)
-    summary.estimated_max_parallel_requests = _estimated_stage_parallelism(
-        execution_stages,
-        mapped_component_ids,
-        mapped_component_weight=1,
-    )
-    if resolved_settings.max_containers is not None:
-        summary.max_parallel_requests_upper_bound = min(
-            summary.estimated_max_parallel_requests,
-            resolved_settings.max_containers,
-        )
-    else:
-        summary.max_parallel_requests_upper_bound = summary.estimated_max_parallel_requests
     validate_remote_component_transport_compatibility(
         prompt=rewritten_prompt,
         components=components,
@@ -1929,22 +2119,8 @@ def rewrite_prompt_for_modal(
     summary.uploaded_volume_paths = [
         asset.remote_path for asset in summary.synced_assets if asset.uploaded
     ]
-    logger.info(
-        "Estimated remote parallelism for prompt rewrite: known_max_parallel_requests=%d max_parallel_requests_upper_bound=%s mapped_components=%s execution_stages=%s",
-        summary.estimated_max_parallel_requests,
-        summary.max_parallel_requests_upper_bound,
-        summary.mapped_component_ids,
-        summary.component_execution_stages,
-    )
-
+    mapped_proxy_component_ids: set[str] = set()
     for component in components:
-        summary.remote_component_ids.append(component.representative_node_id)
-        summary.component_node_ids_by_representative[component.representative_node_id] = list(
-            component.node_ids
-        )
-        for node_id in component.node_ids:
-            summary.rewritten_node_id_map[node_id] = component.representative_node_id
-
         logger.info(
             "Rewriting remote component %s covering nodes %s.",
             component.representative_node_id,
@@ -1965,12 +2141,71 @@ def rewrite_prompt_for_modal(
             uploaded_volume_paths=uploaded_volume_paths,
             terminate_container_on_error=resolved_settings.terminate_container_on_error,
         )
-        _rewrite_component_into_proxy(
+        proxy_node_ids = _rewrite_component_into_proxy(
             component=component,
             rewritten_prompt=rewritten_prompt,
             payload=payload,
             nodes_module=resolved_nodes_module,
         )
+        if "split_proxy_payloads" in payload:
+            static_proxy_node_id, mapped_proxy_node_id = proxy_node_ids
+            summary.remote_component_ids.extend(proxy_node_ids)
+            summary.component_node_ids_by_representative[static_proxy_node_id] = list(
+                component.static_node_ids
+            )
+            summary.component_node_ids_by_representative[mapped_proxy_node_id] = list(
+                component.mapped_node_ids
+            )
+            for node_id in component.static_node_ids:
+                summary.rewritten_node_id_map[node_id] = static_proxy_node_id
+            for node_id in component.mapped_node_ids:
+                summary.rewritten_node_id_map[node_id] = mapped_proxy_node_id
+            mapped_proxy_component_ids.add(mapped_proxy_node_id)
+            continue
+
+        summary.remote_component_ids.extend(proxy_node_ids)
+        summary.component_node_ids_by_representative[proxy_node_ids[0]] = list(component.node_ids)
+        for node_id in component.node_ids:
+            summary.rewritten_node_id_map[node_id] = proxy_node_ids[0]
+        if component.mapped_boundary_input_name:
+            mapped_proxy_component_ids.add(proxy_node_ids[0])
+
+    proxy_component_groups = {
+        component_id: {component_id}
+        for component_id in summary.remote_component_ids
+    }
+    _, dependency_edges, _ = _component_dependency_graph(rewritten_prompt, proxy_component_groups)
+    execution_stages = _component_execution_stages(rewritten_prompt, proxy_component_groups)
+    summary.component_dependency_ids_by_representative = {
+        representative_node_id: sorted(
+            upstream_component_id
+            for upstream_component_id, downstream_component_ids in dependency_edges.items()
+            if representative_node_id in downstream_component_ids
+        )
+        for representative_node_id in sorted(proxy_component_groups)
+    }
+    summary.component_execution_stages = [list(stage) for stage in execution_stages]
+    summary.mapped_component_ids = sorted(mapped_proxy_component_ids)
+    summary.estimated_max_parallel_requests = _estimated_stage_parallelism(
+        execution_stages,
+        mapped_proxy_component_ids,
+        mapped_component_weight=1,
+    )
+    if resolved_settings.max_containers is not None:
+        summary.max_parallel_requests_upper_bound = min(
+            summary.estimated_max_parallel_requests,
+            resolved_settings.max_containers,
+        )
+    else:
+        summary.max_parallel_requests_upper_bound = summary.estimated_max_parallel_requests
+
+    logger.info(
+        "Estimated remote parallelism after proxy rewrite: known_max_parallel_requests=%d max_parallel_requests_upper_bound=%s mapped_components=%s execution_stages=%s",
+        summary.estimated_max_parallel_requests,
+        summary.max_parallel_requests_upper_bound,
+        summary.mapped_component_ids,
+        summary.component_execution_stages,
+    )
 
     return rewritten_prompt, summary
 

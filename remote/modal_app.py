@@ -30,6 +30,12 @@ from ..serialization import (
     serialize_node_outputs,
     serialize_node_inputs,
 )
+from ..session_state import (
+    InMemoryRemoteSessionStore,
+    RemoteSessionHandle,
+    RemoteSessionStateError,
+    is_remote_session_handle_payload,
+)
 from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -45,6 +51,7 @@ _PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
 _PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
 _PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
+_REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 
 
 @dataclass
@@ -76,6 +83,30 @@ class RemoteSubgraphExecutionError(RuntimeError):
 
 class ModalRemoteInvocationError(RuntimeError):
     """Raised when the Modal client cannot invoke the remote runtime."""
+
+
+def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHandle | None:
+    """Return the decoded prompt-scoped remote session handle for one payload."""
+    remote_session = payload.get("remote_session")
+    if not is_remote_session_handle_payload(remote_session):
+        return None
+    return RemoteSessionHandle.from_payload(remote_session)
+
+
+def _resolve_remote_session_inputs(hydrated_inputs: dict[str, Any]) -> dict[str, Any]:
+    """Resolve any remote-session value refs embedded in boundary inputs."""
+    return {
+        input_name: _REMOTE_SESSION_STORE.resolve_value(input_value)
+        for input_name, input_value in hydrated_inputs.items()
+    }
+
+
+def _remote_session_affinity_key(payload: dict[str, Any]) -> str | None:
+    """Return the affinity key that should keep split proxy calls on one remote worker."""
+    session_handle = _payload_remote_session_handle(payload)
+    if session_handle is None:
+        return None
+    return session_handle.session_id
 
 
 class _NullPromptServer:
@@ -585,6 +616,8 @@ def _execute_subgraph_with_mapping(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
+    resolved_inputs = _resolve_remote_session_inputs(dict(hydrated_inputs))
+    session_handle = _payload_remote_session_handle(normalized_payload)
     prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s via test mapping with %d prompt nodes.",
@@ -594,7 +627,7 @@ def _execute_subgraph_with_mapping(
     _apply_boundary_inputs(
         prompt=prompt,
         boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
-        hydrated_inputs=hydrated_inputs,
+        hydrated_inputs=resolved_inputs,
     )
     _coerce_prompt_primitive_input_values(prompt, node_mapping)
     _validate_prompt_input_shapes(prompt, node_mapping)
@@ -654,7 +687,19 @@ def _execute_subgraph_with_mapping(
             raise RemoteSubgraphExecutionError(
                 f"Remote subgraph did not execute boundary output node {node_id}."
             )
-        outputs.append(node_outputs[output_index])
+        output_value = node_outputs[output_index]
+        if bool(boundary_output.get("session_output")):
+            if session_handle is None:
+                raise RemoteSessionStateError(
+                    "Session-backed boundary outputs require payload.remote_session."
+                )
+            output_value = _REMOTE_SESSION_STORE.put_output(
+                session_handle,
+                node_id=node_id,
+                output_index=output_index,
+                value=output_value,
+            ).to_payload()
+        outputs.append(output_value)
     logger.info(
         "Mapped remote subgraph %s produced %d exported outputs.",
         payload.get("component_id"),
@@ -675,6 +720,8 @@ def _execute_subgraph_prompt(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
+    resolved_inputs = _resolve_remote_session_inputs(dict(hydrated_inputs))
+    session_handle = _payload_remote_session_handle(normalized_payload)
     prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s through PromptExecutor with %d prompt nodes, %d boundary inputs, and %d exported outputs.",
@@ -686,7 +733,7 @@ def _execute_subgraph_prompt(
     _apply_boundary_inputs(
         prompt=prompt,
         boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
-        hydrated_inputs=hydrated_inputs,
+        hydrated_inputs=resolved_inputs,
     )
     execution = _load_execution_module()
     resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
@@ -739,12 +786,22 @@ def _execute_subgraph_prompt(
                 raise RemoteSubgraphExecutionError(
                     f"Remote subgraph output index {output_index} is missing for node {node_id}."
                 )
-            outputs.append(
-                _collapse_cache_slot(
-                    slot_values=cache_entry.outputs[output_index],
-                    is_list=bool(boundary_output.get("is_list", False)),
-                )
+            output_value = _collapse_cache_slot(
+                slot_values=cache_entry.outputs[output_index],
+                is_list=bool(boundary_output.get("is_list", False)),
             )
+            if bool(boundary_output.get("session_output")):
+                if session_handle is None:
+                    raise RemoteSessionStateError(
+                        "Session-backed boundary outputs require payload.remote_session."
+                    )
+                output_value = _REMOTE_SESSION_STORE.put_output(
+                    session_handle,
+                    node_id=node_id,
+                    output_index=output_index,
+                    value=output_value,
+                ).to_payload()
+            outputs.append(output_value)
             logger.info(
                 "Collected exported output %s from node %s output %d.",
                 boundary_output.get("proxy_output_name"),
@@ -762,21 +819,26 @@ def execute_subgraph_locally(
     """Execute a rewritten remote component in-process and return serialized outputs."""
     _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    session_handle = _payload_remote_session_handle(payload)
     logger.info(
         "Executing local fallback subgraph %s with %d hydrated inputs.",
         payload.get("component_id"),
         len(hydrated_inputs),
     )
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, node_mapping)
-        try:
-            outputs = future.result()
-        except Exception:
-            logger.exception(
-                "Local fallback subgraph %s raised while running in worker thread.",
-                payload.get("component_id"),
-            )
-            raise
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, node_mapping)
+            try:
+                outputs = future.result()
+            except Exception:
+                logger.exception(
+                    "Local fallback subgraph %s raised while running in worker thread.",
+                    payload.get("component_id"),
+                )
+                raise
+    finally:
+        if bool(payload.get("clear_remote_session")) and session_handle is not None:
+            _REMOTE_SESSION_STORE.clear_session(session_handle)
     logger.info(
         "Local fallback subgraph %s completed with %d outputs.",
         payload.get("component_id"),
@@ -1907,7 +1969,11 @@ def _emit_local_mapped_progress(
     prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
     extra_data = payload.get("extra_data") or {}
     client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
-    display_node_id = str(payload.get("component_id") or "")
+    display_node_id = str(
+        payload.get("mapped_progress_display_node_id")
+        or payload.get("component_id")
+        or ""
+    )
     if not prompt_id or not client_id or not display_node_id:
         return
     _emit_local_modal_progress(
@@ -2243,13 +2309,17 @@ def _lookup_deployed_remote_engine(payload: dict[str, Any]) -> Any:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
     settings = get_settings()
+    affinity_key = _remote_session_affinity_key(payload)
     logger.info(
-        "Attempting deployed Modal invocation for app=%s class=%s component=%s.",
+        "Attempting deployed Modal invocation for app=%s class=%s component=%s session_affinity=%s.",
         settings.app_name,
         "RemoteEngine",
         payload.get("component_id"),
+        affinity_key,
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
+    if affinity_key is not None:
+        return remote_cls(affinity_key)
     return remote_cls()
 
 
@@ -2863,10 +2933,17 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
 
+        def __init__(self, session_affinity_key: str | None = None) -> None:
+            """Record the optional session-affinity key for split-proxy reuse."""
+            self.session_affinity_key = session_affinity_key
+
         @modal.enter()
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
-            logger.info("RemoteEngine setup complete.")
+            logger.info(
+                "RemoteEngine setup complete for session_affinity_key=%s.",
+                self.session_affinity_key,
+            )
 
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
@@ -2889,6 +2966,10 @@ else:
 
     class RemoteEngine:
         """Local fallback runtime used when the Modal SDK is unavailable."""
+
+        def __init__(self, session_affinity_key: str | None = None) -> None:
+            """Record the optional session-affinity key for split-proxy reuse."""
+            self.session_affinity_key = session_affinity_key
 
         def setup(self) -> None:
             """No-op setup for local fallback execution."""

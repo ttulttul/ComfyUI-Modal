@@ -1,5 +1,12 @@
 # Learnings
 
+## 2026-04-20
+
+- Early local delivery for hybrid remote components is much simpler if the queue-time rewrite stops pretending the whole island is one proxy. Splitting the island into a static proxy and a mapped proxy lets ComfyUI unblock ordinary downstream local nodes using its existing scheduler semantics instead of inventing partial-completion behavior for one proxy node.
+- The bridge between those split proxies cannot be a normal transport value when the shared upstream output is something like `MODEL`. The workable shape is an opaque session-ref payload: the static proxy returns a JSON-safe reference, the remote runtime stores the live object in a prompt-scoped session, and the mapped proxy resolves that ref back into the live object when it runs.
+- Rewriting a component into multiple proxies means the old queue-time dependency metadata is stale. Execution stages, dependency edges, and partial-target remapping all need to be derived from the final rewritten proxy graph, not from the pre-rewrite coarse component plan.
+- Prompt-scoped remote state is only useful if both halves of the split can reach the same worker. The current implementation now passes a session-affinity key into deployed `RemoteEngine` lookup, but that still needs live Modal verification under real scale-out before it should be treated as fully proven.
+
 ## 2026-04-19
 
 - Early local unblocking is currently limited by the proxy shape, not just by transportable boundary types. If queue-time rewrite packs a remote branch into one hybrid `mapped_subgraph` proxy, static outputs that are already finished still cannot drive downstream local nodes until the mapped phase also finishes, because the remote runtime only merges and returns those outputs once at the end. Fixing that needs either partial-completion semantics for one proxy node or a shared remote session/cache that lets separate proxies reuse non-transportable state like `MODEL`.
