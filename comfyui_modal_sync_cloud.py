@@ -200,6 +200,13 @@ def _is_interrupt_like_failure(exc: Exception) -> bool:
     return "interrupt" in str(exc).lower()
 
 
+def _is_session_state_like_failure(exc: Exception) -> bool:
+    """Return whether one remote failure came from prompt-scoped session routing/state issues."""
+    if isinstance(exc, RemoteSessionStateError):
+        return True
+    return "remote session" in str(exc).lower()
+
+
 def _maybe_schedule_container_termination_on_error(
     payload: dict[str, Any],
     exc: Exception,
@@ -210,6 +217,13 @@ def _maybe_schedule_container_termination_on_error(
     if not bool(payload.get("terminate_container_on_error", True)):
         return False
     if _is_interrupt_like_failure(exc):
+        return False
+    if _is_session_state_like_failure(exc):
+        logger.warning(
+            "Skipping Modal container termination for component=%s because the failure looks like a remote session routing/state miss.",
+            payload.get("component_id"),
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return False
 
     global _CONTAINER_TERMINATION_SCHEDULED
