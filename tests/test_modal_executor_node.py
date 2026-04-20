@@ -1018,6 +1018,86 @@ def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
     assert {"UNETLoader", "CLIPLoader", "VAELoader"} <= installed_wrappers
 
 
+def test_modal_cloud_node_cache_key_hashes_boundary_tensors(
+    modal_cloud_module: Any,
+) -> None:
+    """Boundary tensors inside ComfyUI cache signatures should produce stable cache keys."""
+    torch = pytest.importorskip("torch")
+
+    first_tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+    same_value_tensor = first_tensor.clone()
+    different_tensor = first_tensor + 1
+    signature = frozenset(
+        {
+            (
+                12,
+                frozenset(
+                    {
+                        (
+                            4,
+                            frozenset(
+                                {
+                                    (0, "latent_image"),
+                                    (1, frozenset({("samples", first_tensor)})),
+                                }
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    same_signature = frozenset(
+        {
+            (
+                12,
+                frozenset(
+                    {
+                        (
+                            4,
+                            frozenset(
+                                {
+                                    (0, "latent_image"),
+                                    (1, frozenset({("samples", same_value_tensor)})),
+                                }
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    different_signature = frozenset(
+        {
+            (
+                12,
+                frozenset(
+                    {
+                        (
+                            4,
+                            frozenset(
+                                {
+                                    (0, "latent_image"),
+                                    (1, frozenset({("samples", different_tensor)})),
+                                }
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+
+    first_key = modal_cloud_module._node_output_cache_key(signature)
+    second_key = modal_cloud_module._node_output_cache_key(same_signature)
+    different_key = modal_cloud_module._node_output_cache_key(different_signature)
+
+    assert isinstance(first_key, str)
+    assert first_key.startswith("NC_")
+    assert second_key == first_key
+    assert different_key != first_key
+
+
 def test_modal_cloud_ignores_heavy_comfyui_paths(
     modal_cloud_module: Any,
 ) -> None:
