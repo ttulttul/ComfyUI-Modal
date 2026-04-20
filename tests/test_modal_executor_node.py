@@ -3788,6 +3788,7 @@ def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instan
         cache_type=execution.CacheType.CLASSIC,
         cache_args={"lru": 0, "ram": 0.0},
     )
+    restored_cache_keys_by_node_id: dict[str, str] = {}
     restored_second = asyncio.run(
         modal_cloud_module._restore_persisted_node_output_cache_entries(
             execution,
@@ -3795,6 +3796,7 @@ def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instan
             prompt_id="prompt-b",
             prompt=copy.deepcopy(prompt),
             cache_store=cache_store,
+            restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
         )
     )
     restored_entry = second_executor.caches.outputs.get("node_1")
@@ -3802,6 +3804,7 @@ def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instan
     assert restored_first == []
     assert persisted_nodes == ["node_1"]
     assert restored_second == ["node_1"]
+    assert restored_cache_keys_by_node_id == {"node_1": next(iter(cache_store))}
     assert list(cache_store) and all(key.startswith("NC_") for key in cache_store)
     assert restored_entry == cache_entry
 
@@ -3834,9 +3837,12 @@ def test_modal_cloud_installs_persisted_cache_restore_after_live_set_prompt(
         *,
         prompt: dict[str, Any],
         cache_store: Any,
+        restored_cache_keys_by_node_id: dict[str, str] | None = None,
     ) -> list[str]:
         """Record the cache-key-set marker visible at restore time."""
         del execution
+        if restored_cache_keys_by_node_id is not None:
+            restored_cache_keys_by_node_id["12"] = "NC_example"
         observed_events.append(
             (
                 "restore",
@@ -3853,7 +3859,7 @@ def test_modal_cloud_installs_persisted_cache_restore_after_live_set_prompt(
         fake_restore,
     )
 
-    restored_node_ids, restore_original_method = (
+    restore_state = (
         modal_cloud_module._install_prompt_executor_persisted_cache_restore(
             object(),
             executor,
@@ -3866,13 +3872,70 @@ def test_modal_cloud_installs_persisted_cache_restore_after_live_set_prompt(
     try:
         asyncio.run(outputs_cache.set_prompt(object(), ["12"], object()))
     finally:
-        restore_original_method()
+        restore_state.restore_original_method()
 
-    assert restored_node_ids == ["12"]
+    assert restore_state.restored_node_ids == ["12"]
+    assert restore_state.restored_cache_keys_by_node_id == {"12": "NC_example"}
     assert observed_events == [
         ("restore", "live-cache-key-set", ("12",), {"NC_example": {"version": 1}})
     ]
     assert outputs_cache.set_prompt.__func__ is FakeOutputsCache.set_prompt
+
+
+def test_modal_cloud_skips_rewriting_restored_distributed_cache_entries(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Persist should skip distributed cache entries that were restored unchanged this run."""
+    monkeypatch.setitem(sys.modules, "torchsde", types.ModuleType("torchsde"))
+    modal_cloud_module._ensure_comfy_runtime_initialized(None)
+
+    execution = modal_cloud_module._load_execution_module()
+    cache_entry = execution.CacheEntry(ui={"output": {"value": [5]}}, outputs=[[5]])
+    cache_key = "NC_existing"
+    cache_store: dict[str, Any] = {cache_key: {"version": 1, "outputs_zlib": b"old"}}
+    observed_logs: list[tuple[Any, ...]] = []
+
+    class FakeOutputsCache:
+        """Minimal outputs cache stub for persist-phase tests."""
+
+        def __init__(self) -> None:
+            """Populate one persistent cache entry."""
+            self.cache_key_set = object()
+
+        def get(self, node_id: str) -> Any:
+            """Return the prepared cache entry for the target node only."""
+            if node_id == "node_1":
+                return cache_entry
+            return None
+
+    executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=FakeOutputsCache()))
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_key_from_key_set_sync",
+        lambda cache_key_set, node_id: cache_key if node_id == "node_1" else None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_emit_cloud_info",
+        lambda message, *args: observed_logs.append((message, *args)),
+    )
+
+    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
+        executor,
+        prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
+        cache_store=cache_store,
+        restored_cache_keys_by_node_id={"node_1": cache_key},
+    )
+
+    assert persisted_nodes == []
+    assert cache_store == {cache_key: {"version": 1, "outputs_zlib": b"old"}}
+    assert observed_logs[-1] == (
+        "Node output cache write node=%s key_prefix=%s result=skip reason=restored-hit",
+        "node_1",
+        "NC_existing",
+    )
 
 
 def test_modal_cloud_materializes_synced_asset_paths(
