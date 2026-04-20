@@ -69,6 +69,46 @@ class _FakeSessionEchoNode:
         return (text,)
 
 
+class _FakeRewriteRemoteModelNode:
+    """Fake rewrite-time node that produces a non-transportable MODEL output."""
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteRemoteSamplerNode:
+    """Fake rewrite-time node that produces a transportable LATENT output."""
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteLatentSourceNode:
+    """Fake local source used to feed LATENT values into remote proxies."""
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteModalMapInputNode:
+    """Fake rewrite-time Modal map marker node."""
+
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("value",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteLocalSinkNode:
+    """Fake local sink used to model downstream local work in rewrite tests."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    OUTPUT_IS_LIST = (False,)
+
+
 def test_dynamic_proxy_node_preserves_output_signature(
     modal_executor_module: Any,
 ) -> None:
@@ -2925,6 +2965,188 @@ def test_execute_subgraph_locally_round_trips_remote_session_refs(
             {"static_input_0": static_outputs[0]},
             {"SessionEchoNode": _FakeSessionEchoNode},
         )
+
+
+def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completion(
+    api_intercept_module: Any,
+    modal_executor_module: Any,
+    session_state_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A local consumer of the static proxy should be able to run while the mapped proxy is still in flight."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRewriteRemoteModelNode,
+                "RemoteSampler": _FakeRewriteRemoteSamplerNode,
+                "LatentSource": _FakeRewriteLatentSourceNode,
+                "ModalMapInput": _FakeRewriteModalMapInputNode,
+                "LocalSink": _FakeRewriteLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+            {"id": 5, "properties": {"is_modal_remote": False}},
+            {"id": 6, "properties": {"is_modal_remote": True}},
+            {"id": 7, "properties": {"is_modal_remote": True}},
+            {"id": 8, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {},
+            "_meta": {"title": "Shared Model"},
+        },
+        "2": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Single Latent"},
+        },
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["2", 0]},
+            "_meta": {"title": "Unmapped Sampler"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["3", 0]},
+            "_meta": {"title": "Local Sink 1"},
+        },
+        "5": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Batch Latent Source"},
+        },
+        "6": {
+            "class_type": "ModalMapInput",
+            "inputs": {"value": ["5", 0]},
+            "_meta": {"title": "Map Input"},
+        },
+        "7": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["6", 0]},
+            "_meta": {"title": "Mapped Sampler"},
+        },
+        "8": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["7", 0]},
+            "_meta": {"title": "Local Sink 2"},
+        },
+    }
+
+    rewritten_prompt, _summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+    static_proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[rewritten_prompt["1"]["class_type"]]
+    mapped_proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[rewritten_prompt["1__mapped"]["class_type"]]
+    static_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    mapped_payload = rewritten_prompt["1__mapped"]["inputs"]["original_node_data"]
+
+    assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
+    assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]
+
+    observed_order: list[str] = []
+    mapped_started = asyncio.Event()
+    release_mapped = asyncio.Event()
+
+    class FakeClient:
+        """Fake async remote client that blocks the mapped proxy until released."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[Any, ...]:
+            """Return deterministic outputs for the split static and mapped proxies."""
+            if str(payload.get("component_id")) == "1":
+                observed_order.append("static_proxy_finish")
+                return (
+                    "static-latent",
+                    session_state_module.RemoteSessionValueRef(
+                        session_id=str(payload["remote_session"]["session_id"]),
+                        node_id="1",
+                        output_index=0,
+                    ).to_payload(),
+                )
+
+            if str(payload.get("component_id")) == "1__mapped":
+                observed_order.append("mapped_proxy_start")
+                mapped_started.set()
+                await release_mapped.wait()
+                observed_order.append("mapped_proxy_finish")
+                return ("mapped-latent",)
+
+            raise AssertionError(f"Unexpected proxy payload: {payload!r}")
+
+    async def run_scenario() -> tuple[Any, ...]:
+        """Run the split static and mapped proxies with a local consumer in between."""
+        static_result = await static_proxy_class.execute(
+            original_node_data=static_payload,
+            remote_input_0="single-latent",
+        )
+        mapped_task = asyncio.create_task(
+            mapped_proxy_class.execute(
+                original_node_data=mapped_payload,
+                remote_input_1="batched-latent",
+                static_input_0=static_result.result[1],
+            )
+        )
+        await mapped_started.wait()
+        observed_order.append(f"local_sink:{static_result.result[0]}")
+        assert not mapped_task.done()
+        release_mapped.set()
+        mapped_result = await mapped_task
+        return static_result.result, mapped_result.result
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        static_outputs, mapped_outputs = asyncio.run(run_scenario())
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert static_outputs[0] == "static-latent"
+    assert session_state_module.is_remote_session_value_ref_payload(static_outputs[1])
+    assert mapped_outputs == ("mapped-latent",)
+    assert observed_order == [
+        "static_proxy_finish",
+        "mapped_proxy_start",
+        "local_sink:static-latent",
+        "mapped_proxy_finish",
+    ]
 
 
 def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
