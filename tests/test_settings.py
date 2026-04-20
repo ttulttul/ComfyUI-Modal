@@ -123,6 +123,38 @@ def test_settings_reads_interrupt_dict_name_override(
     assert settings.interrupt_dict_name == "custom-interrupt-store"
 
 
+def test_settings_defaults_node_cache_dict_name_from_app_name(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The shared node-cache dict should default to one derived from the app name."""
+    monkeypatch.setenv("COMFY_MODAL_APP_NAME", "my-modal-app")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.node_output_cache_dict_name == "my-modal-app-node-cache"
+
+
+def test_settings_reads_node_cache_overrides(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The shared node-cache dict name and size limit should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_NODE_CACHE_DICT_NAME", "custom-node-cache")
+    monkeypatch.setenv("COMFY_MODAL_NODE_CACHE_MAX_BYTES", "123456")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.node_output_cache_dict_name == "custom-node-cache"
+    assert settings.node_output_cache_max_bytes == 123456
+
+
 def test_settings_reads_terminate_container_on_error_override(
     settings_module: Any,
     monkeypatch: Any,

@@ -31,6 +31,8 @@ class ModalSyncSettings:
     comfyui_root: Path | None
     custom_nodes_dir: Path | None
     interrupt_dict_name: str = "comfy-modal-sync-interrupts"
+    node_output_cache_dict_name: str = "comfy-modal-sync-node-cache"
+    node_output_cache_max_bytes: int = 50 * 1024 * 1024
     terminate_container_on_error: bool = True
     modal_gpu: str = "A100"
     scaledown_window_seconds: int = 600
@@ -170,6 +172,14 @@ def get_settings() -> ModalSyncSettings:
         interrupt_dict_name=os.getenv(
             "COMFY_MODAL_INTERRUPT_DICT_NAME",
             f"{app_name}-interrupts",
+        ),
+        node_output_cache_dict_name=os.getenv(
+            "COMFY_MODAL_NODE_CACHE_DICT_NAME",
+            f"{app_name}-node-cache",
+        ),
+        node_output_cache_max_bytes=_read_int_env(
+            "COMFY_MODAL_NODE_CACHE_MAX_BYTES",
+            50 * 1024 * 1024,
         ),
         terminate_container_on_error=_read_bool_env("COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR")
         is not False,
