@@ -1,7 +1,5 @@
 """Stable Modal cloud entrypoint for ComfyUI Modal-Sync."""
 
-from __future__ import annotations
-
 import asyncio
 import base64
 import copy

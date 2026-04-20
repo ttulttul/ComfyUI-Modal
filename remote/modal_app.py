@@ -1,7 +1,5 @@
 """Remote Modal runtime and local execution fallback."""
 
-from __future__ import annotations
-
 import asyncio
 import copy
 from dataclasses import dataclass, field
