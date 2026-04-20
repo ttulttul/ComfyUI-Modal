@@ -1993,10 +1993,18 @@ def _apply_boundary_inputs(
         if proxy_input_name not in hydrated_inputs:
             raise KeyError(f"Missing hydrated boundary input {proxy_input_name!r}.")
         value = hydrated_inputs[proxy_input_name]
+        io_type = (
+            str(boundary_input["io_type"])
+            if boundary_input.get("io_type") is not None
+            else None
+        )
         for target in boundary_input.get("targets", []):
             node_id = str(target["node_id"])
             input_name = str(target["input_name"])
-            prompt[node_id]["inputs"][input_name] = _normalize_prompt_input_value(value)
+            prompt[node_id]["inputs"][input_name] = _normalize_prompt_input_value(
+                value,
+                io_type=io_type,
+            )
 
 
 def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
@@ -2286,9 +2294,30 @@ def _normalize_link_output_index(value: Any) -> Any:
     return value
 
 
-def _normalize_prompt_input_value(value: Any) -> Any:
-    """Unwrap transport-added singleton lists around scalar prompt input values."""
-    while isinstance(value, list) and len(value) == 1:
+def _unwrap_wrapped_prompt_link(value: Any) -> Any:
+    """Collapse nested singleton wrappers around one serialized prompt link when present."""
+    candidate = value
+    while isinstance(candidate, list) and len(candidate) == 1:
+        candidate = candidate[0]
+    if _is_link(candidate):
+        return [candidate[0], _normalize_link_output_index(candidate[1])]
+    return value
+
+
+def _normalize_prompt_input_value(value: Any, io_type: str | None = None) -> Any:
+    """Unwrap transport-added singleton wrappers only for scalar-like prompt input values."""
+    wrapped_link = _unwrap_wrapped_prompt_link(value)
+    if wrapped_link is not value:
+        return wrapped_link
+    while (
+        isinstance(value, list)
+        and len(value) == 1
+        and (
+            io_type in _PRIMITIVE_WIDGET_INPUT_TYPES
+            or value[0] is None
+            or isinstance(value[0], bool | int | float | str)
+        )
+    ):
         value = value[0]
     if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
         return [value[0], _normalize_link_output_index(value[1])]

@@ -5089,6 +5089,43 @@ def test_apply_boundary_inputs_normalizes_wrapped_scalar_values(
         ("modal_cloud_module",),
     ],
 )
+def test_apply_boundary_inputs_preserves_singleton_conditioning_lists(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Boundary input hydration must not flatten singleton CONDITIONING payloads."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    conditioning = [["cond", {"pooled_output": None}]]
+    prompt = {
+        "remote_1": {
+            "class_type": "BoundarySource",
+            "inputs": {"value": 0},
+            "_meta": {},
+        }
+    }
+
+    target_module._apply_boundary_inputs(
+        prompt=prompt,
+        boundary_input_specs=[
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "remote_1", "input_name": "value"}],
+            }
+        ],
+        hydrated_inputs={"remote_input_0": conditioning},
+    )
+
+    assert prompt["remote_1"]["inputs"]["value"] == conditioning
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
 def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
     request: Any,
     module_fixture_name: str,
