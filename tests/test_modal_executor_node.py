@@ -3142,6 +3142,78 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
     ]
 
 
+def test_consume_remote_payload_stream_keeps_static_execute_node_progress_when_status_is_suppressed(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Static sub-runs should still forward real execute-node progress under suppressed status streams."""
+    progress_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: progress_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "1::static",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["1", "2", "12", "4"],
+        "execute_node_ids": ["12", "4"],
+        "boundary_outputs": [
+            {"node_id": "4", "output_index": 0, "io_type": "LATENT", "is_list": False}
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "suppress_status_stream": True,
+    }
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "node_progress",
+                "node_id": "1",
+                "display_node_id": "1",
+                "real_node_id": "12",
+                "value": 5.0,
+                "max": 20.0,
+            },
+            {
+                "kind": "progress",
+                "event_type": "node_progress",
+                "node_id": "2",
+                "display_node_id": "2",
+                "real_node_id": "2",
+                "value": 1.0,
+                "max": 10.0,
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert progress_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "1",
+            "value": 5.0,
+            "max_value": 20.0,
+            "display_node_id": "1",
+            "real_node_id": "12",
+            "lane_id": None,
+            "clear": False,
+            "item_index": None,
+            "aggregate_only": False,
+        }
+    ]
+
+
 def test_consume_remote_payload_stream_filters_static_sibling_ui_events_from_mapped_items(
     remote_modal_app_module: Any,
     serialization_module: Any,
