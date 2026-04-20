@@ -88,6 +88,15 @@ class _ReusablePromptExecutorState:
     lock: threading.Lock
 
 
+@dataclass
+class _PersistedNodeCacheRestoreState:
+    """Track which distributed cache entries were restored into one prompt execution."""
+
+    restored_node_ids: list[str]
+    restored_cache_keys_by_node_id: dict[str, str]
+    restore_original_method: Callable[[], None]
+
+
 _PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
 _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 _MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT = 256
@@ -1652,6 +1661,7 @@ async def _restore_persisted_node_output_cache_entries(
     prompt_id: str,
     prompt: dict[str, Any],
     cache_store: Any,
+    restored_cache_keys_by_node_id: dict[str, str] | None = None,
 ) -> list[str]:
     """Hydrate PromptExecutor output-cache misses from the shared Modal Dict."""
     outputs_cache = executor.caches.outputs
@@ -1665,6 +1675,7 @@ async def _restore_persisted_node_output_cache_entries(
         outputs_cache,
         prompt=prompt,
         cache_store=cache_store,
+        restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
     )
 
 
@@ -1674,6 +1685,7 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
     *,
     prompt: dict[str, Any],
     cache_store: Any,
+    restored_cache_keys_by_node_id: dict[str, str] | None = None,
 ) -> list[str]:
     """Hydrate one already-prepared PromptExecutor outputs cache from the shared Modal Dict."""
     restored_node_ids: list[str] = []
@@ -1711,6 +1723,8 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
             node_id,
             _node_output_cache_key_preview(cache_key),
         )
+        if restored_cache_keys_by_node_id is not None:
+            restored_cache_keys_by_node_id[str(node_id)] = cache_key
         restored_node_ids.append(str(node_id))
     return restored_node_ids
 
@@ -1722,20 +1736,23 @@ def _install_prompt_executor_persisted_cache_restore(
     component_id: str,
     prompt: dict[str, Any],
     cache_store: Any,
-) -> tuple[list[str], Callable[[], None]]:
+) -> _PersistedNodeCacheRestoreState:
     """Patch one executor so persisted-cache restore runs after its live `set_prompt()` call."""
     restored_node_ids: list[str] = []
+    restored_cache_keys_by_node_id: dict[str, str] = {}
     outputs_cache = executor.caches.outputs
     original_set_prompt = outputs_cache.set_prompt
 
     async def wrapped_set_prompt(dynprompt: Any, node_ids: Any, is_changed_cache: Any) -> None:
         await original_set_prompt(dynprompt, node_ids, is_changed_cache)
         with _timed_phase("restore_persisted_node_cache", component=component_id):
+            restored_cache_keys_by_node_id.clear()
             restored_node_ids[:] = await _restore_persisted_node_output_cache_entries_into_prepared_cache(
                 execution,
                 outputs_cache,
                 prompt=prompt,
                 cache_store=cache_store,
+                restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
             )
 
     outputs_cache.set_prompt = wrapped_set_prompt
@@ -1743,7 +1760,11 @@ def _install_prompt_executor_persisted_cache_restore(
     def restore_original_method() -> None:
         outputs_cache.set_prompt = original_set_prompt
 
-    return restored_node_ids, restore_original_method
+    return _PersistedNodeCacheRestoreState(
+        restored_node_ids=restored_node_ids,
+        restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
+        restore_original_method=restore_original_method,
+    )
 
 
 def _persist_node_output_cache_entries(
@@ -1751,6 +1772,7 @@ def _persist_node_output_cache_entries(
     *,
     prompt: dict[str, Any],
     cache_store: Any,
+    restored_cache_keys_by_node_id: dict[str, str] | None = None,
 ) -> list[str]:
     """Persist eligible PromptExecutor cache entries into the shared Modal Dict."""
     max_bytes = get_settings().node_output_cache_max_bytes
@@ -1783,6 +1805,16 @@ def _persist_node_output_cache_entries(
         if record is None:
             _emit_cloud_info(
                 "Node output cache write node=%s key_prefix=%s result=skip reason=ineligible-or-oversize",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
+            continue
+        restored_cache_key = None
+        if restored_cache_keys_by_node_id is not None:
+            restored_cache_key = restored_cache_keys_by_node_id.get(str(node_id))
+        if restored_cache_key == cache_key:
+            _emit_cloud_info(
+                "Node output cache write node=%s key_prefix=%s result=skip reason=restored-hit",
                 node_id,
                 _node_output_cache_key_preview(cache_key),
             )
@@ -2347,10 +2379,9 @@ def _execute_subgraph_prompt(
         cache_store = _node_output_cache_store()
         with executor_state.lock:
             _reset_prompt_executor_request_state(executor_state.executor, prompt_server)
-            restored_node_ids: list[str] = []
-            restore_prompt_executor_cache_hook: Callable[[], None] | None = None
+            restore_state: _PersistedNodeCacheRestoreState | None = None
             if cache_store is not None and get_settings().node_output_cache_max_bytes > 0:
-                restored_node_ids, restore_prompt_executor_cache_hook = (
+                restore_state = (
                     _install_prompt_executor_persisted_cache_restore(
                         execution,
                         executor_state.executor,
@@ -2379,9 +2410,10 @@ def _execute_subgraph_prompt(
                         execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
                     )
             finally:
-                if restore_prompt_executor_cache_hook is not None:
-                    restore_prompt_executor_cache_hook()
+                if restore_state is not None:
+                    restore_state.restore_original_method()
             executor = executor_state.executor
+            restored_node_ids = restore_state.restored_node_ids if restore_state is not None else []
             if restored_node_ids:
                 _emit_cloud_info(
                     "Restored %d persisted node cache entries for component=%s: %s",
@@ -2404,6 +2436,11 @@ def _execute_subgraph_prompt(
                     executor,
                     prompt=prompt,
                     cache_store=cache_store,
+                    restored_cache_keys_by_node_id=(
+                        restore_state.restored_cache_keys_by_node_id
+                        if restore_state is not None
+                        else None
+                    ),
                 )
             if persisted_node_ids:
                 _emit_cloud_info(
