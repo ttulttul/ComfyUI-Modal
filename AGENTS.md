@@ -7,6 +7,7 @@
 - When you make a big discovery or change, note this in docs/LEARNINGS.md, even if user does not ask you to.
 - Update README.md with each major commit.
 - You can find the ComfyUI source code in ~/git/ComfyUI.
+- Use ComfyUI's new "v3" node APIs when building ComfyUI nodes.
 
 ## Dev process tips
 - Use Python logging liberally to insert judicious info, warning, and debug messages in the code.
