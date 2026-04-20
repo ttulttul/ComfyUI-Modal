@@ -31,7 +31,7 @@ Desired behavior:
 - Prompt metadata is recomputed after rewrite so execution stages and dependency edges reflect the real split proxies.
 - A checked-in workflow-shaped regression artifact now locks the split static-plus-mapped rewrite behavior against future drift.
 - Session create, reuse, resolve, storage, and cleanup now emit explicit observability logs in the shared store and both runtime entrypoints.
-- Streamed remote executions now also surface their `MODAL_TASK_ID`, and the local runtime can optionally mirror that container's live logs into local stderr via the Modal SDK or `modal container logs -f` fallback.
+- Streamed remote executions now also surface their `MODAL_TASK_ID`, and the local runtime can optionally mirror that container's live logs into local stderr, preferring `modal container logs -f` with an SDK fallback only when the CLI is unavailable.
 
 ### Why this shape
 

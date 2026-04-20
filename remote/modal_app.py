@@ -11,6 +11,7 @@ from io import BytesIO
 import logging
 import os
 import queue
+import select
 import shutil
 import socket
 import subprocess
@@ -279,23 +280,35 @@ def _stream_remote_container_logs_via_modal_cli(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        bufsize=0,
     )
+    line_buffer = _RemoteContainerLogLineBuffer(task_id=task_id)
     try:
         stdout_stream = process.stdout
         if stdout_stream is None:
             raise RuntimeError("Modal CLI log process did not expose a stdout stream.")
         while not stop_event.is_set():
-            next_line = stdout_stream.readline()
-            if next_line:
-                _write_remote_container_log_chunk(line_buffer, next_line)
-                continue
+            ready_streams, _, _ = select.select([stdout_stream], [], [], 0.25)
+            if ready_streams:
+                next_chunk = stdout_stream.read(4096)
+                if next_chunk:
+                    _write_remote_container_log_chunk(
+                        line_buffer,
+                        next_chunk.decode("utf-8", errors="replace"),
+                    )
+                    continue
             if process.poll() is not None:
+                trailing_chunk = stdout_stream.read()
+                if trailing_chunk:
+                    _write_remote_container_log_chunk(
+                        line_buffer,
+                        trailing_chunk.decode("utf-8", errors="replace"),
+                    )
                 break
-    finally:
         if stop_event.is_set() and process.poll() is None:
             process.terminate()
+    finally:
+        if process.poll() is None:
             try:
                 process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
@@ -314,23 +327,23 @@ def _run_remote_container_log_stream(task_id: str, stop_event: threading.Event) 
     """Run the best available remote log streaming backend for one Modal container."""
     logger.info("Starting remote Modal container log stream for task_id=%s.", task_id)
     try:
-        if _stream_remote_container_logs_via_modal_sdk(task_id, stop_event):
+        if _stream_remote_container_logs_via_modal_cli(task_id, stop_event):
             logger.info("Stopped remote Modal container log stream for task_id=%s.", task_id)
             return
-    except (AttributeError, ImportError, ModuleNotFoundError, OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
         logger.warning(
-            "Falling back from Modal SDK log streaming for task_id=%s after failure: %s",
+            "Falling back from Modal CLI log streaming for task_id=%s after failure: %s",
             task_id,
             exc,
         )
 
     try:
-        if _stream_remote_container_logs_via_modal_cli(task_id, stop_event):
+        if _stream_remote_container_logs_via_modal_sdk(task_id, stop_event):
             logger.info("Stopped remote Modal container log stream for task_id=%s.", task_id)
             return
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (AttributeError, ImportError, ModuleNotFoundError, OSError, RuntimeError, ValueError) as exc:
         logger.warning(
-            "Modal CLI log streaming failed for task_id=%s: %s",
+            "Modal SDK log streaming failed for task_id=%s: %s",
             task_id,
             exc,
         )
@@ -2704,7 +2717,7 @@ def _lookup_deployed_remote_engine(payload: dict[str, Any]) -> Any:
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
     if affinity_key is not None:
-        return remote_cls(affinity_key)
+        return remote_cls(session_affinity_key=affinity_key)
     return remote_cls()
 
 
@@ -3317,17 +3330,14 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     )
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
-
-        def __init__(self, session_affinity_key: str | None = None) -> None:
-            """Record the optional session-affinity key for split-proxy reuse."""
-            self.session_affinity_key = session_affinity_key
+        session_affinity_key: str = modal.parameter(default="")
 
         @modal.enter()
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
             logger.info(
                 "RemoteEngine setup complete for session_affinity_key=%s.",
-                self.session_affinity_key,
+                self.session_affinity_key or None,
             )
 
         @modal.method()
