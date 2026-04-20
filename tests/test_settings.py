@@ -138,6 +138,21 @@ def test_settings_defaults_node_cache_dict_name_from_app_name(
     assert settings.node_output_cache_dict_name == "my-modal-app-node-cache"
 
 
+def test_settings_defaults_node_cache_max_bytes_to_five_mib(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The distributed node-cache size cap should default to 5 MiB."""
+    monkeypatch.delenv("COMFY_MODAL_NODE_CACHE_MAX_BYTES", raising=False)
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.node_output_cache_max_bytes == 5 * 1024 * 1024
+
+
 def test_settings_reads_node_cache_overrides(
     settings_module: Any,
     monkeypatch: Any,
