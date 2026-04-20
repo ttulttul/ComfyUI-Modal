@@ -179,6 +179,7 @@ Remote runtime behavior:
 - Those session refs keep values like `MODEL` remote-only while still letting the mapped proxy reconnect to them later, and the mapped proxy clears the prompt-scoped session once it finishes.
 - Deployed split proxies now also pass a session-affinity key into `RemoteEngine` lookup so the static and mapped halves can reuse that prompt-scoped remote state on the same worker.
 - Session observability now logs the full prompt-scoped lifecycle for split proxies: session creation, reuse, ref resolution, value storage, and cleanup in both local and cloud runtime paths.
+- Opt-in live remote container log mirroring can now follow the active Modal worker's `task_id` during streamed executions and forward those lines into the local ComfyUI process stderr. That makes session create/reuse/cleanup messages visible locally without having to run `modal container logs ...` in a second terminal.
 - The remote worker only forwards numeric node progress for meaningful progress states. Trivial `0/1` updates from ordinary upstream nodes are ignored so sampler-style progress bars stay attached to nodes like `KSampler` instead of appearing on loaders or text encoders.
 - Static sub-runs inside hybrid mapped execution now also forward their lane-less execute-node progress even when coarse per-phase status chatter is suppressed, so one-time upstream samplers still show real progress bars while mapped item runs keep their quieter stream behavior.
 - Those suppressed static progress events now emit an explicit clear when the static sub-run finishes, so one-time upstream sampler bars disappear promptly at completion instead of sticking at `100%` until the whole prompt ends.
@@ -355,6 +356,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR`: When true, a remote execution crash makes the worker exit its own container after returning the error. Default: `true`.
 - `COMFY_MODAL_AUTO_DEPLOY`: Automatically deploy the Modal app on first remote invocation when lookup fails. Default: `true`.
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
+- `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS`: Mirror live remote Modal container logs into the local ComfyUI stderr stream during streamed executions. Default: `false`. Modal-Sync prefers the installed Modal Python SDK's log stream and falls back to `modal container logs <task_id> -f` when only the CLI is available.
 
 ### Modal runtime sizing
 
