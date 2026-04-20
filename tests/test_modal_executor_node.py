@@ -774,6 +774,32 @@ def test_modal_cloud_does_not_schedule_container_exit_for_interruptions(
     assert scheduled_exits == []
 
 
+def test_modal_cloud_does_not_schedule_container_exit_for_session_state_misses(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Prompt-scoped session misses are routing problems, not poisoned-container crashes."""
+    scheduled_exits: list[tuple[float, int]] = []
+    original_flag = modal_cloud_module._CONTAINER_TERMINATION_SCHEDULED
+    monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", False)
+    monkeypatch.setattr(modal_cloud_module, "_is_modal_container_runtime", lambda: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_schedule_process_exit",
+        lambda delay_seconds, exit_code: scheduled_exits.append((delay_seconds, exit_code)),
+    )
+    try:
+        scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
+            {"component_id": "component-1", "terminate_container_on_error": True},
+            modal_cloud_module.RemoteSessionStateError("Remote session 'abc' was not found."),
+        )
+    finally:
+        monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
+
+    assert scheduled is False
+    assert scheduled_exits == []
+
+
 def test_modal_cloud_skips_duplicate_reload_markers_in_same_container(
     modal_cloud_module: Any,
 ) -> None:
