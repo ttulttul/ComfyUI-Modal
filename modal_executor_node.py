@@ -19,6 +19,17 @@ from .serialization import deserialize_node_outputs, serialize_node_inputs
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
 _PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
+_VOLATILE_PROXY_CACHE_KEYS = frozenset(
+    {
+        "prompt_id",
+        "remote_session",
+        "clear_remote_session",
+        "extra_data",
+        "requires_volume_reload",
+        "volume_reload_marker",
+        "uploaded_volume_paths",
+    }
+)
 
 
 class RemoteExecutorClient(Protocol):
@@ -162,9 +173,8 @@ def _payload_is_local_cache_safe(payload: Mapping[str, Any]) -> bool:
 def _sanitize_cache_surface_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Strip run-scoped fields from one proxy payload before exposing it to ComfyUI caching."""
     sanitized_payload = dict(payload)
-    sanitized_payload.pop("prompt_id", None)
-    sanitized_payload.pop("remote_session", None)
-    sanitized_payload.pop("clear_remote_session", None)
+    for field_name in _VOLATILE_PROXY_CACHE_KEYS:
+        sanitized_payload.pop(field_name, None)
 
     split_proxy_payloads = sanitized_payload.get("split_proxy_payloads")
     if isinstance(split_proxy_payloads, Mapping):

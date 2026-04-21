@@ -284,10 +284,9 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert payload["component_node_ids"] == ["1", "2"]
     assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith("/assets/")
     assert payload["execute_node_ids"] == ["2"]
-    assert payload["requires_volume_reload"] is True
-    assert isinstance(payload["volume_reload_marker"], str)
-    assert payload["volume_reload_marker"]
-    assert payload["uploaded_volume_paths"] == [summary.synced_assets[0].remote_path]
+    assert "requires_volume_reload" not in payload
+    assert "volume_reload_marker" not in payload
+    assert "uploaded_volume_paths" not in payload
     assert payload["terminate_container_on_error"] is True
     assert payload["boundary_inputs"] == []
     assert payload["boundary_outputs"] == [
@@ -817,13 +816,16 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
 
     assert summary.remote_component_ids == ["1", "2"]
     assert summary.synced_assets == [uploaded_asset]
-    assert first_payload["requires_volume_reload"] is False
-    assert second_payload["requires_volume_reload"] is True
-    assert isinstance(first_payload["volume_reload_marker"], str)
-    assert first_payload["volume_reload_marker"]
-    assert first_payload["volume_reload_marker"] == second_payload["volume_reload_marker"]
-    assert first_payload["uploaded_volume_paths"] == []
-    assert second_payload["uploaded_volume_paths"] == [uploaded_asset.remote_path]
+    assert "requires_volume_reload" not in first_payload
+    assert "requires_volume_reload" not in second_payload
+    assert "volume_reload_marker" not in first_payload
+    assert "volume_reload_marker" not in second_payload
+    assert "uploaded_volume_paths" not in first_payload
+    assert "uploaded_volume_paths" not in second_payload
+    assert summary.requires_volume_reload is True
+    assert isinstance(summary.volume_reload_marker, str)
+    assert summary.volume_reload_marker
+    assert summary.uploaded_volume_paths == [uploaded_asset.remote_path]
 
 
 def test_rewrite_merges_cyclic_coarse_components_back_into_single_proxy(
