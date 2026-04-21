@@ -1920,6 +1920,92 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     assert deploy_calls == [("comfy-modal-sync", None)]
 
 
+def test_remote_modal_redeploys_when_cached_app_was_deleted(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A stale in-process auto-deploy cache should not block redeploy after app deletion."""
+
+    class FakeLookupError(Exception):
+        """Stand-in for Modal deployed lookup failures."""
+
+    deploy_calls: list[tuple[str | None, str | None]] = []
+
+    class FakeExecuteMethod:
+        """Minimal Modal method handle that records remote calls."""
+
+        def remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Return deterministic remote bytes."""
+            del payload, kwargs_payload
+            return b"remote-response"
+
+    class FakeRemoteEngine:
+        """Minimal deployed remote engine instance."""
+
+        execute_payload = FakeExecuteMethod()
+
+    class FakeApp:
+        """Minimal deployable cloud app double."""
+
+        def deploy(self, *, name: str | None = None, environment_name: str | None = None, **_: Any) -> "FakeApp":
+            """Record the redeploy request and mark the deployment available again."""
+            deploy_calls.append((name, environment_name))
+            FakeModal.deployed = True
+            return self
+
+    class FakeModal:
+        """Minimal modal SDK double with deployed lookup failure types."""
+
+        deployed = False
+        exception = types.SimpleNamespace(
+            NotFoundError=FakeLookupError,
+            ExecutionError=FakeLookupError,
+            InvalidError=FakeLookupError,
+        )
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Raise the same missing-app error until auto-deploy recreates the app."""
+                del app_name, class_name
+                if not FakeModal.deployed:
+                    raise FakeLookupError(
+                        "Lookup failed for Cls 'RemoteEngine' from the 'comfy-modal-sync' app: "
+                        "App 'comfy-modal-sync' not found in environment 'main'."
+                    )
+                return lambda **kwargs: FakeRemoteEngine()
+
+        @staticmethod
+        def enable_output() -> Any:
+            """Provide a no-op output context manager."""
+            return nullcontext()
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_load_modal_cloud_module",
+        lambda: types.SimpleNamespace(app=FakeApp()),
+    )
+    monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
+    remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.add(("comfy-modal-sync", "main"))
+    try:
+        response = remote_modal_app_module._invoke_modal_payload_blocking(
+            {"component_id": "component-1"},
+            b"{}",
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
+
+    assert response == b"remote-response"
+    assert deploy_calls == [("comfy-modal-sync", "main")]
+
+
 def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
     remote_modal_app_module: Any,
     monkeypatch: Any,
