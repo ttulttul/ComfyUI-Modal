@@ -1,16 +1,16 @@
 """Stable Modal cloud entrypoint for ComfyUI Modal-Sync."""
 
-from __future__ import annotations
-
 import asyncio
+import base64
 import copy
 import gc
 import hashlib
 import importlib.util
 from io import BytesIO
-import json
 import inspect
+import json
 import logging
+import math
 import os
 import queue
 import sys
@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -41,7 +42,28 @@ for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_CO
     if candidate_exists and candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-from serialization import coerce_serialized_node_outputs, deserialize_node_inputs, serialize_mapping, serialize_node_outputs
+from serialization import (
+    coerce_serialized_node_outputs,
+    deserialize_node_inputs,
+    deserialize_node_outputs,
+    deserialize_value,
+    serialize_mapping,
+    serialize_node_outputs,
+    serialize_value,
+)
+from session_state import (
+    InMemoryRemoteSessionBridgeStore,
+    InMemoryRemoteSessionStore,
+    RemoteSessionBridgeRecord,
+    RemoteSessionBridgeRef,
+    RemoteSessionHandle,
+    RemoteSessionStateError,
+    RemoteSessionValueRef,
+    is_remote_session_bridge_ref_payload,
+    is_remote_session_handle_payload,
+    is_remote_session_value_ref_payload,
+    stable_session_bridge_key,
+)
 from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -53,9 +75,15 @@ _EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
 _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
+_NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
+_BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
+_NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
+_REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
+_REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
+_REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
 
 try:
     import modal  # type: ignore
@@ -67,12 +95,217 @@ class RemoteSubgraphExecutionError(RuntimeError):
     """Raised when remote subgraph execution fails."""
 
 
+def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHandle | None:
+    """Return the decoded prompt-scoped remote session handle for one payload."""
+    remote_session = payload.get("remote_session")
+    if not is_remote_session_handle_payload(remote_session):
+        return None
+    return RemoteSessionHandle.from_payload(remote_session)
+
+
+def _session_bridge_store() -> Any:
+    """Return the durable store used to replay session-backed outputs across containers."""
+    return globals().get("session_bridge_cache") or _REMOTE_SESSION_BRIDGE_STORE
+
+
+def _sanitize_payload_for_session_bridge_record(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip run-scoped fields from one producer payload before persisting replay metadata."""
+    sanitized_payload = copy.deepcopy(payload)
+    sanitized_payload.pop("prompt_id", None)
+    sanitized_payload.pop("remote_session", None)
+    sanitized_payload.pop("clear_remote_session", None)
+    sanitized_payload["extra_data"] = {}
+    return sanitized_payload
+
+
+def _build_remote_session_bridge_record(
+    *,
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    node_id: str,
+    output_index: int,
+) -> RemoteSessionBridgeRecord:
+    """Build one durable bridge record for a session-backed boundary output."""
+    producer_payload = _sanitize_payload_for_session_bridge_record(payload)
+    producer_inputs = serialize_mapping(hydrated_inputs)
+    return RemoteSessionBridgeRecord(
+        bridge_key=stable_session_bridge_key(
+            producer_payload=producer_payload,
+            producer_inputs=producer_inputs,
+            node_id=node_id,
+            output_index=output_index,
+        ),
+        node_id=node_id,
+        output_index=output_index,
+        producer_payload=producer_payload,
+        producer_inputs=producer_inputs,
+    )
+
+
+def _store_remote_session_bridge_record(record: RemoteSessionBridgeRecord) -> None:
+    """Persist one durable bridge record for replaying remote-only outputs."""
+    store = _session_bridge_store()
+    put_record = getattr(store, "put_record", None)
+    if callable(put_record):
+        put_record(record)
+        return
+    store[record.bridge_key] = record.to_payload()
+    logger.info(
+        "Stored remote session bridge record bridge_key=%s node_id=%s output_index=%d.",
+        record.bridge_key,
+        record.node_id,
+        record.output_index,
+    )
+
+
+def _load_remote_session_bridge_record(bridge_key: str) -> RemoteSessionBridgeRecord:
+    """Load one durable bridge record from the configured backing store."""
+    store = _session_bridge_store()
+    get_record = getattr(store, "get_record", None)
+    if callable(get_record):
+        return get_record(bridge_key)
+    payload = store.get(bridge_key)
+    if not isinstance(payload, dict):
+        raise RemoteSessionStateError(
+            f"Remote session bridge record {bridge_key!r} was not found."
+        )
+    logger.info("Resolved remote session bridge record bridge_key=%s from shared store.", bridge_key)
+    return RemoteSessionBridgeRecord.from_payload(payload)
+
+
+def _remote_session_bridge_replay_stack() -> set[str]:
+    """Return the thread-local guard set for bridge replay recursion detection."""
+    replay_stack = getattr(_REMOTE_SESSION_BRIDGE_REPLAY_STATE, "bridge_keys", None)
+    if replay_stack is None:
+        replay_stack = set()
+        _REMOTE_SESSION_BRIDGE_REPLAY_STATE.bridge_keys = replay_stack
+    return replay_stack
+
+
+def _rehydrate_remote_session_bridge_value(
+    ref: RemoteSessionBridgeRef,
+    *,
+    target_session_handle: RemoteSessionHandle | None,
+    custom_nodes_root: Path | None,
+    cancellation_event: threading.Event | None,
+    interrupt_store: Any | None,
+    interrupt_flag_key: str | None,
+) -> Any:
+    """Replay one producer phase into the current session when the live value is gone."""
+    if target_session_handle is None:
+        raise RemoteSessionStateError(
+            "Remote session bridge replay requires a target remote_session handle."
+        )
+
+    replay_stack = _remote_session_bridge_replay_stack()
+    if ref.bridge_key in replay_stack:
+        raise RemoteSessionStateError(
+            f"Detected recursive remote session bridge replay for {ref.bridge_key!r}."
+        )
+
+    record = _load_remote_session_bridge_record(ref.bridge_key)
+    replay_payload = copy.deepcopy(record.producer_payload)
+    replay_payload["remote_session"] = target_session_handle.to_payload()
+    replay_payload.pop("clear_remote_session", None)
+    if target_session_handle.prompt_id is not None:
+        replay_payload["prompt_id"] = target_session_handle.prompt_id
+    replay_inputs = deserialize_node_inputs(record.producer_inputs)
+
+    logger.info(
+        "Replaying remote session bridge bridge_key=%s into session_id=%s via component=%s.",
+        ref.bridge_key,
+        target_session_handle.session_id,
+        replay_payload.get("component_id"),
+    )
+    replay_stack.add(ref.bridge_key)
+    try:
+        _execute_subgraph_prompt(
+            replay_payload,
+            replay_inputs,
+            custom_nodes_root,
+            None,
+            cancellation_event,
+            interrupt_store,
+            interrupt_flag_key,
+        )
+    finally:
+        replay_stack.remove(ref.bridge_key)
+
+    return _REMOTE_SESSION_STORE.get_output(
+        RemoteSessionValueRef(
+            session_id=target_session_handle.session_id,
+            node_id=ref.node_id,
+            output_index=ref.output_index,
+        )
+    )
+
+
+def _resolve_remote_session_inputs(
+    hydrated_inputs: dict[str, Any],
+    *,
+    component_id: str | None = None,
+    target_session_handle: RemoteSessionHandle | None = None,
+    custom_nodes_root: Path | None = None,
+    cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
+) -> dict[str, Any]:
+    """Resolve any remote-session value refs embedded in boundary inputs."""
+    ref_input_names = [
+        input_name
+        for input_name, input_value in hydrated_inputs.items()
+        if is_remote_session_value_ref_payload(input_value)
+        or is_remote_session_bridge_ref_payload(input_value)
+    ]
+    if ref_input_names:
+        logger.info(
+            "Resolving %d remote session input refs for component=%s inputs=%s.",
+            len(ref_input_names),
+            component_id or "<unknown>",
+            sorted(ref_input_names),
+        )
+    return {
+        input_name: _REMOTE_SESSION_STORE.resolve_value_with_bridges(
+            input_value,
+            target_session_handle=target_session_handle,
+            bridge_resolver=lambda ref: _rehydrate_remote_session_bridge_value(
+                ref,
+                target_session_handle=target_session_handle,
+                custom_nodes_root=custom_nodes_root,
+                cancellation_event=cancellation_event,
+                interrupt_store=interrupt_store,
+                interrupt_flag_key=interrupt_flag_key,
+            ),
+        )
+        for input_name, input_value in hydrated_inputs.items()
+    }
+
+
 @dataclass
 class _ReusablePromptExecutorState:
     """Hold a warm-container PromptExecutor and the lock guarding its reuse."""
 
     executor: Any
     lock: threading.Lock
+
+
+@dataclass
+class _PersistedNodeCacheRestoreState:
+    """Track which distributed cache entries were restored into one prompt execution."""
+
+    restored_node_ids: list[str]
+    restored_cache_keys_by_node_id: dict[str, str]
+    restore_original_method: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class _NodeOutputCacheLookupResult:
+    """Hold one distributed cache lookup result before hydration into the live outputs cache."""
+
+    node_id: str
+    cache_key: str | None
+    raw_record: Any | None
+    cache_entry: Any | None
 
 
 _PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
@@ -82,6 +315,7 @@ _MODAL_VOLUME_RELOAD_MARKERS: queue.SimpleQueue[str] | None = None
 _MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
 _REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS = 1.0
 _CONTAINER_TERMINATION_SCHEDULED = False
+_PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 
 
 @dataclass
@@ -129,6 +363,13 @@ def _is_interrupt_like_failure(exc: Exception) -> bool:
     return "interrupt" in str(exc).lower()
 
 
+def _is_session_state_like_failure(exc: Exception) -> bool:
+    """Return whether one remote failure came from prompt-scoped session routing/state issues."""
+    if isinstance(exc, RemoteSessionStateError):
+        return True
+    return "remote session" in str(exc).lower()
+
+
 def _maybe_schedule_container_termination_on_error(
     payload: dict[str, Any],
     exc: Exception,
@@ -139,6 +380,13 @@ def _maybe_schedule_container_termination_on_error(
     if not bool(payload.get("terminate_container_on_error", True)):
         return False
     if _is_interrupt_like_failure(exc):
+        return False
+    if _is_session_state_like_failure(exc):
+        logger.warning(
+            "Skipping Modal container termination for component=%s because the failure looks like a remote session routing/state miss.",
+            payload.get("component_id"),
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return False
 
     global _CONTAINER_TERMINATION_SCHEDULED
@@ -1160,6 +1408,689 @@ def _get_or_create_prompt_executor_state(
         return state
 
 
+def _node_output_cache_store() -> Any | None:
+    """Return the shared Modal Dict used for persisted transport-safe node outputs."""
+    if modal is None:
+        return None
+    return globals().get("node_output_cache")
+
+
+def _node_output_cache_key_preview(cache_key: str | None, *, max_chars: int = 32) -> str:
+    """Return a short human-readable prefix of one persisted node-cache key."""
+    if cache_key is None:
+        return "<none>"
+    return cache_key[:max_chars]
+
+
+def _node_output_cache_value_preview(value: Any, *, max_chars: int = 160) -> str:
+    """Return a truncated repr for node-cache debug logging."""
+    try:
+        rendered = repr(value)
+    except Exception as exc:  # pragma: no cover - defensive logging path.
+        rendered = f"<repr failed: {type(exc).__name__}: {exc}>"
+    if len(rendered) <= max_chars:
+        return rendered
+    return f"{rendered[:max_chars]}..."
+
+
+def _tensor_cache_key_digest(value: Any) -> dict[str, Any]:
+    """Return a stable digest payload for one tensor used inside a cache key."""
+    from safetensors.torch import save
+
+    tensor = value.detach().contiguous().cpu()
+    tensor_bytes = save({"value": tensor})
+    return {
+        "kind": "tensor",
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "sha256": hashlib.sha256(tensor_bytes).hexdigest(),
+    }
+
+
+async def _node_output_cache_store_get(cache_store: Any, cache_key: str) -> Any:
+    """Return one persisted node-cache record, preferring Modal's async Dict interface."""
+    aio_get = getattr(getattr(cache_store, "get", None), "aio", None)
+    if callable(aio_get):
+        return await aio_get(cache_key)
+    return cache_store.get(cache_key)
+
+
+def _is_input_signature_cache_key_set(cache_key_set: Any) -> bool:
+    """Return whether one cache-key set uses ComfyUI input-signature semantics."""
+    return all(
+        hasattr(cache_key_set, attribute)
+        for attribute in ("dynprompt", "is_changed_cache", "get_ordered_ancestry", "include_node_id_in_input")
+    )
+
+
+def _include_unique_id_in_input_signature(class_type: str) -> bool:
+    """Return whether ComfyUI includes the unique node id in this input signature."""
+    from comfy_execution.caching import include_unique_id_in_input
+
+    return bool(include_unique_id_in_input(class_type))
+
+
+def _build_node_output_cache_immediate_signature(
+    cache_key_set: Any,
+    *,
+    dynprompt: Any,
+    node_id: str,
+    ancestor_order_mapping: dict[str, int],
+    is_changed_value: Any,
+) -> list[Any]:
+    """Return one raw ComfyUI input-signature fragment before `to_hashable()` runs."""
+    if not dynprompt.has_node(node_id):
+        return [float("NaN")]
+
+    node = dynprompt.get_node(node_id)
+    class_type = node["class_type"]
+    class_def = _load_nodes_module().NODE_CLASS_MAPPINGS[class_type]
+    signature: list[Any] = [class_type, is_changed_value]
+    if (
+        cache_key_set.include_node_id_in_input()
+        or (hasattr(class_def, "NOT_IDEMPOTENT") and class_def.NOT_IDEMPOTENT)
+        or _include_unique_id_in_input_signature(class_type)
+    ):
+        signature.append(node_id)
+
+    inputs = node["inputs"]
+    boundary_input_signatures = node.get(_BOUNDARY_INPUT_SIGNATURES_KEY)
+    for key in sorted(inputs.keys()):
+        input_value = inputs[key]
+        if _is_link(input_value):
+            ancestor_id = str(input_value[0])
+            ancestor_socket = int(input_value[1])
+            ancestor_index = int(ancestor_order_mapping[ancestor_id])
+            signature.append((key, ("ANCESTOR", ancestor_index, ancestor_socket)))
+        else:
+            boundary_signature = None
+            if isinstance(boundary_input_signatures, dict):
+                candidate_signature = boundary_input_signatures.get(str(key))
+                if isinstance(candidate_signature, str) and candidate_signature:
+                    boundary_signature = candidate_signature
+            if boundary_signature is not None:
+                signature.append((key, ("BOUNDARY_SOURCE", boundary_signature)))
+            else:
+                signature.append((key, input_value))
+    return signature
+
+
+async def _build_node_output_cache_signature_from_key_set_async(
+    cache_key_set: Any,
+    node_id: str,
+) -> Any:
+    """Return one distributed cache signature derived from a live ComfyUI cache-key set."""
+    if not _is_input_signature_cache_key_set(cache_key_set):
+        return cache_key_set.get_data_key(node_id)
+
+    dynprompt = cache_key_set.dynprompt
+    ancestors, order_mapping = cache_key_set.get_ordered_ancestry(dynprompt, node_id)
+    signature = [
+        _build_node_output_cache_immediate_signature(
+            cache_key_set,
+            dynprompt=dynprompt,
+            node_id=node_id,
+            ancestor_order_mapping=order_mapping,
+            is_changed_value=await cache_key_set.is_changed_cache.get(node_id),
+        )
+    ]
+    for ancestor_id in ancestors:
+        signature.append(
+            _build_node_output_cache_immediate_signature(
+                cache_key_set,
+                dynprompt=dynprompt,
+                node_id=str(ancestor_id),
+                ancestor_order_mapping=order_mapping,
+                is_changed_value=await cache_key_set.is_changed_cache.get(ancestor_id),
+            )
+        )
+    return signature
+
+
+def _build_node_output_cache_signature_from_key_set_sync(
+    cache_key_set: Any,
+    node_id: str,
+) -> Any | None:
+    """Return one distributed cache signature using cached `is_changed` values only."""
+    if not _is_input_signature_cache_key_set(cache_key_set):
+        return cache_key_set.get_data_key(node_id)
+
+    cached_is_changed = getattr(cache_key_set.is_changed_cache, "is_changed", None)
+    if not isinstance(cached_is_changed, dict):
+        return None
+
+    dynprompt = cache_key_set.dynprompt
+    ancestors, order_mapping = cache_key_set.get_ordered_ancestry(dynprompt, node_id)
+    all_node_ids = [str(node_id), *[str(ancestor_id) for ancestor_id in ancestors]]
+    missing_node_ids = [candidate for candidate in all_node_ids if candidate not in cached_is_changed]
+    if missing_node_ids:
+        _emit_cloud_info(
+            "Node output cache signature rebuild node=%s result=skip reason=missing-is-changed values=%s",
+            node_id,
+            missing_node_ids,
+        )
+        return None
+
+    return [
+        _build_node_output_cache_immediate_signature(
+            cache_key_set,
+            dynprompt=dynprompt,
+            node_id=candidate,
+            ancestor_order_mapping=order_mapping,
+            is_changed_value=cached_is_changed[candidate],
+        )
+        for candidate in all_node_ids
+    ]
+
+
+def _canonicalize_node_output_cache_key_part(
+    value: Any,
+    *,
+    path: str = "root",
+) -> Any | None:
+    """Return a JSON-stable representation of one CacheKeySetInputSignature fragment."""
+    value_type_name = type(value).__name__
+    if value_type_name == "Unhashable":
+        _emit_cloud_info(
+            "Node output cache canonicalization path=%s result=unhashable reason=comfy-unhashable-marker type=%s value=%s",
+            path,
+            value_type_name,
+            _node_output_cache_value_preview(value),
+        )
+        return None
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"kind": "float", "value": "nan"}
+        if math.isinf(value):
+            return {"kind": "float", "value": "inf" if value > 0 else "-inf"}
+        return value
+    if isinstance(value, bytes):
+        return {
+            "kind": "bytes",
+            "value": base64.b64encode(value).decode("ascii"),
+        }
+    try:
+        import torch
+    except ModuleNotFoundError:
+        torch = None
+    if torch is not None and isinstance(value, torch.Tensor):
+        return _tensor_cache_key_digest(value)
+    if isinstance(value, tuple):
+        items = []
+        for index, item in enumerate(value):
+            child_path = f"{path}[{index}]"
+            canonical_item = _canonicalize_node_output_cache_key_part(
+                item,
+                path=child_path,
+            )
+            if canonical_item is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=tuple-child child_path=%s parent_type=%s parent_value=%s",
+                    path,
+                    child_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
+                )
+                return None
+            items.append(canonical_item)
+        return {"kind": "tuple", "items": items}
+    if isinstance(value, list):
+        items = []
+        for index, item in enumerate(value):
+            child_path = f"{path}[{index}]"
+            canonical_item = _canonicalize_node_output_cache_key_part(
+                item,
+                path=child_path,
+            )
+            if canonical_item is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=list-child child_path=%s parent_type=%s parent_value=%s",
+                    path,
+                    child_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
+                )
+                return None
+            items.append(canonical_item)
+        return {"kind": "list", "items": items}
+    if isinstance(value, dict):
+        items: list[dict[str, Any]] = []
+        for key in sorted(value):
+            rendered_key = _node_output_cache_value_preview(key, max_chars=48)
+            key_path = f"{path}.key[{rendered_key}]"
+            value_path = f"{path}[{rendered_key}]"
+            canonical_key = _canonicalize_node_output_cache_key_part(
+                key,
+                path=key_path,
+            )
+            canonical_value = _canonicalize_node_output_cache_key_part(
+                value[key],
+                path=value_path,
+            )
+            if canonical_key is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=dict-key child_path=%s parent_type=%s parent_value=%s",
+                    path,
+                    key_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
+                )
+                return None
+            if canonical_value is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=dict-value key=%s child_path=%s parent_type=%s parent_value=%s",
+                    path,
+                    rendered_key,
+                    value_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
+                )
+                return None
+            items.append({"key": canonical_key, "value": canonical_value})
+        return {"kind": "dict", "items": items}
+    if isinstance(value, frozenset):
+        canonical_items: list[Any] = []
+        for index, item in enumerate(
+            sorted(
+                value,
+                key=lambda item: _node_output_cache_value_preview(item, max_chars=120),
+            )
+        ):
+            child_path = f"{path}{{{index}}}"
+            canonical_item = _canonicalize_node_output_cache_key_part(
+                item,
+                path=child_path,
+            )
+            if canonical_item is None:
+                _emit_cloud_info(
+                    "Node output cache canonicalization path=%s result=unhashable reason=frozenset-child child_path=%s parent_type=%s parent_value=%s",
+                    path,
+                    child_path,
+                    value_type_name,
+                    _node_output_cache_value_preview(value),
+                )
+                return None
+            canonical_items.append(canonical_item)
+        canonical_items.sort(
+            key=lambda item: json.dumps(
+                item,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return {"kind": "frozenset", "items": canonical_items}
+    _emit_cloud_info(
+        "Node output cache canonicalization path=%s result=unhashable reason=unsupported-type type=%s value=%s",
+        path,
+        value_type_name,
+        _node_output_cache_value_preview(value),
+    )
+    return None
+
+
+def _node_output_cache_key(signature: Any) -> str | None:
+    """Return the persisted Modal Dict key for one ComfyUI cache signature."""
+    canonical_signature = _canonicalize_node_output_cache_key_part(signature)
+    if canonical_signature is None:
+        return None
+    signature_payload = json.dumps(
+        canonical_signature,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature_digest = hashlib.sha256(signature_payload).hexdigest()
+    return f"{_NODE_OUTPUT_CACHE_KEY_PREFIX}{signature_digest}"
+
+
+async def _node_output_cache_key_from_key_set_async(
+    cache_key_set: Any,
+    node_id: str,
+) -> str | None:
+    """Return the persisted Modal Dict key for one live ComfyUI cache-key-set node."""
+    return _node_output_cache_key(
+        await _build_node_output_cache_signature_from_key_set_async(
+            cache_key_set,
+            node_id,
+        )
+    )
+
+
+def _node_output_cache_key_from_key_set_sync(
+    cache_key_set: Any,
+    node_id: str,
+) -> str | None:
+    """Return the persisted Modal Dict key for one executed ComfyUI cache-key-set node."""
+    signature = _build_node_output_cache_signature_from_key_set_sync(cache_key_set, node_id)
+    if signature is None:
+        return None
+    return _node_output_cache_key(signature)
+
+
+def _estimate_node_output_cache_value_size_bytes(
+    value: Any,
+    *,
+    byte_limit: int,
+) -> int | None:
+    """Return a best-effort raw-size estimate for one transport-safe value."""
+    if byte_limit < 0:
+        return None
+    if value is None or isinstance(value, bool):
+        return 1
+    if isinstance(value, int):
+        return 8
+    if isinstance(value, float):
+        return 8
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, bytes):
+        return len(value)
+
+    try:
+        import torch
+    except ModuleNotFoundError:
+        torch = None
+
+    if torch is not None and isinstance(value, torch.Tensor):
+        return int(value.numel()) * int(value.element_size())
+
+    if isinstance(value, tuple | list):
+        total_size = 0
+        for item in value:
+            item_size = _estimate_node_output_cache_value_size_bytes(item, byte_limit=byte_limit)
+            if item_size is None:
+                return None
+            total_size += item_size
+            if total_size > byte_limit:
+                return total_size
+        return total_size
+
+    if isinstance(value, dict):
+        total_size = 0
+        for key, item in value.items():
+            total_size += len(str(key).encode("utf-8"))
+            if total_size > byte_limit:
+                return total_size
+            item_size = _estimate_node_output_cache_value_size_bytes(item, byte_limit=byte_limit)
+            if item_size is None:
+                return None
+            total_size += item_size
+            if total_size > byte_limit:
+                return total_size
+        return total_size
+
+    return None
+
+
+def _serialize_node_output_cache_entry(
+    cache_entry: Any,
+    *,
+    max_bytes: int,
+) -> dict[str, Any] | None:
+    """Return a persisted node-cache record when the outputs are safe and small enough."""
+    if max_bytes <= 0:
+        return None
+
+    outputs_size = _estimate_node_output_cache_value_size_bytes(
+        list(getattr(cache_entry, "outputs", [])),
+        byte_limit=max_bytes,
+    )
+    if outputs_size is None or outputs_size > max_bytes:
+        return None
+
+    try:
+        serialized_outputs = serialize_node_outputs(tuple(getattr(cache_entry, "outputs", [])))
+    except TypeError:
+        return None
+
+    ui_payload: Any | None = None
+    ui_value = getattr(cache_entry, "ui", None)
+    if ui_value is not None:
+        ui_size = _estimate_node_output_cache_value_size_bytes(ui_value, byte_limit=max_bytes)
+        if ui_size is not None and ui_size <= max_bytes:
+            try:
+                ui_payload = serialize_value(ui_value)
+            except TypeError:
+                ui_payload = None
+
+    return {
+        "version": _NODE_OUTPUT_CACHE_RECORD_VERSION,
+        "outputs_zlib": zlib.compress(serialized_outputs),
+        "outputs_size_bytes": outputs_size,
+        "ui": ui_payload,
+    }
+
+
+def _deserialize_node_output_cache_entry(
+    execution: Any,
+    record: Any,
+) -> Any | None:
+    """Return a ComfyUI CacheEntry reconstructed from one persisted Modal Dict record."""
+    if not isinstance(record, dict):
+        return None
+    if int(record.get("version", -1)) != _NODE_OUTPUT_CACHE_RECORD_VERSION:
+        return None
+    compressed_outputs = record.get("outputs_zlib")
+    if not isinstance(compressed_outputs, (bytes, bytearray)):
+        return None
+
+    try:
+        outputs = list(deserialize_node_outputs(zlib.decompress(bytes(compressed_outputs))))
+    except (TypeError, ValueError, zlib.error):
+        return None
+
+    ui_payload = record.get("ui")
+    try:
+        ui_value = deserialize_value(ui_payload) if ui_payload is not None else None
+    except TypeError:
+        ui_value = None
+    return execution.CacheEntry(ui=ui_value, outputs=outputs)
+
+
+async def _restore_persisted_node_output_cache_entries(
+    execution: Any,
+    executor: Any,
+    *,
+    prompt_id: str,
+    prompt: dict[str, Any],
+    cache_store: Any,
+    restored_cache_keys_by_node_id: dict[str, str] | None = None,
+) -> list[str]:
+    """Hydrate PromptExecutor output-cache misses from the shared Modal Dict."""
+    outputs_cache = executor.caches.outputs
+    dynamic_prompt = execution.DynamicPrompt(prompt)
+    is_changed_cache = execution.IsChangedCache(prompt_id, dynamic_prompt, outputs_cache)
+    await outputs_cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
+    outputs_cache.clean_unused()
+
+    return await _restore_persisted_node_output_cache_entries_into_prepared_cache(
+        execution,
+        outputs_cache,
+        prompt=prompt,
+        cache_store=cache_store,
+        restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
+    )
+
+
+async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
+    execution: Any,
+    outputs_cache: Any,
+    *,
+    prompt: dict[str, Any],
+    cache_store: Any,
+    restored_cache_keys_by_node_id: dict[str, str] | None = None,
+) -> list[str]:
+    """Hydrate one already-prepared PromptExecutor outputs cache from the shared Modal Dict."""
+    restored_node_ids: list[str] = []
+    pending_lookup_tasks: list[asyncio.Task[_NodeOutputCacheLookupResult]] = []
+
+    async def lookup_node(node_id: str) -> _NodeOutputCacheLookupResult:
+        """Resolve one distributed cache candidate without mutating the live outputs cache."""
+        cache_key = await _node_output_cache_key_from_key_set_async(outputs_cache.cache_key_set, node_id)
+        if cache_key is None:
+            return _NodeOutputCacheLookupResult(
+                node_id=node_id,
+                cache_key=None,
+                raw_record=None,
+                cache_entry=None,
+            )
+        raw_record = await _node_output_cache_store_get(cache_store, cache_key)
+        return _NodeOutputCacheLookupResult(
+            node_id=node_id,
+            cache_key=cache_key,
+            raw_record=raw_record,
+            cache_entry=_deserialize_node_output_cache_entry(execution, raw_record),
+        )
+
+    for node_id in prompt:
+        if outputs_cache.get(node_id) is not None:
+            _emit_cloud_info(
+                "Node output cache lookup node=%s result=local-hit",
+                node_id,
+            )
+            continue
+        pending_lookup_tasks.append(asyncio.create_task(lookup_node(str(node_id))))
+
+    if not pending_lookup_tasks:
+        return restored_node_ids
+
+    for lookup_result in await asyncio.gather(*pending_lookup_tasks):
+        node_id = lookup_result.node_id
+        cache_key = lookup_result.cache_key
+        if cache_key is None:
+            _emit_cloud_info(
+                "Node output cache lookup node=%s key_prefix=%s result=skip reason=key-unhashable",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
+            continue
+        raw_record = lookup_result.raw_record
+        cache_entry = lookup_result.cache_entry
+        if cache_entry is None:
+            result = "miss"
+            if raw_record is not None:
+                result = "miss-invalid"
+            _emit_cloud_info(
+                "Node output cache lookup node=%s key_prefix=%s result=%s",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+                result,
+            )
+            continue
+        outputs_cache.set(node_id, cache_entry)
+        _emit_cloud_info(
+            "Node output cache lookup node=%s key_prefix=%s result=hit",
+            node_id,
+            _node_output_cache_key_preview(cache_key),
+        )
+        if restored_cache_keys_by_node_id is not None:
+            restored_cache_keys_by_node_id[str(node_id)] = cache_key
+        restored_node_ids.append(str(node_id))
+    return restored_node_ids
+
+
+def _install_prompt_executor_persisted_cache_restore(
+    execution: Any,
+    executor: Any,
+    *,
+    component_id: str,
+    prompt: dict[str, Any],
+    cache_store: Any,
+) -> _PersistedNodeCacheRestoreState:
+    """Patch one executor so persisted-cache restore runs after its live `set_prompt()` call."""
+    restored_node_ids: list[str] = []
+    restored_cache_keys_by_node_id: dict[str, str] = {}
+    outputs_cache = executor.caches.outputs
+    original_set_prompt = outputs_cache.set_prompt
+
+    async def wrapped_set_prompt(dynprompt: Any, node_ids: Any, is_changed_cache: Any) -> None:
+        await original_set_prompt(dynprompt, node_ids, is_changed_cache)
+        with _timed_phase("restore_persisted_node_cache", component=component_id):
+            restored_cache_keys_by_node_id.clear()
+            restored_node_ids[:] = await _restore_persisted_node_output_cache_entries_into_prepared_cache(
+                execution,
+                outputs_cache,
+                prompt=prompt,
+                cache_store=cache_store,
+                restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
+            )
+
+    outputs_cache.set_prompt = wrapped_set_prompt
+
+    def restore_original_method() -> None:
+        outputs_cache.set_prompt = original_set_prompt
+
+    return _PersistedNodeCacheRestoreState(
+        restored_node_ids=restored_node_ids,
+        restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
+        restore_original_method=restore_original_method,
+    )
+
+
+def _persist_node_output_cache_entries(
+    executor: Any,
+    *,
+    prompt: dict[str, Any],
+    cache_store: Any,
+    restored_cache_keys_by_node_id: dict[str, str] | None = None,
+) -> list[str]:
+    """Persist eligible PromptExecutor cache entries into the shared Modal Dict."""
+    max_bytes = get_settings().node_output_cache_max_bytes
+    if max_bytes <= 0:
+        return []
+
+    outputs_cache = executor.caches.outputs
+    cache_key_set = getattr(outputs_cache, "cache_key_set", None)
+    if cache_key_set is None:
+        return []
+
+    persisted_node_ids: list[str] = []
+    for node_id in prompt:
+        cache_entry = outputs_cache.get(node_id)
+        if cache_entry is None:
+            _emit_cloud_info(
+                "Node output cache write node=%s result=skip reason=no-local-cache-entry",
+                node_id,
+            )
+            continue
+        cache_key = _node_output_cache_key_from_key_set_sync(cache_key_set, str(node_id))
+        if cache_key is None:
+            _emit_cloud_info(
+                "Node output cache write node=%s key_prefix=%s result=skip reason=key-unhashable",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
+            continue
+        restored_cache_key = None
+        if restored_cache_keys_by_node_id is not None:
+            restored_cache_key = restored_cache_keys_by_node_id.get(str(node_id))
+        if restored_cache_key == cache_key:
+            _emit_cloud_info(
+                "Node output cache write node=%s key_prefix=%s result=skip reason=restored-hit",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
+            continue
+        record = _serialize_node_output_cache_entry(cache_entry, max_bytes=max_bytes)
+        if record is None:
+            _emit_cloud_info(
+                "Node output cache write node=%s key_prefix=%s result=skip reason=ineligible-or-oversize",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+            )
+            continue
+        cache_store[cache_key] = record
+        _emit_cloud_info(
+            "Node output cache write node=%s key_prefix=%s result=write outputs_size_bytes=%s",
+            node_id,
+            _node_output_cache_key_preview(cache_key),
+            record.get("outputs_size_bytes"),
+        )
+        persisted_node_ids.append(str(node_id))
+    return persisted_node_ids
+
+
 def _invoke_original_node(
     node_class: type[Any],
     node_data: dict[str, Any],
@@ -1248,10 +2179,24 @@ def _apply_boundary_inputs(
         if proxy_input_name not in hydrated_inputs:
             raise KeyError(f"Missing hydrated boundary input {proxy_input_name!r}.")
         value = hydrated_inputs[proxy_input_name]
+        io_type = (
+            str(boundary_input["io_type"])
+            if boundary_input.get("io_type") is not None
+            else None
+        )
         for target in boundary_input.get("targets", []):
             node_id = str(target["node_id"])
             input_name = str(target["input_name"])
-            prompt[node_id]["inputs"][input_name] = _normalize_prompt_input_value(value)
+            prompt_node = prompt[node_id]
+            prompt_node["inputs"][input_name] = _normalize_prompt_input_value(
+                value,
+                io_type=io_type,
+            )
+            source_signature = boundary_input.get("source_signature")
+            if isinstance(source_signature, str) and source_signature:
+                boundary_signatures = prompt_node.setdefault(_BOUNDARY_INPUT_SIGNATURES_KEY, {})
+                if isinstance(boundary_signatures, dict):
+                    boundary_signatures[input_name] = source_signature
 
 
 def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
@@ -1346,12 +2291,98 @@ def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
     return input_type_map
 
 
-def _validate_prompt_input_shapes(
+def _coerce_primitive_prompt_input_value(
+    *,
+    node_id: str,
+    class_type: str,
+    input_name: str,
+    declared_type: str,
+    input_value: Any,
+) -> Any:
+    """Coerce one primitive prompt literal using ComfyUI's `validate_inputs` semantics."""
+    literal_value = (
+        input_value.get("__value__")
+        if isinstance(input_value, dict) and "__value__" in input_value
+        else input_value
+    )
+    if isinstance(literal_value, list):
+        return input_value
+
+    try:
+        if declared_type == "INT":
+            return int(literal_value)
+        if declared_type == "FLOAT":
+            return float(literal_value)
+        if declared_type == "STRING":
+            return str(literal_value)
+        if declared_type == "BOOLEAN":
+            return bool(literal_value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise RemoteSubgraphExecutionError(
+            "Remote subgraph input could not be coerced to the declared primitive socket type."
+            f" node_id={node_id!r} node_type={class_type!r}"
+            f" input_name={input_name!r} declared_type={declared_type!r}"
+            f" received_value={literal_value!r}"
+        ) from exc
+
+    return input_value
+
+
+def _coerce_prompt_primitive_input_values(
     prompt: dict[str, Any],
     node_mapping: dict[str, type[Any]],
 ) -> None:
+    """Mutate prompt literals in-place to match ComfyUI's primitive widget coercion."""
+    for node_id, prompt_node in sorted(prompt.items()):
+        class_type = str(prompt_node.get("class_type"))
+        node_class = node_mapping.get(class_type)
+        if node_class is None:
+            continue
+        input_type_map = _node_input_type_map(node_class)
+        if not input_type_map:
+            continue
+        inputs = prompt_node.get("inputs") or {}
+        for input_name, input_value in list(inputs.items()):
+            declared_type = input_type_map.get(str(input_name))
+            if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
+                continue
+            if (
+                isinstance(input_value, list)
+                and len(input_value) == 2
+                and isinstance(input_value[0], str)
+            ):
+                continue
+            coerced_value = _coerce_primitive_prompt_input_value(
+                node_id=str(node_id),
+                class_type=class_type,
+                input_name=str(input_name),
+                declared_type=declared_type,
+                input_value=input_value,
+            )
+            if coerced_value is not input_value:
+                logger.debug(
+                    "Coerced remote primitive input %s.%s from %r to %r for type %s.",
+                    node_id,
+                    input_name,
+                    input_value,
+                    coerced_value,
+                    declared_type,
+                )
+                inputs[input_name] = coerced_value
+
+
+def _validate_prompt_input_shapes(
+    prompt: dict[str, Any],
+    node_mapping: dict[str, type[Any]],
+    boundary_input_specs: list[dict[str, Any]] | None = None,
+) -> None:
     """Reject prompt inputs that still look invalid for primitive widget sockets."""
-    primitive_types = {"INT", "FLOAT", "BOOLEAN", "STRING"}
+    boundary_targets = {
+        (str(target.get("node_id")), str(target.get("input_name")))
+        for boundary_input in (boundary_input_specs or [])
+        for target in boundary_input.get("targets", [])
+        if target.get("node_id") is not None and target.get("input_name") is not None
+    }
     for node_id, prompt_node in sorted(prompt.items()):
         class_type = str(prompt_node.get("class_type"))
         node_class = node_mapping.get(class_type)
@@ -1362,13 +2393,15 @@ def _validate_prompt_input_shapes(
             continue
         for input_name, input_value in (prompt_node.get("inputs") or {}).items():
             declared_type = input_type_map.get(str(input_name))
-            if declared_type not in primitive_types:
+            if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
                 continue
             if (
                 isinstance(input_value, list)
                 and len(input_value) == 2
                 and isinstance(input_value[0], str)
             ):
+                continue
+            if (str(node_id), str(input_name)) in boundary_targets:
                 continue
             literal_value = (
                 input_value.get("__value__")
@@ -1453,9 +2486,30 @@ def _normalize_link_output_index(value: Any) -> Any:
     return value
 
 
-def _normalize_prompt_input_value(value: Any) -> Any:
-    """Unwrap transport-added singleton lists around scalar prompt input values."""
-    while isinstance(value, list) and len(value) == 1:
+def _unwrap_wrapped_prompt_link(value: Any) -> Any:
+    """Collapse nested singleton wrappers around one serialized prompt link when present."""
+    candidate = value
+    while isinstance(candidate, list) and len(candidate) == 1:
+        candidate = candidate[0]
+    if _is_link(candidate):
+        return [candidate[0], _normalize_link_output_index(candidate[1])]
+    return value
+
+
+def _normalize_prompt_input_value(value: Any, io_type: str | None = None) -> Any:
+    """Unwrap transport-added singleton wrappers only for scalar-like prompt input values."""
+    wrapped_link = _unwrap_wrapped_prompt_link(value)
+    if wrapped_link is not value:
+        return wrapped_link
+    while (
+        isinstance(value, list)
+        and len(value) == 1
+        and (
+            io_type in _PRIMITIVE_WIDGET_INPUT_TYPES
+            or value[0] is None
+            or isinstance(value[0], bool | int | float | str)
+        )
+    ):
         value = value[0]
     if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
         return [value[0], _normalize_link_output_index(value[1])]
@@ -1588,18 +2642,41 @@ def _execute_subgraph_prompt(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
+    session_handle = _payload_remote_session_handle(normalized_payload)
+    resolved_inputs = _resolve_remote_session_inputs(
+        dict(hydrated_inputs),
+        component_id=component_id,
+        target_session_handle=session_handle,
+        custom_nodes_root=custom_nodes_root,
+        cancellation_event=cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key=interrupt_flag_key,
+    )
+    if session_handle is not None:
+        logger.info(
+            "Executing cloud subgraph component=%s with remote_session session_id=%s prompt_id=%s owner_component_id=%s.",
+            component_id,
+            session_handle.session_id,
+            session_handle.prompt_id,
+            session_handle.owner_component_id,
+        )
     with _timed_phase("prepare_subgraph_prompt", component=component_id):
         prompt = _rewrite_modal_asset_references(copy.deepcopy(normalized_payload["subgraph_prompt"]))
         _apply_boundary_inputs(
             prompt=prompt,
             boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
-            hydrated_inputs=hydrated_inputs,
+            hydrated_inputs=resolved_inputs,
         )
     with _timed_phase("load_execution_module", component=component_id):
         execution = _load_execution_module()
         cache_type, cache_args = _prompt_executor_cache_config(execution)
         resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
-    _validate_prompt_input_shapes(prompt, resolved_node_mapping)
+    _coerce_prompt_primitive_input_values(prompt, resolved_node_mapping)
+    _validate_prompt_input_shapes(
+        prompt,
+        resolved_node_mapping,
+        list(normalized_payload.get("boundary_inputs", [])),
+    )
 
     with (
         _temporary_node_mapping(None),
@@ -1626,24 +2703,51 @@ def _execute_subgraph_prompt(
                 cache_args=cache_args,
                 custom_nodes_root=custom_nodes_root,
             )
-        prompt_server.configure_boundary_output_stream(
-            boundary_outputs=list(normalized_payload.get("boundary_outputs", [])),
-            lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
-        )
+        cache_store = _node_output_cache_store()
         with executor_state.lock:
             _reset_prompt_executor_request_state(executor_state.executor, prompt_server)
-            with _timed_phase(
-                "prompt_executor_execute",
-                component=component_id,
-                execute_nodes=list(normalized_payload.get("execute_node_ids", [])),
-            ):
-                executor_state.executor.execute(
-                    prompt=prompt,
-                    prompt_id=component_id,
-                    extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
-                    execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
+            restore_state: _PersistedNodeCacheRestoreState | None = None
+            if cache_store is not None and get_settings().node_output_cache_max_bytes > 0:
+                restore_state = (
+                    _install_prompt_executor_persisted_cache_restore(
+                        execution,
+                        executor_state.executor,
+                        component_id=component_id,
+                        prompt=prompt,
+                        cache_store=cache_store,
+                    )
                 )
+            prompt_server.configure_boundary_output_stream(
+                boundary_outputs=list(normalized_payload.get("boundary_outputs", [])),
+                lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
+            )
+            try:
+                with _timed_phase(
+                    "prompt_executor_execute",
+                    component=component_id,
+                    execute_nodes=list(normalized_payload.get("execute_node_ids", [])),
+                ):
+                    executor_state.executor.execute(
+                        prompt=prompt,
+                        prompt_id=str(
+                            payload.get("prompt_id")
+                            or component_id
+                        ),
+                        extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
+                        execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
+                    )
+            finally:
+                if restore_state is not None:
+                    restore_state.restore_original_method()
             executor = executor_state.executor
+            restored_node_ids = restore_state.restored_node_ids if restore_state is not None else []
+            if restored_node_ids:
+                _emit_cloud_info(
+                    "Restored %d persisted node cache entries for component=%s: %s",
+                    len(restored_node_ids),
+                    component_id,
+                    restored_node_ids,
+                )
         if not executor.success:
             _log_prompt_executor_failure_details(
                 component_id=component_id,
@@ -1652,6 +2756,26 @@ def _execute_subgraph_prompt(
                 executor=executor,
             )
             raise RemoteSubgraphExecutionError(_extract_prompt_executor_error(executor))
+
+        if cache_store is not None and get_settings().node_output_cache_max_bytes > 0:
+            with _timed_phase("persist_node_cache", component=component_id):
+                persisted_node_ids = _persist_node_output_cache_entries(
+                    executor,
+                    prompt=prompt,
+                    cache_store=cache_store,
+                    restored_cache_keys_by_node_id=(
+                        restore_state.restored_cache_keys_by_node_id
+                        if restore_state is not None
+                        else None
+                    ),
+                )
+            if persisted_node_ids:
+                _emit_cloud_info(
+                    "Persisted %d node cache entries for component=%s: %s",
+                    len(persisted_node_ids),
+                    component_id,
+                    persisted_node_ids,
+                )
 
         outputs: list[Any] = []
         with _timed_phase(
@@ -1671,12 +2795,35 @@ def _execute_subgraph_prompt(
                     raise RemoteSubgraphExecutionError(
                         f"Remote subgraph output index {output_index} is missing for node {node_id}."
                     )
-                outputs.append(
-                    _collapse_cache_slot(
-                        slot_values=cache_entry.outputs[output_index],
-                        is_list=bool(boundary_output.get("is_list", False)),
-                    )
+                output_value = _collapse_cache_slot(
+                    slot_values=cache_entry.outputs[output_index],
+                    is_list=bool(boundary_output.get("is_list", False)),
                 )
+                if bool(boundary_output.get("session_output")):
+                    if session_handle is None:
+                        raise RemoteSessionStateError(
+                            "Session-backed boundary outputs require payload.remote_session."
+                        )
+                    live_ref = _REMOTE_SESSION_STORE.put_output(
+                        session_handle,
+                        node_id=node_id,
+                        output_index=output_index,
+                        value=output_value,
+                    )
+                    bridge_record = _build_remote_session_bridge_record(
+                        payload=normalized_payload,
+                        hydrated_inputs=hydrated_inputs,
+                        node_id=node_id,
+                        output_index=output_index,
+                    )
+                    _store_remote_session_bridge_record(bridge_record)
+                    output_value = RemoteSessionBridgeRef(
+                        bridge_key=bridge_record.bridge_key,
+                        node_id=node_id,
+                        output_index=output_index,
+                        session_id=live_ref.session_id,
+                    ).to_payload()
+                outputs.append(output_value)
         return tuple(outputs)
 
 
@@ -1690,26 +2837,343 @@ def execute_subgraph_locally(
 ) -> bytes:
     """Execute a rewritten remote component in-process and return serialized outputs."""
     component_id = str(payload.get("component_id", "modal-subgraph"))
+    session_handle = _payload_remote_session_handle(payload)
     with _timed_phase("execute_subgraph_locally", component=component_id):
         custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
         _ensure_comfy_runtime_initialized(custom_nodes_root)
         with _timed_phase("deserialize_boundary_inputs", component=component_id):
             hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-        with _timed_phase("subgraph_worker_roundtrip", component=component_id):
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    _execute_subgraph_prompt,
-                    payload,
-                    hydrated_inputs,
-                    custom_nodes_root,
-                    status_callback,
-                    cancellation_event,
-                    interrupt_store,
-                    interrupt_flag_key,
+        logger.info(
+            "Executing cloud-local subgraph component=%s hydrated_inputs=%d session_id=%s clear_remote_session=%s.",
+            component_id,
+            len(hydrated_inputs),
+            session_handle.session_id if session_handle is not None else None,
+            bool(payload.get("clear_remote_session")),
+        )
+        try:
+            with _timed_phase("subgraph_worker_roundtrip", component=component_id):
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        _execute_subgraph_prompt,
+                        payload,
+                        hydrated_inputs,
+                        custom_nodes_root,
+                        status_callback,
+                        cancellation_event,
+                        interrupt_store,
+                        interrupt_flag_key,
+                    )
+                    outputs = future.result()
+        finally:
+            if bool(payload.get("clear_remote_session")) and session_handle is not None:
+                logger.info(
+                    "Clearing remote session after cloud component=%s session_id=%s.",
+                    component_id,
+                    session_handle.session_id,
                 )
-                outputs = future.result()
+                _REMOTE_SESSION_STORE.clear_session(session_handle)
         with _timed_phase("serialize_boundary_outputs", component=component_id):
             return serialize_node_outputs(outputs)
+
+
+def _mapped_phase_definition(payload: dict[str, Any], phase_key: str) -> dict[str, Any] | None:
+    """Return one explicit mapped phase definition when queue-time planning provided it."""
+    phase_payload = payload.get(phase_key)
+    if isinstance(phase_payload, dict):
+        return phase_payload
+    return None
+
+
+def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the payload fields shared by every explicit mapped phase."""
+    shared_fields = {
+        "prompt_id": payload.get("prompt_id"),
+        "extra_data": copy.deepcopy(payload.get("extra_data") or {}),
+        "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
+        "volume_reload_marker": payload.get("volume_reload_marker"),
+        "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
+        "terminate_container_on_error": bool(payload.get("terminate_container_on_error", True)),
+        "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
+    }
+    remote_session = payload.get("remote_session")
+    if remote_session is not None:
+        shared_fields["remote_session"] = copy.deepcopy(remote_session)
+    if bool(payload.get("clear_remote_session")):
+        shared_fields["clear_remote_session"] = True
+    return shared_fields
+
+
+def _build_phase_subgraph_payload(
+    payload: dict[str, Any],
+    phase_key: str,
+    component_id: str,
+) -> dict[str, Any]:
+    """Return one explicit static or mapped subgraph payload."""
+    phase_definition = _mapped_phase_definition(payload, phase_key)
+    if phase_definition is None:
+        raise KeyError(f"Mapped payload is missing phase definition {phase_key!r}.")
+
+    return {
+        "payload_kind": "subgraph",
+        "component_id": component_id,
+        **_shared_subgraph_payload_fields(payload),
+        "component_node_ids": [
+            str(node_id)
+            for node_id in phase_definition.get("component_node_ids", [])
+            if str(node_id)
+        ],
+        "subgraph_prompt": copy.deepcopy(phase_definition.get("subgraph_prompt", {})),
+        "boundary_inputs": copy.deepcopy(phase_definition.get("boundary_inputs", [])),
+        "boundary_outputs": copy.deepcopy(phase_definition.get("boundary_outputs", [])),
+        "execute_node_ids": [
+            str(node_id)
+            for node_id in phase_definition.get("execute_node_ids", [])
+            if str(node_id)
+        ],
+    }
+
+
+def _split_phase_outputs(
+    phase_outputs: tuple[Any, ...],
+    boundary_outputs: list[dict[str, Any]],
+    internal_output_names: set[str],
+) -> tuple[dict[str, Any], tuple[Any, ...]]:
+    """Split one phase result tuple into bridge values and external outputs."""
+    internal_outputs: dict[str, Any] = {}
+    external_outputs: list[Any] = []
+    for boundary_output, output_value in zip(boundary_outputs, phase_outputs, strict=True):
+        output_name = str(boundary_output.get("proxy_output_name") or "")
+        if output_name in internal_output_names:
+            internal_outputs[output_name] = output_value
+            continue
+        external_outputs.append(output_value)
+    return internal_outputs, tuple(external_outputs)
+
+
+def _aggregate_mapped_phase_outputs(
+    per_item_outputs: list[tuple[Any, ...]],
+    payload: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Join ordered mapped-phase outputs back into one proxy result tuple."""
+    if not per_item_outputs:
+        raise ValueError("Mapped execution produced no per-item outputs to aggregate.")
+
+    output_count = len(per_item_outputs[0])
+    if any(len(item_outputs) != output_count for item_outputs in per_item_outputs):
+        raise RemoteSubgraphExecutionError("Mapped remote execution produced inconsistent output arity.")
+
+    aggregated_outputs: list[Any] = []
+    boundary_outputs = list(payload.get("boundary_outputs", []))
+    for output_index in range(output_count):
+        boundary_output = boundary_outputs[output_index] if output_index < len(boundary_outputs) else {}
+        aggregated_outputs.append(
+            _merge_static_or_mapped_values(
+                [item_outputs[output_index] for item_outputs in per_item_outputs],
+                io_type=str(boundary_output.get("io_type", "*")),
+                is_list=bool(boundary_output.get("is_list", False)),
+            )
+        )
+    return tuple(aggregated_outputs)
+
+
+def _merge_static_or_mapped_values(
+    values: list[Any],
+    *,
+    io_type: str,
+    is_list: bool,
+) -> Any:
+    """Join mapped per-item outputs using the shared transport serializer rules."""
+    from serialization import join_mapped_values
+
+    return join_mapped_values(values, io_type=io_type, is_list=is_list)
+
+
+def _merge_static_and_mapped_outputs(
+    *,
+    static_outputs: tuple[Any, ...],
+    mapped_outputs: tuple[Any, ...],
+    payload: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Reassemble one mapped component's static and mapped outputs in proxy order."""
+    combined_outputs: list[Any] = []
+    static_output_index = 0
+    mapped_output_index = 0
+    for boundary_output in payload.get("boundary_outputs", []):
+        if bool(boundary_output.get("mapped_output")):
+            if mapped_output_index >= len(mapped_outputs):
+                raise RemoteSubgraphExecutionError(
+                    "Mapped remote execution returned fewer mapped outputs than expected."
+                )
+            combined_outputs.append(mapped_outputs[mapped_output_index])
+            mapped_output_index += 1
+            continue
+        if static_output_index >= len(static_outputs):
+            raise RemoteSubgraphExecutionError(
+                "Mapped remote execution returned fewer static outputs than expected."
+            )
+        combined_outputs.append(static_outputs[static_output_index])
+        static_output_index += 1
+
+    if static_output_index != len(static_outputs) or mapped_output_index != len(mapped_outputs):
+        raise RemoteSubgraphExecutionError(
+            "Mapped remote execution produced extra outputs that did not match the declared boundary outputs."
+        )
+    return tuple(combined_outputs)
+
+
+def _execute_mapped_subgraph_payload(
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    custom_nodes_root: Path | None,
+    status_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
+) -> tuple[Any, ...]:
+    """Execute one mapped payload inside a single remote runtime process."""
+    mapped_input = payload.get("mapped_input") or {}
+    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
+    if not mapped_input_name:
+        raise RemoteSubgraphExecutionError("Mapped remote payloads must define mapped_input.proxy_input_name.")
+    if mapped_input_name not in hydrated_inputs:
+        raise KeyError(f"Mapped remote payload input {mapped_input_name!r} was not provided.")
+
+    from serialization import split_mapped_value
+
+    mapped_items = split_mapped_value(
+        hydrated_inputs[mapped_input_name],
+        str(mapped_input.get("io_type", "*")),
+    )
+    if not mapped_items:
+        raise ValueError("Mapped remote execution requires at least one input item.")
+
+    broadcast_inputs = dict(hydrated_inputs)
+    broadcast_inputs.pop(mapped_input_name, None)
+    static_to_mapped_boundaries = list(payload.get("static_to_mapped_boundaries", []))
+    bridge_output_names = {
+        str(boundary_spec.get("proxy_name") or "")
+        for boundary_spec in static_to_mapped_boundaries
+        if str(boundary_spec.get("proxy_name") or "")
+    }
+
+    static_outputs: tuple[Any, ...] = ()
+    if payload.get("static_phase") is not None:
+        static_phase_payload = _build_phase_subgraph_payload(
+            payload,
+            "static_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::static",
+        )
+        if static_phase_payload.get("execute_node_ids"):
+            static_phase_outputs = _execute_subgraph_prompt(
+                static_phase_payload,
+                dict(broadcast_inputs),
+                custom_nodes_root,
+                status_callback=status_callback,
+                cancellation_event=cancellation_event,
+                interrupt_store=interrupt_store,
+                interrupt_flag_key=interrupt_flag_key,
+            )
+            bridge_inputs, static_outputs = _split_phase_outputs(
+                static_phase_outputs,
+                list(static_phase_payload.get("boundary_outputs", [])),
+                bridge_output_names,
+            )
+            broadcast_inputs.update(bridge_inputs)
+
+    if status_callback is not None:
+        status_callback(
+            {
+                "event_type": "node_progress",
+                "node_id": str(payload.get("component_id") or "modal-subgraph"),
+                "display_node_id": str(payload.get("component_id") or "modal-subgraph"),
+                "value": 0.0,
+                "max": float(len(mapped_items)),
+                "aggregate_only": True,
+            }
+        )
+
+    per_item_outputs: list[tuple[Any, ...]] = []
+    for item_index, item_value in enumerate(mapped_items):
+        last_lane_node_id: str | None = None
+        lane_id = str(payload.get("mapped_progress_lane_id") or item_index)
+
+        def publish_item_status(progress_state: dict[str, Any]) -> None:
+            """Attach mapped-lane metadata to one per-item progress event."""
+            nonlocal last_lane_node_id
+            if status_callback is None:
+                return
+            event_type = str(progress_state.get("event_type", ""))
+            if event_type == "node_progress":
+                reported_node_id = progress_state.get("real_node_id") or progress_state.get("node_id")
+                if reported_node_id is not None:
+                    last_lane_node_id = str(reported_node_id)
+                status_callback(
+                    {
+                        **progress_state,
+                        "lane_id": lane_id,
+                        "item_index": item_index,
+                    }
+                )
+                return
+            if event_type in {"executed", "preview", "boundary_output"}:
+                status_callback({**progress_state, "item_index": item_index})
+
+        item_payload = _build_phase_subgraph_payload(
+            payload,
+            "mapped_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}",
+        )
+        item_inputs = dict(broadcast_inputs)
+        item_inputs[mapped_input_name] = item_value
+        per_item_outputs.append(
+            _execute_subgraph_prompt(
+                item_payload,
+                item_inputs,
+                custom_nodes_root,
+                status_callback=publish_item_status,
+                cancellation_event=cancellation_event,
+                interrupt_store=interrupt_store,
+                interrupt_flag_key=interrupt_flag_key,
+            )
+        )
+        if status_callback is not None:
+            status_callback(
+                {
+                    "event_type": "node_progress",
+                    "node_id": last_lane_node_id or str(payload.get("component_id") or "modal-subgraph"),
+                    "display_node_id": last_lane_node_id or str(payload.get("component_id") or "modal-subgraph"),
+                    "value": 0.0,
+                    "max": 1.0,
+                    "lane_id": lane_id,
+                    "item_index": item_index,
+                    "clear": True,
+                }
+            )
+            status_callback(
+                {
+                    "event_type": "node_progress",
+                    "node_id": str(payload.get("component_id") or "modal-subgraph"),
+                    "display_node_id": str(payload.get("component_id") or "modal-subgraph"),
+                    "value": float(item_index + 1),
+                    "max": float(len(mapped_items)),
+                    "aggregate_only": True,
+                }
+            )
+
+    mapped_phase_payload = _build_phase_subgraph_payload(
+        payload,
+        "mapped_phase",
+        f"{payload.get('component_id', 'modal-subgraph')}::mapped",
+    )
+    mapped_outputs = _aggregate_mapped_phase_outputs(
+        per_item_outputs,
+        {"boundary_outputs": list(mapped_phase_payload.get("boundary_outputs", []))},
+    )
+    return _merge_static_and_mapped_outputs(
+        static_outputs=static_outputs,
+        mapped_outputs=mapped_outputs,
+        payload=payload,
+    )
 
 
 def _stream_remote_payload_events(
@@ -1721,6 +3185,7 @@ def _stream_remote_payload_events(
 ) -> Iterator[dict[str, Any]]:
     """Yield progress and result events for one remote payload execution."""
     event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+    task_id = os.getenv("MODAL_TASK_ID")
 
     def publish_status(progress_state: dict[str, Any]) -> None:
         """Queue a progress envelope for the remote caller."""
@@ -1729,7 +3194,22 @@ def _stream_remote_payload_events(
     def execute_payload() -> None:
         """Run the payload in a worker thread and enqueue the terminal outcome."""
         try:
-            if payload.get("payload_kind") == "subgraph":
+            if payload.get("payload_kind") == "mapped_subgraph":
+                custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
+                _ensure_comfy_runtime_initialized(custom_nodes_root)
+                hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+                outputs = serialize_node_outputs(
+                    _execute_mapped_subgraph_payload(
+                        payload,
+                        hydrated_inputs,
+                        custom_nodes_root,
+                        status_callback=publish_status,
+                        cancellation_event=cancellation_event,
+                        interrupt_store=interrupt_store,
+                        interrupt_flag_key=interrupt_flag_key,
+                    )
+                )
+            elif payload.get("payload_kind") == "subgraph":
                 execute_subgraph_kwargs: dict[str, Any] = {"status_callback": publish_status}
                 if "cancellation_event" in inspect.signature(execute_subgraph_locally).parameters:
                     execute_subgraph_kwargs["cancellation_event"] = cancellation_event
@@ -1763,6 +3243,8 @@ def _stream_remote_payload_events(
         name=f"modal-stream-{payload.get('component_id', 'payload')}",
         daemon=True,
     )
+    if task_id:
+        yield {"kind": "remote_logs", "task_id": task_id}
     worker_thread.start()
     try:
         while True:
@@ -2204,6 +3686,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         settings.interrupt_dict_name,
         create_if_missing=True,
     )
+    node_output_cache = modal.Dict.from_name(
+        settings.node_output_cache_dict_name,
+        create_if_missing=True,
+    )
+    session_bridge_cache = modal.Dict.from_name(
+        settings.session_bridge_dict_name,
+        create_if_missing=True,
+    )
     image = (
         modal.Image.debian_slim()
         .pip_install(*_comfyui_runtime_packages())
@@ -2234,20 +3724,27 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     @modal.concurrent(max_inputs=1)
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
+        session_affinity_key: str = modal.parameter(default="")
 
         @modal.enter(snap=True)
         def setup_snapshot_state(self) -> None:
             """Prepare snapshot-friendly runtime state before Modal captures memory."""
             with _timed_phase("remote_engine_setup_snapshot"):
                 _prewarm_snapshot_state(settings)
-                logger.info("RemoteEngine snapshot setup complete.")
+                logger.info(
+                    "RemoteEngine snapshot setup complete for session_affinity_key=%s.",
+                    self.session_affinity_key or None,
+                )
 
         @modal.enter(snap=False)
         def setup_restored_runtime(self) -> None:
             """Prepare request-serving runtime state after a fresh boot or snapshot restore."""
             with _timed_phase("remote_engine_setup_restored"):
                 _prewarm_restored_runtime()
-                logger.info("RemoteEngine restored-runtime setup complete.")
+                logger.info(
+                    "RemoteEngine restored-runtime setup complete for session_affinity_key=%s.",
+                    self.session_affinity_key or None,
+                )
 
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
@@ -2270,6 +3767,20 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                             )
                         else:
                             _emit_modal_volume_reload_skip(component_id, payload)
+                        if payload.get("payload_kind") == "mapped_subgraph":
+                            custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
+                            _ensure_comfy_runtime_initialized(custom_nodes_root)
+                            hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+                            return serialize_node_outputs(
+                                _execute_mapped_subgraph_payload(
+                                    payload,
+                                    hydrated_inputs,
+                                    custom_nodes_root,
+                                    cancellation_event=execution_control.cancellation_event,
+                                    interrupt_store=interrupt_flags,
+                                    interrupt_flag_key=execution_control.interrupt_flag_key,
+                                )
+                            )
                         if payload.get("payload_kind") == "subgraph":
                             return execute_subgraph_locally(
                                 payload,

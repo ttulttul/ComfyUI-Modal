@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import sys
 import threading
 import time
 import types
 from contextlib import nullcontext
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 import logging
 from typing import Any, Iterator
@@ -40,6 +41,72 @@ class _CloneableCacheValue:
     def clone(self) -> "_CloneableCacheValue":
         """Return a fresh object carrying the same value."""
         return _CloneableCacheValue(self.value)
+
+
+class _FakeSessionValueNode:
+    """Fake node that produces one remote-only STRING value."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "execute"
+
+    def execute(self) -> tuple[str]:
+        """Return a deterministic value that can be stored in session state."""
+        return ("shared-session-value",)
+
+
+class _FakeSessionEchoNode:
+    """Fake node that echoes a STRING input back to the caller."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "execute"
+
+    def execute(self, text: str) -> tuple[str]:
+        """Return the supplied input unchanged for session-ref resolution tests."""
+        return (text,)
+
+
+class _FakeRewriteRemoteModelNode:
+    """Fake rewrite-time node that produces a non-transportable MODEL output."""
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteRemoteSamplerNode:
+    """Fake rewrite-time node that produces a transportable LATENT output."""
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteLatentSourceNode:
+    """Fake local source used to feed LATENT values into remote proxies."""
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteModalMapInputNode:
+    """Fake rewrite-time Modal map marker node."""
+
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("value",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteLocalSinkNode:
+    """Fake local sink used to model downstream local work in rewrite tests."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    OUTPUT_IS_LIST = (False,)
 
 
 def test_dynamic_proxy_node_preserves_output_signature(
@@ -163,6 +230,222 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
         "payload_kind": "subgraph",
         "scalar_value": 3,
         "mapped_value": ["a", "b", "c"],
+    }
+
+
+def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
+    modal_executor_module: Any,
+) -> None:
+    """Cache-friendly proxy payloads should strip prompt_id from inputs and restore it when they execute."""
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {"OriginalNode": _FakeOriginalNode},
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    proxy_id = modal_executor_module.ensure_modal_proxy_node_registered(
+        original_class_type="OriginalNode",
+        original_class=_FakeOriginalNode,
+        nodes_module=fake_nodes_module,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_id]
+
+    payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-1",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "prompt_id": "prompt-1",
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+    )
+
+    class FakeClient:
+        """Test client that captures the rehydrated payload."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str, int]:
+            """Return values derived from the restored prompt id."""
+            return (str(payload.get("prompt_id")), len(kwargs))
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        result = asyncio.run(
+            proxy_class.execute(
+                original_node_data=payload,
+                unique_id="node-1",
+                value="payload",
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert "prompt_id" not in payload
+    assert result.result == ("prompt-1", 1)
+
+
+def test_register_cache_friendly_proxy_payload_strips_session_fields_and_rehydrates_them(
+    modal_executor_module: Any,
+) -> None:
+    """Session-backed proxy payloads should strip run-scoped fields from the local cache surface."""
+    payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-1",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "prompt_id": "prompt-1",
+            "remote_session": {
+                "session_id": "session-1",
+                "prompt_id": "prompt-1",
+                "owner_component_id": "component-1",
+            },
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+            "clear_remote_session": True,
+            "extra_data": {
+                "prompt_id": "prompt-1",
+                "create_time": 1234567890,
+                "modal": {"remote_node_ids": ["12"], "estimated_max_parallel_requests": 1},
+            },
+            "requires_volume_reload": True,
+            "volume_reload_marker": "marker-1",
+            "uploaded_volume_paths": ["/storage/assets/example.safetensors"],
+        },
+    )
+
+    assert "prompt_id" not in payload
+    assert "remote_session" not in payload
+    assert "clear_remote_session" not in payload
+    assert "extra_data" not in payload
+    assert "requires_volume_reload" not in payload
+    assert "volume_reload_marker" not in payload
+    assert "uploaded_volume_paths" not in payload
+    assert modal_executor_module._rehydrate_proxy_payload(payload, unique_id="node-1") == {
+        "payload_kind": "subgraph",
+        "component_id": "component-1",
+        "prompt_id": "prompt-1",
+        "remote_session": {
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "owner_component_id": "component-1",
+        },
+        "boundary_outputs": [],
+        "execute_node_ids": [],
+        "clear_remote_session": True,
+        "extra_data": {
+            "prompt_id": "prompt-1",
+            "create_time": 1234567890,
+            "modal": {"remote_node_ids": ["12"], "estimated_max_parallel_requests": 1},
+        },
+        "requires_volume_reload": True,
+        "volume_reload_marker": "marker-1",
+        "uploaded_volume_paths": ["/storage/assets/example.safetensors"],
+    }
+
+
+def test_cache_friendly_proxy_payload_rehydrates_without_hidden_unique_id(
+    modal_executor_module: Any,
+) -> None:
+    """Cache-friendly proxy payloads should still rehydrate when ComfyUI omits hidden unique_id."""
+    payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-7",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-7",
+            "prompt_id": "prompt-7",
+            "remote_session": {
+                "session_id": "session-7",
+                "prompt_id": "prompt-7",
+                "owner_component_id": "component-7",
+            },
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+    )
+
+    assert modal_executor_module._rehydrate_proxy_payload(payload, unique_id=None) == {
+        "payload_kind": "subgraph",
+        "component_id": "component-7",
+        "prompt_id": "prompt-7",
+        "remote_session": {
+            "session_id": "session-7",
+            "prompt_id": "prompt-7",
+            "owner_component_id": "component-7",
+        },
+        "boundary_outputs": [],
+        "execute_node_ids": [],
+    }
+
+
+def test_cache_friendly_proxy_payload_ignores_volatile_queue_metadata(
+    modal_executor_module: Any,
+) -> None:
+    """Identical proxy work should sanitize to one local cache surface across prompt runs."""
+    first_payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-9",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-9",
+            "prompt_id": "prompt-1",
+            "boundary_outputs": [],
+            "execute_node_ids": ["12"],
+            "extra_data": {
+                "client_id": "client-1",
+                "create_time": 1000,
+                "modal": {"remote_component_ids": ["12"]},
+            },
+            "requires_volume_reload": True,
+            "volume_reload_marker": "marker-1",
+            "uploaded_volume_paths": ["/storage/assets/a.bin"],
+        },
+    )
+    second_payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-9",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-9",
+            "prompt_id": "prompt-2",
+            "boundary_outputs": [],
+            "execute_node_ids": ["12"],
+            "extra_data": {
+                "client_id": "client-1",
+                "create_time": 2000,
+                "modal": {"remote_component_ids": ["12", "39"]},
+            },
+            "requires_volume_reload": False,
+            "volume_reload_marker": None,
+            "uploaded_volume_paths": [],
+        },
+    )
+
+    assert first_payload == second_payload == {
+        "payload_kind": "subgraph",
+        "component_id": "component-9",
+        "boundary_outputs": [],
+        "execute_node_ids": ["12"],
+        modal_executor_module._PROXY_CACHE_CONTEXT_ID_KEY: "node-9",
+    }
+    assert modal_executor_module._rehydrate_proxy_payload(first_payload, unique_id="node-9") == {
+        "payload_kind": "subgraph",
+        "component_id": "component-9",
+        "prompt_id": "prompt-2",
+        "boundary_outputs": [],
+        "execute_node_ids": ["12"],
+        "extra_data": {
+            "client_id": "client-1",
+            "create_time": 2000,
+            "modal": {"remote_component_ids": ["12", "39"]},
+        },
+        "requires_volume_reload": False,
+        "volume_reload_marker": None,
+        "uploaded_volume_paths": [],
     }
 
 
@@ -524,6 +807,45 @@ def test_modal_cloud_streams_progress_and_result_events(
     ]
 
 
+def test_modal_cloud_streams_remote_log_task_id_before_progress(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote streamed payloads should surface the current Modal task id for local log mirroring."""
+
+    def fake_execute_subgraph_locally(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        status_callback: Any = None,
+    ) -> bytes:
+        if status_callback is not None:
+            status_callback({"phase": "executing", "active_node_id": "7"})
+        return b"serialized-outputs"
+
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-remote-123")
+    monkeypatch.setattr(modal_cloud_module, "execute_subgraph_locally", fake_execute_subgraph_locally)
+
+    events = list(
+        modal_cloud_module._stream_remote_payload_events(
+            {"payload_kind": "subgraph", "component_id": "component-1"},
+            b"{}",
+        )
+    )
+
+    assert events[0] == {"kind": "remote_logs", "task_id": "ta-remote-123"}
+    assert events[1:] == [
+        {
+            "kind": "progress",
+            "phase": "executing",
+            "active_node_id": "7",
+        },
+        {
+            "kind": "result",
+            "outputs": b"serialized-outputs",
+        },
+    ]
+
+
 def test_modal_cloud_streams_tensor_safe_progress_and_result_events(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -660,6 +982,32 @@ def test_modal_cloud_does_not_schedule_container_exit_for_interruptions(
             modal_cloud_module.RemoteSubgraphExecutionError(
                 "Remote subgraph execution was interrupted."
             ),
+        )
+    finally:
+        monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
+
+    assert scheduled is False
+    assert scheduled_exits == []
+
+
+def test_modal_cloud_does_not_schedule_container_exit_for_session_state_misses(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Prompt-scoped session misses are routing problems, not poisoned-container crashes."""
+    scheduled_exits: list[tuple[float, int]] = []
+    original_flag = modal_cloud_module._CONTAINER_TERMINATION_SCHEDULED
+    monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", False)
+    monkeypatch.setattr(modal_cloud_module, "_is_modal_container_runtime", lambda: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_schedule_process_exit",
+        lambda delay_seconds, exit_code: scheduled_exits.append((delay_seconds, exit_code)),
+    )
+    try:
+        scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
+            {"component_id": "component-1", "terminate_container_on_error": True},
+            modal_cloud_module.RemoteSessionStateError("Remote session 'abc' was not found."),
         )
     finally:
         monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
@@ -1017,6 +1365,260 @@ def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
     assert {"UNETLoader", "CLIPLoader", "VAELoader"} <= installed_wrappers
 
 
+def test_modal_cloud_node_cache_key_hashes_boundary_tensors(
+    modal_cloud_module: Any,
+) -> None:
+    """Boundary tensors inside ComfyUI cache signatures should produce stable cache keys."""
+    torch = pytest.importorskip("torch")
+
+    first_tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+    same_value_tensor = first_tensor.clone()
+    different_tensor = first_tensor + 1
+    signature = frozenset(
+        {
+            (
+                12,
+                frozenset(
+                    {
+                        (
+                            4,
+                            frozenset(
+                                {
+                                    (0, "latent_image"),
+                                    (1, frozenset({("samples", first_tensor)})),
+                                }
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    same_signature = frozenset(
+        {
+            (
+                12,
+                frozenset(
+                    {
+                        (
+                            4,
+                            frozenset(
+                                {
+                                    (0, "latent_image"),
+                                    (1, frozenset({("samples", same_value_tensor)})),
+                                }
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    different_signature = frozenset(
+        {
+            (
+                12,
+                frozenset(
+                    {
+                        (
+                            4,
+                            frozenset(
+                                {
+                                    (0, "latent_image"),
+                                    (1, frozenset({("samples", different_tensor)})),
+                                }
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+
+    first_key = modal_cloud_module._node_output_cache_key(signature)
+    second_key = modal_cloud_module._node_output_cache_key(same_signature)
+    different_key = modal_cloud_module._node_output_cache_key(different_signature)
+
+    assert isinstance(first_key, str)
+    assert first_key.startswith("NC_")
+    assert second_key == first_key
+    assert different_key != first_key
+
+
+def test_modal_cloud_node_cache_key_rebuilds_input_signature_before_unhashable_conversion(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Distributed node caching should bypass ComfyUI's precomputed `Unhashable` data key."""
+    torch = pytest.importorskip("torch")
+
+    class FakeDynPrompt:
+        """Minimal dynamic-prompt stub for input-signature reconstruction."""
+
+        def __init__(self, node: dict[str, Any]) -> None:
+            """Store one node payload under id `12`."""
+            self._node = node
+
+        def has_node(self, node_id: str) -> bool:
+            """Return whether the requested node exists."""
+            return str(node_id) == "12"
+
+        def get_node(self, node_id: str) -> dict[str, Any]:
+            """Return the stored node payload."""
+            if not self.has_node(node_id):
+                raise KeyError(node_id)
+            return self._node
+
+    class FakeUnhashable:
+        """Stand-in for ComfyUI's `Unhashable` marker."""
+
+    tensor = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+    dynprompt = FakeDynPrompt(
+        {
+            "class_type": "FakeSampler",
+            "inputs": {
+                "latent_image": {"samples": tensor},
+                "steps": 18,
+            },
+        }
+    )
+    cache_key_set = types.SimpleNamespace(
+        dynprompt=dynprompt,
+        is_changed_cache=types.SimpleNamespace(is_changed={"12": False}),
+        get_ordered_ancestry=lambda current_dynprompt, node_id: ([], {}),
+        include_node_id_in_input=lambda: False,
+        get_data_key=lambda node_id: frozenset({("latent_image", FakeUnhashable())}),
+    )
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_nodes_module",
+        lambda: types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_include_unique_id_in_input_signature",
+        lambda class_type: False,
+    )
+
+    rebuilt_key = modal_cloud_module._node_output_cache_key_from_key_set_sync(cache_key_set, "12")
+    direct_bad_key = modal_cloud_module._node_output_cache_key(cache_key_set.get_data_key("12"))
+
+    assert isinstance(rebuilt_key, str)
+    assert rebuilt_key.startswith("NC_")
+    assert direct_bad_key is None
+
+
+def test_modal_cloud_node_cache_key_uses_boundary_source_signature_for_unhashable_inputs(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Boundary-fed runtime objects should hash by stable source provenance instead of object identity."""
+
+    class FakeDynPrompt:
+        """Minimal dynamic prompt wrapper backed by one mutable prompt dict."""
+
+        def __init__(self, prompt: dict[str, Any]) -> None:
+            """Store the prompt used by the cache-key rebuild."""
+            self._prompt = prompt
+
+        def has_node(self, node_id: str) -> bool:
+            """Return whether the requested node exists in the prompt."""
+            return str(node_id) in self._prompt
+
+        def get_node(self, node_id: str) -> dict[str, Any]:
+            """Return the stored node payload."""
+            return self._prompt[str(node_id)]
+
+    class FakeModelPatcher:
+        """Stand-in for ComfyUI's unhashable `ModelPatcher` runtime object."""
+
+    prompt_one = {
+        "39": {
+            "class_type": "FakeSampler",
+            "inputs": {},
+        }
+    }
+    prompt_two = {
+        "39": {
+            "class_type": "FakeSampler",
+            "inputs": {},
+        }
+    }
+    prompt_three = {
+        "39": {
+            "class_type": "FakeSampler",
+            "inputs": {},
+        }
+    }
+    boundary_spec_one = [
+        {
+            "proxy_input_name": "remote_input_0",
+            "io_type": "MODEL",
+            "source_signature": "SRC_same_model",
+            "targets": [{"node_id": "39", "input_name": "model"}],
+        }
+    ]
+    boundary_spec_three = [
+        {
+            "proxy_input_name": "remote_input_0",
+            "io_type": "MODEL",
+            "source_signature": "SRC_other_model",
+            "targets": [{"node_id": "39", "input_name": "model"}],
+        }
+    ]
+    modal_cloud_module._apply_boundary_inputs(
+        prompt_one,
+        boundary_spec_one,
+        {"remote_input_0": FakeModelPatcher()},
+    )
+    modal_cloud_module._apply_boundary_inputs(
+        prompt_two,
+        boundary_spec_one,
+        {"remote_input_0": FakeModelPatcher()},
+    )
+    modal_cloud_module._apply_boundary_inputs(
+        prompt_three,
+        boundary_spec_three,
+        {"remote_input_0": FakeModelPatcher()},
+    )
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_nodes_module",
+        lambda: types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_include_unique_id_in_input_signature",
+        lambda class_type: False,
+    )
+
+    def cache_key_for(prompt: dict[str, Any]) -> str | None:
+        """Build one distributed cache key for the prepared prompt."""
+        cache_key_set = types.SimpleNamespace(
+            dynprompt=FakeDynPrompt(prompt),
+            is_changed_cache=types.SimpleNamespace(is_changed={"39": False}),
+            get_ordered_ancestry=lambda current_dynprompt, node_id: ([], {}),
+            include_node_id_in_input=lambda: False,
+            get_data_key=lambda node_id: None,
+        )
+        return modal_cloud_module._node_output_cache_key_from_key_set_sync(cache_key_set, "39")
+
+    first_key = cache_key_for(prompt_one)
+    second_key = cache_key_for(prompt_two)
+    different_key = cache_key_for(prompt_three)
+
+    assert isinstance(first_key, str)
+    assert first_key.startswith("NC_")
+    assert second_key == first_key
+    assert different_key != first_key
+
+
 def test_modal_cloud_ignores_heavy_comfyui_paths(
     modal_cloud_module: Any,
 ) -> None:
@@ -1289,7 +1891,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
                 """Return a deployed class after the first auto-deploy."""
                 if not FakeModal.deployed:
                     raise FakeLookupError("not deployed")
-                return lambda: FakeRemoteEngine()
+                return lambda **kwargs: FakeRemoteEngine()
 
         @staticmethod
         def enable_output() -> Any:
@@ -1316,6 +1918,49 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", None)]
+
+
+def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Deployed Modal lookups should use keyword parameterization for affinity-key routing."""
+    observed_kwargs: list[dict[str, Any]] = []
+
+    class FakeModal:
+        """Minimal modal SDK double that captures class construction kwargs."""
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a factory that records the provided class parameters."""
+                assert app_name == "comfy-modal-sync"
+                assert class_name == "RemoteEngine"
+
+                def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
+                    """Record one synthesized Modal class constructor call."""
+                    observed_kwargs.append(kwargs)
+                    return kwargs
+
+                return build_remote_engine
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+
+    result = remote_modal_app_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            "remote_session": remote_modal_app_module.RemoteSessionHandle(
+                session_id="session-123",
+                prompt_id="prompt-1",
+                owner_component_id="component-1",
+            ).to_payload(),
+        }
+    )
+
+    assert result == {"session_affinity_key": "session-123"}
+    assert observed_kwargs == [{"session_affinity_key": "session-123"}]
 
 
 def test_load_modal_cloud_module_reloads_stale_partial_module(
@@ -1491,6 +2136,147 @@ def test_remote_modal_consumes_streamed_progress_and_result(
             "client-1",
         ),
     ]
+
+
+def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Stream consumers should retain and release one container-log watcher per remote payload."""
+    log_stream_calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(stream_remote_container_logs=True),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_retain_remote_container_log_stream",
+        lambda task_id: log_stream_calls.append(("retain", task_id)) or task_id,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_release_remote_container_log_stream",
+        lambda task_id: log_stream_calls.append(("release", task_id)),
+    )
+
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "component-1",
+            "component_node_ids": ["7"],
+            "extra_data": {"client_id": "client-1"},
+        },
+        iter(
+            [
+                {"kind": "remote_logs", "task_id": "ta-123"},
+                {"kind": "result", "outputs": b"serialized-outputs"},
+            ]
+        ),
+    )
+
+    assert result == b"serialized-outputs"
+    assert log_stream_calls == [("retain", "ta-123"), ("release", "ta-123")]
+
+
+def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """CLI-backed container log streaming should mirror complete prefixed lines into local stderr."""
+
+    class FakeStdout:
+        """Expose a deterministic binary read interface for the fake Modal CLI process."""
+
+        def __init__(self, chunks: list[bytes]) -> None:
+            """Store the binary chunks that should be returned to the caller."""
+            self._chunks = chunks
+            self._index = 0
+
+        def read(self, size: int = -1) -> bytes:
+            """Return one queued binary chunk or EOF when exhausted."""
+            del size
+            if self._index >= len(self._chunks):
+                return b""
+            chunk = self._chunks[self._index]
+            self._index += 1
+            return chunk
+
+    class FakeProcess:
+        """Minimal subprocess stub used to emulate `modal container logs -f`."""
+
+        def __init__(self) -> None:
+            """Expose a stdout pipe and process lifecycle methods."""
+            self.stdout = FakeStdout([b"session reuse\n", b"session miss\n"])
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            """Report process completion after all fake lines have been read."""
+            if self.stdout._index >= len(self.stdout._chunks):
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self) -> None:
+            """Mark the fake process as stopped."""
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Return the final process exit code."""
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            """Mark the fake process as killed."""
+            self.returncode = 0
+
+    stderr_buffer = StringIO()
+    monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda name: "/usr/bin/modal")
+    monkeypatch.setattr(remote_modal_app_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(
+        remote_modal_app_module.select,
+        "select",
+        lambda streams, _write, _error, _timeout: (
+            streams if streams[0]._index < len(streams[0]._chunks) else [],
+            [],
+            [],
+        ),
+    )
+    monkeypatch.setattr(remote_modal_app_module.sys, "stderr", stderr_buffer)
+
+    result = remote_modal_app_module._stream_remote_container_logs_via_modal_cli(
+        "ta-123",
+        threading.Event(),
+    )
+
+    assert result is True
+    assert stderr_buffer.getvalue() == (
+        "[modal:ta-123] session reuse\n"
+        "[modal:ta-123] session miss\n"
+    )
+
+
+def test_remote_modal_log_stream_prefers_cli_before_sdk(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local log watcher should avoid the SDK path when the Modal CLI is available."""
+    backend_calls: list[str] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_stream_remote_container_logs_via_modal_cli",
+        lambda task_id, stop_event: backend_calls.append(f"cli:{task_id}") or True,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_stream_remote_container_logs_via_modal_sdk",
+        lambda task_id, stop_event: backend_calls.append(f"sdk:{task_id}") or True,
+    )
+
+    remote_modal_app_module._run_remote_container_log_stream("ta-123", threading.Event())
+
+    assert backend_calls == ["cli:ta-123"]
 
 
 def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
@@ -2153,73 +2939,206 @@ def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_out
     assert interrupt_calls == ["interrupt"]
 
 
-def test_invoke_mapped_remote_engine_async_uses_bounded_parallelism(
+def test_invoke_mapped_remote_engine_async_runs_explicit_mapped_phase_items(
     remote_modal_app_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Mapped remote execution should refill a local queue up to COMFY_MODAL_MAX_CONTAINERS."""
-    in_flight = 0
-    max_in_flight = 0
+    """Mapped remote execution should run the explicit mapped phase once per item in order."""
+    observed_calls: list[tuple[str, dict[str, Any]]] = []
     progress_updates: list[dict[str, Any]] = []
 
-    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
-        nonlocal in_flight, max_in_flight
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        node_mapping: Any = None,
+    ) -> tuple[str]:
         assert payload["payload_kind"] == "subgraph"
         assert payload["suppress_status_stream"] is True
-        assert payload["mapped_progress_lane_id"] in {"0", "1"}
-        mapped_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
-        item_value = mapped_inputs["remote_input_0"]
-        in_flight += 1
-        max_in_flight = max(max_in_flight, in_flight)
-        await asyncio.sleep(0.01)
-        in_flight -= 1
-        return serialization_module.serialize_node_outputs((f"done:{item_value}",))
+        observed_calls.append((str(payload["component_id"]), dict(hydrated_inputs)))
+        return (f"done:{hydrated_inputs['remote_input_0']}",)
 
-    monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "2")
-    remote_modal_app_module.get_settings.cache_clear()
     monkeypatch.setattr(
         remote_modal_app_module,
-        "invoke_remote_engine_async",
-        fake_invoke_remote_engine_async,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
     )
     monkeypatch.setattr(
         remote_modal_app_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_updates.append(kwargs),
     )
-    try:
-        payload = {
-            "payload_kind": "mapped_subgraph",
-            "component_id": "6",
-            "prompt_id": "prompt-1",
-            "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "STRING"},
-            "boundary_outputs": [{"io_type": "STRING", "is_list": False}],
-            "extra_data": {"client_id": "client-1"},
-        }
-        response = asyncio.run(
-            remote_modal_app_module._invoke_mapped_remote_engine_async(
-                payload,
-                serialization_module.serialize_node_inputs(
-                    {"remote_input_0": ["a", "b", "c", "d"]}
-                ),
-            )
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "6",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "STRING"},
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            }
+        ],
+        "static_to_mapped_boundaries": [],
+        "static_phase": {
+            "component_node_ids": [],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["7"],
+            "subgraph_prompt": {
+                "7": {
+                    "class_type": "RemoteStringEcho",
+                    "inputs": {"text": ["remote_input_0", 0]},
+                }
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_0",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "7", "input_name": "text"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "7_text",
+                    "node_id": "7",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["7"],
+        },
+        "extra_data": {"client_id": "client-1"},
+    }
+    response = asyncio.run(
+        remote_modal_app_module._invoke_mapped_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {"remote_input_0": ["a", "b", "c", "d"]}
+            ),
         )
-    finally:
-        remote_modal_app_module.get_settings.cache_clear()
+    )
 
     assert serialization_module.deserialize_node_outputs(response) == (
         ["done:a", "done:b", "done:c", "done:d"],
     )
-    assert max_in_flight == 2
+    assert observed_calls == [
+        ("6::item:0", {"remote_input_0": "a"}),
+        ("6::item:1", {"remote_input_0": "b"}),
+        ("6::item:2", {"remote_input_0": "c"}),
+        ("6::item:3", {"remote_input_0": "d"}),
+    ]
     assert progress_updates[0]["value"] == 0.0
     assert progress_updates[0].get("lane_id") is None
-    aggregate_updates = [update for update in progress_updates if update.get("lane_id") is None]
-    lane_updates = [update for update in progress_updates if update.get("lane_id") is not None]
-    assert aggregate_updates[-1]["value"] == 4.0
-    assert {update["lane_id"] for update in lane_updates} == {"0", "1"}
-    assert lane_updates
-    assert all(update.get("clear") is True for update in lane_updates)
+    assert progress_updates[-1]["value"] == 4.0
+
+
+def test_invoke_mapped_remote_engine_async_splits_int_inputs_for_direct_targets(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped remote execution should itemize list(INT) inputs even when ModalMapInput stays local."""
+    observed_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        node_mapping: Any = None,
+    ) -> tuple[str]:
+        observed_calls.append((str(payload["component_id"]), dict(hydrated_inputs)))
+        return (f"seed:{hydrated_inputs['remote_input_0']}",)
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "12",
+        "prompt_id": "prompt-1",
+        "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "INT"},
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "12_latent",
+                "node_id": "12",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            }
+        ],
+        "static_to_mapped_boundaries": [],
+        "static_phase": {
+            "component_node_ids": [],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["12"],
+            "subgraph_prompt": {
+                "12": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"seed": ["remote_input_0", 0]},
+                }
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_0",
+                    "io_type": "INT",
+                    "targets": [{"node_id": "12", "input_name": "seed"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "12_latent",
+                    "node_id": "12",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["12"],
+        },
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_mapped_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {"remote_input_0": [10, 11, 12]}
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        [
+            "seed:10",
+            "seed:11",
+            "seed:12",
+        ],
+    )
+    assert observed_calls == [
+        ("12::item:0", {"remote_input_0": 10}),
+        ("12::item:1", {"remote_input_0": 11}),
+        ("12::item:2", {"remote_input_0": 12}),
+    ]
 
 
 def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
@@ -2227,30 +3146,37 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Mapped remote execution should run static execute targets once and mapped targets per item."""
+    """Mapped remote execution should run the explicit static phase once and inject its bridge outputs."""
     observed_execute_node_ids: list[tuple[str, tuple[str, ...]]] = []
 
-    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        node_mapping: Any = None,
+    ) -> tuple[str, ...]:
         observed_execute_node_ids.append(
             (
                 str(payload["component_id"]),
                 tuple(str(node_id) for node_id in payload.get("execute_node_ids", [])),
             )
         )
-        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
         if str(payload["component_id"]).endswith("::static"):
-            assert tuple(payload.get("execute_node_ids", [])) == ("3",)
-            assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["3"]
-            return serialization_module.serialize_node_outputs(("static-output",))
+            assert tuple(payload.get("execute_node_ids", [])) == ("1", "3")
+            assert [output["proxy_output_name"] for output in payload.get("boundary_outputs", [])] == [
+                "3_text",
+                "static_input_0",
+            ]
+            return ("static-output", "shared-model")
 
         assert tuple(payload.get("execute_node_ids", [])) == ("7",)
-        assert [output["node_id"] for output in payload.get("boundary_outputs", [])] == ["7"]
-        return serialization_module.serialize_node_outputs((f"mapped:{hydrated_inputs['remote_input_1']}",))
+        assert hydrated_inputs["static_input_0"] == "shared-model"
+        assert [output["proxy_output_name"] for output in payload.get("boundary_outputs", [])] == ["7_text"]
+        return (f"mapped:{hydrated_inputs['remote_input_1']}",)
 
     monkeypatch.setattr(
         remote_modal_app_module,
-        "invoke_remote_engine_async",
-        fake_invoke_remote_engine_async,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
     )
 
     payload = {
@@ -2258,12 +3184,94 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
         "component_id": "1",
         "prompt_id": "prompt-1",
         "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "static_to_mapped_boundaries": [
+            {
+                "proxy_name": "static_input_0",
+                "node_id": "1",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "targets": [{"node_id": "7", "input_name": "model"}],
+            }
+        ],
+        "static_phase": {
+            "component_node_ids": ["1", "3"],
+            "subgraph_prompt": {
+                "1": {"class_type": "RemoteModel", "inputs": {}},
+                "3": {"class_type": "RemoteSampler", "inputs": {"model": ["1", 0]}},
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "3_text",
+                    "node_id": "3",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "static_input_0",
+                    "node_id": "1",
+                    "output_index": 0,
+                    "io_type": "MODEL",
+                    "is_list": False,
+                },
+            ],
+            "execute_node_ids": ["1", "3"],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["6", "7"],
+            "subgraph_prompt": {
+                "6": {"class_type": "ModalMapInput", "inputs": {"value": ["remote_input_1", 0]}},
+                "7": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"model": ["static_input_0", 0], "latent": ["6", 0]},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_1",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "6", "input_name": "value"}],
+                },
+                {
+                    "proxy_input_name": "static_input_0",
+                    "io_type": "MODEL",
+                    "targets": [{"node_id": "7", "input_name": "model"}],
+                },
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "7_text",
+                    "node_id": "7",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["7"],
+        },
         "boundary_outputs": [
-            {"node_id": "3", "io_type": "STRING", "is_list": False, "mapped_output": False},
-            {"node_id": "7", "io_type": "STRING", "is_list": False, "mapped_output": True},
+            {
+                "proxy_output_name": "3_text",
+                "node_id": "3",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": False,
+            },
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            },
         ],
         "execute_node_ids": ["3", "7"],
-        "static_execute_node_ids": ["3"],
+        "static_execute_node_ids": ["1", "3"],
         "mapped_execute_node_ids": ["7"],
         "extra_data": {"client_id": "client-1"},
     }
@@ -2281,56 +3289,626 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
         "static-output",
         ["mapped:a", "mapped:b"],
     )
-    assert observed_execute_node_ids[0] == ("1::static", ("3",))
+    assert observed_execute_node_ids[0] == ("1::static", ("1", "3"))
     assert observed_execute_node_ids[1:] == [
         ("1::item:0", ("7",)),
         ("1::item:1", ("7",)),
     ]
 
 
-def test_invoke_mapped_remote_engine_async_keeps_heterogeneous_latents_as_list(
-    remote_modal_app_module: Any,
-    serialization_module: Any,
+def test_modal_cloud_execute_mapped_subgraph_payload_injects_static_bridges(
+    modal_cloud_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Mapped LATENT outputs should remain a list when per-item spatial shapes differ."""
-    torch = pytest.importorskip("torch")
+    """The cloud runtime should execute the static phase once and feed its outputs into each mapped item."""
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
 
-    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
-        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
-        scale = int(hydrated_inputs["remote_input_0"])
-        latent = {
-            "samples": torch.zeros((1, 4, scale, scale), dtype=torch.float32),
-            "batch_index": [scale],
-        }
-        return serialization_module.serialize_node_outputs((latent,))
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        custom_nodes_root: Any,
+        status_callback: Any = None,
+        cancellation_event: Any = None,
+        interrupt_store: Any = None,
+        interrupt_flag_key: Any = None,
+    ) -> tuple[str, ...]:
+        observed_calls.append(
+            (
+                str(payload["component_id"]),
+                tuple(str(node_id) for node_id in payload.get("execute_node_ids", [])),
+                dict(hydrated_inputs),
+            )
+        )
+        if str(payload["component_id"]).endswith("::static"):
+            return ("static-output", "shared-model")
+        return (f"mapped:{hydrated_inputs['remote_input_1']}:{hydrated_inputs['static_input_0']}",)
 
     monkeypatch.setattr(
-        remote_modal_app_module,
-        "invoke_remote_engine_async",
-        fake_invoke_remote_engine_async,
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
     )
 
     payload = {
         "payload_kind": "mapped_subgraph",
-        "component_id": "7",
+        "component_id": "cloud-1",
         "prompt_id": "prompt-1",
-        "mapped_input": {"proxy_input_name": "remote_input_0", "io_type": "INT"},
-        "boundary_outputs": [{"io_type": "LATENT", "is_list": False}],
+        "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "static_to_mapped_boundaries": [
+            {
+                "proxy_name": "static_input_0",
+                "node_id": "1",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "targets": [{"node_id": "7", "input_name": "model"}],
+            }
+        ],
+        "static_phase": {
+            "component_node_ids": ["1", "3"],
+            "subgraph_prompt": {
+                "1": {"class_type": "RemoteModel", "inputs": {}},
+                "3": {"class_type": "RemoteSampler", "inputs": {"model": ["1", 0]}},
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "3_text",
+                    "node_id": "3",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "static_input_0",
+                    "node_id": "1",
+                    "output_index": 0,
+                    "io_type": "MODEL",
+                    "is_list": False,
+                },
+            ],
+            "execute_node_ids": ["1", "3"],
+        },
+        "mapped_phase": {
+            "component_node_ids": ["6", "7"],
+            "subgraph_prompt": {
+                "6": {"class_type": "ModalMapInput", "inputs": {"value": ["remote_input_1", 0]}},
+                "7": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"model": ["static_input_0", 0], "latent": ["6", 0]},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_1",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "6", "input_name": "value"}],
+                },
+                {
+                    "proxy_input_name": "static_input_0",
+                    "io_type": "MODEL",
+                    "targets": [{"node_id": "7", "input_name": "model"}],
+                },
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "7_text",
+                    "node_id": "7",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["7"],
+        },
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "3_text",
+                "node_id": "3",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": False,
+            },
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            },
+        ],
         "extra_data": {"client_id": "client-1"},
     }
 
-    response = asyncio.run(
-        remote_modal_app_module._invoke_mapped_remote_engine_async(
-            payload,
-            serialization_module.serialize_node_inputs({"remote_input_0": [32, 35]}),
+    outputs = modal_cloud_module._execute_mapped_subgraph_payload(
+        payload,
+        {"remote_input_1": ["a", "b"]},
+        None,
+    )
+
+    assert outputs == (
+        "static-output",
+        ["mapped:a:shared-model", "mapped:b:shared-model"],
+    )
+    assert observed_calls == [
+        ("cloud-1::static", ("1", "3"), {}),
+        ("cloud-1::item:0", ("7",), {"static_input_0": "shared-model", "remote_input_1": "a"}),
+        ("cloud-1::item:1", ("7",), {"static_input_0": "shared-model", "remote_input_1": "b"}),
+    ]
+
+
+def test_modal_cloud_execute_mapped_subgraph_payload_preserves_assigned_lane_id(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped cloud progress should keep the caller-assigned lane id instead of collapsing to `0`."""
+    observed_progress_events: list[dict[str, Any]] = []
+
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        custom_nodes_root: Any,
+        status_callback: Any = None,
+        cancellation_event: Any = None,
+        interrupt_store: Any = None,
+        interrupt_flag_key: Any = None,
+    ) -> tuple[str, ...]:
+        del custom_nodes_root, cancellation_event, interrupt_store, interrupt_flag_key
+        if status_callback is not None:
+            status_callback(
+                {
+                    "event_type": "node_progress",
+                    "node_id": "12",
+                    "display_node_id": "12",
+                    "real_node_id": "12",
+                    "value": 3.0,
+                    "max": 9.0,
+                }
+            )
+        return (f"mapped:{hydrated_inputs['remote_input_1']}",)
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        fake_execute_subgraph_prompt,
+    )
+
+    payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "cloud-2",
+        "prompt_id": "prompt-1",
+        "mapped_progress_lane_id": "3",
+        "mapped_input": {"proxy_input_name": "remote_input_1", "io_type": "STRING"},
+        "static_to_mapped_boundaries": [],
+        "mapped_phase": {
+            "component_node_ids": ["12", "39"],
+            "subgraph_prompt": {
+                "39": {
+                    "class_type": "RemoteSampler",
+                    "inputs": {"latent": ["remote_input_1", 0]},
+                },
+            },
+            "boundary_inputs": [
+                {
+                    "proxy_input_name": "remote_input_1",
+                    "io_type": "STRING",
+                    "targets": [{"node_id": "39", "input_name": "latent"}],
+                }
+            ],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "39_text",
+                    "node_id": "39",
+                    "output_index": 0,
+                    "io_type": "STRING",
+                    "is_list": False,
+                    "mapped_output": True,
+                }
+            ],
+            "execute_node_ids": ["39"],
+        },
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "39_text",
+                "node_id": "39",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+                "mapped_output": True,
+            },
+        ],
+    }
+
+    outputs = modal_cloud_module._execute_mapped_subgraph_payload(
+        payload,
+        {"remote_input_1": ["a"]},
+        None,
+        status_callback=lambda event: observed_progress_events.append(dict(event)),
+    )
+
+    assert outputs == (["mapped:a"],)
+    assert any(
+        event.get("event_type") == "node_progress"
+        and event.get("real_node_id") == "12"
+        and event.get("lane_id") == "3"
+        for event in observed_progress_events
+    )
+    assert any(
+        event.get("event_type") == "node_progress"
+        and event.get("clear") is True
+        and event.get("lane_id") == "3"
+        for event in observed_progress_events
+    )
+
+
+def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    session_state_module: Any,
+) -> None:
+    """Split proxy subgraphs should return durable bridge refs that survive lost sessions."""
+    static_payload = {
+        "payload_kind": "subgraph",
+        "component_id": "1",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["1"],
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "SessionValueNode",
+                "inputs": {},
+            }
+        },
+        "boundary_inputs": [],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "static_input_0",
+                "node_id": "1",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "session_output": True,
+            }
+        ],
+        "execute_node_ids": ["1"],
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-runtime-1",
+            prompt_id="prompt-1",
+            owner_component_id="1",
+        ).to_payload(),
+    }
+
+    static_outputs = serialization_module.deserialize_node_outputs(
+        remote_modal_app_module.execute_subgraph_locally(
+            static_payload,
+            serialization_module.serialize_node_inputs({}),
+            node_mapping={"SessionValueNode": _FakeSessionValueNode},
+        )
+    )
+    assert session_state_module.is_remote_session_bridge_ref_payload(static_outputs[0])
+    remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(
+        session_state_module.RemoteSessionHandle.from_payload(static_payload["remote_session"])
+    )
+
+    mapped_payload = {
+        "payload_kind": "subgraph",
+        "component_id": "1__mapped",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["7"],
+        "subgraph_prompt": {
+            "7": {
+                "class_type": "SessionEchoNode",
+                "inputs": {"text": ["static_input_0", 0]},
+            }
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "7", "input_name": "text"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "7_text",
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+            }
+        ],
+        "execute_node_ids": ["7"],
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-runtime-2",
+            prompt_id="prompt-1",
+            owner_component_id="1",
+        ).to_payload(),
+        "clear_remote_session": True,
+    }
+
+    mapped_outputs = serialization_module.deserialize_node_outputs(
+        remote_modal_app_module.execute_subgraph_locally(
+            mapped_payload,
+            serialization_module.serialize_node_inputs({"static_input_0": static_outputs[0]}),
+            node_mapping={
+                "SessionEchoNode": _FakeSessionEchoNode,
+                "SessionValueNode": _FakeSessionValueNode,
+            },
         )
     )
 
-    outputs = serialization_module.deserialize_node_outputs(response)
-    assert len(outputs) == 1
-    assert isinstance(outputs[0], list)
-    assert [item["samples"].shape for item in outputs[0]] == [(1, 4, 32, 32), (1, 4, 35, 35)]
+    assert mapped_outputs == ("shared-session-value",)
+    replay_outputs = remote_modal_app_module._execute_subgraph_prompt(
+        {
+            **mapped_payload,
+            "remote_session": session_state_module.RemoteSessionHandle(
+                session_id="session-runtime-3",
+                prompt_id="prompt-1",
+                owner_component_id="1",
+            ).to_payload(),
+            "clear_remote_session": False,
+        },
+        {"static_input_0": static_outputs[0]},
+        {
+            "SessionEchoNode": _FakeSessionEchoNode,
+            "SessionValueNode": _FakeSessionValueNode,
+        },
+    )
+    assert replay_outputs == ("shared-session-value",)
+
+
+def test_local_phase_payload_builder_preserves_remote_session(
+    remote_modal_app_module: Any,
+) -> None:
+    """Explicit local mapped phase payloads should keep remote_session context."""
+    payload = {
+        "prompt_id": "prompt-1",
+        "extra_data": {"client_id": "c-1"},
+        "remote_session": {
+            "__comfy_modal_remote_session_handle__": True,
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "owner_component_id": "component-1",
+        },
+        "clear_remote_session": True,
+        "static_phase": {
+            "component_node_ids": ["1"],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": ["1"],
+        },
+    }
+
+    phase_payload = remote_modal_app_module._build_phase_subgraph_payload(
+        payload,
+        "static_phase",
+        "component-1::static",
+        suppress_status_stream=True,
+    )
+
+    assert phase_payload["remote_session"]["session_id"] == "session-1"
+    assert phase_payload["clear_remote_session"] is True
+
+
+def test_cloud_phase_payload_builder_preserves_remote_session(
+    modal_cloud_module: Any,
+) -> None:
+    """Explicit cloud mapped phase payloads should keep remote_session context."""
+    payload = {
+        "prompt_id": "prompt-1",
+        "extra_data": {"client_id": "c-1"},
+        "remote_session": {
+            "__comfy_modal_remote_session_handle__": True,
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "owner_component_id": "component-1",
+        },
+        "clear_remote_session": True,
+        "mapped_phase": {
+            "component_node_ids": ["7"],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": ["7"],
+        },
+    }
+
+    phase_payload = modal_cloud_module._build_phase_subgraph_payload(
+        payload,
+        "mapped_phase",
+        "component-1::mapped",
+    )
+
+    assert phase_payload["remote_session"]["session_id"] == "session-1"
+    assert phase_payload["clear_remote_session"] is True
+
+
+def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completion(
+    api_intercept_module: Any,
+    modal_executor_module: Any,
+    session_state_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A local consumer of the static proxy should be able to run while the mapped proxy is still in flight."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRewriteRemoteModelNode,
+                "RemoteSampler": _FakeRewriteRemoteSamplerNode,
+                "LatentSource": _FakeRewriteLatentSourceNode,
+                "ModalMapInput": _FakeRewriteModalMapInputNode,
+                "LocalSink": _FakeRewriteLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+            {"id": 5, "properties": {"is_modal_remote": False}},
+            {"id": 6, "properties": {"is_modal_remote": True}},
+            {"id": 7, "properties": {"is_modal_remote": True}},
+            {"id": 8, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {},
+            "_meta": {"title": "Shared Model"},
+        },
+        "2": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Single Latent"},
+        },
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["2", 0]},
+            "_meta": {"title": "Unmapped Sampler"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["3", 0]},
+            "_meta": {"title": "Local Sink 1"},
+        },
+        "5": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Batch Latent Source"},
+        },
+        "6": {
+            "class_type": "ModalMapInput",
+            "inputs": {"value": ["5", 0]},
+            "_meta": {"title": "Map Input"},
+        },
+        "7": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["6", 0]},
+            "_meta": {"title": "Mapped Sampler"},
+        },
+        "8": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["7", 0]},
+            "_meta": {"title": "Local Sink 2"},
+        },
+    }
+
+    rewritten_prompt, _summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+    static_proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[rewritten_prompt["1"]["class_type"]]
+    mapped_proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[rewritten_prompt["1__mapped"]["class_type"]]
+    static_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    mapped_payload = rewritten_prompt["1__mapped"]["inputs"]["original_node_data"]
+
+    assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
+    assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]
+
+    observed_order: list[str] = []
+    mapped_started = asyncio.Event()
+    release_mapped = asyncio.Event()
+
+    class FakeClient:
+        """Fake async remote client that blocks the mapped proxy until released."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[Any, ...]:
+            """Return deterministic outputs for the split static and mapped proxies."""
+            if str(payload.get("component_id")) == "1":
+                observed_order.append("static_proxy_finish")
+                return (
+                    "static-latent",
+                    session_state_module.RemoteSessionBridgeRef(
+                        bridge_key="RSB_static_model",
+                        node_id="1",
+                        output_index=0,
+                        session_id=str(payload["remote_session"]["session_id"]),
+                    ).to_payload(),
+                )
+
+            if str(payload.get("component_id")) == "1__mapped":
+                observed_order.append("mapped_proxy_start")
+                mapped_started.set()
+                await release_mapped.wait()
+                observed_order.append("mapped_proxy_finish")
+                return ("mapped-latent",)
+
+            raise AssertionError(f"Unexpected proxy payload: {payload!r}")
+
+    async def run_scenario() -> tuple[Any, ...]:
+        """Run the split static and mapped proxies with a local consumer in between."""
+        static_result = await static_proxy_class.execute(
+            original_node_data=static_payload,
+            unique_id="1",
+            remote_input_0="single-latent",
+        )
+        mapped_task = asyncio.create_task(
+            mapped_proxy_class.execute(
+                original_node_data=mapped_payload,
+                unique_id="1__mapped",
+                remote_input_1="batched-latent",
+                static_input_0=static_result.result[1],
+            )
+        )
+        await mapped_started.wait()
+        observed_order.append(f"local_sink:{static_result.result[0]}")
+        assert not mapped_task.done()
+        release_mapped.set()
+        mapped_result = await mapped_task
+        return static_result.result, mapped_result.result
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        static_outputs, mapped_outputs = asyncio.run(run_scenario())
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert static_outputs[0] == "static-latent"
+    assert session_state_module.is_remote_session_bridge_ref_payload(static_outputs[1])
+    assert mapped_outputs == ("mapped-latent",)
+    assert observed_order == [
+        "static_proxy_finish",
+        "mapped_proxy_start",
+        "local_sink:static-latent",
+        "mapped_proxy_finish",
+    ]
 
 
 def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
@@ -2487,6 +4065,401 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
         ("17::item:1", ("12",), {"remote_input_0": 11, "remote_input_1": [28]}),
         ("17::item:2", ("12",), {"remote_input_0": 12, "remote_input_1": [28]}),
         ("17::item:3", ("12",), {"remote_input_0": 13, "remote_input_1": [28]}),
+    ]
+
+
+def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit fan-out should not split components whose list boundary lands on INPUT_IS_LIST nodes."""
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "ImplicitBatchListSource": _ImplicitBatchListSourceNode,
+                "ImplicitBatchScalarConsumer": _ImplicitBatchScalarConsumerNode,
+                "ImplicitBatchListConsumer": _ImplicitBatchListConsumerNode,
+            }
+        },
+    )()
+    monkeypatch.setattr(remote_modal_app_module, "_load_nodes_module", lambda: fake_nodes_module)
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+        return serialization_module.serialize_node_outputs(
+            ("scalar-output", ["list-output:0", "list-output:1", "list-output:2"])
+        )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["4", "12", "17"],
+        "execute_node_ids": ["4", "12"],
+        "subgraph_prompt": {
+            "17": {"class_type": "ImplicitBatchListSource", "inputs": {"values": 0}},
+            "4": {
+                "class_type": "ImplicitBatchScalarConsumer",
+                "inputs": {"value": ["17", 0]},
+            },
+            "12": {
+                "class_type": "ImplicitBatchListConsumer",
+                "inputs": {"values": ["17", 1]},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "17", "input_name": "values"}],
+            }
+        ],
+        "boundary_outputs": [
+            {"node_id": "4", "io_type": "STRING", "is_list": False},
+            {"node_id": "12", "io_type": "STRING", "is_list": True},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs({"remote_input_0": [10, 11, 12]}),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        "scalar-output",
+        ["list-output:0", "list-output:1", "list-output:2"],
+    )
+    assert observed_calls == [
+        ("17", ("4", "12"), {"remote_input_0": [10, 11, 12]}),
+    ]
+
+
+def test_implicitly_mapped_subgraph_clears_remote_session_once_after_all_items_finish(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    session_state_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit mapped execution should reserve remote-session cleanup for one final cleanup payload."""
+    observed_calls: list[tuple[str, bool, tuple[str, ...], dict[str, Any]]] = []
+    session_cleared = False
+
+    monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        nonlocal session_cleared
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        clear_remote_session = bool(payload.get("clear_remote_session"))
+        observed_calls.append(
+            (str(payload["component_id"]), clear_remote_session, execute_node_ids, hydrated_inputs)
+        )
+
+        if clear_remote_session:
+            session_cleared = True
+        elif session_cleared:
+            raise session_state_module.RemoteSessionStateError(
+                "Remote session 'session-1' was not found."
+            )
+
+        if execute_node_ids == ("4",):
+            return serialization_module.serialize_node_outputs(("sampler-4",))
+        if execute_node_ids == ("12",):
+            return serialization_module.serialize_node_outputs((f"sampler-12:{hydrated_inputs['remote_input_0']}",))
+        if execute_node_ids == ():
+            return serialization_module.serialize_node_outputs(())
+        raise AssertionError(f"Unexpected execute nodes for implicit cleanup regression: {execute_node_ids!r}")
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["4", "12", "17"],
+        "execute_node_ids": ["4", "12"],
+        "subgraph_prompt": {
+            "17": {"class_type": "LoraLoaderModelOnly", "inputs": {}},
+            "4": {"class_type": "KSampler", "inputs": {"model": ["17", 0], "seed": 0}},
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {"model": ["17", 0], "seed": 0},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "4", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "4", "io_type": "STRING", "is_list": False},
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-1",
+            prompt_id="prompt-1",
+            owner_component_id="17",
+        ).to_payload(),
+        "clear_remote_session": True,
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": [10, 11, 12],
+                    "remote_input_1": [28],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        "sampler-4",
+        ["sampler-12:10", "sampler-12:11", "sampler-12:12"],
+    )
+    assert [
+        (component_id, execute_node_ids)
+        for component_id, _, execute_node_ids, _ in observed_calls
+    ] == [
+        ("17::static", ("4",)),
+        ("17::item:0", ("12",)),
+        ("17::item:1", ("12",)),
+        ("17::item:2", ("12",)),
+        ("17::cleanup", ()),
+    ]
+    assert all(
+        not clear_remote_session
+        for component_id, clear_remote_session, _, _ in observed_calls
+        if component_id != "17::cleanup"
+    )
+    assert observed_calls[-1] == ("17::cleanup", True, (), {})
+
+
+def test_implicitly_mapped_subgraph_keeps_conditioning_lists_broadcast(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit mapped execution must not split list-backed CONDITIONING inputs per item."""
+    conditioning = [
+        ["cond-a", {"pooled_output": "pool-a"}],
+        ["cond-b", {"pooled_output": "pool-b"}],
+    ]
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+
+        if execute_node_ids != ("12",):
+            raise AssertionError(
+                f"Unexpected execute nodes for conditioning implicit mapped regression: {execute_node_ids!r}"
+            )
+        return serialization_module.serialize_node_outputs(
+            (f"{hydrated_inputs['remote_input_1']}:{len(hydrated_inputs['remote_input_0'])}",)
+        )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "positive": 0,
+                    "seed": 0,
+                },
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "12", "input_name": "positive"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": conditioning,
+                    "remote_input_1": [10, 11, 12, 13],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["10:2", "11:2", "12:2", "13:2"],
+    )
+    assert observed_calls == [
+        ("17::item:0", ("12",), {"remote_input_0": conditioning, "remote_input_1": 10}),
+        ("17::item:1", ("12",), {"remote_input_0": conditioning, "remote_input_1": 11}),
+        ("17::item:2", ("12",), {"remote_input_0": conditioning, "remote_input_1": 12}),
+        ("17::item:3", ("12",), {"remote_input_0": conditioning, "remote_input_1": 13}),
+    ]
+
+
+def test_implicitly_mapped_subgraph_splits_session_ref_lists_for_nontransportable_inputs(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit mapped execution should itemize lists of remote session refs even for MODEL/CONDITIONING."""
+    model_ref = {
+        "__comfy_modal_remote_session_value_ref__": True,
+        "session_id": "session-1",
+        "node_id": "31",
+        "output_index": 0,
+    }
+    conditioning_ref = {
+        "__comfy_modal_remote_session_value_ref__": True,
+        "session_id": "session-1",
+        "node_id": "2",
+        "output_index": 0,
+    }
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+
+        if execute_node_ids != ("12",):
+            raise AssertionError(
+                f"Unexpected execute nodes for implicit session-ref regression: {execute_node_ids!r}"
+            )
+        return serialization_module.serialize_node_outputs((f"seed:{hydrated_inputs['remote_input_2']}",))
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model": 0,
+                    "positive": 0,
+                    "seed": 0,
+                },
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "12", "input_name": "model"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "12", "input_name": "positive"}],
+            },
+            {
+                "proxy_input_name": "remote_input_2",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": [model_ref, model_ref, model_ref],
+                    "remote_input_1": [conditioning_ref, conditioning_ref, conditioning_ref],
+                    "remote_input_2": [10, 11, 12],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["seed:10", "seed:11", "seed:12"],
+    )
+    assert observed_calls == [
+        (
+            "17::item:0",
+            ("12",),
+            {"remote_input_0": model_ref, "remote_input_1": conditioning_ref, "remote_input_2": 10},
+        ),
+        (
+            "17::item:1",
+            ("12",),
+            {"remote_input_0": model_ref, "remote_input_1": conditioning_ref, "remote_input_2": 11},
+        ),
+        (
+            "17::item:2",
+            ("12",),
+            {"remote_input_0": model_ref, "remote_input_1": conditioning_ref, "remote_input_2": 12},
+        ),
     ]
 
 
@@ -2652,7 +4625,9 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
             "display_node_id": "7",
             "real_node_id": None,
             "lane_id": "1",
+            "clear": False,
             "item_index": 0,
+            "aggregate_only": False,
         }
     ]
     assert status_calls == []
@@ -2663,6 +4638,155 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
             "preview_target_node_ids": ["9"],
             "image_value": ["preview"],
         }
+    ]
+
+
+def test_consume_remote_payload_stream_keeps_static_execute_node_progress_when_status_is_suppressed(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Static sub-runs should still forward real execute-node progress under suppressed status streams."""
+    progress_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: progress_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "1::static",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["1", "2", "12", "4"],
+        "execute_node_ids": ["12", "4"],
+        "boundary_outputs": [
+            {"node_id": "4", "output_index": 0, "io_type": "LATENT", "is_list": False}
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "suppress_status_stream": True,
+    }
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "node_progress",
+                "node_id": "1",
+                "display_node_id": "1",
+                "real_node_id": "12",
+                "value": 5.0,
+                "max": 20.0,
+            },
+            {
+                "kind": "progress",
+                "event_type": "node_progress",
+                "node_id": "2",
+                "display_node_id": "2",
+                "real_node_id": "2",
+                "value": 1.0,
+                "max": 10.0,
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert progress_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "1",
+            "value": 5.0,
+            "max_value": 20.0,
+            "display_node_id": "1",
+            "real_node_id": "12",
+            "lane_id": None,
+            "clear": False,
+            "item_index": None,
+            "aggregate_only": False,
+        }
+    ]
+
+
+def test_consume_remote_payload_stream_clears_static_execute_node_progress_on_suppressed_completion(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Suppressed static sub-runs should emit an explicit clear for lane-less node progress on completion."""
+    progress_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: progress_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "1::static",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["1", "2", "12", "4"],
+        "execute_node_ids": ["12", "4"],
+        "boundary_outputs": [
+            {"node_id": "4", "output_index": 0, "io_type": "LATENT", "is_list": False}
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "suppress_status_stream": True,
+    }
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "node_progress",
+                "node_id": "1",
+                "display_node_id": "1",
+                "real_node_id": "12",
+                "value": 5.0,
+                "max": 20.0,
+            },
+            {
+                "kind": "progress",
+                "phase": "execution_success",
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert progress_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "1",
+            "value": 5.0,
+            "max_value": 20.0,
+            "display_node_id": "1",
+            "real_node_id": "12",
+            "lane_id": None,
+            "clear": False,
+            "item_index": None,
+            "aggregate_only": False,
+        },
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "1",
+            "value": 0.0,
+            "max_value": 1.0,
+            "display_node_id": "1",
+            "real_node_id": "12",
+            "clear": True,
+        },
     ]
 
 
@@ -3061,6 +5185,382 @@ def test_modal_cloud_separates_prompt_executor_cache_scopes_by_custom_nodes_root
     assert first_state is not second_state
 
 
+class _PersistentCacheNode:
+    """Simple node used to verify persisted node-cache reuse across prompt runs."""
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("value",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "run"
+    invocation_count = 0
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str]]]:
+        """Return the minimal V1 schema needed for cache-key generation."""
+        return {"required": {"value": ("INT",)}}
+
+    def run(self, value: int) -> tuple[int]:
+        """Count real executions so persisted cache hits are visible to the test."""
+        type(self).invocation_count += 1
+        return (value + 1,)
+
+
+def test_modal_cloud_serializes_only_small_transport_safe_node_outputs(
+    modal_cloud_module: Any,
+) -> None:
+    """Persisted node-cache records should keep small tensor outputs and skip oversized ones."""
+    import torch
+
+    execution = modal_cloud_module._load_execution_module()
+    small_entry = execution.CacheEntry(ui=None, outputs=[[torch.zeros((8,), dtype=torch.float32)]])
+    large_entry = execution.CacheEntry(ui=None, outputs=[[torch.zeros((512,), dtype=torch.float32)]])
+
+    small_record = modal_cloud_module._serialize_node_output_cache_entry(
+        small_entry,
+        max_bytes=1024,
+    )
+    large_record = modal_cloud_module._serialize_node_output_cache_entry(
+        large_entry,
+        max_bytes=1024,
+    )
+
+    assert small_record is not None
+    assert large_record is None
+
+
+def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instances(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A fresh PromptExecutor cache should round-trip persisted node outputs through Modal Dict state."""
+    monkeypatch.setitem(sys.modules, "torchsde", types.ModuleType("torchsde"))
+    modal_cloud_module._ensure_comfy_runtime_initialized(None)
+    import comfy_execution.caching as comfy_caching
+
+    execution = modal_cloud_module._load_execution_module()
+    nodes_module = modal_cloud_module._load_nodes_module()
+    cache_store: dict[str, Any] = {}
+    prompt = {
+        "node_1": {
+            "class_type": "PersistentCacheNode",
+            "inputs": {"value": 4},
+            "_meta": {},
+        }
+    }
+
+    _PersistentCacheNode.invocation_count = 0
+    monkeypatch.setitem(nodes_module.NODE_CLASS_MAPPINGS, "PersistentCacheNode", _PersistentCacheNode)
+    monkeypatch.setitem(
+        comfy_caching.nodes.NODE_CLASS_MAPPINGS,
+        "PersistentCacheNode",
+        _PersistentCacheNode,
+    )
+    monkeypatch.setitem(
+        nodes_module.NODE_DISPLAY_NAME_MAPPINGS,
+        "PersistentCacheNode",
+        "PersistentCacheNode",
+    )
+    cache_entry = execution.CacheEntry(ui={"output": {"value": [5]}}, outputs=[[5]])
+    first_executor = execution.PromptExecutor(
+        modal_cloud_module._NullPromptServer(),
+        cache_type=execution.CacheType.CLASSIC,
+        cache_args={"lru": 0, "ram": 0.0},
+    )
+    restored_first = asyncio.run(
+        modal_cloud_module._restore_persisted_node_output_cache_entries(
+            execution,
+            first_executor,
+            prompt_id="prompt-a",
+            prompt=copy.deepcopy(prompt),
+            cache_store=cache_store,
+        )
+    )
+    first_executor.caches.outputs.set("node_1", cache_entry)
+    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
+        first_executor,
+        prompt=copy.deepcopy(prompt),
+        cache_store=cache_store,
+    )
+
+    second_executor = execution.PromptExecutor(
+        modal_cloud_module._NullPromptServer(),
+        cache_type=execution.CacheType.CLASSIC,
+        cache_args={"lru": 0, "ram": 0.0},
+    )
+    restored_cache_keys_by_node_id: dict[str, str] = {}
+    restored_second = asyncio.run(
+        modal_cloud_module._restore_persisted_node_output_cache_entries(
+            execution,
+            second_executor,
+            prompt_id="prompt-b",
+            prompt=copy.deepcopy(prompt),
+            cache_store=cache_store,
+            restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
+        )
+    )
+    restored_entry = second_executor.caches.outputs.get("node_1")
+
+    assert restored_first == []
+    assert persisted_nodes == ["node_1"]
+    assert restored_second == ["node_1"]
+    assert restored_cache_keys_by_node_id == {"node_1": next(iter(cache_store))}
+    assert list(cache_store) and all(key.startswith("NC_") for key in cache_store)
+    assert restored_entry == cache_entry
+
+
+def test_modal_cloud_installs_persisted_cache_restore_after_live_set_prompt(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Persisted-cache restore should run after PromptExecutor prepares the active outputs cache."""
+
+    class FakeOutputsCache:
+        """Minimal outputs-cache stub with a mutable cache-key-set marker."""
+
+        def __init__(self) -> None:
+            """Initialize the fake cache-key-set marker."""
+            self.cache_key_set = None
+
+        async def set_prompt(self, dynprompt: Any, node_ids: Any, is_changed_cache: Any) -> None:
+            """Simulate ComfyUI assigning the live cache-key set during prompt setup."""
+            del dynprompt, node_ids, is_changed_cache
+            self.cache_key_set = "live-cache-key-set"
+
+    outputs_cache = FakeOutputsCache()
+    executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=outputs_cache))
+    observed_events: list[tuple[str, Any]] = []
+
+    async def fake_restore(
+        execution: Any,
+        prepared_outputs_cache: Any,
+        *,
+        prompt: dict[str, Any],
+        cache_store: Any,
+        restored_cache_keys_by_node_id: dict[str, str] | None = None,
+    ) -> list[str]:
+        """Record the cache-key-set marker visible at restore time."""
+        del execution
+        if restored_cache_keys_by_node_id is not None:
+            restored_cache_keys_by_node_id["12"] = "NC_example"
+        observed_events.append(
+            (
+                "restore",
+                prepared_outputs_cache.cache_key_set,
+                tuple(sorted(prompt)),
+                cache_store,
+            )
+        )
+        return ["12"]
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_restore_persisted_node_output_cache_entries_into_prepared_cache",
+        fake_restore,
+    )
+
+    restore_state = (
+        modal_cloud_module._install_prompt_executor_persisted_cache_restore(
+            object(),
+            executor,
+            component_id="component-1",
+            prompt={"12": {"class_type": "PersistentCacheNode", "inputs": {}}},
+            cache_store={"NC_example": {"version": 1}},
+        )
+    )
+
+    try:
+        asyncio.run(outputs_cache.set_prompt(object(), ["12"], object()))
+    finally:
+        restore_state.restore_original_method()
+
+    assert restore_state.restored_node_ids == ["12"]
+    assert restore_state.restored_cache_keys_by_node_id == {"12": "NC_example"}
+    assert observed_events == [
+        ("restore", "live-cache-key-set", ("12",), {"NC_example": {"version": 1}})
+    ]
+    assert outputs_cache.set_prompt.__func__ is FakeOutputsCache.set_prompt
+
+
+def test_modal_cloud_skips_rewriting_restored_distributed_cache_entries(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Persist should skip distributed cache entries that were restored unchanged this run."""
+    monkeypatch.setitem(sys.modules, "torchsde", types.ModuleType("torchsde"))
+    modal_cloud_module._ensure_comfy_runtime_initialized(None)
+
+    execution = modal_cloud_module._load_execution_module()
+    cache_entry = execution.CacheEntry(ui={"output": {"value": [5]}}, outputs=[[5]])
+    cache_key = "NC_existing"
+    cache_store: dict[str, Any] = {cache_key: {"version": 1, "outputs_zlib": b"old"}}
+    observed_logs: list[tuple[Any, ...]] = []
+
+    class FakeOutputsCache:
+        """Minimal outputs cache stub for persist-phase tests."""
+
+        def __init__(self) -> None:
+            """Populate one persistent cache entry."""
+            self.cache_key_set = object()
+
+        def get(self, node_id: str) -> Any:
+            """Return the prepared cache entry for the target node only."""
+            if node_id == "node_1":
+                return cache_entry
+            return None
+
+    executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=FakeOutputsCache()))
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_key_from_key_set_sync",
+        lambda cache_key_set, node_id: cache_key if node_id == "node_1" else None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_emit_cloud_info",
+        lambda message, *args: observed_logs.append((message, *args)),
+    )
+
+    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
+        executor,
+        prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
+        cache_store=cache_store,
+        restored_cache_keys_by_node_id={"node_1": cache_key},
+    )
+
+    assert persisted_nodes == []
+    assert cache_store == {cache_key: {"version": 1, "outputs_zlib": b"old"}}
+    assert observed_logs[-1] == (
+        "Node output cache write node=%s key_prefix=%s result=skip reason=restored-hit",
+        "node_1",
+        "NC_existing",
+    )
+
+
+def test_modal_cloud_skips_restored_hit_before_cache_entry_serialization(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Persist should avoid cache-entry serialization entirely for restored-hit keys."""
+    cache_entry = object()
+
+    class FakeOutputsCache:
+        """Minimal outputs cache stub for persist fast-path tests."""
+
+        def __init__(self) -> None:
+            """Expose a cache-key-set marker for sync key generation."""
+            self.cache_key_set = object()
+
+        def get(self, node_id: str) -> Any:
+            """Return a placeholder cache entry for the target node."""
+            if node_id == "node_1":
+                return cache_entry
+            return None
+
+    executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=FakeOutputsCache()))
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_key_from_key_set_sync",
+        lambda cache_key_set, node_id: "NC_existing" if node_id == "node_1" else None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_serialize_node_output_cache_entry",
+        lambda cache_entry, max_bytes: (_ for _ in ()).throw(
+            AssertionError("restored-hit should skip before serialization")
+        ),
+    )
+
+    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
+        executor,
+        prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
+        cache_store={},
+        restored_cache_keys_by_node_id={"node_1": "NC_existing"},
+    )
+
+    assert persisted_nodes == []
+
+
+def test_modal_cloud_restores_persisted_node_cache_entries_in_parallel(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Prepared-cache restore should overlap independent distributed lookups."""
+    in_flight_gets = 0
+    max_in_flight_gets = 0
+    restored_values: dict[str, Any] = {}
+
+    class FakeOutputsCache:
+        """Minimal outputs cache stub for restore concurrency tests."""
+
+        def __init__(self) -> None:
+            """Expose the cache-key-set marker read by restore."""
+            self.cache_key_set = object()
+
+        def get(self, node_id: str) -> Any:
+            """Return any previously restored entry."""
+            return restored_values.get(node_id)
+
+        def set(self, node_id: str, cache_entry: Any) -> None:
+            """Record one restored cache entry."""
+            restored_values[node_id] = cache_entry
+
+    async def fake_key_from_key_set(cache_key_set: Any, node_id: str) -> str:
+        """Yield briefly so multiple node lookups can queue together."""
+        del cache_key_set
+        await asyncio.sleep(0)
+        return f"NC_{node_id}"
+
+    async def fake_store_get(cache_store: Any, cache_key: str) -> Any:
+        """Track how many distributed cache reads overlap."""
+        nonlocal in_flight_gets, max_in_flight_gets
+        del cache_store
+        in_flight_gets += 1
+        max_in_flight_gets = max(max_in_flight_gets, in_flight_gets)
+        await asyncio.sleep(0.01)
+        in_flight_gets -= 1
+        return {"cache_key": cache_key}
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_key_from_key_set_async",
+        fake_key_from_key_set,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_store_get",
+        fake_store_get,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_deserialize_node_output_cache_entry",
+        lambda execution, record: record,
+    )
+    monkeypatch.setattr(modal_cloud_module, "_emit_cloud_info", lambda *args: None)
+
+    outputs_cache = FakeOutputsCache()
+    restored_node_ids = asyncio.run(
+        modal_cloud_module._restore_persisted_node_output_cache_entries_into_prepared_cache(
+            object(),
+            outputs_cache,
+            prompt={
+                "node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 1}},
+                "node_2": {"class_type": "PersistentCacheNode", "inputs": {"value": 2}},
+                "node_3": {"class_type": "PersistentCacheNode", "inputs": {"value": 3}},
+            },
+            cache_store={},
+        )
+    )
+
+    assert restored_node_ids == ["node_1", "node_2", "node_3"]
+    assert max_in_flight_gets >= 2
+    assert restored_values == {
+        "node_1": {"cache_key": "NC_node_1"},
+        "node_2": {"cache_key": "NC_node_2"},
+        "node_3": {"cache_key": "NC_node_3"},
+    }
+
+
 def test_modal_cloud_materializes_synced_asset_paths(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -3218,6 +5718,70 @@ class _BoundarySinkNode:
     def run(self, value: int) -> tuple[int]:
         """Double the upstream value."""
         return (value * 2,)
+
+
+class _PrimitiveEchoNode:
+    """Simple node used to verify primitive widget coercion."""
+
+    RETURN_TYPES = ("INT", "FLOAT", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("steps", "cfg", "enabled", "label")
+    OUTPUT_IS_LIST = (False, False, False, False)
+    FUNCTION = "run"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str]]]:
+        """Return one primitive input of each V1 widget type."""
+        return {
+            "required": {
+                "steps": ("INT",),
+                "cfg": ("FLOAT",),
+                "enabled": ("BOOLEAN",),
+                "label": ("STRING",),
+            }
+        }
+
+    def run(
+        self,
+        steps: int,
+        cfg: float,
+        enabled: bool,
+        label: str,
+    ) -> tuple[int, float, bool, str]:
+        """Echo primitive inputs after asserting their coerced Python types."""
+        assert isinstance(steps, int)
+        assert isinstance(cfg, float)
+        assert isinstance(enabled, bool)
+        assert isinstance(label, str)
+        return (steps, cfg, enabled, label)
+
+
+class _ImplicitBatchListSourceNode:
+    """Fake node that consumes a whole list once and emits scalar and list outputs."""
+
+    RETURN_TYPES = ("INT", "INT")
+    RETURN_NAMES = ("first_value", "all_values")
+    OUTPUT_IS_LIST = (False, True)
+    INPUT_IS_LIST = True
+    FUNCTION = "run"
+
+
+class _ImplicitBatchScalarConsumerNode:
+    """Fake scalar consumer used for outer implicit batch regressions."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "run"
+
+
+class _ImplicitBatchListConsumerNode:
+    """Fake list-aware consumer used for outer implicit batch regressions."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (True,)
+    INPUT_IS_LIST = True
+    FUNCTION = "run"
 
 
 def test_local_remote_app_executes_subgraph_payload(
@@ -3401,6 +5965,43 @@ def test_apply_boundary_inputs_normalizes_wrapped_scalar_values(
         ("modal_cloud_module",),
     ],
 )
+def test_apply_boundary_inputs_preserves_singleton_conditioning_lists(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Boundary input hydration must not flatten singleton CONDITIONING payloads."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    conditioning = [["cond", {"pooled_output": None}]]
+    prompt = {
+        "remote_1": {
+            "class_type": "BoundarySource",
+            "inputs": {"value": 0},
+            "_meta": {},
+        }
+    }
+
+    target_module._apply_boundary_inputs(
+        prompt=prompt,
+        boundary_input_specs=[
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "remote_1", "input_name": "value"}],
+            }
+        ],
+        hydrated_inputs={"remote_input_0": conditioning},
+    )
+
+    assert prompt["remote_1"]["inputs"]["value"] == conditioning
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
 def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
     request: Any,
     module_fixture_name: str,
@@ -3420,6 +6021,146 @@ def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
             prompt,
             {"BoundarySource": _BoundarySourceNode},
         )
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_validate_prompt_input_shapes_allows_boundary_supplied_list_on_primitive_socket(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Boundary-fed primitive lists should pass through so ComfyUI can map over them normally."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    prompt = {
+        "remote_1": {
+            "class_type": "BoundarySource",
+            "inputs": {"value": [4, 5]},
+            "_meta": {},
+        }
+    }
+
+    target_module._validate_prompt_input_shapes(
+        prompt,
+        {"BoundarySource": _BoundarySourceNode},
+        [
+            {
+                "proxy_input_name": "remote_input_0",
+                "targets": [{"node_id": "remote_1", "input_name": "value"}],
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_coerce_prompt_primitive_input_values_matches_comfyui_semantics(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Remote runtimes should coerce primitive prompt literals the same way ComfyUI does."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    prompt = {
+        "remote_1": {
+            "class_type": "PrimitiveEcho",
+            "inputs": {
+                "steps": 18.0,
+                "cfg": 5,
+                "enabled": 1,
+                "label": 7,
+            },
+            "_meta": {},
+        }
+    }
+
+    target_module._coerce_prompt_primitive_input_values(
+        prompt,
+        {"PrimitiveEcho": _PrimitiveEchoNode},
+    )
+
+    assert prompt["remote_1"]["inputs"] == {
+        "steps": 18,
+        "cfg": 5.0,
+        "enabled": True,
+        "label": "7",
+    }
+    assert isinstance(prompt["remote_1"]["inputs"]["steps"], int)
+    assert isinstance(prompt["remote_1"]["inputs"]["cfg"], float)
+    assert isinstance(prompt["remote_1"]["inputs"]["enabled"], bool)
+    assert isinstance(prompt["remote_1"]["inputs"]["label"], str)
+
+
+def test_local_remote_app_coerces_primitive_widget_literals_before_execution(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+) -> None:
+    """The local fallback runner should coerce primitive widget literals before executing nodes."""
+    payload = remote_modal_app_module.execute_subgraph_locally(
+        payload={
+            "payload_kind": "subgraph",
+            "component_id": "component-primitive-coercion",
+            "subgraph_prompt": {
+                "remote_1": {
+                    "class_type": "PrimitiveEcho",
+                    "inputs": {
+                        "steps": 18.0,
+                        "cfg": 5,
+                        "enabled": 1,
+                        "label": 7,
+                    },
+                    "_meta": {},
+                }
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "steps",
+                    "node_id": "remote_1",
+                    "output_index": 0,
+                    "io_type": "INT",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "cfg",
+                    "node_id": "remote_1",
+                    "output_index": 1,
+                    "io_type": "FLOAT",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "enabled",
+                    "node_id": "remote_1",
+                    "output_index": 2,
+                    "io_type": "BOOLEAN",
+                    "is_list": False,
+                },
+                {
+                    "proxy_output_name": "label",
+                    "node_id": "remote_1",
+                    "output_index": 3,
+                    "io_type": "STRING",
+                    "is_list": False,
+                },
+            ],
+            "execute_node_ids": ["remote_1"],
+            "extra_data": {},
+            "custom_nodes_bundle": None,
+        },
+        kwargs_payload="{}",
+        node_mapping={"PrimitiveEcho": _PrimitiveEchoNode},
+    )
+
+    outputs = serialization_module.deserialize_node_outputs(payload)
+    assert outputs == (18, 5.0, True, "7")
 
 
 @pytest.mark.parametrize(

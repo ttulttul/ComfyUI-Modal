@@ -123,6 +123,83 @@ def test_settings_reads_interrupt_dict_name_override(
     assert settings.interrupt_dict_name == "custom-interrupt-store"
 
 
+def test_settings_defaults_node_cache_dict_name_from_app_name(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The shared node-cache dict should default to one derived from the app name."""
+    monkeypatch.setenv("COMFY_MODAL_APP_NAME", "my-modal-app")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.node_output_cache_dict_name == "my-modal-app-node-cache"
+
+
+def test_settings_defaults_session_bridge_dict_name_from_app_name(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The durable session-bridge dict should default to one derived from the app name."""
+    monkeypatch.setenv("COMFY_MODAL_APP_NAME", "my-modal-app")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.session_bridge_dict_name == "my-modal-app-session-bridges"
+
+
+def test_settings_defaults_node_cache_max_bytes_to_five_mib(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The distributed node-cache size cap should default to 5 MiB."""
+    monkeypatch.delenv("COMFY_MODAL_NODE_CACHE_MAX_BYTES", raising=False)
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.node_output_cache_max_bytes == 5 * 1024 * 1024
+
+
+def test_settings_reads_node_cache_overrides(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The shared node-cache dict name and size limit should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_NODE_CACHE_DICT_NAME", "custom-node-cache")
+    monkeypatch.setenv("COMFY_MODAL_NODE_CACHE_MAX_BYTES", "123456")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.node_output_cache_dict_name == "custom-node-cache"
+    assert settings.node_output_cache_max_bytes == 123456
+
+
+def test_settings_reads_session_bridge_dict_name_override(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The durable session-bridge dict name should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_SESSION_BRIDGE_DICT_NAME", "custom-session-bridges")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.session_bridge_dict_name == "custom-session-bridges"
+
+
 def test_settings_reads_terminate_container_on_error_override(
     settings_module: Any,
     monkeypatch: Any,

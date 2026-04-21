@@ -119,6 +119,12 @@ def settings_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def session_state_module(extension_package: object) -> object:
+    """Return the prompt-scoped remote session helpers module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.session_state")
+
+
+@pytest.fixture(scope="session")
 def sync_engine_module(extension_package: object) -> object:
     """Return the sync engine module."""
     return importlib.import_module(f"{PACKAGE_NAME}.sync_engine")
@@ -146,6 +152,8 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.delenv("COMFY_MODAL_MAX_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_BUFFER_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_ENABLE_PROACTIVE_WARMUP", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_SESSION_BRIDGE_DICT_NAME", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_SCALEDOWN_WINDOW", raising=False)
     monkeypatch.delenv("COMFY_MODAL_MIN_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFYUI_ROOT", raising=False)

@@ -1,15 +1,18 @@
 """Remote Modal runtime and local execution fallback."""
 
-from __future__ import annotations
-
 import asyncio
 import copy
 from dataclasses import dataclass, field
+import importlib
 import importlib.util
 from io import BytesIO
 import logging
 import os
 import queue
+import select
+import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -26,9 +29,23 @@ from ..serialization import (
     deserialize_value,
     deserialize_node_inputs,
     deserialize_node_outputs,
+    serialize_mapping,
     split_mapped_value,
     serialize_node_outputs,
     serialize_node_inputs,
+)
+from ..session_state import (
+    InMemoryRemoteSessionBridgeStore,
+    InMemoryRemoteSessionStore,
+    RemoteSessionBridgeRecord,
+    RemoteSessionBridgeRef,
+    RemoteSessionHandle,
+    RemoteSessionStateError,
+    RemoteSessionValueRef,
+    is_remote_session_bridge_ref_payload,
+    is_remote_session_handle_payload,
+    is_remote_session_value_ref_payload,
+    stable_session_bridge_key,
 )
 from ..settings import get_settings
 
@@ -44,6 +61,14 @@ _PROMPT_WARMUP_STATES_LOCK = threading.Lock()
 _PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
 _PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
 _PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
+_PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
+_BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
+_REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()
+_REMOTE_CONTAINER_LOG_STREAMS: dict[str, "_RemoteContainerLogStreamState"] = {}
+_REMOTE_CONTAINER_LOG_STDERR_LOCK = threading.Lock()
+_REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
+_REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
+_REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
 
 
 @dataclass
@@ -52,6 +77,24 @@ class _PromptWarmupState:
 
     scheduled_slots: set[int] = field(default_factory=set)
     exact_component_parallelism: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class _RemoteContainerLogLineBuffer:
+    """Buffer partial remote log lines so stderr mirroring stays line-oriented."""
+
+    task_id: str
+    buffered_text: str = ""
+
+
+@dataclass
+class _RemoteContainerLogStreamState:
+    """Track one active local watcher mirroring logs for a Modal container."""
+
+    task_id: str
+    stop_event: threading.Event
+    thread: threading.Thread
+    refcount: int = 0
 
 
 def _remote_modal_call_worker_count() -> int:
@@ -75,6 +118,459 @@ class RemoteSubgraphExecutionError(RuntimeError):
 
 class ModalRemoteInvocationError(RuntimeError):
     """Raised when the Modal client cannot invoke the remote runtime."""
+
+
+def _is_remote_container_log_stream_enabled() -> bool:
+    """Return whether remote Modal container logs should be mirrored locally."""
+    return bool(get_settings().stream_remote_container_logs)
+
+
+def _coerce_modal_task_id(value: Any) -> str | None:
+    """Normalize one streamed Modal task id into a non-empty string."""
+    if value is None:
+        return None
+    task_id = str(value).strip()
+    return task_id or None
+
+
+def _write_remote_container_log_line(
+    task_id: str,
+    line: str,
+    *,
+    stream: Any = None,
+) -> None:
+    """Write one complete remote container log line to the local stderr stream."""
+    target_stream = stream if stream is not None else sys.stderr
+    with _REMOTE_CONTAINER_LOG_STDERR_LOCK:
+        target_stream.write(f"[modal:{task_id}] {line}")
+        target_stream.flush()
+
+
+def _write_remote_container_log_chunk(
+    line_buffer: _RemoteContainerLogLineBuffer,
+    chunk: str,
+    *,
+    stream: Any = None,
+) -> None:
+    """Buffer one remote log chunk and mirror complete lines to local stderr."""
+    line_buffer.buffered_text += chunk
+    while True:
+        newline_index = line_buffer.buffered_text.find("\n")
+        if newline_index < 0:
+            return
+        next_line = line_buffer.buffered_text[: newline_index + 1]
+        line_buffer.buffered_text = line_buffer.buffered_text[newline_index + 1 :]
+        _write_remote_container_log_line(line_buffer.task_id, next_line, stream=stream)
+
+
+def _flush_remote_container_log_chunk(
+    line_buffer: _RemoteContainerLogLineBuffer,
+    *,
+    stream: Any = None,
+) -> None:
+    """Flush any partial remote log text remaining in the local line buffer."""
+    if not line_buffer.buffered_text:
+        return
+    _write_remote_container_log_line(
+        line_buffer.task_id,
+        f"{line_buffer.buffered_text}\n",
+        stream=stream,
+    )
+    line_buffer.buffered_text = ""
+
+
+async def _close_modal_client(client: Any) -> None:
+    """Close one Modal SDK client if the concrete client exposes a close hook."""
+    close_callable = getattr(client, "aclose", None)
+    if callable(close_callable):
+        close_result = close_callable()
+        if asyncio.iscoroutine(close_result):
+            await close_result
+        return
+
+    close_callable = getattr(client, "close", None)
+    if callable(close_callable):
+        close_result = close_callable()
+        if asyncio.iscoroutine(close_result):
+            await close_result
+
+
+async def _stream_remote_container_logs_via_modal_sdk_async(
+    task_id: str,
+    stop_event: threading.Event,
+) -> None:
+    """Follow one Modal container log stream through the Python SDK internals."""
+    if modal is None:
+        raise ModuleNotFoundError("Modal SDK is unavailable.")
+
+    client_module = importlib.import_module("modal.client")
+    exception_module = importlib.import_module("modal.exception")
+    api_pb2 = importlib.import_module("modal_proto.api_pb2")
+    grpclib_exceptions = importlib.import_module("grpclib.exceptions")
+    client = await client_module._Client.from_env()
+    line_buffer = _RemoteContainerLogLineBuffer(task_id=task_id)
+    last_entry_id = ""
+
+    try:
+        while not stop_event.is_set():
+            request = api_pb2.AppGetLogsRequest(
+                task_id=task_id,
+                timeout=5,
+                last_entry_id=last_entry_id,
+            )
+            try:
+                async for log_batch in client.stub.AppGetLogs.unary_stream(request):
+                    if stop_event.is_set():
+                        break
+                    if log_batch.entry_id:
+                        last_entry_id = str(log_batch.entry_id)
+                    if bool(log_batch.app_done):
+                        logger.info("Modal SDK log stream finished for task_id=%s.", task_id)
+                        return
+                    for log_item in log_batch.items:
+                        log_data = getattr(log_item, "data", "")
+                        if not log_data:
+                            continue
+                        _write_remote_container_log_chunk(line_buffer, str(log_data))
+            except (
+                exception_module.ServiceError,
+                exception_module.InternalError,
+                grpclib_exceptions.StreamTerminatedError,
+                socket.gaierror,
+            ) as exc:
+                if stop_event.is_set():
+                    break
+                logger.warning(
+                    "Retrying Modal SDK log stream for task_id=%s after transient failure: %s",
+                    task_id,
+                    exc,
+                )
+                continue
+            except AttributeError as exc:
+                if stop_event.is_set():
+                    break
+                if "_write_appdata" in str(exc):
+                    logger.warning(
+                        "Retrying Modal SDK log stream for task_id=%s after connection loss: %s",
+                        task_id,
+                        exc,
+                    )
+                    continue
+                raise
+    finally:
+        _flush_remote_container_log_chunk(line_buffer)
+        await _close_modal_client(client)
+
+
+def _stream_remote_container_logs_via_modal_sdk(
+    task_id: str,
+    stop_event: threading.Event,
+) -> bool:
+    """Try to mirror one Modal container log stream through the installed SDK."""
+    if modal is None:
+        return False
+    asyncio.run(_stream_remote_container_logs_via_modal_sdk_async(task_id, stop_event))
+    return True
+
+
+def _stream_remote_container_logs_via_modal_cli(
+    task_id: str,
+    stop_event: threading.Event,
+) -> bool:
+    """Try to mirror one Modal container log stream through the Modal CLI."""
+    modal_cli = shutil.which("modal")
+    if modal_cli is None:
+        return False
+
+    command = [modal_cli, "container", "logs", task_id, "-f"]
+    line_buffer = _RemoteContainerLogLineBuffer(task_id=task_id)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    line_buffer = _RemoteContainerLogLineBuffer(task_id=task_id)
+    try:
+        stdout_stream = process.stdout
+        if stdout_stream is None:
+            raise RuntimeError("Modal CLI log process did not expose a stdout stream.")
+        while not stop_event.is_set():
+            ready_streams, _, _ = select.select([stdout_stream], [], [], 0.25)
+            if ready_streams:
+                next_chunk = stdout_stream.read(4096)
+                if next_chunk:
+                    _write_remote_container_log_chunk(
+                        line_buffer,
+                        next_chunk.decode("utf-8", errors="replace"),
+                    )
+                    continue
+            if process.poll() is not None:
+                trailing_chunk = stdout_stream.read()
+                if trailing_chunk:
+                    _write_remote_container_log_chunk(
+                        line_buffer,
+                        trailing_chunk.decode("utf-8", errors="replace"),
+                    )
+                break
+        if stop_event.is_set() and process.poll() is None:
+            process.terminate()
+    finally:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+        _flush_remote_container_log_chunk(line_buffer)
+
+    if process.returncode not in {0, None} and not stop_event.is_set():
+        raise RuntimeError(
+            f"Modal CLI exited with status {process.returncode} while streaming logs for task_id={task_id}."
+        )
+    return True
+
+
+def _run_remote_container_log_stream(task_id: str, stop_event: threading.Event) -> None:
+    """Run the best available remote log streaming backend for one Modal container."""
+    logger.info("Starting remote Modal container log stream for task_id=%s.", task_id)
+    try:
+        if _stream_remote_container_logs_via_modal_cli(task_id, stop_event):
+            logger.info("Stopped remote Modal container log stream for task_id=%s.", task_id)
+            return
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning(
+            "Falling back from Modal CLI log streaming for task_id=%s after failure: %s",
+            task_id,
+            exc,
+        )
+
+    try:
+        if _stream_remote_container_logs_via_modal_sdk(task_id, stop_event):
+            logger.info("Stopped remote Modal container log stream for task_id=%s.", task_id)
+            return
+    except (AttributeError, ImportError, ModuleNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Modal SDK log streaming failed for task_id=%s: %s",
+            task_id,
+            exc,
+        )
+
+    logger.warning(
+        "Unable to mirror remote Modal container logs for task_id=%s because neither the Modal SDK nor CLI is available locally.",
+        task_id,
+    )
+
+
+def _retain_remote_container_log_stream(task_id: str) -> str:
+    """Increment one shared Modal container log watcher and start it if needed."""
+    with _REMOTE_CONTAINER_LOG_STREAMS_LOCK:
+        stream_state = _REMOTE_CONTAINER_LOG_STREAMS.get(task_id)
+        if stream_state is None:
+            stop_event = threading.Event()
+            stream_state = _RemoteContainerLogStreamState(
+                task_id=task_id,
+                stop_event=stop_event,
+                thread=threading.Thread(
+                    target=_run_remote_container_log_stream,
+                    args=(task_id, stop_event),
+                    name=f"modal-log-stream-{task_id}",
+                    daemon=True,
+                ),
+            )
+            _REMOTE_CONTAINER_LOG_STREAMS[task_id] = stream_state
+            logger.info("Creating remote Modal container log stream for task_id=%s.", task_id)
+            stream_state.thread.start()
+        elif not stream_state.thread.is_alive() and stream_state.refcount == 0:
+            stop_event = threading.Event()
+            stream_state = _RemoteContainerLogStreamState(
+                task_id=task_id,
+                stop_event=stop_event,
+                thread=threading.Thread(
+                    target=_run_remote_container_log_stream,
+                    args=(task_id, stop_event),
+                    name=f"modal-log-stream-{task_id}",
+                    daemon=True,
+                ),
+            )
+            _REMOTE_CONTAINER_LOG_STREAMS[task_id] = stream_state
+            logger.info("Restarting remote Modal container log stream for task_id=%s.", task_id)
+            stream_state.thread.start()
+        else:
+            logger.info("Reusing remote Modal container log stream for task_id=%s.", task_id)
+        stream_state.refcount += 1
+        logger.info(
+            "Remote Modal container log stream retain task_id=%s refcount=%d.",
+            task_id,
+            stream_state.refcount,
+        )
+
+    return task_id
+
+
+def _release_remote_container_log_stream(task_id: str) -> None:
+    """Release one retained Modal container log watcher when a payload finishes."""
+    stream_state: _RemoteContainerLogStreamState | None = None
+    should_stop = False
+    with _REMOTE_CONTAINER_LOG_STREAMS_LOCK:
+        stream_state = _REMOTE_CONTAINER_LOG_STREAMS.get(task_id)
+        if stream_state is None:
+            return
+        stream_state.refcount = max(0, stream_state.refcount - 1)
+        logger.info(
+            "Remote Modal container log stream release task_id=%s refcount=%d.",
+            task_id,
+            stream_state.refcount,
+        )
+        if stream_state.refcount == 0:
+            should_stop = True
+            _REMOTE_CONTAINER_LOG_STREAMS.pop(task_id, None)
+
+    if should_stop and stream_state is not None:
+        logger.info("Stopping remote Modal container log stream for task_id=%s.", task_id)
+        stream_state.stop_event.set()
+        stream_state.thread.join(timeout=0.2)
+
+
+def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHandle | None:
+    """Return the decoded prompt-scoped remote session handle for one payload."""
+    remote_session = payload.get("remote_session")
+    if not is_remote_session_handle_payload(remote_session):
+        return None
+    return RemoteSessionHandle.from_payload(remote_session)
+
+
+def _sanitize_payload_for_session_bridge_record(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip run-scoped fields from one producer payload before persisting replay metadata."""
+    sanitized_payload = copy.deepcopy(payload)
+    sanitized_payload.pop("prompt_id", None)
+    sanitized_payload.pop("remote_session", None)
+    sanitized_payload.pop("clear_remote_session", None)
+    sanitized_payload["extra_data"] = {}
+    return sanitized_payload
+
+
+def _build_remote_session_bridge_record(
+    *,
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    node_id: str,
+    output_index: int,
+) -> RemoteSessionBridgeRecord:
+    """Build one durable bridge record for a session-backed boundary output."""
+    producer_payload = _sanitize_payload_for_session_bridge_record(payload)
+    producer_inputs = serialize_mapping(hydrated_inputs)
+    return RemoteSessionBridgeRecord(
+        bridge_key=stable_session_bridge_key(
+            producer_payload=producer_payload,
+            producer_inputs=producer_inputs,
+            node_id=node_id,
+            output_index=output_index,
+        ),
+        node_id=node_id,
+        output_index=output_index,
+        producer_payload=producer_payload,
+        producer_inputs=producer_inputs,
+    )
+
+
+def _remote_session_bridge_replay_stack() -> set[str]:
+    """Return the thread-local guard set for bridge replay recursion detection."""
+    replay_stack = getattr(_REMOTE_SESSION_BRIDGE_REPLAY_STATE, "bridge_keys", None)
+    if replay_stack is None:
+        replay_stack = set()
+        _REMOTE_SESSION_BRIDGE_REPLAY_STATE.bridge_keys = replay_stack
+    return replay_stack
+
+
+def _rehydrate_remote_session_bridge_value(
+    ref: RemoteSessionBridgeRef,
+    *,
+    target_session_handle: RemoteSessionHandle | None,
+    node_mapping: dict[str, type[Any]] | None = None,
+) -> Any:
+    """Replay one producer phase into the current session when the live value is gone."""
+    if target_session_handle is None:
+        raise RemoteSessionStateError(
+            "Remote session bridge replay requires a target remote_session handle."
+        )
+
+    replay_stack = _remote_session_bridge_replay_stack()
+    if ref.bridge_key in replay_stack:
+        raise RemoteSessionStateError(
+            f"Detected recursive remote session bridge replay for {ref.bridge_key!r}."
+        )
+
+    record = _REMOTE_SESSION_BRIDGE_STORE.get_record(ref.bridge_key)
+    replay_payload = copy.deepcopy(record.producer_payload)
+    replay_payload["remote_session"] = target_session_handle.to_payload()
+    replay_payload.pop("clear_remote_session", None)
+    if target_session_handle.prompt_id is not None:
+        replay_payload["prompt_id"] = target_session_handle.prompt_id
+    replay_inputs = deserialize_node_inputs(record.producer_inputs)
+
+    logger.info(
+        "Replaying remote session bridge bridge_key=%s into session_id=%s via component=%s.",
+        ref.bridge_key,
+        target_session_handle.session_id,
+        replay_payload.get("component_id"),
+    )
+    replay_stack.add(ref.bridge_key)
+    try:
+        _execute_subgraph_prompt(replay_payload, replay_inputs, node_mapping)
+    finally:
+        replay_stack.remove(ref.bridge_key)
+
+    return _REMOTE_SESSION_STORE.get_output(
+        RemoteSessionValueRef(
+            session_id=target_session_handle.session_id,
+            node_id=ref.node_id,
+            output_index=ref.output_index,
+        )
+    )
+
+
+def _resolve_remote_session_inputs(
+    hydrated_inputs: dict[str, Any],
+    *,
+    component_id: str | None = None,
+    target_session_handle: RemoteSessionHandle | None = None,
+    node_mapping: dict[str, type[Any]] | None = None,
+) -> dict[str, Any]:
+    """Resolve any remote-session value refs embedded in boundary inputs."""
+    ref_input_names = [
+        input_name
+        for input_name, input_value in hydrated_inputs.items()
+        if is_remote_session_value_ref_payload(input_value)
+        or is_remote_session_bridge_ref_payload(input_value)
+    ]
+    if ref_input_names:
+        logger.info(
+            "Resolving %d remote session input refs for component=%s inputs=%s.",
+            len(ref_input_names),
+            component_id or "<unknown>",
+            sorted(ref_input_names),
+        )
+    return {
+        input_name: _REMOTE_SESSION_STORE.resolve_value_with_bridges(
+            input_value,
+            target_session_handle=target_session_handle,
+            bridge_resolver=lambda ref: _rehydrate_remote_session_bridge_value(
+                ref,
+                target_session_handle=target_session_handle,
+                node_mapping=node_mapping,
+            ),
+        )
+        for input_name, input_value in hydrated_inputs.items()
+    }
+
+
+def _remote_session_affinity_key(payload: dict[str, Any]) -> str | None:
+    """Return the affinity key that should keep split proxy calls on one remote worker."""
+    session_handle = _payload_remote_session_handle(payload)
+    if session_handle is None:
+        return None
+    return session_handle.session_id
 
 
 class _NullPromptServer:
@@ -218,6 +714,11 @@ def _apply_boundary_inputs(
         if proxy_input_name not in hydrated_inputs:
             raise KeyError(f"Missing hydrated boundary input {proxy_input_name!r}.")
         value = hydrated_inputs[proxy_input_name]
+        io_type = (
+            str(boundary_input["io_type"])
+            if boundary_input.get("io_type") is not None
+            else None
+        )
         logger.info(
             "Applying boundary input %s to %d targets.",
             proxy_input_name,
@@ -226,7 +727,16 @@ def _apply_boundary_inputs(
         for target in boundary_input.get("targets", []):
             node_id = str(target["node_id"])
             input_name = str(target["input_name"])
-            prompt[node_id]["inputs"][input_name] = _normalize_prompt_input_value(value)
+            prompt_node = prompt[node_id]
+            prompt_node["inputs"][input_name] = _normalize_prompt_input_value(
+                value,
+                io_type=io_type,
+            )
+            source_signature = boundary_input.get("source_signature")
+            if isinstance(source_signature, str) and source_signature:
+                boundary_signatures = prompt_node.setdefault(_BOUNDARY_INPUT_SIGNATURES_KEY, {})
+                if isinstance(boundary_signatures, dict):
+                    boundary_signatures[input_name] = source_signature
 
 
 def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
@@ -294,12 +804,98 @@ def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
     return input_type_map
 
 
-def _validate_prompt_input_shapes(
+def _coerce_primitive_prompt_input_value(
+    *,
+    node_id: str,
+    class_type: str,
+    input_name: str,
+    declared_type: str,
+    input_value: Any,
+) -> Any:
+    """Coerce one primitive prompt literal using ComfyUI's `validate_inputs` semantics."""
+    literal_value = (
+        input_value.get("__value__")
+        if isinstance(input_value, dict) and "__value__" in input_value
+        else input_value
+    )
+    if isinstance(literal_value, list):
+        return input_value
+
+    try:
+        if declared_type == "INT":
+            return int(literal_value)
+        if declared_type == "FLOAT":
+            return float(literal_value)
+        if declared_type == "STRING":
+            return str(literal_value)
+        if declared_type == "BOOLEAN":
+            return bool(literal_value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise RemoteSubgraphExecutionError(
+            "Remote subgraph input could not be coerced to the declared primitive socket type."
+            f" node_id={node_id!r} node_type={class_type!r}"
+            f" input_name={input_name!r} declared_type={declared_type!r}"
+            f" received_value={literal_value!r}"
+        ) from exc
+
+    return input_value
+
+
+def _coerce_prompt_primitive_input_values(
     prompt: dict[str, Any],
     node_mapping: dict[str, type[Any]],
 ) -> None:
+    """Mutate prompt literals in-place to match ComfyUI's primitive widget coercion."""
+    for node_id, prompt_node in sorted(prompt.items()):
+        class_type = str(prompt_node.get("class_type"))
+        node_class = node_mapping.get(class_type)
+        if node_class is None:
+            continue
+        input_type_map = _node_input_type_map(node_class)
+        if not input_type_map:
+            continue
+        inputs = prompt_node.get("inputs") or {}
+        for input_name, input_value in list(inputs.items()):
+            declared_type = input_type_map.get(str(input_name))
+            if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
+                continue
+            if (
+                isinstance(input_value, list)
+                and len(input_value) == 2
+                and isinstance(input_value[0], str)
+            ):
+                continue
+            coerced_value = _coerce_primitive_prompt_input_value(
+                node_id=str(node_id),
+                class_type=class_type,
+                input_name=str(input_name),
+                declared_type=declared_type,
+                input_value=input_value,
+            )
+            if coerced_value is not input_value:
+                logger.debug(
+                    "Coerced remote primitive input %s.%s from %r to %r for type %s.",
+                    node_id,
+                    input_name,
+                    input_value,
+                    coerced_value,
+                    declared_type,
+                )
+                inputs[input_name] = coerced_value
+
+
+def _validate_prompt_input_shapes(
+    prompt: dict[str, Any],
+    node_mapping: dict[str, type[Any]],
+    boundary_input_specs: list[dict[str, Any]] | None = None,
+) -> None:
     """Reject prompt inputs that still look invalid for primitive widget sockets."""
-    primitive_types = {"INT", "FLOAT", "BOOLEAN", "STRING"}
+    boundary_targets = {
+        (str(target.get("node_id")), str(target.get("input_name")))
+        for boundary_input in (boundary_input_specs or [])
+        for target in boundary_input.get("targets", [])
+        if target.get("node_id") is not None and target.get("input_name") is not None
+    }
     for node_id, prompt_node in sorted(prompt.items()):
         class_type = str(prompt_node.get("class_type"))
         node_class = node_mapping.get(class_type)
@@ -310,13 +906,15 @@ def _validate_prompt_input_shapes(
             continue
         for input_name, input_value in (prompt_node.get("inputs") or {}).items():
             declared_type = input_type_map.get(str(input_name))
-            if declared_type not in primitive_types:
+            if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
                 continue
             if (
                 isinstance(input_value, list)
                 and len(input_value) == 2
                 and isinstance(input_value[0], str)
             ):
+                continue
+            if (str(node_id), str(input_name)) in boundary_targets:
                 continue
             literal_value = (
                 input_value.get("__value__")
@@ -460,9 +1058,30 @@ def _normalize_link_output_index(value: Any) -> Any:
     return value
 
 
-def _normalize_prompt_input_value(value: Any) -> Any:
-    """Unwrap transport-added singleton lists around scalar prompt input values."""
-    while isinstance(value, list) and len(value) == 1:
+def _unwrap_wrapped_prompt_link(value: Any) -> Any:
+    """Collapse nested singleton wrappers around one serialized prompt link when present."""
+    candidate = value
+    while isinstance(candidate, list) and len(candidate) == 1:
+        candidate = candidate[0]
+    if _is_link(candidate):
+        return [candidate[0], _normalize_link_output_index(candidate[1])]
+    return value
+
+
+def _normalize_prompt_input_value(value: Any, io_type: str | None = None) -> Any:
+    """Unwrap transport-added singleton wrappers only for scalar-like prompt input values."""
+    wrapped_link = _unwrap_wrapped_prompt_link(value)
+    if wrapped_link is not value:
+        return wrapped_link
+    while (
+        isinstance(value, list)
+        and len(value) == 1
+        and (
+            io_type in _PRIMITIVE_WIDGET_INPUT_TYPES
+            or value[0] is None
+            or isinstance(value[0], bool | int | float | str)
+        )
+    ):
         value = value[0]
     if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
         return [value[0], _normalize_link_output_index(value[1])]
@@ -505,6 +1124,21 @@ def _execute_subgraph_with_mapping(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
+    session_handle = _payload_remote_session_handle(normalized_payload)
+    resolved_inputs = _resolve_remote_session_inputs(
+        dict(hydrated_inputs),
+        component_id=str(payload.get("component_id") or ""),
+        target_session_handle=session_handle,
+        node_mapping=node_mapping,
+    )
+    if session_handle is not None:
+        logger.info(
+            "Executing mapped remote subgraph %s with remote_session session_id=%s prompt_id=%s owner_component_id=%s.",
+            payload.get("component_id"),
+            session_handle.session_id,
+            session_handle.prompt_id,
+            session_handle.owner_component_id,
+        )
     prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s via test mapping with %d prompt nodes.",
@@ -514,9 +1148,14 @@ def _execute_subgraph_with_mapping(
     _apply_boundary_inputs(
         prompt=prompt,
         boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
-        hydrated_inputs=hydrated_inputs,
+        hydrated_inputs=resolved_inputs,
     )
-    _validate_prompt_input_shapes(prompt, node_mapping)
+    _coerce_prompt_primitive_input_values(prompt, node_mapping)
+    _validate_prompt_input_shapes(
+        prompt,
+        node_mapping,
+        list(normalized_payload.get("boundary_inputs", [])),
+    )
     required_node_ids = _resolve_required_subgraph_nodes(
         prompt=prompt,
         execute_node_ids=list(normalized_payload.get("execute_node_ids", [])),
@@ -573,7 +1212,32 @@ def _execute_subgraph_with_mapping(
             raise RemoteSubgraphExecutionError(
                 f"Remote subgraph did not execute boundary output node {node_id}."
             )
-        outputs.append(node_outputs[output_index])
+        output_value = node_outputs[output_index]
+        if bool(boundary_output.get("session_output")):
+            if session_handle is None:
+                raise RemoteSessionStateError(
+                    "Session-backed boundary outputs require payload.remote_session."
+                )
+            live_ref = _REMOTE_SESSION_STORE.put_output(
+                session_handle,
+                node_id=node_id,
+                output_index=output_index,
+                value=output_value,
+            )
+            bridge_record = _build_remote_session_bridge_record(
+                payload=normalized_payload,
+                hydrated_inputs=hydrated_inputs,
+                node_id=node_id,
+                output_index=output_index,
+            )
+            _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
+            output_value = RemoteSessionBridgeRef(
+                bridge_key=bridge_record.bridge_key,
+                node_id=node_id,
+                output_index=output_index,
+                session_id=live_ref.session_id,
+            ).to_payload()
+        outputs.append(output_value)
     logger.info(
         "Mapped remote subgraph %s produced %d exported outputs.",
         payload.get("component_id"),
@@ -594,6 +1258,21 @@ def _execute_subgraph_prompt(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
+    session_handle = _payload_remote_session_handle(normalized_payload)
+    resolved_inputs = _resolve_remote_session_inputs(
+        dict(hydrated_inputs),
+        component_id=str(payload.get("component_id") or ""),
+        target_session_handle=session_handle,
+        node_mapping=node_mapping,
+    )
+    if session_handle is not None:
+        logger.info(
+            "Executing PromptExecutor remote subgraph %s with remote_session session_id=%s prompt_id=%s owner_component_id=%s.",
+            payload.get("component_id"),
+            session_handle.session_id,
+            session_handle.prompt_id,
+            session_handle.owner_component_id,
+        )
     prompt = copy.deepcopy(normalized_payload["subgraph_prompt"])
     logger.info(
         "Executing remote subgraph %s through PromptExecutor with %d prompt nodes, %d boundary inputs, and %d exported outputs.",
@@ -605,11 +1284,16 @@ def _execute_subgraph_prompt(
     _apply_boundary_inputs(
         prompt=prompt,
         boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
-        hydrated_inputs=hydrated_inputs,
+        hydrated_inputs=resolved_inputs,
     )
     execution = _load_execution_module()
     resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
-    _validate_prompt_input_shapes(prompt, resolved_node_mapping)
+    _coerce_prompt_primitive_input_values(prompt, resolved_node_mapping)
+    _validate_prompt_input_shapes(
+        prompt,
+        resolved_node_mapping,
+        list(normalized_payload.get("boundary_inputs", [])),
+    )
 
     with _temporary_node_mapping(node_mapping):
         executor = execution.PromptExecutor(_NullPromptServer())
@@ -621,7 +1305,10 @@ def _execute_subgraph_prompt(
         )
         executor.execute(
             prompt=prompt,
-            prompt_id=str(payload.get("component_id", "modal-subgraph")),
+            prompt_id=str(
+                payload.get("prompt_id")
+                or payload.get("component_id", "modal-subgraph")
+            ),
             extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
             execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
         )
@@ -654,12 +1341,35 @@ def _execute_subgraph_prompt(
                 raise RemoteSubgraphExecutionError(
                     f"Remote subgraph output index {output_index} is missing for node {node_id}."
                 )
-            outputs.append(
-                _collapse_cache_slot(
-                    slot_values=cache_entry.outputs[output_index],
-                    is_list=bool(boundary_output.get("is_list", False)),
-                )
+            output_value = _collapse_cache_slot(
+                slot_values=cache_entry.outputs[output_index],
+                is_list=bool(boundary_output.get("is_list", False)),
             )
+            if bool(boundary_output.get("session_output")):
+                if session_handle is None:
+                    raise RemoteSessionStateError(
+                        "Session-backed boundary outputs require payload.remote_session."
+                    )
+                live_ref = _REMOTE_SESSION_STORE.put_output(
+                    session_handle,
+                    node_id=node_id,
+                    output_index=output_index,
+                    value=output_value,
+                )
+                bridge_record = _build_remote_session_bridge_record(
+                    payload=normalized_payload,
+                    hydrated_inputs=hydrated_inputs,
+                    node_id=node_id,
+                    output_index=output_index,
+                )
+                _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
+                output_value = RemoteSessionBridgeRef(
+                    bridge_key=bridge_record.bridge_key,
+                    node_id=node_id,
+                    output_index=output_index,
+                    session_id=live_ref.session_id,
+                ).to_payload()
+            outputs.append(output_value)
             logger.info(
                 "Collected exported output %s from node %s output %d.",
                 boundary_output.get("proxy_output_name"),
@@ -677,21 +1387,33 @@ def execute_subgraph_locally(
     """Execute a rewritten remote component in-process and return serialized outputs."""
     _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    session_handle = _payload_remote_session_handle(payload)
     logger.info(
-        "Executing local fallback subgraph %s with %d hydrated inputs.",
+        "Executing local fallback subgraph %s with %d hydrated inputs session_id=%s clear_remote_session=%s.",
         payload.get("component_id"),
         len(hydrated_inputs),
+        session_handle.session_id if session_handle is not None else None,
+        bool(payload.get("clear_remote_session")),
     )
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, node_mapping)
-        try:
-            outputs = future.result()
-        except Exception:
-            logger.exception(
-                "Local fallback subgraph %s raised while running in worker thread.",
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, node_mapping)
+            try:
+                outputs = future.result()
+            except Exception:
+                logger.exception(
+                    "Local fallback subgraph %s raised while running in worker thread.",
+                    payload.get("component_id"),
+                )
+                raise
+    finally:
+        if bool(payload.get("clear_remote_session")) and session_handle is not None:
+            logger.info(
+                "Clearing remote session after component=%s session_id=%s.",
                 payload.get("component_id"),
+                session_handle.session_id,
             )
-            raise
+            _REMOTE_SESSION_STORE.clear_session(session_handle)
     logger.info(
         "Local fallback subgraph %s completed with %d outputs.",
         payload.get("component_id"),
@@ -993,11 +1715,54 @@ def _should_forward_suppressed_stream_event(
     return str(reported_node_id) in allowed_node_ids
 
 
+def _progress_stream_event_node_id(stream_event: dict[str, Any]) -> str | None:
+    """Return the best node id to use for progress filtering and forwarding."""
+    for candidate in (
+        stream_event.get("real_node_id"),
+        stream_event.get("node_id"),
+        stream_event.get("display_node_id"),
+    ):
+        if candidate is None:
+            continue
+        candidate_text = str(candidate)
+        if candidate_text:
+            return candidate_text
+    return None
+
+
+def _progress_stream_event_metadata(stream_event: dict[str, Any]) -> dict[str, str | None] | None:
+    """Return normalized metadata for one streamed progress event."""
+    reported_node_id = (
+        str(stream_event["node_id"])
+        if stream_event.get("node_id") is not None
+        else None
+    )
+    display_node_id = (
+        str(stream_event["display_node_id"])
+        if stream_event.get("display_node_id") is not None
+        else reported_node_id
+    )
+    real_node_id = (
+        str(stream_event["real_node_id"])
+        if stream_event.get("real_node_id") is not None
+        else None
+    )
+    filter_node_id = real_node_id or reported_node_id or display_node_id
+    if filter_node_id is None:
+        return None
+    return {
+        "node_id": reported_node_id or filter_node_id,
+        "display_node_id": display_node_id,
+        "real_node_id": real_node_id,
+        "filter_node_id": filter_node_id,
+    }
+
+
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
     """Return whether the local client has enough context to mirror remote node progress."""
     extra_data = payload.get("extra_data") or {}
     return (
-        payload.get("payload_kind") == "subgraph"
+        payload.get("payload_kind") in {"subgraph", "mapped_subgraph"}
         and isinstance(payload.get("prompt_id"), str)
         and bool(payload.get("prompt_id"))
         and isinstance(extra_data.get("client_id"), str)
@@ -1177,204 +1942,265 @@ def _consume_remote_payload_stream(
     node_ids = [str(node_id) for node_id in payload.get("component_node_ids", [])]
     suppress_status_stream = bool(payload.get("suppress_status_stream"))
     result_payload: bytes | bytearray | None = None
+    suppressed_progress_node_metadata: dict[str, dict[str, str | None]] = {}
+    active_remote_log_task_id: str | None = None
 
-    for stream_event in stream_events:
-        event_kind = str(stream_event.get("kind", ""))
-        if event_kind == "progress":
-            event_type = str(stream_event.get("event_type", ""))
-            if event_type == "node_progress":
-                lane_id = (
-                    str(payload["mapped_progress_lane_id"])
-                    if payload.get("mapped_progress_lane_id") is not None
-                    else None
-                )
-                if suppress_status_stream and lane_id is None:
+    try:
+        for stream_event in stream_events:
+            event_kind = str(stream_event.get("kind", ""))
+            if event_kind == "remote_logs":
+                task_id = _coerce_modal_task_id(stream_event.get("task_id"))
+                if (
+                    task_id is not None
+                    and active_remote_log_task_id is None
+                    and _is_remote_container_log_stream_enabled()
+                ):
+                    active_remote_log_task_id = _retain_remote_container_log_stream(task_id)
+                continue
+            if event_kind == "progress":
+                event_type = str(stream_event.get("event_type", ""))
+                if event_type == "node_progress":
+                    progress_metadata = _progress_stream_event_metadata(stream_event)
+                    filter_node_id = (
+                        progress_metadata["filter_node_id"] if progress_metadata is not None else None
+                    )
+                    lane_id = (
+                        str(stream_event["lane_id"])
+                        if stream_event.get("lane_id") is not None
+                        else (
+                            str(payload["mapped_progress_lane_id"])
+                            if payload.get("mapped_progress_lane_id") is not None
+                            else None
+                        )
+                    )
+                    aggregate_only = bool(stream_event.get("aggregate_only", False))
+                    if (
+                        suppress_status_stream
+                        and lane_id is None
+                        and not aggregate_only
+                        and not _should_forward_suppressed_stream_event(payload, filter_node_id)
+                    ):
+                        logger.debug(
+                            "Suppressing streamed Modal node progress for component=%s node_id=%s real_node_id=%s because it does not belong to this mapped/static payload.",
+                            payload.get("component_id"),
+                            stream_event.get("node_id"),
+                            stream_event.get("real_node_id"),
+                        )
+                        continue
+                    reported_node_id = (
+                        progress_metadata["node_id"] if progress_metadata is not None else None
+                    )
+                    if reported_node_id is not None:
+                        display_node_id = (
+                            progress_metadata["display_node_id"]
+                            if progress_metadata is not None
+                            else str(reported_node_id)
+                        )
+                        real_node_id = (
+                            progress_metadata["real_node_id"] if progress_metadata is not None else None
+                        )
+                        progress_node_id = real_node_id or display_node_id
+                        if lane_id is not None:
+                            _remember_mapped_lane_node_id(payload, lane_id, progress_node_id)
+                        elif suppress_status_stream and not aggregate_only and progress_metadata is not None:
+                            suppressed_progress_node_metadata[str(progress_metadata["filter_node_id"])] = {
+                                "node_id": str(reported_node_id),
+                                "display_node_id": display_node_id,
+                                "real_node_id": real_node_id,
+                            }
+                        logger.debug(
+                            "Forwarding streamed Modal node progress for component=%s node_id=%s real_node_id=%s value=%s max=%s lane_id=%s.",
+                            payload.get("component_id"),
+                            reported_node_id,
+                            real_node_id,
+                            stream_event.get("value"),
+                            stream_event.get("max"),
+                            lane_id,
+                        )
+                        _emit_local_modal_progress(
+                            prompt_id=prompt_id,
+                            client_id=client_id,
+                            node_id=str(reported_node_id),
+                            value=float(stream_event.get("value", 0.0)),
+                            max_value=float(stream_event.get("max", 1.0)),
+                            display_node_id=display_node_id,
+                            real_node_id=real_node_id,
+                            lane_id=lane_id,
+                            clear=bool(stream_event.get("clear", False)),
+                            item_index=(
+                                int(stream_event["item_index"])
+                                if stream_event.get("item_index") is not None
+                                else (
+                                    int(payload["map_item_index"])
+                                    if payload.get("map_item_index") is not None
+                                    else None
+                                )
+                            ),
+                            aggregate_only=aggregate_only,
+                        )
                     continue
-                reported_node_id = stream_event.get("node_id")
-                if reported_node_id is not None:
-                    display_node_id = (
-                        str(stream_event["display_node_id"])
-                        if stream_event.get("display_node_id") is not None
-                        else str(reported_node_id)
-                    )
-                    real_node_id = (
-                        str(stream_event["real_node_id"])
-                        if stream_event.get("real_node_id") is not None
-                        else None
-                    )
-                    progress_node_id = real_node_id or display_node_id
-                    if lane_id is not None:
-                        _remember_mapped_lane_node_id(payload, lane_id, progress_node_id)
-                    logger.debug(
-                        "Forwarding streamed Modal node progress for component=%s node_id=%s real_node_id=%s value=%s max=%s lane_id=%s.",
-                        payload.get("component_id"),
-                        reported_node_id,
-                        real_node_id,
-                        stream_event.get("value"),
-                        stream_event.get("max"),
-                        lane_id,
-                    )
-                    _emit_local_modal_progress(
-                        prompt_id=prompt_id,
-                        client_id=client_id,
-                        node_id=str(reported_node_id),
-                        value=float(stream_event.get("value", 0.0)),
-                        max_value=float(stream_event.get("max", 1.0)),
-                        display_node_id=display_node_id,
-                        real_node_id=real_node_id,
-                        lane_id=lane_id,
-                        item_index=(
-                            int(payload["map_item_index"])
-                            if payload.get("map_item_index") is not None
-                            else None
-                        ),
-                    )
-                continue
-            if event_type == "executed":
-                reported_node_id = stream_event.get("node_id")
-                if reported_node_id is not None:
-                    if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                if event_type == "executed":
+                    reported_node_id = stream_event.get("node_id")
+                    if reported_node_id is not None:
+                        if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                            logger.debug(
+                                "Suppressing streamed Modal executed output for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                                payload.get("component_id"),
+                                reported_node_id,
+                            )
+                            continue
                         logger.debug(
-                            "Suppressing streamed Modal executed output for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                            "Forwarding streamed Modal executed output for component=%s node_id=%s.",
                             payload.get("component_id"),
                             reported_node_id,
                         )
-                        continue
-                    logger.debug(
-                        "Forwarding streamed Modal executed output for component=%s node_id=%s.",
-                        payload.get("component_id"),
-                        reported_node_id,
-                    )
-                    _emit_local_executed_output(
-                        prompt_id=prompt_id,
-                        client_id=client_id,
-                        node_id=str(reported_node_id),
-                        display_node_id=(
-                            str(stream_event["display_node_id"])
-                            if stream_event.get("display_node_id") is not None
-                            else None
-                        ),
-                        output_payload=deserialize_value(stream_event.get("output")),
-                    )
-                continue
-            if event_type == "preview":
-                reported_node_id = stream_event.get("node_id")
-                image_bytes = deserialize_value(stream_event.get("image_bytes"))
-                if reported_node_id is not None and isinstance(image_bytes, bytes):
-                    if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                        _emit_local_executed_output(
+                            prompt_id=prompt_id,
+                            client_id=client_id,
+                            node_id=str(reported_node_id),
+                            display_node_id=(
+                                str(stream_event["display_node_id"])
+                                if stream_event.get("display_node_id") is not None
+                                else None
+                            ),
+                            output_payload=deserialize_value(stream_event.get("output")),
+                        )
+                    continue
+                if event_type == "preview":
+                    reported_node_id = stream_event.get("node_id")
+                    image_bytes = deserialize_value(stream_event.get("image_bytes"))
+                    if reported_node_id is not None and isinstance(image_bytes, bytes):
+                        if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                            logger.debug(
+                                "Suppressing streamed Modal preview image for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                                payload.get("component_id"),
+                                reported_node_id,
+                            )
+                            continue
                         logger.debug(
-                            "Suppressing streamed Modal preview image for component=%s node_id=%s because it does not belong to this mapped/static payload.",
+                            "Forwarding streamed Modal preview image for component=%s node_id=%s.",
                             payload.get("component_id"),
                             reported_node_id,
                         )
-                        continue
-                    logger.debug(
-                        "Forwarding streamed Modal preview image for component=%s node_id=%s.",
-                        payload.get("component_id"),
-                        reported_node_id,
-                    )
-                    _emit_local_preview_image(
+                        _emit_local_preview_image(
+                            prompt_id=prompt_id,
+                            client_id=client_id,
+                            node_id=str(reported_node_id),
+                            display_node_id=(
+                                str(stream_event["display_node_id"])
+                                if stream_event.get("display_node_id") is not None
+                                else None
+                            ),
+                            parent_node_id=(
+                                str(stream_event["parent_node_id"])
+                                if stream_event.get("parent_node_id") is not None
+                                else None
+                            ),
+                            real_node_id=(
+                                str(stream_event["real_node_id"])
+                                if stream_event.get("real_node_id") is not None
+                                else None
+                            ),
+                            image_type=str(stream_event.get("image_type", "PNG")),
+                            image_bytes=image_bytes,
+                            max_size=(
+                                int(stream_event["max_size"])
+                                if stream_event.get("max_size") is not None
+                                else None
+                            ),
+                        )
+                    continue
+                if event_type == "boundary_output":
+                    preview_target_node_ids = [
+                        str(node_id)
+                        for node_id in stream_event.get("preview_target_node_ids", [])
+                        if str(node_id)
+                    ]
+                    if preview_target_node_ids:
+                        logger.debug(
+                            "Forwarding streamed Modal boundary output previews for component=%s source_node=%s targets=%s.",
+                            payload.get("component_id"),
+                            stream_event.get("node_id"),
+                            preview_target_node_ids,
+                        )
+                        _emit_local_preview_boundary_output(
+                            prompt_id=prompt_id,
+                            client_id=client_id,
+                            preview_target_node_ids=preview_target_node_ids,
+                            image_value=deserialize_value(stream_event.get("value")),
+                        )
+                    continue
+                logger.info(
+                    "Forwarding streamed Modal progress for component=%s phase=%s active_node_id=%s.",
+                    payload.get("component_id"),
+                    stream_event.get("phase"),
+                    stream_event.get("active_node_id"),
+                )
+                if suppress_status_stream:
+                    remote_phase = str(stream_event.get("phase", "executing"))
+                    if remote_phase in {"execution_success", "execution_error", "execution_interrupted"}:
+                        for progress_metadata in suppressed_progress_node_metadata.values():
+                            _emit_local_modal_progress(
+                                prompt_id=prompt_id,
+                                client_id=client_id,
+                                node_id=str(progress_metadata["node_id"]),
+                                value=0.0,
+                                max_value=1.0,
+                                display_node_id=progress_metadata["display_node_id"],
+                                real_node_id=progress_metadata["real_node_id"],
+                                clear=True,
+                            )
+                        suppressed_progress_node_metadata.clear()
+                    continue
+                remote_phase = str(stream_event.get("phase", "executing"))
+                if remote_phase == "execution_success":
+                    _emit_local_modal_status(
                         prompt_id=prompt_id,
                         client_id=client_id,
-                        node_id=str(reported_node_id),
-                        display_node_id=(
-                            str(stream_event["display_node_id"])
-                            if stream_event.get("display_node_id") is not None
-                            else None
-                        ),
-                        parent_node_id=(
-                            str(stream_event["parent_node_id"])
-                            if stream_event.get("parent_node_id") is not None
-                            else None
-                        ),
-                        real_node_id=(
-                            str(stream_event["real_node_id"])
-                            if stream_event.get("real_node_id") is not None
-                            else None
-                        ),
-                        image_type=str(stream_event.get("image_type", "PNG")),
-                        image_bytes=image_bytes,
-                        max_size=(
-                            int(stream_event["max_size"])
-                            if stream_event.get("max_size") is not None
-                            else None
-                        ),
+                        phase="finalizing",
+                        node_ids=node_ids,
+                        status_message="Receiving Modal outputs",
                     )
-                continue
-            if event_type == "boundary_output":
-                preview_target_node_ids = [
-                    str(node_id)
-                    for node_id in stream_event.get("preview_target_node_ids", [])
-                    if str(node_id)
-                ]
-                if preview_target_node_ids:
-                    logger.debug(
-                        "Forwarding streamed Modal boundary output previews for component=%s source_node=%s targets=%s.",
-                        payload.get("component_id"),
-                        stream_event.get("node_id"),
-                        preview_target_node_ids,
-                    )
-                    _emit_local_preview_boundary_output(
-                        prompt_id=prompt_id,
-                        client_id=client_id,
-                        preview_target_node_ids=preview_target_node_ids,
-                        image_value=deserialize_value(stream_event.get("value")),
-                    )
-                continue
-            logger.info(
-                "Forwarding streamed Modal progress for component=%s phase=%s active_node_id=%s.",
-                payload.get("component_id"),
-                stream_event.get("phase"),
-                stream_event.get("active_node_id"),
-            )
-            if suppress_status_stream:
-                continue
-            remote_phase = str(stream_event.get("phase", "executing"))
-            if remote_phase == "execution_success":
+                    continue
                 _emit_local_modal_status(
                     prompt_id=prompt_id,
                     client_id=client_id,
-                    phase="finalizing",
+                    phase=remote_phase,
                     node_ids=node_ids,
-                    status_message="Receiving Modal outputs",
+                    active_node_id=(
+                        str(stream_event["active_node_id"])
+                        if stream_event.get("active_node_id") is not None
+                        else None
+                    ),
+                    active_node_class_type=(
+                        str(stream_event["active_node_class_type"])
+                        if stream_event.get("active_node_class_type") is not None
+                        else None
+                    ),
+                    active_node_role=(
+                        str(stream_event["active_node_role"])
+                        if stream_event.get("active_node_role") is not None
+                        else None
+                    ),
                 )
                 continue
-            _emit_local_modal_status(
-                prompt_id=prompt_id,
-                client_id=client_id,
-                phase=remote_phase,
-                node_ids=node_ids,
-                active_node_id=(
-                    str(stream_event["active_node_id"])
-                    if stream_event.get("active_node_id") is not None
-                    else None
-                ),
-                active_node_class_type=(
-                    str(stream_event["active_node_class_type"])
-                    if stream_event.get("active_node_class_type") is not None
-                    else None
-                ),
-                active_node_role=(
-                    str(stream_event["active_node_role"])
-                    if stream_event.get("active_node_role") is not None
-                    else None
-                ),
+            if event_kind == "result":
+                candidate_outputs = stream_event.get("outputs")
+                try:
+                    result_payload = coerce_serialized_node_outputs(candidate_outputs)
+                except TypeError as exc:
+                    raise ModalRemoteInvocationError(
+                        "Modal streamed payload result did not include transport-safe outputs."
+                    ) from exc
+                continue
+            logger.debug(
+                "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
+                event_kind,
+                payload.get("component_id"),
             )
-            continue
-        if event_kind == "result":
-            candidate_outputs = stream_event.get("outputs")
-            try:
-                result_payload = coerce_serialized_node_outputs(candidate_outputs)
-            except TypeError as exc:
-                raise ModalRemoteInvocationError(
-                    "Modal streamed payload result did not include transport-safe outputs."
-                ) from exc
-            continue
-        logger.debug(
-            "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
-            event_kind,
-            payload.get("component_id"),
-        )
+    finally:
+        if active_remote_log_task_id is not None:
+            _release_remote_container_log_stream(active_remote_log_task_id)
 
     if result_payload is None:
         raise ModalRemoteInvocationError(
@@ -1390,12 +2216,233 @@ def _mapped_execution_parallelism(item_count: int) -> int:
     return max(1, min(item_count, configured_limit))
 
 
+def _mapped_phase_definition(payload: dict[str, Any], phase_key: str) -> dict[str, Any] | None:
+    """Return one explicit mapped phase definition when queue-time planning provided it."""
+    phase_payload = payload.get(phase_key)
+    if isinstance(phase_payload, dict):
+        return phase_payload
+    return None
+
+
+def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the payload fields shared by every explicit mapped phase."""
+    shared_fields = {
+        "prompt_id": payload.get("prompt_id"),
+        "extra_data": copy.deepcopy(payload.get("extra_data") or {}),
+        "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
+        "volume_reload_marker": payload.get("volume_reload_marker"),
+        "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
+        "terminate_container_on_error": bool(payload.get("terminate_container_on_error", True)),
+        "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
+    }
+    remote_session = payload.get("remote_session")
+    if remote_session is not None:
+        shared_fields["remote_session"] = copy.deepcopy(remote_session)
+    if bool(payload.get("clear_remote_session")):
+        shared_fields["clear_remote_session"] = True
+    return shared_fields
+
+
+def _build_phase_subgraph_payload(
+    payload: dict[str, Any],
+    phase_key: str,
+    component_id: str,
+    *,
+    suppress_status_stream: bool = False,
+    lane_id: str | None = None,
+    item_index: int | None = None,
+) -> dict[str, Any]:
+    """Return one explicit static or mapped subgraph payload."""
+    phase_definition = _mapped_phase_definition(payload, phase_key)
+    if phase_definition is None:
+        raise KeyError(f"Mapped payload is missing phase definition {phase_key!r}.")
+
+    phase_payload = {
+        "payload_kind": "subgraph",
+        "component_id": component_id,
+        **_shared_subgraph_payload_fields(payload),
+        "component_node_ids": [
+            str(node_id)
+            for node_id in phase_definition.get("component_node_ids", [])
+            if str(node_id)
+        ],
+        "subgraph_prompt": copy.deepcopy(phase_definition.get("subgraph_prompt", {})),
+        "boundary_inputs": copy.deepcopy(phase_definition.get("boundary_inputs", [])),
+        "boundary_outputs": copy.deepcopy(phase_definition.get("boundary_outputs", [])),
+        "execute_node_ids": [
+            str(node_id)
+            for node_id in phase_definition.get("execute_node_ids", [])
+            if str(node_id)
+        ],
+    }
+    if suppress_status_stream:
+        phase_payload["suppress_status_stream"] = True
+    if lane_id is not None:
+        phase_payload["mapped_progress_lane_id"] = str(lane_id)
+        phase_payload["mapped_progress_display_node_id"] = str(
+            payload.get("component_id", "modal-subgraph")
+        )
+    if item_index is not None:
+        phase_payload["map_item_index"] = int(item_index)
+    return phase_payload
+
+
+def _split_phase_outputs(
+    phase_outputs: tuple[Any, ...],
+    boundary_outputs: list[dict[str, Any]],
+    internal_output_names: set[str],
+) -> tuple[dict[str, Any], tuple[Any, ...]]:
+    """Split one phase result tuple into bridge values and external outputs."""
+    internal_outputs: dict[str, Any] = {}
+    external_outputs: list[Any] = []
+    for boundary_output, output_value in zip(boundary_outputs, phase_outputs, strict=True):
+        output_name = str(boundary_output.get("proxy_output_name") or "")
+        if output_name in internal_output_names:
+            internal_outputs[output_name] = output_value
+            continue
+        external_outputs.append(output_value)
+    return internal_outputs, tuple(external_outputs)
+
+
+def _execute_mapped_subgraph_payload(
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    node_mapping: dict[str, type[Any]] | None = None,
+) -> tuple[Any, ...]:
+    """Execute one mapped payload locally using explicit static and mapped phases."""
+    mapped_input = payload.get("mapped_input") or {}
+    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
+    if not mapped_input_name:
+        raise ModalRemoteInvocationError("Mapped remote payloads must define mapped_input.proxy_input_name.")
+    if mapped_input_name not in hydrated_inputs:
+        raise KeyError(f"Mapped remote payload input {mapped_input_name!r} was not provided.")
+
+    mapped_items = split_mapped_value(
+        hydrated_inputs[mapped_input_name],
+        str(mapped_input.get("io_type", "*")),
+    )
+    if not mapped_items:
+        raise ValueError("Mapped remote execution requires at least one input item.")
+
+    broadcast_inputs = dict(hydrated_inputs)
+    broadcast_inputs.pop(mapped_input_name, None)
+    static_to_mapped_boundaries = list(payload.get("static_to_mapped_boundaries", []))
+    bridge_output_names = {
+        str(boundary_spec.get("proxy_name") or "")
+        for boundary_spec in static_to_mapped_boundaries
+        if str(boundary_spec.get("proxy_name") or "")
+    }
+
+    static_outputs: tuple[Any, ...] = ()
+    static_phase_payload: dict[str, Any] | None = None
+    if payload.get("static_phase") is not None:
+        static_phase_payload = _build_phase_subgraph_payload(
+            payload,
+            "static_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::static",
+            suppress_status_stream=True,
+        )
+    elif payload.get("static_execute_node_ids"):
+        static_phase_payload = _build_static_mapped_payload(payload)
+
+    if static_phase_payload is not None:
+        if static_phase_payload.get("execute_node_ids"):
+            logger.info(
+                "Executing static mapped phase for component=%s with execute nodes=%s.",
+                payload.get("component_id"),
+                static_phase_payload.get("execute_node_ids", []),
+            )
+            static_phase_outputs = _execute_subgraph_prompt(
+                static_phase_payload,
+                dict(broadcast_inputs),
+                node_mapping,
+            )
+            bridge_inputs, static_outputs = _split_phase_outputs(
+                static_phase_outputs,
+                list(static_phase_payload.get("boundary_outputs", [])),
+                bridge_output_names,
+            )
+            broadcast_inputs.update(bridge_inputs)
+
+    total_items = len(mapped_items)
+    _emit_local_mapped_progress(payload, 0, total_items)
+    per_item_outputs: list[tuple[Any, ...]] = []
+    for item_index, item_value in enumerate(mapped_items):
+        if _local_processing_interrupted():
+            _raise_local_interrupt()
+        if payload.get("mapped_phase") is not None:
+            item_payload = _build_phase_subgraph_payload(
+                payload,
+                "mapped_phase",
+                f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}",
+                suppress_status_stream=True,
+                lane_id="0",
+                item_index=item_index,
+            )
+        else:
+            item_payload = _build_mapped_item_payload(payload, item_index, 0)
+        item_inputs = dict(broadcast_inputs)
+        item_inputs[mapped_input_name] = item_value
+        logger.info(
+            "Executing mapped item %d/%d for component=%s with execute nodes=%s.",
+            item_index + 1,
+            total_items,
+            payload.get("component_id"),
+            item_payload.get("execute_node_ids", []),
+        )
+        per_item_outputs.append(
+            _execute_subgraph_prompt(
+                item_payload,
+                item_inputs,
+                node_mapping,
+            )
+        )
+        _emit_local_mapped_progress(payload, item_index + 1, total_items)
+
+    if payload.get("mapped_phase") is not None:
+        mapped_phase_payload = _build_phase_subgraph_payload(
+            payload,
+            "mapped_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::mapped",
+        )
+    else:
+        mapped_phase_payload = {
+            **payload,
+            "boundary_outputs": [
+                boundary_output
+                for boundary_output in payload.get("boundary_outputs", [])
+                if _is_mapped_boundary_output(boundary_output, payload)
+            ],
+        }
+    mapped_outputs = _aggregate_mapped_outputs(
+        per_item_outputs,
+        {
+            **payload,
+            "boundary_outputs": list(mapped_phase_payload.get("boundary_outputs", [])),
+        },
+    )
+    return _merge_static_and_mapped_outputs(
+        static_outputs=static_outputs,
+        mapped_outputs=mapped_outputs,
+        payload=payload,
+    )
+
+
 def _build_mapped_item_payload(
     payload: dict[str, Any],
     item_index: int,
     lane_index: int,
 ) -> dict[str, Any]:
     """Return one per-item subgraph payload derived from a mapped remote component payload."""
+    if _mapped_phase_definition(payload, "mapped_phase") is not None:
+        return _build_phase_subgraph_payload(
+            payload,
+            "mapped_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}",
+            suppress_status_stream=True,
+            lane_id=str(lane_index),
+            item_index=item_index,
+        )
     item_payload = copy.deepcopy(payload)
     item_payload["payload_kind"] = "subgraph"
     item_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}"
@@ -1406,6 +2453,7 @@ def _build_mapped_item_payload(
     item_payload["mapped_progress_display_node_id"] = str(
         payload.get("component_id", "modal-subgraph")
     )
+    item_payload.pop("clear_remote_session", None)
     item_payload["execute_node_ids"] = list(
         payload.get("mapped_execute_node_ids") or payload.get("execute_node_ids", [])
     )
@@ -1443,6 +2491,27 @@ def _aggregate_mapped_outputs(
     return tuple(aggregated_outputs)
 
 
+def _build_remote_session_cleanup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a dedicated cleanup payload that clears one shared remote session once."""
+    remote_session = payload.get("remote_session")
+    if not bool(payload.get("clear_remote_session")) or not is_remote_session_handle_payload(remote_session):
+        return None
+    return {
+        "payload_kind": "subgraph",
+        "component_id": f"{payload.get('component_id', 'modal-subgraph')}::cleanup",
+        **_shared_subgraph_payload_fields(payload),
+        "component_node_ids": [],
+        "subgraph_prompt": {},
+        "boundary_inputs": [],
+        "boundary_outputs": [],
+        "execute_node_ids": [],
+        "remote_session": copy.deepcopy(remote_session),
+        "clear_remote_session": True,
+        "suppress_status_stream": True,
+        "terminate_container_on_error": False,
+    }
+
+
 def _is_mapped_boundary_output(boundary_output: dict[str, Any], payload: dict[str, Any]) -> bool:
     """Return whether one boundary output belongs to the mapped per-item branch."""
     mapped_output = boundary_output.get("mapped_output")
@@ -1453,11 +2522,19 @@ def _is_mapped_boundary_output(boundary_output: dict[str, Any], payload: dict[st
 
 def _build_static_mapped_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Return the one-time static subgraph payload for a hybrid mapped component."""
+    if _mapped_phase_definition(payload, "static_phase") is not None:
+        return _build_phase_subgraph_payload(
+            payload,
+            "static_phase",
+            f"{payload.get('component_id', 'modal-subgraph')}::static",
+            suppress_status_stream=True,
+        )
     static_payload = copy.deepcopy(payload)
     static_payload["payload_kind"] = "subgraph"
     static_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::static"
     static_payload["mapped_input"] = None
     static_payload["suppress_status_stream"] = True
+    static_payload.pop("clear_remote_session", None)
     static_payload["execute_node_ids"] = list(payload.get("static_execute_node_ids") or [])
     static_payload["boundary_outputs"] = [
         copy.deepcopy(boundary_output)
@@ -1510,7 +2587,11 @@ def _emit_local_mapped_progress(
     prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
     extra_data = payload.get("extra_data") or {}
     client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
-    display_node_id = str(payload.get("component_id") or "")
+    display_node_id = str(
+        payload.get("mapped_progress_display_node_id")
+        or payload.get("component_id")
+        or ""
+    )
     if not prompt_id or not client_id or not display_node_id:
         return
     _emit_local_modal_progress(
@@ -1608,15 +2689,41 @@ def _split_batch_boundary_inputs(
     hydrated_inputs: dict[str, Any],
 ) -> tuple[dict[str, list[Any]], int] | None:
     """Return zipped per-item boundary inputs when an ordinary subgraph receives batched values."""
+    implicitly_batchable_scalar_io_types = frozenset({"BOOLEAN", "FLOAT", "INT", "STRING"})
+    implicitly_batchable_transport_io_types = frozenset({"IMAGE", "LATENT", "MASK", "NOISE", "SIGMAS"})
     split_inputs: dict[str, list[Any]] = {}
     for boundary_input in payload.get("boundary_inputs", []):
         proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
         if not proxy_input_name or proxy_input_name not in hydrated_inputs:
             continue
+        io_type = str(boundary_input.get("io_type", "*"))
+        input_value = hydrated_inputs[proxy_input_name]
+        is_session_ref_list = (
+            isinstance(input_value, list)
+            and len(input_value) > 0
+            and all(
+                is_remote_session_value_ref_payload(item)
+                or is_remote_session_bridge_ref_payload(item)
+                for item in input_value
+            )
+        )
+        if (
+            isinstance(input_value, list)
+            and not is_session_ref_list
+            and io_type not in (
+            implicitly_batchable_scalar_io_types | implicitly_batchable_transport_io_types
+            )
+        ):
+            logger.info(
+                "Skipping implicit batch split for boundary input %s io_type=%s because list-backed non-scalar values stay broadcast.",
+                proxy_input_name,
+                io_type,
+            )
+            continue
         try:
             items = split_mapped_value(
-                hydrated_inputs[proxy_input_name],
-                str(boundary_input.get("io_type", "*")),
+                input_value,
+                io_type,
             )
         except (TypeError, ValueError):
             continue
@@ -1635,6 +2742,43 @@ def _split_batch_boundary_inputs(
             f"Received counts: {item_counts!r}"
         )
     return split_inputs, next(iter(unique_counts))
+
+
+def _implicit_batch_input_is_list_target_node_ids(
+    payload: dict[str, Any],
+    split_inputs: dict[str, list[Any]],
+) -> list[str]:
+    """Return split-boundary target nodes that must consume the full list in one execution."""
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict):
+        return []
+
+    try:
+        resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
+    except ModuleNotFoundError:
+        logger.debug(
+            "Skipping INPUT_IS_LIST detection for implicit batching because ComfyUI nodes are unavailable."
+        )
+        return []
+    target_node_ids: set[str] = set()
+    for boundary_input in payload.get("boundary_inputs", []):
+        proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
+        if proxy_input_name not in split_inputs:
+            continue
+        for target in boundary_input.get("targets", []):
+            target_node_id = str(target.get("node_id") or "")
+            if not target_node_id:
+                continue
+            prompt_node = prompt.get(target_node_id)
+            if prompt_node is None:
+                continue
+            class_type = str(prompt_node.get("class_type"))
+            node_class = resolved_node_mapping.get(class_type)
+            if node_class is None:
+                continue
+            if bool(getattr(node_class, "INPUT_IS_LIST", False)):
+                target_node_ids.add(target_node_id)
+    return sorted(target_node_ids)
 
 
 def _partition_implicit_batched_execute_nodes(
@@ -1725,6 +2869,18 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         )
 
     split_inputs, total_items = split_batch_inputs
+    input_is_list_target_node_ids = _implicit_batch_input_is_list_target_node_ids(
+        payload,
+        split_inputs,
+    )
+    if input_is_list_target_node_ids:
+        logger.info(
+            "Executing implicitly batched Modal component=%s as one ordinary subgraph because split boundary inputs target INPUT_IS_LIST nodes=%s.",
+            payload.get("component_id"),
+            input_is_list_target_node_ids,
+        )
+        return await invoke_remote_engine_async(payload, kwargs_payload)
+
     parallelism = _mapped_execution_parallelism(total_items)
     refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
     ensure_remote_warm_capacity(
@@ -1758,176 +2914,92 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         payload,
         mapped_execute_node_ids,
     )
+    cleanup_payload = _build_remote_session_cleanup_payload(hybrid_payload)
 
     static_outputs: tuple[Any, ...] = ()
-    if static_execute_node_ids:
-        static_response = await invoke_remote_engine_async(
-            _build_static_mapped_payload(hybrid_payload),
-            serialize_node_inputs(broadcast_inputs),
-        )
-        static_outputs = deserialize_node_outputs(static_response)
-
-    per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
-    completed_items = 0
-    item_queue: asyncio.Queue[int | None] = asyncio.Queue()
-    for item_index in range(total_items):
-        item_queue.put_nowait(item_index)
-    for _ in range(parallelism):
-        item_queue.put_nowait(None)
-
-    async def run_worker(lane_index: int) -> None:
-        """Execute queued implicit mapped items through one stable local worker lane."""
-        nonlocal completed_items
-        while True:
-            item_index = await item_queue.get()
-            if item_index is None:
-                return
-            if _local_processing_interrupted():
-                _raise_local_interrupt()
-            try:
-                item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
-                item_inputs = dict(broadcast_inputs)
-                for input_name, items in split_inputs.items():
-                    item_inputs[input_name] = items[item_index]
-                item_response = await invoke_remote_engine_async(
-                    item_payload,
-                    serialize_node_inputs(item_inputs),
-                )
-                per_item_outputs[item_index] = deserialize_node_outputs(item_response)
-                completed_items += 1
-                _emit_local_mapped_progress(payload, completed_items, total_items)
-            finally:
-                _clear_local_mapped_lane_progress(payload, lane_index, item_index)
-
-    tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
     try:
-        await asyncio.gather(*tasks)
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        if static_execute_node_ids:
+            static_response = await invoke_remote_engine_async(
+                _build_static_mapped_payload(hybrid_payload),
+                serialize_node_inputs(broadcast_inputs),
+            )
+            static_outputs = deserialize_node_outputs(static_response)
 
-    return serialize_node_outputs(
-        _merge_static_and_mapped_outputs(
-            static_outputs=static_outputs,
-            mapped_outputs=_aggregate_mapped_outputs(
-                [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
-                {
-                    **hybrid_payload,
-                    "boundary_outputs": [
-                        boundary_output
-                        for boundary_output in hybrid_payload.get("boundary_outputs", [])
-                        if _is_mapped_boundary_output(boundary_output, hybrid_payload)
-                    ],
-                },
-            ),
-            payload=hybrid_payload,
+        per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
+        completed_items = 0
+        item_queue: asyncio.Queue[int | None] = asyncio.Queue()
+        for item_index in range(total_items):
+            item_queue.put_nowait(item_index)
+        for _ in range(parallelism):
+            item_queue.put_nowait(None)
+
+        async def run_worker(lane_index: int) -> None:
+            """Execute queued implicit mapped items through one stable local worker lane."""
+            nonlocal completed_items
+            while True:
+                item_index = await item_queue.get()
+                if item_index is None:
+                    return
+                if _local_processing_interrupted():
+                    _raise_local_interrupt()
+                try:
+                    item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
+                    item_inputs = dict(broadcast_inputs)
+                    for input_name, items in split_inputs.items():
+                        item_inputs[input_name] = items[item_index]
+                    item_response = await invoke_remote_engine_async(
+                        item_payload,
+                        serialize_node_inputs(item_inputs),
+                    )
+                    per_item_outputs[item_index] = deserialize_node_outputs(item_response)
+                    completed_items += 1
+                    _emit_local_mapped_progress(payload, completed_items, total_items)
+                finally:
+                    _clear_local_mapped_lane_progress(payload, lane_index, item_index)
+
+        tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        return serialize_node_outputs(
+            _merge_static_and_mapped_outputs(
+                static_outputs=static_outputs,
+                mapped_outputs=_aggregate_mapped_outputs(
+                    [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+                    {
+                        **hybrid_payload,
+                        "boundary_outputs": [
+                            boundary_output
+                            for boundary_output in hybrid_payload.get("boundary_outputs", [])
+                            if _is_mapped_boundary_output(boundary_output, hybrid_payload)
+                        ],
+                    },
+                ),
+                payload=hybrid_payload,
+            )
         )
-    )
+    finally:
+        if cleanup_payload is not None:
+            await invoke_remote_engine_async(
+                cleanup_payload,
+                serialize_node_inputs({}),
+            )
 
 
 async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
-    """Split one mapped boundary input, run per-item remote executions, and reassemble outputs."""
-    mapped_input = payload.get("mapped_input") or {}
-    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
-    if not mapped_input_name:
-        raise ModalRemoteInvocationError("Mapped remote payloads must define mapped_input.proxy_input_name.")
-
+    """Execute one mapped payload locally using explicit static and mapped phases."""
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-    if mapped_input_name not in hydrated_inputs:
-        raise KeyError(f"Mapped remote payload input {mapped_input_name!r} was not provided.")
-
-    mapped_items = split_mapped_value(
-        hydrated_inputs[mapped_input_name],
-        str(mapped_input.get("io_type", "*")),
-    )
-    if not mapped_items:
-        raise ValueError("Mapped remote execution requires at least one input item.")
-
-    broadcast_inputs = dict(hydrated_inputs)
-    broadcast_inputs.pop(mapped_input_name, None)
-    total_items = len(mapped_items)
-    parallelism = _mapped_execution_parallelism(total_items)
-    refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
-    ensure_remote_warm_capacity(
-        _build_prompt_warmup_request(payload),
-        warmup_target=refined_prompt_warmup_target,
-        reason="mapped_component_exact_parallelism",
-    )
-    logger.info(
-        "Scheduling mapped Modal component=%s for %d item(s) with local parallelism=%d prompt_warmup_target=%d.",
-        payload.get("component_id"),
-        total_items,
-        parallelism,
-        refined_prompt_warmup_target,
-    )
-    _emit_local_mapped_progress(payload, 0, total_items)
-
-    static_outputs: tuple[Any, ...] = ()
-    if payload.get("static_execute_node_ids"):
-        static_response = await invoke_remote_engine_async(
-            _build_static_mapped_payload(payload),
-            kwargs_payload,
-        )
-        static_outputs = deserialize_node_outputs(static_response)
-
-    per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
-    completed_items = 0
-    item_queue: asyncio.Queue[tuple[int, Any] | None] = asyncio.Queue()
-    for item_index, item_value in enumerate(mapped_items):
-        item_queue.put_nowait((item_index, item_value))
-    for _ in range(parallelism):
-        item_queue.put_nowait(None)
-
-    async def run_worker(lane_index: int) -> None:
-        """Execute queued mapped items through one stable local worker lane."""
-        nonlocal completed_items
-        while True:
-            queued_item = await item_queue.get()
-            if queued_item is None:
-                return
-            item_index, item_value = queued_item
-            if _local_processing_interrupted():
-                _raise_local_interrupt()
-            try:
-                item_payload = _build_mapped_item_payload(payload, item_index, lane_index)
-                item_inputs = dict(broadcast_inputs)
-                item_inputs[mapped_input_name] = item_value
-                item_response = await invoke_remote_engine_async(
-                    item_payload,
-                    serialize_node_inputs(item_inputs),
-                )
-                per_item_outputs[item_index] = deserialize_node_outputs(item_response)
-                completed_items += 1
-                _emit_local_mapped_progress(payload, completed_items, total_items)
-            finally:
-                _clear_local_mapped_lane_progress(payload, lane_index, item_index)
-
-    tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
-    try:
-        await asyncio.gather(*tasks)
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-    return serialize_node_outputs(
-        _merge_static_and_mapped_outputs(
-            static_outputs=static_outputs,
-            mapped_outputs=_aggregate_mapped_outputs(
-                [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
-                {
-                    **payload,
-                    "boundary_outputs": [
-                        boundary_output
-                        for boundary_output in payload.get("boundary_outputs", [])
-                        if _is_mapped_boundary_output(boundary_output, payload)
-                    ],
-                },
-            ),
-            payload=payload,
+    return await asyncio.to_thread(
+        lambda: serialize_node_outputs(
+            _execute_mapped_subgraph_payload(
+                payload,
+                hydrated_inputs,
+            )
         )
     )
 
@@ -1938,13 +3010,17 @@ def _lookup_deployed_remote_engine(payload: dict[str, Any]) -> Any:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
     settings = get_settings()
+    affinity_key = _remote_session_affinity_key(payload)
     logger.info(
-        "Attempting deployed Modal invocation for app=%s class=%s component=%s.",
+        "Attempting deployed Modal invocation for app=%s class=%s component=%s session_affinity=%s.",
         settings.app_name,
         "RemoteEngine",
         payload.get("component_id"),
+        affinity_key,
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
+    if affinity_key is not None:
+        return remote_cls(session_affinity_key=affinity_key)
     return remote_cls()
 
 
@@ -2420,14 +3496,17 @@ def _invoke_modal_payload_blocking(
 
 def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal when configured, or fall back to local in-process execution."""
+    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if payload.get("payload_kind") == "mapped_subgraph":
-        return asyncio.run(_invoke_mapped_remote_engine_async(payload, kwargs_payload))
+        if execution_mode == "local" or modal is None:
+            hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+            return serialize_node_outputs(
+                _execute_mapped_subgraph_payload(payload, hydrated_inputs)
+            )
     if payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
             return asyncio.run(_invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload))
-
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
         if payload.get("payload_kind") == "subgraph":
             return execute_subgraph_locally(payload, kwargs_payload)
@@ -2480,14 +3559,14 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
 
 async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
+    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if payload.get("payload_kind") == "mapped_subgraph":
-        return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
+        if execution_mode == "local" or modal is None:
+            return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
     if payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
             return await _invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload)
-
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
     if execution_mode == "local" or modal is None:
         return await asyncio.to_thread(invoke_remote_engine, payload, kwargs_payload)
 
@@ -2554,15 +3633,24 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     )
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
+        session_affinity_key: str = modal.parameter(default="")
 
         @modal.enter()
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
-            logger.info("RemoteEngine setup complete.")
+            logger.info(
+                "RemoteEngine setup complete for session_affinity_key=%s.",
+                self.session_affinity_key or None,
+            )
 
         @modal.method()
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
+            if payload.get("payload_kind") == "mapped_subgraph":
+                hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+                return serialize_node_outputs(
+                    _execute_mapped_subgraph_payload(payload, hydrated_inputs)
+                )
             if payload.get("payload_kind") == "subgraph":
                 return execute_subgraph_locally(payload, kwargs_payload)
             return execute_node_locally(payload, kwargs_payload)
@@ -2577,11 +3665,20 @@ else:
     class RemoteEngine:
         """Local fallback runtime used when the Modal SDK is unavailable."""
 
+        def __init__(self, session_affinity_key: str | None = None) -> None:
+            """Record the optional session-affinity key for split-proxy reuse."""
+            self.session_affinity_key = session_affinity_key
+
         def setup(self) -> None:
             """No-op setup for local fallback execution."""
 
         def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Execute the proxied node or subgraph locally."""
+            if payload.get("payload_kind") == "mapped_subgraph":
+                hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+                return serialize_node_outputs(
+                    _execute_mapped_subgraph_payload(payload, hydrated_inputs)
+                )
             if payload.get("payload_kind") == "subgraph":
                 return execute_subgraph_locally(payload, kwargs_payload)
             return execute_node_locally(payload, kwargs_payload)

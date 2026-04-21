@@ -396,7 +396,7 @@ function refreshModalUiAfterVisibilityChange() {
 /**
  * Return the prompt metadata bucket, creating it if needed.
  * @param {string} promptId
- * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, laneNodeIdsByLane: Map<string, string> }}
+ * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
  */
 function ensurePromptState(promptId) {
   if (!modalPromptStates.has(promptId)) {
@@ -405,6 +405,7 @@ function ensurePromptState(promptId) {
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
       componentNodeIdsByMember: new Map(),
+      representativeNodeIdByMember: new Map(),
       descendantNodeIdsByAncestor: new Map(),
       laneNodeIdsByLane: new Map(),
       activeNodeId: null,
@@ -546,6 +547,7 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
     const mergedRemoteNodeIds = new Set(remoteNodeIds.map((nodeIdValue) => String(nodeIdValue)));
     promptState.componentsByRepresentative.clear();
     promptState.componentNodeIdsByMember.clear();
+    promptState.representativeNodeIdByMember.clear();
     promptState.activeNodeId = null;
     promptState.hasStreamedProgress = false;
     for (const component of components) {
@@ -558,8 +560,10 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
         componentNodeIds,
       );
       promptState.componentNodeIdsByMember.set(representativeNodeId, componentNodeIds);
+      promptState.representativeNodeIdByMember.set(representativeNodeId, representativeNodeId);
       for (const componentNodeId of componentNodeIds) {
         promptState.componentNodeIdsByMember.set(componentNodeId, componentNodeIds);
+        promptState.representativeNodeIdByMember.set(componentNodeId, representativeNodeId);
         mergedRemoteNodeIds.add(componentNodeId);
       }
     }
@@ -851,14 +855,15 @@ function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, ite
     return;
   }
   const safeNodeIdValue = String(nodeIdValue);
+  const safeLaneKey = laneOwnerKey(promptId, safeNodeIdValue, safeLaneId);
   const safeMaxValue = Math.max(1, Number(maxValue) || 1);
   const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
   const promptState = ensurePromptState(promptId);
-  const previousNodeId = promptState.laneNodeIdsByLane.get(safeLaneId);
+  const previousNodeId = promptState.laneNodeIdsByLane.get(safeLaneKey);
   if (previousNodeId && previousNodeId !== safeNodeIdValue) {
     deleteNodeProgressLane(previousNodeId, promptId, safeLaneId);
   }
-  promptState.laneNodeIdsByLane.set(safeLaneId, safeNodeIdValue);
+  promptState.laneNodeIdsByLane.set(safeLaneKey, safeNodeIdValue);
   const progressNodeIds = [safeNodeIdValue, ...ancestorNodeIds(safeNodeIdValue)];
 
   for (const progressNodeId of progressNodeIds) {
@@ -899,9 +904,10 @@ function clearNodeProgressLane(nodeIdValue, promptId, laneId) {
     return;
   }
   const safeNodeIdValue = String(nodeIdValue);
+  const safeLaneKey = laneOwnerKey(promptId, safeNodeIdValue, safeLaneId);
   const promptState = modalPromptStates.get(promptId);
-  if (promptState?.laneNodeIdsByLane.get(safeLaneId) === safeNodeIdValue) {
-    promptState.laneNodeIdsByLane.delete(safeLaneId);
+  if (promptState?.laneNodeIdsByLane.get(safeLaneKey) === safeNodeIdValue) {
+    promptState.laneNodeIdsByLane.delete(safeLaneKey);
   }
   deleteNodeProgressLane(safeNodeIdValue, promptId, safeLaneId);
 
@@ -928,6 +934,32 @@ function resolveComponentNodeIds(promptId, representativeNodeId) {
     return [candidateNodeId];
   }
   return null;
+}
+
+/**
+ * Return the representative node id for one remote component member when known.
+ * @param {string} promptId
+ * @param {string} nodeIdValue
+ * @returns {string | null}
+ */
+function resolveComponentRepresentativeNodeId(promptId, nodeIdValue) {
+  const promptState = modalPromptStates.get(promptId);
+  if (!promptState) {
+    return null;
+  }
+  return promptState.representativeNodeIdByMember.get(String(nodeIdValue)) ?? null;
+}
+
+/**
+ * Return the stable prompt-local lane owner key for one component worker lane.
+ * @param {string} promptId
+ * @param {string} nodeIdValue
+ * @param {string} laneId
+ * @returns {string}
+ */
+function laneOwnerKey(promptId, nodeIdValue, laneId) {
+  const ownerNodeId = resolveComponentRepresentativeNodeId(promptId, nodeIdValue) ?? String(nodeIdValue);
+  return `${ownerNodeId}:${String(laneId)}`;
 }
 
 /**
@@ -1613,6 +1645,10 @@ function handleModalProgress(event) {
     );
     return;
   }
+  if (detail.clear) {
+    clearNodeProgress(progressNodeId, promptId);
+    return;
+  }
   if (readyNodeIds.length > 0) {
     setNodesPhase(readyNodeIds, STATE_READY, promptId);
   }
@@ -1644,7 +1680,7 @@ function handleExecutionPhase(event, phase) {
     return;
   }
   const promptState = ensurePromptState(promptId);
-  if (promptState.hasStreamedProgress && phase !== STATE_ERROR) {
+  if (promptState.hasStreamedProgress && phase === EXECUTION_PHASE) {
     return;
   }
   if (phase === EXECUTION_PHASE) {
