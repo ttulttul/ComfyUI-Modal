@@ -1438,6 +1438,24 @@ def _modal_lookup_error_types() -> tuple[type[BaseException], ...]:
     return tuple(error_types)
 
 
+def _is_missing_modal_deployment_error(exc: BaseException) -> bool:
+    """Return whether one Modal lookup failure indicates missing deployed app state."""
+    message = str(exc).strip().lower()
+    if "not found" not in message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "lookup failed for cls",
+            "app '",
+            'app "',
+            "class '",
+            'class "',
+            "not found in environment",
+        )
+    )
+
+
 def _load_modal_cloud_module() -> Any:
     """Load the stable Modal cloud entry module under a valid Python name."""
     existing_module = sys.modules.get(_MODAL_CLOUD_MODULE_NAME)
@@ -3319,12 +3337,21 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
 
     with _MODAL_AUTO_DEPLOY_LOCK:
         if deploy_key in _MODAL_AUTO_DEPLOYED_APPS:
-            logger.info(
-                "Auto-deploy already completed for app=%s env=%s; reusing cached deployment state.",
-                settings.app_name,
-                deploy_key[1] or "<default>",
-            )
-            return
+            if _is_missing_modal_deployment_error(lookup_error):
+                logger.warning(
+                    "Discarding stale auto-deploy cache entry for app=%s env=%s after missing deployment lookup failure: %s",
+                    settings.app_name,
+                    deploy_key[1] or "<default>",
+                    lookup_error,
+                )
+                _MODAL_AUTO_DEPLOYED_APPS.discard(deploy_key)
+            else:
+                logger.info(
+                    "Auto-deploy already completed for app=%s env=%s; reusing cached deployment state.",
+                    settings.app_name,
+                    deploy_key[1] or "<default>",
+                )
+                return
 
         logger.warning(
             "Deployed Modal app lookup failed for app=%s component=%s: %s. "
