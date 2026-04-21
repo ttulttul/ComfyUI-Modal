@@ -52,11 +52,17 @@ from serialization import (
     serialize_value,
 )
 from session_state import (
+    InMemoryRemoteSessionBridgeStore,
     InMemoryRemoteSessionStore,
+    RemoteSessionBridgeRecord,
+    RemoteSessionBridgeRef,
     RemoteSessionHandle,
     RemoteSessionStateError,
+    RemoteSessionValueRef,
+    is_remote_session_bridge_ref_payload,
     is_remote_session_handle_payload,
     is_remote_session_value_ref_payload,
+    stable_session_bridge_key,
 )
 from settings import get_settings
 
@@ -75,6 +81,9 @@ _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
+_REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
+_REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
+_REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
 
 try:
     import modal  # type: ignore
@@ -94,16 +103,159 @@ def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHand
     return RemoteSessionHandle.from_payload(remote_session)
 
 
+def _session_bridge_store() -> Any:
+    """Return the durable store used to replay session-backed outputs across containers."""
+    return globals().get("session_bridge_cache") or _REMOTE_SESSION_BRIDGE_STORE
+
+
+def _sanitize_payload_for_session_bridge_record(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip run-scoped fields from one producer payload before persisting replay metadata."""
+    sanitized_payload = copy.deepcopy(payload)
+    sanitized_payload.pop("prompt_id", None)
+    sanitized_payload.pop("remote_session", None)
+    sanitized_payload.pop("clear_remote_session", None)
+    sanitized_payload["extra_data"] = {}
+    return sanitized_payload
+
+
+def _build_remote_session_bridge_record(
+    *,
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    node_id: str,
+    output_index: int,
+) -> RemoteSessionBridgeRecord:
+    """Build one durable bridge record for a session-backed boundary output."""
+    producer_payload = _sanitize_payload_for_session_bridge_record(payload)
+    producer_inputs = serialize_mapping(hydrated_inputs)
+    return RemoteSessionBridgeRecord(
+        bridge_key=stable_session_bridge_key(
+            producer_payload=producer_payload,
+            producer_inputs=producer_inputs,
+            node_id=node_id,
+            output_index=output_index,
+        ),
+        node_id=node_id,
+        output_index=output_index,
+        producer_payload=producer_payload,
+        producer_inputs=producer_inputs,
+    )
+
+
+def _store_remote_session_bridge_record(record: RemoteSessionBridgeRecord) -> None:
+    """Persist one durable bridge record for replaying remote-only outputs."""
+    store = _session_bridge_store()
+    put_record = getattr(store, "put_record", None)
+    if callable(put_record):
+        put_record(record)
+        return
+    store[record.bridge_key] = record.to_payload()
+    logger.info(
+        "Stored remote session bridge record bridge_key=%s node_id=%s output_index=%d.",
+        record.bridge_key,
+        record.node_id,
+        record.output_index,
+    )
+
+
+def _load_remote_session_bridge_record(bridge_key: str) -> RemoteSessionBridgeRecord:
+    """Load one durable bridge record from the configured backing store."""
+    store = _session_bridge_store()
+    get_record = getattr(store, "get_record", None)
+    if callable(get_record):
+        return get_record(bridge_key)
+    payload = store.get(bridge_key)
+    if not isinstance(payload, dict):
+        raise RemoteSessionStateError(
+            f"Remote session bridge record {bridge_key!r} was not found."
+        )
+    logger.info("Resolved remote session bridge record bridge_key=%s from shared store.", bridge_key)
+    return RemoteSessionBridgeRecord.from_payload(payload)
+
+
+def _remote_session_bridge_replay_stack() -> set[str]:
+    """Return the thread-local guard set for bridge replay recursion detection."""
+    replay_stack = getattr(_REMOTE_SESSION_BRIDGE_REPLAY_STATE, "bridge_keys", None)
+    if replay_stack is None:
+        replay_stack = set()
+        _REMOTE_SESSION_BRIDGE_REPLAY_STATE.bridge_keys = replay_stack
+    return replay_stack
+
+
+def _rehydrate_remote_session_bridge_value(
+    ref: RemoteSessionBridgeRef,
+    *,
+    target_session_handle: RemoteSessionHandle | None,
+    custom_nodes_root: Path | None,
+    cancellation_event: threading.Event | None,
+    interrupt_store: Any | None,
+    interrupt_flag_key: str | None,
+) -> Any:
+    """Replay one producer phase into the current session when the live value is gone."""
+    if target_session_handle is None:
+        raise RemoteSessionStateError(
+            "Remote session bridge replay requires a target remote_session handle."
+        )
+
+    replay_stack = _remote_session_bridge_replay_stack()
+    if ref.bridge_key in replay_stack:
+        raise RemoteSessionStateError(
+            f"Detected recursive remote session bridge replay for {ref.bridge_key!r}."
+        )
+
+    record = _load_remote_session_bridge_record(ref.bridge_key)
+    replay_payload = copy.deepcopy(record.producer_payload)
+    replay_payload["remote_session"] = target_session_handle.to_payload()
+    replay_payload.pop("clear_remote_session", None)
+    if target_session_handle.prompt_id is not None:
+        replay_payload["prompt_id"] = target_session_handle.prompt_id
+    replay_inputs = deserialize_node_inputs(record.producer_inputs)
+
+    logger.info(
+        "Replaying remote session bridge bridge_key=%s into session_id=%s via component=%s.",
+        ref.bridge_key,
+        target_session_handle.session_id,
+        replay_payload.get("component_id"),
+    )
+    replay_stack.add(ref.bridge_key)
+    try:
+        _execute_subgraph_prompt(
+            replay_payload,
+            replay_inputs,
+            custom_nodes_root,
+            None,
+            cancellation_event,
+            interrupt_store,
+            interrupt_flag_key,
+        )
+    finally:
+        replay_stack.remove(ref.bridge_key)
+
+    return _REMOTE_SESSION_STORE.get_output(
+        RemoteSessionValueRef(
+            session_id=target_session_handle.session_id,
+            node_id=ref.node_id,
+            output_index=ref.output_index,
+        )
+    )
+
+
 def _resolve_remote_session_inputs(
     hydrated_inputs: dict[str, Any],
     *,
     component_id: str | None = None,
+    target_session_handle: RemoteSessionHandle | None = None,
+    custom_nodes_root: Path | None = None,
+    cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
 ) -> dict[str, Any]:
     """Resolve any remote-session value refs embedded in boundary inputs."""
     ref_input_names = [
         input_name
         for input_name, input_value in hydrated_inputs.items()
         if is_remote_session_value_ref_payload(input_value)
+        or is_remote_session_bridge_ref_payload(input_value)
     ]
     if ref_input_names:
         logger.info(
@@ -113,7 +265,18 @@ def _resolve_remote_session_inputs(
             sorted(ref_input_names),
         )
     return {
-        input_name: _REMOTE_SESSION_STORE.resolve_value(input_value)
+        input_name: _REMOTE_SESSION_STORE.resolve_value_with_bridges(
+            input_value,
+            target_session_handle=target_session_handle,
+            bridge_resolver=lambda ref: _rehydrate_remote_session_bridge_value(
+                ref,
+                target_session_handle=target_session_handle,
+                custom_nodes_root=custom_nodes_root,
+                cancellation_event=cancellation_event,
+                interrupt_store=interrupt_store,
+                interrupt_flag_key=interrupt_flag_key,
+            ),
+        )
         for input_name, input_value in hydrated_inputs.items()
     }
 
@@ -153,7 +316,6 @@ _MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
 _REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS = 1.0
 _CONTAINER_TERMINATION_SCHEDULED = False
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
-_REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 
 
 @dataclass
@@ -2480,11 +2642,16 @@ def _execute_subgraph_prompt(
     normalized_payload = _trim_subgraph_payload_to_required_nodes(
         _normalize_subgraph_payload(payload)
     )
+    session_handle = _payload_remote_session_handle(normalized_payload)
     resolved_inputs = _resolve_remote_session_inputs(
         dict(hydrated_inputs),
         component_id=component_id,
+        target_session_handle=session_handle,
+        custom_nodes_root=custom_nodes_root,
+        cancellation_event=cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key=interrupt_flag_key,
     )
-    session_handle = _payload_remote_session_handle(normalized_payload)
     if session_handle is not None:
         logger.info(
             "Executing cloud subgraph component=%s with remote_session session_id=%s prompt_id=%s owner_component_id=%s.",
@@ -2637,11 +2804,24 @@ def _execute_subgraph_prompt(
                         raise RemoteSessionStateError(
                             "Session-backed boundary outputs require payload.remote_session."
                         )
-                    output_value = _REMOTE_SESSION_STORE.put_output(
+                    live_ref = _REMOTE_SESSION_STORE.put_output(
                         session_handle,
                         node_id=node_id,
                         output_index=output_index,
                         value=output_value,
+                    )
+                    bridge_record = _build_remote_session_bridge_record(
+                        payload=normalized_payload,
+                        hydrated_inputs=hydrated_inputs,
+                        node_id=node_id,
+                        output_index=output_index,
+                    )
+                    _store_remote_session_bridge_record(bridge_record)
+                    output_value = RemoteSessionBridgeRef(
+                        bridge_key=bridge_record.bridge_key,
+                        node_id=node_id,
+                        output_index=output_index,
+                        session_id=live_ref.session_id,
                     ).to_payload()
                 outputs.append(output_value)
         return tuple(outputs)
@@ -3502,6 +3682,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     )
     node_output_cache = modal.Dict.from_name(
         settings.node_output_cache_dict_name,
+        create_if_missing=True,
+    )
+    session_bridge_cache = modal.Dict.from_name(
+        settings.session_bridge_dict_name,
         create_if_missing=True,
     )
     image = (

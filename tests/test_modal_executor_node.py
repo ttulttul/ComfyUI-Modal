@@ -291,10 +291,10 @@ def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
     assert result.result == ("prompt-1", 1)
 
 
-def test_register_cache_friendly_proxy_payload_preserves_session_backed_prompt_id(
+def test_register_cache_friendly_proxy_payload_strips_session_fields_and_rehydrates_them(
     modal_executor_module: Any,
 ) -> None:
-    """Session-backed proxy payloads should stay prompt-scoped and skip cache-surface stripping."""
+    """Session-backed proxy payloads should strip run-scoped fields from the local cache surface."""
     payload = modal_executor_module.register_cache_friendly_proxy_payload(
         "node-1",
         {
@@ -308,10 +308,26 @@ def test_register_cache_friendly_proxy_payload_preserves_session_backed_prompt_i
             },
             "boundary_outputs": [],
             "execute_node_ids": [],
+            "clear_remote_session": True,
         },
     )
 
-    assert payload["prompt_id"] == "prompt-1"
+    assert "prompt_id" not in payload
+    assert "remote_session" not in payload
+    assert "clear_remote_session" not in payload
+    assert modal_executor_module._rehydrate_proxy_payload(payload, unique_id="node-1") == {
+        "payload_kind": "subgraph",
+        "component_id": "component-1",
+        "prompt_id": "prompt-1",
+        "remote_session": {
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "owner_component_id": "component-1",
+        },
+        "boundary_outputs": [],
+        "execute_node_ids": [],
+        "clear_remote_session": True,
+    }
 
 
 def test_proxy_execution_wraps_sync_remote_clients(
@@ -3409,12 +3425,12 @@ def test_modal_cloud_execute_mapped_subgraph_payload_preserves_assigned_lane_id(
     )
 
 
-def test_execute_subgraph_locally_round_trips_remote_session_refs(
+def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
     remote_modal_app_module: Any,
     serialization_module: Any,
     session_state_module: Any,
 ) -> None:
-    """Split proxy subgraphs should store remote-only outputs in-session and resolve them later."""
+    """Split proxy subgraphs should return durable bridge refs that survive lost sessions."""
     static_payload = {
         "payload_kind": "subgraph",
         "component_id": "1",
@@ -3452,7 +3468,10 @@ def test_execute_subgraph_locally_round_trips_remote_session_refs(
             node_mapping={"SessionValueNode": _FakeSessionValueNode},
         )
     )
-    assert session_state_module.is_remote_session_value_ref_payload(static_outputs[0])
+    assert session_state_module.is_remote_session_bridge_ref_payload(static_outputs[0])
+    remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(
+        session_state_module.RemoteSessionHandle.from_payload(static_payload["remote_session"])
+    )
 
     mapped_payload = {
         "payload_kind": "subgraph",
@@ -3482,7 +3501,11 @@ def test_execute_subgraph_locally_round_trips_remote_session_refs(
             }
         ],
         "execute_node_ids": ["7"],
-        "remote_session": static_payload["remote_session"],
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-runtime-2",
+            prompt_id="prompt-1",
+            owner_component_id="1",
+        ).to_payload(),
         "clear_remote_session": True,
     }
 
@@ -3490,17 +3513,31 @@ def test_execute_subgraph_locally_round_trips_remote_session_refs(
         remote_modal_app_module.execute_subgraph_locally(
             mapped_payload,
             serialization_module.serialize_node_inputs({"static_input_0": static_outputs[0]}),
-            node_mapping={"SessionEchoNode": _FakeSessionEchoNode},
+            node_mapping={
+                "SessionEchoNode": _FakeSessionEchoNode,
+                "SessionValueNode": _FakeSessionValueNode,
+            },
         )
     )
 
     assert mapped_outputs == ("shared-session-value",)
-    with pytest.raises(session_state_module.RemoteSessionStateError):
-        remote_modal_app_module._execute_subgraph_prompt(
-            mapped_payload,
-            {"static_input_0": static_outputs[0]},
-            {"SessionEchoNode": _FakeSessionEchoNode},
-        )
+    replay_outputs = remote_modal_app_module._execute_subgraph_prompt(
+        {
+            **mapped_payload,
+            "remote_session": session_state_module.RemoteSessionHandle(
+                session_id="session-runtime-3",
+                prompt_id="prompt-1",
+                owner_component_id="1",
+            ).to_payload(),
+            "clear_remote_session": False,
+        },
+        {"static_input_0": static_outputs[0]},
+        {
+            "SessionEchoNode": _FakeSessionEchoNode,
+            "SessionValueNode": _FakeSessionValueNode,
+        },
+    )
+    assert replay_outputs == ("shared-session-value",)
 
 
 def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completion(
@@ -3632,10 +3669,11 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
                 observed_order.append("static_proxy_finish")
                 return (
                     "static-latent",
-                    session_state_module.RemoteSessionValueRef(
-                        session_id=str(payload["remote_session"]["session_id"]),
+                    session_state_module.RemoteSessionBridgeRef(
+                        bridge_key="RSB_static_model",
                         node_id="1",
                         output_index=0,
+                        session_id=str(payload["remote_session"]["session_id"]),
                     ).to_payload(),
                 )
 
@@ -3652,11 +3690,13 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
         """Run the split static and mapped proxies with a local consumer in between."""
         static_result = await static_proxy_class.execute(
             original_node_data=static_payload,
+            unique_id="1",
             remote_input_0="single-latent",
         )
         mapped_task = asyncio.create_task(
             mapped_proxy_class.execute(
                 original_node_data=mapped_payload,
+                unique_id="1__mapped",
                 remote_input_1="batched-latent",
                 static_input_0=static_result.result[1],
             )
@@ -3675,7 +3715,7 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
         modal_executor_module.set_remote_executor_client_factory(None)
 
     assert static_outputs[0] == "static-latent"
-    assert session_state_module.is_remote_session_value_ref_payload(static_outputs[1])
+    assert session_state_module.is_remote_session_bridge_ref_payload(static_outputs[1])
     assert mapped_outputs == ("mapped-latent",)
     assert observed_order == [
         "static_proxy_finish",

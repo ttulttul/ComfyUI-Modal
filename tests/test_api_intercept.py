@@ -1184,6 +1184,7 @@ def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
 
 def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_with_unmapped_sibling(
     api_intercept_module: Any,
+    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
@@ -1300,6 +1301,14 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
 
     static_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
     mapped_payload = rewritten_prompt["1__mapped"]["inputs"]["original_node_data"]
+    static_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        static_payload,
+        unique_id="1",
+    )
+    mapped_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        mapped_payload,
+        unique_id="1__mapped",
+    )
 
     assert static_payload["payload_kind"] == "subgraph"
     assert static_payload["component_node_ids"] == ["1", "3"]
@@ -1330,7 +1339,8 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
         },
     ]
     assert static_payload["execute_node_ids"] == ["1", "3"]
-    assert static_payload["remote_session"]["owner_component_id"] == "1"
+    assert "remote_session" not in static_payload
+    assert static_execution_payload["remote_session"]["owner_component_id"] == "1"
 
     assert mapped_payload["payload_kind"] == "subgraph"
     assert mapped_payload["component_node_ids"] == ["6", "7"]
@@ -1361,9 +1371,13 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
         }
     ]
     assert mapped_payload["execute_node_ids"] == ["7"]
-    assert mapped_payload["clear_remote_session"] is True
+    assert "clear_remote_session" not in mapped_payload
     assert mapped_payload["mapped_progress_display_node_id"] == "1"
-    assert mapped_payload["remote_session"]["session_id"] == static_payload["remote_session"]["session_id"]
+    assert mapped_execution_payload["clear_remote_session"] is True
+    assert (
+        mapped_execution_payload["remote_session"]["session_id"]
+        == static_execution_payload["remote_session"]["session_id"]
+    )
     assert rewritten_prompt["1__mapped"]["inputs"]["static_input_0"] == ["1", 1]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
     assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]
@@ -1371,6 +1385,7 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
 
 def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_upstream(
     api_intercept_module: Any,
+    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
@@ -1482,6 +1497,14 @@ def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_up
 
     first_payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
     second_payload = rewritten_prompt["6"]["inputs"]["original_node_data"]
+    first_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        first_payload,
+        unique_id="3",
+    )
+    second_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        second_payload,
+        unique_id="6",
+    )
 
     assert first_payload["payload_kind"] == "subgraph"
     assert first_payload["component_node_ids"] == ["1", "3"]
@@ -1505,7 +1528,8 @@ def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_up
     assert first_payload["boundary_outputs"][1]["io_type"] == "MODEL"
     assert first_payload["boundary_outputs"][1]["session_output"] is True
     assert first_payload["execute_node_ids"] == ["3"]
-    assert first_payload["remote_session"]["owner_component_id"] == "1"
+    assert "remote_session" not in first_payload
+    assert first_execution_payload["remote_session"]["owner_component_id"] == "1"
 
     assert second_payload["payload_kind"] == "subgraph"
     assert second_payload["component_node_ids"] == ["6"]
@@ -1536,8 +1560,12 @@ def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_up
         }
     ]
     assert second_payload["execute_node_ids"] == ["6"]
-    assert second_payload["clear_remote_session"] is True
-    assert second_payload["remote_session"]["session_id"] == first_payload["remote_session"]["session_id"]
+    assert "clear_remote_session" not in second_payload
+    assert second_execution_payload["clear_remote_session"] is True
+    assert (
+        second_execution_payload["remote_session"]["session_id"]
+        == first_execution_payload["remote_session"]["session_id"]
+    )
     assert rewritten_prompt["6"]["inputs"][first_payload["boundary_outputs"][1]["proxy_output_name"]] == ["3", 1]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["3", 0]
     assert rewritten_prompt["7"]["inputs"]["image"] == ["6", 0]

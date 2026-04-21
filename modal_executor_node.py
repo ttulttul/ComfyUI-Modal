@@ -66,7 +66,7 @@ _PROXY_EXECUTION_CONTEXTS: dict[str, "_ProxyExecutionContext"] = {}
 class _ProxyExecutionContext:
     """Run-scoped execution context used to rehydrate cache-friendly proxy payloads."""
 
-    prompt_id: str | None = None
+    execution_payload: dict[str, Any]
 
 
 def set_remote_executor_client_factory(
@@ -139,9 +139,6 @@ def _normalize_prompt_id(value: Any) -> str | None:
 
 def _payload_is_local_cache_safe(payload: Mapping[str, Any]) -> bool:
     """Return whether one proxy payload can safely reuse local ComfyUI outputs across prompt runs."""
-    if payload.get("remote_session") is not None or bool(payload.get("clear_remote_session")):
-        return False
-
     split_proxy_payloads = payload.get("split_proxy_payloads")
     if isinstance(split_proxy_payloads, Mapping):
         return all(
@@ -161,25 +158,55 @@ def _payload_is_local_cache_safe(payload: Mapping[str, Any]) -> bool:
     return True
 
 
+def _sanitize_cache_surface_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip run-scoped fields from one proxy payload before exposing it to ComfyUI caching."""
+    sanitized_payload = dict(payload)
+    sanitized_payload.pop("prompt_id", None)
+    sanitized_payload.pop("remote_session", None)
+    sanitized_payload.pop("clear_remote_session", None)
+
+    split_proxy_payloads = sanitized_payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, Mapping):
+        sanitized_payload["split_proxy_payloads"] = {
+            str(phase_name): _sanitize_cache_surface_payload(dict(phase_payload))
+            for phase_name, phase_payload in split_proxy_payloads.items()
+            if isinstance(phase_payload, Mapping)
+        }
+    elif isinstance(split_proxy_payloads, Sequence) and not isinstance(
+        split_proxy_payloads,
+        (str, bytes, bytearray),
+    ):
+        sanitized_payload["split_proxy_payloads"] = [
+            _sanitize_cache_surface_payload(dict(phase_payload))
+            for phase_payload in split_proxy_payloads
+            if isinstance(phase_payload, Mapping)
+        ]
+
+    for phase_name in ("static_phase", "mapped_phase"):
+        phase_payload = sanitized_payload.get(phase_name)
+        if isinstance(phase_payload, Mapping):
+            sanitized_payload[phase_name] = _sanitize_cache_surface_payload(dict(phase_payload))
+    return sanitized_payload
+
+
 def register_cache_friendly_proxy_payload(
     node_id: str,
     payload: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     """Return the payload that should be embedded in the proxy node input for local cache reuse."""
-    normalized_prompt_id = _normalize_prompt_id(payload.get("prompt_id"))
     if not _payload_is_local_cache_safe(payload):
         return dict(payload)
 
-    sanitized_payload = dict(payload)
-    sanitized_payload.pop("prompt_id", None)
+    sanitized_payload = _sanitize_cache_surface_payload(payload)
     with _PROXY_EXECUTION_CONTEXTS_LOCK:
         _PROXY_EXECUTION_CONTEXTS[str(node_id)] = _ProxyExecutionContext(
-            prompt_id=normalized_prompt_id,
+            execution_payload=dict(payload),
         )
     logger.debug(
-        "Registered cache-friendly Modal proxy payload for node_id=%s prompt_id=%s.",
+        "Registered cache-friendly Modal proxy payload for node_id=%s prompt_id=%s session_backed=%s.",
         node_id,
-        normalized_prompt_id,
+        _normalize_prompt_id(payload.get("prompt_id")),
+        payload.get("remote_session") is not None,
     )
     return sanitized_payload
 
@@ -190,17 +217,15 @@ def _rehydrate_proxy_payload(
     unique_id: str | None,
 ) -> Mapping[str, Any]:
     """Restore any execution-scoped fields stripped from a cache-friendly proxy payload."""
-    if payload.get("prompt_id") is not None or unique_id is None:
+    if unique_id is None:
         return payload
 
     with _PROXY_EXECUTION_CONTEXTS_LOCK:
         context = _PROXY_EXECUTION_CONTEXTS.get(str(unique_id))
-    if context is None or context.prompt_id is None:
+    if context is None:
         return payload
 
-    hydrated_payload = dict(payload)
-    hydrated_payload["prompt_id"] = context.prompt_id
-    return hydrated_payload
+    return dict(context.execution_payload)
 
 
 def _normalized_output_metadata(
