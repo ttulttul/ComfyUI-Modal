@@ -1,7 +1,5 @@
 """Remote Modal runtime and local execution fallback."""
 
-from __future__ import annotations
-
 import asyncio
 import copy
 from dataclasses import dataclass, field
@@ -496,7 +494,7 @@ def _build_remote_session_bridge_record(
 
 
 def _record_remote_session_resolution_event(
-    resolution_stats: _RemoteSessionBridgeResolutionStats | None,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None",
     event_name: str,
     event_payload: Mapping[str, Any],
 ) -> None:
@@ -557,7 +555,7 @@ def _rehydrate_remote_session_bridge_value(
     *,
     target_session_handle: RemoteSessionHandle | None,
     node_mapping: dict[str, type[Any]] | None = None,
-    resolution_stats: _RemoteSessionBridgeResolutionStats | None = None,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> Any:
     """Replay one producer phase into the current session when the live value is gone."""
     if target_session_handle is None:
@@ -636,7 +634,7 @@ def _resolve_remote_session_inputs(
     component_id: str | None = None,
     target_session_handle: RemoteSessionHandle | None = None,
     node_mapping: dict[str, type[Any]] | None = None,
-    resolution_stats: _RemoteSessionBridgeResolutionStats | None = None,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> dict[str, Any]:
     """Resolve any remote-session value refs embedded in boundary inputs."""
     ref_input_names = [
@@ -681,7 +679,7 @@ def _resolve_remote_session_inputs(
 def _log_remote_session_resolution_summary(
     *,
     component_id: str,
-    resolution_stats: _RemoteSessionBridgeResolutionStats,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats",
 ) -> None:
     """Emit one high-signal summary for local fallback bridge resolution work."""
     if resolution_stats.input_ref_count <= 0:

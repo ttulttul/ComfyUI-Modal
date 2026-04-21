@@ -1,7 +1,5 @@
 """Stable Modal cloud entrypoint for ComfyUI Modal-Sync."""
 
-from __future__ import annotations
-
 import asyncio
 import base64
 import copy
@@ -238,7 +236,7 @@ def _rehydrate_remote_session_bridge_value(
     cancellation_event: threading.Event | None,
     interrupt_store: Any | None,
     interrupt_flag_key: str | None,
-    resolution_stats: _RemoteSessionBridgeResolutionStats | None = None,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> Any:
     """Replay one producer phase into the current session when the live value is gone."""
     if target_session_handle is None:
@@ -328,7 +326,7 @@ def _resolve_remote_session_inputs(
     cancellation_event: threading.Event | None = None,
     interrupt_store: Any | None = None,
     interrupt_flag_key: str | None = None,
-    resolution_stats: _RemoteSessionBridgeResolutionStats | None = None,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> dict[str, Any]:
     """Resolve any remote-session value refs embedded in boundary inputs."""
     ref_input_names = [
@@ -376,7 +374,7 @@ def _resolve_remote_session_inputs(
 def _log_remote_session_resolution_summary(
     *,
     component_id: str,
-    resolution_stats: _RemoteSessionBridgeResolutionStats,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats",
     loader_cache_before: dict[str, int],
     loader_cache_after: dict[str, int],
 ) -> None:
@@ -446,7 +444,7 @@ class _RemoteSessionBridgeResolutionStats:
 
 
 def _record_remote_session_resolution_event(
-    resolution_stats: _RemoteSessionBridgeResolutionStats | None,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None",
     event_name: str,
     event_payload: Mapping[str, Any],
 ) -> None:
