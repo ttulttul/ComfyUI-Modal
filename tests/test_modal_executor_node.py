@@ -309,12 +309,24 @@ def test_register_cache_friendly_proxy_payload_strips_session_fields_and_rehydra
             "boundary_outputs": [],
             "execute_node_ids": [],
             "clear_remote_session": True,
+            "extra_data": {
+                "prompt_id": "prompt-1",
+                "create_time": 1234567890,
+                "modal": {"remote_node_ids": ["12"], "estimated_max_parallel_requests": 1},
+            },
+            "requires_volume_reload": True,
+            "volume_reload_marker": "marker-1",
+            "uploaded_volume_paths": ["/storage/assets/example.safetensors"],
         },
     )
 
     assert "prompt_id" not in payload
     assert "remote_session" not in payload
     assert "clear_remote_session" not in payload
+    assert "extra_data" not in payload
+    assert "requires_volume_reload" not in payload
+    assert "volume_reload_marker" not in payload
+    assert "uploaded_volume_paths" not in payload
     assert modal_executor_module._rehydrate_proxy_payload(payload, unique_id="node-1") == {
         "payload_kind": "subgraph",
         "component_id": "component-1",
@@ -327,6 +339,14 @@ def test_register_cache_friendly_proxy_payload_strips_session_fields_and_rehydra
         "boundary_outputs": [],
         "execute_node_ids": [],
         "clear_remote_session": True,
+        "extra_data": {
+            "prompt_id": "prompt-1",
+            "create_time": 1234567890,
+            "modal": {"remote_node_ids": ["12"], "estimated_max_parallel_requests": 1},
+        },
+        "requires_volume_reload": True,
+        "volume_reload_marker": "marker-1",
+        "uploaded_volume_paths": ["/storage/assets/example.safetensors"],
     }
 
 
@@ -361,6 +381,71 @@ def test_cache_friendly_proxy_payload_rehydrates_without_hidden_unique_id(
         },
         "boundary_outputs": [],
         "execute_node_ids": [],
+    }
+
+
+def test_cache_friendly_proxy_payload_ignores_volatile_queue_metadata(
+    modal_executor_module: Any,
+) -> None:
+    """Identical proxy work should sanitize to one local cache surface across prompt runs."""
+    first_payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-9",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-9",
+            "prompt_id": "prompt-1",
+            "boundary_outputs": [],
+            "execute_node_ids": ["12"],
+            "extra_data": {
+                "client_id": "client-1",
+                "create_time": 1000,
+                "modal": {"remote_component_ids": ["12"]},
+            },
+            "requires_volume_reload": True,
+            "volume_reload_marker": "marker-1",
+            "uploaded_volume_paths": ["/storage/assets/a.bin"],
+        },
+    )
+    second_payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-9",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-9",
+            "prompt_id": "prompt-2",
+            "boundary_outputs": [],
+            "execute_node_ids": ["12"],
+            "extra_data": {
+                "client_id": "client-1",
+                "create_time": 2000,
+                "modal": {"remote_component_ids": ["12", "39"]},
+            },
+            "requires_volume_reload": False,
+            "volume_reload_marker": None,
+            "uploaded_volume_paths": [],
+        },
+    )
+
+    assert first_payload == second_payload == {
+        "payload_kind": "subgraph",
+        "component_id": "component-9",
+        "boundary_outputs": [],
+        "execute_node_ids": ["12"],
+        modal_executor_module._PROXY_CACHE_CONTEXT_ID_KEY: "node-9",
+    }
+    assert modal_executor_module._rehydrate_proxy_payload(first_payload, unique_id="node-9") == {
+        "payload_kind": "subgraph",
+        "component_id": "component-9",
+        "prompt_id": "prompt-2",
+        "boundary_outputs": [],
+        "execute_node_ids": ["12"],
+        "extra_data": {
+            "client_id": "client-1",
+            "create_time": 2000,
+            "modal": {"remote_component_ids": ["12", "39"]},
+        },
+        "requires_volume_reload": False,
+        "volume_reload_marker": None,
+        "uploaded_volume_paths": [],
     }
 
 
