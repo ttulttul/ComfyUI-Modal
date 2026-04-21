@@ -410,6 +410,7 @@ class InMemoryRemoteSessionStore:
         *,
         target_session_handle: RemoteSessionHandle | None = None,
         bridge_resolver: Callable[[RemoteSessionBridgeRef], Any] | None = None,
+        resolution_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
     ) -> Any:
         """Resolve one possible live or durable session reference into the underlying value."""
         if is_remote_session_value_ref_payload(value):
@@ -420,6 +421,15 @@ class InMemoryRemoteSessionStore:
                 ref.node_id,
                 ref.output_index,
             )
+            if resolution_callback is not None:
+                resolution_callback(
+                    "session-value-hit",
+                    {
+                        "session_id": ref.session_id,
+                        "node_id": ref.node_id,
+                        "output_index": ref.output_index,
+                    },
+                )
             return self.get_output(ref)
 
         if not is_remote_session_bridge_ref_payload(value):
@@ -448,6 +458,16 @@ class InMemoryRemoteSessionStore:
                     ref.bridge_key,
                     target_session_handle.session_id,
                 )
+                if resolution_callback is not None:
+                    resolution_callback(
+                        "bridge-target-hit",
+                        {
+                            "bridge_key": ref.bridge_key,
+                            "session_id": target_session_handle.session_id,
+                            "node_id": ref.node_id,
+                            "output_index": ref.output_index,
+                        },
+                    )
                 return live_value
         if ref.session_id:
             found, live_value = self.try_get_output(
@@ -463,6 +483,16 @@ class InMemoryRemoteSessionStore:
                     ref.bridge_key,
                     ref.session_id,
                 )
+                if resolution_callback is not None:
+                    resolution_callback(
+                        "bridge-source-hit",
+                        {
+                            "bridge_key": ref.bridge_key,
+                            "session_id": ref.session_id,
+                            "node_id": ref.node_id,
+                            "output_index": ref.output_index,
+                        },
+                    )
                 return live_value
         if bridge_resolver is None:
             raise RemoteSessionStateError(
@@ -474,6 +504,18 @@ class InMemoryRemoteSessionStore:
             ref.bridge_key,
             target_session_handle.session_id if target_session_handle is not None else None,
         )
+        if resolution_callback is not None:
+            resolution_callback(
+                "bridge-rehydrate",
+                {
+                    "bridge_key": ref.bridge_key,
+                    "target_session_id": (
+                        target_session_handle.session_id if target_session_handle is not None else None
+                    ),
+                    "node_id": ref.node_id,
+                    "output_index": ref.output_index,
+                },
+            )
         return bridge_resolver(ref)
 
 

@@ -1313,8 +1313,11 @@ def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
 
     original_cache = dict(modal_cloud_module._LOADER_OUTPUT_CACHE)
     original_wrapped = set(modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES)
+    original_metrics = dict(modal_cloud_module._LOADER_CACHE_METRICS)
     modal_cloud_module._LOADER_OUTPUT_CACHE.clear()
     modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
+    modal_cloud_module._LOADER_CACHE_METRICS.clear()
+    modal_cloud_module._LOADER_CACHE_METRICS.update({"hit": 0, "miss": 0})
     try:
         modal_cloud_module._wrap_loader_method_with_cache(
             "FakeLoader",
@@ -1326,17 +1329,125 @@ def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
         first = loader.load("model.safetensors", device="cpu")[0]
         second = loader.load("model.safetensors", device="cpu")[0]
         third = loader.load("other.safetensors", device="cpu")[0]
+        metrics_snapshot = modal_cloud_module._loader_cache_metric_snapshot()
     finally:
         modal_cloud_module._LOADER_OUTPUT_CACHE.clear()
         modal_cloud_module._LOADER_OUTPUT_CACHE.update(original_cache)
         modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
         modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
+        modal_cloud_module._LOADER_CACHE_METRICS.clear()
+        modal_cloud_module._LOADER_CACHE_METRICS.update(original_metrics)
 
     assert loader.calls == 2
     assert first.value == "model.safetensors:cpu:1"
     assert second.value == "model.safetensors:cpu:1"
     assert third.value == "other.safetensors:cpu:2"
     assert first is not second
+    assert metrics_snapshot == {"hit": 1, "miss": 2}
+
+
+def test_modal_cloud_rehydrates_bridge_refs_from_warm_value_cache_without_replay(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Warm-worker bridge values should restore directly into a fresh session without replay."""
+    bridge_key = "RSB_cached_bridge"
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+        bridge_key=bridge_key,
+        node_id="node-7",
+        output_index=0,
+        session_id="session-source",
+    )
+    original_cache = dict(modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE)
+    original_order = list(modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER)
+    try:
+        seed_value = _CloneableCacheValue("warm-bridge-value")
+        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
+        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
+        modal_cloud_module._store_remote_session_bridge_value(bridge_key, seed_value)
+        monkeypatch.setattr(
+            modal_cloud_module,
+            "_load_remote_session_bridge_record",
+            lambda bridge_key: (_ for _ in ()).throw(
+                AssertionError(f"warm bridge cache hit should skip record lookup for {bridge_key}")
+            ),
+        )
+        resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
+
+        restored_value = modal_cloud_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            custom_nodes_root=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+            resolution_stats=resolution_stats,
+        )
+
+        stored_value = modal_cloud_module._REMOTE_SESSION_STORE.get_output(
+            modal_cloud_module.RemoteSessionValueRef(
+                session_id=target_handle.session_id,
+                node_id="node-7",
+                output_index=0,
+            )
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
+        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.update(original_cache)
+        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
+        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.extend(original_order)
+
+    assert isinstance(restored_value, _CloneableCacheValue)
+    assert restored_value.value == "warm-bridge-value"
+    assert restored_value is not seed_value
+    assert stored_value is restored_value
+    assert resolution_stats.bridge_cache_hits == 1
+    assert resolution_stats.bridge_record_lookups == 0
+    assert resolution_stats.replay_count == 0
+    assert resolution_stats.session_restore_writes == 1
+
+
+def test_modal_cloud_logs_remote_session_resolution_summary(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped-phase bridge resolution should emit one summary block with replay and loader deltas."""
+    observed_logs: list[tuple[str, tuple[Any, ...]]] = []
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_emit_cloud_info",
+        lambda message, *args: observed_logs.append((message, args)),
+    )
+
+    modal_cloud_module._log_remote_session_resolution_summary(
+        component_id="1::mapped",
+        resolution_stats=modal_cloud_module._RemoteSessionBridgeResolutionStats(
+            input_ref_count=2,
+            live_session_hits=1,
+            bridge_cache_hits=1,
+            bridge_record_lookups=1,
+            bridge_record_lookup_seconds=0.25,
+            replay_count=1,
+            replay_seconds=1.5,
+            direct_restore_seconds=0.02,
+            session_restore_writes=1,
+        ),
+        loader_cache_before={"hit": 3, "miss": 4},
+        loader_cache_after={"hit": 5, "miss": 5},
+    )
+
+    assert observed_logs == [
+        (
+            "Remote session resolution summary component=%s refs=%d live_hits=%d warm_bridge_hits=%d bridge_record_lookups=%d bridge_record_lookup_seconds=%.3f replay_count=%d replay_seconds=%.3f direct_restore_seconds=%.3f session_restore_writes=%d loader_cache_hits=%d loader_cache_misses=%d",
+            ("1::mapped", 2, 1, 1, 1, 0.25, 1, 1.5, 0.02, 1, 2, 1),
+        )
+    ]
 
 
 def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
@@ -3743,6 +3854,62 @@ def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
         },
     )
     assert replay_outputs == ("shared-session-value",)
+
+
+def test_local_remote_app_rehydrates_bridge_refs_from_warm_value_cache_without_replay(
+    remote_modal_app_module: Any,
+) -> None:
+    """The local fallback bridge fast path should restore retained values without replaying producers."""
+    bridge_key = "RSB_local_cached_bridge"
+    target_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key=bridge_key,
+        node_id="node-7",
+        output_index=0,
+        session_id="session-source",
+    )
+    original_cache = dict(remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE)
+    original_order = list(remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER)
+    try:
+        seed_value = _CloneableCacheValue("warm-local-bridge-value")
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
+        remote_modal_app_module._store_remote_session_bridge_value(bridge_key, seed_value)
+        resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+
+        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            node_mapping=None,
+            resolution_stats=resolution_stats,
+        )
+
+        stored_value = remote_modal_app_module._REMOTE_SESSION_STORE.get_output(
+            remote_modal_app_module.RemoteSessionValueRef(
+                session_id=target_handle.session_id,
+                node_id="node-7",
+                output_index=0,
+            )
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.update(original_cache)
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.extend(original_order)
+
+    assert isinstance(restored_value, _CloneableCacheValue)
+    assert restored_value.value == "warm-local-bridge-value"
+    assert restored_value is not seed_value
+    assert stored_value is restored_value
+    assert resolution_stats.bridge_cache_hits == 1
+    assert resolution_stats.bridge_record_lookups == 0
+    assert resolution_stats.replay_count == 0
+    assert resolution_stats.session_restore_writes == 1
 
 
 def test_local_phase_payload_builder_preserves_remote_session(
