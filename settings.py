@@ -31,6 +31,9 @@ class ModalSyncSettings:
     comfyui_root: Path | None
     custom_nodes_dir: Path | None
     interrupt_dict_name: str = "comfy-modal-sync-interrupts"
+    node_output_cache_dict_name: str = "comfy-modal-sync-node-cache"
+    session_bridge_dict_name: str = "comfy-modal-sync-session-bridges"
+    node_output_cache_max_bytes: int = 5 * 1024 * 1024
     terminate_container_on_error: bool = True
     modal_gpu: str = "A100"
     scaledown_window_seconds: int = 600
@@ -38,6 +41,7 @@ class ModalSyncSettings:
     max_containers: int | None = None
     buffer_containers: int | None = None
     enable_proactive_warmup: bool = True
+    stream_remote_container_logs: bool = False
 
 
 def _read_path_env(name: str) -> Path | None:
@@ -171,6 +175,18 @@ def get_settings() -> ModalSyncSettings:
             "COMFY_MODAL_INTERRUPT_DICT_NAME",
             f"{app_name}-interrupts",
         ),
+        node_output_cache_dict_name=os.getenv(
+            "COMFY_MODAL_NODE_CACHE_DICT_NAME",
+            f"{app_name}-node-cache",
+        ),
+        session_bridge_dict_name=os.getenv(
+            "COMFY_MODAL_SESSION_BRIDGE_DICT_NAME",
+            f"{app_name}-session-bridges",
+        ),
+        node_output_cache_max_bytes=_read_int_env(
+            "COMFY_MODAL_NODE_CACHE_MAX_BYTES",
+            5 * 1024 * 1024,
+        ),
         terminate_container_on_error=_read_bool_env("COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR")
         is not False,
         modal_gpu=os.getenv("COMFY_MODAL_GPU", "A100").strip() or "A100",
@@ -179,6 +195,8 @@ def get_settings() -> ModalSyncSettings:
         max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),
         buffer_containers=_read_optional_int_env("COMFY_MODAL_BUFFER_CONTAINERS"),
         enable_proactive_warmup=_read_bool_env("COMFY_MODAL_ENABLE_PROACTIVE_WARMUP") is not False,
+        stream_remote_container_logs=_read_bool_env("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS")
+        or False,
     )
     logger.debug("Resolved Modal-Sync settings: %s", settings)
     return settings

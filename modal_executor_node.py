@@ -7,7 +7,9 @@ import hashlib
 import inspect
 import json
 import logging
+import threading
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from comfy_api.latest import _io as io
@@ -16,6 +18,18 @@ from .serialization import deserialize_node_outputs, serialize_node_inputs
 
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
+_PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
+_VOLATILE_PROXY_CACHE_KEYS = frozenset(
+    {
+        "prompt_id",
+        "remote_session",
+        "clear_remote_session",
+        "extra_data",
+        "requires_volume_reload",
+        "volume_reload_marker",
+        "uploaded_volume_paths",
+    }
+)
 
 
 class RemoteExecutorClient(Protocol):
@@ -56,6 +70,15 @@ class ModalRemoteExecutorClient:
 
 _REMOTE_EXECUTOR_CLIENT_FACTORY: Callable[[], RemoteExecutorClient] = ModalRemoteExecutorClient
 _PROXY_NODE_CACHE: dict[str, type[io.ComfyNode]] = {}
+_PROXY_EXECUTION_CONTEXTS_LOCK = threading.Lock()
+_PROXY_EXECUTION_CONTEXTS: dict[str, "_ProxyExecutionContext"] = {}
+
+
+@dataclass(frozen=True)
+class _ProxyExecutionContext:
+    """Run-scoped execution context used to rehydrate cache-friendly proxy payloads."""
+
+    execution_payload: dict[str, Any]
 
 
 def set_remote_executor_client_factory(
@@ -116,6 +139,111 @@ def _normalize_proxy_payload(payload: Any) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise TypeError("original_node_data must be a mapping or JSON object.")
     return payload
+
+
+def _normalize_prompt_id(value: Any) -> str | None:
+    """Return one non-empty prompt id string when available."""
+    if value is None:
+        return None
+    prompt_id = str(value).strip()
+    return prompt_id or None
+
+
+def _payload_is_local_cache_safe(payload: Mapping[str, Any]) -> bool:
+    """Return whether one proxy payload can safely reuse local ComfyUI outputs across prompt runs."""
+    split_proxy_payloads = payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, Mapping):
+        return all(
+            isinstance(nested_payload, Mapping) and _payload_is_local_cache_safe(nested_payload)
+            for nested_payload in split_proxy_payloads.values()
+        )
+    if isinstance(split_proxy_payloads, Sequence) and not isinstance(split_proxy_payloads, (str, bytes, bytearray)):
+        return all(
+            isinstance(nested_payload, Mapping) and _payload_is_local_cache_safe(nested_payload)
+            for nested_payload in split_proxy_payloads
+        )
+
+    for phase_name in ("static_phase", "mapped_phase"):
+        phase_payload = payload.get(phase_name)
+        if isinstance(phase_payload, Mapping) and not _payload_is_local_cache_safe(phase_payload):
+            return False
+    return True
+
+
+def _sanitize_cache_surface_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip run-scoped fields from one proxy payload before exposing it to ComfyUI caching."""
+    sanitized_payload = dict(payload)
+    for field_name in _VOLATILE_PROXY_CACHE_KEYS:
+        sanitized_payload.pop(field_name, None)
+
+    split_proxy_payloads = sanitized_payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, Mapping):
+        sanitized_payload["split_proxy_payloads"] = {
+            str(phase_name): _sanitize_cache_surface_payload(dict(phase_payload))
+            for phase_name, phase_payload in split_proxy_payloads.items()
+            if isinstance(phase_payload, Mapping)
+        }
+    elif isinstance(split_proxy_payloads, Sequence) and not isinstance(
+        split_proxy_payloads,
+        (str, bytes, bytearray),
+    ):
+        sanitized_payload["split_proxy_payloads"] = [
+            _sanitize_cache_surface_payload(dict(phase_payload))
+            for phase_payload in split_proxy_payloads
+            if isinstance(phase_payload, Mapping)
+        ]
+
+    for phase_name in ("static_phase", "mapped_phase"):
+        phase_payload = sanitized_payload.get(phase_name)
+        if isinstance(phase_payload, Mapping):
+            sanitized_payload[phase_name] = _sanitize_cache_surface_payload(dict(phase_payload))
+    return sanitized_payload
+
+
+def register_cache_friendly_proxy_payload(
+    node_id: str,
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Return the payload that should be embedded in the proxy node input for local cache reuse."""
+    if not _payload_is_local_cache_safe(payload):
+        return dict(payload)
+
+    sanitized_payload = _sanitize_cache_surface_payload(payload)
+    sanitized_payload[_PROXY_CACHE_CONTEXT_ID_KEY] = str(node_id)
+    with _PROXY_EXECUTION_CONTEXTS_LOCK:
+        _PROXY_EXECUTION_CONTEXTS[str(node_id)] = _ProxyExecutionContext(
+            execution_payload=dict(payload),
+        )
+    logger.debug(
+        "Registered cache-friendly Modal proxy payload for node_id=%s prompt_id=%s session_backed=%s.",
+        node_id,
+        _normalize_prompt_id(payload.get("prompt_id")),
+        payload.get("remote_session") is not None,
+    )
+    return sanitized_payload
+
+
+def _rehydrate_proxy_payload(
+    payload: Mapping[str, Any],
+    *,
+    unique_id: str | None,
+) -> Mapping[str, Any]:
+    """Restore any execution-scoped fields stripped from a cache-friendly proxy payload."""
+    context_id = unique_id
+    if context_id is None:
+        candidate_context_id = payload.get(_PROXY_CACHE_CONTEXT_ID_KEY)
+        if candidate_context_id is not None:
+            normalized_context_id = str(candidate_context_id).strip()
+            context_id = normalized_context_id or None
+    if context_id is None:
+        return payload
+
+    with _PROXY_EXECUTION_CONTEXTS_LOCK:
+        context = _PROXY_EXECUTION_CONTEXTS.get(str(context_id))
+    if context is None:
+        return payload
+
+    return dict(context.execution_payload)
 
 
 def _normalized_output_metadata(
@@ -186,6 +314,7 @@ def _build_proxy_node_class(
                 outputs=outputs,
                 is_input_list=True,
                 accept_all_inputs=True,
+                hidden=[io.Hidden.unique_id],
                 is_dev_only=True,
                 is_experimental=True,
             )
@@ -193,7 +322,11 @@ def _build_proxy_node_class(
         @classmethod
         async def execute(cls, **kwargs: Any) -> io.NodeOutput:
             """Forward the execution payload to the configured remote executor."""
-            payload = _normalize_proxy_payload(kwargs.pop(payload_input_name, None))
+            unique_id = _normalize_prompt_id(kwargs.pop(io.Hidden.unique_id.name, None))
+            payload = _rehydrate_proxy_payload(
+                _normalize_proxy_payload(kwargs.pop(payload_input_name, None)),
+                unique_id=unique_id,
+            )
 
             outputs = tuple(
                 await _execute_payload_async(

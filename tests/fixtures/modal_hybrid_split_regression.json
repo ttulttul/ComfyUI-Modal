@@ -1,0 +1,155 @@
+{
+  "name": "hybrid_split_static_then_mapped",
+  "workflow": {
+    "version": 0.4,
+    "nodes": [
+      {
+        "id": 1,
+        "type": "RemoteModel",
+        "properties": {
+          "is_modal_remote": true
+        }
+      },
+      {
+        "id": 2,
+        "type": "LatentSource",
+        "properties": {
+          "is_modal_remote": false
+        }
+      },
+      {
+        "id": 3,
+        "type": "RemoteSampler",
+        "properties": {
+          "is_modal_remote": true
+        }
+      },
+      {
+        "id": 4,
+        "type": "LocalSink",
+        "properties": {
+          "is_modal_remote": false
+        }
+      },
+      {
+        "id": 5,
+        "type": "LatentSource",
+        "properties": {
+          "is_modal_remote": false
+        }
+      },
+      {
+        "id": 6,
+        "type": "ModalMapInput",
+        "properties": {
+          "is_modal_remote": true
+        }
+      },
+      {
+        "id": 7,
+        "type": "RemoteSampler",
+        "properties": {
+          "is_modal_remote": true
+        }
+      },
+      {
+        "id": 8,
+        "type": "LocalSink",
+        "properties": {
+          "is_modal_remote": false
+        }
+      }
+    ]
+  },
+  "prompt": {
+    "1": {
+      "class_type": "RemoteModel",
+      "inputs": {},
+      "_meta": {
+        "title": "Shared Model"
+      }
+    },
+    "2": {
+      "class_type": "LatentSource",
+      "inputs": {},
+      "_meta": {
+        "title": "Single Latent"
+      }
+    },
+    "3": {
+      "class_type": "RemoteSampler",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "latent": [
+          "2",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Static Remote Sampler"
+      }
+    },
+    "4": {
+      "class_type": "LocalSink",
+      "inputs": {
+        "image": [
+          "3",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Static Local Sink"
+      }
+    },
+    "5": {
+      "class_type": "LatentSource",
+      "inputs": {},
+      "_meta": {
+        "title": "Mapped Latent Source"
+      }
+    },
+    "6": {
+      "class_type": "ModalMapInput",
+      "inputs": {
+        "value": [
+          "5",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Modal Map Input"
+      }
+    },
+    "7": {
+      "class_type": "RemoteSampler",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "latent": [
+          "6",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Mapped Remote Sampler"
+      }
+    },
+    "8": {
+      "class_type": "LocalSink",
+      "inputs": {
+        "image": [
+          "7",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Mapped Local Sink"
+      }
+    }
+  }
+}

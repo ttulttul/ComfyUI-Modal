@@ -64,7 +64,7 @@ The list above is the shortest accurate summary. If you want the execution path 
   - The proxy node serializes its boundary inputs.
   - It checks the payload kind.
     - If the payload is a normal remote component, it dispatches a `subgraph` payload.
-    - If the payload uses `ModalMapInput`, it dispatches a `mapped_subgraph` payload and fans out per-item executions.
+    - If the payload uses `ModalMapInput`, it dispatches one `mapped_subgraph` payload whose explicit static and mapped phases are executed inside a single runtime.
 
 - **4. Dispatch decision**
   1. Check `COMFY_MODAL_EXECUTION_MODE`.
@@ -174,10 +174,20 @@ Remote runtime behavior:
 - Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.
 - Remote proxy nodes now execute through ComfyUI's async node path, so independent Modal-backed components can overlap instead of being forced through one blocking local proxy at a time.
 - The local Modal call executor keeps multiple worker threads available, which removes the previous `max_workers=1` bottleneck when several remote components are ready at once.
-- `ModalMapInput` can turn one remote component boundary into a locally scheduled mapped execution. List inputs and batched tensors fan out into multiple per-item Modal subgraph calls, and the local scheduler refills that queue up to the configured `COMFY_MODAL_MAX_CONTAINERS`.
-- When a mapped remote component has several Modal workers running at once, the local node overlay now shows one progress lane per active worker plus the aggregate completion bar, instead of letting concurrent runs overwrite a single progress bar.
+- Pure `ModalMapInput` components still use one explicit `mapped_subgraph` payload when the whole remote island is per-item work.
+- Hybrid `ModalMapInput` components with a one-time static branch now rewrite into two ordinary proxy nodes: a static `subgraph` proxy that can return transportable outputs early, and a mapped `subgraph` proxy that reuses the static branch's remote-only values through prompt-scoped session refs.
+- Ordinary remote components can now also split into ordered `subgraph` proxies when multiple execute branches only share remote-only upstream state. That lets one branch unblock local downstream work as soon as its transportable outputs are ready while later remote phases reconnect to shared remote-only values through prompt-scoped session refs.
+- Those session refs keep values like `MODEL` remote-only while still letting the mapped proxy reconnect to them later, and the mapped proxy clears the prompt-scoped session once it finishes.
+- Deployed split proxies now also pass a session-affinity key into `RemoteEngine` lookup so the static and mapped halves can reuse that prompt-scoped remote state on the same worker.
+- Session observability now logs the full prompt-scoped lifecycle for split proxies: session creation, reuse, ref resolution, value storage, and cleanup in both local and cloud runtime paths.
+- Opt-in live remote container log mirroring can now follow the active Modal worker's `task_id` during streamed executions and forward those lines into the local ComfyUI process stderr. That makes session create/reuse/cleanup messages visible locally without having to run `modal container logs ...` in a second terminal, and the watcher now prefers the Modal CLI path to avoid SDK task-context warnings in the local process.
 - The remote worker only forwards numeric node progress for meaningful progress states. Trivial `0/1` updates from ordinary upstream nodes are ignored so sampler-style progress bars stay attached to nodes like `KSampler` instead of appearing on loaders or text encoders.
+- Static sub-runs inside hybrid mapped execution now also forward their lane-less execute-node progress even when coarse per-phase status chatter is suppressed, so one-time upstream samplers still show real progress bars while mapped item runs keep their quieter stream behavior.
+- Those suppressed static progress events now emit an explicit clear when the static sub-run finishes, so one-time upstream sampler bars disappear promptly at completion instead of sticking at `100%` until the whole prompt ends.
+- Persisted remote node-cache hits are now idempotent within one execution: if a node output was restored from the distributed Modal Dict under a given `NC_...` key and nothing invalidated that key during the run, the persist phase skips rewriting that same record instead of churning the Dict on a pure cache hit.
+- The distributed cache hot path is also lighter now: `restored-hit` nodes short-circuit before any output serialization work in the persist phase, and restore fan-outs independent Modal Dict lookups so mapped item runs spend less time waiting on node-cache bookkeeping.
 - Mapped remote components can now contain both one-time execute targets and per-item execute targets. A common case is two remote `KSampler` nodes sharing one upstream `Load Diffusion Model`, where only the sampler fed by `ModalMapInput` should fan out per latent while the sibling sampler still runs exactly once.
+- Queue-time rewrite now materializes explicit static-to-mapped boundaries for invariant upstream outputs. That lets the mapped phase consume only the values it really depends on instead of carrying the whole coarse component prompt back through every item run.
 - Hybrid mapped sub-runs now trim their prompt down to the dependency closure of the specific `execute_node_ids` they are about to run. That keeps a static-only sub-run from validating or executing the unrelated mapped branch just because both branches originally lived in the same coarse remote component.
 - Hybrid sub-run trimming also tolerates stale execute target ids that are no longer present in the current subgraph prompt. Those ids are now dropped before dependency resolution instead of crashing the remote worker with a `KeyError`.
 - Boundary inputs injected back into a remote subgraph are now normalized through the same singleton-wrapper cleanup path as stored prompt inputs, so a proxied scalar like `[4]` no longer reaches `PromptExecutor` as `int([4])`.
@@ -303,6 +313,10 @@ Remote nodes that emit ComfyUI UI outputs also stream those `executed` payloads 
 
 For direct local `PreviewImage` consumers of a remote boundary `IMAGE` output, the relay also synthesizes the local preview-node UI event as soon as that remote boundary image is ready. This improves the common "remote decode -> local preview" case even though the proxy node itself still returns its formal outputs only when the remote component finishes.
 
+Remote subgraph runs also persist transport-safe node outputs into a shared Modal `Dict` using ComfyUI's `CacheKeySetInputSignature` semantics. In practice that lets later workflow runs reuse small and medium cached outputs, including image tensors, even after Modal scales down and starts a fresh container, while still skipping non-serializable outputs and entries above the configured size cap.
+
+Session-backed split proxies use a second Modal `Dict` for durable bridge metadata. That store does not try to serialize live remote-only objects like `MODEL` or `CONDITIONING`; instead it records how to replay the producing split phase, so cached bridge refs can lazily rebuild those values inside the current remote session if the original Modal container is gone.
+
 The extension also keeps a global activity badge visible during queue-time sync and remote execution, including the period before the prompt is formally queued. During setup it now surfaces more specific stages such as packaging the `custom_nodes` ZIP and uploading named assets, and after remote execution finishes it can briefly report that it is still receiving Modal outputs before the local proxy returns.
 
 ### 6. Asset sync expectations
@@ -340,9 +354,13 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_EXECUTION_MODE`: Set to `local` for in-process fallback execution. Default: `local`.
 - `COMFY_MODAL_APP_NAME` and `COMFY_MODAL_VOLUME_NAME`: Override Modal app and volume naming.
 - `COMFY_MODAL_INTERRUPT_DICT_NAME`: Override the shared Modal `Dict` used for remote cancellation flags. Default: `<app_name>-interrupts`.
+- `COMFY_MODAL_NODE_CACHE_DICT_NAME`: Override the shared Modal `Dict` used for persisted transport-safe node outputs. Default: `<app_name>-node-cache`.
+- `COMFY_MODAL_SESSION_BRIDGE_DICT_NAME`: Override the shared Modal `Dict` used for durable session-bridge replay metadata. Default: `<app_name>-session-bridges`.
+- `COMFY_MODAL_NODE_CACHE_MAX_BYTES`: Maximum raw output size eligible for persisted node caching. Default: `5242880` (5 MiB). Set to `0` to disable the persisted node-output cache.
 - `COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR`: When true, a remote execution crash makes the worker exit its own container after returning the error. Default: `true`.
 - `COMFY_MODAL_AUTO_DEPLOY`: Automatically deploy the Modal app on first remote invocation when lookup fails. Default: `true`.
 - `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK`: Re-enable slow `app.run()` fallback in remote mode. Default: `false`.
+- `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS`: Mirror live remote Modal container logs into the local ComfyUI stderr stream during streamed executions. Default: `false`. Modal-Sync prefers `modal container logs <task_id> -f` and only falls back to the installed Modal Python SDK log stream when the CLI is unavailable.
 
 ### Modal runtime sizing
 
@@ -352,7 +370,6 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle containers warm for this many seconds. Default: `600`.
 - `COMFY_MODAL_MIN_CONTAINERS`: Keep at least this many containers warm. Default: `0`.
 - `COMFY_MODAL_MAX_CONTAINERS`: Optional upper bound on simultaneously scaled Modal containers.
-- `COMFY_MODAL_MAX_CONTAINERS` also caps the local mapped-execution worker queue driven by `ModalMapInput`.
 - `COMFY_MODAL_BUFFER_CONTAINERS`: Optional number of spare warm containers Modal should try to keep ready above current load.
 - `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP`: Start best-effort background warmup RPCs based on queue-time and runtime parallelism estimates. Default: `true`.
 
@@ -376,6 +393,11 @@ COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
 - Before publishing, create a Comfy Registry publisher and API key, then store the token in the GitHub Actions secret `REGISTRY_ACCESS_TOKEN`.
 - The registry pack name is `modal-sync`, the display name is `Modal Sync`, and the current publisher id is set to `ttulttul` to match the GitHub origin owner.
 - [`modal_test_workflow.json`](modal_test_workflow.json) is a checked-in smoke artifact from a successful Modal-path run, not a pristine authoring workflow.
+- Local ComfyUI output caching now works again for cache-safe remote proxies, including session-backed split proxies. The rewritten proxy payload strips all run-scoped queue metadata from `original_node_data` and restores it only if the proxy actually executes, so rerunning an unchanged graph can skip the remote call entirely instead of merely hitting Modal Dict quickly. The sanitized payload also carries a stable internal context id so rehydration still works when ComfyUI omits the hidden `unique_id`.
+- Session-backed split proxies now use durable replay refs rather than raw prompt-scoped session ids. Live remote-only values still stay in the in-memory session store for the fast path, but a second Modal `Dict` stores replay metadata so later split phases can rebuild those values after container churn. Session misses are treated as routing/state failures rather than poisoned-worker crashes, and every synthesized static or mapped phase payload now preserves `remote_session` so replayed producers can still export session-backed outputs safely.
+- Split-phase remote distributed caching now carries stable provenance for non-transportable boundary-fed inputs. When a later phase receives a live object like `ModelPatcher` or `CONDITIONING` through boundary injection, the persisted Modal Dict key is derived from the original upstream prompt structure instead of the live Python object identity, so repeated runs can reuse sampler-adjacent cached nodes across containers.
+- Queue-time rewrite and implicit mapped execution now handle the list-shaped edge cases that showed up online: local `ModalMapInput` markers still produce mapped remote work, raw semantic lists like `CONDITIONING` stay broadcast, lists of remote session refs split per item, primitive list values from upstream nodes are allowed to follow ComfyUI's normal over-list behavior, singleton-list cleanup preserves semantic payloads, and `INPUT_IS_LIST` targets suppress outer Modal fan-out so the remote subgraph runs once unchanged.
+- Frontend mapped-progress lanes are now scoped by component representative, and streamed runs still consume the proxy's final native completion event. That prevents parallel remote components from stealing each other's purple bars and stops single-node remote components from staying purple after completion.
 
 ## Current limitations
 
