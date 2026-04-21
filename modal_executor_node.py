@@ -18,6 +18,7 @@ from .serialization import deserialize_node_outputs, serialize_node_inputs
 
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
+_PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
 
 
 class RemoteExecutorClient(Protocol):
@@ -198,6 +199,7 @@ def register_cache_friendly_proxy_payload(
         return dict(payload)
 
     sanitized_payload = _sanitize_cache_surface_payload(payload)
+    sanitized_payload[_PROXY_CACHE_CONTEXT_ID_KEY] = str(node_id)
     with _PROXY_EXECUTION_CONTEXTS_LOCK:
         _PROXY_EXECUTION_CONTEXTS[str(node_id)] = _ProxyExecutionContext(
             execution_payload=dict(payload),
@@ -217,11 +219,17 @@ def _rehydrate_proxy_payload(
     unique_id: str | None,
 ) -> Mapping[str, Any]:
     """Restore any execution-scoped fields stripped from a cache-friendly proxy payload."""
-    if unique_id is None:
+    context_id = unique_id
+    if context_id is None:
+        candidate_context_id = payload.get(_PROXY_CACHE_CONTEXT_ID_KEY)
+        if candidate_context_id is not None:
+            normalized_context_id = str(candidate_context_id).strip()
+            context_id = normalized_context_id or None
+    if context_id is None:
         return payload
 
     with _PROXY_EXECUTION_CONTEXTS_LOCK:
-        context = _PROXY_EXECUTION_CONTEXTS.get(str(unique_id))
+        context = _PROXY_EXECUTION_CONTEXTS.get(str(context_id))
     if context is None:
         return payload
 
