@@ -330,6 +330,40 @@ def test_register_cache_friendly_proxy_payload_strips_session_fields_and_rehydra
     }
 
 
+def test_cache_friendly_proxy_payload_rehydrates_without_hidden_unique_id(
+    modal_executor_module: Any,
+) -> None:
+    """Cache-friendly proxy payloads should still rehydrate when ComfyUI omits hidden unique_id."""
+    payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-7",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-7",
+            "prompt_id": "prompt-7",
+            "remote_session": {
+                "session_id": "session-7",
+                "prompt_id": "prompt-7",
+                "owner_component_id": "component-7",
+            },
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+    )
+
+    assert modal_executor_module._rehydrate_proxy_payload(payload, unique_id=None) == {
+        "payload_kind": "subgraph",
+        "component_id": "component-7",
+        "prompt_id": "prompt-7",
+        "remote_session": {
+            "session_id": "session-7",
+            "prompt_id": "prompt-7",
+            "owner_component_id": "component-7",
+        },
+        "boundary_outputs": [],
+        "execute_node_ids": [],
+    }
+
+
 def test_proxy_execution_wraps_sync_remote_clients(
     modal_executor_module: Any,
 ) -> None:
@@ -3538,6 +3572,73 @@ def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
         },
     )
     assert replay_outputs == ("shared-session-value",)
+
+
+def test_local_phase_payload_builder_preserves_remote_session(
+    remote_modal_app_module: Any,
+) -> None:
+    """Explicit local mapped phase payloads should keep remote_session context."""
+    payload = {
+        "prompt_id": "prompt-1",
+        "extra_data": {"client_id": "c-1"},
+        "remote_session": {
+            "__comfy_modal_remote_session_handle__": True,
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "owner_component_id": "component-1",
+        },
+        "clear_remote_session": True,
+        "static_phase": {
+            "component_node_ids": ["1"],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": ["1"],
+        },
+    }
+
+    phase_payload = remote_modal_app_module._build_phase_subgraph_payload(
+        payload,
+        "static_phase",
+        "component-1::static",
+        suppress_status_stream=True,
+    )
+
+    assert phase_payload["remote_session"]["session_id"] == "session-1"
+    assert phase_payload["clear_remote_session"] is True
+
+
+def test_cloud_phase_payload_builder_preserves_remote_session(
+    modal_cloud_module: Any,
+) -> None:
+    """Explicit cloud mapped phase payloads should keep remote_session context."""
+    payload = {
+        "prompt_id": "prompt-1",
+        "extra_data": {"client_id": "c-1"},
+        "remote_session": {
+            "__comfy_modal_remote_session_handle__": True,
+            "session_id": "session-1",
+            "prompt_id": "prompt-1",
+            "owner_component_id": "component-1",
+        },
+        "clear_remote_session": True,
+        "mapped_phase": {
+            "component_node_ids": ["7"],
+            "subgraph_prompt": {},
+            "boundary_inputs": [],
+            "boundary_outputs": [],
+            "execute_node_ids": ["7"],
+        },
+    }
+
+    phase_payload = modal_cloud_module._build_phase_subgraph_payload(
+        payload,
+        "mapped_phase",
+        "component-1::mapped",
+    )
+
+    assert phase_payload["remote_session"]["session_id"] == "session-1"
+    assert phase_payload["clear_remote_session"] is True
 
 
 def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completion(

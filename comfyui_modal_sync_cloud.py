@@ -2886,7 +2886,7 @@ def _mapped_phase_definition(payload: dict[str, Any], phase_key: str) -> dict[st
 
 def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
     """Return the payload fields shared by every explicit mapped phase."""
-    return {
+    shared_fields = {
         "prompt_id": payload.get("prompt_id"),
         "extra_data": copy.deepcopy(payload.get("extra_data") or {}),
         "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
@@ -2895,6 +2895,12 @@ def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
         "terminate_container_on_error": bool(payload.get("terminate_container_on_error", True)),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
     }
+    remote_session = payload.get("remote_session")
+    if remote_session is not None:
+        shared_fields["remote_session"] = copy.deepcopy(remote_session)
+    if bool(payload.get("clear_remote_session")):
+        shared_fields["clear_remote_session"] = True
+    return shared_fields
 
 
 def _build_phase_subgraph_payload(
