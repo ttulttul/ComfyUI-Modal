@@ -1,5 +1,7 @@
 """Stable Modal cloud entrypoint for ComfyUI Modal-Sync."""
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import copy
@@ -23,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
@@ -75,6 +77,8 @@ _EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
 _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
+_LOADER_CACHE_METRICS_LOCK = threading.Lock()
+_LOADER_CACHE_METRICS: dict[str, int] = {"hit": 0, "miss": 0}
 _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
@@ -84,6 +88,10 @@ _CONTAINER_TERMINATION_LOCK = threading.Lock()
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
 _REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
+_REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
+_REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
+_REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER: list[str] = []
+_REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT = 32
 
 try:
     import modal  # type: ignore
@@ -173,6 +181,46 @@ def _load_remote_session_bridge_record(bridge_key: str) -> RemoteSessionBridgeRe
     return RemoteSessionBridgeRecord.from_payload(payload)
 
 
+def _record_loader_cache_metric(result: str) -> None:
+    """Increment one warm-worker loader-cache metric counter."""
+    with _LOADER_CACHE_METRICS_LOCK:
+        _LOADER_CACHE_METRICS[result] = _LOADER_CACHE_METRICS.get(result, 0) + 1
+
+
+def _loader_cache_metric_snapshot() -> dict[str, int]:
+    """Return the current cumulative loader-cache metrics."""
+    with _LOADER_CACHE_METRICS_LOCK:
+        return dict(_LOADER_CACHE_METRICS)
+
+
+def _store_remote_session_bridge_value(
+    bridge_key: str,
+    value: Any,
+) -> None:
+    """Retain one live bridge value in-process so later mapped phases can skip replay."""
+    cached_value = _clone_loader_cache_value(value)
+    with _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK:
+        _REMOTE_SESSION_BRIDGE_VALUE_CACHE[bridge_key] = cached_value
+        if bridge_key in _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER:
+            _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.remove(bridge_key)
+        _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.append(bridge_key)
+        while len(_REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER) > _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT:
+            evicted_key = _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.pop(0)
+            _REMOTE_SESSION_BRIDGE_VALUE_CACHE.pop(evicted_key, None)
+
+
+def _get_remote_session_bridge_value(bridge_key: str) -> Any | None:
+    """Return one retained bridge value when the current worker still has it."""
+    with _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK:
+        cached_value = _REMOTE_SESSION_BRIDGE_VALUE_CACHE.get(bridge_key)
+        if cached_value is None:
+            return None
+        if bridge_key in _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER:
+            _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.remove(bridge_key)
+        _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.append(bridge_key)
+    return _clone_loader_cache_value(cached_value)
+
+
 def _remote_session_bridge_replay_stack() -> set[str]:
     """Return the thread-local guard set for bridge replay recursion detection."""
     replay_stack = getattr(_REMOTE_SESSION_BRIDGE_REPLAY_STATE, "bridge_keys", None)
@@ -190,6 +238,7 @@ def _rehydrate_remote_session_bridge_value(
     cancellation_event: threading.Event | None,
     interrupt_store: Any | None,
     interrupt_flag_key: str | None,
+    resolution_stats: _RemoteSessionBridgeResolutionStats | None = None,
 ) -> Any:
     """Replay one producer phase into the current session when the live value is gone."""
     if target_session_handle is None:
@@ -197,13 +246,39 @@ def _rehydrate_remote_session_bridge_value(
             "Remote session bridge replay requires a target remote_session handle."
         )
 
+    cached_value = _get_remote_session_bridge_value(ref.bridge_key)
+    if cached_value is not None:
+        restore_started_at = time.perf_counter()
+        _REMOTE_SESSION_STORE.put_output(
+            target_session_handle,
+            node_id=ref.node_id,
+            output_index=ref.output_index,
+            value=cached_value,
+        )
+        if resolution_stats is not None:
+            resolution_stats.bridge_cache_hits += 1
+            resolution_stats.session_restore_writes += 1
+            resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
+        logger.info(
+            "Restored remote session bridge bridge_key=%s directly from warm cache into session_id=%s.",
+            ref.bridge_key,
+            target_session_handle.session_id,
+        )
+        return cached_value
+
     replay_stack = _remote_session_bridge_replay_stack()
     if ref.bridge_key in replay_stack:
         raise RemoteSessionStateError(
             f"Detected recursive remote session bridge replay for {ref.bridge_key!r}."
         )
 
+    record_lookup_started_at = time.perf_counter()
     record = _load_remote_session_bridge_record(ref.bridge_key)
+    if resolution_stats is not None:
+        resolution_stats.bridge_record_lookups += 1
+        resolution_stats.bridge_record_lookup_seconds += (
+            time.perf_counter() - record_lookup_started_at
+        )
     replay_payload = copy.deepcopy(record.producer_payload)
     replay_payload["remote_session"] = target_session_handle.to_payload()
     replay_payload.pop("clear_remote_session", None)
@@ -218,6 +293,7 @@ def _rehydrate_remote_session_bridge_value(
         replay_payload.get("component_id"),
     )
     replay_stack.add(ref.bridge_key)
+    replay_started_at = time.perf_counter()
     try:
         _execute_subgraph_prompt(
             replay_payload,
@@ -230,6 +306,9 @@ def _rehydrate_remote_session_bridge_value(
         )
     finally:
         replay_stack.remove(ref.bridge_key)
+    if resolution_stats is not None:
+        resolution_stats.replay_count += 1
+        resolution_stats.replay_seconds += time.perf_counter() - replay_started_at
 
     return _REMOTE_SESSION_STORE.get_output(
         RemoteSessionValueRef(
@@ -249,6 +328,7 @@ def _resolve_remote_session_inputs(
     cancellation_event: threading.Event | None = None,
     interrupt_store: Any | None = None,
     interrupt_flag_key: str | None = None,
+    resolution_stats: _RemoteSessionBridgeResolutionStats | None = None,
 ) -> dict[str, Any]:
     """Resolve any remote-session value refs embedded in boundary inputs."""
     ref_input_names = [
@@ -264,10 +344,21 @@ def _resolve_remote_session_inputs(
             component_id or "<unknown>",
             sorted(ref_input_names),
         )
+    if resolution_stats is not None:
+        resolution_stats.input_ref_count += len(ref_input_names)
     return {
         input_name: _REMOTE_SESSION_STORE.resolve_value_with_bridges(
             input_value,
             target_session_handle=target_session_handle,
+            resolution_callback=(
+                lambda event_name, event_payload: _record_remote_session_resolution_event(
+                    resolution_stats,
+                    event_name,
+                    event_payload,
+                )
+            )
+            if resolution_stats is not None
+            else None,
             bridge_resolver=lambda ref: _rehydrate_remote_session_bridge_value(
                 ref,
                 target_session_handle=target_session_handle,
@@ -275,10 +366,41 @@ def _resolve_remote_session_inputs(
                 cancellation_event=cancellation_event,
                 interrupt_store=interrupt_store,
                 interrupt_flag_key=interrupt_flag_key,
+                resolution_stats=resolution_stats,
             ),
         )
         for input_name, input_value in hydrated_inputs.items()
     }
+
+
+def _log_remote_session_resolution_summary(
+    *,
+    component_id: str,
+    resolution_stats: _RemoteSessionBridgeResolutionStats,
+    loader_cache_before: dict[str, int],
+    loader_cache_after: dict[str, int],
+) -> None:
+    """Emit one high-signal log line summarizing bridge resolution cost for a payload."""
+    if resolution_stats.input_ref_count <= 0:
+        return
+
+    loader_hit_delta = loader_cache_after.get("hit", 0) - loader_cache_before.get("hit", 0)
+    loader_miss_delta = loader_cache_after.get("miss", 0) - loader_cache_before.get("miss", 0)
+    _emit_cloud_info(
+        "Remote session resolution summary component=%s refs=%d live_hits=%d warm_bridge_hits=%d bridge_record_lookups=%d bridge_record_lookup_seconds=%.3f replay_count=%d replay_seconds=%.3f direct_restore_seconds=%.3f session_restore_writes=%d loader_cache_hits=%d loader_cache_misses=%d",
+        component_id,
+        resolution_stats.input_ref_count,
+        resolution_stats.live_session_hits,
+        resolution_stats.bridge_cache_hits,
+        resolution_stats.bridge_record_lookups,
+        resolution_stats.bridge_record_lookup_seconds,
+        resolution_stats.replay_count,
+        resolution_stats.replay_seconds,
+        resolution_stats.direct_restore_seconds,
+        resolution_stats.session_restore_writes,
+        loader_hit_delta,
+        loader_miss_delta,
+    )
 
 
 @dataclass
@@ -306,6 +428,33 @@ class _NodeOutputCacheLookupResult:
     cache_key: str | None
     raw_record: Any | None
     cache_entry: Any | None
+
+
+@dataclass
+class _RemoteSessionBridgeResolutionStats:
+    """Track how one payload resolved session-backed boundary inputs."""
+
+    input_ref_count: int = 0
+    live_session_hits: int = 0
+    bridge_cache_hits: int = 0
+    bridge_record_lookups: int = 0
+    bridge_record_lookup_seconds: float = 0.0
+    replay_count: int = 0
+    replay_seconds: float = 0.0
+    direct_restore_seconds: float = 0.0
+    session_restore_writes: int = 0
+
+
+def _record_remote_session_resolution_event(
+    resolution_stats: _RemoteSessionBridgeResolutionStats | None,
+    event_name: str,
+    event_payload: Mapping[str, Any],
+) -> None:
+    """Accumulate one remote-session resolution event when stats collection is active."""
+    if resolution_stats is None:
+        return
+    if event_name in {"session-value-hit", "bridge-target-hit", "bridge-source-hit"}:
+        resolution_stats.live_session_hits += 1
 
 
 _PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
@@ -1200,9 +1349,11 @@ def _wrap_loader_method_with_cache(
         with _LOADER_CACHE_LOCK:
             cached_outputs = _LOADER_OUTPUT_CACHE.get(cache_key)
         if cached_outputs is not None:
+            _record_loader_cache_metric("hit")
             _emit_cloud_info("Loader cache hit class_type=%s key=%s", class_type, cache_key[1])
             return _clone_loader_cache_outputs(cached_outputs)
 
+        _record_loader_cache_metric("miss")
         _emit_cloud_info("Loader cache miss class_type=%s key=%s", class_type, cache_key[1])
         outputs = original_method(self, *args, **kwargs)
         normalized_outputs = tuple(outputs) if isinstance(outputs, (list, tuple)) else (outputs,)
@@ -1314,6 +1465,10 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                 return
 
             if custom_nodes_root_key is None or custom_nodes_root_key in _COMFY_RUNTIME_CUSTOM_NODE_ROOTS:
+                logger.info(
+                    "Reusing initialized remote ComfyUI runtime for custom_nodes=%s without re-running custom node import.",
+                    custom_nodes_root_key or "<default>",
+                )
                 _install_loader_cache_wrappers()
                 return
 
@@ -2643,6 +2798,8 @@ def _execute_subgraph_prompt(
         _normalize_subgraph_payload(payload)
     )
     session_handle = _payload_remote_session_handle(normalized_payload)
+    resolution_stats = _RemoteSessionBridgeResolutionStats()
+    loader_cache_before = _loader_cache_metric_snapshot()
     resolved_inputs = _resolve_remote_session_inputs(
         dict(hydrated_inputs),
         component_id=component_id,
@@ -2651,6 +2808,13 @@ def _execute_subgraph_prompt(
         cancellation_event=cancellation_event,
         interrupt_store=interrupt_store,
         interrupt_flag_key=interrupt_flag_key,
+        resolution_stats=resolution_stats,
+    )
+    _log_remote_session_resolution_summary(
+        component_id=component_id,
+        resolution_stats=resolution_stats,
+        loader_cache_before=loader_cache_before,
+        loader_cache_after=_loader_cache_metric_snapshot(),
     )
     if session_handle is not None:
         logger.info(
@@ -2817,6 +2981,7 @@ def _execute_subgraph_prompt(
                         output_index=output_index,
                     )
                     _store_remote_session_bridge_record(bridge_record)
+                    _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
                     output_value = RemoteSessionBridgeRef(
                         bridge_key=bridge_record.bridge_key,
                         node_id=node_id,
