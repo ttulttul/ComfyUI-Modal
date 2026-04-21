@@ -73,6 +73,7 @@ def test_modal_test_workflow_captures_known_working_remote_component() -> None:
 
 def test_hybrid_split_workflow_artifact_rewrites_into_static_and_mapped_proxies(
     api_intercept_module: Any,
+    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
@@ -146,9 +147,22 @@ def test_hybrid_split_workflow_artifact_rewrites_into_static_and_mapped_proxies(
 
     static_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
     mapped_payload = rewritten_prompt["1__mapped"]["inputs"]["original_node_data"]
+    static_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        static_payload,
+        unique_id="1",
+    )
+    mapped_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        mapped_payload,
+        unique_id="1__mapped",
+    )
 
     assert static_payload["component_node_ids"] == ["1", "3"]
     assert mapped_payload["component_node_ids"] == ["6", "7"]
     assert static_payload["boundary_outputs"][1]["session_output"] is True
-    assert static_payload["remote_session"]["session_id"] == mapped_payload["remote_session"]["session_id"]
-    assert mapped_payload["clear_remote_session"] is True
+    assert "remote_session" not in static_payload
+    assert (
+        static_execution_payload["remote_session"]["session_id"]
+        == mapped_execution_payload["remote_session"]["session_id"]
+    )
+    assert "clear_remote_session" not in mapped_payload
+    assert mapped_execution_payload["clear_remote_session"] is True
