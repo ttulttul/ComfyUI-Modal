@@ -6,6 +6,7 @@
 - Durable bridge refs still are not enough on their own for fast repeat mapped runs. If the worker already has the live remote-only value in memory, the cheapest path is to cache that value by `bridge_key` and restore it directly into the next prompt-scoped session instead of replaying the whole static producer subgraph just to recreate the same `MODEL` or `CONDITIONING`.
 - Replay optimization needs its own instrumentation. A single mapped-phase summary that breaks bridge resolution down into live-session hits, warm bridge-cache hits, durable-record lookup time, replay time, session-restore writes, and loader-cache hit/miss deltas makes it obvious whether a repeat run really skipped work or just hid it behind another internal phase.
 - Remote custom-node reuse is mostly an idempotence problem, not a raw import-speed problem. Once one extracted bundle root has already been initialized on a warm worker, repeating `init_external_custom_nodes()` for the same root mostly adds log noise and risk, so the runtime should treat that root as already loaded and make the reuse explicit in logs.
+- The local streamed Modal bridge should stop waiting once it receives the terminal `result` envelope. In real runs, the underlying `remote_gen(...)` iterator can take tens of extra seconds to unwind after the remote payload has already finished, and that tail latency blocks mapped cleanup and makes one lane look like a straggler even though inference is done.
 
 ## 2026-04-20
 

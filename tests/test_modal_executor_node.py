@@ -2469,6 +2469,55 @@ def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
     assert log_stream_calls == [("retain", "ta-123"), ("release", "ta-123")]
 
 
+def test_remote_modal_stops_consuming_stream_after_terminal_result(
+    remote_modal_app_module: Any,
+) -> None:
+    """The local stream consumer should not wait for extra events after the final result arrives."""
+
+    class FakeStreamEvents:
+        """Iterator that fails if the consumer requests post-result events."""
+
+        def __init__(self) -> None:
+            """Initialize the deterministic event sequence."""
+            self._events = [
+                {"kind": "remote_logs", "task_id": "ta-123"},
+                {"kind": "result", "outputs": b"serialized-outputs"},
+            ]
+            self._index = 0
+            self.close_calls = 0
+
+        def __iter__(self) -> "FakeStreamEvents":
+            """Return the iterator itself."""
+            return self
+
+        def __next__(self) -> dict[str, Any]:
+            """Return the next event and reject any post-result polling."""
+            if self._index >= len(self._events):
+                raise AssertionError("The stream consumer requested events after the terminal result.")
+            next_event = self._events[self._index]
+            self._index += 1
+            return next_event
+
+        def close(self) -> None:
+            """Record one best-effort close from the local consumer."""
+            self.close_calls += 1
+
+    stream_events = FakeStreamEvents()
+
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "component-1",
+            "component_node_ids": ["7"],
+            "extra_data": {"client_id": "client-1"},
+        },
+        stream_events,
+    )
+
+    assert result == b"serialized-outputs"
+    assert stream_events.close_calls == 1
+
+
 def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
     remote_modal_app_module: Any,
     monkeypatch: Any,
