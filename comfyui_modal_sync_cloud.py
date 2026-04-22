@@ -139,6 +139,11 @@ def _build_remote_session_bridge_record(
     producer_payload = _sanitize_payload_for_session_bridge_record(payload)
     producer_inputs = serialize_mapping(hydrated_inputs)
     serialized_output = _serialize_durable_bridge_output(output_value, io_type)
+    rehydration_plan = _build_durable_bridge_rehydration_plan(
+        payload=producer_payload,
+        node_id=node_id,
+        io_type=io_type,
+    )
     return RemoteSessionBridgeRecord(
         bridge_key=stable_session_bridge_key(
             producer_payload=producer_payload,
@@ -152,6 +157,8 @@ def _build_remote_session_bridge_record(
         producer_inputs=producer_inputs,
         serialized_output=serialized_output,
         serialized_output_io_type=(str(io_type) if serialized_output is not None else None),
+        rehydration_plan=rehydration_plan,
+        rehydration_plan_io_type=(str(io_type) if rehydration_plan is not None else None),
     )
 
 
@@ -274,6 +281,100 @@ def _restore_serialized_remote_session_bridge_value(
     return restored_value
 
 
+def _build_durable_bridge_rehydration_plan(
+    *,
+    payload: dict[str, Any],
+    node_id: str,
+    io_type: str,
+) -> dict[str, Any] | None:
+    """Return a direct rehydration plan when one bridge output can be rebuilt without replay."""
+    if str(io_type or "") != "MODEL":
+        return None
+    prompt = payload.get("subgraph_prompt")
+    if not isinstance(prompt, dict):
+        return None
+    prompt_node = prompt.get(str(node_id))
+    if not isinstance(prompt_node, dict):
+        return None
+    class_type = prompt_node.get("class_type")
+    inputs = prompt_node.get("inputs")
+    if not isinstance(class_type, str) or not class_type.strip() or not isinstance(inputs, dict):
+        return None
+
+    normalized_inputs: dict[str, Any] = {}
+    for input_name, input_value in inputs.items():
+        normalized_value = _normalize_prompt_input_value(copy.deepcopy(input_value))
+        if _is_link(normalized_value):
+            logger.info(
+                "Skipping durable MODEL bridge rehydration plan for node_id=%s class_type=%s because input %s is still linked.",
+                node_id,
+                class_type,
+                input_name,
+            )
+            return None
+        normalized_inputs[str(input_name)] = normalized_value
+
+    node_data: dict[str, Any] = {"class_type": class_type}
+    custom_nodes_bundle = payload.get("custom_nodes_bundle")
+    if isinstance(custom_nodes_bundle, str) and custom_nodes_bundle.strip():
+        node_data["custom_nodes_bundle"] = custom_nodes_bundle
+    return {
+        "kind": "single_node_output",
+        "node_data": node_data,
+        "node_inputs": normalized_inputs,
+    }
+
+
+def _restore_planned_remote_session_bridge_value(
+    record: RemoteSessionBridgeRecord,
+    *,
+    target_session_handle: RemoteSessionHandle,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
+) -> Any | None:
+    """Restore one bridge value directly from a durable node rehydration plan."""
+    if not isinstance(record.rehydration_plan, Mapping):
+        return None
+    if str(record.rehydration_plan.get("kind") or "") != "single_node_output":
+        return None
+    node_data = record.rehydration_plan.get("node_data")
+    node_inputs = record.rehydration_plan.get("node_inputs")
+    if not isinstance(node_data, Mapping) or not isinstance(node_inputs, Mapping):
+        return None
+
+    restore_started_at = time.perf_counter()
+    outputs = _execute_node_locally_raw(
+        dict(node_data),
+        dict(node_inputs),
+        node_mapping=None,
+        cancellation_event=None,
+        interrupt_store=None,
+        interrupt_flag_key=None,
+    )
+    if record.output_index < 0 or record.output_index >= len(outputs):
+        raise RemoteSessionStateError(
+            f"Durable bridge rehydration plan for {record.bridge_key!r} did not produce output index {record.output_index}."
+        )
+    restored_value = outputs[record.output_index]
+    _REMOTE_SESSION_STORE.put_output(
+        target_session_handle,
+        node_id=record.node_id,
+        output_index=record.output_index,
+        value=restored_value,
+    )
+    _store_remote_session_bridge_value(record.bridge_key, restored_value)
+    if resolution_stats is not None:
+        resolution_stats.durable_bridge_hits += 1
+        resolution_stats.session_restore_writes += 1
+        resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
+    logger.info(
+        "Restored remote session bridge bridge_key=%s from durable %s rehydration plan into session_id=%s.",
+        record.bridge_key,
+        record.rehydration_plan_io_type or "bridge",
+        target_session_handle.session_id,
+    )
+    return restored_value
+
+
 def _remote_session_bridge_replay_stack() -> set[str]:
     """Return the thread-local guard set for bridge replay recursion detection."""
     replay_stack = getattr(_REMOTE_SESSION_BRIDGE_REPLAY_STATE, "bridge_keys", None)
@@ -333,6 +434,13 @@ def _rehydrate_remote_session_bridge_value(
             time.perf_counter() - record_lookup_started_at
         )
     restored_value = _restore_serialized_remote_session_bridge_value(
+        record,
+        target_session_handle=target_session_handle,
+        resolution_stats=resolution_stats,
+    )
+    if restored_value is not None:
+        return restored_value
+    restored_value = _restore_planned_remote_session_bridge_value(
         record,
         target_session_handle=target_session_handle,
         resolution_stats=resolution_stats,
@@ -1423,6 +1531,23 @@ def _build_vae_loader_cache_key(kwargs: dict[str, Any]) -> str:
     return _serialize_loader_cache_key({"vae_name": kwargs.get("vae_name")})
 
 
+def _build_checkpoint_loader_cache_key(kwargs: dict[str, Any]) -> str:
+    """Build a stable cache key for checkpoint-style model loaders."""
+    import folder_paths
+
+    key_parts: dict[str, Any] = {}
+    if "config_name" in kwargs:
+        key_parts["config_path"] = folder_paths.get_full_path("configs", str(kwargs["config_name"]))
+    if "ckpt_name" in kwargs:
+        key_parts["ckpt_path"] = folder_paths.get_full_path_or_raise(
+            "checkpoints",
+            str(kwargs["ckpt_name"]),
+        )
+    if "model_path" in kwargs:
+        key_parts["model_path"] = str(kwargs["model_path"])
+    return _serialize_loader_cache_key(key_parts)
+
+
 def _wrap_loader_method_with_cache(
     class_type: str,
     node_class: type[Any],
@@ -1466,9 +1591,13 @@ def _install_loader_cache_wrappers() -> None:
     """Patch the heavyweight built-in model loaders to reuse warm-container state."""
     nodes_module = _load_nodes_module()
     cacheable_loader_specs = {
+        "CheckpointLoader": ("load_checkpoint", _build_checkpoint_loader_cache_key),
+        "CheckpointLoaderSimple": ("load_checkpoint", _build_checkpoint_loader_cache_key),
         "UNETLoader": ("load_unet", _build_unet_loader_cache_key),
         "CLIPLoader": ("load_clip", _build_clip_loader_cache_key),
         "VAELoader": ("load_vae", _build_vae_loader_cache_key),
+        "unCLIPCheckpointLoader": ("load_checkpoint", _build_checkpoint_loader_cache_key),
+        "ImageOnlyCheckpointLoader": ("load_checkpoint", _build_checkpoint_loader_cache_key),
     }
 
     for class_type, (method_name, cache_key_builder) in cacheable_loader_specs.items():
@@ -2381,6 +2510,26 @@ def execute_node_locally(
     interrupt_flag_key: str | None = None,
 ) -> bytes:
     """Execute a single target node in-process and return serialized outputs."""
+    outputs = _execute_node_locally_raw(
+        node_data,
+        kwargs_payload,
+        node_mapping=node_mapping,
+        cancellation_event=cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key=interrupt_flag_key,
+    )
+    return serialize_node_outputs(outputs)
+
+
+def _execute_node_locally_raw(
+    node_data: dict[str, Any],
+    kwargs_payload: bytes | bytearray | str | dict[str, Any],
+    node_mapping: dict[str, type[Any]] | None = None,
+    cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
+) -> tuple[Any, ...]:
+    """Execute a single target node in-process and return raw node outputs."""
     custom_nodes_root = _extract_custom_nodes_bundle(node_data.get("custom_nodes_bundle"))
     _ensure_comfy_runtime_initialized(custom_nodes_root)
     kwargs = _rewrite_modal_asset_references(deserialize_node_inputs(kwargs_payload))
@@ -2398,8 +2547,7 @@ def execute_node_locally(
                 interrupt_flag_key=interrupt_flag_key,
             ),
         ):
-            outputs = _invoke_original_node(node_mapping[class_type], node_data, kwargs)
-            return serialize_node_outputs(outputs)
+            return _invoke_original_node(node_mapping[class_type], node_data, kwargs)
 
     with _temporary_node_mapping(node_mapping):
         resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
@@ -2416,8 +2564,7 @@ def execute_node_locally(
                 interrupt_flag_key=interrupt_flag_key,
             ),
         ):
-            outputs = _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
-    return serialize_node_outputs(outputs)
+            return _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
 
 
 def _apply_boundary_inputs(
