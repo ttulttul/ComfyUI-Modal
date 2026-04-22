@@ -109,6 +109,21 @@ class _FakeRewriteLocalSinkNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeImplicitBatchKSamplerNode:
+    """Fake sampler node exposing ComfyUI-style LATENT and primitive socket types."""
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str]]]:
+        """Return the minimal socket schema needed for implicit batch target inspection."""
+        return {
+            "required": {
+                "latent_image": ("LATENT",),
+                "seed": ("INT",),
+                "positive": ("CONDITIONING",),
+            }
+        }
+
+
 def test_dynamic_proxy_node_preserves_output_signature(
     modal_executor_module: Any,
 ) -> None:
@@ -4602,6 +4617,100 @@ def test_implicitly_mapped_subgraph_keeps_conditioning_lists_broadcast(
         ("17::item:1", ("12",), {"remote_input_0": conditioning, "remote_input_1": 11}),
         ("17::item:2", ("12",), {"remote_input_0": conditioning, "remote_input_1": 12}),
         ("17::item:3", ("12",), {"remote_input_0": conditioning, "remote_input_1": 13}),
+    ]
+
+
+def test_implicitly_mapped_subgraph_splits_wildcard_latent_lists_for_latent_targets(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Wildcard boundary lists of LATENT-like mappings should still itemize for LATENT sockets."""
+    latent_items = [
+        {"samples": "latent-a", "batch_index": [0]},
+        {"samples": "latent-b", "batch_index": [1]},
+        {"samples": "latent-c", "batch_index": [2]},
+    ]
+    observed_calls: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {"NODE_CLASS_MAPPINGS": {"KSampler": _FakeImplicitBatchKSamplerNode}},
+    )()
+    monkeypatch.setattr(remote_modal_app_module, "_load_nodes_module", lambda: fake_nodes_module)
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+
+        if execute_node_ids != ("12",):
+            raise AssertionError(
+                f"Unexpected execute nodes for wildcard LATENT implicit mapped regression: {execute_node_ids!r}"
+            )
+        return serialization_module.serialize_node_outputs(
+            (f"{hydrated_inputs['remote_input_1']}:{hydrated_inputs['remote_input_0']['samples']}",)
+        )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "latent_image": 0,
+                    "seed": 0,
+                },
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "*",
+                "targets": [{"node_id": "12", "input_name": "latent_image"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": latent_items,
+                    "remote_input_1": [10, 11, 12],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["10:latent-a", "11:latent-b", "12:latent-c"],
+    )
+    assert observed_calls == [
+        ("17::item:0", ("12",), {"remote_input_0": latent_items[0], "remote_input_1": 10}),
+        ("17::item:1", ("12",), {"remote_input_0": latent_items[1], "remote_input_1": 11}),
+        ("17::item:2", ("12",), {"remote_input_0": latent_items[2], "remote_input_1": 12}),
     ]
 
 
