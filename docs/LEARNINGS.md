@@ -3,6 +3,7 @@
 ## 2026-04-22
 
 - Prompt-scoped Modal class parameters are the wrong place to carry remote session identity. The `remote_session.session_id` belongs in the payload for data isolation, but `@app.cls` affinity should use reusable worker-pool slots like `worker-pool:slot:N`; otherwise every prompt asks Modal for a brand-new parameterized class instance and cross-prompt warm-container reuse never happens.
+- The local `custom_nodes/` tree is effectively process-static for one ComfyUI lifetime. Since adding or removing custom nodes still requires a ComfyUI restart before node availability changes, the queue-time sync engine should resolve `custom_nodes/` once per process and then reuse that cached decision instead of rehashing or rescanning the tree on every workflow run.
 
 ## 2026-04-21
 

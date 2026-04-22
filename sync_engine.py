@@ -397,6 +397,9 @@ class ModalAssetSyncEngine:
     _hash_cache_dirty: bool = field(init=False, default=False)
     _sync_scope_prefix_cache: str | None = field(init=False, default=None)
     _sync_scope_prefix_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
+    _custom_nodes_sync_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
+    _custom_nodes_sync_checked: bool = field(init=False, default=False)
+    _custom_nodes_bundle_cache: SyncedAsset | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         """Load persistent metadata caches used to avoid repeated hashing work."""
@@ -508,6 +511,35 @@ class ModalAssetSyncEngine:
         return rewritten_inputs, synced_assets
 
     def sync_custom_nodes_directory(
+        self,
+        *,
+        status_callback: SyncStatusCallback | None = None,
+    ) -> SyncedAsset | None:
+        """Mirror custom_nodes once per ComfyUI process and reuse that result afterward."""
+        with self._custom_nodes_sync_lock:
+            if self._custom_nodes_sync_checked:
+                logger.info(
+                    "Skipping custom_nodes rescan because this ComfyUI process already resolved it once."
+                )
+                return self._clone_cached_custom_nodes_bundle()
+
+            bundle = self._sync_custom_nodes_directory_uncached(status_callback=status_callback)
+            self._custom_nodes_bundle_cache = bundle
+            self._custom_nodes_sync_checked = True
+            return bundle
+
+    def _clone_cached_custom_nodes_bundle(self) -> SyncedAsset | None:
+        """Return the cached custom_nodes sync result as a no-upload reuse decision."""
+        if self._custom_nodes_bundle_cache is None:
+            return None
+        return SyncedAsset(
+            local_path=self._custom_nodes_bundle_cache.local_path,
+            remote_path=self._custom_nodes_bundle_cache.remote_path,
+            sha256=self._custom_nodes_bundle_cache.sha256,
+            uploaded=False,
+        )
+
+    def _sync_custom_nodes_directory_uncached(
         self,
         *,
         status_callback: SyncStatusCallback | None = None,
