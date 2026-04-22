@@ -80,6 +80,8 @@ _LOADER_CACHE_METRICS_LOCK = threading.Lock()
 _LOADER_CACHE_METRICS: dict[str, int] = {"hit": 0, "miss": 0}
 _LOADER_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
 _LOADER_PREWARM_PLAN_KEYS: set[str] = set()
+_SNAPSHOT_PROFILE_CACHE_LOCK = threading.Lock()
+_SNAPSHOT_PROFILE_CACHE: dict[str, list[dict[str, Any]]] = {}
 _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
@@ -116,6 +118,45 @@ def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHand
 def _session_bridge_store() -> Any:
     """Return the durable store used to replay session-backed outputs across containers."""
     return globals().get("session_bridge_cache") or _REMOTE_SESSION_BRIDGE_STORE
+
+
+def _snapshot_profile_store() -> Any | None:
+    """Return the shared store used to look up snapshot loader-prewarm profiles."""
+    return globals().get("snapshot_profiles")
+
+
+def _load_loader_snapshot_profile(snapshot_profile_key: str) -> list[dict[str, Any]]:
+    """Return the loader prewarm plans associated with one snapshot profile key."""
+    normalized_key = str(snapshot_profile_key).strip()
+    if not normalized_key:
+        return []
+
+    with _SNAPSHOT_PROFILE_CACHE_LOCK:
+        cached_plans = _SNAPSHOT_PROFILE_CACHE.get(normalized_key)
+        if cached_plans is not None:
+            return copy.deepcopy(cached_plans)
+
+    store = _snapshot_profile_store()
+    if store is None:
+        return []
+
+    payload = store.get(normalized_key)
+    if not isinstance(payload, dict):
+        logger.warning("Snapshot profile %s was not found in the shared store.", normalized_key)
+        return []
+
+    loader_prewarm_plans = payload.get("loader_prewarm_plans")
+    if not isinstance(loader_prewarm_plans, list):
+        return []
+
+    normalized_plans = [
+        copy.deepcopy(plan)
+        for plan in loader_prewarm_plans
+        if isinstance(plan, dict)
+    ]
+    with _SNAPSHOT_PROFILE_CACHE_LOCK:
+        _SNAPSHOT_PROFILE_CACHE[normalized_key] = copy.deepcopy(normalized_plans)
+    return normalized_plans
 
 
 def _sanitize_payload_for_session_bridge_record(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3879,13 +3920,24 @@ def _comfyui_torch_packages() -> tuple[str, ...]:
     )
 
 
-def _prewarm_snapshot_state(settings: Any) -> None:
+def _prewarm_snapshot_state(settings: Any, snapshot_profile_key: str = "") -> None:
     """Run snapshot-safe initialization before Modal captures a memory snapshot."""
-    with _timed_phase("prewarm_snapshot_state", gpu_snapshot=settings.enable_gpu_memory_snapshot):
+    with _timed_phase(
+        "prewarm_snapshot_state",
+        gpu_snapshot=settings.enable_gpu_memory_snapshot,
+        snapshot_profile=snapshot_profile_key or None,
+    ):
         _ensure_comfyui_support_packages()
         if settings.enable_gpu_memory_snapshot:
             _ensure_comfy_runtime_initialized(None)
             _load_execution_module()
+            loader_prewarm_plans = _load_loader_snapshot_profile(snapshot_profile_key)
+            if loader_prewarm_plans:
+                _execute_loader_prewarm_plans(
+                    component_id=f"snapshot-profile:{snapshot_profile_key}",
+                    loader_prewarm_plans=loader_prewarm_plans,
+                    custom_nodes_root=None,
+                )
             _emit_cloud_info("Completed GPU-snapshot ComfyUI prewarm before snapshot capture.")
             return
 
@@ -4336,6 +4388,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         settings.session_bridge_dict_name,
         create_if_missing=True,
     )
+    snapshot_profiles = modal.Dict.from_name(
+        settings.snapshot_profile_dict_name,
+        create_if_missing=True,
+    )
     image = (
         modal.Image.debian_slim()
         .pip_install(*_comfyui_runtime_packages())
@@ -4367,15 +4423,17 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
         worker_affinity_key: str = modal.parameter(default="")
+        snapshot_profile_key: str = modal.parameter(default="")
 
         @modal.enter(snap=True)
         def setup_snapshot_state(self) -> None:
             """Prepare snapshot-friendly runtime state before Modal captures memory."""
             with _timed_phase("remote_engine_setup_snapshot"):
-                _prewarm_snapshot_state(settings)
+                _prewarm_snapshot_state(settings, self.snapshot_profile_key)
                 logger.info(
-                    "RemoteEngine snapshot setup complete for worker_affinity_key=%s.",
+                    "RemoteEngine snapshot setup complete for worker_affinity_key=%s snapshot_profile_key=%s.",
                     self.worker_affinity_key or None,
+                    self.snapshot_profile_key or None,
                 )
 
         @modal.enter(snap=False)
@@ -4384,8 +4442,9 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             with _timed_phase("remote_engine_setup_restored"):
                 _prewarm_restored_runtime()
                 logger.info(
-                    "RemoteEngine restored-runtime setup complete for worker_affinity_key=%s.",
+                    "RemoteEngine restored-runtime setup complete for worker_affinity_key=%s snapshot_profile_key=%s.",
                     self.worker_affinity_key or None,
+                    self.snapshot_profile_key or None,
                 )
 
         @modal.method()
