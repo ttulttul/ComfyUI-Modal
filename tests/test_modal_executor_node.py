@@ -703,6 +703,51 @@ def test_await_prompt_warmup_slots_waits_for_inflight_futures(
     assert completed_count == 1
 
 
+def test_build_prompt_warmup_request_includes_root_loader_prewarm_plans(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Warmup requests should synthesize one-node plans for root literal loader nodes only."""
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        warmup_request = remote_modal_app_module._build_prompt_warmup_request(
+            {
+                "prompt_id": "prompt-1",
+                "component_id": "component-1",
+                "subgraph_prompt": {
+                    "1": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
+                    },
+                    "2": {
+                        "class_type": "CLIPLoader",
+                        "inputs": {"clip_name": "clip-a.safetensors", "type": "stable_diffusion"},
+                    },
+                    "3": {
+                        "class_type": "DualCLIPLoader",
+                        "inputs": {"clip_name1": "clip-a.safetensors", "clip_name2": "clip-b.safetensors", "type": "flux"},
+                    },
+                    "4": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"unet_name": ["99", 0]},
+                    },
+                    "5": {
+                        "class_type": "KSampler",
+                        "inputs": {"model": ["1", 0]},
+                    },
+                },
+            }
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    loader_plans = warmup_request["loader_prewarm_plans"]
+    assert [plan["node_id"] for plan in loader_plans] == ["1", "2", "3"]
+    assert [plan["class_type"] for plan in loader_plans] == ["UNETLoader", "CLIPLoader", "DualCLIPLoader"]
+    assert all(plan["execute_node_ids"] == [plan["node_id"]] for plan in loader_plans)
+
+
 def test_register_exact_component_parallelism_refines_prompt_target(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -1890,6 +1935,7 @@ def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
             "CheckpointLoaderSimple": type("CheckpointLoaderSimple", (), {"load_checkpoint": lambda self, ckpt_name: (ckpt_name,)}),
             "UNETLoader": type("UNETLoader", (), {"load_unet": lambda self, unet_name, weight_dtype="default": (unet_name,)}),
             "CLIPLoader": type("CLIPLoader", (), {"load_clip": lambda self, clip_name, type="stable_diffusion", device="default": (clip_name,)}),
+            "DualCLIPLoader": type("DualCLIPLoader", (), {"load_clip": lambda self, clip_name1, clip_name2, type, device="default": (clip_name1, clip_name2)}),
             "VAELoader": type("VAELoader", (), {"load_vae": lambda self, vae_name: (vae_name,)}),
             "unCLIPCheckpointLoader": type("unCLIPCheckpointLoader", (), {"load_checkpoint": lambda self, ckpt_name, output_vae=True, output_clip=True: (ckpt_name,)}),
             "ImageOnlyCheckpointLoader": type("ImageOnlyCheckpointLoader", (), {"load_checkpoint": lambda self, ckpt_name, output_vae=True, output_clip=True: (ckpt_name,)}),
@@ -1911,6 +1957,7 @@ def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
         "CheckpointLoaderSimple",
         "UNETLoader",
         "CLIPLoader",
+        "DualCLIPLoader",
         "VAELoader",
         "unCLIPCheckpointLoader",
         "ImageOnlyCheckpointLoader",
@@ -2368,6 +2415,13 @@ def test_modal_cloud_prepares_warm_container_for_request(
         "_register_custom_nodes_root",
         lambda custom_nodes_root: calls.append(("register", custom_nodes_root)),
     )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_loader_prewarm_plans",
+        lambda *, component_id, loader_prewarm_plans, custom_nodes_root: calls.append(
+            ("prewarm", component_id, tuple(plan["signature"] for plan in loader_prewarm_plans), custom_nodes_root)
+        ),
+    )
     monkeypatch.setenv("MODAL_TASK_ID", "task-123")
 
     result = modal_cloud_module._prepare_warm_container_for_request(
@@ -2378,12 +2432,14 @@ def test_modal_cloud_prepares_warm_container_for_request(
             "uploaded_volume_paths": ["/storage/example.bin"],
             "custom_nodes_bundle": "custom_nodes_bundle.zip",
             "warmup_slot_index": 2,
+            "loader_prewarm_plans": [{"signature": "loader-plan-1"}],
         },
     )
 
     assert calls == [
         ("reload", "component-1", "marker-1", ["/storage/example.bin"]),
         ("register", Path("/tmp/extracted-bundle")),
+        ("prewarm", "component-1", ("loader-plan-1",), Path("/tmp/extracted-bundle")),
     ]
     assert result == {
         "component_id": "component-1",
@@ -2391,6 +2447,61 @@ def test_modal_cloud_prepares_warm_container_for_request(
         "warmup_slot_index": 2,
         "reloaded_volume": True,
     }
+
+
+def test_modal_cloud_executes_loader_prewarm_plans_once_per_worker(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Worker-local loader prewarm plans should execute once and then be skipped on reuse."""
+    original_plan_keys = set(modal_cloud_module._LOADER_PREWARM_PLAN_KEYS)
+    modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.clear()
+    observed_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: observed_calls.append(("runtime", (str(custom_nodes_root),))),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        lambda payload, hydrated_inputs, custom_nodes_root, **kwargs: observed_calls.append(
+            ("execute", (str(payload["component_id"]), str(tuple(payload["execute_node_ids"]))))
+        ) or tuple(),
+    )
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
+    modal_cloud_module.get_settings.cache_clear()
+    try:
+        plans = [
+            {
+                "signature": "loader-plan-1",
+                "node_id": "7",
+                "prompt_id": "prompt-1",
+                "subgraph_prompt": {"7": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}}},
+                "execute_node_ids": ["7"],
+            }
+        ]
+        modal_cloud_module._execute_loader_prewarm_plans(
+            component_id="component-1",
+            loader_prewarm_plans=plans,
+            custom_nodes_root=Path("/tmp/extracted-bundle"),
+        )
+        modal_cloud_module._execute_loader_prewarm_plans(
+            component_id="component-1",
+            loader_prewarm_plans=plans,
+            custom_nodes_root=Path("/tmp/extracted-bundle"),
+        )
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.clear()
+        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.update(original_plan_keys)
+
+    assert observed_calls == [
+        ("runtime", ("/tmp/extracted-bundle",)),
+        ("execute", ("component-1::loader-prewarm:7", "('7',)")),
+        ("runtime", ("/tmp/extracted-bundle",)),
+    ]
 
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
