@@ -2862,8 +2862,12 @@ def _split_batch_boundary_inputs(
         proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
         if not proxy_input_name or proxy_input_name not in hydrated_inputs:
             continue
-        io_type = str(boundary_input.get("io_type", "*"))
         input_value = hydrated_inputs[proxy_input_name]
+        io_type = _implicit_batch_boundary_effective_io_type(
+            payload=payload,
+            boundary_input=boundary_input,
+            input_value=input_value,
+        )
         is_session_ref_list = (
             isinstance(input_value, list)
             and len(input_value) > 0
@@ -2908,6 +2912,75 @@ def _split_batch_boundary_inputs(
             f"Received counts: {item_counts!r}"
         )
     return split_inputs, next(iter(unique_counts))
+
+
+def _is_latent_like_mapping(value: Any) -> bool:
+    """Return whether one runtime value looks like a ComfyUI LATENT mapping."""
+    return isinstance(value, Mapping) and "samples" in value
+
+
+def _list_is_latent_like_batch(value: Any) -> bool:
+    """Return whether one runtime value is a list of LATENT-like mappings."""
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(_is_latent_like_mapping(item) for item in value)
+    )
+
+
+def _implicit_batch_boundary_target_input_types(
+    payload: dict[str, Any],
+    boundary_input: dict[str, Any],
+) -> set[str]:
+    """Return the declared input types of one boundary input's target sockets."""
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict):
+        return set()
+
+    try:
+        resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
+    except ModuleNotFoundError:
+        logger.debug(
+            "Skipping target input type discovery for implicit batching because ComfyUI nodes are unavailable."
+        )
+        return set()
+
+    target_input_types: set[str] = set()
+    for target in boundary_input.get("targets", []):
+        node_id = str(target.get("node_id") or "")
+        input_name = str(target.get("input_name") or "")
+        if not node_id or not input_name:
+            continue
+        prompt_node = prompt.get(node_id)
+        if not isinstance(prompt_node, dict):
+            continue
+        node_class = resolved_node_mapping.get(str(prompt_node.get("class_type")))
+        if node_class is None:
+            continue
+        declared_type = _node_input_type_map(node_class).get(input_name)
+        if isinstance(declared_type, str) and declared_type:
+            target_input_types.add(declared_type)
+    return target_input_types
+
+
+def _implicit_batch_boundary_effective_io_type(
+    *,
+    payload: dict[str, Any],
+    boundary_input: dict[str, Any],
+    input_value: Any,
+) -> str:
+    """Return the best effective io_type for implicit batching of one boundary input."""
+    declared_io_type = str(boundary_input.get("io_type", "*"))
+    if declared_io_type != "*":
+        return declared_io_type
+
+    if _list_is_latent_like_batch(input_value):
+        return "LATENT"
+
+    target_input_types = _implicit_batch_boundary_target_input_types(payload, boundary_input)
+    if len(target_input_types) == 1:
+        return next(iter(target_input_types))
+    return declared_io_type
 
 
 def _implicit_batch_input_is_list_target_node_ids(
