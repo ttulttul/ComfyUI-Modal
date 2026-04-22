@@ -9,6 +9,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -394,6 +395,8 @@ class ModalAssetSyncEngine:
     _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
     _hash_cache_dirty: bool = field(init=False, default=False)
+    _sync_scope_prefix_cache: str | None = field(init=False, default=None)
+    _sync_scope_prefix_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         """Load persistent metadata caches used to avoid repeated hashing work."""
@@ -772,18 +775,84 @@ class ModalAssetSyncEngine:
 
     def _asset_sync_index_key(self, sha256: str) -> str:
         """Return the sync-index key for one content-addressed asset digest."""
-        return f"{self.settings.volume_name}:asset:{sha256}"
+        return f"{self._sync_index_scope_prefix()}:asset:{sha256}"
 
     def _custom_nodes_manifest_sync_index_key(self, directory_hash: str) -> str:
         """Return the sync-index key for one whole-tree custom_nodes manifest digest."""
-        return f"{self.settings.volume_name}:custom_nodes_manifest:{directory_hash}"
+        return f"{self._sync_index_scope_prefix()}:custom_nodes_manifest:{directory_hash}"
 
     def _custom_nodes_entry_sync_index_key(self, entry_name: str, entry_hash: str) -> str:
         """Return the sync-index key for one top-level custom_nodes entry archive digest."""
         return (
-            f"{self.settings.volume_name}:custom_nodes_entry:"
+            f"{self._sync_index_scope_prefix()}:custom_nodes_entry:"
             f"{self._custom_nodes_entry_slug(entry_name)}:{entry_hash}"
         )
+
+    def _sync_index_scope_prefix(self) -> str:
+        """Return the active sync-index scope prefix for this storage backend."""
+        cached_prefix = self._sync_scope_prefix_cache
+        if cached_prefix is not None:
+            return cached_prefix
+        with self._sync_scope_prefix_lock:
+            cached_prefix = self._sync_scope_prefix_cache
+            if cached_prefix is not None:
+                return cached_prefix
+            if self.settings.execution_mode != "remote" or not isinstance(self.volume, ModalVolumeBackend):
+                cached_prefix = f"local:{self.settings.local_storage_root.resolve()}"
+            else:
+                cached_prefix = self._ensure_remote_volume_epoch_scope()
+            self._sync_scope_prefix_cache = cached_prefix
+            return cached_prefix
+
+    def _ensure_remote_volume_epoch_scope(self) -> str:
+        """Return a sync-index prefix tied to the currently mounted Modal volume contents."""
+        fixed_key = f"{self.settings.volume_name}:current_volume_epoch"
+        current_record = self._lookup_sync_record(fixed_key)
+        if current_record is not None:
+            epoch = current_record.get("epoch")
+            sentinel_path = current_record.get("sentinel_path")
+            if (
+                isinstance(epoch, str)
+                and epoch
+                and isinstance(sentinel_path, str)
+                and sentinel_path
+                and self.volume.exists(sentinel_path)
+            ):
+                return f"{self.settings.volume_name}:epoch:{epoch}"
+            logger.warning(
+                "Discarding stale Modal sync-index volume epoch for volume=%s because sentinel %s is missing.",
+                self.settings.volume_name,
+                sentinel_path,
+            )
+
+        epoch = uuid.uuid4().hex
+        sentinel_path = f"/sync_index_epochs/{epoch}.json"
+        self.volume.put_bytes(
+            json.dumps(
+                {
+                    "volume_name": self.settings.volume_name,
+                    "epoch": epoch,
+                },
+                sort_keys=True,
+            ).encode("utf-8"),
+            sentinel_path,
+        )
+        assert self.sync_index is not None
+        self.sync_index.put(
+            fixed_key,
+            {
+                "epoch": epoch,
+                "remote_path": sentinel_path,
+                "sentinel_path": sentinel_path,
+            },
+        )
+        logger.info(
+            "Initialized Modal sync-index volume epoch %s for volume=%s sentinel=%s.",
+            epoch,
+            self.settings.volume_name,
+            sentinel_path,
+        )
+        return f"{self.settings.volume_name}:epoch:{epoch}"
 
 
     def _resolve_model_path(self, value: str) -> Path | None:

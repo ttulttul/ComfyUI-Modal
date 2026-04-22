@@ -697,6 +697,132 @@ def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
     assert all(not remote_path.startswith("/hashes/") for remote_path in uploaded_remote_paths)
 
 
+def test_remote_sync_index_discards_stale_volume_epoch_and_reuploads_missing_payloads(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A fresh volume should ignore stale sync-index records from an older volume epoch."""
+
+    class FakeBatch:
+        """Capture files uploaded through Modal batch_upload."""
+
+        def __init__(self, volume: "FakeVolume") -> None:
+            """Store the backing volume for uploaded-path tracking."""
+            self.volume = volume
+
+        def __enter__(self) -> "FakeBatch":
+            """Return the active batch context."""
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            """Close the fake batch context."""
+            return None
+
+        def put_file(self, source: Any, remote_path: str) -> None:
+            """Record the uploaded remote path as present in the fake volume."""
+            del source
+            self.volume.paths.add(remote_path)
+            self.volume.uploads.append(remote_path)
+
+    class FakeVolume:
+        """Minimal Modal volume double with listdir accounting."""
+
+        def __init__(self) -> None:
+            """Initialize fake storage state."""
+            self.paths: set[str] = set()
+            self.uploads: list[str] = []
+
+        def listdir(self, remote_path: str, recursive: bool = False) -> list[str]:
+            """Return a listing for known paths."""
+            del recursive
+            return [remote_path] if remote_path in self.paths else []
+
+        def batch_upload(self) -> FakeBatch:
+            """Return a fake uploader."""
+            return FakeBatch(self)
+
+    fake_volume = FakeVolume()
+    fake_dict: dict[str, Any] = {}
+
+    class FakeModal:
+        """Minimal Modal SDK double exposing both Volume and Dict backends."""
+
+        exception = type(
+            "FakeExceptionNamespace",
+            (),
+            {
+                "NotFoundError": FileNotFoundError,
+                "ResourceExhaustedError": RuntimeError,
+            },
+        )
+
+        class Dict:
+            """Namespace for sync-index lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> dict[str, Any]:
+                """Return the shared fake dict store for any lookup."""
+                del name, create_if_missing
+                return fake_dict
+
+        class Volume:
+            """Namespace for volume lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> FakeVolume:
+                """Return the fake volume for any lookup."""
+                del name, create_if_missing
+                return fake_volume
+
+    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    entry_hash = engine._hash_directory(package_dir)
+    fake_dict[f"{settings.volume_name}:current_volume_epoch"] = {
+        "epoch": "stale-epoch",
+        "remote_path": "/sync_index_epochs/stale-epoch.json",
+        "sentinel_path": "/sync_index_epochs/stale-epoch.json",
+    }
+    fake_dict[
+        f"{settings.volume_name}:epoch:stale-epoch:custom_nodes_entry:example:{entry_hash}"
+    ] = {
+        "remote_path": engine._custom_nodes_archive_remote_path("example", entry_hash),
+        "source": str(package_dir),
+    }
+
+    bundle = engine.sync_custom_nodes_directory()
+
+    assert bundle is not None
+    assert bundle.uploaded is True
+    assert any(path.startswith("/sync_index_epochs/") for path in fake_volume.uploads)
+    assert any(path.startswith("/custom_nodes/entries/example/") for path in fake_volume.uploads)
+    assert fake_dict[f"{settings.volume_name}:current_volume_epoch"]["epoch"] != "stale-epoch"
+
+
 def test_modal_volume_backend_treats_missing_path_as_cache_miss(
     sync_engine_module: Any,
     monkeypatch: Any,
