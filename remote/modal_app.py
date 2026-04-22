@@ -707,6 +707,14 @@ def _remote_session_affinity_key(payload: dict[str, Any]) -> str | None:
     return session_handle.session_id
 
 
+def _mapped_lane_affinity_key(payload: dict[str, Any], lane_index: int) -> str | None:
+    """Return the stable per-lane affinity key used to pin one mapped worker lane."""
+    session_affinity_key = _remote_session_affinity_key(payload)
+    if session_affinity_key is None:
+        return None
+    return f"{session_affinity_key}::lane:{int(lane_index)}"
+
+
 class _NullPromptServer:
     """Minimal PromptExecutor server stub for headless subgraph execution."""
 
@@ -3154,15 +3162,56 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         mapped_execute_node_ids,
     )
     cleanup_payload = _build_remote_session_cleanup_payload(hybrid_payload)
+    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
+    use_seeded_remote_lanes = (
+        execution_mode != "local"
+        and modal is not None
+        and _payload_remote_session_handle(hybrid_payload) is not None
+        and _mapped_phase_definition(hybrid_payload, "static_phase") is not None
+    )
 
     static_outputs: tuple[Any, ...] = ()
+    lane_remote_engines: list[Any] = []
     try:
-        if static_execute_node_ids:
+        if use_seeded_remote_lanes:
+            lane_remote_engines = [
+                _lookup_deployed_remote_engine(
+                    hybrid_payload,
+                    affinity_key_override=_mapped_lane_affinity_key(hybrid_payload, lane_index),
+                )
+                for lane_index in range(parallelism)
+            ]
+            logger.info(
+                "Seeding %d mapped worker lane(s) for component=%s before per-item dispatch.",
+                parallelism,
+                payload.get("component_id"),
+            )
+
+            async def seed_lane(lane_index: int) -> None:
+                """Run the static bridge-producing phase once on one mapped worker lane."""
+                lane_seed_payload = _build_phase_subgraph_payload(
+                    hybrid_payload,
+                    "static_phase",
+                    f"{payload.get('component_id', 'modal-subgraph')}::seed:{lane_index}",
+                    suppress_status_stream=True,
+                )
+                await _invoke_bound_remote_engine_async(
+                    lane_remote_engines[lane_index],
+                    lane_seed_payload,
+                    serialize_node_inputs(broadcast_inputs),
+                )
+
+            await asyncio.gather(
+                *(seed_lane(lane_index) for lane_index in range(parallelism))
+            )
+        elif static_execute_node_ids:
             static_response = await invoke_remote_engine_async(
                 _build_static_mapped_payload(hybrid_payload),
                 serialize_node_inputs(broadcast_inputs),
             )
             static_outputs = deserialize_node_outputs(static_response)
+        else:
+            lane_remote_engines = []
 
         per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
         completed_items = 0
@@ -3186,10 +3235,17 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     item_inputs = dict(broadcast_inputs)
                     for input_name, items in split_inputs.items():
                         item_inputs[input_name] = items[item_index]
-                    item_response = await invoke_remote_engine_async(
-                        item_payload,
-                        serialize_node_inputs(item_inputs),
-                    )
+                    if use_seeded_remote_lanes:
+                        item_response = await _invoke_bound_remote_engine_async(
+                            lane_remote_engines[lane_index],
+                            item_payload,
+                            serialize_node_inputs(item_inputs),
+                        )
+                    else:
+                        item_response = await invoke_remote_engine_async(
+                            item_payload,
+                            serialize_node_inputs(item_inputs),
+                        )
                     per_item_outputs[item_index] = deserialize_node_outputs(item_response)
                     completed_items += 1
                     _emit_local_mapped_progress(payload, completed_items, total_items)
@@ -3224,10 +3280,27 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         )
     finally:
         if cleanup_payload is not None:
-            await invoke_remote_engine_async(
-                cleanup_payload,
-                serialize_node_inputs({}),
-            )
+            if use_seeded_remote_lanes and lane_remote_engines:
+                await asyncio.gather(
+                    *(
+                        _invoke_bound_remote_engine_async(
+                            lane_remote_engines[lane_index],
+                            {
+                                **cleanup_payload,
+                                "component_id": (
+                                    f"{payload.get('component_id', 'modal-subgraph')}::cleanup:{lane_index}"
+                                ),
+                            },
+                            serialize_node_inputs({}),
+                        )
+                        for lane_index in range(parallelism)
+                    )
+                )
+            else:
+                await invoke_remote_engine_async(
+                    cleanup_payload,
+                    serialize_node_inputs({}),
+                )
 
 
 async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
@@ -3243,13 +3316,19 @@ async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_pay
     )
 
 
-def _lookup_deployed_remote_engine(payload: dict[str, Any]) -> Any:
+def _lookup_deployed_remote_engine(
+    payload: dict[str, Any],
+    *,
+    affinity_key_override: str | None = None,
+) -> Any:
     """Look up the deployed Modal runtime class instance."""
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
     settings = get_settings()
-    affinity_key = _remote_session_affinity_key(payload)
+    affinity_key = affinity_key_override
+    if affinity_key is None:
+        affinity_key = _remote_session_affinity_key(payload)
     logger.info(
         "Attempting deployed Modal invocation for app=%s class=%s component=%s session_affinity=%s.",
         settings.app_name,
@@ -3261,6 +3340,62 @@ def _lookup_deployed_remote_engine(payload: dict[str, Any]) -> Any:
     if affinity_key is not None:
         return remote_cls(session_affinity_key=affinity_key)
     return remote_cls()
+
+
+async def _invoke_bound_remote_engine_async(
+    remote_engine: Any,
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+) -> bytes:
+    """Invoke one pre-bound remote engine handle asynchronously with local interrupt mirroring."""
+    logger.info(
+        "Dispatching async Modal remote invocation via bound engine for component=%s payload_kind=%s.",
+        payload.get("component_id"),
+        payload.get("payload_kind"),
+    )
+    cancellation_event = threading.Event()
+    future = _REMOTE_MODAL_CALL_EXECUTOR.submit(
+        _invoke_remote_engine_payload,
+        remote_engine,
+        dict(payload),
+        kwargs_payload,
+        cancellation_event,
+    )
+    wrapped_future = asyncio.wrap_future(future)
+    try:
+        while True:
+            try:
+                response = await asyncio.wait_for(asyncio.shield(wrapped_future), timeout=0.1)
+                break
+            except asyncio.TimeoutError:
+                _sync_local_interrupt_to_cancellation_event(payload, cancellation_event)
+                continue
+    except asyncio.CancelledError:
+        cancellation_event.set()
+        raise
+    except Exception:
+        if cancellation_event.is_set() or _local_processing_interrupted():
+            logger.info(
+                "Reraising async Modal failure as a local interrupt for component=%s after cancellation.",
+                payload.get("component_id"),
+            )
+            _raise_local_interrupt()
+        logger.exception(
+            "Async Modal remote invocation via bound engine failed for component=%s.",
+            payload.get("component_id"),
+        )
+        raise
+    if cancellation_event.is_set() or _local_processing_interrupted():
+        logger.info(
+            "Async bound-engine invocation for component=%s finished after interruption; raising local interrupt.",
+            payload.get("component_id"),
+        )
+        _raise_local_interrupt()
+    logger.info(
+        "Async Modal remote invocation via bound engine completed for component=%s.",
+        payload.get("component_id"),
+    )
+    return response
 
 
 def _modal_environment_name() -> str | None:
