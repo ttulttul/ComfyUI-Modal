@@ -3109,6 +3109,20 @@ def _execute_subgraph_prompt(
         loader_cache_before=loader_cache_before,
         loader_cache_after=_loader_cache_metric_snapshot(),
     )
+    short_circuit_outputs = _short_circuit_restored_session_output_subgraph(
+        payload=normalized_payload,
+        hydrated_inputs=hydrated_inputs,
+        session_handle=session_handle,
+        resolution_stats=resolution_stats,
+    )
+    if short_circuit_outputs is not None:
+        logger.info(
+            "Skipping prompt_executor_execute for component=%s because all %d session-backed outputs were restored into session_id=%s.",
+            component_id,
+            len(short_circuit_outputs),
+            session_handle.session_id if session_handle is not None else None,
+        )
+        return short_circuit_outputs
     if session_handle is not None:
         logger.info(
             "Executing cloud subgraph component=%s with remote_session session_id=%s prompt_id=%s owner_component_id=%s.",
@@ -3285,6 +3299,64 @@ def _execute_subgraph_prompt(
                     ).to_payload()
                 outputs.append(output_value)
         return tuple(outputs)
+
+
+def _short_circuit_restored_session_output_subgraph(
+    *,
+    payload: dict[str, Any],
+    hydrated_inputs: dict[str, Any],
+    session_handle: RemoteSessionHandle | None,
+    resolution_stats: _RemoteSessionBridgeResolutionStats,
+) -> tuple[Any, ...] | None:
+    """Return session-backed outputs directly when bridge restoration already satisfied them all."""
+    boundary_outputs = list(payload.get("boundary_outputs", []))
+    if session_handle is None or not boundary_outputs:
+        return None
+    if resolution_stats.input_ref_count <= 0 or resolution_stats.replay_count > 0:
+        return None
+    if any(not bool(boundary_output.get("session_output")) for boundary_output in boundary_outputs):
+        return None
+
+    restored_outputs: list[Any] = []
+    for boundary_output in boundary_outputs:
+        node_id = str(boundary_output["node_id"])
+        output_index = int(boundary_output["output_index"])
+        try:
+            output_value = _REMOTE_SESSION_STORE.get_output(
+                RemoteSessionValueRef(
+                    session_id=session_handle.session_id,
+                    node_id=node_id,
+                    output_index=output_index,
+                )
+            )
+        except RemoteSessionStateError:
+            return None
+
+        live_ref = _REMOTE_SESSION_STORE.put_output(
+            session_handle,
+            node_id=node_id,
+            output_index=output_index,
+            value=output_value,
+        )
+        bridge_record = _build_remote_session_bridge_record(
+            payload=payload,
+            hydrated_inputs=hydrated_inputs,
+            node_id=node_id,
+            output_index=output_index,
+            io_type=str(boundary_output.get("io_type") or "*"),
+            output_value=output_value,
+        )
+        _store_remote_session_bridge_record(bridge_record)
+        _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
+        restored_outputs.append(
+            RemoteSessionBridgeRef(
+                bridge_key=bridge_record.bridge_key,
+                node_id=node_id,
+                output_index=output_index,
+                session_id=live_ref.session_id,
+            ).to_payload()
+        )
+    return tuple(restored_outputs)
 
 
 def execute_subgraph_locally(

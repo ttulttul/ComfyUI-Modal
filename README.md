@@ -222,6 +222,7 @@ Remote runtime behavior:
 - The local queue-time sync engine now resolves `custom_nodes/` only once per ComfyUI process. After the first successful decision, later workflow runs reuse that cached bundle result and skip rehashing or rescanning the local `custom_nodes` tree until ComfyUI restarts.
 - First-run auto-deploy is now coordinated across local threads. Warmup and real payload dispatch share one per-app readiness state, so only one thread calls `app.deploy()` and the others wait until deployed `Cls.from_name(...)` lookup actually becomes ready instead of triggering a second deploy during Modal's propagation window.
 - Once a given extracted `custom_nodes` root has already been imported on a warm worker, the runtime now logs that it is reusing that initialized root and skips re-running external custom-node import work for repeat requests on the same bundle digest.
+- Mapped `seed:*` payloads now short-circuit when every exported static bridge output was already restored into the target session through live-session hits, warm bridge-cache hits, or durable bridge restore. In that case Modal-Sync skips `prompt_executor_execute` for the static phase and returns fresh bridge refs immediately instead of rerunning loader and encoder nodes.
 
 If you change `COMFY_MODAL_GPU`, redeploy the Modal app or delete it and let auto-deploy recreate it. Modal hardware is fixed at deploy time.
 

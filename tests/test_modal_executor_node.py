@@ -1767,6 +1767,80 @@ def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_repl
     assert resolution_stats.session_restore_writes == 1
 
 
+def test_modal_cloud_skips_seed_execution_when_session_outputs_are_already_restored(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Cloud seed payloads should no-op when bridge outputs are already in session memory."""
+    session_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-restored",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    restored_value = _FakeModelValue("restored-model")
+    modal_cloud_module._REMOTE_SESSION_STORE.put_output(
+        session_handle,
+        node_id="5",
+        output_index=0,
+        value=restored_value,
+    )
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "1__mapped::seed:0",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["5"],
+        "subgraph_prompt": {
+            "5": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": "model.safetensors"},
+            }
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "5", "input_name": "model"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "static_input_0",
+                "node_id": "5",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "session_output": True,
+            }
+        ],
+        "execute_node_ids": ["5"],
+        "remote_session": session_handle.to_payload(),
+    }
+    hydrated_inputs = {
+        "static_input_0": modal_cloud_module.RemoteSessionValueRef(
+            session_id=session_handle.session_id,
+            node_id="5",
+            output_index=0,
+        ).to_payload()
+    }
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_execution_module",
+        lambda: (_ for _ in ()).throw(AssertionError("seed short-circuit should skip PromptExecutor")),
+    )
+
+    try:
+        outputs = modal_cloud_module._execute_subgraph_prompt(
+            payload,
+            hydrated_inputs,
+            None,
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(session_handle)
+
+    assert len(outputs) == 1
+    assert modal_cloud_module.is_remote_session_bridge_ref_payload(outputs[0])
+
+
 def test_modal_cloud_logs_remote_session_resolution_summary(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -4470,6 +4544,82 @@ def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
         },
     )
     assert replay_outputs == ("shared-session-value",)
+
+
+def test_local_fallback_skips_seed_execution_when_session_outputs_are_already_restored(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Local fallback seed payloads should no-op when bridge outputs are already in session memory."""
+    session_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-restored",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    restored_value = _FakeModelValue("restored-model")
+    remote_modal_app_module._REMOTE_SESSION_STORE.put_output(
+        session_handle,
+        node_id="5",
+        output_index=0,
+        value=restored_value,
+    )
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "1__mapped::seed:0",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["5"],
+        "subgraph_prompt": {
+            "5": {
+                "class_type": "ShouldNotRun",
+                "inputs": {"model": ["static_input_0", 0]},
+            }
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "5", "input_name": "model"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "static_input_0",
+                "node_id": "5",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "session_output": True,
+            }
+        ],
+        "execute_node_ids": ["5"],
+        "remote_session": session_handle.to_payload(),
+    }
+    hydrated_inputs = {
+        "static_input_0": remote_modal_app_module.RemoteSessionValueRef(
+            session_id=session_handle.session_id,
+            node_id="5",
+            output_index=0,
+        ).to_payload()
+    }
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_invoke_original_node",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("seed short-circuit should skip local node execution")
+        ),
+    )
+
+    try:
+        outputs = remote_modal_app_module._execute_subgraph_prompt(
+            payload,
+            hydrated_inputs,
+            node_mapping={"ShouldNotRun": type("ShouldNotRun", (), {})},
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(session_handle)
+
+    assert len(outputs) == 1
+    assert remote_modal_app_module.is_remote_session_bridge_ref_payload(outputs[0])
 
 
 def test_local_remote_app_rehydrates_bridge_refs_from_warm_value_cache_without_replay(
