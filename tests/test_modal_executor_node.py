@@ -43,6 +43,31 @@ class _CloneableCacheValue:
         return _CloneableCacheValue(self.value)
 
 
+class _FakeModelValue:
+    """Simple cloneable stand-in for a non-transportable MODEL output."""
+
+    def __init__(self, value: str) -> None:
+        """Store an identifying value for later assertions."""
+        self.value = value
+
+    def clone(self) -> "_FakeModelValue":
+        """Return a fresh model value carrying the same identifier."""
+        return _FakeModelValue(self.value)
+
+
+class _FakeModelLoaderNode:
+    """Fake self-contained loader node that returns one MODEL-like object."""
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "load_checkpoint"
+
+    def load_checkpoint(self, ckpt_name: str) -> tuple[_FakeModelValue]:
+        """Return a deterministic model value derived from the checkpoint name."""
+        return (_FakeModelValue(f"model::{ckpt_name}"),)
+
+
 class _FakeSessionValueNode:
     """Fake node that produces one remote-only STRING value."""
 
@@ -1504,6 +1529,93 @@ def test_modal_cloud_rehydrates_conditioning_bridge_refs_from_durable_record_wit
     assert resolution_stats.session_restore_writes == 1
 
 
+def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_replay(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Durable MODEL bridge plans should rebuild one self-contained loader output without replay."""
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_model_bridge",
+        node_id="node-5",
+        output_index=0,
+        session_id="session-source",
+    )
+    record = modal_cloud_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "component-seed",
+            "subgraph_prompt": {
+                "node-5": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "model.safetensors"},
+                }
+            },
+        },
+        hydrated_inputs={},
+        node_id="node-5",
+        output_index=0,
+        io_type="MODEL",
+        output_value=_FakeModelValue("seed-model"),
+    )
+    execute_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    monkeypatch.setattr(modal_cloud_module, "_load_remote_session_bridge_record", lambda bridge_key: record)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("durable MODEL rehydration should skip replay")
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_node_locally_raw",
+        lambda node_data, kwargs_payload, **kwargs: (
+            execute_calls.append((dict(node_data), dict(kwargs_payload))),
+            (_FakeModelValue("restored-model"),),
+        )[1],
+    )
+    resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = modal_cloud_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            custom_nodes_root=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+            resolution_stats=resolution_stats,
+        )
+        stored_value = modal_cloud_module._REMOTE_SESSION_STORE.get_output(
+            modal_cloud_module.RemoteSessionValueRef(
+                session_id=target_handle.session_id,
+                node_id="node-5",
+                output_index=0,
+            )
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert isinstance(restored_value, _FakeModelValue)
+    assert restored_value.value == "restored-model"
+    assert stored_value is restored_value
+    assert execute_calls == [
+        (
+            {"class_type": "CheckpointLoaderSimple"},
+            {"ckpt_name": "model.safetensors"},
+        )
+    ]
+    assert resolution_stats.bridge_cache_hits == 0
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.bridge_record_lookups == 1
+    assert resolution_stats.replay_count == 0
+    assert resolution_stats.session_restore_writes == 1
+
+
 def test_modal_cloud_logs_remote_session_resolution_summary(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -1549,9 +1661,13 @@ def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
     """The runtime should patch the heavyweight built-in loaders once they are available."""
     fake_nodes_module = types.SimpleNamespace(
         NODE_CLASS_MAPPINGS={
+            "CheckpointLoader": type("CheckpointLoader", (), {"load_checkpoint": lambda self, config_name, ckpt_name: (config_name, ckpt_name)}),
+            "CheckpointLoaderSimple": type("CheckpointLoaderSimple", (), {"load_checkpoint": lambda self, ckpt_name: (ckpt_name,)}),
             "UNETLoader": type("UNETLoader", (), {"load_unet": lambda self, unet_name, weight_dtype="default": (unet_name,)}),
             "CLIPLoader": type("CLIPLoader", (), {"load_clip": lambda self, clip_name, type="stable_diffusion", device="default": (clip_name,)}),
             "VAELoader": type("VAELoader", (), {"load_vae": lambda self, vae_name: (vae_name,)}),
+            "unCLIPCheckpointLoader": type("unCLIPCheckpointLoader", (), {"load_checkpoint": lambda self, ckpt_name, output_vae=True, output_clip=True: (ckpt_name,)}),
+            "ImageOnlyCheckpointLoader": type("ImageOnlyCheckpointLoader", (), {"load_checkpoint": lambda self, ckpt_name, output_vae=True, output_clip=True: (ckpt_name,)}),
         }
     )
 
@@ -1565,7 +1681,15 @@ def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
         modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
         modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
 
-    assert {"UNETLoader", "CLIPLoader", "VAELoader"} <= installed_wrappers
+    assert {
+        "CheckpointLoader",
+        "CheckpointLoaderSimple",
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader",
+        "unCLIPCheckpointLoader",
+        "ImageOnlyCheckpointLoader",
+    } <= installed_wrappers
 
 
 def test_modal_cloud_node_cache_key_hashes_boundary_tensors(
@@ -4119,6 +4243,75 @@ def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_recor
     assert torch.equal(restored_value[0][0], conditioning[0][0])
     assert torch.equal(restored_value[0][1]["pooled_output"], conditioning[0][1]["pooled_output"])
     assert torch.equal(stored_value[0][0], conditioning[0][0])
+    assert resolution_stats.bridge_cache_hits == 0
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.bridge_record_lookups == 1
+    assert resolution_stats.replay_count == 0
+    assert resolution_stats.session_restore_writes == 1
+
+
+def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without_replay(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local fallback should rebuild one MODEL bridge output from a durable plan without replay."""
+    target_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_model_bridge",
+        node_id="node-5",
+        output_index=0,
+        session_id="session-source",
+    )
+    record = remote_modal_app_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "component-seed",
+            "subgraph_prompt": {
+                "node-5": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "model.safetensors"},
+                }
+            },
+        },
+        hydrated_inputs={},
+        node_id="node-5",
+        output_index=0,
+        io_type="MODEL",
+        output_value=_FakeModelValue("seed-model"),
+    )
+    monkeypatch.setattr(remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("durable MODEL rehydration should skip local replay")
+        ),
+    )
+    resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            node_mapping={"CheckpointLoaderSimple": _FakeModelLoaderNode},
+            resolution_stats=resolution_stats,
+        )
+        stored_value = remote_modal_app_module._REMOTE_SESSION_STORE.get_output(
+            remote_modal_app_module.RemoteSessionValueRef(
+                session_id=target_handle.session_id,
+                node_id="node-5",
+                output_index=0,
+            )
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert isinstance(restored_value, _FakeModelValue)
+    assert restored_value.value == "model::model.safetensors"
+    assert stored_value is restored_value
     assert resolution_stats.bridge_cache_hits == 0
     assert resolution_stats.durable_bridge_hits == 1
     assert resolution_stats.bridge_record_lookups == 1

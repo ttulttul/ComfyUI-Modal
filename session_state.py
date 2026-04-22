@@ -143,6 +143,8 @@ class RemoteSessionBridgeRecord:
     producer_inputs: dict[str, Any]
     serialized_output: Any | None = None
     serialized_output_io_type: str | None = None
+    rehydration_plan: dict[str, Any] | None = None
+    rehydration_plan_io_type: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize this bridge record into a JSON-safe payload mapping."""
@@ -155,6 +157,8 @@ class RemoteSessionBridgeRecord:
             "producer_inputs": self.producer_inputs,
             "serialized_output": self.serialized_output,
             "serialized_output_io_type": self.serialized_output_io_type,
+            "rehydration_plan": self.rehydration_plan,
+            "rehydration_plan_io_type": self.rehydration_plan_io_type,
         }
 
     @classmethod
@@ -178,6 +182,8 @@ class RemoteSessionBridgeRecord:
                 "Remote session bridge records must define mapping producer_payload and producer_inputs."
             )
         serialized_output_io_type = payload.get("serialized_output_io_type")
+        rehydration_plan = payload.get("rehydration_plan")
+        rehydration_plan_io_type = payload.get("rehydration_plan_io_type")
         return cls(
             bridge_key=bridge_key,
             node_id=node_id,
@@ -188,6 +194,16 @@ class RemoteSessionBridgeRecord:
             serialized_output_io_type=(
                 str(serialized_output_io_type)
                 if serialized_output_io_type is not None and str(serialized_output_io_type).strip()
+                else None
+            ),
+            rehydration_plan=(
+                dict(rehydration_plan)
+                if isinstance(rehydration_plan, Mapping)
+                else None
+            ),
+            rehydration_plan_io_type=(
+                str(rehydration_plan_io_type)
+                if rehydration_plan_io_type is not None and str(rehydration_plan_io_type).strip()
                 else None
             ),
         )
