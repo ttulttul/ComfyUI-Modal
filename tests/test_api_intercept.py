@@ -1064,6 +1064,7 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
 
 def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
     api_intercept_module: Any,
+    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
@@ -1181,6 +1182,10 @@ def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
         ],
         "execute_node_ids": ["3"],
     }
+    with modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS_LOCK:
+        warmup_context = modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS["2"]
+    assert warmup_context.mapped_io_type == "STRING"
+    assert warmup_context.execution_payload["component_id"] == "3"
     assert rewritten_prompt["4"]["inputs"]["text"] == ["3", 0]
 
 

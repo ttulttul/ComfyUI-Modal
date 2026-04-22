@@ -8,6 +8,7 @@
 - Replay optimization needs its own instrumentation. A single mapped-phase summary that breaks bridge resolution down into live-session hits, warm bridge-cache hits, durable-record lookup time, replay time, session-restore writes, and loader-cache hit/miss deltas makes it obvious whether a repeat run really skipped work or just hid it behind another internal phase.
 - Remote custom-node reuse is mostly an idempotence problem, not a raw import-speed problem. Once one extracted bundle root has already been initialized on a warm worker, repeating `init_external_custom_nodes()` for the same root mostly adds log noise and risk, so the runtime should treat that root as already loaded and make the reuse explicit in logs.
 - The local streamed Modal bridge should stop waiting once it receives the terminal `result` envelope. In real runs, the underlying `remote_gen(...)` iterator can take tens of extra seconds to unwind after the remote payload has already finished, and that tail latency blocks mapped cleanup and makes one lane look like a straggler even though inference is done.
+- Queue-time warmup estimates are not enough for mapped fan-out because the real list length is often only known when `ModalMapInput` executes. Registering the local map node as a warmup trigger lets Modal-Sync top up exact container demand one node earlier than the mapped proxy, and a short bounded head-start on those in-flight warmup slots is enough to overlap some cold boot time instead of discovering it only at the first seed call.
 
 ## 2026-04-20
 

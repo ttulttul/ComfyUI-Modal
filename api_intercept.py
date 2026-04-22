@@ -18,6 +18,7 @@ from .modal_executor_node import (
     MODAL_MAP_INPUT_NODE_ID,
     ensure_modal_component_proxy_node_registered,
     register_cache_friendly_proxy_payload,
+    register_modal_map_input_warmup_context,
 )
 from .session_state import RemoteSessionHandle
 from .settings import ModalSyncSettings, get_settings
@@ -113,6 +114,7 @@ class RemoteComponentPlan:
     contains_output_node: bool
     mapped_boundary_input_name: str | None = None
     mapped_boundary_input_io_type: str | None = None
+    mapped_boundary_source_node_id: str | None = None
     static_node_ids: list[str] = field(default_factory=list)
     mapped_node_ids: list[str] = field(default_factory=list)
     mapped_execute_node_ids: list[str] = field(default_factory=list)
@@ -1409,6 +1411,12 @@ def _build_component_plan(
             mapped_boundary_spec.proxy_input_name if mapped_boundary_spec is not None else None
         ),
         mapped_boundary_input_io_type=mapped_boundary_input_io_type,
+        mapped_boundary_source_node_id=(
+            mapped_boundary_spec.source.node_id
+            if mapped_boundary_spec is not None
+            and prompt.get(mapped_boundary_spec.source.node_id, {}).get("class_type") == MODAL_MAP_INPUT_NODE_ID
+            else None
+        ),
         static_node_ids=static_node_ids,
         mapped_node_ids=mapped_node_ids,
         mapped_execute_node_ids=mapped_execute_node_ids,
@@ -2560,6 +2568,12 @@ def _rewrite_component_into_proxy(
             meta=mapped_proxy_meta,
             is_output_node=contains_output_node(component.mapped_node_ids),
         )
+        if component.mapped_boundary_source_node_id is not None:
+            register_modal_map_input_warmup_context(
+                component.mapped_boundary_source_node_id,
+                mapped_payload,
+                str(component.mapped_boundary_input_io_type or "*"),
+            )
 
         for node_id, prompt_node in list(rewritten_prompt.items()):
             if node_id in {static_proxy_node_id, mapped_proxy_node_id}:
@@ -2598,6 +2612,12 @@ def _rewrite_component_into_proxy(
         "inputs": proxy_inputs,
         "_meta": representative_meta,
     }
+    if component.mapped_boundary_source_node_id is not None:
+        register_modal_map_input_warmup_context(
+            component.mapped_boundary_source_node_id,
+            payload,
+            str(component.mapped_boundary_input_io_type or "*"),
+        )
     boundary_output_indices = {
         spec.source: index for index, spec in enumerate(component.boundary_outputs)
     }

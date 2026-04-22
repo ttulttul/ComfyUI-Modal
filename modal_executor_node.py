@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 from comfy_api.latest import _io as io
 
-from .serialization import deserialize_node_outputs, serialize_node_inputs
+from .serialization import deserialize_node_outputs, serialize_node_inputs, split_mapped_value
 
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
@@ -72,6 +72,8 @@ _REMOTE_EXECUTOR_CLIENT_FACTORY: Callable[[], RemoteExecutorClient] = ModalRemot
 _PROXY_NODE_CACHE: dict[str, type[io.ComfyNode]] = {}
 _PROXY_EXECUTION_CONTEXTS_LOCK = threading.Lock()
 _PROXY_EXECUTION_CONTEXTS: dict[str, "_ProxyExecutionContext"] = {}
+_MODAL_MAP_WARMUP_CONTEXTS_LOCK = threading.Lock()
+_MODAL_MAP_WARMUP_CONTEXTS: dict[str, "_ModalMapWarmupContext"] = {}
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,14 @@ class _ProxyExecutionContext:
     """Run-scoped execution context used to rehydrate cache-friendly proxy payloads."""
 
     execution_payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ModalMapWarmupContext:
+    """Run-scoped warmup context used by one local Modal Map Input node."""
+
+    execution_payload: dict[str, Any]
+    mapped_io_type: str
 
 
 def set_remote_executor_client_factory(
@@ -221,6 +231,59 @@ def register_cache_friendly_proxy_payload(
         payload.get("remote_session") is not None,
     )
     return sanitized_payload
+
+
+def register_modal_map_input_warmup_context(
+    node_id: str,
+    payload: Mapping[str, Any],
+    mapped_io_type: str,
+) -> None:
+    """Register prompt-scoped warmup metadata for one local Modal Map Input node."""
+    with _MODAL_MAP_WARMUP_CONTEXTS_LOCK:
+        _MODAL_MAP_WARMUP_CONTEXTS[str(node_id)] = _ModalMapWarmupContext(
+            execution_payload=dict(payload),
+            mapped_io_type=str(mapped_io_type or "*"),
+        )
+    logger.debug(
+        "Registered Modal Map Input warmup context for node_id=%s component_id=%s prompt_id=%s io_type=%s.",
+        node_id,
+        payload.get("component_id"),
+        _normalize_prompt_id(payload.get("prompt_id")),
+        mapped_io_type,
+    )
+
+
+def _boost_modal_map_input_warmup(
+    unique_id: str | None,
+    value: Any,
+) -> None:
+    """Best-effort exact warmup boost for one local Modal Map Input execution."""
+    if unique_id is None:
+        return
+
+    with _MODAL_MAP_WARMUP_CONTEXTS_LOCK:
+        context = _MODAL_MAP_WARMUP_CONTEXTS.get(str(unique_id))
+    if context is None:
+        return
+
+    try:
+        total_items = len(split_mapped_value(value, context.mapped_io_type))
+    except (TypeError, ValueError) as exc:
+        logger.debug(
+            "Skipping Modal Map Input warmup boost for node_id=%s because the runtime value was not splittable as io_type=%s: %s",
+            unique_id,
+            context.mapped_io_type,
+            exc,
+        )
+        return
+
+    from .remote.modal_app import boost_mapped_component_warmup
+
+    boost_mapped_component_warmup(
+        payload=context.execution_payload,
+        total_items=total_items,
+        reason="modal_map_input_execute",
+    )
 
 
 def _rehydrate_proxy_payload(
@@ -461,10 +524,15 @@ class ModalMapInput(io.ComfyNode):
             ),
             inputs=[io.AnyType.Input("value")],
             outputs=[io.AnyType.Output(display_name="value")],
+            hidden=[io.Hidden.unique_id],
             is_experimental=True,
         )
 
     @classmethod
-    def execute(cls, value: Any) -> io.NodeOutput:
+    def execute(cls, value: Any, unique_id: str | None = None) -> io.NodeOutput:
         """Pass the input value through unchanged at runtime."""
+        _boost_modal_map_input_warmup(
+            _normalize_prompt_id(unique_id),
+            value,
+        )
         return io.NodeOutput(value)
