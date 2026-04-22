@@ -14,7 +14,7 @@ def test_sync_file_deduplicates_by_hash(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Repeated file syncs should reuse the same remote path and marker."""
+    """Repeated file syncs should reuse the same remote path and sync-index record."""
     monkeypatch.setattr(sync_engine_module, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
@@ -46,7 +46,9 @@ def test_sync_file_deduplicates_by_hash(
     assert first.uploaded is True
     assert second.uploaded is False
     assert (settings.local_storage_root / first.remote_path.lstrip("/")).exists()
-    assert (settings.local_storage_root / f"hashes/{first.sha256}.done").exists()
+    sync_index_path = settings.local_storage_root / "metadata" / "sync_index.json"
+    assert sync_index_path.exists()
+    assert first.remote_path in sync_index_path.read_text(encoding="utf-8")
 
 
 def test_sync_file_emits_upload_status(
@@ -304,7 +306,7 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
     assert first_bundle is not None
 
     class NeverExistsVolume:
-        """Volume double that forces archive reuse by reporting no remote markers."""
+        """Volume double that forces archive reuse without any remote metadata probes."""
 
         def exists(self, remote_path: str) -> bool:
             return False
@@ -328,18 +330,18 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
 
     assert second_bundle is not None
     assert second_bundle.sha256 == first_bundle.sha256
-    assert second_bundle.uploaded is True
+    assert second_bundle.uploaded is False
     entry_hash = second_engine._hash_directory(custom_nodes_dir / "example")
     assert second_engine._cached_custom_nodes_archive_path("example", entry_hash).exists()
 
 
-def test_sync_file_backfills_marker_when_remote_payload_already_exists(
+def test_sync_file_reuses_sync_index_record_for_existing_remote_payload(
     settings_module: Any,
     sync_engine_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """An existing deterministic remote asset should be reused even when its marker is missing."""
+    """An indexed deterministic asset should be reused without a second upload."""
     monkeypatch.setattr(sync_engine_module, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
@@ -362,41 +364,43 @@ def test_sync_file_backfills_marker_when_remote_payload_already_exists(
         custom_nodes_dir=None,
     )
 
-    class ExistingRemoteFileVolume:
-        """Volume double with a missing marker but a pre-existing deterministic payload path."""
+    class RecordingVolume:
+        """Volume double that records any attempted uploads."""
 
         def __init__(self) -> None:
             """Initialize captured writes."""
             self.put_file_calls: list[tuple[Path, str]] = []
-            self.put_bytes_calls: list[tuple[bytes, str]] = []
-
-        def exists(self, remote_path: str) -> bool:
-            return remote_path.startswith("/assets/") and remote_path.endswith("_model.safetensors")
 
         def put_file(self, local_path: Path, remote_path: str) -> None:
             self.put_file_calls.append((local_path, remote_path))
 
         def put_bytes(self, payload: bytes, remote_path: str) -> None:
-            self.put_bytes_calls.append((payload, remote_path))
+            raise AssertionError("Sync records should not be mirrored as marker files.")
 
-    volume = ExistingRemoteFileVolume()
+        def exists(self, remote_path: str) -> bool:
+            raise AssertionError("Sync should not probe volume metadata for indexed payloads.")
+
+    volume = RecordingVolume()
     engine = sync_engine_module.ModalAssetSyncEngine(volume=volume, settings=settings)
+    engine.sync_index.put(
+        engine._asset_sync_index_key(engine._hash_file(asset_path)),
+        {"remote_path": "/assets/existing_model.safetensors", "source": "existing"},
+    )
 
     synced_asset = engine.sync_file(asset_path)
 
     assert synced_asset.uploaded is False
+    assert synced_asset.remote_path == "/assets/existing_model.safetensors"
     assert volume.put_file_calls == []
-    assert len(volume.put_bytes_calls) == 1
-    assert volume.put_bytes_calls[0][1] == f"/hashes/{synced_asset.sha256}.done"
 
 
-def test_sync_custom_nodes_directory_backfills_marker_when_remote_bundle_already_exists(
+def test_sync_custom_nodes_directory_reuses_indexed_remote_bundle(
     settings_module: Any,
     sync_engine_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """An existing hash-named remote custom_nodes bundle should be reused without rebuilding or reuploading."""
+    """An indexed hash-named remote custom_nodes bundle should be reused without rebuilding or reuploading."""
     monkeypatch.setattr(sync_engine_module, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
@@ -424,30 +428,32 @@ def test_sync_custom_nodes_directory_backfills_marker_when_remote_bundle_already
     engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
     directory_hash = engine._hash_directory(custom_nodes_dir)
     remote_path = engine._custom_nodes_manifest_remote_path(directory_hash)
-    marker_path = f"/hashes/custom_nodes_{directory_hash}.done"
 
-    class ExistingRemoteBundleVolume:
-        """Volume double with a missing marker but a pre-existing deterministic custom_nodes bundle path."""
+    class RecordingVolume:
+        """Volume double that records any attempted uploads."""
 
         def __init__(self) -> None:
             """Initialize captured writes."""
             self.put_file_calls: list[tuple[Path, str]] = []
-            self.put_bytes_calls: list[tuple[bytes, str]] = []
-
-        def exists(self, candidate_path: str) -> bool:
-            return candidate_path == remote_path
 
         def put_file(self, local_path: Path, candidate_path: str) -> None:
             self.put_file_calls.append((local_path, candidate_path))
 
         def put_bytes(self, payload: bytes, candidate_path: str) -> None:
-            self.put_bytes_calls.append((payload, candidate_path))
+            raise AssertionError("Sync records should not be mirrored as marker files.")
 
-    volume = ExistingRemoteBundleVolume()
+        def exists(self, candidate_path: str) -> bool:
+            raise AssertionError("Sync should not probe volume metadata for indexed bundles.")
+
+    volume = RecordingVolume()
     engine = sync_engine_module.ModalAssetSyncEngine(volume=volume, settings=settings)
+    engine.sync_index.put(
+        engine._custom_nodes_manifest_sync_index_key(directory_hash),
+        {"remote_path": remote_path, "source": str(custom_nodes_dir)},
+    )
 
     def fail_create_archive(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("Expected the existing hash-named remote bundle to be reused.")
+        raise AssertionError("Expected the indexed hash-named remote bundle to be reused.")
 
     monkeypatch.setattr(engine, "_create_archive", fail_create_archive)
     bundle = engine.sync_custom_nodes_directory()
@@ -457,8 +463,6 @@ def test_sync_custom_nodes_directory_backfills_marker_when_remote_bundle_already
     assert bundle.remote_path == remote_path
     assert bundle.uploaded is False
     assert volume.put_file_calls == []
-    assert len(volume.put_bytes_calls) == 1
-    assert volume.put_bytes_calls[0][1] == marker_path
 
 
 def test_sync_custom_nodes_directory_only_rebuilds_changed_top_level_archive(
@@ -502,7 +506,7 @@ def test_sync_custom_nodes_directory_only_rebuilds_changed_top_level_archive(
     (package_b / "node.py").write_text("VALUE = 2\n", encoding="utf-8")
 
     class NeverExistsVolume:
-        """Volume double that forces all deterministic uploads through without remote cache hits."""
+        """Volume double that forces all deterministic uploads through without indexed cache hits."""
 
         def exists(self, remote_path: str) -> bool:
             return False
@@ -643,6 +647,15 @@ def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
     class FakeModal:
         """Minimal modal SDK double that returns a stable volume handle."""
 
+        class Dict:
+            """Namespace for sync-index lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> dict[str, Any]:
+                """Return a plain dict-backed sync index."""
+                del name, create_if_missing
+                return {}
+
         class Volume:
             """Namespace for volume lookups."""
 
@@ -673,6 +686,7 @@ def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
 
     engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
     assert type(engine.volume).__name__ == "ModalVolumeBackend"
+    assert type(engine.sync_index).__name__ == "ModalDictSyncIndex"
 
     asset_path = tmp_path / "encoder.safetensors"
     asset_path.write_bytes(b"weights")
@@ -680,7 +694,7 @@ def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
 
     uploaded_remote_paths = [remote_path for _, remote_path in fake_volume.uploads]
     assert synced.remote_path in uploaded_remote_paths
-    assert f"/hashes/{synced.sha256}.done" in uploaded_remote_paths
+    assert all(not remote_path.startswith("/hashes/") for remote_path in uploaded_remote_paths)
 
 
 def test_modal_volume_backend_treats_missing_path_as_cache_miss(

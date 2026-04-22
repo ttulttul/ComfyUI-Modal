@@ -33,6 +33,7 @@ class ModalSyncSettings:
     interrupt_dict_name: str = "comfy-modal-sync-interrupts"
     node_output_cache_dict_name: str = "comfy-modal-sync-node-cache"
     session_bridge_dict_name: str = "comfy-modal-sync-session-bridges"
+    sync_index_dict_name: str = "comfy-modal-sync-sync-index"
     node_output_cache_max_bytes: int = 5 * 1024 * 1024
     terminate_container_on_error: bool = True
     modal_gpu: str = "A100"
@@ -194,6 +195,10 @@ def get_settings() -> ModalSyncSettings:
         session_bridge_dict_name=os.getenv(
             "COMFY_MODAL_SESSION_BRIDGE_DICT_NAME",
             f"{app_name}-session-bridges",
+        ),
+        sync_index_dict_name=os.getenv(
+            "COMFY_MODAL_SYNC_INDEX_DICT_NAME",
+            f"{app_name}-sync-index",
         ),
         node_output_cache_max_bytes=_read_int_env(
             "COMFY_MODAL_NODE_CACHE_MAX_BYTES",

@@ -85,6 +85,16 @@ class VolumeBackend(Protocol):
         """Upload raw bytes into the remote storage backend."""
 
 
+class SyncIndexBackend(Protocol):
+    """Minimal metadata index interface used to deduplicate deterministic uploads."""
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        """Return one stored sync record when it exists."""
+
+    def put(self, key: str, value: dict[str, Any]) -> None:
+        """Persist one sync record under the provided key."""
+
+
 @dataclass(frozen=True)
 class SyncedAsset:
     """Description of a local asset mirrored into the remote storage root."""
@@ -117,6 +127,14 @@ class _CustomNodesArchiveSyncResult:
     uploaded: bool
 
 
+@dataclass(frozen=True)
+class _ContentAddressedSyncResult:
+    """Describe the outcome of one content-addressed file sync decision."""
+
+    remote_path: str
+    uploaded: bool
+
+
 def _modal_volume_worker_count() -> int:
     """Return the worker count used for local Modal volume SDK calls."""
     return 4
@@ -128,6 +146,85 @@ def _custom_nodes_sync_worker_count() -> int:
 
 
 _MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=_modal_volume_worker_count())
+
+
+class _ModalSdkCaller:
+    """Shared retry and backoff helper for Modal SDK calls."""
+
+    def __init__(self, *, target_kind: str) -> None:
+        """Initialize shared retry bookkeeping for one Modal SDK target."""
+        self._target_kind = target_kind
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until_monotonic = 0.0
+        self._rate_limit_backoff_seconds = 0.0
+
+    def _resource_exhausted_error_types(self) -> tuple[type[BaseException], ...]:
+        """Return the Modal SDK exception types that indicate transient rate limiting."""
+        if modal is None:
+            return ()
+        exception_namespace = getattr(modal, "exception", None)
+        if exception_namespace is None:
+            return ()
+        error_type = getattr(exception_namespace, "ResourceExhaustedError", None)
+        if isinstance(error_type, type) and issubclass(error_type, BaseException):
+            return (error_type,)
+        return ()
+
+    def _wait_for_shared_rate_limit_backoff(self) -> None:
+        """Pause until the shared Modal backoff window expires."""
+        while True:
+            with self._rate_limit_lock:
+                remaining_seconds = self._rate_limit_until_monotonic - time.monotonic()
+            if remaining_seconds <= 0.0:
+                return
+            time.sleep(remaining_seconds)
+
+    def _record_shared_rate_limit_backoff(self) -> float:
+        """Increase and publish the shared Modal backoff window."""
+        with self._rate_limit_lock:
+            next_backoff_seconds = (
+                0.25
+                if self._rate_limit_backoff_seconds <= 0.0
+                else min(self._rate_limit_backoff_seconds * 2.0, 8.0)
+            )
+            self._rate_limit_backoff_seconds = next_backoff_seconds
+            self._rate_limit_until_monotonic = max(
+                self._rate_limit_until_monotonic,
+                time.monotonic() + next_backoff_seconds,
+            )
+            return next_backoff_seconds
+
+    def _clear_shared_rate_limit_backoff_if_expired(self) -> None:
+        """Reset the shared backoff after the cooldown window has fully elapsed."""
+        with self._rate_limit_lock:
+            if time.monotonic() >= self._rate_limit_until_monotonic:
+                self._rate_limit_backoff_seconds = 0.0
+                self._rate_limit_until_monotonic = 0.0
+
+    def _run_sdk_call(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run one Modal SDK call with shared retry and backoff semantics."""
+        retryable_errors = self._resource_exhausted_error_types()
+        max_attempts = 5
+        for attempt_index in range(max_attempts):
+            self._wait_for_shared_rate_limit_backoff()
+            future = _MODAL_VOLUME_EXECUTOR.submit(callback, *args, **kwargs)
+            try:
+                result = future.result()
+                self._clear_shared_rate_limit_backoff_if_expired()
+                return result
+            except retryable_errors:
+                if attempt_index >= max_attempts - 1:
+                    raise
+                backoff_seconds = self._record_shared_rate_limit_backoff()
+                logger.warning(
+                    "Modal %s call %s hit rate limiting on attempt %d/%d; applying shared retry backoff of %.2fs.",
+                    self._target_kind,
+                    getattr(callback, "__name__", repr(callback)),
+                    attempt_index + 1,
+                    max_attempts,
+                    backoff_seconds,
+                )
+        raise RuntimeError("Modal SDK call retry loop exited unexpectedly.")
 
 
 class LocalMirrorVolume:
@@ -159,86 +256,98 @@ class LocalMirrorVolume:
         return self.root / remote_path.lstrip("/")
 
 
-class ModalVolumeBackend:
+class LocalFileSyncIndex:
+    """JSON-backed sync index used for local mirrors and tests."""
+
+    def __init__(self, root: Path) -> None:
+        """Initialize the on-disk metadata store."""
+        self._index_path = root / "metadata" / "sync_index.json"
+        self._lock = threading.Lock()
+        self._records = self._load_records()
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        """Return one stored sync record when it exists."""
+        with self._lock:
+            payload = self._records.get(key)
+            return dict(payload) if isinstance(payload, dict) else None
+
+    def put(self, key: str, value: dict[str, Any]) -> None:
+        """Persist one sync record to the local metadata file."""
+        with self._lock:
+            self._records[key] = dict(value)
+            self._save_records()
+
+    def _load_records(self) -> dict[str, dict[str, Any]]:
+        """Load the persisted sync index when available."""
+        if not self._index_path.exists():
+            return {}
+        try:
+            payload = json.loads(self._index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Sync index at %s is unreadable; rebuilding it from scratch.", self._index_path)
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in payload.items()
+            if isinstance(value, dict)
+        }
+
+    def _save_records(self) -> None:
+        """Write the current sync index to disk."""
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        self._index_path.write_text(json.dumps(self._records, sort_keys=True), encoding="utf-8")
+
+
+class ModalDictSyncIndex(_ModalSdkCaller):
+    """Modal Dict-backed sync index for remote content-addressed uploads."""
+
+    def __init__(self, dict_name: str) -> None:
+        """Resolve a named Modal Dict lazily from the local SDK client."""
+        if modal is None:
+            raise RuntimeError("Modal SDK is required for ModalDictSyncIndex.")
+        super().__init__(target_kind="dict")
+        self._dict = modal.Dict.from_name(dict_name, create_if_missing=True)
+        self._missing = object()
+        self._cache: dict[str, object] = {}
+        self._cache_lock = threading.Lock()
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        """Return one stored sync record when it exists."""
+        with self._cache_lock:
+            cached_value = self._cache.get(key, self._missing)
+        if cached_value is not self._missing:
+            return dict(cached_value) if isinstance(cached_value, dict) else None
+        payload = self._run_sdk_call(self._dict.get, key)
+        normalized_payload = dict(payload) if isinstance(payload, dict) else None
+        with self._cache_lock:
+            self._cache[key] = dict(normalized_payload) if normalized_payload is not None else None
+        return dict(normalized_payload) if normalized_payload is not None else None
+
+    def put(self, key: str, value: dict[str, Any]) -> None:
+        """Persist one sync record to the shared Modal Dict."""
+        normalized_value = dict(value)
+
+        def write_record() -> None:
+            self._dict[key] = normalized_value
+
+        self._run_sdk_call(write_record)
+        with self._cache_lock:
+            self._cache[key] = dict(normalized_value)
+
+
+class ModalVolumeBackend(_ModalSdkCaller):
     """Modal Volume-backed storage for real remote execution."""
 
     def __init__(self, volume_name: str) -> None:
         """Resolve a named Modal volume lazily from the local SDK client."""
         if modal is None:
             raise RuntimeError("Modal SDK is required for ModalVolumeBackend.")
+        super().__init__(target_kind="volume")
         self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
         self._exists_cache: dict[str, bool] = {}
         self._exists_cache_lock = threading.Lock()
-        self._rate_limit_lock = threading.Lock()
-        self._rate_limit_until_monotonic = 0.0
-        self._rate_limit_backoff_seconds = 0.0
-
-    def _resource_exhausted_error_types(self) -> tuple[type[BaseException], ...]:
-        """Return the Modal SDK exception types that indicate transient rate limiting."""
-        if modal is None:
-            return ()
-        exception_namespace = getattr(modal, "exception", None)
-        if exception_namespace is None:
-            return ()
-        error_type = getattr(exception_namespace, "ResourceExhaustedError", None)
-        if isinstance(error_type, type) and issubclass(error_type, BaseException):
-            return (error_type,)
-        return ()
-
-    def _wait_for_shared_rate_limit_backoff(self) -> None:
-        """Pause until the shared Modal volume backoff window expires."""
-        while True:
-            with self._rate_limit_lock:
-                remaining_seconds = self._rate_limit_until_monotonic - time.monotonic()
-            if remaining_seconds <= 0.0:
-                return
-            time.sleep(remaining_seconds)
-
-    def _record_shared_rate_limit_backoff(self) -> float:
-        """Increase and publish the shared Modal volume backoff window."""
-        with self._rate_limit_lock:
-            next_backoff_seconds = (
-                0.25
-                if self._rate_limit_backoff_seconds <= 0.0
-                else min(self._rate_limit_backoff_seconds * 2.0, 8.0)
-            )
-            self._rate_limit_backoff_seconds = next_backoff_seconds
-            self._rate_limit_until_monotonic = max(
-                self._rate_limit_until_monotonic,
-                time.monotonic() + next_backoff_seconds,
-            )
-            return next_backoff_seconds
-
-    def _clear_shared_rate_limit_backoff_if_expired(self) -> None:
-        """Reset the shared backoff after the cooldown window has fully elapsed."""
-        with self._rate_limit_lock:
-            if time.monotonic() >= self._rate_limit_until_monotonic:
-                self._rate_limit_backoff_seconds = 0.0
-                self._rate_limit_until_monotonic = 0.0
-
-    def _run_volume_call(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
-        """Run a Modal SDK volume call in a worker thread outside the request event loop."""
-        retryable_errors = self._resource_exhausted_error_types()
-        max_attempts = 5
-        for attempt_index in range(max_attempts):
-            self._wait_for_shared_rate_limit_backoff()
-            future = _MODAL_VOLUME_EXECUTOR.submit(callback, *args, **kwargs)
-            try:
-                result = future.result()
-                self._clear_shared_rate_limit_backoff_if_expired()
-                return result
-            except retryable_errors as exc:
-                if attempt_index >= max_attempts - 1:
-                    raise
-                backoff_seconds = self._record_shared_rate_limit_backoff()
-                logger.warning(
-                    "Modal volume call %s hit rate limiting on attempt %d/%d; applying shared retry backoff of %.2fs.",
-                    getattr(callback, "__name__", repr(callback)),
-                    attempt_index + 1,
-                    max_attempts,
-                    backoff_seconds,
-                )
-        raise RuntimeError("Modal volume call retry loop exited unexpectedly.")
 
     def exists(self, remote_path: str) -> bool:
         """Return whether a file already exists in the Modal volume."""
@@ -247,7 +356,7 @@ class ModalVolumeBackend:
         if cached_result is not None:
             return cached_result
         try:
-            exists = len(self._run_volume_call(self._volume.listdir, remote_path, recursive=False)) > 0
+            exists = len(self._run_sdk_call(self._volume.listdir, remote_path, recursive=False)) > 0
         except modal.exception.NotFoundError:
             exists = False
         with self._exists_cache_lock:
@@ -260,7 +369,7 @@ class ModalVolumeBackend:
             with self._volume.batch_upload() as batch:
                 batch.put_file(local_path, remote_path)
 
-        self._run_volume_call(upload)
+        self._run_sdk_call(upload)
         with self._exists_cache_lock:
             self._exists_cache[remote_path] = True
 
@@ -270,7 +379,7 @@ class ModalVolumeBackend:
             with self._volume.batch_upload() as batch:
                 batch.put_file(io.BytesIO(payload), remote_path)
 
-        self._run_volume_call(upload)
+        self._run_sdk_call(upload)
         with self._exists_cache_lock:
             self._exists_cache[remote_path] = True
 
@@ -281,12 +390,15 @@ class ModalAssetSyncEngine:
 
     volume: VolumeBackend
     settings: ModalSyncSettings
+    sync_index: SyncIndexBackend | None = None
     _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
     _hash_cache_dirty: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         """Load persistent metadata caches used to avoid repeated hashing work."""
+        if self.sync_index is None:
+            self.sync_index = LocalFileSyncIndex(self.settings.local_storage_root)
         self._hash_cache = self._load_hash_cache()
 
     @classmethod
@@ -294,19 +406,23 @@ class ModalAssetSyncEngine:
         """Create a sync engine using the local mirror backend by default."""
         resolved_settings = settings or get_settings()
         backend: VolumeBackend
+        sync_index: SyncIndexBackend
         if resolved_settings.execution_mode == "remote" and modal is not None:
             logger.info(
-                "Using Modal volume backend %s for remote asset sync.",
+                "Using Modal volume backend %s and Modal sync index %s for remote asset sync.",
                 resolved_settings.volume_name,
+                resolved_settings.sync_index_dict_name,
             )
             backend = ModalVolumeBackend(resolved_settings.volume_name)
+            sync_index = ModalDictSyncIndex(resolved_settings.sync_index_dict_name)
         else:
             if resolved_settings.execution_mode == "remote" and modal is None:
                 logger.warning(
                     "Modal SDK is unavailable in remote execution mode; falling back to local mirror storage."
                 )
             backend = LocalMirrorVolume(resolved_settings.local_storage_root)
-        return cls(volume=backend, settings=resolved_settings)
+            sync_index = LocalFileSyncIndex(resolved_settings.local_storage_root)
+        return cls(volume=backend, settings=resolved_settings, sync_index=sync_index)
 
     def sync_file(
         self,
@@ -323,12 +439,11 @@ class ModalAssetSyncEngine:
             raise FileNotFoundError(f"Asset not found: {resolved_path}")
 
         sha256 = self._hash_file(resolved_path)
-        marker_path = f"/hashes/{sha256}.done"
-        remote_path = f"{remote_folder.rstrip('/')}/{sha256}_{resolved_path.name}"
-        uploaded = self._sync_content_addressed_file(
+        proposed_remote_path = f"{remote_folder.rstrip('/')}/{sha256}_{resolved_path.name}"
+        sync_result = self._sync_content_addressed_file(
             local_path=resolved_path,
-            remote_path=remote_path,
-            marker_path=marker_path,
+            remote_path=proposed_remote_path,
+            sync_key=self._asset_sync_index_key(sha256),
             source_description=str(resolved_path),
             status_callback=status_callback,
             upload_status_message=_format_asset_upload_status(
@@ -342,9 +457,9 @@ class ModalAssetSyncEngine:
 
         return SyncedAsset(
             local_path=resolved_path,
-            remote_path=remote_path,
+            remote_path=sync_result.remote_path,
             sha256=sha256,
-            uploaded=uploaded,
+            uploaded=sync_result.uploaded,
         )
 
     def sync_prompt_inputs(
@@ -408,10 +523,10 @@ class ModalAssetSyncEngine:
             time.perf_counter() - sync_started_at,
             directory_hash,
         )
-        marker_path = f"/hashes/custom_nodes_{directory_hash}.done"
-        remote_path = self._custom_nodes_manifest_remote_path(directory_hash)
-
-        if self.volume.exists(marker_path):
+        manifest_sync_key = self._custom_nodes_manifest_sync_index_key(directory_hash)
+        manifest_record = self._lookup_sync_record(manifest_sync_key)
+        if manifest_record is not None:
+            remote_path = str(manifest_record["remote_path"])
             logger.info(
                 "Custom_nodes manifest already mirrored at %s after %.3fs total sync time.",
                 remote_path,
@@ -423,24 +538,7 @@ class ModalAssetSyncEngine:
                 sha256=directory_hash,
                 uploaded=False,
             )
-
-        if self.volume.exists(remote_path):
-            logger.warning(
-                "Reusing mirrored custom_nodes manifest at %s because the deterministic payload already exists without marker %s; backfilling the marker.",
-                remote_path,
-                marker_path,
-            )
-            self._write_sync_marker(
-                source_description=str(custom_nodes_dir),
-                remote_path=remote_path,
-                marker_path=marker_path,
-            )
-            return SyncedAsset(
-                local_path=custom_nodes_dir,
-                remote_path=remote_path,
-                sha256=directory_hash,
-                uploaded=False,
-            )
+        remote_path = self._custom_nodes_manifest_remote_path(directory_hash)
 
         archive_specs = self._custom_nodes_archive_specs(custom_nodes_dir)
         if not archive_specs:
@@ -493,23 +591,23 @@ class ModalAssetSyncEngine:
                 encoding="utf-8",
             )
 
-        manifest_uploaded = self._sync_content_addressed_file(
+        manifest_sync_result = self._sync_content_addressed_file(
             local_path=manifest_path,
             remote_path=remote_path,
-            marker_path=marker_path,
+            sync_key=manifest_sync_key,
             source_description=str(custom_nodes_dir),
             upload_status_message="Uploading custom nodes ZIP to Modal",
         )
-        uploaded = uploaded or manifest_uploaded
+        uploaded = uploaded or manifest_sync_result.uploaded
 
         logger.info(
             "Finished custom_nodes sync to %s in %.3fs total.",
-            remote_path,
+            manifest_sync_result.remote_path,
             time.perf_counter() - sync_started_at,
         )
         return SyncedAsset(
             local_path=custom_nodes_dir,
-            remote_path=remote_path,
+            remote_path=manifest_sync_result.remote_path,
             sha256=directory_hash,
             uploaded=uploaded,
         )
@@ -519,26 +617,26 @@ class ModalAssetSyncEngine:
         *,
         local_path: Path,
         remote_path: str,
-        marker_path: str,
+        sync_key: str,
         source_description: str,
         status_callback: SyncStatusCallback | None = None,
         upload_status_message: str | None = None,
         status_current: int | None = None,
         status_total: int | None = None,
-    ) -> bool:
-        """Upload one deterministic file only when neither the file nor its marker already exists."""
-        if self.volume.exists(marker_path):
-            logger.info("Reusing mirrored asset at %s because marker %s already exists.", remote_path, marker_path)
-            return False
-
-        if self.volume.exists(remote_path):
-            logger.warning(
-                "Reusing mirrored asset at %s because the deterministic file already exists without marker %s; backfilling the marker.",
-                remote_path,
-                marker_path,
+    ) -> _ContentAddressedSyncResult:
+        """Upload one deterministic file only when its digest is absent from the sync index."""
+        existing_record = self._lookup_sync_record(sync_key)
+        if existing_record is not None:
+            indexed_remote_path = str(existing_record["remote_path"])
+            logger.info(
+                "Reusing mirrored asset at %s because sync index key %s already exists.",
+                indexed_remote_path,
+                sync_key,
             )
-            self._write_sync_marker(source_description=source_description, remote_path=remote_path, marker_path=marker_path)
-            return False
+            return _ContentAddressedSyncResult(
+                remote_path=indexed_remote_path,
+                uploaded=False,
+            )
 
         logger.info("Syncing %s to %s", source_description, remote_path)
         _emit_sync_status(
@@ -548,21 +646,12 @@ class ModalAssetSyncEngine:
             status_total,
         )
         self.volume.put_file(local_path, remote_path)
-        self._write_sync_marker(source_description=source_description, remote_path=remote_path, marker_path=marker_path)
-        return True
-
-    def _write_sync_marker(
-        self,
-        *,
-        source_description: str,
-        remote_path: str,
-        marker_path: str,
-    ) -> None:
-        """Persist one sync marker payload describing a mirrored content-addressed file."""
-        self.volume.put_bytes(
-            json.dumps({"source": source_description, "remote_path": remote_path}).encode("utf-8"),
-            marker_path,
+        self._store_sync_record(
+            sync_key=sync_key,
+            remote_path=remote_path,
+            source_description=source_description,
         )
+        return _ContentAddressedSyncResult(remote_path=remote_path, uploaded=True)
 
     def _sync_custom_nodes_archives_parallel(
         self,
@@ -638,9 +727,9 @@ class ModalAssetSyncEngine:
         entry_uploaded = self._sync_content_addressed_file(
             local_path=archive_path,
             remote_path=archive_remote_path,
-            marker_path=(
-                f"/hashes/custom_nodes_entry_"
-                f"{self._custom_nodes_entry_slug(archive_spec.entry_name)}_{archive_spec.sha256}.done"
+            sync_key=self._custom_nodes_entry_sync_index_key(
+                archive_spec.entry_name,
+                archive_spec.sha256,
             ),
             source_description=archive_spec.source_description,
         )
@@ -648,8 +737,52 @@ class ModalAssetSyncEngine:
             entry_name=archive_spec.entry_name,
             display_name=archive_spec.display_name,
             sha256=archive_spec.sha256,
-            remote_path=archive_remote_path,
-            uploaded=entry_uploaded,
+            remote_path=entry_uploaded.remote_path,
+            uploaded=entry_uploaded.uploaded,
+        )
+
+    def _lookup_sync_record(self, sync_key: str) -> dict[str, Any] | None:
+        """Return one normalized sync-index record when the key is present."""
+        assert self.sync_index is not None
+        payload = self.sync_index.get(sync_key)
+        if payload is None:
+            return None
+        remote_path = payload.get("remote_path")
+        if not isinstance(remote_path, str) or not remote_path:
+            logger.warning("Ignoring malformed sync-index record for key=%s payload=%s.", sync_key, payload)
+            return None
+        return dict(payload)
+
+    def _store_sync_record(
+        self,
+        *,
+        sync_key: str,
+        remote_path: str,
+        source_description: str,
+    ) -> None:
+        """Persist one normalized sync-index record."""
+        assert self.sync_index is not None
+        self.sync_index.put(
+            sync_key,
+            {
+                "remote_path": remote_path,
+                "source": source_description,
+            },
+        )
+
+    def _asset_sync_index_key(self, sha256: str) -> str:
+        """Return the sync-index key for one content-addressed asset digest."""
+        return f"{self.settings.volume_name}:asset:{sha256}"
+
+    def _custom_nodes_manifest_sync_index_key(self, directory_hash: str) -> str:
+        """Return the sync-index key for one whole-tree custom_nodes manifest digest."""
+        return f"{self.settings.volume_name}:custom_nodes_manifest:{directory_hash}"
+
+    def _custom_nodes_entry_sync_index_key(self, entry_name: str, entry_hash: str) -> str:
+        """Return the sync-index key for one top-level custom_nodes entry archive digest."""
+        return (
+            f"{self.settings.volume_name}:custom_nodes_entry:"
+            f"{self._custom_nodes_entry_slug(entry_name)}:{entry_hash}"
         )
 
 
