@@ -30,6 +30,7 @@ from ..serialization import (
     deserialize_node_inputs,
     deserialize_node_outputs,
     serialize_mapping,
+    serialize_value,
     split_mapped_value,
     serialize_node_outputs,
     serialize_node_inputs,
@@ -73,6 +74,7 @@ _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER: list[str] = []
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT = 32
+_DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset({"CONDITIONING"})
 
 
 @dataclass
@@ -108,6 +110,7 @@ class _RemoteSessionBridgeResolutionStats:
     input_ref_count: int = 0
     live_session_hits: int = 0
     bridge_cache_hits: int = 0
+    durable_bridge_hits: int = 0
     bridge_record_lookups: int = 0
     bridge_record_lookup_seconds: float = 0.0
     replay_count: int = 0
@@ -475,10 +478,13 @@ def _build_remote_session_bridge_record(
     hydrated_inputs: dict[str, Any],
     node_id: str,
     output_index: int,
+    io_type: str,
+    output_value: Any,
 ) -> RemoteSessionBridgeRecord:
     """Build one durable bridge record for a session-backed boundary output."""
     producer_payload = _sanitize_payload_for_session_bridge_record(payload)
     producer_inputs = serialize_mapping(hydrated_inputs)
+    serialized_output = _serialize_durable_bridge_output(output_value, io_type)
     return RemoteSessionBridgeRecord(
         bridge_key=stable_session_bridge_key(
             producer_payload=producer_payload,
@@ -490,6 +496,8 @@ def _build_remote_session_bridge_record(
         output_index=output_index,
         producer_payload=producer_payload,
         producer_inputs=producer_inputs,
+        serialized_output=serialized_output,
+        serialized_output_io_type=(str(io_type) if serialized_output is not None else None),
     )
 
 
@@ -539,6 +547,54 @@ def _get_remote_session_bridge_value(bridge_key: str) -> Any | None:
             _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.remove(bridge_key)
         _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.append(bridge_key)
         return _clone_cached_bridge_value(cached_value)
+
+
+def _serialize_durable_bridge_output(output_value: Any, io_type: str) -> Any | None:
+    """Serialize one bridge output when its io_type supports durable direct restore."""
+    normalized_io_type = str(io_type or "")
+    if normalized_io_type not in _DURABLE_BRIDGE_SERIALIZATION_IO_TYPES:
+        return None
+    try:
+        return serialize_value(output_value)
+    except TypeError:
+        logger.warning(
+            "Skipping durable bridge serialization for io_type=%s value_type=%s.",
+            normalized_io_type,
+            type(output_value).__name__,
+        )
+        return None
+
+
+def _restore_serialized_remote_session_bridge_value(
+    record: RemoteSessionBridgeRecord,
+    *,
+    target_session_handle: RemoteSessionHandle,
+    resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
+) -> Any | None:
+    """Restore one bridge value directly from a durable serialized payload."""
+    if record.serialized_output is None:
+        return None
+
+    restore_started_at = time.perf_counter()
+    restored_value = deserialize_value(record.serialized_output)
+    _REMOTE_SESSION_STORE.put_output(
+        target_session_handle,
+        node_id=record.node_id,
+        output_index=record.output_index,
+        value=restored_value,
+    )
+    _store_remote_session_bridge_value(record.bridge_key, restored_value)
+    if resolution_stats is not None:
+        resolution_stats.durable_bridge_hits += 1
+        resolution_stats.session_restore_writes += 1
+        resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
+    logger.info(
+        "Resolved remote session bridge bridge_key=%s from durable serialized %s payload into session_id=%s.",
+        record.bridge_key,
+        record.serialized_output_io_type or "bridge",
+        target_session_handle.session_id,
+    )
+    return restored_value
 
 
 def _remote_session_bridge_replay_stack() -> set[str]:
@@ -596,6 +652,13 @@ def _rehydrate_remote_session_bridge_value(
         resolution_stats.bridge_record_lookup_seconds += (
             time.perf_counter() - record_lookup_started_at
         )
+    restored_value = _restore_serialized_remote_session_bridge_value(
+        record,
+        target_session_handle=target_session_handle,
+        resolution_stats=resolution_stats,
+    )
+    if restored_value is not None:
+        return restored_value
     replay_payload = copy.deepcopy(record.producer_payload)
     replay_payload["remote_session"] = target_session_handle.to_payload()
     replay_payload.pop("clear_remote_session", None)
@@ -685,11 +748,12 @@ def _log_remote_session_resolution_summary(
     if resolution_stats.input_ref_count <= 0:
         return
     logger.info(
-        "Remote session resolution summary component=%s refs=%d live_hits=%d warm_bridge_hits=%d bridge_record_lookups=%d bridge_record_lookup_seconds=%.3f replay_count=%d replay_seconds=%.3f direct_restore_seconds=%.3f session_restore_writes=%d.",
+        "Remote session resolution summary component=%s refs=%d live_hits=%d warm_bridge_hits=%d durable_bridge_hits=%d bridge_record_lookups=%d bridge_record_lookup_seconds=%.3f replay_count=%d replay_seconds=%.3f direct_restore_seconds=%.3f session_restore_writes=%d.",
         component_id,
         resolution_stats.input_ref_count,
         resolution_stats.live_session_hits,
         resolution_stats.bridge_cache_hits,
+        resolution_stats.durable_bridge_hits,
         resolution_stats.bridge_record_lookups,
         resolution_stats.bridge_record_lookup_seconds,
         resolution_stats.replay_count,
@@ -1377,6 +1441,8 @@ def _execute_subgraph_with_mapping(
                 hydrated_inputs=hydrated_inputs,
                 node_id=node_id,
                 output_index=output_index,
+                io_type=str(boundary_output.get("io_type") or "*"),
+                output_value=output_value,
             )
             _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
             _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
@@ -1516,6 +1582,8 @@ def _execute_subgraph_prompt(
                     hydrated_inputs=hydrated_inputs,
                     node_id=node_id,
                     output_index=output_index,
+                    io_type=str(boundary_output.get("io_type") or "*"),
+                    output_value=output_value,
                 )
                 _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
                 _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
@@ -2516,6 +2584,7 @@ def _execute_mapped_subgraph_payload(
             f"{payload.get('component_id', 'modal-subgraph')}::static",
             suppress_status_stream=True,
         )
+        static_phase_payload.pop("clear_remote_session", None)
     elif payload.get("static_execute_node_ids"):
         static_phase_payload = _build_static_mapped_payload(payload)
 
@@ -3195,6 +3264,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     f"{payload.get('component_id', 'modal-subgraph')}::seed:{lane_index}",
                     suppress_status_stream=True,
                 )
+                lane_seed_payload.pop("clear_remote_session", None)
                 await _invoke_bound_remote_engine_async(
                     lane_remote_engines[lane_index],
                     lane_seed_payload,

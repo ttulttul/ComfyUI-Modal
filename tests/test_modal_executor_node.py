@@ -1428,6 +1428,82 @@ def test_modal_cloud_rehydrates_bridge_refs_from_warm_value_cache_without_replay
     assert resolution_stats.session_restore_writes == 1
 
 
+def test_modal_cloud_rehydrates_conditioning_bridge_refs_from_durable_record_without_replay(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Durably serialized CONDITIONING bridge values should restore without replay on fresh workers."""
+    import torch
+
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_conditioning_bridge",
+        node_id="node-9",
+        output_index=0,
+        session_id="session-source",
+    )
+    conditioning = [
+        [
+            torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+            {"pooled_output": torch.arange(4, dtype=torch.float32).reshape(1, 4)},
+        ]
+    ]
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_remote_session_bridge_record",
+        lambda bridge_key: modal_cloud_module.RemoteSessionBridgeRecord(
+            bridge_key=bridge_key,
+            node_id="node-9",
+            output_index=0,
+            producer_payload={"component_id": "should-not-replay"},
+            producer_inputs={},
+            serialized_output=modal_cloud_module.serialize_value(conditioning),
+            serialized_output_io_type="CONDITIONING",
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("durable CONDITIONING restore should skip replay")
+        ),
+    )
+    resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = modal_cloud_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            custom_nodes_root=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+            resolution_stats=resolution_stats,
+        )
+        stored_value = modal_cloud_module._REMOTE_SESSION_STORE.get_output(
+            modal_cloud_module.RemoteSessionValueRef(
+                session_id=target_handle.session_id,
+                node_id="node-9",
+                output_index=0,
+            )
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert torch.equal(restored_value[0][0], conditioning[0][0])
+    assert torch.equal(restored_value[0][1]["pooled_output"], conditioning[0][1]["pooled_output"])
+    assert torch.equal(stored_value[0][0], conditioning[0][0])
+    assert resolution_stats.bridge_cache_hits == 0
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.bridge_record_lookups == 1
+    assert resolution_stats.replay_count == 0
+    assert resolution_stats.session_restore_writes == 1
+
+
 def test_modal_cloud_logs_remote_session_resolution_summary(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -1446,6 +1522,7 @@ def test_modal_cloud_logs_remote_session_resolution_summary(
             input_ref_count=2,
             live_session_hits=1,
             bridge_cache_hits=1,
+            durable_bridge_hits=1,
             bridge_record_lookups=1,
             bridge_record_lookup_seconds=0.25,
             replay_count=1,
@@ -1459,8 +1536,8 @@ def test_modal_cloud_logs_remote_session_resolution_summary(
 
     assert observed_logs == [
         (
-            "Remote session resolution summary component=%s refs=%d live_hits=%d warm_bridge_hits=%d bridge_record_lookups=%d bridge_record_lookup_seconds=%.3f replay_count=%d replay_seconds=%.3f direct_restore_seconds=%.3f session_restore_writes=%d loader_cache_hits=%d loader_cache_misses=%d",
-            ("1::mapped", 2, 1, 1, 1, 0.25, 1, 1.5, 0.02, 1, 2, 1),
+            "Remote session resolution summary component=%s refs=%d live_hits=%d warm_bridge_hits=%d durable_bridge_hits=%d bridge_record_lookups=%d bridge_record_lookup_seconds=%.3f replay_count=%d replay_seconds=%.3f direct_restore_seconds=%.3f session_restore_writes=%d loader_cache_hits=%d loader_cache_misses=%d",
+            ("1::mapped", 2, 1, 1, 1, 1, 0.25, 1, 1.5, 0.02, 1, 2, 1),
         )
     ]
 
@@ -3927,6 +4004,79 @@ def test_local_remote_app_rehydrates_bridge_refs_from_warm_value_cache_without_r
     assert resolution_stats.session_restore_writes == 1
 
 
+def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_record_without_replay(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local fallback should restore durably serialized CONDITIONING bridge values without replay."""
+    import torch
+
+    target_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_conditioning_bridge",
+        node_id="node-9",
+        output_index=0,
+        session_id="session-source",
+    )
+    conditioning = [
+        [
+            torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+            {"pooled_output": torch.arange(4, dtype=torch.float32).reshape(1, 4)},
+        ]
+    ]
+    monkeypatch.setattr(
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        "get_record",
+        lambda bridge_key: remote_modal_app_module.RemoteSessionBridgeRecord(
+            bridge_key=bridge_key,
+            node_id="node-9",
+            output_index=0,
+            producer_payload={"component_id": "should-not-replay"},
+            producer_inputs={},
+            serialized_output=remote_modal_app_module.serialize_value(conditioning),
+            serialized_output_io_type="CONDITIONING",
+        ),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("durable CONDITIONING restore should skip local replay")
+        ),
+    )
+    resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            node_mapping=None,
+            resolution_stats=resolution_stats,
+        )
+        stored_value = remote_modal_app_module._REMOTE_SESSION_STORE.get_output(
+            remote_modal_app_module.RemoteSessionValueRef(
+                session_id=target_handle.session_id,
+                node_id="node-9",
+                output_index=0,
+            )
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert torch.equal(restored_value[0][0], conditioning[0][0])
+    assert torch.equal(restored_value[0][1]["pooled_output"], conditioning[0][1]["pooled_output"])
+    assert torch.equal(stored_value[0][0], conditioning[0][0])
+    assert resolution_stats.bridge_cache_hits == 0
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.bridge_record_lookups == 1
+    assert resolution_stats.replay_count == 0
+    assert resolution_stats.session_restore_writes == 1
+
+
 def test_local_phase_payload_builder_preserves_remote_session(
     remote_modal_app_module: Any,
 ) -> None:
@@ -4354,7 +4504,7 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
     monkeypatch: Any,
 ) -> None:
     """Mapped remote scheduling should seed one bound worker lane before sending per-item calls there."""
-    observed_calls: list[tuple[str, str, tuple[str, ...], dict[str, Any]]] = []
+    observed_calls: list[tuple[str, str, bool, tuple[str, ...], dict[str, Any]]] = []
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
@@ -4375,7 +4525,15 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
     ) -> bytes:
         hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
         execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
-        observed_calls.append((str(remote_engine), str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+        observed_calls.append(
+            (
+                str(remote_engine),
+                str(payload["component_id"]),
+                bool(payload.get("clear_remote_session")),
+                execute_node_ids,
+                hydrated_inputs,
+            )
+        )
         if str(payload["component_id"]).startswith("17::seed:"):
             return serialization_module.serialize_node_outputs(())
         if str(payload["component_id"]).startswith("17::cleanup:"):
@@ -4476,12 +4634,14 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
         (
             "engine:session-1::lane:0",
             "17::seed:0",
+            False,
             ("4",),
             {"static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True}},
         ),
         (
             "engine:session-1::lane:1",
             "17::seed:1",
+            False,
             ("4",),
             {"static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True}},
         ),
@@ -4489,8 +4649,8 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
     assert {call[0] for call in item_calls} <= {"engine:session-1::lane:0", "engine:session-1::lane:1"}
     assert {call[0] for call in item_calls} <= {call[0] for call in seed_calls}
     assert sorted(cleanup_calls) == [
-        ("engine:session-1::lane:0", "17::cleanup:0", (), {}),
-        ("engine:session-1::lane:1", "17::cleanup:1", (), {}),
+        ("engine:session-1::lane:0", "17::cleanup:0", True, (), {}),
+        ("engine:session-1::lane:1", "17::cleanup:1", True, (), {}),
     ]
     response_outputs = serialization_module.deserialize_node_outputs(response)[0]
     assert len(response_outputs) == 4
