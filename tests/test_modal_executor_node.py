@@ -6,6 +6,7 @@ import asyncio
 import copy
 from concurrent.futures import Future
 import importlib.util
+import json
 import sys
 import threading
 import time
@@ -813,6 +814,69 @@ def test_modal_cloud_reuses_extracted_custom_nodes_bundle(
 
     assert first_root is not None
     assert second_root == first_root
+
+
+def test_modal_cloud_extracts_custom_nodes_manifest_with_multiple_archives(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The remote runtime should resolve manifest-based custom_nodes bundles into several archives."""
+    storage_root = tmp_path / "storage"
+    entry_a_path = storage_root / "custom_nodes" / "entries" / "example_a" / "hash_a_bundle.zip"
+    entry_b_path = storage_root / "custom_nodes" / "entries" / "example_b" / "hash_b_bundle.zip"
+    manifest_path = storage_root / "custom_nodes" / "manifests" / "bundle_manifest.json"
+    entry_a_path.parent.mkdir(parents=True, exist_ok=True)
+    entry_b_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import zipfile
+
+    with zipfile.ZipFile(entry_a_path, "w") as archive:
+        archive.writestr("example_a/__init__.py", "NODE_CLASS_MAPPINGS = {}\n")
+    with zipfile.ZipFile(entry_b_path, "w") as archive:
+        archive.writestr("example_b/__init__.py", "NODE_CLASS_MAPPINGS = {}\n")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "bundle_sha256": "bundle-hash",
+                "entries": [
+                    {
+                        "entry_name": "example_a",
+                        "display_name": "example_a",
+                        "sha256": "hash-a",
+                        "remote_path": "/custom_nodes/entries/example_a/hash_a_bundle.zip",
+                    },
+                    {
+                        "entry_name": "example_b",
+                        "display_name": "example_b",
+                        "sha256": "hash-b",
+                        "remote_path": "/custom_nodes/entries/example_b/hash_b_bundle.zip",
+                    },
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(storage_root))
+    modal_cloud_module.get_settings.cache_clear()
+    original_cache = dict(modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES)
+    modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+    try:
+        extraction_root = modal_cloud_module._extract_custom_nodes_bundle(
+            "/custom_nodes/manifests/bundle_manifest.json"
+        )
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
+
+    assert extraction_root is not None
+    assert (extraction_root / "example_a" / "__init__.py").exists()
+    assert (extraction_root / "example_b" / "__init__.py").exists()
 
 
 def test_modal_cloud_traces_remote_node_execution_spans(

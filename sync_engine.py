@@ -95,6 +95,17 @@ class SyncedAsset:
     uploaded: bool
 
 
+@dataclass(frozen=True)
+class _CustomNodesArchiveSpec:
+    """Deterministic archive spec for one top-level custom_nodes payload slice."""
+
+    entry_name: str
+    display_name: str
+    source_description: str
+    files: tuple[Path, ...]
+    sha256: str
+
+
 class LocalMirrorVolume:
     """Simple filesystem-backed volume used for tests and dry runs."""
 
@@ -318,7 +329,7 @@ class ModalAssetSyncEngine:
         *,
         status_callback: SyncStatusCallback | None = None,
     ) -> SyncedAsset | None:
-        """Zip and mirror the local custom_nodes directory when available."""
+        """Mirror custom_nodes as a manifest plus per-package archives when available."""
         custom_nodes_dir = self.settings.custom_nodes_dir
         if custom_nodes_dir is None or not custom_nodes_dir.exists():
             logger.info("No custom_nodes directory detected for mirroring.")
@@ -332,13 +343,12 @@ class ModalAssetSyncEngine:
             time.perf_counter() - sync_started_at,
             directory_hash,
         )
-        archive_name = self.settings.custom_nodes_archive_name
         marker_path = f"/hashes/custom_nodes_{directory_hash}.done"
-        remote_path = f"/custom_nodes/{directory_hash}_{archive_name}"
+        remote_path = self._custom_nodes_manifest_remote_path(directory_hash)
 
         if self.volume.exists(marker_path):
             logger.info(
-                "Custom_nodes bundle already mirrored at %s after %.3fs total sync time.",
+                "Custom_nodes manifest already mirrored at %s after %.3fs total sync time.",
                 remote_path,
                 time.perf_counter() - sync_started_at,
             )
@@ -351,7 +361,7 @@ class ModalAssetSyncEngine:
 
         if self.volume.exists(remote_path):
             logger.warning(
-                "Reusing mirrored custom_nodes bundle at %s because the deterministic payload already exists without marker %s; backfilling the marker.",
+                "Reusing mirrored custom_nodes manifest at %s because the deterministic payload already exists without marker %s; backfilling the marker.",
                 remote_path,
                 marker_path,
             )
@@ -367,28 +377,106 @@ class ModalAssetSyncEngine:
                 uploaded=False,
             )
 
-        archive_path = self._cached_custom_nodes_archive_path(directory_hash)
-        if archive_path.exists():
-            logger.info("Reusing cached custom_nodes archive %s for digest %s.", archive_path, directory_hash)
-        else:
-            archive_started_at = time.perf_counter()
-            _emit_sync_status(status_callback, "Packaging custom nodes ZIP for Modal")
-            logger.info("Creating custom_nodes archive for %s", custom_nodes_dir)
-            self._create_archive(custom_nodes_dir, archive_path)
-            logger.info(
-                "Created custom_nodes archive %s in %.3fs.",
-                archive_path,
-                time.perf_counter() - archive_started_at,
+        archive_specs = self._custom_nodes_archive_specs(custom_nodes_dir)
+        if not archive_specs:
+            logger.info("Custom_nodes directory %s contained no syncable files.", custom_nodes_dir)
+            return None
+
+        packaging_status_emitted = False
+        upload_status_emitted = False
+        uploaded = False
+        manifest_entries: list[dict[str, str]] = []
+        for archive_spec in archive_specs:
+            archive_path = self._cached_custom_nodes_archive_path(
+                archive_spec.entry_name,
+                archive_spec.sha256,
+            )
+            archive_remote_path = self._custom_nodes_archive_remote_path(
+                archive_spec.entry_name,
+                archive_spec.sha256,
+            )
+            if archive_path.exists():
+                logger.info(
+                    "Reusing cached custom_nodes archive %s for entry=%s digest=%s.",
+                    archive_path,
+                    archive_spec.display_name,
+                    archive_spec.sha256,
+                )
+            else:
+                if not packaging_status_emitted:
+                    _emit_sync_status(status_callback, "Packaging custom nodes ZIP for Modal")
+                    packaging_status_emitted = True
+                archive_started_at = time.perf_counter()
+                logger.info(
+                    "Creating custom_nodes archive for entry=%s from %d files.",
+                    archive_spec.display_name,
+                    len(archive_spec.files),
+                )
+                self._create_archive_from_files(
+                    custom_nodes_dir,
+                    list(archive_spec.files),
+                    archive_path,
+                )
+                logger.info(
+                    "Created custom_nodes archive %s for entry=%s in %.3fs.",
+                    archive_path,
+                    archive_spec.display_name,
+                    time.perf_counter() - archive_started_at,
+                )
+
+            entry_uploaded = self._sync_content_addressed_file(
+                local_path=archive_path,
+                remote_path=archive_remote_path,
+                marker_path=(
+                    f"/hashes/custom_nodes_entry_"
+                    f"{self._custom_nodes_entry_slug(archive_spec.entry_name)}_{archive_spec.sha256}.done"
+                ),
+                source_description=archive_spec.source_description,
+                status_callback=status_callback if not upload_status_emitted else None,
+                upload_status_message="Uploading custom nodes ZIP to Modal",
+            )
+            if entry_uploaded:
+                upload_status_emitted = True
+                uploaded = True
+            manifest_entries.append(
+                {
+                    "entry_name": archive_spec.entry_name,
+                    "display_name": archive_spec.display_name,
+                    "sha256": archive_spec.sha256,
+                    "remote_path": archive_remote_path,
+                }
             )
 
-        uploaded = self._sync_content_addressed_file(
-            local_path=archive_path,
+        manifest_path = self._cached_custom_nodes_manifest_path(directory_hash)
+        if manifest_path.exists():
+            logger.info(
+                "Reusing cached custom_nodes manifest %s for digest %s.",
+                manifest_path,
+                directory_hash,
+            )
+        else:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "bundle_sha256": directory_hash,
+                        "entries": manifest_entries,
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+        manifest_uploaded = self._sync_content_addressed_file(
+            local_path=manifest_path,
             remote_path=remote_path,
             marker_path=marker_path,
             source_description=str(custom_nodes_dir),
-            status_callback=status_callback,
+            status_callback=status_callback if not upload_status_emitted else None,
             upload_status_message="Uploading custom nodes ZIP to Modal",
         )
+        uploaded = uploaded or manifest_uploaded
 
         logger.info(
             "Finished custom_nodes sync to %s in %.3fs total.",
@@ -588,30 +676,122 @@ class ModalAssetSyncEngine:
         )
         return sha256
 
+    def _hash_file_group(self, root: Path, files: list[Path]) -> str:
+        """Compute a stable digest for a selected file subset rooted under one directory."""
+        digest = hashlib.sha256()
+        for child in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
+            relative_path = child.relative_to(root).as_posix()
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(self._hash_file(child).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
     def _create_archive(self, path: Path, archive_path: Path) -> Path:
         """Create a zip archive for the given directory tree."""
-        archive_started_at = time.perf_counter()
         files = sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix())
+        return self._create_archive_from_files(path, files, archive_path)
+
+    def _create_archive_from_files(
+        self,
+        root_path: Path,
+        files: list[Path],
+        archive_path: Path,
+    ) -> Path:
+        """Create a zip archive from a selected file list rooted under one directory."""
+        archive_started_at = time.perf_counter()
         archive_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Archiving %d files from %s into %s", len(files), path, archive_path)
+        logger.info("Archiving %d files from %s into %s", len(files), root_path, archive_path)
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for child in files:
-                archive.write(child, arcname=child.relative_to(path))
+            for child in sorted(files, key=lambda item: item.relative_to(root_path).as_posix()):
+                archive.write(child, arcname=child.relative_to(root_path))
 
         logger.info(
             "Finished archive build for %s in %.3fs.",
-            path,
+            root_path,
             time.perf_counter() - archive_started_at,
         )
         return archive_path
 
-    def _cached_custom_nodes_archive_path(self, directory_hash: str) -> Path:
-        """Return the deterministic local path for a digest-keyed custom_nodes archive."""
+    def _cached_custom_nodes_archive_path(self, entry_name: str, entry_hash: str) -> Path:
+        """Return the deterministic local path for one digest-keyed custom_nodes slice archive."""
         return (
             self.settings.local_storage_root
             / "custom_nodes_archives"
-            / f"{directory_hash}_{self.settings.custom_nodes_archive_name}"
+            / self._custom_nodes_entry_slug(entry_name)
+            / f"{entry_hash}_{self.settings.custom_nodes_archive_name}"
         )
+
+    def _cached_custom_nodes_manifest_path(self, directory_hash: str) -> Path:
+        """Return the deterministic local path for a whole-tree custom_nodes manifest."""
+        return (
+            self.settings.local_storage_root
+            / "custom_nodes_manifests"
+            / f"{directory_hash}_custom_nodes_bundle_manifest.json"
+        )
+
+    def _custom_nodes_manifest_remote_path(self, directory_hash: str) -> str:
+        """Return the remote storage path for a whole-tree custom_nodes manifest."""
+        return f"/custom_nodes/manifests/{directory_hash}_custom_nodes_bundle_manifest.json"
+
+    def _custom_nodes_archive_remote_path(self, entry_name: str, entry_hash: str) -> str:
+        """Return the remote storage path for one content-addressed custom_nodes slice archive."""
+        return (
+            f"/custom_nodes/entries/{self._custom_nodes_entry_slug(entry_name)}/"
+            f"{entry_hash}_{self.settings.custom_nodes_archive_name}"
+        )
+
+    def _custom_nodes_entry_slug(self, entry_name: str) -> str:
+        """Return a filesystem-safe slug for one top-level custom_nodes entry name."""
+        normalized_name = entry_name.strip() or "root_files"
+        return "".join(
+            character if character.isalnum() or character in {"-", "_", "."} else "_"
+            for character in normalized_name
+        )
+
+    def _custom_nodes_archive_specs(self, custom_nodes_dir: Path) -> list[_CustomNodesArchiveSpec]:
+        """Return deterministic archive specs for each top-level custom_nodes payload slice."""
+        resolved_root = custom_nodes_dir.resolve()
+        root_files: list[Path] = []
+        archive_specs: list[_CustomNodesArchiveSpec] = []
+
+        for child in sorted(resolved_root.iterdir(), key=lambda item: item.name):
+            if child.name in _SKIP_DIRS:
+                continue
+            if child.is_file():
+                if child.suffix.lower() in _SKIP_FILE_SUFFIXES:
+                    continue
+                root_files.append(child)
+                continue
+            if child.is_dir():
+                files = sorted(
+                    self._iter_files(child),
+                    key=lambda item: item.relative_to(resolved_root).as_posix(),
+                )
+                if not files:
+                    continue
+                archive_specs.append(
+                    _CustomNodesArchiveSpec(
+                        entry_name=child.name,
+                        display_name=child.name,
+                        source_description=str(child),
+                        files=tuple(files),
+                        sha256=self._hash_directory(child),
+                    )
+                )
+
+        if root_files:
+            archive_specs.append(
+                _CustomNodesArchiveSpec(
+                    entry_name="root_files",
+                    display_name="root files",
+                    source_description=str(resolved_root),
+                    files=tuple(root_files),
+                    sha256=self._hash_file_group(resolved_root, root_files),
+                )
+            )
+
+        return archive_specs
 
     def _directory_fingerprint(self, root: Path, files: list[Path]) -> str:
         """Return a metadata-only fingerprint for a directory tree."""

@@ -327,7 +327,8 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
     assert second_bundle is not None
     assert second_bundle.sha256 == first_bundle.sha256
     assert second_bundle.uploaded is True
-    assert second_engine._cached_custom_nodes_archive_path(first_bundle.sha256).exists()
+    entry_hash = second_engine._hash_directory(custom_nodes_dir / "example")
+    assert second_engine._cached_custom_nodes_archive_path("example", entry_hash).exists()
 
 
 def test_sync_file_backfills_marker_when_remote_payload_already_exists(
@@ -420,7 +421,7 @@ def test_sync_custom_nodes_directory_backfills_marker_when_remote_bundle_already
 
     engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
     directory_hash = engine._hash_directory(custom_nodes_dir)
-    remote_path = f"/custom_nodes/{directory_hash}_{settings.custom_nodes_archive_name}"
+    remote_path = engine._custom_nodes_manifest_remote_path(directory_hash)
     marker_path = f"/hashes/custom_nodes_{directory_hash}.done"
 
     class ExistingRemoteBundleVolume:
@@ -456,6 +457,79 @@ def test_sync_custom_nodes_directory_backfills_marker_when_remote_bundle_already
     assert volume.put_file_calls == []
     assert len(volume.put_bytes_calls) == 1
     assert volume.put_bytes_calls[0][1] == marker_path
+
+
+def test_sync_custom_nodes_directory_only_rebuilds_changed_top_level_archive(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Changing one custom_nodes package should only rebuild that package archive plus the manifest."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_a = custom_nodes_dir / "example_a"
+    package_b = custom_nodes_dir / "example_b"
+    package_a.mkdir(parents=True)
+    package_b.mkdir(parents=True)
+    (package_a / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    (package_b / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    first_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    first_bundle = first_engine.sync_custom_nodes_directory()
+    assert first_bundle is not None
+
+    (package_b / "node.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    class NeverExistsVolume:
+        """Volume double that forces all deterministic uploads through without remote cache hits."""
+
+        def exists(self, remote_path: str) -> bool:
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            return None
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            return None
+
+    second_engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=NeverExistsVolume(),
+        settings=settings,
+    )
+    rebuilt_entries: list[str] = []
+    original_create_archive = second_engine._create_archive_from_files
+
+    def record_create_archive(root_path: Path, files: list[Path], archive_path: Path) -> Path:
+        """Record which top-level package archive had to be rebuilt."""
+        del root_path
+        rebuilt_entries.append(files[0].relative_to(custom_nodes_dir).parts[0])
+        return original_create_archive(custom_nodes_dir, files, archive_path)
+
+    monkeypatch.setattr(second_engine, "_create_archive_from_files", record_create_archive)
+    second_bundle = second_engine.sync_custom_nodes_directory()
+
+    assert second_bundle is not None
+    assert second_bundle.sha256 != first_bundle.sha256
+    assert rebuilt_entries == ["example_b"]
 
 
 def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(

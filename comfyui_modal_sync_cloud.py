@@ -1199,7 +1199,7 @@ def _temporary_node_mapping(node_mapping: dict[str, type[Any]] | None) -> Iterat
 
 
 def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
-    """Extract a mirrored custom_nodes archive into a temporary import path."""
+    """Extract a mirrored custom_nodes bundle ZIP or manifest into a temporary import path."""
     if not bundle_path:
         return None
 
@@ -1233,14 +1233,63 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
     extraction_root = Path(tempfile.gettempdir()) / "comfy-modal-sync-custom-nodes" / local_bundle.stem
     extraction_root.mkdir(parents=True, exist_ok=True)
     with _timed_phase("extract_custom_nodes_bundle", bundle=local_bundle.name):
-        with zipfile.ZipFile(local_bundle, "r") as archive:
-            archive.extractall(extraction_root)
+        archives_to_extract = _resolve_custom_nodes_archives(local_bundle, storage_roots)
+        for archive_path in archives_to_extract:
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                archive.extractall(extraction_root)
 
     if str(extraction_root) not in sys.path:
         sys.path.insert(0, str(extraction_root))
     _EXTRACTED_CUSTOM_NODE_BUNDLES[local_bundle.name] = extraction_root
     logger.info("Extracted remote custom_nodes bundle to %s", extraction_root)
     return extraction_root
+
+
+def _resolve_custom_nodes_archives(
+    local_bundle: Path,
+    storage_roots: list[Path],
+) -> list[Path]:
+    """Return the archive paths described by one custom_nodes bundle ZIP or manifest."""
+    if local_bundle.suffix.lower() == ".zip":
+        return [local_bundle]
+    if local_bundle.suffix.lower() != ".json":
+        raise RuntimeError(
+            f"Unsupported custom_nodes bundle format {local_bundle.suffix!r} for {local_bundle}."
+        )
+
+    try:
+        manifest_payload = json.loads(local_bundle.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} is unreadable.") from exc
+    if not isinstance(manifest_payload, dict):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} must be a JSON object.")
+    entry_payloads = manifest_payload.get("entries")
+    if not isinstance(entry_payloads, list):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} did not contain a valid entries list.")
+
+    archive_paths: list[Path] = []
+    for entry_payload in entry_payloads:
+        if not isinstance(entry_payload, dict):
+            raise RuntimeError(f"Custom nodes manifest {local_bundle} contained a non-object entry.")
+        remote_path = entry_payload.get("remote_path")
+        if not isinstance(remote_path, str) or not remote_path.strip():
+            raise RuntimeError(f"Custom nodes manifest {local_bundle} contained an entry without remote_path.")
+        archive_path = _resolve_custom_nodes_bundle_path(remote_path, storage_roots)
+        if archive_path is None:
+            raise RuntimeError(
+                f"Custom nodes archive {remote_path} referenced by {local_bundle} was not found in any storage root."
+            )
+        archive_paths.append(archive_path)
+    return archive_paths
+
+
+def _resolve_custom_nodes_bundle_path(bundle_path: str, storage_roots: list[Path]) -> Path | None:
+    """Resolve one custom_nodes bundle or archive path against the known storage roots."""
+    for storage_root in storage_roots:
+        candidate = storage_root / bundle_path.lstrip("/")
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _register_custom_nodes_root(custom_nodes_root: Path) -> None:
