@@ -64,6 +64,8 @@ _PROMPT_WARMUP_STATES_LOCK = threading.Lock()
 _PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
 _PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
 _PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
+_SNAPSHOT_PROFILE_RECORDS_LOCK = threading.Lock()
+_SNAPSHOT_PROFILE_RECORDS: dict[str, dict[str, Any]] = {}
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
     {
@@ -3704,15 +3706,25 @@ def _lookup_deployed_remote_engine(
     affinity_key = affinity_key_override
     if affinity_key is None:
         affinity_key = _remote_worker_affinity_key(payload)
+    snapshot_profile_key = ""
+    payload_snapshot_profile_key = payload.get("snapshot_profile_key")
+    if isinstance(payload_snapshot_profile_key, str):
+        snapshot_profile_key = payload_snapshot_profile_key.strip()
+    if not snapshot_profile_key:
+        snapshot_profile_key = _store_loader_snapshot_profile(_build_loader_prewarm_plans(payload))
     logger.info(
-        "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s.",
+        "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s snapshot_profile=%s.",
         settings.app_name,
         "RemoteEngine",
         payload.get("component_id"),
         affinity_key,
+        snapshot_profile_key or None,
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
-    return remote_cls(worker_affinity_key=affinity_key)
+    remote_engine_kwargs: dict[str, Any] = {"worker_affinity_key": affinity_key}
+    if snapshot_profile_key:
+        remote_engine_kwargs["snapshot_profile_key"] = snapshot_profile_key
+    return remote_cls(**remote_engine_kwargs)
 
 
 async def _invoke_bound_remote_engine_async(
@@ -3907,6 +3919,63 @@ def _loader_prewarm_plan_signature(class_type: str, inputs: Mapping[str, Any]) -
     )
 
 
+def _loader_snapshot_profile_key(loader_prewarm_plans: list[dict[str, Any]]) -> str:
+    """Return the stable snapshot-profile key for one set of loader prewarm plans."""
+    if not loader_prewarm_plans:
+        return ""
+
+    profile_payload = {
+        "plan_signatures": sorted(
+            str(plan.get("signature") or "")
+            for plan in loader_prewarm_plans
+            if str(plan.get("signature") or "")
+        )
+    }
+    if not profile_payload["plan_signatures"]:
+        return ""
+    profile_digest = hashlib.sha256(
+        json.dumps(profile_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"loader-profile:{profile_digest}"
+
+
+def _normalize_loader_snapshot_profile_record(
+    loader_prewarm_plans: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return the normalized snapshot-profile record for one loader-plan set."""
+    snapshot_profile_key = _loader_snapshot_profile_key(loader_prewarm_plans)
+    if not snapshot_profile_key:
+        return None
+    return {
+        "snapshot_profile_key": snapshot_profile_key,
+        "loader_prewarm_plans": copy.deepcopy(loader_prewarm_plans),
+    }
+
+
+def _store_loader_snapshot_profile(loader_prewarm_plans: list[dict[str, Any]]) -> str:
+    """Persist one loader snapshot profile so `snap=True` can retrieve it later."""
+    settings = get_settings()
+    if not settings.enable_gpu_memory_snapshot or modal is None:
+        return ""
+
+    normalized_record = _normalize_loader_snapshot_profile_record(loader_prewarm_plans)
+    if normalized_record is None:
+        return ""
+
+    snapshot_profile_key = str(normalized_record["snapshot_profile_key"])
+    with _SNAPSHOT_PROFILE_RECORDS_LOCK:
+        cached_record = _SNAPSHOT_PROFILE_RECORDS.get(snapshot_profile_key)
+        if cached_record == normalized_record:
+            return snapshot_profile_key
+        snapshot_profiles = modal.Dict.from_name(
+            settings.snapshot_profile_dict_name,
+            create_if_missing=True,
+        )
+        snapshot_profiles[snapshot_profile_key] = normalized_record
+        _SNAPSHOT_PROFILE_RECORDS[snapshot_profile_key] = normalized_record
+    return snapshot_profile_key
+
+
 def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Return synthetic one-node subgraph plans for supported root loader nodes."""
     if not get_settings().enable_loader_prewarm:
@@ -3947,6 +4016,7 @@ def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]
 
 def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any]:
     """Extract the prompt-scoped warmup-relevant fields from one payload."""
+    loader_prewarm_plans = _build_loader_prewarm_plans(payload)
     return {
         "prompt_id": (
             str(payload.get("prompt_id"))
@@ -3960,7 +4030,8 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any]:
         "volume_reload_marker": payload.get("volume_reload_marker"),
         "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
-        "loader_prewarm_plans": _build_loader_prewarm_plans(payload),
+        "loader_prewarm_plans": loader_prewarm_plans,
+        "snapshot_profile_key": _store_loader_snapshot_profile(loader_prewarm_plans),
     }
 
 
@@ -4655,13 +4726,15 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
         worker_affinity_key: str = modal.parameter(default="")
+        snapshot_profile_key: str = modal.parameter(default="")
 
         @modal.enter()
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
             logger.info(
-                "RemoteEngine setup complete for worker_affinity_key=%s.",
+                "RemoteEngine setup complete for worker_affinity_key=%s snapshot_profile_key=%s.",
                 self.worker_affinity_key or None,
+                self.snapshot_profile_key or None,
             )
 
         @modal.method()
@@ -4686,9 +4759,14 @@ else:
     class RemoteEngine:
         """Local fallback runtime used when the Modal SDK is unavailable."""
 
-        def __init__(self, worker_affinity_key: str | None = None) -> None:
-            """Record the optional worker-pool affinity key for split-proxy reuse."""
+        def __init__(
+            self,
+            worker_affinity_key: str | None = None,
+            snapshot_profile_key: str | None = None,
+        ) -> None:
+            """Record the optional worker-pool affinity and snapshot-profile keys."""
             self.worker_affinity_key = worker_affinity_key
+            self.snapshot_profile_key = snapshot_profile_key
 
         def setup(self) -> None:
             """No-op setup for local fallback execution."""

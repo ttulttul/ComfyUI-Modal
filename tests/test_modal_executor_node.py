@@ -748,6 +748,62 @@ def test_build_prompt_warmup_request_includes_root_loader_prewarm_plans(
     assert all(plan["execute_node_ids"] == [plan["node_id"]] for plan in loader_plans)
 
 
+def test_build_prompt_warmup_request_registers_snapshot_profile_when_gpu_snapshots_enabled(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Warmup requests should register one snapshot profile for GPU-snapshot loader plans."""
+
+    class FakeSnapshotProfiles(dict[str, Any]):
+        """Minimal modal.Dict shim for snapshot profile writes."""
+
+    snapshot_profiles = FakeSnapshotProfiles()
+
+    class FakeModal:
+        """Minimal modal SDK double that exposes Dict.from_name."""
+
+        class Dict:
+            """Namespace for fake dict lookups."""
+
+            @staticmethod
+            def from_name(dict_name: str, create_if_missing: bool = False) -> Any:
+                """Return the shared fake snapshot profile store."""
+                assert dict_name == "comfy-modal-sync-snapshot-profiles"
+                assert create_if_missing is True
+                return snapshot_profiles
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    try:
+        warmup_request = remote_modal_app_module._build_prompt_warmup_request(
+            {
+                "prompt_id": "prompt-1",
+                "component_id": "component-1",
+                "subgraph_prompt": {
+                    "1": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
+                    },
+                    "2": {
+                        "class_type": "CLIPLoader",
+                        "inputs": {"clip_name": "clip-a.safetensors", "type": "flux"},
+                    },
+                },
+            }
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+
+    snapshot_profile_key = warmup_request["snapshot_profile_key"]
+    assert snapshot_profile_key.startswith("loader-profile:")
+    assert snapshot_profile_key in snapshot_profiles
+    assert snapshot_profiles[snapshot_profile_key]["loader_prewarm_plans"] == warmup_request["loader_prewarm_plans"]
+
+
 def test_register_exact_component_parallelism_refines_prompt_target(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -2337,6 +2393,63 @@ def test_modal_cloud_prewarms_snapshot_state_without_gpu_runtime_by_default(
     assert calls == ["support"]
 
 
+def test_modal_cloud_prewarms_snapshot_loader_profile_when_gpu_snapshots_enabled(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """GPU snapshot prewarm should execute registered loader plans for one snapshot profile."""
+    calls: list[tuple[str, Any]] = []
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfyui_support_packages",
+        lambda: calls.append(("support", None)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: calls.append(("runtime", custom_nodes_root)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_execution_module",
+        lambda: calls.append(("execution", None)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_loader_snapshot_profile",
+        lambda snapshot_profile_key: [
+            {
+                "signature": "loader-plan-1",
+                "node_id": "7",
+                "subgraph_prompt": {"7": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}}},
+                "execute_node_ids": ["7"],
+            }
+        ]
+        if snapshot_profile_key == "loader-profile:abc"
+        else [],
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_loader_prewarm_plans",
+        lambda *, component_id, loader_prewarm_plans, custom_nodes_root: calls.append(
+            ("prewarm", component_id, tuple(plan["signature"] for plan in loader_prewarm_plans), custom_nodes_root)
+        ),
+    )
+
+    modal_cloud_module._prewarm_snapshot_state(
+        types.SimpleNamespace(enable_gpu_memory_snapshot=True),
+        "loader-profile:abc",
+    )
+
+    assert calls == [
+        ("support", None),
+        ("runtime", None),
+        ("execution", None),
+        ("prewarm", "snapshot-profile:loader-profile:abc", ("loader-plan-1",), None),
+    ]
+
+
 def test_modal_cloud_prewarms_snapshot_state_fully_for_gpu_snapshots(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -2851,6 +2964,69 @@ def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
 
     assert result == {"worker_affinity_key": "worker-pool:slot:0"}
     assert observed_kwargs == [{"worker_affinity_key": "worker-pool:slot:0"}]
+
+
+def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu_snapshots(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Deployed Modal lookups should parameterize workers by snapshot profile when enabled."""
+    observed_kwargs: list[dict[str, Any]] = []
+    snapshot_profiles: dict[str, Any] = {}
+
+    class FakeModal:
+        """Minimal modal SDK double that captures class construction kwargs."""
+
+        class Dict:
+            """Namespace for fake dict lookups."""
+
+            @staticmethod
+            def from_name(dict_name: str, create_if_missing: bool = False) -> Any:
+                """Return the shared fake snapshot profile store."""
+                assert dict_name == "comfy-modal-sync-snapshot-profiles"
+                assert create_if_missing is True
+                return snapshot_profiles
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a factory that records the provided class parameters."""
+                assert app_name == "comfy-modal-sync"
+                assert class_name == "RemoteEngine"
+
+                def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
+                    """Record one synthesized Modal class constructor call."""
+                    observed_kwargs.append(kwargs)
+                    return kwargs
+
+                return build_remote_engine
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    try:
+        result = remote_modal_app_module._lookup_deployed_remote_engine(
+            {
+                "component_id": "component-1",
+                "subgraph_prompt": {
+                    "1": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
+                    }
+                },
+            }
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+
+    assert result["worker_affinity_key"] == "worker-pool:slot:0"
+    assert result["snapshot_profile_key"].startswith("loader-profile:")
+    assert observed_kwargs == [result]
+    assert result["snapshot_profile_key"] in snapshot_profiles
 
 
 def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_sessions(

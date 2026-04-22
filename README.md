@@ -170,6 +170,7 @@ Remote runtime behavior:
 - The deployed class reads its GPU type from `COMFY_MODAL_GPU`.
 - CPU memory snapshots are enabled by default.
 - GPU memory snapshots remain opt-in.
+- When GPU snapshots are enabled, Modal-Sync now derives a stable snapshot profile from root literal loader nodes and runs those loaders in `@modal.enter(snap=True)`, so later cold restarts for the same model set can restore post-loader GPU state instead of reloading those weights from scratch.
 - The default `scaledown_window` is `600` seconds with `min_containers=0`.
 - Warm containers can reuse loader state and `PromptExecutor` state across compatible requests.
 - Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.
@@ -388,6 +389,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 
 - `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT`: Enable Modal CPU memory snapshots. Default: `true`.
 - `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT`: Enable Modal GPU memory snapshots. Default: `false`.
+- `COMFY_MODAL_SNAPSHOT_PROFILE_DICT_NAME`: Modal `Dict` used to publish per-model-set snapshot loader plans to `snap=True`. Default: `<app_name>-snapshot-profiles`.
 - `COMFY_MODAL_GPU`: Modal GPU type to request when deploying the remote class. Default: `A100`.
 - `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle containers warm for this many seconds. Default: `600`.
 - `COMFY_MODAL_MIN_CONTAINERS`: Keep at least this many containers warm. Default: `0`.
