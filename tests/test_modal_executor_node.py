@@ -4105,6 +4105,17 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
 
     assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
     assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]
+    assert mapped_payload["static_phase"]["execute_node_ids"] == ["1"]
+    assert mapped_payload["static_to_mapped_boundaries"] == [
+        {
+            "proxy_name": "static_input_0",
+            "node_id": "1",
+            "output_index": 0,
+            "io_type": "MODEL",
+            "is_list": False,
+            "targets": [{"node_id": "7", "input_name": "model"}],
+        }
+    ]
 
     observed_order: list[str] = []
     mapped_started = asyncio.Event()
@@ -4334,6 +4345,156 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
         ("17::item:2", ("12",), {"remote_input_0": 12, "remote_input_1": [28]}),
         ("17::item:3", ("12",), {"remote_input_0": 13, "remote_input_1": [28]}),
     ]
+
+
+def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    session_state_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped remote scheduling should seed one bound worker lane before sending per-item calls there."""
+    observed_calls: list[tuple[str, str, tuple[str, ...], dict[str, Any]]] = []
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
+    monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_lookup_deployed_remote_engine",
+        lambda payload, affinity_key_override=None: (
+            f"engine:{affinity_key_override or remote_modal_app_module._remote_session_affinity_key(payload)}"
+        ),
+    )
+
+    async def fake_invoke_bound_remote_engine_async(
+        remote_engine: Any,
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+    ) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
+        observed_calls.append((str(remote_engine), str(payload["component_id"]), execute_node_ids, hydrated_inputs))
+        if str(payload["component_id"]).startswith("17::seed:"):
+            return serialization_module.serialize_node_outputs(())
+        if str(payload["component_id"]).startswith("17::cleanup:"):
+            return serialization_module.serialize_node_outputs(())
+        if execute_node_ids == ("12",):
+            await asyncio.sleep(0)
+            return serialization_module.serialize_node_outputs((f"{remote_engine}:{hydrated_inputs['remote_input_0']}",))
+        raise AssertionError(f"Unexpected seeded-lane payload: {payload!r}")
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_invoke_bound_remote_engine_async",
+        fake_invoke_bound_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {"model": 0, "seed": 0},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "12", "input_name": "model"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-1",
+            prompt_id="prompt-1",
+            owner_component_id="17",
+        ).to_payload(),
+        "clear_remote_session": True,
+        "static_to_mapped_boundaries": [
+            {
+                "proxy_name": "static_input_0",
+                "node_id": "4",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "targets": [{"node_id": "12", "input_name": "model"}],
+            }
+        ],
+        "static_phase": {
+            "component_node_ids": ["4"],
+            "subgraph_prompt": {
+                "4": {"class_type": "LoraLoaderModelOnly", "inputs": {}},
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "static_input_0",
+                    "node_id": "4",
+                    "output_index": 0,
+                    "io_type": "MODEL",
+                    "is_list": False,
+                    "session_output": True,
+                    "preview_target_node_ids": [],
+                }
+            ],
+            "execute_node_ids": ["4"],
+        },
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": [10, 11, 12, 13],
+                    "static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True},
+                }
+            ),
+        )
+    )
+
+    seed_calls = [call for call in observed_calls if call[1].startswith("17::seed:")]
+    item_calls = [call for call in observed_calls if call[1].startswith("17::item:")]
+    cleanup_calls = [call for call in observed_calls if call[1].startswith("17::cleanup:")]
+
+    assert sorted(seed_calls) == [
+        (
+            "engine:session-1::lane:0",
+            "17::seed:0",
+            ("4",),
+            {"static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True}},
+        ),
+        (
+            "engine:session-1::lane:1",
+            "17::seed:1",
+            ("4",),
+            {"static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True}},
+        ),
+    ]
+    assert {call[0] for call in item_calls} <= {"engine:session-1::lane:0", "engine:session-1::lane:1"}
+    assert {call[0] for call in item_calls} <= {call[0] for call in seed_calls}
+    assert sorted(cleanup_calls) == [
+        ("engine:session-1::lane:0", "17::cleanup:0", (), {}),
+        ("engine:session-1::lane:1", "17::cleanup:1", (), {}),
+    ]
+    response_outputs = serialization_module.deserialize_node_outputs(response)[0]
+    assert len(response_outputs) == 4
+    assert [output.rsplit(":", 1)[-1] for output in response_outputs] == ["10", "11", "12", "13"]
 
 
 def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets(

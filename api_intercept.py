@@ -2293,6 +2293,35 @@ def _build_component_payload(
                 ),
             }
         }
+        payload["split_proxy_payloads"]["mapped"]["static_to_mapped_boundaries"] = [
+            {
+                "proxy_name": boundary_spec.proxy_name,
+                "node_id": boundary_spec.source.node_id,
+                "output_index": boundary_spec.source.output_index,
+                "io_type": boundary_spec.io_type,
+                "is_list": boundary_spec.is_list,
+                "targets": [
+                    {"node_id": target.node_id, "input_name": target.input_name}
+                    for target in boundary_spec.targets
+                ],
+            }
+            for boundary_spec in component.static_to_mapped_boundaries
+        ]
+        payload["split_proxy_payloads"]["mapped"]["static_phase"] = {
+            "component_node_ids": list(component.static_node_ids),
+            "subgraph_prompt": _subset_component_prompt(component_prompt, component.static_node_ids),
+            "boundary_inputs": _serialize_boundary_input_specs(
+                static_boundary_inputs,
+                signature_prompt=signature_prompt,
+            ),
+            "boundary_outputs": copy.deepcopy(static_bridge_outputs),
+            "execute_node_ids": list(
+                dict.fromkeys(
+                    boundary_spec.source.node_id
+                    for boundary_spec in component.static_to_mapped_boundaries
+                )
+            ),
+        }
     return payload
 
 
