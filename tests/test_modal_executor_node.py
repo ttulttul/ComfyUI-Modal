@@ -2384,7 +2384,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     )
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
+    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {"component_id": "component-1"},
@@ -2392,7 +2392,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
+        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", None)]
@@ -2469,8 +2469,10 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.add(("comfy-modal-sync", "main"))
+    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES[("comfy-modal-sync", "main")] = (
+        remote_modal_app_module._ModalAutoDeployState(ready=True)
+    )
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {"component_id": "component-1"},
@@ -2478,9 +2480,148 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOYED_APPS.clear()
+        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
 
     assert response == b"remote-response"
+    assert deploy_calls == [("comfy-modal-sync", "main")]
+
+
+def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Concurrent first-run callers should share one deploy and wait for lookup readiness."""
+
+    class FakeLookupError(Exception):
+        """Stand-in for Modal deployed lookup failures."""
+
+    deploy_calls: list[tuple[str | None, str | None]] = []
+    deployed_ready_event = threading.Event()
+    lookup_lock = threading.Lock()
+    ready_after_deploy_misses = 0
+
+    class FakeExecuteMethod:
+        """Minimal Modal method handle that returns deterministic bytes."""
+
+        def remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Return deterministic remote bytes."""
+            del payload, kwargs_payload
+            return b"remote-response"
+
+    class FakeWarmupMethod:
+        """Minimal Modal warmup handle."""
+
+        def remote(self, payload: dict[str, Any]) -> dict[str, Any]:
+            """Return deterministic warmup metadata."""
+            return {"component_id": str(payload.get("component_id"))}
+
+    class FakeRemoteEngine:
+        """Minimal deployed remote engine instance."""
+
+        execute_payload = FakeExecuteMethod()
+        warmup_for_request = FakeWarmupMethod()
+
+    class FakeApp:
+        """Minimal deployable cloud app double."""
+
+        def deploy(self, *, name: str | None = None, environment_name: str | None = None, **_: Any) -> "FakeApp":
+            """Record one deploy request and make the app discoverable shortly after."""
+            nonlocal ready_after_deploy_misses
+            deploy_calls.append((name, environment_name))
+            with lookup_lock:
+                FakeModal.deployed = True
+                ready_after_deploy_misses = 2
+            deployed_ready_event.set()
+            return self
+
+    class FakeModal:
+        """Minimal modal SDK double with eventual-consistency lookup behavior."""
+
+        deployed = False
+        exception = types.SimpleNamespace(
+            NotFoundError=FakeLookupError,
+            ExecutionError=FakeLookupError,
+            InvalidError=FakeLookupError,
+        )
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a deployed class after one deploy and a short readiness delay."""
+                nonlocal ready_after_deploy_misses
+                del app_name, class_name
+                with lookup_lock:
+                    if not FakeModal.deployed:
+                        raise FakeLookupError("Lookup failed for Cls 'RemoteEngine': not deployed")
+                    if ready_after_deploy_misses > 0:
+                        ready_after_deploy_misses -= 1
+                        raise FakeLookupError(
+                            "Lookup failed for Cls 'RemoteEngine' from the 'comfy-modal-sync' app: "
+                            "App 'comfy-modal-sync' not found in environment 'main'."
+                        )
+                return lambda **kwargs: FakeRemoteEngine()
+
+        @staticmethod
+        def enable_output() -> Any:
+            """Provide a no-op output context manager."""
+            return nullcontext()
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_load_modal_cloud_module",
+        lambda: types.SimpleNamespace(app=FakeApp()),
+    )
+    monkeypatch.setattr(remote_modal_app_module.time, "sleep", lambda _: None)
+    monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+
+    try:
+        payload_response: list[bytes] = []
+        warmup_response: list[dict[str, Any]] = []
+        thread_errors: list[BaseException] = []
+
+        def run_payload() -> None:
+            """Invoke the payload path from one thread."""
+            try:
+                payload_response.append(
+                    remote_modal_app_module._invoke_modal_payload_blocking(
+                        {"component_id": "component-1"},
+                        b"{}",
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - assertion surface
+                thread_errors.append(exc)
+
+        def run_warmup() -> None:
+            """Invoke the warmup path from one thread."""
+            try:
+                warmup_response.append(
+                    remote_modal_app_module._invoke_modal_warmup_blocking(
+                        {"component_id": "component-1", "prompt_id": "prompt-1"},
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - assertion surface
+                thread_errors.append(exc)
+
+        payload_thread = threading.Thread(target=run_payload)
+        warmup_thread = threading.Thread(target=run_warmup)
+        payload_thread.start()
+        assert deployed_ready_event.wait(1.0)
+        warmup_thread.start()
+        payload_thread.join(timeout=1.0)
+        warmup_thread.join(timeout=1.0)
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+
+    assert thread_errors == []
+    assert payload_response == [b"remote-response"]
+    assert warmup_response == [{"component_id": "component-1"}]
     assert deploy_calls == [("comfy-modal-sync", "main")]
 
 
