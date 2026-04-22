@@ -134,6 +134,60 @@ def test_sync_custom_nodes_directory_creates_archive(
     assert (settings.local_storage_root / bundle.remote_path.lstrip("/")).exists()
 
 
+def test_sync_custom_nodes_directory_only_checks_once_per_engine_lifetime(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The same sync engine should not rescan custom_nodes after the first successful sync."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    first_bundle = engine.sync_custom_nodes_directory()
+    assert first_bundle is not None
+    assert first_bundle.uploaded is True
+
+    (package_dir / "new_file.py").write_text("print('new node')\n", encoding="utf-8")
+
+    def fail_hash_directory(path: Path) -> str:
+        """Fail the test when a second custom_nodes scan happens."""
+        raise AssertionError(f"Did not expect custom_nodes to be rehashed: {path}")
+
+    monkeypatch.setattr(engine, "_hash_directory", fail_hash_directory)
+
+    second_bundle = engine.sync_custom_nodes_directory()
+
+    assert second_bundle == sync_engine_module.SyncedAsset(
+        local_path=first_bundle.local_path,
+        remote_path=first_bundle.remote_path,
+        sha256=first_bundle.sha256,
+        uploaded=False,
+    )
+
+
 def test_sync_custom_nodes_directory_emits_packaging_and_upload_status(
     settings_module: Any,
     sync_engine_module: Any,
@@ -177,6 +231,79 @@ def test_sync_custom_nodes_directory_emits_packaging_and_upload_status(
         ("Packaging custom nodes ZIP for Modal", None, None),
         ("Uploading custom nodes ZIP to Modal", None, None),
     ]
+
+
+def test_sync_custom_nodes_directory_concurrent_calls_share_one_initial_sync(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Concurrent first-run calls should serialize behind one custom_nodes sync decision."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    original_sync = engine._sync_custom_nodes_directory_uncached
+    sync_call_count = 0
+    sync_call_count_lock = threading.Lock()
+    release_first_sync = threading.Event()
+
+    def wrapped_sync(*, status_callback: Any = None) -> Any:
+        """Count uncached sync executions and block the first one briefly."""
+        nonlocal sync_call_count
+        with sync_call_count_lock:
+            sync_call_count += 1
+        release_first_sync.wait(timeout=5.0)
+        return original_sync(status_callback=status_callback)
+
+    monkeypatch.setattr(engine, "_sync_custom_nodes_directory_uncached", wrapped_sync)
+
+    results: list[Any] = [None, None]
+
+    def run_sync(index: int) -> None:
+        """Run one custom_nodes sync call and store the result."""
+        results[index] = engine.sync_custom_nodes_directory()
+
+    first_thread = threading.Thread(target=run_sync, args=(0,))
+    second_thread = threading.Thread(target=run_sync, args=(1,))
+    first_thread.start()
+    time.sleep(0.1)
+    second_thread.start()
+    release_first_sync.set()
+    first_thread.join(timeout=5.0)
+    second_thread.join(timeout=5.0)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert sync_call_count == 1
+    assert results[0] is not None
+    assert results[1] is not None
+    assert results[0].remote_path == results[1].remote_path
+    assert results[0].sha256 == results[1].sha256
+    assert results[0].uploaded is True
+    assert results[1].uploaded is False
 
 
 def test_hash_directory_ignores_virtualenv_and_bytecode_artifacts(
