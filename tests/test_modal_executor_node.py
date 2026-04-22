@@ -5441,6 +5441,72 @@ def test_modal_cloud_interrupt_monitor_consumes_shared_cancel_flag(
     assert cancellation_event.is_set()
 
 
+def test_modal_cloud_interrupt_monitor_ignores_modal_client_shutdown(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The remote interrupt monitor should exit quietly if Modal tears down the client first."""
+
+    class FakeClientClosedError(RuntimeError):
+        """Stand-in for `modal.exception.ClientClosed`."""
+
+    class FakeInterruptFlags:
+        """Simple Modal Dict double that fails once the client is already shutting down."""
+
+        def __init__(self) -> None:
+            """Initialize the poll counter."""
+            self.contains_calls = 0
+            self.pop_calls: list[tuple[str, Any]] = []
+
+        def contains(self, key: str) -> bool:
+            """Raise the same client-shutdown error Modal emits during teardown."""
+            del key
+            self.contains_calls += 1
+            raise FakeClientClosedError("client closed")
+
+        def pop(self, key: str, default: Any = None) -> Any:
+            """Record unexpected cleanup attempts."""
+            self.pop_calls.append((key, default))
+            return None
+
+    interrupt_calls: list[str] = []
+    thread_exceptions: list[BaseException] = []
+    cancellation_event = threading.Event()
+    fake_modal_module = types.ModuleType("modal")
+    fake_modal_exception_module = types.ModuleType("modal.exception")
+    fake_modal_exception_module.ClientClosed = FakeClientClosedError
+    fake_modal_module.exception = fake_modal_exception_module
+    monkeypatch.setitem(sys.modules, "modal", fake_modal_module)
+    monkeypatch.setitem(sys.modules, "modal.exception", fake_modal_exception_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "nodes",
+        types.SimpleNamespace(interrupt_processing=lambda: interrupt_calls.append("interrupt")),
+    )
+    monkeypatch.setattr(
+        threading,
+        "excepthook",
+        lambda args: thread_exceptions.append(args.exc_value),
+    )
+    interrupt_store = FakeInterruptFlags()
+
+    with modal_cloud_module._temporary_remote_interrupt_monitor(
+        "component-2",
+        cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key="prompt-1:component-2",
+    ):
+        deadline = time.time() + 1.0
+        while interrupt_store.contains_calls == 0 and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert interrupt_store.contains_calls >= 1
+    assert interrupt_store.pop_calls == []
+    assert interrupt_calls == []
+    assert not cancellation_event.is_set()
+    assert thread_exceptions == []
+
+
 def test_modal_cloud_reuses_prompt_executor_for_same_cache_scope(
     modal_cloud_module: Any,
     tmp_path: Path,
