@@ -5,6 +5,7 @@ import base64
 import copy
 import gc
 import hashlib
+import importlib
 import importlib.util
 from io import BytesIO
 import inspect
@@ -1200,6 +1201,39 @@ def _temporary_remote_interrupt_monitor(
     import nodes
 
     stop_event = threading.Event()
+    try:
+        modal_exception_module = importlib.import_module("modal.exception")
+    except ModuleNotFoundError:
+        modal_exception_module = None
+    modal_client_closed_error = getattr(modal_exception_module, "ClientClosed", None)
+
+    def shared_cancel_flag_exists() -> bool:
+        """Return whether the shared interrupt flag is present, tolerating Modal shutdown races."""
+        try:
+            return bool(interrupt_store.contains(interrupt_flag_key))
+        except Exception as exc:
+            if modal_client_closed_error is not None and isinstance(exc, modal_client_closed_error):
+                logger.info(
+                    "Remote interrupt monitor stopped after Modal client shutdown for component=%s.",
+                    component_id,
+                )
+                stop_event.set()
+                return False
+            raise
+
+    def consume_shared_cancel_flag() -> None:
+        """Remove the shared interrupt flag if the Modal client is still alive."""
+        try:
+            interrupt_store.pop(interrupt_flag_key, None)
+        except Exception as exc:
+            if modal_client_closed_error is not None and isinstance(exc, modal_client_closed_error):
+                logger.info(
+                    "Remote interrupt monitor skipped flag cleanup after Modal client shutdown for component=%s.",
+                    component_id,
+                )
+                stop_event.set()
+                return
+            raise
 
     def monitor_interrupts() -> None:
         """Set ComfyUI's interrupt flag once the caller requests cancellation."""
@@ -1210,13 +1244,15 @@ def _temporary_remote_interrupt_monitor(
                 return
             if interrupt_store is None or interrupt_flag_key is None:
                 continue
-            if not interrupt_store.contains(interrupt_flag_key):
+            if not shared_cancel_flag_exists():
                 continue
             logger.info(
                 "Remote interrupt monitor observed shared cancel flag for component=%s.",
                 component_id,
             )
-            interrupt_store.pop(interrupt_flag_key, None)
+            consume_shared_cancel_flag()
+            if stop_event.is_set():
+                return
             if cancellation_event is not None:
                 cancellation_event.set()
             nodes.interrupt_processing()
