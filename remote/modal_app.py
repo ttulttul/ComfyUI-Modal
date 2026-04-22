@@ -65,6 +65,14 @@ _PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
 _PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
 _PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
+_ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
+    {
+        "CheckpointLoaderSimple",
+        "UNETLoader",
+        "CLIPLoader",
+        "DualCLIPLoader",
+    }
+)
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()
 _REMOTE_CONTAINER_LOG_STREAMS: dict[str, "_RemoteContainerLogStreamState"] = {}
@@ -3859,6 +3867,84 @@ def _clamp_prompt_warmup_target(warmup_target: int) -> int:
     return normalized_target
 
 
+def _iter_loader_prewarm_prompt_payloads(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Yield subgraph-like payload fragments that may contain root loader nodes."""
+    split_proxy_payloads = payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, dict):
+        for phase_payload in split_proxy_payloads.values():
+            if isinstance(phase_payload, dict):
+                yield phase_payload
+        return
+    if isinstance(split_proxy_payloads, list):
+        for phase_payload in split_proxy_payloads:
+            if isinstance(phase_payload, dict):
+                yield phase_payload
+        return
+    if isinstance(payload.get("subgraph_prompt"), dict):
+        yield payload
+
+
+def _is_root_literal_loader_node(prompt_node: Mapping[str, Any]) -> bool:
+    """Return whether one prompt node is a supported loader with only literal inputs."""
+    class_type = str(prompt_node.get("class_type") or "")
+    if class_type not in _ROOT_LOADER_PREWARM_CLASS_TYPES:
+        return False
+    inputs = prompt_node.get("inputs")
+    if not isinstance(inputs, Mapping):
+        return False
+    return not any(_is_link(input_value) for input_value in inputs.values())
+
+
+def _loader_prewarm_plan_signature(class_type: str, inputs: Mapping[str, Any]) -> str:
+    """Return a stable signature for one synthetic loader prewarm plan."""
+    return json.dumps(
+        {
+            "class_type": class_type,
+            "inputs": copy.deepcopy(dict(inputs)),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return synthetic one-node subgraph plans for supported root loader nodes."""
+    if not get_settings().enable_loader_prewarm:
+        return []
+
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    seen_signatures: set[str] = set()
+    plans: list[dict[str, Any]] = []
+    for prompt_payload in _iter_loader_prewarm_prompt_payloads(payload):
+        subgraph_prompt = prompt_payload.get("subgraph_prompt")
+        if not isinstance(subgraph_prompt, Mapping):
+            continue
+        for node_id, prompt_node in subgraph_prompt.items():
+            if not isinstance(prompt_node, Mapping) or not _is_root_literal_loader_node(prompt_node):
+                continue
+            class_type = str(prompt_node.get("class_type") or "")
+            inputs = prompt_node.get("inputs")
+            if not isinstance(inputs, Mapping):
+                continue
+            signature = _loader_prewarm_plan_signature(class_type, inputs)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            plans.append(
+                {
+                    "signature": signature,
+                    "node_id": str(node_id),
+                    "class_type": class_type,
+                    "prompt_id": prompt_id,
+                    "subgraph_prompt": {
+                        str(node_id): copy.deepcopy(dict(prompt_node)),
+                    },
+                    "execute_node_ids": [str(node_id)],
+                }
+            )
+    return plans
+
+
 def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any]:
     """Extract the prompt-scoped warmup-relevant fields from one payload."""
     return {
@@ -3874,6 +3960,7 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any]:
         "volume_reload_marker": payload.get("volume_reload_marker"),
         "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
+        "loader_prewarm_plans": _build_loader_prewarm_plans(payload),
     }
 
 

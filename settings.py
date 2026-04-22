@@ -42,6 +42,7 @@ class ModalSyncSettings:
     max_containers: int | None = None
     buffer_containers: int | None = None
     enable_proactive_warmup: bool = True
+    enable_loader_prewarm: bool = True
     proactive_warmup_head_start_seconds: float = 2.0
     stream_remote_container_logs: bool = False
 
@@ -212,6 +213,7 @@ def get_settings() -> ModalSyncSettings:
         max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),
         buffer_containers=_read_optional_int_env("COMFY_MODAL_BUFFER_CONTAINERS"),
         enable_proactive_warmup=_read_bool_env("COMFY_MODAL_ENABLE_PROACTIVE_WARMUP") is not False,
+        enable_loader_prewarm=_read_bool_env("COMFY_MODAL_ENABLE_LOADER_PREWARM") is not False,
         proactive_warmup_head_start_seconds=_read_float_env(
             "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
             2.0,

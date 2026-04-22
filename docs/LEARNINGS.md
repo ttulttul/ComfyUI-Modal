@@ -5,6 +5,7 @@
 - Prompt-scoped Modal class parameters are the wrong place to carry remote session identity. The `remote_session.session_id` belongs in the payload for data isolation, but `@app.cls` affinity should use reusable worker-pool slots like `worker-pool:slot:N`; otherwise every prompt asks Modal for a brand-new parameterized class instance and cross-prompt warm-container reuse never happens.
 - The local `custom_nodes/` tree is effectively process-static for one ComfyUI lifetime. Since adding or removing custom nodes still requires a ComfyUI restart before node availability changes, the queue-time sync engine should resolve `custom_nodes/` once per process and then reuse that cached decision instead of rehashing or rescanning the tree on every workflow run.
 - Warm bridge restoration is only half of the mapped seed optimization. Once every exported static bridge output has already been restored into the target remote session without replay, the seed payload should skip `prompt_executor_execute` entirely and synthesize its bridge-ref outputs directly from session state; otherwise the system still wastes seconds rerunning loader and encoder nodes after the expensive work was already avoided.
+- Modal function snapshots are initialization snapshots, not mid-request checkpoints. The practical way to hide first-request model loads is to detect root literal loader nodes in the rewritten prompt, then execute them as synthetic one-node subgraphs during proactive warmup so the worker-local loader cache is hot before the real payload arrives.
 
 ## 2026-04-21
 

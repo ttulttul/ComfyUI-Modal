@@ -78,6 +78,8 @@ _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _LOADER_CACHE_METRICS_LOCK = threading.Lock()
 _LOADER_CACHE_METRICS: dict[str, int] = {"hit": 0, "miss": 0}
+_LOADER_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
+_LOADER_PREWARM_PLAN_KEYS: set[str] = set()
 _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
@@ -1575,6 +1577,26 @@ def _build_clip_loader_cache_key(kwargs: dict[str, Any]) -> str:
     )
 
 
+def _build_dual_clip_loader_cache_key(kwargs: dict[str, Any]) -> str:
+    """Build a stable cache key for the ComfyUI dual CLIP loader."""
+    import folder_paths
+
+    return _serialize_loader_cache_key(
+        {
+            "clip_path_1": folder_paths.get_full_path_or_raise(
+                "text_encoders",
+                str(kwargs["clip_name1"]),
+            ),
+            "clip_path_2": folder_paths.get_full_path_or_raise(
+                "text_encoders",
+                str(kwargs["clip_name2"]),
+            ),
+            "type": kwargs.get("type"),
+            "device": kwargs.get("device", "default"),
+        }
+    )
+
+
 def _build_vae_loader_cache_key(kwargs: dict[str, Any]) -> str:
     """Build a stable cache key for the ComfyUI VAE loader."""
     return _serialize_loader_cache_key({"vae_name": kwargs.get("vae_name")})
@@ -1644,6 +1666,7 @@ def _install_loader_cache_wrappers() -> None:
         "CheckpointLoaderSimple": ("load_checkpoint", _build_checkpoint_loader_cache_key),
         "UNETLoader": ("load_unet", _build_unet_loader_cache_key),
         "CLIPLoader": ("load_clip", _build_clip_loader_cache_key),
+        "DualCLIPLoader": ("load_clip", _build_dual_clip_loader_cache_key),
         "VAELoader": ("load_vae", _build_vae_loader_cache_key),
         "unCLIPCheckpointLoader": ("load_checkpoint", _build_checkpoint_loader_cache_key),
         "ImageOnlyCheckpointLoader": ("load_checkpoint", _build_checkpoint_loader_cache_key),
@@ -4194,10 +4217,18 @@ def _prepare_warm_container_for_request(volume: Any, payload: dict[str, Any]) ->
         else:
             _emit_modal_volume_reload_skip(component_id, payload)
         custom_nodes_bundle = payload.get("custom_nodes_bundle")
+        custom_nodes_root: Path | None = None
         if isinstance(custom_nodes_bundle, str) and custom_nodes_bundle.strip():
             custom_nodes_root = _extract_custom_nodes_bundle(custom_nodes_bundle)
             if custom_nodes_root is not None:
                 _register_custom_nodes_root(custom_nodes_root)
+        loader_prewarm_plans = payload.get("loader_prewarm_plans")
+        if isinstance(loader_prewarm_plans, list) and loader_prewarm_plans:
+            _execute_loader_prewarm_plans(
+                component_id=component_id,
+                loader_prewarm_plans=loader_prewarm_plans,
+                custom_nodes_root=custom_nodes_root,
+            )
         return {
             "component_id": component_id,
             "task_id": os.getenv("MODAL_TASK_ID"),
@@ -4208,6 +4239,85 @@ def _prepare_warm_container_for_request(volume: Any, payload: dict[str, Any]) ->
             ),
             "reloaded_volume": needs_volume_reload,
         }
+
+
+def _loader_prewarm_plan_key(plan: Mapping[str, Any]) -> str | None:
+    """Return the stable worker-local dedupe key for one loader prewarm plan."""
+    signature = plan.get("signature")
+    if signature is None:
+        return None
+    normalized_signature = str(signature).strip()
+    return normalized_signature or None
+
+
+def _build_loader_prewarm_payload(
+    *,
+    component_id: str,
+    plan_index: int,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one synthetic single-node subgraph payload for loader warmup."""
+    plan_node_id = str(plan.get("node_id") or f"loader-{plan_index}")
+    prompt_id = plan.get("prompt_id")
+    return {
+        "payload_kind": "subgraph",
+        "component_id": f"{component_id}::loader-prewarm:{plan_node_id}",
+        "prompt_id": (str(prompt_id) if prompt_id is not None else None),
+        "component_node_ids": [plan_node_id],
+        "subgraph_prompt": copy.deepcopy(dict(plan["subgraph_prompt"])),
+        "boundary_inputs": [],
+        "boundary_outputs": [],
+        "execute_node_ids": list(plan.get("execute_node_ids") or [plan_node_id]),
+        "extra_data": {},
+    }
+
+
+def _execute_loader_prewarm_plans(
+    *,
+    component_id: str,
+    loader_prewarm_plans: list[dict[str, Any]],
+    custom_nodes_root: Path | None,
+) -> None:
+    """Execute synthetic one-node loader workflows so fresh workers preload heavyweight models."""
+    if not get_settings().enable_loader_prewarm:
+        return
+
+    _ensure_comfy_runtime_initialized(custom_nodes_root)
+    executed_plan_count = 0
+    skipped_plan_count = 0
+    for plan_index, plan in enumerate(loader_prewarm_plans):
+        if not isinstance(plan, Mapping):
+            continue
+        plan_key = _loader_prewarm_plan_key(plan)
+        if plan_key is not None:
+            with _LOADER_PREWARM_PLAN_KEYS_LOCK:
+                if plan_key in _LOADER_PREWARM_PLAN_KEYS:
+                    skipped_plan_count += 1
+                    continue
+                _LOADER_PREWARM_PLAN_KEYS.add(plan_key)
+        try:
+            _execute_subgraph_prompt(
+                _build_loader_prewarm_payload(
+                    component_id=component_id,
+                    plan_index=plan_index,
+                    plan=plan,
+                ),
+                hydrated_inputs={},
+                custom_nodes_root=custom_nodes_root,
+            )
+            executed_plan_count += 1
+        except Exception:
+            if plan_key is not None:
+                with _LOADER_PREWARM_PLAN_KEYS_LOCK:
+                    _LOADER_PREWARM_PLAN_KEYS.discard(plan_key)
+            raise
+    if executed_plan_count or skipped_plan_count:
+        logger.info(
+            "Warm container loader prewarm finished for component=%s executed=%d skipped=%d.",
+            component_id,
+            executed_plan_count,
+            skipped_plan_count,
+        )
 
 
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.

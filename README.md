@@ -211,6 +211,7 @@ Remote runtime behavior:
 - When a mapped or implicitly batched component finally hydrates its input batch, Modal-Sync upgrades that queue-time estimate with the exact per-item lane count and tops up background warmup again. That keeps early warmup conservative when fan-out size is unknown, but still lets the runtime race ahead of the heavy component once the true item count is available.
 - When a local `Modal Map Input` feeds a mapped remote component, the prompt rewrite now registers that node as an exact warmup trigger. As soon as the node executes and sees the concrete list or batch size, it starts the exact container top-up before the mapped proxy begins dispatching remote work.
 - The mapped scheduler now tracks in-flight warmup slots and can give new exact-parallelism warmup requests a short bounded head-start before lane seeding begins. That trims cold-start stalls without blocking indefinitely on proactive warmup.
+- Proactive warmup now also scans each remote payload for root heavy loader nodes with only literal inputs, such as `UNETLoader`, `CheckpointLoaderSimple`, `CLIPLoader`, and `DualCLIPLoader`. Fresh workers execute those loaders as synthetic one-node subgraphs during warmup so later real requests can hit the warm loader cache instead of paying the first model load on the critical path.
 - If `vol.reload()` still reports open files after that bounded retry window, the worker now checks whether the payload's referenced mounted-volume paths are already visible on disk. When they are, Modal-Sync proceeds and records the reload marker instead of failing on a redundant reload.
 - The worker now logs mounted-volume reload diagnostics when open-file retries start, including the uploaded paths and referenced paths for that payload, so you can see exactly which files were relevant when reload got stuck behind open handles.
 - Custom-node bundle sync now treats the digest-index record as authoritative for dedupe and the hash-addressed volume path as the payload location. Once a bundle digest is indexed, later runs reuse it without reuploading or probing the volume for marker blobs.
@@ -393,6 +394,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_MAX_CONTAINERS`: Optional upper bound on simultaneously scaled Modal containers.
 - `COMFY_MODAL_BUFFER_CONTAINERS`: Optional number of spare warm containers Modal should try to keep ready above current load.
 - `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP`: Start best-effort background warmup RPCs based on queue-time and runtime parallelism estimates. Default: `true`.
+- `COMFY_MODAL_ENABLE_LOADER_PREWARM`: During proactive warmup, execute synthetic one-node loader prompts for root literal model-loader nodes so fresh workers preload common models before the first real payload arrives. Default: `true`.
 - `COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS`: How long mapped execution may wait for newly requested exact warmup slots before it starts seeding lanes anyway. Default: `2.0`.
 
 ## Development
