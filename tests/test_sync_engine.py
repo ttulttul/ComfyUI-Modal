@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 
@@ -530,6 +532,67 @@ def test_sync_custom_nodes_directory_only_rebuilds_changed_top_level_archive(
     assert second_bundle is not None
     assert second_bundle.sha256 != first_bundle.sha256
     assert rebuilt_entries == ["example_b"]
+
+
+def test_sync_custom_nodes_directory_builds_multiple_archives_in_parallel(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Fresh per-package custom_nodes archives should build in parallel."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_a = custom_nodes_dir / "example_a"
+    package_b = custom_nodes_dir / "example_b"
+    package_a.mkdir(parents=True)
+    package_b.mkdir(parents=True)
+    (package_a / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    (package_b / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    original_create_archive = engine._create_archive_from_files
+    thread_ids: set[int] = set()
+    started_count = 0
+    started_lock = threading.Lock()
+    overlap_event = threading.Event()
+
+    def record_create_archive(root_path: Path, files: list[Path], archive_path: Path) -> Path:
+        """Block briefly until two archive builds overlap so the test can observe parallel execution."""
+        nonlocal started_count
+        del root_path
+        with started_lock:
+            started_count += 1
+            thread_ids.add(threading.get_ident())
+            if started_count >= 2:
+                overlap_event.set()
+        assert overlap_event.wait(0.2), "Expected per-package archive builds to overlap."
+        time.sleep(0.02)
+        return original_create_archive(custom_nodes_dir, files, archive_path)
+
+    monkeypatch.setattr(engine, "_create_archive_from_files", record_create_archive)
+    bundle = engine.sync_custom_nodes_directory()
+
+    assert bundle is not None
+    assert len(thread_ids) >= 2
 
 
 def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(

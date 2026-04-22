@@ -214,6 +214,7 @@ Remote runtime behavior:
 - The worker now logs mounted-volume reload diagnostics when open-file retries start, including the uploaded paths and referenced paths for that payload, so you can see exactly which files were relevant when reload got stuck behind open handles.
 - Custom-node bundle sync now treats the hash-addressed bundle path itself as authoritative. If ComfyUI crashes after uploading `/custom_nodes/<hash>_custom_nodes_bundle.zip` but before writing its marker, the next run backfills the marker and reuses the existing bundle instead of trying to rebuild or reupload it.
 - Custom-node sync no longer rebuilds one monolithic archive for the whole `custom_nodes/` tree. It now writes one tiny whole-tree manifest plus one content-addressed archive per top-level custom-node package, so editing one package only rebuilds and reuploads that package's archive and the manifest.
+- Per-package custom-node archive creation and upload now run in parallel on the local side, and the Modal volume bridge no longer serializes every SDK call through a single worker thread. That lets the split-archive design actually overlap the mostly I/O-bound ZIP and transfer work.
 - Once a given extracted `custom_nodes` root has already been imported on a warm worker, the runtime now logs that it is reusing that initialized root and skips re-running external custom-node import work for repeat requests on the same bundle digest.
 
 If you change `COMFY_MODAL_GPU`, redeploy the Modal app or delete it and let auto-deploy recreate it. Modal hardware is fixed at deploy time.

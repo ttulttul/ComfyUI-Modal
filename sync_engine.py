@@ -7,9 +7,10 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -17,7 +18,6 @@ from typing import Any, Callable, Protocol
 from .settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
-_MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 SyncStatusCallback = Callable[[str, int | None, int | None], None]
 
 _SYNC_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".vae"}
@@ -106,6 +106,30 @@ class _CustomNodesArchiveSpec:
     sha256: str
 
 
+@dataclass(frozen=True)
+class _CustomNodesArchiveSyncResult:
+    """Describe the sync result for one top-level custom_nodes archive."""
+
+    entry_name: str
+    display_name: str
+    sha256: str
+    remote_path: str
+    uploaded: bool
+
+
+def _modal_volume_worker_count() -> int:
+    """Return the worker count used for local Modal volume SDK calls."""
+    return max(4, min(16, os.cpu_count() or 1))
+
+
+def _custom_nodes_sync_worker_count() -> int:
+    """Return the worker count used to package and upload per-package custom_nodes archives."""
+    return max(4, min(16, os.cpu_count() or 1))
+
+
+_MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=_modal_volume_worker_count())
+
+
 class LocalMirrorVolume:
     """Simple filesystem-backed volume used for tests and dry runs."""
 
@@ -144,6 +168,7 @@ class ModalVolumeBackend:
             raise RuntimeError("Modal SDK is required for ModalVolumeBackend.")
         self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
         self._exists_cache: dict[str, bool] = {}
+        self._exists_cache_lock = threading.Lock()
 
     def _resource_exhausted_error_types(self) -> tuple[type[BaseException], ...]:
         """Return the Modal SDK exception types that indicate transient rate limiting."""
@@ -181,14 +206,16 @@ class ModalVolumeBackend:
 
     def exists(self, remote_path: str) -> bool:
         """Return whether a file already exists in the Modal volume."""
-        cached_result = self._exists_cache.get(remote_path)
+        with self._exists_cache_lock:
+            cached_result = self._exists_cache.get(remote_path)
         if cached_result is not None:
             return cached_result
         try:
             exists = len(self._run_volume_call(self._volume.listdir, remote_path, recursive=False)) > 0
         except modal.exception.NotFoundError:
             exists = False
-        self._exists_cache[remote_path] = exists
+        with self._exists_cache_lock:
+            self._exists_cache[remote_path] = exists
         return exists
 
     def put_file(self, local_path: Path, remote_path: str) -> None:
@@ -198,7 +225,8 @@ class ModalVolumeBackend:
                 batch.put_file(local_path, remote_path)
 
         self._run_volume_call(upload)
-        self._exists_cache[remote_path] = True
+        with self._exists_cache_lock:
+            self._exists_cache[remote_path] = True
 
     def put_bytes(self, payload: bytes, remote_path: str) -> None:
         """Upload bytes into the Modal volume."""
@@ -207,7 +235,8 @@ class ModalVolumeBackend:
                 batch.put_file(io.BytesIO(payload), remote_path)
 
         self._run_volume_call(upload)
-        self._exists_cache[remote_path] = True
+        with self._exists_cache_lock:
+            self._exists_cache[remote_path] = True
 
 
 @dataclass
@@ -382,70 +411,30 @@ class ModalAssetSyncEngine:
             logger.info("Custom_nodes directory %s contained no syncable files.", custom_nodes_dir)
             return None
 
-        packaging_status_emitted = False
-        upload_status_emitted = False
-        uploaded = False
-        manifest_entries: list[dict[str, str]] = []
-        for archive_spec in archive_specs:
-            archive_path = self._cached_custom_nodes_archive_path(
+        if any(
+            not self._cached_custom_nodes_archive_path(
                 archive_spec.entry_name,
                 archive_spec.sha256,
-            )
-            archive_remote_path = self._custom_nodes_archive_remote_path(
-                archive_spec.entry_name,
-                archive_spec.sha256,
-            )
-            if archive_path.exists():
-                logger.info(
-                    "Reusing cached custom_nodes archive %s for entry=%s digest=%s.",
-                    archive_path,
-                    archive_spec.display_name,
-                    archive_spec.sha256,
-                )
-            else:
-                if not packaging_status_emitted:
-                    _emit_sync_status(status_callback, "Packaging custom nodes ZIP for Modal")
-                    packaging_status_emitted = True
-                archive_started_at = time.perf_counter()
-                logger.info(
-                    "Creating custom_nodes archive for entry=%s from %d files.",
-                    archive_spec.display_name,
-                    len(archive_spec.files),
-                )
-                self._create_archive_from_files(
-                    custom_nodes_dir,
-                    list(archive_spec.files),
-                    archive_path,
-                )
-                logger.info(
-                    "Created custom_nodes archive %s for entry=%s in %.3fs.",
-                    archive_path,
-                    archive_spec.display_name,
-                    time.perf_counter() - archive_started_at,
-                )
+            ).exists()
+            for archive_spec in archive_specs
+        ):
+            _emit_sync_status(status_callback, "Packaging custom nodes ZIP for Modal")
+        _emit_sync_status(status_callback, "Uploading custom nodes ZIP to Modal")
 
-            entry_uploaded = self._sync_content_addressed_file(
-                local_path=archive_path,
-                remote_path=archive_remote_path,
-                marker_path=(
-                    f"/hashes/custom_nodes_entry_"
-                    f"{self._custom_nodes_entry_slug(archive_spec.entry_name)}_{archive_spec.sha256}.done"
-                ),
-                source_description=archive_spec.source_description,
-                status_callback=status_callback if not upload_status_emitted else None,
-                upload_status_message="Uploading custom nodes ZIP to Modal",
-            )
-            if entry_uploaded:
-                upload_status_emitted = True
-                uploaded = True
-            manifest_entries.append(
-                {
-                    "entry_name": archive_spec.entry_name,
-                    "display_name": archive_spec.display_name,
-                    "sha256": archive_spec.sha256,
-                    "remote_path": archive_remote_path,
-                }
-            )
+        archive_results = self._sync_custom_nodes_archives_parallel(
+            custom_nodes_dir=custom_nodes_dir,
+            archive_specs=archive_specs,
+        )
+        uploaded = any(archive_result.uploaded for archive_result in archive_results)
+        manifest_entries = [
+            {
+                "entry_name": archive_result.entry_name,
+                "display_name": archive_result.display_name,
+                "sha256": archive_result.sha256,
+                "remote_path": archive_result.remote_path,
+            }
+            for archive_result in archive_results
+        ]
 
         manifest_path = self._cached_custom_nodes_manifest_path(directory_hash)
         if manifest_path.exists():
@@ -473,7 +462,6 @@ class ModalAssetSyncEngine:
             remote_path=remote_path,
             marker_path=marker_path,
             source_description=str(custom_nodes_dir),
-            status_callback=status_callback if not upload_status_emitted else None,
             upload_status_message="Uploading custom nodes ZIP to Modal",
         )
         uploaded = uploaded or manifest_uploaded
@@ -538,6 +526,94 @@ class ModalAssetSyncEngine:
         self.volume.put_bytes(
             json.dumps({"source": source_description, "remote_path": remote_path}).encode("utf-8"),
             marker_path,
+        )
+
+    def _sync_custom_nodes_archives_parallel(
+        self,
+        *,
+        custom_nodes_dir: Path,
+        archive_specs: list[_CustomNodesArchiveSpec],
+    ) -> list[_CustomNodesArchiveSyncResult]:
+        """Build and upload per-package custom_nodes archives in parallel."""
+        max_workers = min(len(archive_specs), _custom_nodes_sync_worker_count())
+        if max_workers <= 1:
+            return [
+                self._sync_custom_nodes_archive_spec(custom_nodes_dir, archive_spec)
+                for archive_spec in archive_specs
+            ]
+
+        results_by_entry_name: dict[str, _CustomNodesArchiveSyncResult] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures_by_entry_name: dict[str, Future[_CustomNodesArchiveSyncResult]] = {
+                archive_spec.entry_name: executor.submit(
+                    self._sync_custom_nodes_archive_spec,
+                    custom_nodes_dir,
+                    archive_spec,
+                )
+                for archive_spec in archive_specs
+            }
+            for entry_name, future in futures_by_entry_name.items():
+                results_by_entry_name[entry_name] = future.result()
+        return [
+            results_by_entry_name[archive_spec.entry_name]
+            for archive_spec in archive_specs
+        ]
+
+    def _sync_custom_nodes_archive_spec(
+        self,
+        custom_nodes_dir: Path,
+        archive_spec: _CustomNodesArchiveSpec,
+    ) -> _CustomNodesArchiveSyncResult:
+        """Build and upload one per-package custom_nodes archive."""
+        archive_path = self._cached_custom_nodes_archive_path(
+            archive_spec.entry_name,
+            archive_spec.sha256,
+        )
+        archive_remote_path = self._custom_nodes_archive_remote_path(
+            archive_spec.entry_name,
+            archive_spec.sha256,
+        )
+        if archive_path.exists():
+            logger.info(
+                "Reusing cached custom_nodes archive %s for entry=%s digest=%s.",
+                archive_path,
+                archive_spec.display_name,
+                archive_spec.sha256,
+            )
+        else:
+            archive_started_at = time.perf_counter()
+            logger.info(
+                "Creating custom_nodes archive for entry=%s from %d files.",
+                archive_spec.display_name,
+                len(archive_spec.files),
+            )
+            self._create_archive_from_files(
+                custom_nodes_dir,
+                list(archive_spec.files),
+                archive_path,
+            )
+            logger.info(
+                "Created custom_nodes archive %s for entry=%s in %.3fs.",
+                archive_path,
+                archive_spec.display_name,
+                time.perf_counter() - archive_started_at,
+            )
+
+        entry_uploaded = self._sync_content_addressed_file(
+            local_path=archive_path,
+            remote_path=archive_remote_path,
+            marker_path=(
+                f"/hashes/custom_nodes_entry_"
+                f"{self._custom_nodes_entry_slug(archive_spec.entry_name)}_{archive_spec.sha256}.done"
+            ),
+            source_description=archive_spec.source_description,
+        )
+        return _CustomNodesArchiveSyncResult(
+            entry_name=archive_spec.entry_name,
+            display_name=archive_spec.display_name,
+            sha256=archive_spec.sha256,
+            remote_path=archive_remote_path,
+            uploaded=entry_uploaded,
         )
 
 
