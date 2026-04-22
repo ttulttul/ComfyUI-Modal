@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from concurrent.futures import Future
 import importlib.util
 import sys
 import threading
@@ -527,6 +528,60 @@ def test_proxy_execution_wraps_sync_remote_clients(
     assert result.result == ("sync::OriginalNode::payload", 4)
 
 
+def test_modal_map_input_execute_boosts_exact_warmup_for_registered_context(
+    modal_executor_module: Any,
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Local Modal Map Input execution should kick off exact warmup once the real list value is known."""
+    observed_boost: dict[str, Any] = {}
+
+    def fake_boost_mapped_component_warmup(
+        payload: dict[str, Any],
+        *,
+        total_items: int,
+        reason: str,
+    ) -> tuple[int, int]:
+        """Record the exact warmup boost request without touching Modal."""
+        observed_boost["payload"] = dict(payload)
+        observed_boost["total_items"] = total_items
+        observed_boost["reason"] = reason
+        return 2, 2
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "boost_mapped_component_warmup",
+        fake_boost_mapped_component_warmup,
+    )
+    with modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS_LOCK:
+        modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS.clear()
+    modal_executor_module.register_modal_map_input_warmup_context(
+        "map-node-1",
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "mapped-component-1",
+            "extra_data": {"modal": {"mapped_component_ids": ["mapped-component-1"]}},
+        },
+        "INT",
+    )
+
+    result = modal_executor_module.ModalMapInput.execute(
+        value=[10, 11, 12],
+        unique_id="map-node-1",
+    )
+
+    assert result.result == ([10, 11, 12],)
+    assert observed_boost == {
+        "payload": {
+            "prompt_id": "prompt-1",
+            "component_id": "mapped-component-1",
+            "extra_data": {"modal": {"mapped_component_ids": ["mapped-component-1"]}},
+        },
+        "total_items": 3,
+        "reason": "modal_map_input_execute",
+    }
+
+
 def test_local_remote_app_executes_original_node(
     remote_modal_app_module: Any,
     serialization_module: Any,
@@ -576,9 +631,10 @@ def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
     class FakeExecutor:
         """Minimal executor that records submitted warmup jobs."""
 
-        def submit(self, fn: Any, *args: Any) -> None:
+        def submit(self, fn: Any, *args: Any) -> Future[Any]:
             """Capture one scheduled warmup task without running it."""
             submitted_tasks.append((fn, args))
+            return Future()
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
@@ -613,6 +669,37 @@ def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
     assert third_target == 4
     assert len(submitted_tasks) == 4
     assert [args[1] for _fn, args in submitted_tasks] == [0, 1, 2, 3]
+
+
+def test_await_prompt_warmup_slots_waits_for_inflight_futures(
+    remote_modal_app_module: Any,
+) -> None:
+    """Mapped execution should be able to wait briefly for already scheduled warmup slots."""
+    prompt_id = "prompt-head-start"
+    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
+        remote_modal_app_module._ensure_prompt_warmup_state(prompt_id)
+
+    future: Future[Any] = Future()
+    remote_modal_app_module._track_prompt_warmup_future(prompt_id, 0, future)
+
+    def complete_future() -> None:
+        """Complete the synthetic warmup slot after a short delay."""
+        time.sleep(0.01)
+        future.set_result({"ok": True})
+
+    threading.Thread(target=complete_future, daemon=True).start()
+
+    completed_count = asyncio.run(
+        remote_modal_app_module._await_prompt_warmup_slots(
+            prompt_id,
+            [0],
+            0.2,
+        )
+    )
+
+    assert completed_count == 1
 
 
 def test_register_exact_component_parallelism_refines_prompt_target(

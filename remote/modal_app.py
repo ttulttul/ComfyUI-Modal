@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -83,6 +83,7 @@ class _PromptWarmupState:
 
     scheduled_slots: set[int] = field(default_factory=set)
     exact_component_parallelism: dict[str, int] = field(default_factory=dict)
+    slot_futures: dict[int, Future[Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -3338,13 +3339,18 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         )
         return await invoke_remote_engine_async(payload, kwargs_payload)
 
-    parallelism = _mapped_execution_parallelism(total_items)
-    refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
-    ensure_remote_warm_capacity(
-        _build_prompt_warmup_request(payload),
-        warmup_target=refined_prompt_warmup_target,
+    parallelism, refined_prompt_warmup_target = boost_mapped_component_warmup(
+        payload,
+        total_items=total_items,
         reason="implicit_mapped_component_exact_parallelism",
     )
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    if prompt_id is not None:
+        await _await_prompt_warmup_slots(
+            prompt_id,
+            list(range(refined_prompt_warmup_target)),
+            _prompt_warmup_head_start_seconds(),
+        )
     logger.info(
         "Scheduling implicitly mapped Modal component=%s for %d item(s) with local parallelism=%d prompt_warmup_target=%d across inputs=%s.",
         payload.get("component_id"),
@@ -3750,6 +3756,11 @@ def _warmup_slot_payload(warmup_request: dict[str, Any], slot_index: int) -> dic
     return slot_payload
 
 
+def _prompt_warmup_head_start_seconds() -> float:
+    """Return the bounded delay the local scheduler may wait for exact warmup slots to start."""
+    return max(0.0, float(get_settings().proactive_warmup_head_start_seconds))
+
+
 def _invoke_remote_engine_warmup(remote_engine: Any, warmup_request: dict[str, Any]) -> Any:
     """Ask one prepared remote engine instance to warm a container for a prompt."""
     warmup_method = getattr(remote_engine, "warmup_for_request", None)
@@ -3835,6 +3846,78 @@ def _run_prompt_warmup_slot(
         )
 
 
+def _track_prompt_warmup_future(
+    prompt_id: str,
+    slot_index: int,
+    future: Future[Any],
+) -> None:
+    """Track one in-flight warmup future so mapped execution can await short exact warmup bursts."""
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+        if warmup_state is not None:
+            warmup_state.slot_futures[slot_index] = future
+
+    def _clear_tracked_future(completed_future: Future[Any]) -> None:
+        """Drop one completed future from the prompt warmup state."""
+        with _PROMPT_WARMUP_STATES_LOCK:
+            warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+            if warmup_state is None:
+                return
+            tracked_future = warmup_state.slot_futures.get(slot_index)
+            if tracked_future is completed_future:
+                warmup_state.slot_futures.pop(slot_index, None)
+
+    future.add_done_callback(_clear_tracked_future)
+
+
+async def _await_prompt_warmup_slots(
+    prompt_id: str,
+    slot_indices: list[int],
+    timeout_seconds: float,
+) -> int:
+    """Wait briefly for any in-flight prompt warmup slots to finish."""
+    if timeout_seconds <= 0.0 or not slot_indices:
+        return 0
+
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+        if warmup_state is None:
+            return 0
+        pending_slot_futures = [
+            warmup_state.slot_futures[slot_index]
+            for slot_index in slot_indices
+            if slot_index in warmup_state.slot_futures and not warmup_state.slot_futures[slot_index].done()
+        ]
+
+    if not pending_slot_futures:
+        return 0
+
+    wrapped_futures = [
+        asyncio.wrap_future(slot_future)
+        for slot_future in pending_slot_futures
+    ]
+    done_futures, pending_futures = await asyncio.wait(
+        wrapped_futures,
+        timeout=timeout_seconds,
+        return_when=asyncio.ALL_COMPLETED,
+    )
+    if done_futures:
+        logger.info(
+            "Prompt=%s warmup head-start completed %d/%d slot(s) before mapped dispatch.",
+            prompt_id,
+            len(done_futures),
+            len(wrapped_futures),
+        )
+    elif pending_futures:
+        logger.info(
+            "Prompt=%s warmup head-start timed out after %.3fs with %d slot(s) still warming.",
+            prompt_id,
+            timeout_seconds,
+            len(pending_futures),
+        )
+    return len(done_futures)
+
+
 def ensure_remote_warm_capacity(
     warmup_request: dict[str, Any],
     *,
@@ -3878,14 +3961,40 @@ def ensure_remote_warm_capacity(
         reason,
     )
     for slot_index in missing_slots:
-        _REMOTE_MODAL_WARMUP_EXECUTOR.submit(
+        future = _REMOTE_MODAL_WARMUP_EXECUTOR.submit(
             _run_prompt_warmup_slot,
             prompt_id,
             slot_index,
             copy.deepcopy(warmup_request),
             reason,
         )
+        _track_prompt_warmup_future(prompt_id, slot_index, future)
     return clamped_target
+
+
+def boost_mapped_component_warmup(
+    payload: dict[str, Any],
+    *,
+    total_items: int,
+    reason: str,
+) -> tuple[int, int]:
+    """Record exact mapped fan-out and top up prompt warmup for the resulting lane count."""
+    parallelism = _mapped_execution_parallelism(total_items)
+    refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
+    ensure_remote_warm_capacity(
+        _build_prompt_warmup_request(payload),
+        warmup_target=refined_prompt_warmup_target,
+        reason=reason,
+    )
+    logger.info(
+        "Boosted exact mapped warmup for component=%s total_items=%d local_parallelism=%d prompt_warmup_target=%d reason=%s.",
+        payload.get("component_id"),
+        total_items,
+        parallelism,
+        refined_prompt_warmup_target,
+        reason,
+    )
+    return parallelism, refined_prompt_warmup_target
 
 
 def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException) -> None:

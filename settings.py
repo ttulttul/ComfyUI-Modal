@@ -41,6 +41,7 @@ class ModalSyncSettings:
     max_containers: int | None = None
     buffer_containers: int | None = None
     enable_proactive_warmup: bool = True
+    proactive_warmup_head_start_seconds: float = 2.0
     stream_remote_container_logs: bool = False
 
 
@@ -91,6 +92,17 @@ def _read_optional_int_env(name: str) -> int | None:
         return int(value)
     except ValueError as exc:
         raise ValueError(f"Environment variable {name} must be an integer, got {value!r}.") from exc
+
+
+def _read_float_env(name: str, default: float) -> float:
+    """Resolve an environment variable into a float when present."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be a float, got {value!r}.") from exc
 
 
 def _looks_like_comfyui_root(candidate: Path) -> bool:
@@ -195,6 +207,10 @@ def get_settings() -> ModalSyncSettings:
         max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),
         buffer_containers=_read_optional_int_env("COMFY_MODAL_BUFFER_CONTAINERS"),
         enable_proactive_warmup=_read_bool_env("COMFY_MODAL_ENABLE_PROACTIVE_WARMUP") is not False,
+        proactive_warmup_head_start_seconds=_read_float_env(
+            "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
+            2.0,
+        ),
         stream_remote_container_logs=_read_bool_env("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS")
         or False,
     )
