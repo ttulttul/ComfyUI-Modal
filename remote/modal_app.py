@@ -3,6 +3,7 @@
 import asyncio
 import copy
 from dataclasses import dataclass, field
+import hashlib
 import importlib
 import importlib.util
 from io import BytesIO
@@ -900,20 +901,36 @@ def _log_remote_session_resolution_summary(
     )
 
 
-def _remote_session_affinity_key(payload: dict[str, Any]) -> str | None:
-    """Return the affinity key that should keep split proxy calls on one remote worker."""
-    session_handle = _payload_remote_session_handle(payload)
-    if session_handle is None:
-        return None
-    return session_handle.session_id
+def _remote_worker_pool_affinity_key(slot_index: int) -> str:
+    """Return the stable worker-pool affinity key for one reusable remote slot."""
+    return f"worker-pool:slot:{int(slot_index)}"
+
+
+def _component_pool_slot_index(payload: dict[str, Any]) -> int:
+    """Return the reusable worker-pool slot index for one ordinary remote payload."""
+    warmup_slot_index = payload.get("warmup_slot_index")
+    if warmup_slot_index is not None:
+        return max(0, int(warmup_slot_index))
+
+    prompt_parallelism_target = _prompt_parallelism_target(payload)
+    slot_count = max(1, int(prompt_parallelism_target))
+    component_id = str(payload.get("component_id") or "")
+    if not component_id:
+        return 0
+
+    component_hash = hashlib.sha256(component_id.encode("utf-8")).digest()
+    return int.from_bytes(component_hash[:8], "big") % slot_count
+
+
+def _remote_worker_affinity_key(payload: dict[str, Any]) -> str:
+    """Return the reusable worker-pool affinity key for one remote payload."""
+    return _remote_worker_pool_affinity_key(_component_pool_slot_index(payload))
 
 
 def _mapped_lane_affinity_key(payload: dict[str, Any], lane_index: int) -> str | None:
-    """Return the stable per-lane affinity key used to pin one mapped worker lane."""
-    session_affinity_key = _remote_session_affinity_key(payload)
-    if session_affinity_key is None:
-        return None
-    return f"{session_affinity_key}::lane:{int(lane_index)}"
+    """Return the stable per-lane worker-pool affinity key used for mapped execution."""
+    del payload
+    return _remote_worker_pool_affinity_key(lane_index)
 
 
 class _NullPromptServer:
@@ -3592,18 +3609,16 @@ def _lookup_deployed_remote_engine(
     settings = get_settings()
     affinity_key = affinity_key_override
     if affinity_key is None:
-        affinity_key = _remote_session_affinity_key(payload)
+        affinity_key = _remote_worker_affinity_key(payload)
     logger.info(
-        "Attempting deployed Modal invocation for app=%s class=%s component=%s session_affinity=%s.",
+        "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s.",
         settings.app_name,
         "RemoteEngine",
         payload.get("component_id"),
         affinity_key,
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
-    if affinity_key is not None:
-        return remote_cls(session_affinity_key=affinity_key)
-    return remote_cls()
+    return remote_cls(worker_affinity_key=affinity_key)
 
 
 async def _invoke_bound_remote_engine_async(
@@ -4466,14 +4481,14 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     )
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
-        session_affinity_key: str = modal.parameter(default="")
+        worker_affinity_key: str = modal.parameter(default="")
 
         @modal.enter()
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
             logger.info(
-                "RemoteEngine setup complete for session_affinity_key=%s.",
-                self.session_affinity_key or None,
+                "RemoteEngine setup complete for worker_affinity_key=%s.",
+                self.worker_affinity_key or None,
             )
 
         @modal.method()
@@ -4498,9 +4513,9 @@ else:
     class RemoteEngine:
         """Local fallback runtime used when the Modal SDK is unavailable."""
 
-        def __init__(self, session_affinity_key: str | None = None) -> None:
-            """Record the optional session-affinity key for split-proxy reuse."""
-            self.session_affinity_key = session_affinity_key
+        def __init__(self, worker_affinity_key: str | None = None) -> None:
+            """Record the optional worker-pool affinity key for split-proxy reuse."""
+            self.worker_affinity_key = worker_affinity_key
 
         def setup(self) -> None:
             """No-op setup for local fallback execution."""

@@ -2629,7 +2629,7 @@ def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Deployed Modal lookups should use keyword parameterization for affinity-key routing."""
+    """Deployed Modal lookups should use keyword parameterization for reusable worker-pool routing."""
     observed_kwargs: list[dict[str, Any]] = []
 
     class FakeModal:
@@ -2664,8 +2664,67 @@ def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
         }
     )
 
-    assert result == {"session_affinity_key": "session-123"}
-    assert observed_kwargs == [{"session_affinity_key": "session-123"}]
+    assert result == {"worker_affinity_key": "worker-pool:slot:0"}
+    assert observed_kwargs == [{"worker_affinity_key": "worker-pool:slot:0"}]
+
+
+def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_sessions(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Different prompt sessions should map to one reusable worker-pool slot."""
+    observed_kwargs: list[dict[str, Any]] = []
+
+    class FakeModal:
+        """Minimal modal SDK double that captures class construction kwargs."""
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a factory that records the provided class parameters."""
+                assert app_name == "comfy-modal-sync"
+                assert class_name == "RemoteEngine"
+
+                def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
+                    """Record one synthesized Modal class constructor call."""
+                    observed_kwargs.append(kwargs)
+                    return kwargs
+
+                return build_remote_engine
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+
+    first_result = remote_modal_app_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            "prompt_id": "prompt-1",
+            "remote_session": remote_modal_app_module.RemoteSessionHandle(
+                session_id="session-123",
+                prompt_id="prompt-1",
+                owner_component_id="component-1",
+            ).to_payload(),
+        }
+    )
+    second_result = remote_modal_app_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            "prompt_id": "prompt-2",
+            "remote_session": remote_modal_app_module.RemoteSessionHandle(
+                session_id="session-456",
+                prompt_id="prompt-2",
+                owner_component_id="component-1",
+            ).to_payload(),
+        }
+    )
+
+    assert first_result == {"worker_affinity_key": "worker-pool:slot:0"}
+    assert second_result == {"worker_affinity_key": "worker-pool:slot:0"}
+    assert observed_kwargs == [
+        {"worker_affinity_key": "worker-pool:slot:0"},
+        {"worker_affinity_key": "worker-pool:slot:0"},
+    ]
 
 
 def test_load_modal_cloud_module_reloads_stale_partial_module(
@@ -5048,7 +5107,7 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
         remote_modal_app_module,
         "_lookup_deployed_remote_engine",
         lambda payload, affinity_key_override=None: (
-            f"engine:{affinity_key_override or remote_modal_app_module._remote_session_affinity_key(payload)}"
+            f"engine:{affinity_key_override or remote_modal_app_module._remote_worker_affinity_key(payload)}"
         ),
     )
 
@@ -5166,25 +5225,25 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
 
     assert sorted(seed_calls) == [
         (
-            "engine:session-1::lane:0",
+            "engine:worker-pool:slot:0",
             "17::seed:0",
             False,
             ("4",),
             {"static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True}},
         ),
         (
-            "engine:session-1::lane:1",
+            "engine:worker-pool:slot:1",
             "17::seed:1",
             False,
             ("4",),
             {"static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True}},
         ),
     ]
-    assert {call[0] for call in item_calls} <= {"engine:session-1::lane:0", "engine:session-1::lane:1"}
+    assert {call[0] for call in item_calls} <= {"engine:worker-pool:slot:0", "engine:worker-pool:slot:1"}
     assert {call[0] for call in item_calls} <= {call[0] for call in seed_calls}
     assert sorted(cleanup_calls) == [
-        ("engine:session-1::lane:0", "17::cleanup:0", True, (), {}),
-        ("engine:session-1::lane:1", "17::cleanup:1", True, (), {}),
+        ("engine:worker-pool:slot:0", "17::cleanup:0", True, (), {}),
+        ("engine:worker-pool:slot:1", "17::cleanup:1", True, (), {}),
     ]
     response_outputs = serialization_module.deserialize_node_outputs(response)[0]
     assert len(response_outputs) == 4
