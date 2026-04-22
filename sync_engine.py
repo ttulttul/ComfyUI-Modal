@@ -119,7 +119,7 @@ class _CustomNodesArchiveSyncResult:
 
 def _modal_volume_worker_count() -> int:
     """Return the worker count used for local Modal volume SDK calls."""
-    return max(4, min(16, os.cpu_count() or 1))
+    return 4
 
 
 def _custom_nodes_sync_worker_count() -> int:
@@ -169,6 +169,9 @@ class ModalVolumeBackend:
         self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
         self._exists_cache: dict[str, bool] = {}
         self._exists_cache_lock = threading.Lock()
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until_monotonic = 0.0
+        self._rate_limit_backoff_seconds = 0.0
 
     def _resource_exhausted_error_types(self) -> tuple[type[BaseException], ...]:
         """Return the Modal SDK exception types that indicate transient rate limiting."""
@@ -182,26 +185,59 @@ class ModalVolumeBackend:
             return (error_type,)
         return ()
 
+    def _wait_for_shared_rate_limit_backoff(self) -> None:
+        """Pause until the shared Modal volume backoff window expires."""
+        while True:
+            with self._rate_limit_lock:
+                remaining_seconds = self._rate_limit_until_monotonic - time.monotonic()
+            if remaining_seconds <= 0.0:
+                return
+            time.sleep(remaining_seconds)
+
+    def _record_shared_rate_limit_backoff(self) -> float:
+        """Increase and publish the shared Modal volume backoff window."""
+        with self._rate_limit_lock:
+            next_backoff_seconds = (
+                0.25
+                if self._rate_limit_backoff_seconds <= 0.0
+                else min(self._rate_limit_backoff_seconds * 2.0, 8.0)
+            )
+            self._rate_limit_backoff_seconds = next_backoff_seconds
+            self._rate_limit_until_monotonic = max(
+                self._rate_limit_until_monotonic,
+                time.monotonic() + next_backoff_seconds,
+            )
+            return next_backoff_seconds
+
+    def _clear_shared_rate_limit_backoff_if_expired(self) -> None:
+        """Reset the shared backoff after the cooldown window has fully elapsed."""
+        with self._rate_limit_lock:
+            if time.monotonic() >= self._rate_limit_until_monotonic:
+                self._rate_limit_backoff_seconds = 0.0
+                self._rate_limit_until_monotonic = 0.0
+
     def _run_volume_call(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
         """Run a Modal SDK volume call in a worker thread outside the request event loop."""
         retryable_errors = self._resource_exhausted_error_types()
         max_attempts = 5
         for attempt_index in range(max_attempts):
+            self._wait_for_shared_rate_limit_backoff()
             future = _MODAL_VOLUME_EXECUTOR.submit(callback, *args, **kwargs)
             try:
-                return future.result()
+                result = future.result()
+                self._clear_shared_rate_limit_backoff_if_expired()
+                return result
             except retryable_errors as exc:
                 if attempt_index >= max_attempts - 1:
                     raise
-                backoff_seconds = 0.25 * (2**attempt_index)
+                backoff_seconds = self._record_shared_rate_limit_backoff()
                 logger.warning(
-                    "Modal volume call %s hit rate limiting on attempt %d/%d; retrying in %.2fs.",
+                    "Modal volume call %s hit rate limiting on attempt %d/%d; applying shared retry backoff of %.2fs.",
                     getattr(callback, "__name__", repr(callback)),
                     attempt_index + 1,
                     max_attempts,
                     backoff_seconds,
                 )
-                time.sleep(backoff_seconds)
         raise RuntimeError("Modal volume call retry loop exited unexpectedly.")
 
     def exists(self, remote_path: str) -> bool:

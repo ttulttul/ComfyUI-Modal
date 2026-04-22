@@ -11,6 +11,7 @@
 - Queue-time warmup estimates are not enough for mapped fan-out because the real list length is often only known when `ModalMapInput` executes. Registering the local map node as a warmup trigger lets Modal-Sync top up exact container demand one node earlier than the mapped proxy, and a short bounded head-start on those in-flight warmup slots is enough to overlap some cold boot time instead of discovering it only at the first seed call.
 - `custom_nodes/` behaves much better as a manifest plus per-package archives than as one whole-tree ZIP. The overall manifest still gives one deterministic tree digest for volume reload and runtime cache identity, but hashing and packaging each top-level custom-node package separately means one edited package no longer forces a full rebuild and reupload of every other unchanged package.
 - Split custom-node archives only pay off if the local pipeline is parallel too. Building each per-package ZIP and uploading it independently in worker threads lets the local machine overlap the mostly I/O-bound file reads, compression, and Modal volume transfers instead of serializing those stages back into one long queue.
+- Parallel local packaging needs a stricter policy on the Modal volume side than on the filesystem side. Metadata probes like `VolumeListFiles` can rate-limit well before the actual uploads do, so the safe pattern is to keep a small fixed concurrency for volume SDK calls and publish one shared exponential backoff window across all local workers when any of them gets `ResourceExhaustedError`.
 
 ## 2026-04-20
 

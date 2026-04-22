@@ -842,11 +842,82 @@ def test_modal_volume_backend_retries_rate_limited_calls(
                 """Return the fake volume for any lookup."""
                 return fake_volume
 
+    monotonic_time = 100.0
     sleep_calls: list[float] = []
+
+    def fake_monotonic() -> float:
+        """Return the controllable monotonic clock."""
+        return monotonic_time
+
+    def fake_sleep(seconds: float) -> None:
+        """Advance the controllable monotonic clock instead of actually sleeping."""
+        nonlocal monotonic_time
+        sleep_calls.append(seconds)
+        monotonic_time += seconds
+
     monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
-    monkeypatch.setattr(sync_engine_module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(sync_engine_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(sync_engine_module.time, "monotonic", fake_monotonic)
     backend = sync_engine_module.ModalVolumeBackend("volume")
 
     assert backend.exists("/hashes/present.done") is True
     assert fake_volume.listdir_calls == 2
+    assert sleep_calls == [0.25]
+
+
+def test_modal_volume_backend_applies_shared_rate_limit_backoff_across_calls(
+    sync_engine_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """One rate-limited Modal volume call should publish a shared backoff window for later calls."""
+
+    class FakeVolume:
+        """Minimal Modal volume double that always succeeds."""
+
+        def listdir(self, remote_path: str, recursive: bool = False) -> list[str]:
+            """Return one successful listing."""
+            return [remote_path]
+
+    fake_volume = FakeVolume()
+
+    class FakeModal:
+        """Minimal modal SDK double exposing retryable error types."""
+
+        exception = type(
+            "FakeExceptionNamespace",
+            (),
+            {
+                "NotFoundError": FileNotFoundError,
+                "ResourceExhaustedError": RuntimeError,
+            },
+        )
+
+        class Volume:
+            """Namespace for volume lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> FakeVolume:
+                """Return the fake volume for any lookup."""
+                return fake_volume
+
+    monotonic_time = 100.0
+    sleep_calls: list[float] = []
+
+    def fake_monotonic() -> float:
+        """Return the controllable monotonic clock."""
+        return monotonic_time
+
+    def fake_sleep(seconds: float) -> None:
+        """Advance the controllable monotonic clock instead of actually sleeping."""
+        nonlocal monotonic_time
+        sleep_calls.append(seconds)
+        monotonic_time += seconds
+
+    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(sync_engine_module.time, "monotonic", fake_monotonic)
+    backend = sync_engine_module.ModalVolumeBackend("volume")
+
+    assert backend._record_shared_rate_limit_backoff() == 0.25
+    assert backend.exists("/hashes/second.done") is True
     assert sleep_calls == [0.25]
