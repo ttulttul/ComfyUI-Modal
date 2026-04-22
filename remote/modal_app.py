@@ -54,7 +54,7 @@ from ..settings import get_settings
 logger = logging.getLogger(__name__)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
-_MODAL_AUTO_DEPLOYED_APPS: set[tuple[str, str | None]] = set()
+_MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
@@ -85,6 +85,16 @@ class _PromptWarmupState:
     scheduled_slots: set[int] = field(default_factory=set)
     exact_component_parallelism: dict[str, int] = field(default_factory=dict)
     slot_futures: dict[int, Future[Any]] = field(default_factory=dict)
+
+
+@dataclass
+class _ModalAutoDeployState:
+    """Track one thread-safe deployed-app readiness lifecycle."""
+
+    condition: threading.Condition = field(default_factory=threading.Condition)
+    deploy_in_progress: bool = False
+    ready: bool = False
+    last_error: BaseException | None = None
 
 
 @dataclass
@@ -3667,6 +3677,50 @@ def _modal_deploy_cache_key() -> tuple[str, str | None]:
     return (settings.app_name, _modal_environment_name())
 
 
+def _modal_auto_deploy_state(
+    deploy_key: tuple[str, str | None],
+) -> _ModalAutoDeployState:
+    """Return the shared auto-deploy state bucket for one Modal app/environment."""
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        state = _MODAL_AUTO_DEPLOY_STATES.get(deploy_key)
+        if state is None:
+            state = _ModalAutoDeployState()
+            _MODAL_AUTO_DEPLOY_STATES[deploy_key] = state
+        return state
+
+
+def _lookup_deployed_remote_engine_with_retry(
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: float = 15.0,
+    initial_delay_seconds: float = 0.25,
+    max_delay_seconds: float = 2.0,
+) -> Any:
+    """Poll deployed Modal lookup until the freshly deployed app becomes discoverable."""
+    lookup_error_types = _modal_lookup_error_types()
+    if not lookup_error_types:
+        return _lookup_deployed_remote_engine(payload)
+
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    delay_seconds = max(0.0, initial_delay_seconds)
+    last_error: BaseException | None = None
+    while True:
+        try:
+            return _lookup_deployed_remote_engine(payload)
+        except lookup_error_types as exc:
+            last_error = exc
+            if not _is_missing_modal_deployment_error(exc):
+                raise
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0.0:
+                raise
+            time.sleep(min(delay_seconds, remaining_seconds))
+            delay_seconds = min(max_delay_seconds, max(delay_seconds * 2.0, initial_delay_seconds))
+    if last_error is not None:
+        raise last_error
+    raise ModalRemoteInvocationError("Deployed Modal lookup retry loop exited unexpectedly.")
+
+
 def _warmup_prompt_id(warmup_request: dict[str, Any]) -> str | None:
     """Return the prompt id that scopes proactive warmup state."""
     prompt_id = warmup_request.get("prompt_id")
@@ -3826,9 +3880,8 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
             return _invoke_remote_engine_warmup(remote_engine, warmup_request)
         except lookup_error_types as exc:
             if settings.auto_deploy:
-                _auto_deploy_modal_app(warmup_request, exc)
+                remote_engine = _auto_deploy_modal_app(warmup_request, exc)
                 try:
-                    remote_engine = _lookup_deployed_remote_engine(warmup_request)
                     return _invoke_remote_engine_warmup(remote_engine, warmup_request)
                 except lookup_error_types as retry_exc:
                     exc = retry_exc
@@ -4034,13 +4087,14 @@ def boost_mapped_component_warmup(
     return parallelism, refined_prompt_warmup_target
 
 
-def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException) -> None:
-    """Deploy the stable Modal cloud app once when deployed lookup fails."""
+def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException) -> Any:
+    """Deploy the stable Modal cloud app once and wait until deployed lookup becomes ready."""
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
     settings = get_settings()
     deploy_key = _modal_deploy_cache_key()
+    deploy_state = _modal_auto_deploy_state(deploy_key)
     cloud_module = _load_modal_cloud_module()
     cloud_app = getattr(cloud_module, "app", None)
     if cloud_app is None:
@@ -4048,24 +4102,46 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
             "Stable Modal cloud entry module did not expose a deployable app."
         )
 
-    with _MODAL_AUTO_DEPLOY_LOCK:
-        if deploy_key in _MODAL_AUTO_DEPLOYED_APPS:
-            if _is_missing_modal_deployment_error(lookup_error):
-                logger.warning(
-                    "Discarding stale auto-deploy cache entry for app=%s env=%s after missing deployment lookup failure: %s",
-                    settings.app_name,
-                    deploy_key[1] or "<default>",
-                    lookup_error,
-                )
-                _MODAL_AUTO_DEPLOYED_APPS.discard(deploy_key)
-            else:
+    while True:
+        with deploy_state.condition:
+            if not _is_missing_modal_deployment_error(lookup_error) and deploy_state.ready:
                 logger.info(
                     "Auto-deploy already completed for app=%s env=%s; reusing cached deployment state.",
                     settings.app_name,
                     deploy_key[1] or "<default>",
                 )
-                return
+                return _lookup_deployed_remote_engine(payload)
+            if _is_missing_modal_deployment_error(lookup_error) and deploy_state.ready:
+                logger.warning(
+                    "Discarding stale auto-deploy ready state for app=%s env=%s after missing deployment lookup failure: %s",
+                    settings.app_name,
+                    deploy_key[1] or "<default>",
+                    lookup_error,
+                )
+                deploy_state.ready = False
+            if deploy_state.deploy_in_progress:
+                logger.info(
+                    "Waiting for in-flight auto-deploy readiness for app=%s env=%s component=%s.",
+                    settings.app_name,
+                    deploy_key[1] or "<default>",
+                    payload.get("component_id"),
+                )
+                deploy_state.condition.wait()
+                if deploy_state.ready:
+                    return _lookup_deployed_remote_engine(payload)
+                if deploy_state.last_error is not None:
+                    logger.warning(
+                        "Retrying Modal auto-deploy for app=%s env=%s after previous readiness failure: %s",
+                        settings.app_name,
+                        deploy_key[1] or "<default>",
+                        deploy_state.last_error,
+                    )
+                continue
+            deploy_state.deploy_in_progress = True
+            deploy_state.last_error = None
+            break
 
+    try:
         logger.warning(
             "Deployed Modal app lookup failed for app=%s component=%s: %s. "
             "Attempting first-run auto-deploy from the custom node.",
@@ -4080,13 +4156,31 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
                 name=settings.app_name,
                 environment_name=deploy_key[1],
             )
-        _MODAL_AUTO_DEPLOYED_APPS.add(deploy_key)
         logger.info(
-            "Auto-deployed Modal app %s for env=%s in %.3fs.",
+            "Auto-deployed Modal app %s for env=%s in %.3fs; waiting for deployed lookup readiness.",
             settings.app_name,
             deploy_key[1] or "<default>",
             time.perf_counter() - deploy_started_at,
         )
+        remote_engine = _lookup_deployed_remote_engine_with_retry(payload)
+    except BaseException as exc:
+        with deploy_state.condition:
+            deploy_state.deploy_in_progress = False
+            deploy_state.last_error = exc
+            deploy_state.condition.notify_all()
+        raise
+
+    with deploy_state.condition:
+        deploy_state.deploy_in_progress = False
+        deploy_state.ready = True
+        deploy_state.last_error = None
+        deploy_state.condition.notify_all()
+    logger.info(
+        "Deployed Modal app %s for env=%s is now lookup-ready.",
+        settings.app_name,
+        deploy_key[1] or "<default>",
+    )
+    return remote_engine
 
 
 def _build_remote_interrupt_callback(_remote_engine: Any, payload: dict[str, Any]) -> Callable[[], Any] | None:
@@ -4161,9 +4255,8 @@ def _invoke_modal_payload_blocking(
             )
         except lookup_error_types as exc:
             if settings.auto_deploy:
-                _auto_deploy_modal_app(payload, exc)
+                remote_engine = _auto_deploy_modal_app(payload, exc)
                 try:
-                    remote_engine = _lookup_deployed_remote_engine(payload)
                     logger.info(
                         "Using auto-deployed Modal app %s for component %s.",
                         settings.app_name,
