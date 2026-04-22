@@ -454,6 +454,24 @@ def _release_remote_container_log_stream(task_id: str) -> None:
         stream_state.thread.join(timeout=0.2)
 
 
+def _close_remote_payload_stream(stream_events: Iterator[dict[str, Any]]) -> None:
+    """Best-effort close one streamed Modal iterator after the terminal result arrives."""
+    close_callable = getattr(stream_events, "close", None)
+    if not callable(close_callable):
+        return
+    try:
+        close_result = close_callable()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        logger.debug("Ignoring remote payload stream close failure: %s", exc)
+        return
+    if not asyncio.iscoroutine(close_result):
+        return
+    try:
+        asyncio.run(close_result)
+    except (RuntimeError, ValueError) as exc:
+        logger.debug("Ignoring async remote payload stream close failure: %s", exc)
+
+
 def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHandle | None:
     """Return the decoded prompt-scoped remote session handle for one payload."""
     remote_session = payload.get("remote_session")
@@ -2186,6 +2204,7 @@ def _consume_remote_payload_stream(
     result_payload: bytes | bytearray | None = None
     suppressed_progress_node_metadata: dict[str, dict[str, str | None]] = {}
     active_remote_log_task_id: str | None = None
+    should_close_stream = False
 
     try:
         for stream_event in stream_events:
@@ -2434,13 +2453,16 @@ def _consume_remote_payload_stream(
                     raise ModalRemoteInvocationError(
                         "Modal streamed payload result did not include transport-safe outputs."
                     ) from exc
-                continue
+                should_close_stream = True
+                break
             logger.debug(
                 "Ignoring unexpected streamed Modal event kind=%s for component=%s.",
                 event_kind,
                 payload.get("component_id"),
             )
     finally:
+        if should_close_stream:
+            _close_remote_payload_stream(stream_events)
         if active_remote_log_task_id is not None:
             _release_remote_container_log_stream(active_remote_log_task_id)
 
