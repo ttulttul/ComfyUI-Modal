@@ -27,6 +27,7 @@
 1. You mark nodes with `Run on Modal`.
 2. Queueing goes to `/modal/queue_prompt` instead of ComfyUI's normal `/prompt` route.
 3. The backend reads `extra_pnginfo.workflow`, including nested subgraph metadata, and resolves those markers onto queued prompt node ids.
+   Nested subgraph markers now prefer the most specific composed prompt path, so a marked inner node like `195:27` is not mistaken for an unrelated top-level node `27` when ids collide.
 4. Remote-marked nodes are partitioned into transport-aware components, with upstream auto-expansion when required by non-transportable inputs.
    If the coarse transport-aware split would create a cyclic quotient between components, the backend merges that SCC back into one larger remote component before rewrite.
 5. Each component is replaced with a generated `ModalUniversalExecutor_<hash>` proxy node.

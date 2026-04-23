@@ -626,10 +626,10 @@ def _resolve_prompt_node_ids_for_workflow_node(
 ) -> set[str]:
     """Resolve one saved workflow node id to matching queued prompt node ids."""
     path_segments = ancestor_node_ids + (workflow_node_id,)
-    resolved_prompt_node_ids: set[str] = set()
 
     for index in range(len(path_segments)):
         candidate = ":".join(path_segments[index:])
+        resolved_prompt_node_ids: set[str] = set()
         if candidate in prompt_node_ids:
             resolved_prompt_node_ids.add(candidate)
         descendant_prefix = f"{candidate}:"
@@ -638,9 +638,10 @@ def _resolve_prompt_node_ids_for_workflow_node(
             for prompt_node_id in prompt_node_ids
             if prompt_node_id.startswith(descendant_prefix)
         )
+        if resolved_prompt_node_ids:
+            return resolved_prompt_node_ids
 
-    if resolved_prompt_node_ids:
-        return resolved_prompt_node_ids
+    resolved_prompt_node_ids: set[str] = set()
 
     for ancestor_node_id in reversed(ancestor_node_ids):
         if ancestor_node_id in prompt_node_ids:
@@ -705,7 +706,7 @@ def _build_workflow_prompt_resolution_maps(
             ancestor_node_ids,
             prompt_node_ids,
         )
-        if workflow_node_id in prompt_node_ids:
+        if not ancestor_node_ids and workflow_node_id in prompt_node_ids:
             resolved_prompt_node_ids.add(workflow_node_id)
         if workflow_node_path in prompt_node_ids:
             resolved_prompt_node_ids.add(workflow_node_path)
@@ -783,7 +784,7 @@ def extract_remote_node_ids(
         properties = node.get("properties") or {}
         if properties.get(marker):
             node_id = str(node.get("id"))
-            if prompt_node_ids is None or node_id in prompt_node_ids:
+            if prompt_node_ids is None:
                 remote_node_ids.add(node_id)
                 continue
 
