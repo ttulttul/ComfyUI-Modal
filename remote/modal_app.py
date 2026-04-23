@@ -3809,7 +3809,7 @@ async def _invoke_bound_remote_engine_async(
     )
     cancellation_event = threading.Event()
     future = _REMOTE_MODAL_CALL_EXECUTOR.submit(
-        _invoke_remote_engine_payload,
+        _invoke_remote_engine_payload_with_recovery,
         remote_engine,
         dict(payload),
         kwargs_payload,
@@ -4203,6 +4203,27 @@ def _invoke_remote_engine_warmup(remote_engine: Any, warmup_request: dict[str, A
     return warmup_method(warmup_request)
 
 
+def _invoke_remote_engine_warmup_with_recovery(
+    remote_engine: Any,
+    warmup_request: dict[str, Any],
+) -> Any:
+    """Retry one warmup call after auto-deploy when a stale deployed handle vanishes."""
+    lookup_error_types = _modal_lookup_error_types()
+    settings = get_settings()
+    try:
+        return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+    except lookup_error_types as exc:
+        if not settings.auto_deploy or not _is_missing_modal_deployment_error(exc):
+            raise
+        logger.warning(
+            "Modal warmup invocation failed for component=%s because the deployed app was missing at call time: %s. Recreating the app and retrying.",
+            warmup_request.get("component_id"),
+            exc,
+        )
+        recovered_remote_engine = _auto_deploy_modal_app(warmup_request, exc)
+        return _invoke_remote_engine_warmup(recovered_remote_engine, warmup_request)
+
+
 def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
     """Warm one Modal container slot using deployed or ephemeral app state."""
     if modal is None:
@@ -4213,12 +4234,15 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
     if lookup_error_types:
         try:
             remote_engine = _lookup_deployed_remote_engine(warmup_request)
-            return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+            return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
         except lookup_error_types as exc:
             if settings.auto_deploy:
                 remote_engine = _auto_deploy_modal_app(warmup_request, exc)
                 try:
-                    return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+                    return _invoke_remote_engine_warmup_with_recovery(
+                        remote_engine,
+                        warmup_request,
+                    )
                 except lookup_error_types as retry_exc:
                     exc = retry_exc
             if not settings.allow_ephemeral_fallback:
@@ -4228,7 +4252,7 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
                 ) from exc
     else:
         remote_engine = _lookup_deployed_remote_engine(warmup_request)
-        return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+        return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
 
     cloud_module = _load_modal_cloud_module()
     cloud_app = getattr(cloud_module, "app", None)
@@ -4240,7 +4264,7 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
     run_context = cloud_app.run() if hasattr(cloud_app, "run") else nullcontext()
     with run_context:
         remote_engine = cloud_remote_engine()
-        return _invoke_remote_engine_warmup(remote_engine, warmup_request)
+        return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
 
 
 def _run_prompt_warmup_slot(
@@ -4566,6 +4590,39 @@ def _invoke_remote_engine_payload(
     )
 
 
+def _invoke_remote_engine_payload_with_recovery(
+    remote_engine: Any,
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    cancellation_event: threading.Event | None,
+) -> bytes:
+    """Retry one payload call after auto-deploy when a stale deployed handle vanishes."""
+    lookup_error_types = _modal_lookup_error_types()
+    settings = get_settings()
+    try:
+        return _invoke_remote_engine_payload(
+            remote_engine,
+            payload,
+            kwargs_payload,
+            cancellation_event,
+        )
+    except lookup_error_types as exc:
+        if not settings.auto_deploy or not _is_missing_modal_deployment_error(exc):
+            raise
+        logger.warning(
+            "Modal payload invocation failed for component=%s because the deployed app was missing at call time: %s. Recreating the app and retrying.",
+            payload.get("component_id"),
+            exc,
+        )
+        recovered_remote_engine = _auto_deploy_modal_app(payload, exc)
+        return _invoke_remote_engine_payload(
+            recovered_remote_engine,
+            payload,
+            kwargs_payload,
+            cancellation_event,
+        )
+
+
 def _invoke_modal_payload_blocking(
     payload: dict[str, Any],
     kwargs_payload: bytes,
@@ -4585,7 +4642,7 @@ def _invoke_modal_payload_blocking(
                 settings.app_name,
                 payload.get("component_id"),
             )
-            return _invoke_remote_engine_payload(
+            return _invoke_remote_engine_payload_with_recovery(
                 remote_engine,
                 payload,
                 kwargs_payload,
@@ -4600,7 +4657,7 @@ def _invoke_modal_payload_blocking(
                         settings.app_name,
                         payload.get("component_id"),
                     )
-                    return _invoke_remote_engine_payload(
+                    return _invoke_remote_engine_payload_with_recovery(
                         remote_engine,
                         payload,
                         kwargs_payload,
@@ -4628,7 +4685,7 @@ def _invoke_modal_payload_blocking(
             settings.app_name,
             payload.get("component_id"),
         )
-        return _invoke_remote_engine_payload(
+        return _invoke_remote_engine_payload_with_recovery(
             remote_engine,
             payload,
             kwargs_payload,
@@ -4652,7 +4709,7 @@ def _invoke_modal_payload_blocking(
     run_context = cloud_app.run() if hasattr(cloud_app, "run") else nullcontext()
     with run_context:
         remote_engine = cloud_remote_engine()
-        result = _invoke_remote_engine_payload(
+        result = _invoke_remote_engine_payload_with_recovery(
             remote_engine,
             payload,
             kwargs_payload,
