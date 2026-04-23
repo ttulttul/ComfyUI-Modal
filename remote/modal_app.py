@@ -3480,6 +3480,26 @@ def _annotate_implicit_batched_boundary_outputs(
     return annotated_outputs
 
 
+def _log_detached_mapped_lane_result(
+    task: asyncio.Task[None],
+    *,
+    component_id: str,
+    lane_index: int,
+) -> None:
+    """Consume and log any late failure from one detached mapped worker lane."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except BaseException as exc:
+        logger.warning(
+            "Detached mapped worker lane=%d for component=%s finished with an unawaited failure: %s",
+            lane_index,
+            component_id,
+            exc,
+        )
+
+
 async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Fan out one ordinary subgraph payload when batchable boundary inputs arrive zipped."""
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
@@ -3551,6 +3571,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
 
     static_outputs: tuple[Any, ...] = ()
     lane_remote_engines: list[Any] = []
+    seeded_lane_indices: set[int] = set()
     try:
         if use_seeded_remote_lanes:
             lane_remote_engines = [
@@ -3580,6 +3601,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     lane_seed_payload,
                     serialize_node_inputs(broadcast_inputs),
                 )
+                seeded_lane_indices.add(lane_index)
         elif static_execute_node_ids:
             static_response = await invoke_remote_engine_async(
                 _build_static_mapped_payload(hybrid_payload),
@@ -3591,6 +3613,8 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
 
         per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
         completed_items = 0
+        all_items_completed = asyncio.Event()
+        worker_failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
         item_queue: asyncio.Queue[int | None] = asyncio.Queue()
         for item_index in range(total_items):
             item_queue.put_nowait(item_index)
@@ -3600,44 +3624,80 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         async def run_worker(lane_index: int) -> None:
             """Execute queued implicit mapped items through one stable local worker lane."""
             nonlocal completed_items
-            if use_seeded_remote_lanes:
-                await seed_lane(lane_index)
-            while True:
-                item_index = await item_queue.get()
-                if item_index is None:
-                    return
-                if _local_processing_interrupted():
-                    _raise_local_interrupt()
-                try:
-                    item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
-                    item_inputs = dict(broadcast_inputs)
-                    for input_name, items in split_inputs.items():
-                        item_inputs[input_name] = items[item_index]
-                    if use_seeded_remote_lanes:
-                        item_response = await _invoke_bound_remote_engine_async(
-                            lane_remote_engines[lane_index],
-                            item_payload,
-                            serialize_node_inputs(item_inputs),
-                        )
-                    else:
-                        item_response = await invoke_remote_engine_async(
-                            item_payload,
-                            serialize_node_inputs(item_inputs),
-                        )
-                    per_item_outputs[item_index] = deserialize_node_outputs(item_response)
-                    completed_items += 1
-                    _emit_local_mapped_progress(payload, completed_items, total_items)
-                finally:
-                    _clear_local_mapped_lane_progress(payload, lane_index, item_index)
+            try:
+                if use_seeded_remote_lanes:
+                    await seed_lane(lane_index)
+                while True:
+                    item_index = await item_queue.get()
+                    if item_index is None:
+                        return
+                    if _local_processing_interrupted():
+                        _raise_local_interrupt()
+                    try:
+                        item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
+                        item_inputs = dict(broadcast_inputs)
+                        for input_name, items in split_inputs.items():
+                            item_inputs[input_name] = items[item_index]
+                        if use_seeded_remote_lanes:
+                            item_response = await _invoke_bound_remote_engine_async(
+                                lane_remote_engines[lane_index],
+                                item_payload,
+                                serialize_node_inputs(item_inputs),
+                            )
+                        else:
+                            item_response = await invoke_remote_engine_async(
+                                item_payload,
+                                serialize_node_inputs(item_inputs),
+                            )
+                        per_item_outputs[item_index] = deserialize_node_outputs(item_response)
+                        completed_items += 1
+                        _emit_local_mapped_progress(payload, completed_items, total_items)
+                        if completed_items >= total_items:
+                            all_items_completed.set()
+                    finally:
+                        _clear_local_mapped_lane_progress(payload, lane_index, item_index)
+            except BaseException as exc:
+                if not worker_failure.done():
+                    worker_failure.set_result(exc)
+                raise
 
         tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
+        for lane_index, task in enumerate(tasks):
+            task.add_done_callback(
+                lambda completed_task, lane_index=lane_index: _log_detached_mapped_lane_result(
+                    completed_task,
+                    component_id=str(payload.get("component_id", "modal-subgraph")),
+                    lane_index=lane_index,
+                )
+            )
+        completion_task = asyncio.create_task(all_items_completed.wait())
         try:
-            await asyncio.gather(*tasks)
-        except Exception:
+            while not all_items_completed.is_set():
+                wait_set: set[asyncio.Task[Any] | asyncio.Future[BaseException]] = {
+                    completion_task,
+                    worker_failure,
+                    *tasks,
+                }
+                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                if completion_task in done or all_items_completed.is_set():
+                    break
+                if worker_failure in done:
+                    raise worker_failure.result()
+                for task in done:
+                    if task in tasks:
+                        task_exc = task.exception()
+                        if task_exc is not None:
+                            raise task_exc
+            if not all(item_outputs is not None for item_outputs in per_item_outputs):
+                await asyncio.gather(*tasks)
+        except BaseException:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        finally:
+            completion_task.cancel()
+            await asyncio.gather(completion_task, return_exceptions=True)
 
         return serialize_node_outputs(
             _merge_static_and_mapped_outputs(
@@ -3671,7 +3731,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                             },
                             serialize_node_inputs({}),
                         )
-                        for lane_index in range(parallelism)
+                        for lane_index in sorted(seeded_lane_indices)
                     )
                 )
             else:
