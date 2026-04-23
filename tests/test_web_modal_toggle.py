@@ -62,6 +62,19 @@ def test_remote_modal_status_tracks_active_node_ids() -> None:
     assert "clearPromptRemoteStates(promptId)" in source
 
 
+def test_interrupted_prompts_clear_modal_ui_by_prompt_id() -> None:
+    """Interrupt cleanup should not depend on native execution events naming a specific node."""
+    source = _modal_toggle_source()
+
+    assert 'if (detail.phase === "execution_interrupted") {' in source
+    assert "function handlePromptInterruption(promptId)" in source
+    assert "clearGlobalStatusPhase(promptId);" in source
+    assert "clearPromptRemoteStates(promptId);" in source
+    assert 'api.addEventListener("execution_interrupted", (event) => {' in source
+    assert "const promptId = String(eventDetail(event).prompt_id ?? \"\");" in source
+    assert "handlePromptInterruption(promptId);" in source
+
+
 def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     """The frontend should distinguish ready, active, and completed remote nodes visually."""
     source = _modal_toggle_source()

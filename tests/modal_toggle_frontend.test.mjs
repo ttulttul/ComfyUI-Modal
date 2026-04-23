@@ -43,7 +43,9 @@ const transformedSource = `${[
   "  registerPromptComponents,",
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
+  "  handleModalStatus,",
   "  handleExecutionPhase,",
+  "  handlePromptInterruption,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  modalNodeStates,",
@@ -202,3 +204,53 @@ modalToggle.handleModalProgress({
   },
 });
 assert.equal(modalToggle.getRemoteVisualState({ id: "11" })?.phase, modalToggle.STATE_READY);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-e", ["10", "11"], [
+  {
+    representative_node_id: "10",
+    node_ids: ["10", "11"],
+  },
+]);
+modalToggle.handleExecutionPhase(
+  {
+    detail: {
+      prompt_id: "prompt-e",
+      node: "10",
+    },
+  },
+  modalToggle.EXECUTION_PHASE,
+);
+assert.equal(modalToggle.modalPromptStates.has("prompt-e"), true);
+assert.equal(modalToggle.modalNodeStates.get("10")?.phase, modalToggle.STATE_READY);
+modalToggle.handlePromptInterruption("prompt-e");
+assert.equal(modalToggle.modalPromptStates.has("prompt-e"), false);
+assert.equal(modalToggle.modalNodeStates.has("10"), false);
+assert.equal(modalToggle.modalNodeStates.has("11"), false);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-f", ["20", "21"], [
+  {
+    representative_node_id: "20",
+    node_ids: ["20", "21"],
+  },
+]);
+modalToggle.handleExecutionPhase(
+  {
+    detail: {
+      prompt_id: "prompt-f",
+      node: "20",
+    },
+  },
+  modalToggle.EXECUTION_PHASE,
+);
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-f",
+    phase: "execution_interrupted",
+    node_ids: ["20", "21"],
+  },
+});
+assert.equal(modalToggle.modalPromptStates.has("prompt-f"), false);
+assert.equal(modalToggle.modalNodeStates.has("20"), false);
+assert.equal(modalToggle.modalNodeStates.has("21"), false);
