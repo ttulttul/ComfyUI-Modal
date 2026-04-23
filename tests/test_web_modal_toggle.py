@@ -185,8 +185,11 @@ def test_ready_nodes_distinguish_active_component_members_and_cached_nodes() -> 
     """Ready nodes should visually distinguish active-component membership and cache hits."""
     source = _modal_toggle_source()
 
+    assert "function activeProgressNodeIds(promptId)" in source
     assert "function isNodeInActiveComponent(promptId, nodeIdValue)" in source
-    assert "const activeComponentNodeIds = resolveComponentNodeIds(promptId, activeNodeId);" in source
+    assert "const promptActiveNodeId = promptState.activeNodeId;" in source
+    assert "for (const liveProgressNodeId of activeProgressNodeIds(promptId)) {" in source
+    assert "const liveProgressComponentNodeIds = resolveComponentNodeIds(promptId, liveProgressNodeId);" in source
     assert "const descendantNodeIds = promptState.descendantNodeIdsByAncestor.get(safeNodeIdValue);" in source
     assert "const pulseRate = state?.isCachedRemoteNode ? 2 : 6;" in source
     assert "borderColor = state?.isActiveComponentMember" in source
@@ -203,7 +206,10 @@ def test_cached_node_hits_are_marked_without_fake_progress() -> None:
     assert "function clearNodeCached(nodeIdValue, promptId)" in source
     assert "function nodeCachedState(nodeIdValue, promptId)" in source
     assert "if (detail.cached_hit) {" in source
-    assert "markNodeCached(progressNodeId, promptId);" in source
+    assert "const cachedNodeIds = new Set(" in source
+    assert "[detail.node_id, detail.display_node_id, detail.real_node_id]" in source
+    assert "for (const cachedNodeId of cachedNodeIds) {" in source
+    assert "markNodeCached(cachedNodeId, promptId);" in source
     assert "const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;" in source
 
 
