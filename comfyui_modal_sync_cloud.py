@@ -3923,15 +3923,19 @@ def _comfyui_torch_packages() -> tuple[str, ...]:
     )
 
 
-def _prewarm_snapshot_state(settings: Any, snapshot_profile_key: str = "") -> None:
+def _prewarm_snapshot_state(
+    *,
+    gpu_snapshot_enabled: bool,
+    snapshot_profile_key: str = "",
+) -> None:
     """Run snapshot-safe initialization before Modal captures a memory snapshot."""
     with _timed_phase(
         "prewarm_snapshot_state",
-        gpu_snapshot=settings.enable_gpu_memory_snapshot,
+        gpu_snapshot=gpu_snapshot_enabled,
         snapshot_profile=snapshot_profile_key or None,
     ):
         _ensure_comfyui_support_packages()
-        if settings.enable_gpu_memory_snapshot:
+        if gpu_snapshot_enabled:
             _ensure_comfy_runtime_initialized(None)
             _load_execution_module()
             loader_prewarm_plans = _load_loader_snapshot_profile(snapshot_profile_key)
@@ -4427,16 +4431,21 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         """Modal runtime class that executes proxied ComfyUI payloads."""
         worker_affinity_key: str = modal.parameter(default="")
         snapshot_profile_key: str = modal.parameter(default="")
+        gpu_snapshot_enabled: bool = modal.parameter(default=False)
 
         @modal.enter(snap=True)
         def setup_snapshot_state(self) -> None:
             """Prepare snapshot-friendly runtime state before Modal captures memory."""
             with _timed_phase("remote_engine_setup_snapshot"):
-                _prewarm_snapshot_state(settings, self.snapshot_profile_key)
+                _prewarm_snapshot_state(
+                    gpu_snapshot_enabled=bool(self.gpu_snapshot_enabled),
+                    snapshot_profile_key=self.snapshot_profile_key,
+                )
                 logger.info(
-                    "RemoteEngine snapshot setup complete for worker_affinity_key=%s snapshot_profile_key=%s.",
+                    "RemoteEngine snapshot setup complete for worker_affinity_key=%s snapshot_profile_key=%s gpu_snapshot_enabled=%s.",
                     self.worker_affinity_key or None,
                     self.snapshot_profile_key or None,
+                    bool(self.gpu_snapshot_enabled),
                 )
 
         @modal.enter(snap=False)

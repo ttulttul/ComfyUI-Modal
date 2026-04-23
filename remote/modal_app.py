@@ -3716,15 +3716,19 @@ def _lookup_deployed_remote_engine(
     if not snapshot_profile_key:
         snapshot_profile_key = _store_loader_snapshot_profile(_build_loader_prewarm_plans(payload))
     logger.info(
-        "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s snapshot_profile=%s.",
+        "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s snapshot_profile=%s gpu_snapshot_enabled=%s.",
         settings.app_name,
         "RemoteEngine",
         payload.get("component_id"),
         affinity_key,
         snapshot_profile_key or None,
+        settings.enable_gpu_memory_snapshot,
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
-    remote_engine_kwargs: dict[str, Any] = {"worker_affinity_key": affinity_key}
+    remote_engine_kwargs: dict[str, Any] = {
+        "worker_affinity_key": affinity_key,
+        "gpu_snapshot_enabled": bool(settings.enable_gpu_memory_snapshot),
+    }
     if snapshot_profile_key:
         remote_engine_kwargs["snapshot_profile_key"] = snapshot_profile_key
     return remote_cls(**remote_engine_kwargs)
@@ -4730,14 +4734,16 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
         """Modal runtime class that executes proxied ComfyUI payloads."""
         worker_affinity_key: str = modal.parameter(default="")
         snapshot_profile_key: str = modal.parameter(default="")
+        gpu_snapshot_enabled: bool = modal.parameter(default=False)
 
         @modal.enter()
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
             logger.info(
-                "RemoteEngine setup complete for worker_affinity_key=%s snapshot_profile_key=%s.",
+                "RemoteEngine setup complete for worker_affinity_key=%s snapshot_profile_key=%s gpu_snapshot_enabled=%s.",
                 self.worker_affinity_key or None,
                 self.snapshot_profile_key or None,
+                bool(self.gpu_snapshot_enabled),
             )
 
         @modal.method()
@@ -4766,10 +4772,12 @@ else:
             self,
             worker_affinity_key: str | None = None,
             snapshot_profile_key: str | None = None,
+            gpu_snapshot_enabled: bool = False,
         ) -> None:
             """Record the optional worker-pool affinity and snapshot-profile keys."""
             self.worker_affinity_key = worker_affinity_key
             self.snapshot_profile_key = snapshot_profile_key
+            self.gpu_snapshot_enabled = gpu_snapshot_enabled
 
         def setup(self) -> None:
             """No-op setup for local fallback execution."""
