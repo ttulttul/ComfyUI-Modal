@@ -4163,6 +4163,30 @@ def test_modal_cloud_tracing_prompt_server_emits_executed_outputs(
     ]
 
 
+def test_modal_cloud_emits_restored_node_cache_events(
+    modal_cloud_module: Any,
+) -> None:
+    """Persisted node-cache restores should surface one cached-node marker per restored node."""
+    observed_updates: list[dict[str, Any]] = []
+
+    modal_cloud_module._emit_restored_node_cache_events(observed_updates.append, ["7", "9"])
+
+    assert observed_updates == [
+        {
+            "event_type": "node_cached",
+            "node_id": "7",
+            "display_node_id": "7",
+            "real_node_id": "7",
+        },
+        {
+            "event_type": "node_cached",
+            "node_id": "9",
+            "display_node_id": "9",
+            "real_node_id": "9",
+        },
+    ]
+
+
 def test_modal_cloud_tracing_prompt_server_emits_boundary_image_outputs(
     modal_cloud_module: Any,
 ) -> None:
@@ -7299,6 +7323,61 @@ def test_consume_remote_payload_stream_filters_static_sibling_ui_events_from_map
             "image_type": "PNG",
             "image_bytes": b"preview-bytes",
             "max_size": None,
+        }
+    ]
+
+
+def test_consume_remote_payload_stream_forwards_cached_node_markers(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Streamed node-cache hits should mark the matching UI node as cached without fake progress."""
+    progress_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: progress_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "1::static",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["1", "2", "12", "4"],
+        "execute_node_ids": ["12", "4"],
+        "extra_data": {"client_id": "client-1"},
+        "suppress_status_stream": True,
+    }
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "node_cached",
+                "node_id": "1",
+                "display_node_id": "1",
+                "real_node_id": "12",
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert progress_calls == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "1",
+            "value": 0.0,
+            "max_value": 1.0,
+            "display_node_id": "1",
+            "real_node_id": "12",
+            "cached_hit": True,
         }
     ]
 

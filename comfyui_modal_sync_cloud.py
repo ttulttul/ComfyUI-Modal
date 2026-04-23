@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
@@ -2522,6 +2522,26 @@ def _install_prompt_executor_persisted_cache_restore(
     )
 
 
+def _emit_restored_node_cache_events(
+    status_callback: Callable[[dict[str, Any]], None] | None,
+    restored_node_ids: Sequence[str],
+) -> None:
+    """Publish one status event per node whose outputs were restored from the persisted cache."""
+    if status_callback is None:
+        return
+
+    for node_id in restored_node_ids:
+        safe_node_id = str(node_id)
+        status_callback(
+            {
+                "event_type": "node_cached",
+                "node_id": safe_node_id,
+                "display_node_id": safe_node_id,
+                "real_node_id": safe_node_id,
+            }
+        )
+
+
 def _persist_node_output_cache_entries(
     executor: Any,
     *,
@@ -3283,6 +3303,7 @@ def _execute_subgraph_prompt(
                     component_id,
                     restored_node_ids,
                 )
+                _emit_restored_node_cache_events(status_callback, restored_node_ids)
         if not executor.success:
             _log_prompt_executor_failure_details(
                 component_id=component_id,

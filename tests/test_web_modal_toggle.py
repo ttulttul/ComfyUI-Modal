@@ -66,7 +66,8 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     """The frontend should distinguish ready, active, and completed remote nodes visually."""
     source = _modal_toggle_source()
 
-    assert 'const READY_BORDER_COLOR = "#22c55e";' in source
+    assert 'const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";' in source
+    assert 'const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";' in source
     assert 'const ACTIVE_BORDER_COLOR = "#a855f7";' in source
     assert 'const COMPLETE_BORDER_COLOR = "#16a34a";' in source
     assert 'const STATE_WAITING = "waiting";' in source
@@ -138,6 +139,8 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "setNodeProgressLane(" in source
     assert "function deriveRemoteNodePhase(phase, hasLiveProgress)" in source
     assert "isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === nodeId(node)," in source
+    assert "isActiveComponentMember: isNodeInActiveComponent(state.promptId, nodeId(node))," in source
+    assert "isCachedRemoteNode: Boolean(cachedState)," in source
     assert 'const panelY = node.size[1] + 6 / scale;' in source
     assert 'ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);' in source
     assert 'const headerText = hasAggregateProgress' in source
@@ -176,6 +179,32 @@ def test_mapped_lane_setup_events_render_placeholder_lane_bars() -> None:
     assert "Boolean(detail.setup_only)," in source
     assert "const hasSetupLaneProgress = setupProgressLanes.length > 0;" in source
     assert "const hasVisibleLaneProgress = visibleLaneProgress.length > 0;" in source
+
+
+def test_ready_nodes_distinguish_active_component_members_and_cached_nodes() -> None:
+    """Ready nodes should visually distinguish active-component membership and cache hits."""
+    source = _modal_toggle_source()
+
+    assert "function isNodeInActiveComponent(promptId, nodeIdValue)" in source
+    assert "const activeComponentNodeIds = resolveComponentNodeIds(promptId, activeNodeId);" in source
+    assert "const descendantNodeIds = promptState.descendantNodeIdsByAncestor.get(safeNodeIdValue);" in source
+    assert "const pulseRate = state?.isCachedRemoteNode ? 2 : 6;" in source
+    assert "borderColor = state?.isActiveComponentMember" in source
+    assert "READY_INACTIVE_COMPONENT_BORDER_COLOR" in source
+    assert "READY_ACTIVE_COMPONENT_BORDER_COLOR" in source
+
+
+def test_cached_node_hits_are_marked_without_fake_progress() -> None:
+    """Cache-hit markers should be tracked separately from numeric progress."""
+    source = _modal_toggle_source()
+
+    assert "const modalNodeCachedStates = new Map();" in source
+    assert "function markNodeCached(nodeIdValue, promptId)" in source
+    assert "function clearNodeCached(nodeIdValue, promptId)" in source
+    assert "function nodeCachedState(nodeIdValue, promptId)" in source
+    assert "if (detail.cached_hit) {" in source
+    assert "markNodeCached(progressNodeId, promptId);" in source
+    assert "const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;" in source
 
 
 def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
