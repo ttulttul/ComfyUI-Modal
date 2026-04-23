@@ -3764,9 +3764,6 @@ def _lookup_deployed_remote_engine(
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
     settings = get_settings()
-    affinity_key = affinity_key_override
-    if affinity_key is None:
-        affinity_key = _remote_worker_affinity_key(payload)
     loader_prewarm_plans: list[dict[str, Any]] = _build_loader_prewarm_plans(payload)
     snapshot_profile_key = ""
     payload_snapshot_profile_key = payload.get("snapshot_profile_key")
@@ -3786,13 +3783,12 @@ def _lookup_deployed_remote_engine(
         settings.app_name,
         "RemoteEngine",
         payload.get("component_id"),
-        affinity_key,
+        affinity_key_override or _remote_worker_affinity_key(payload),
         snapshot_profile_key or None,
         settings.enable_gpu_memory_snapshot,
     )
     remote_cls = modal.Cls.from_name(settings.app_name, "RemoteEngine")
     remote_engine_kwargs: dict[str, Any] = {
-        "worker_affinity_key": affinity_key,
         "gpu_snapshot_enabled": bool(settings.enable_gpu_memory_snapshot),
     }
     if snapshot_profile_key:
@@ -4808,7 +4804,6 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     )
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
-        worker_affinity_key: str = modal.parameter(default="")
         snapshot_profile_key: str = modal.parameter(default="")
         gpu_snapshot_enabled: bool = modal.parameter(default=False)
 
@@ -4816,8 +4811,7 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
         def setup(self) -> None:
             """Prepare the container process for headless node execution."""
             logger.info(
-                "RemoteEngine setup complete for worker_affinity_key=%s snapshot_profile_key=%s gpu_snapshot_enabled=%s.",
-                self.worker_affinity_key or None,
+                "RemoteEngine setup complete for snapshot_profile_key=%s gpu_snapshot_enabled=%s.",
                 self.snapshot_profile_key or None,
                 bool(self.gpu_snapshot_enabled),
             )
@@ -4846,12 +4840,10 @@ else:
 
         def __init__(
             self,
-            worker_affinity_key: str | None = None,
             snapshot_profile_key: str | None = None,
             gpu_snapshot_enabled: bool = False,
         ) -> None:
-            """Record the optional worker-pool affinity and snapshot-profile keys."""
-            self.worker_affinity_key = worker_affinity_key
+            """Record the optional snapshot-profile key and GPU snapshot mode."""
             self.snapshot_profile_key = snapshot_profile_key
             self.gpu_snapshot_enabled = gpu_snapshot_enabled
 

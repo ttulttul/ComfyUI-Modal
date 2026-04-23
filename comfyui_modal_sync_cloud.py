@@ -4436,7 +4436,6 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     @modal.concurrent(max_inputs=1)
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
-        worker_affinity_key: str = modal.parameter(default="")
         snapshot_profile_key: str = modal.parameter(default="")
         gpu_snapshot_enabled: bool = modal.parameter(default=False)
 
@@ -4449,8 +4448,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     snapshot_profile_key=self.snapshot_profile_key,
                 )
                 logger.info(
-                    "RemoteEngine snapshot setup complete for worker_affinity_key=%s snapshot_profile_key=%s gpu_snapshot_enabled=%s.",
-                    self.worker_affinity_key or None,
+                    "RemoteEngine snapshot setup complete for snapshot_profile_key=%s gpu_snapshot_enabled=%s.",
                     self.snapshot_profile_key or None,
                     bool(self.gpu_snapshot_enabled),
                 )
@@ -4461,8 +4459,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             with _timed_phase("remote_engine_setup_restored"):
                 _prewarm_restored_runtime()
                 logger.info(
-                    "RemoteEngine restored-runtime setup complete for worker_affinity_key=%s snapshot_profile_key=%s.",
-                    self.worker_affinity_key or None,
+                    "RemoteEngine restored-runtime setup complete for snapshot_profile_key=%s.",
                     self.snapshot_profile_key or None,
                 )
 
