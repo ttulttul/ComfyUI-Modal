@@ -176,6 +176,7 @@ Remote runtime behavior:
 - Coarse payloads now persist any synthesized loader `snapshot_profile_key` back onto themselves before later split static/mapped payloads are derived, so mapped worker lanes inherit the same snapshot-backed model profile instead of silently recomputing from a loader-free per-item subgraph.
 - The queue rewrite now stamps that same loader `snapshot_profile_key` onto already-materialized split proxy payloads up front, because runtime lookup happens too late to fix payloads that were cloned earlier during graph rewrite.
 - Remote lookup now also backfills the snapshot-profile record when a payload already carries the key but still has enough loader context to reconstruct the record, which keeps rewrite-time stamped profiles usable on first lookup.
+- Generic `snapshot_profile=None` workers now skip GPU snapshot runtime prewarm entirely. Only profiled `loader-profile:...` workers do full ComfyUI initialization in `snap=True`, which avoids wasting time on unstable no-profile GPU snapshots that do not help cold-start model loading anyway.
 - The default `scaledown_window` is `600` seconds with `min_containers=0`.
 - Warm containers can reuse loader state and `PromptExecutor` state across compatible requests.
 - Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.
