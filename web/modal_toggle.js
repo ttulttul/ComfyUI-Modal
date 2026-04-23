@@ -1351,25 +1351,62 @@ function getRemoteVisualState(node) {
 }
 
 /**
- * Return whether one visible node belongs to the component that is currently executing.
+ * Return the remote node ids that currently have live numeric or lane progress.
+ * @param {string} promptId
+ * @returns {string[]}
+ */
+function activeProgressNodeIds(promptId) {
+  const promptState = modalPromptStates.get(promptId);
+  if (!promptState) {
+    return [];
+  }
+  return promptState.remoteNodeIds.filter((candidateNodeId) =>
+    hasLiveNodeProgress(candidateNodeId, promptId),
+  );
+}
+
+/**
+ * Return whether one visible node belongs to any component that is currently executing.
  * @param {string} promptId
  * @param {string} nodeIdValue
  * @returns {boolean}
  */
 function isNodeInActiveComponent(promptId, nodeIdValue) {
   const promptState = modalPromptStates.get(promptId);
-  const activeNodeId = promptState?.activeNodeId ?? null;
-  if (!promptState || !activeNodeId) {
+  if (!promptState) {
     return false;
   }
 
-  const activeComponentNodeIds = resolveComponentNodeIds(promptId, activeNodeId);
-  if (!activeComponentNodeIds || activeComponentNodeIds.length === 0) {
-    return activeNodeId === String(nodeIdValue);
+  const activeComponentNodeIds = new Set();
+  const promptActiveNodeId = promptState.activeNodeId;
+  if (promptActiveNodeId) {
+    const promptActiveComponentNodeIds = resolveComponentNodeIds(promptId, promptActiveNodeId);
+    if (promptActiveComponentNodeIds?.length) {
+      for (const componentNodeId of promptActiveComponentNodeIds) {
+        activeComponentNodeIds.add(String(componentNodeId));
+      }
+    } else {
+      activeComponentNodeIds.add(String(promptActiveNodeId));
+    }
+  }
+
+  for (const liveProgressNodeId of activeProgressNodeIds(promptId)) {
+    const liveProgressComponentNodeIds = resolveComponentNodeIds(promptId, liveProgressNodeId);
+    if (liveProgressComponentNodeIds?.length) {
+      for (const componentNodeId of liveProgressComponentNodeIds) {
+        activeComponentNodeIds.add(String(componentNodeId));
+      }
+    } else {
+      activeComponentNodeIds.add(String(liveProgressNodeId));
+    }
+  }
+
+  if (activeComponentNodeIds.size === 0) {
+    return false;
   }
 
   const safeNodeIdValue = String(nodeIdValue);
-  if (activeComponentNodeIds.includes(safeNodeIdValue)) {
+  if (activeComponentNodeIds.has(safeNodeIdValue)) {
     return true;
   }
 
@@ -1377,7 +1414,7 @@ function isNodeInActiveComponent(promptId, nodeIdValue) {
   if (!descendantNodeIds || descendantNodeIds.size === 0) {
     return false;
   }
-  return activeComponentNodeIds.some((componentNodeId) => descendantNodeIds.has(componentNodeId));
+  return Array.from(activeComponentNodeIds).some((componentNodeId) => descendantNodeIds.has(componentNodeId));
 }
 
 /**
@@ -1742,7 +1779,17 @@ function handleModalProgress(event) {
     return;
   }
   if (detail.cached_hit) {
-    markNodeCached(progressNodeId, promptId);
+    const cachedNodeIds = new Set(
+      [detail.node_id, detail.display_node_id, detail.real_node_id]
+        .filter((nodeIdValue) => nodeIdValue != null)
+        .map((nodeIdValue) => String(nodeIdValue)),
+    );
+    if (cachedNodeIds.size === 0) {
+      cachedNodeIds.add(progressNodeId);
+    }
+    for (const cachedNodeId of cachedNodeIds) {
+      markNodeCached(cachedNodeId, promptId);
+    }
     return;
   }
   setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
