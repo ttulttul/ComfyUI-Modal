@@ -16,6 +16,14 @@ class _FakeRemoteModelNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeCheckpointLoaderSimpleNode:
+    """Fake root loader node that produces a non-transportable MODEL output."""
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    OUTPUT_IS_LIST = (False,)
+
+
 class _FakeRemoteSamplerNode:
     """Fake node that consumes a model and produces a transportable latent."""
 
@@ -1388,6 +1396,116 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
     assert rewritten_prompt["1__mapped"]["inputs"]["static_input_0"] == ["1", 1]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
     assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]
+
+
+def test_rewrite_stamps_snapshot_profile_on_split_static_and_mapped_payloads(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Split static and mapped payloads should inherit the same loader snapshot profile."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=True,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "CheckpointLoaderSimple": _FakeCheckpointLoaderSimpleNode,
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "LatentSource": _FakeLatentSourceNode,
+                "ModalMapInput": _FakeModalMapInputNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+            {"id": 5, "properties": {"is_modal_remote": False}},
+            {"id": 6, "properties": {"is_modal_remote": True}},
+            {"id": 7, "properties": {"is_modal_remote": True}},
+            {"id": 8, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": "base.safetensors"},
+            "_meta": {"title": "Checkpoint"},
+        },
+        "2": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Single Latent"},
+        },
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["2", 0]},
+            "_meta": {"title": "Unmapped Sampler"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["3", 0]},
+            "_meta": {"title": "Local Sink 1"},
+        },
+        "5": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Batch Latent Source"},
+        },
+        "6": {
+            "class_type": "ModalMapInput",
+            "inputs": {"value": ["5", 0]},
+            "_meta": {"title": "Map Input"},
+        },
+        "7": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["6", 0]},
+            "_meta": {"title": "Mapped Sampler"},
+        },
+        "8": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["7", 0]},
+            "_meta": {"title": "Local Sink 2"},
+        },
+    }
+
+    rewritten_prompt, _ = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    static_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    mapped_payload = rewritten_prompt["1__mapped"]["inputs"]["original_node_data"]
+
+    assert static_payload["snapshot_profile_key"].startswith("loader-profile:")
+    assert mapped_payload["snapshot_profile_key"] == static_payload["snapshot_profile_key"]
 
 
 def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_upstream(
