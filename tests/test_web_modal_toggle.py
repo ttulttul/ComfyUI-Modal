@@ -128,7 +128,7 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "if (detail.aggregate_only) {" in source
     assert "setNodeBatchProgress(" in source
     assert "function setNodeProgress(nodeIdValue, promptId, value, maxValue)" in source
-    assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex)" in source
+    assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false)" in source
     assert "function clearNodeProgressLane(nodeIdValue, promptId, laneId)" in source
     assert "function clearNodeProgress(nodeIdValue, promptId)" in source
     assert "state?.progress" in source
@@ -149,7 +149,7 @@ def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
 
     assert "const modalNodeProgressLanes = new Map();" in source
     assert "const modalNodeBatchProgress = new Map();" in source
-    assert "progressLanes.length > 0" in source
+    assert "visibleLaneProgress.length > 0" in source
     assert "const laneColors = [" in source
     assert 'const badgeText = hasBatchBadge' in source
     assert 'const badgeY = panelY + panelPaddingY;' in source
@@ -161,6 +161,21 @@ def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     assert "function deleteNodeProgressLane(nodeIdValue, promptId, laneId)" in source
     assert "function laneOwnerKey(promptId, nodeIdValue, laneId)" in source
     assert "promptState.laneNodeIdsByLane.set(safeLaneKey, safeNodeIdValue);" in source
+    assert "const setupProgressLanes = progressLanes.filter((laneProgress) => laneProgress.setupOnly);" in source
+    assert "const activeProgressLanes = progressLanes.filter((laneProgress) => !laneProgress.setupOnly);" in source
+    assert "laneProgress.setupOnly" in source
+    assert 'laneColor.replace("0.94)", `${0.28 + elapsedPulse * 0.22})`)' in source
+
+
+def test_mapped_lane_setup_events_render_placeholder_lane_bars() -> None:
+    """Lane setup events should render translucent placeholder bars before real node progress arrives."""
+    source = _modal_toggle_source()
+
+    assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false)" in source
+    assert "setupOnly: Boolean(setupOnly)," in source
+    assert "Boolean(detail.setup_only)," in source
+    assert "const hasSetupLaneProgress = setupProgressLanes.length > 0;" in source
+    assert "const hasVisibleLaneProgress = visibleLaneProgress.length > 0;" in source
 
 
 def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:

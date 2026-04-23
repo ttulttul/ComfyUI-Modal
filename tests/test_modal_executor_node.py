@@ -3626,6 +3626,43 @@ def test_remote_modal_consumes_streamed_progress_and_result(
     ]
 
 
+def test_emit_local_mapped_lane_progress_start_marks_lane_as_setup_only(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Provisioning a mapped lane should emit a dedicated setup-only lane progress event."""
+    emitted_progress: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: emitted_progress.append(kwargs),
+    )
+
+    remote_modal_app_module._emit_local_mapped_lane_progress_start(
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "component-1",
+            "extra_data": {"client_id": "client-1"},
+        },
+        lane_index=3,
+    )
+
+    assert emitted_progress == [
+        {
+            "prompt_id": "prompt-1",
+            "client_id": "client-1",
+            "node_id": "component-1",
+            "value": 0.0,
+            "max_value": 1.0,
+            "display_node_id": "component-1",
+            "lane_id": "3",
+            "item_index": None,
+            "setup_only": True,
+        }
+    ]
+
+
 def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -5902,6 +5939,7 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
 ) -> None:
     """Mapped remote scheduling should seed one bound worker lane before sending per-item calls there."""
     observed_calls: list[tuple[str, str, bool, tuple[str, ...], dict[str, Any]]] = []
+    observed_lane_setup_starts: list[tuple[str, int]] = []
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
@@ -5944,6 +5982,13 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
         remote_modal_app_module,
         "_invoke_bound_remote_engine_async",
         fake_invoke_bound_remote_engine_async,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_mapped_lane_progress_start",
+        lambda payload, lane_index, item_index=None: observed_lane_setup_starts.append(
+            (str(payload["component_id"]), int(lane_index))
+        ),
     )
 
     payload = {
@@ -6049,6 +6094,7 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
         ("engine:worker-pool:slot:0", "17::cleanup:0", True, (), {}),
         ("engine:worker-pool:slot:1", "17::cleanup:1", True, (), {}),
     ]
+    assert sorted(observed_lane_setup_starts) == [("17", 0), ("17", 1)]
     response_outputs = serialization_module.deserialize_node_outputs(response)[0]
     assert len(response_outputs) == 4
     assert [output.rsplit(":", 1)[-1] for output in response_outputs] == ["10", "11", "12", "13"]

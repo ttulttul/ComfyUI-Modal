@@ -697,7 +697,7 @@ function nodeProgressState(nodeIdValue, promptId) {
  * Return sorted per-lane progress payloads for one node when they belong to the prompt.
  * @param {string} nodeIdValue
  * @param {string} promptId
- * @returns {{ laneId: string, value: number, max: number, itemIndex: number | null, updatedAt: number }[]}
+ * @returns {{ laneId: string, value: number, max: number, itemIndex: number | null, updatedAt: number, setupOnly: boolean }[]}
  */
 function nodeProgressLanes(nodeIdValue, promptId) {
   const progressLaneState = modalNodeProgressLanes.get(String(nodeIdValue)) ?? null;
@@ -848,8 +848,9 @@ function setNodeProgress(nodeIdValue, promptId, value, maxValue) {
  * @param {number} value
  * @param {number} maxValue
  * @param {number | null | undefined} itemIndex
+ * @param {boolean} setupOnly
  */
-function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex) {
+function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false) {
   const safeLaneId = String(laneId ?? "");
   if (!safeLaneId) {
     return;
@@ -884,6 +885,7 @@ function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, ite
       max: safeMaxValue,
       itemIndex: Number.isFinite(Number(itemIndex)) ? Number(itemIndex) : null,
       updatedAt: nowMs(),
+      setupOnly: Boolean(setupOnly),
     });
     modalNodeProgressLanes.set(progressNodeId, laneState);
   }
@@ -1361,11 +1363,14 @@ function drawRemoteNodeDecoration(node, ctx) {
   ctx.restore();
 
   const progressLanes = Array.isArray(state?.progressLanes) ? state.progressLanes : [];
+  const setupProgressLanes = progressLanes.filter((laneProgress) => laneProgress.setupOnly);
+  const activeProgressLanes = progressLanes.filter((laneProgress) => !laneProgress.setupOnly);
   const batchProgress = state?.batchProgress ?? null;
   const hasAggregateProgress = Boolean(state?.progress && state.phase === STATE_ACTIVE);
-  const hasLaneProgress = progressLanes.length > 0 && state?.phase === STATE_ACTIVE;
+  const hasSetupLaneProgress = setupProgressLanes.length > 0;
+  const hasLaneProgress = activeProgressLanes.length > 0 && state?.phase === STATE_ACTIVE;
   const hasBatchBadge = Boolean(batchProgress && state?.phase === STATE_ACTIVE && !hasAggregateProgress);
-  if (!hasAggregateProgress && !hasLaneProgress && !hasBatchBadge) {
+  if (!hasAggregateProgress && !hasLaneProgress && !hasSetupLaneProgress && !hasBatchBadge) {
     return;
   }
 
@@ -1378,11 +1383,13 @@ function drawRemoteNodeDecoration(node, ctx) {
   const panelPaddingX = 6 / scale;
   const panelPaddingY = 6 / scale;
   const headerHeight = 16 / scale;
-  const laneBlockHeight = hasLaneProgress
-    ? progressLanes.length * laneHeight + (progressLanes.length - 1) * laneGap
+  const visibleLaneProgress = hasLaneProgress ? activeProgressLanes : setupProgressLanes;
+  const hasVisibleLaneProgress = visibleLaneProgress.length > 0;
+  const laneBlockHeight = hasVisibleLaneProgress
+    ? visibleLaneProgress.length * laneHeight + (visibleLaneProgress.length - 1) * laneGap
     : 0;
   const bodyHeight =
-    (hasLaneProgress ? laneBlockHeight + laneGap : 0) + (hasAggregateProgress ? aggregateHeight : 0);
+    (hasVisibleLaneProgress ? laneBlockHeight + laneGap : 0) + (hasAggregateProgress ? aggregateHeight : 0);
   const panelHeight = panelPaddingY * 2 + headerHeight + bodyHeight;
   const laneColors = [
     "rgba(196, 181, 253, 0.94)",
@@ -1406,8 +1413,8 @@ function drawRemoteNodeDecoration(node, ctx) {
 
   const headerText = hasAggregateProgress
     ? `${Math.round((state.progress.value / state.progress.max) * 100)}%`
-    : hasLaneProgress
-      ? `${progressLanes.length}x`
+    : hasVisibleLaneProgress
+      ? `${visibleLaneProgress.length}x`
       : null;
   const headerBaselineY = panelY + panelPaddingY + headerHeight / 2;
   if (headerText) {
@@ -1440,14 +1447,22 @@ function drawRemoteNodeDecoration(node, ctx) {
 
   const barY = panelY + panelPaddingY + headerHeight + laneGap;
 
-  if (hasLaneProgress) {
+  if (hasVisibleLaneProgress) {
     let laneY = barY;
-    for (const [laneIndex, laneProgress] of progressLanes.entries()) {
-      const laneRatio = Math.max(0, Math.min(1, laneProgress.value / laneProgress.max));
+    const elapsedPulse = (Math.sin(elapsed * 6) + 1) / 2;
+    for (const [laneIndex, laneProgress] of visibleLaneProgress.entries()) {
+      const laneRatio = laneProgress.setupOnly
+        ? 1
+        : Math.max(0, Math.min(1, laneProgress.value / laneProgress.max));
       const laneWidth = Math.max(0, barWidth * laneRatio);
       ctx.fillStyle = "rgba(15, 23, 42, 0.66)";
       ctx.fillRect(-borderWidth, laneY, barWidth, laneHeight);
-      ctx.fillStyle = laneColors[laneIndex % laneColors.length];
+      const laneColor = laneColors[laneIndex % laneColors.length];
+      if (laneProgress.setupOnly) {
+        ctx.fillStyle = laneColor.replace("0.94)", `${0.28 + elapsedPulse * 0.22})`);
+      } else {
+        ctx.fillStyle = laneColor;
+      }
       ctx.fillRect(-borderWidth, laneY, laneWidth, laneHeight);
       laneY += laneHeight + laneGap;
     }
@@ -1456,7 +1471,7 @@ function drawRemoteNodeDecoration(node, ctx) {
   if (hasAggregateProgress) {
     const progressRatio = Math.max(0, Math.min(1, state.progress.value / state.progress.max));
     const progressWidth = Math.max(0, barWidth * progressRatio);
-    const aggregateY = hasLaneProgress ? barY + laneBlockHeight + laneGap : barY;
+    const aggregateY = hasVisibleLaneProgress ? barY + laneBlockHeight + laneGap : barY;
     ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
     ctx.fillRect(-borderWidth, aggregateY, barWidth, aggregateHeight);
     ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
@@ -1642,6 +1657,7 @@ function handleModalProgress(event) {
       Number(detail.value ?? 0),
       Number(detail.max ?? 1),
       detail.item_index,
+      Boolean(detail.setup_only),
     );
     return;
   }
