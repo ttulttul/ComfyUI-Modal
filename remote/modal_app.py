@@ -2779,6 +2779,9 @@ def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
         "terminate_container_on_error": bool(payload.get("terminate_container_on_error", True)),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
     }
+    snapshot_profile_key = payload.get("snapshot_profile_key")
+    if isinstance(snapshot_profile_key, str) and snapshot_profile_key.strip():
+        shared_fields["snapshot_profile_key"] = snapshot_profile_key.strip()
     remote_session = payload.get("remote_session")
     if remote_session is not None:
         shared_fields["remote_session"] = copy.deepcopy(remote_session)
