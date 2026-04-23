@@ -171,6 +171,7 @@ Remote runtime behavior:
 - CPU memory snapshots are enabled by default.
 - GPU memory snapshots remain opt-in.
 - When GPU snapshots are enabled, Modal-Sync now derives a stable snapshot profile from root literal loader nodes and runs those loaders in `@modal.enter(snap=True)`, so later cold restarts for the same model set can restore post-loader GPU state instead of reloading those weights from scratch.
+- That snapshot profile now propagates through split static/mapped phase payloads as well, so mapped worker lanes can reuse the same snapshot-backed model set instead of silently falling back to the default no-profile worker class.
 - The default `scaledown_window` is `600` seconds with `min_containers=0`.
 - Warm containers can reuse loader state and `PromptExecutor` state across compatible requests.
 - Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.

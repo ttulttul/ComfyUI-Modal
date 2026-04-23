@@ -5107,13 +5107,14 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
     assert resolution_stats.session_restore_writes == 1
 
 
-def test_local_phase_payload_builder_preserves_remote_session(
+def test_local_phase_payload_builder_preserves_remote_session_and_snapshot_profile(
     remote_modal_app_module: Any,
 ) -> None:
-    """Explicit local mapped phase payloads should keep remote_session context."""
+    """Explicit local mapped phase payloads should keep remote_session context and snapshot profile."""
     payload = {
         "prompt_id": "prompt-1",
         "extra_data": {"client_id": "c-1"},
+        "snapshot_profile_key": "loader-profile:abc",
         "remote_session": {
             "__comfy_modal_remote_session_handle__": True,
             "session_id": "session-1",
@@ -5139,15 +5140,17 @@ def test_local_phase_payload_builder_preserves_remote_session(
 
     assert phase_payload["remote_session"]["session_id"] == "session-1"
     assert phase_payload["clear_remote_session"] is True
+    assert phase_payload["snapshot_profile_key"] == "loader-profile:abc"
 
 
-def test_cloud_phase_payload_builder_preserves_remote_session(
+def test_cloud_phase_payload_builder_preserves_remote_session_and_snapshot_profile(
     modal_cloud_module: Any,
 ) -> None:
-    """Explicit cloud mapped phase payloads should keep remote_session context."""
+    """Explicit cloud mapped phase payloads should keep remote_session context and snapshot profile."""
     payload = {
         "prompt_id": "prompt-1",
         "extra_data": {"client_id": "c-1"},
+        "snapshot_profile_key": "loader-profile:abc",
         "remote_session": {
             "__comfy_modal_remote_session_handle__": True,
             "session_id": "session-1",
@@ -5172,6 +5175,7 @@ def test_cloud_phase_payload_builder_preserves_remote_session(
 
     assert phase_payload["remote_session"]["session_id"] == "session-1"
     assert phase_payload["clear_remote_session"] is True
+    assert phase_payload["snapshot_profile_key"] == "loader-profile:abc"
 
 
 def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completion(
