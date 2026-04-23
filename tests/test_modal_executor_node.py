@@ -6410,6 +6410,144 @@ def test_implicitly_mapped_subgraph_returns_once_all_items_finish_without_waitin
     assert ("seed_done", "17::seed:0", "engine:worker-pool:slot:0") not in observed_events
 
 
+def test_implicitly_mapped_subgraph_ignores_late_lane_failure_after_all_items_complete(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    session_state_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A detached late lane must not fail the prompt after all mapped outputs are already complete."""
+    observed_events: list[tuple[str, str, str]] = []
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
+    monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_lookup_deployed_remote_engine",
+        lambda payload, affinity_key_override=None: (
+            f"engine:{affinity_key_override or remote_modal_app_module._remote_worker_affinity_key(payload)}"
+        ),
+    )
+
+    async def fake_invoke_bound_remote_engine_async(
+        remote_engine: Any,
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+    ) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        component_id = str(payload["component_id"])
+        if component_id == "17::seed:0":
+            observed_events.append(("seed_start", component_id, str(remote_engine)))
+            await asyncio.sleep(0.05)
+            raise RuntimeError("late lane failed after prompt completion")
+        if component_id == "17::seed:1":
+            observed_events.append(("seed_start", component_id, str(remote_engine)))
+            await asyncio.sleep(0)
+            observed_events.append(("seed_done", component_id, str(remote_engine)))
+            return serialization_module.serialize_node_outputs(())
+        if component_id.startswith("17::cleanup:"):
+            observed_events.append(("cleanup", component_id, str(remote_engine)))
+            return serialization_module.serialize_node_outputs(())
+        if component_id.startswith("17::item:"):
+            observed_events.append(("item", component_id, str(remote_engine)))
+            return serialization_module.serialize_node_outputs(
+                (f"{remote_engine}:{hydrated_inputs['remote_input_0']}",)
+            )
+        raise AssertionError(f"Unexpected seeded-lane payload: {payload!r}")
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_invoke_bound_remote_engine_async",
+        fake_invoke_bound_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {"model": 0, "seed": 0},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "12", "input_name": "model"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-1",
+            prompt_id="prompt-1",
+            owner_component_id="17",
+        ).to_payload(),
+        "clear_remote_session": True,
+        "static_to_mapped_boundaries": [
+            {
+                "proxy_name": "static_input_0",
+                "node_id": "4",
+                "output_index": 0,
+                "io_type": "MODEL",
+                "is_list": False,
+                "targets": [{"node_id": "12", "input_name": "model"}],
+            }
+        ],
+        "static_phase": {
+            "component_node_ids": ["4"],
+            "subgraph_prompt": {
+                "4": {"class_type": "LoraLoaderModelOnly", "inputs": {}},
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "static_input_0",
+                    "node_id": "4",
+                    "output_index": 0,
+                    "io_type": "MODEL",
+                    "is_list": False,
+                    "session_output": True,
+                    "preview_target_node_ids": [],
+                }
+            ],
+            "execute_node_ids": ["4"],
+        },
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": [10, 11],
+                    "static_input_0": {"__comfy_modal_remote_session_bridge_ref__": True},
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response)[0] == [
+        "engine:worker-pool:slot:1:10",
+        "engine:worker-pool:slot:1:11",
+    ]
+    assert ("cleanup", "17::cleanup:1", "engine:worker-pool:slot:1") in observed_events
+    assert ("cleanup", "17::cleanup:0", "engine:worker-pool:slot:0") not in observed_events
+
+
 def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets(
     remote_modal_app_module: Any,
     serialization_module: Any,

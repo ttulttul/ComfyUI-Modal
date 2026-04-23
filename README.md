@@ -313,6 +313,7 @@ Current mapped-execution rules:
 - mapped lane setup now emits its own `setup_only` lane events before a worker starts real node execution, and the frontend renders those as translucent pulsing lane bars. That makes cold-lane provisioning visible without pretending the worker is already doing sampler progress.
 - ready-state node outlines now distinguish component membership: bright green means the node belongs to the component that is currently running, while dark green means the node is remote-ready but belongs to some other component waiting its turn
 - persisted Modal node-cache hits now emit lightweight `cached_hit` UI markers, and the frontend renders those nodes with a slower green pulse so users can see when outputs were reused instead of recomputed
+- once all mapped outputs are already complete, late failures from detached spare lanes are treated as benign background shutdown noise instead of aborting the finished ComfyUI prompt
 - the proxy node itself now opts into ComfyUI `INPUT_IS_LIST` handling and unwraps singleton list wrappers on both `original_node_data` and ordinary inputs before dispatch, so list-valued mapped inputs reach the internal Modal scheduler without causing the whole proxy node to be auto-mapped once per item
 - static and per-item sub-runs prune the rewritten prompt to only the nodes they actually depend on before handing it to `PromptExecutor`, so shared-upstream hybrid components do not validate the other branch's batched inputs during the wrong sub-run
 
