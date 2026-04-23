@@ -1717,6 +1717,12 @@ function handleModalStatus(event) {
     return;
   }
 
+  if (detail.phase === "execution_interrupted") {
+    endSyntheticExecutionUi(promptId);
+    handlePromptInterruption(promptId);
+    return;
+  }
+
   if (detail.phase === EXECUTION_PHASE) {
     endSyntheticExecutionUi(promptId);
     const nextActiveNodeId =
@@ -1746,6 +1752,18 @@ function handleModalStatus(event) {
     setNodesPhase(nodeIds, STATE_COMPLETE, promptId);
     return;
   }
+}
+
+/**
+ * Clear one interrupted prompt's temporary Modal UI state.
+ * @param {string} promptId
+ */
+function handlePromptInterruption(promptId) {
+  if (!promptId) {
+    return;
+  }
+  clearGlobalStatusPhase(promptId);
+  clearPromptRemoteStates(promptId);
 }
 
 /**
@@ -2037,8 +2055,9 @@ function registerExecutionListeners() {
     handleExecutionPhase(event, STATE_ERROR);
   });
   api.addEventListener("execution_interrupted", (event) => {
-    endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""), true);
-    handleExecutionPhase(event, STATE_ERROR);
+    const promptId = String(eventDetail(event).prompt_id ?? "");
+    endSyntheticExecutionUi(promptId);
+    handlePromptInterruption(promptId);
   });
   api.addEventListener("execution_success", (event) => {
     const detail = eventDetail(event);
