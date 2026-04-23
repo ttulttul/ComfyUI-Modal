@@ -3015,18 +3015,17 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
-    try:
-        result = remote_modal_app_module._lookup_deployed_remote_engine(
-            {
-                "component_id": "component-1",
-                "subgraph_prompt": {
-                    "1": {
-                        "class_type": "UNETLoader",
-                        "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
-                    }
-                },
+    payload = {
+        "component_id": "component-1",
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
             }
-        )
+        },
+    }
+    try:
+        result = remote_modal_app_module._lookup_deployed_remote_engine(payload)
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
@@ -3036,6 +3035,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
     assert result["snapshot_profile_key"].startswith("loader-profile:")
     assert observed_kwargs == [result]
     assert result["snapshot_profile_key"] in snapshot_profiles
+    assert payload["snapshot_profile_key"] == result["snapshot_profile_key"]
 
 
 def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_sessions(
