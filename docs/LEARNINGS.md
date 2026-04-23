@@ -1,5 +1,9 @@
 # Learnings
 
+## 2026-04-23
+
+- Nested workflow-marker resolution has to stop at the first matching composed prompt-id suffix, not union every suffix. If a subgraph node `195:27` is marked remote and the prompt also contains an unrelated root node `27`, collecting both matches makes the real nested node look local during boundary validation and proxy rewrite.
+
 ## 2026-04-22
 
 - Prompt-scoped Modal class parameters are the wrong place to carry remote session identity. The `remote_session.session_id` belongs in the payload for data isolation, but `@app.cls` affinity should use reusable worker-pool slots like `worker-pool:slot:N`; otherwise every prompt asks Modal for a brand-new parameterized class instance and cross-prompt warm-container reuse never happens.
