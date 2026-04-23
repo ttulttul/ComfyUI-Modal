@@ -2078,6 +2078,7 @@ def _emit_local_modal_progress(
     item_index: int | None = None,
     aggregate_only: bool = False,
     setup_only: bool = False,
+    cached_hit: bool = False,
 ) -> None:
     """Forward remote numeric node progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -2107,6 +2108,8 @@ def _emit_local_modal_progress(
         payload["aggregate_only"] = True
     if setup_only:
         payload["setup_only"] = True
+    if cached_hit:
+        payload["cached_hit"] = True
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 
@@ -2672,6 +2675,51 @@ def _consume_remote_payload_stream(
                             client_id=client_id,
                             preview_target_node_ids=preview_target_node_ids,
                             image_value=deserialize_value(stream_event.get("value")),
+                        )
+                    continue
+                if event_type == "node_cached":
+                    progress_metadata = _progress_stream_event_metadata(stream_event)
+                    filter_node_id = (
+                        progress_metadata["filter_node_id"] if progress_metadata is not None else None
+                    )
+                    if (
+                        suppress_status_stream
+                        and not _should_forward_suppressed_stream_event(payload, filter_node_id)
+                    ):
+                        logger.debug(
+                            "Suppressing streamed Modal cached-node marker for component=%s node_id=%s real_node_id=%s because it does not belong to this mapped/static payload.",
+                            payload.get("component_id"),
+                            stream_event.get("node_id"),
+                            stream_event.get("real_node_id"),
+                        )
+                        continue
+                    reported_node_id = (
+                        progress_metadata["node_id"] if progress_metadata is not None else None
+                    )
+                    if reported_node_id is not None:
+                        display_node_id = (
+                            progress_metadata["display_node_id"]
+                            if progress_metadata is not None
+                            else str(reported_node_id)
+                        )
+                        real_node_id = (
+                            progress_metadata["real_node_id"] if progress_metadata is not None else None
+                        )
+                        logger.debug(
+                            "Forwarding streamed Modal cached-node marker for component=%s node_id=%s real_node_id=%s.",
+                            payload.get("component_id"),
+                            reported_node_id,
+                            real_node_id,
+                        )
+                        _emit_local_modal_progress(
+                            prompt_id=prompt_id,
+                            client_id=client_id,
+                            node_id=str(reported_node_id),
+                            value=0.0,
+                            max_value=1.0,
+                            display_node_id=display_node_id,
+                            real_node_id=real_node_id,
+                            cached_hit=True,
                         )
                     continue
                 logger.info(

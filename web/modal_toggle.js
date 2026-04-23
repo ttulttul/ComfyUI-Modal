@@ -8,7 +8,8 @@ const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
 const SETUP_BORDER_COLOR = "#f59e0b";
-const READY_BORDER_COLOR = "#22c55e";
+const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";
+const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";
 const ACTIVE_BORDER_COLOR = "#a855f7";
 const COMPLETE_BORDER_COLOR = "#16a34a";
 const ERROR_BORDER_COLOR = "#ef4444";
@@ -27,6 +28,7 @@ const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
 const modalNodeProgressLanes = new Map();
 const modalNodeBatchProgress = new Map();
+const modalNodeCachedStates = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
 const syntheticPromptUiStates = new Map();
@@ -448,7 +450,8 @@ function refreshCanvasAnimation() {
   const hasAnimatedState = Array.from(modalNodeStates.values()).some((state) =>
     [STATE_SETUP, STATE_READY, STATE_ACTIVE, STATE_ERROR].includes(state.phase),
   );
-  if (!hasAnimatedState) {
+  const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;
+  if (!hasAnimatedState && !hasCachedPulse) {
     animationFrameHandle = null;
     return;
   }
@@ -520,6 +523,9 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     });
     if (phase === STATE_ERROR) {
       scheduleNodeClear(currentNodeId, promptId, ERROR_CLEAR_DELAY_MS);
+    }
+    if (phase === STATE_SETUP || phase === STATE_ERROR) {
+      clearNodeCached(currentNodeId, promptId);
     }
     if (phase === STATE_COMPLETE || phase === STATE_ERROR) {
       clearNodeProgress(currentNodeId, promptId);
@@ -785,6 +791,56 @@ function clearNodeProgress(nodeIdValue, promptId) {
       continue;
     }
     modalNodeProgressLanes.delete(progressNodeId);
+  }
+}
+
+/**
+ * Return one cached-node marker when it belongs to the prompt.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ * @returns {{ promptId: string, cachedAt: number } | null}
+ */
+function nodeCachedState(nodeIdValue, promptId) {
+  const cachedState = modalNodeCachedStates.get(String(nodeIdValue)) ?? null;
+  return cachedState?.promptId === promptId ? cachedState : null;
+}
+
+/**
+ * Mark one node and its visible ancestors as restored from the remote Modal node-output cache.
+ * @param {string} nodeIdValue
+ * @param {string} promptId
+ */
+function markNodeCached(nodeIdValue, promptId) {
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+  for (const progressNodeId of progressNodeIds) {
+    if (!shouldApplyPromptState(progressNodeId, promptId)) {
+      continue;
+    }
+    modalNodeCachedStates.set(progressNodeId, {
+      promptId,
+      cachedAt: nowMs(),
+    });
+  }
+  ensureAnimationLoop();
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+/**
+ * Remove one cached-node marker from a node and its visible ancestors.
+ * @param {string} nodeIdValue
+ * @param {string | undefined} promptId
+ */
+function clearNodeCached(nodeIdValue, promptId) {
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+  for (const progressNodeId of progressNodeIds) {
+    const cachedState = modalNodeCachedStates.get(progressNodeId);
+    if (!cachedState) {
+      continue;
+    }
+    if (promptId && cachedState.promptId !== promptId) {
+      continue;
+    }
+    modalNodeCachedStates.delete(progressNodeId);
   }
 }
 
@@ -1278,16 +1334,50 @@ function getRemoteVisualState(node) {
   const promptState = modalPromptStates.get(state.promptId);
   const progressState = nodeProgressState(nodeId(node), state.promptId);
   const progressLanes = nodeProgressLanes(nodeId(node), state.promptId);
+  const cachedState = nodeCachedState(nodeId(node), state.promptId);
   const batchProgressState = modalNodeBatchProgress.get(nodeId(node)) ?? null;
   const hasLiveProgress = hasLiveNodeProgress(nodeId(node), state.promptId);
   return {
     ...state,
     phase: deriveRemoteNodePhase(state.phase, hasLiveProgress),
     isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === nodeId(node),
+    isActiveComponentMember: isNodeInActiveComponent(state.promptId, nodeId(node)),
+    isCachedRemoteNode: Boolean(cachedState),
+    cachedAt: cachedState?.cachedAt ?? null,
     progress: progressState,
     batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,
     progressLanes,
   };
+}
+
+/**
+ * Return whether one visible node belongs to the component that is currently executing.
+ * @param {string} promptId
+ * @param {string} nodeIdValue
+ * @returns {boolean}
+ */
+function isNodeInActiveComponent(promptId, nodeIdValue) {
+  const promptState = modalPromptStates.get(promptId);
+  const activeNodeId = promptState?.activeNodeId ?? null;
+  if (!promptState || !activeNodeId) {
+    return false;
+  }
+
+  const activeComponentNodeIds = resolveComponentNodeIds(promptId, activeNodeId);
+  if (!activeComponentNodeIds || activeComponentNodeIds.length === 0) {
+    return activeNodeId === String(nodeIdValue);
+  }
+
+  const safeNodeIdValue = String(nodeIdValue);
+  if (activeComponentNodeIds.includes(safeNodeIdValue)) {
+    return true;
+  }
+
+  const descendantNodeIds = promptState.descendantNodeIdsByAncestor.get(safeNodeIdValue);
+  if (!descendantNodeIds || descendantNodeIds.size === 0) {
+    return false;
+  }
+  return activeComponentNodeIds.some((componentNodeId) => descendantNodeIds.has(componentNodeId));
 }
 
 /**
@@ -1317,10 +1407,17 @@ function drawRemoteNodeDecoration(node, ctx) {
       .padStart(2, "0")}`;
     shadowColor = `rgba(245, 158, 11, ${0.25 + pulse * 0.35})`;
   } else if (state?.phase === STATE_READY) {
-    const pulse = (Math.sin(elapsed * 6) + 1) / 2;
-    borderColor = READY_BORDER_COLOR;
-    shadowColor = "rgba(34, 197, 94, 0.35)";
-    fillColor = `rgba(134, 239, 172, ${0.12 + pulse * 0.08})`;
+    const pulseRate = state?.isCachedRemoteNode ? 2 : 6;
+    const pulse = (Math.sin(elapsed * pulseRate) + 1) / 2;
+    borderColor = state?.isActiveComponentMember
+      ? READY_ACTIVE_COMPONENT_BORDER_COLOR
+      : READY_INACTIVE_COMPONENT_BORDER_COLOR;
+    shadowColor = state?.isActiveComponentMember
+      ? `rgba(34, 197, 94, ${0.24 + pulse * 0.18})`
+      : `rgba(22, 101, 52, ${0.18 + pulse * 0.12})`;
+    fillColor = state?.isActiveComponentMember
+      ? `rgba(134, 239, 172, ${0.1 + pulse * 0.07})`
+      : `rgba(74, 222, 128, ${0.06 + pulse * 0.04})`;
   } else if (state?.phase === STATE_ACTIVE) {
     const pulse = (Math.sin(elapsed * 7) + 1) / 2;
     borderColor = `${ACTIVE_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
@@ -1329,9 +1426,15 @@ function drawRemoteNodeDecoration(node, ctx) {
     shadowColor = `rgba(168, 85, 247, ${0.28 + pulse * 0.32})`;
     fillColor = `rgba(216, 180, 254, ${0.16 + pulse * 0.1})`;
   } else if (state?.phase === STATE_COMPLETE) {
+    const pulseRate = state?.isCachedRemoteNode ? 2 : 0;
+    const pulse = pulseRate > 0 ? (Math.sin(elapsed * pulseRate) + 1) / 2 : 0;
     borderColor = COMPLETE_BORDER_COLOR;
-    shadowColor = "rgba(34, 197, 94, 0.28)";
-    fillColor = "rgba(134, 239, 172, 0.14)";
+    shadowColor = state?.isCachedRemoteNode
+      ? `rgba(34, 197, 94, ${0.16 + pulse * 0.12})`
+      : "rgba(34, 197, 94, 0.28)";
+    fillColor = state?.isCachedRemoteNode
+      ? `rgba(134, 239, 172, ${0.1 + pulse * 0.06})`
+      : "rgba(134, 239, 172, 0.14)";
   } else if (state?.phase === STATE_ERROR) {
     const pulse = (Math.sin(elapsed * 6) + 1) / 2;
     borderColor = `${ERROR_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
@@ -1638,6 +1741,10 @@ function handleModalProgress(event) {
     setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
     return;
   }
+  if (detail.cached_hit) {
+    markNodeCached(progressNodeId, promptId);
+    return;
+  }
   setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
   if (detail.lane_id != null) {
     setPromptActiveNode(promptId, null);
@@ -1741,6 +1848,7 @@ function clearPromptRemoteStates(promptId) {
   for (const remoteNodeId of promptState.remoteNodeIds) {
     clearNodeTimer(remoteNodeId);
     clearNodeProgress(remoteNodeId, promptId);
+    clearNodeCached(remoteNodeId, promptId);
     const currentState = modalNodeStates.get(remoteNodeId);
     if (currentState?.promptId === promptId) {
       modalNodeStates.delete(remoteNodeId);
@@ -1749,6 +1857,7 @@ function clearPromptRemoteStates(promptId) {
   for (const ancestorNodeId of promptState.descendantNodeIdsByAncestor.keys()) {
     clearNodeTimer(ancestorNodeId);
     clearNodeProgress(ancestorNodeId, promptId);
+    clearNodeCached(ancestorNodeId, promptId);
     const currentState = modalNodeStates.get(ancestorNodeId);
     if (currentState?.promptId === promptId) {
       modalNodeStates.delete(ancestorNodeId);
