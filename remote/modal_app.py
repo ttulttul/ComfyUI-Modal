@@ -2077,6 +2077,7 @@ def _emit_local_modal_progress(
     clear: bool = False,
     item_index: int | None = None,
     aggregate_only: bool = False,
+    setup_only: bool = False,
 ) -> None:
     """Forward remote numeric node progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -2104,6 +2105,8 @@ def _emit_local_modal_progress(
         payload["item_index"] = int(item_index)
     if aggregate_only:
         payload["aggregate_only"] = True
+    if setup_only:
+        payload["setup_only"] = True
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 
@@ -3211,7 +3214,7 @@ def _clear_local_mapped_lane_progress(
 def _emit_local_mapped_lane_progress_start(
     payload: dict[str, Any],
     lane_index: int,
-    item_index: int,
+    item_index: int | None = None,
 ) -> None:
     """Create or reset one mapped worker lane before remote progress begins arriving."""
     prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
@@ -3229,6 +3232,7 @@ def _emit_local_mapped_lane_progress_start(
         display_node_id=display_node_id,
         lane_id=str(lane_index),
         item_index=item_index,
+        setup_only=True,
     )
 
 
@@ -3626,6 +3630,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
             nonlocal completed_items
             try:
                 if use_seeded_remote_lanes:
+                    _emit_local_mapped_lane_progress_start(payload, lane_index)
                     await seed_lane(lane_index)
                 while True:
                     item_index = await item_queue.get()
