@@ -2387,7 +2387,7 @@ def test_modal_cloud_prewarms_snapshot_state_without_gpu_runtime_by_default(
     )
 
     modal_cloud_module._prewarm_snapshot_state(
-        types.SimpleNamespace(enable_gpu_memory_snapshot=False)
+        gpu_snapshot_enabled=False,
     )
 
     assert calls == ["support"]
@@ -2438,8 +2438,8 @@ def test_modal_cloud_prewarms_snapshot_loader_profile_when_gpu_snapshots_enabled
     )
 
     modal_cloud_module._prewarm_snapshot_state(
-        types.SimpleNamespace(enable_gpu_memory_snapshot=True),
-        "loader-profile:abc",
+        gpu_snapshot_enabled=True,
+        snapshot_profile_key="loader-profile:abc",
     )
 
     assert calls == [
@@ -2474,7 +2474,7 @@ def test_modal_cloud_prewarms_snapshot_state_fully_for_gpu_snapshots(
     )
 
     modal_cloud_module._prewarm_snapshot_state(
-        types.SimpleNamespace(enable_gpu_memory_snapshot=True)
+        gpu_snapshot_enabled=True,
     )
 
     assert calls == ["support", "runtime:None", "execution"]
@@ -2962,8 +2962,16 @@ def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
         }
     )
 
-    assert result == {"worker_affinity_key": "worker-pool:slot:0"}
-    assert observed_kwargs == [{"worker_affinity_key": "worker-pool:slot:0"}]
+    assert result == {
+        "worker_affinity_key": "worker-pool:slot:0",
+        "gpu_snapshot_enabled": False,
+    }
+    assert observed_kwargs == [
+        {
+            "worker_affinity_key": "worker-pool:slot:0",
+            "gpu_snapshot_enabled": False,
+        }
+    ]
 
 
 def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu_snapshots(
@@ -3024,6 +3032,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
         remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
     assert result["worker_affinity_key"] == "worker-pool:slot:0"
+    assert result["gpu_snapshot_enabled"] is True
     assert result["snapshot_profile_key"].startswith("loader-profile:")
     assert observed_kwargs == [result]
     assert result["snapshot_profile_key"] in snapshot_profiles
@@ -3080,11 +3089,23 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
         }
     )
 
-    assert first_result == {"worker_affinity_key": "worker-pool:slot:0"}
-    assert second_result == {"worker_affinity_key": "worker-pool:slot:0"}
+    assert first_result == {
+        "worker_affinity_key": "worker-pool:slot:0",
+        "gpu_snapshot_enabled": False,
+    }
+    assert second_result == {
+        "worker_affinity_key": "worker-pool:slot:0",
+        "gpu_snapshot_enabled": False,
+    }
     assert observed_kwargs == [
-        {"worker_affinity_key": "worker-pool:slot:0"},
-        {"worker_affinity_key": "worker-pool:slot:0"},
+        {
+            "worker_affinity_key": "worker-pool:slot:0",
+            "gpu_snapshot_enabled": False,
+        },
+        {
+            "worker_affinity_key": "worker-pool:slot:0",
+            "gpu_snapshot_enabled": False,
+        },
     ]
 
 
