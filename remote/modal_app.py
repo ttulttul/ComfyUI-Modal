@@ -3710,6 +3710,14 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     finally:
                         _clear_local_mapped_lane_progress(payload, lane_index, item_index)
             except BaseException as exc:
+                if all_items_completed.is_set():
+                    logger.info(
+                        "Ignoring late mapped worker failure after component=%s already completed all items lane=%d: %s",
+                        payload.get("component_id"),
+                        lane_index,
+                        exc,
+                    )
+                    return
                 if not worker_failure.done():
                     worker_failure.set_result(exc)
                 raise
