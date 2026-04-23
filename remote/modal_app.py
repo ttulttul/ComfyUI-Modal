@@ -4029,9 +4029,17 @@ def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]
     return plans
 
 
-def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any]:
+def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Extract the prompt-scoped warmup-relevant fields from one payload."""
+    settings = get_settings()
     loader_prewarm_plans = _build_loader_prewarm_plans(payload)
+    snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
+    if settings.enable_gpu_memory_snapshot and not snapshot_profile_key:
+        logger.info(
+            "Skipping proactive Modal warmup request for component=%s because GPU snapshots are enabled and no loader snapshot profile was derived.",
+            payload.get("component_id"),
+        )
+        return None
     return {
         "prompt_id": (
             str(payload.get("prompt_id"))
@@ -4046,7 +4054,7 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any]:
         "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
         "loader_prewarm_plans": loader_prewarm_plans,
-        "snapshot_profile_key": _store_loader_snapshot_profile(loader_prewarm_plans),
+        "snapshot_profile_key": snapshot_profile_key,
     }
 
 
@@ -4283,7 +4291,7 @@ async def _await_prompt_warmup_slots(
 
 
 def ensure_remote_warm_capacity(
-    warmup_request: dict[str, Any],
+    warmup_request: dict[str, Any] | None,
     *,
     warmup_target: int,
     reason: str,
@@ -4293,6 +4301,8 @@ def ensure_remote_warm_capacity(
     if not settings.enable_proactive_warmup:
         return 0
     if settings.execution_mode == "local" or modal is None:
+        return 0
+    if warmup_request is None:
         return 0
 
     prompt_id = _warmup_prompt_id(warmup_request)

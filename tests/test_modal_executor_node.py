@@ -709,6 +709,7 @@ def test_build_prompt_warmup_request_includes_root_loader_prewarm_plans(
 ) -> None:
     """Warmup requests should synthesize one-node plans for root literal loader nodes only."""
     monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "false")
     remote_modal_app_module.get_settings.cache_clear()
     try:
         warmup_request = remote_modal_app_module._build_prompt_warmup_request(
@@ -802,6 +803,33 @@ def test_build_prompt_warmup_request_registers_snapshot_profile_when_gpu_snapsho
     assert snapshot_profile_key.startswith("loader-profile:")
     assert snapshot_profile_key in snapshot_profiles
     assert snapshot_profiles[snapshot_profile_key]["loader_prewarm_plans"] == warmup_request["loader_prewarm_plans"]
+
+
+def test_build_prompt_warmup_request_skips_generic_gpu_snapshot_warmup_without_profile(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Generic proactive warmup should be skipped when GPU snapshots are enabled without a loader profile."""
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        warmup_request = remote_modal_app_module._build_prompt_warmup_request(
+            {
+                "prompt_id": "prompt-1",
+                "component_id": "component-1",
+                "subgraph_prompt": {
+                    "5": {
+                        "class_type": "KSampler",
+                        "inputs": {"model": ["1", 0]},
+                    }
+                },
+            }
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert warmup_request is None
 
 
 def test_register_exact_component_parallelism_refines_prompt_target(
@@ -2964,12 +2992,12 @@ def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
 
     assert result == {
         "worker_affinity_key": "worker-pool:slot:0",
-        "gpu_snapshot_enabled": False,
+        "gpu_snapshot_enabled": True,
     }
     assert observed_kwargs == [
         {
             "worker_affinity_key": "worker-pool:slot:0",
-            "gpu_snapshot_enabled": False,
+            "gpu_snapshot_enabled": True,
         }
     ]
 
@@ -3163,20 +3191,20 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
 
     assert first_result == {
         "worker_affinity_key": "worker-pool:slot:0",
-        "gpu_snapshot_enabled": False,
+        "gpu_snapshot_enabled": True,
     }
     assert second_result == {
         "worker_affinity_key": "worker-pool:slot:0",
-        "gpu_snapshot_enabled": False,
+        "gpu_snapshot_enabled": True,
     }
     assert observed_kwargs == [
         {
             "worker_affinity_key": "worker-pool:slot:0",
-            "gpu_snapshot_enabled": False,
+            "gpu_snapshot_enabled": True,
         },
         {
             "worker_affinity_key": "worker-pool:slot:0",
-            "gpu_snapshot_enabled": False,
+            "gpu_snapshot_enabled": True,
         },
     ]
 

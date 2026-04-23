@@ -172,7 +172,8 @@ def get_settings() -> ModalSyncSettings:
         auto_deploy=_read_bool_env("COMFY_MODAL_AUTO_DEPLOY") is not False,
         allow_ephemeral_fallback=_read_bool_env("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK") or False,
         enable_memory_snapshot=_read_bool_env("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT") is not False,
-        enable_gpu_memory_snapshot=_read_bool_env("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT") or False,
+        enable_gpu_memory_snapshot=_read_bool_env("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT")
+        is not False,
         execution_mode=execution_mode,
         sync_custom_nodes=sync_custom_nodes,
         volume_name=os.getenv("COMFY_MODAL_VOLUME_NAME", "comfy-universal-storage"),
