@@ -2951,11 +2951,11 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     assert deploy_calls == [("comfy-modal-sync", "main")]
 
 
-def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
+def test_lookup_deployed_remote_engine_excludes_affinity_from_modal_class_parameters(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Deployed Modal lookups should use keyword parameterization for reusable worker-pool routing."""
+    """Deployed Modal lookups should keep scheduler lane affinity out of Modal class identity."""
     observed_kwargs: list[dict[str, Any]] = []
 
     class FakeModal:
@@ -2991,12 +2991,10 @@ def test_lookup_deployed_remote_engine_passes_affinity_as_modal_parameter(
     )
 
     assert result == {
-        "worker_affinity_key": "worker-pool:slot:0",
         "gpu_snapshot_enabled": True,
     }
     assert observed_kwargs == [
         {
-            "worker_affinity_key": "worker-pool:slot:0",
             "gpu_snapshot_enabled": True,
         }
     ]
@@ -3058,7 +3056,6 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
-    assert result["worker_affinity_key"] == "worker-pool:slot:0"
     assert result["gpu_snapshot_enabled"] is True
     assert result["snapshot_profile_key"].startswith("loader-profile:")
     assert observed_kwargs == [result]
@@ -3142,7 +3139,7 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Different prompt sessions should map to one reusable worker-pool slot."""
+    """Different prompt sessions should reuse one shared deployed RemoteEngine identity."""
     observed_kwargs: list[dict[str, Any]] = []
 
     class FakeModal:
@@ -3190,23 +3187,88 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
     )
 
     assert first_result == {
-        "worker_affinity_key": "worker-pool:slot:0",
         "gpu_snapshot_enabled": True,
     }
     assert second_result == {
-        "worker_affinity_key": "worker-pool:slot:0",
         "gpu_snapshot_enabled": True,
     }
     assert observed_kwargs == [
         {
-            "worker_affinity_key": "worker-pool:slot:0",
             "gpu_snapshot_enabled": True,
         },
         {
-            "worker_affinity_key": "worker-pool:slot:0",
             "gpu_snapshot_enabled": True,
         },
     ]
+
+
+def test_lookup_deployed_remote_engine_shares_profiled_identity_across_lane_overrides(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Lane-specific affinity overrides should not create separate Modal class identities."""
+    observed_kwargs: list[dict[str, Any]] = []
+    snapshot_profiles: dict[str, Any] = {}
+
+    class FakeModal:
+        """Minimal modal SDK double that captures class construction kwargs."""
+
+        class Dict:
+            """Namespace for fake dict lookups."""
+
+            @staticmethod
+            def from_name(dict_name: str, create_if_missing: bool = False) -> Any:
+                """Return the shared fake snapshot profile store."""
+                assert dict_name == "comfy-modal-sync-snapshot-profiles"
+                assert create_if_missing is True
+                return snapshot_profiles
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a factory that records the provided class parameters."""
+                assert app_name == "comfy-modal-sync"
+                assert class_name == "RemoteEngine"
+
+                def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
+                    """Record one synthesized Modal class constructor call."""
+                    observed_kwargs.append(kwargs)
+                    return kwargs
+
+                return build_remote_engine
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    payload = {
+        "component_id": "component-1__mapped",
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
+            }
+        },
+    }
+    try:
+        first_result = remote_modal_app_module._lookup_deployed_remote_engine(
+            payload,
+            affinity_key_override="worker-pool:slot:0",
+        )
+        second_result = remote_modal_app_module._lookup_deployed_remote_engine(
+            payload,
+            affinity_key_override="worker-pool:slot:3",
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+
+    assert first_result == second_result
+    assert "worker_affinity_key" not in first_result
+    assert first_result["snapshot_profile_key"].startswith("loader-profile:")
+    assert observed_kwargs == [first_result, second_result]
 
 
 def test_load_modal_cloud_module_reloads_stale_partial_module(
