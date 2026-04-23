@@ -2450,11 +2450,11 @@ def test_modal_cloud_prewarms_snapshot_loader_profile_when_gpu_snapshots_enabled
     ]
 
 
-def test_modal_cloud_prewarms_snapshot_state_fully_for_gpu_snapshots(
+def test_modal_cloud_skips_generic_gpu_snapshot_prewarm_without_profile(
     modal_cloud_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """GPU snapshot prewarm should initialize the remote runtime before snapshot capture."""
+    """GPU snapshot prewarm should skip runtime init when no stable snapshot profile exists."""
     calls: list[str] = []
 
     monkeypatch.setattr(
@@ -2477,7 +2477,7 @@ def test_modal_cloud_prewarms_snapshot_state_fully_for_gpu_snapshots(
         gpu_snapshot_enabled=True,
     )
 
-    assert calls == ["support", "runtime:None", "execution"]
+    assert calls == ["support"]
 
 
 def test_modal_cloud_prewarms_restored_runtime(

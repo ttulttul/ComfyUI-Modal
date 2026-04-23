@@ -3935,22 +3935,29 @@ def _prewarm_snapshot_state(
         snapshot_profile=snapshot_profile_key or None,
     ):
         _ensure_comfyui_support_packages()
-        if gpu_snapshot_enabled:
+        normalized_snapshot_profile_key = snapshot_profile_key.strip()
+        if gpu_snapshot_enabled and normalized_snapshot_profile_key:
             _ensure_comfy_runtime_initialized(None)
             _load_execution_module()
-            loader_prewarm_plans = _load_loader_snapshot_profile(snapshot_profile_key)
+            loader_prewarm_plans = _load_loader_snapshot_profile(normalized_snapshot_profile_key)
             if loader_prewarm_plans:
                 _execute_loader_prewarm_plans(
-                    component_id=f"snapshot-profile:{snapshot_profile_key}",
+                    component_id=f"snapshot-profile:{normalized_snapshot_profile_key}",
                     loader_prewarm_plans=loader_prewarm_plans,
                     custom_nodes_root=None,
                 )
             _emit_cloud_info("Completed GPU-snapshot ComfyUI prewarm before snapshot capture.")
             return
 
-        _emit_cloud_info(
-            "Skipping full ComfyUI runtime prewarm during CPU-only snapshot to avoid accidental CUDA initialization."
-        )
+        if gpu_snapshot_enabled:
+            _emit_cloud_info(
+                "Skipping GPU-snapshot ComfyUI prewarm before snapshot capture because no snapshot profile was provided."
+            )
+        else:
+            _emit_cloud_info(
+                "Skipping full ComfyUI runtime prewarm during CPU-only snapshot to avoid accidental CUDA initialization."
+            )
+
 
 
 def _prewarm_restored_runtime() -> None:
