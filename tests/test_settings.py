@@ -59,6 +59,21 @@ def test_settings_reads_modal_gpu_override(
     assert settings.modal_gpu == "L40S"
 
 
+def test_settings_enable_gpu_memory_snapshot_defaults_true(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """GPU memory snapshots should be enabled by default."""
+    monkeypatch.delenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", raising=False)
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.enable_gpu_memory_snapshot is True
+
+
 def test_settings_reads_modal_container_scaling_overrides(
     settings_module: Any,
     monkeypatch: Any,

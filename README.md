@@ -177,6 +177,7 @@ Remote runtime behavior:
 - The queue rewrite now stamps that same loader `snapshot_profile_key` onto already-materialized split proxy payloads up front, because runtime lookup happens too late to fix payloads that were cloned earlier during graph rewrite.
 - Remote lookup now also backfills the snapshot-profile record when a payload already carries the key but still has enough loader context to reconstruct the record, which keeps rewrite-time stamped profiles usable on first lookup.
 - Generic `snapshot_profile=None` workers now skip GPU snapshot runtime prewarm entirely. Only profiled `loader-profile:...` workers do full ComfyUI initialization in `snap=True`, which avoids wasting time on unstable no-profile GPU snapshots that do not help cold-start model loading anyway.
+- When GPU snapshots are enabled, proactive `::warmup` lookups are now skipped entirely for no-profile payloads. Modal only warms concrete profiled workers, so the scheduler no longer burns time on generic `snapshot_profile=None` classes that cannot produce useful model-loaded snapshots.
 - The default `scaledown_window` is `600` seconds with `min_containers=0`.
 - Warm containers can reuse loader state and `PromptExecutor` state across compatible requests.
 - Each Modal GPU container now handles one active workflow execution at a time. If multiple remote components become ready in parallel, Modal can scale them out across multiple containers instead of multiplexing several executions onto one GPU worker.
@@ -394,7 +395,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 ### Modal runtime sizing
 
 - `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT`: Enable Modal CPU memory snapshots. Default: `true`.
-- `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT`: Enable Modal GPU memory snapshots. Default: `false`.
+- `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT`: Enable Modal GPU memory snapshots. Default: `true`.
 - `COMFY_MODAL_SNAPSHOT_PROFILE_DICT_NAME`: Modal `Dict` used to publish per-model-set snapshot loader plans to `snap=True`. Default: `<app_name>-snapshot-profiles`.
 - `COMFY_MODAL_GPU`: Modal GPU type to request when deploying the remote class. Default: `A100`.
 - `COMFY_MODAL_SCALEDOWN_WINDOW`: Keep idle containers warm for this many seconds. Default: `600`.
