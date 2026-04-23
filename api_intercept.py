@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from aiohttp import web
 
@@ -39,6 +39,14 @@ _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
         "NOISE",
         "SIGMAS",
         "STRING",
+    }
+)
+_ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
+    {
+        "CheckpointLoaderSimple",
+        "UNETLoader",
+        "CLIPLoader",
+        "DualCLIPLoader",
     }
 )
 
@@ -363,6 +371,111 @@ def _prompt_node_signature_digest(
     ).hexdigest()
     memo[str(node_id)] = digest
     return digest
+
+
+def _iter_loader_snapshot_prompt_payloads(payload: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
+    """Yield prompt-bearing payload fragments that may contain root loader nodes."""
+    split_proxy_payloads = payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, dict):
+        for phase_payload in split_proxy_payloads.values():
+            if isinstance(phase_payload, Mapping):
+                yield phase_payload
+        return
+    if isinstance(split_proxy_payloads, list):
+        for phase_payload in split_proxy_payloads:
+            if isinstance(phase_payload, Mapping):
+                yield phase_payload
+        return
+    if isinstance(payload.get("subgraph_prompt"), Mapping):
+        yield payload
+
+
+def _is_root_literal_loader_node(prompt_node: Mapping[str, Any]) -> bool:
+    """Return whether one prompt node is a supported root loader with literal inputs."""
+    class_type = str(prompt_node.get("class_type") or "")
+    if class_type not in _ROOT_LOADER_PREWARM_CLASS_TYPES:
+        return False
+    inputs = prompt_node.get("inputs")
+    if not isinstance(inputs, Mapping):
+        return False
+    return not any(_is_link(input_value) for input_value in inputs.values())
+
+
+def _loader_prewarm_plan_signature(class_type: str, inputs: Mapping[str, Any]) -> str:
+    """Return a stable signature for one synthetic loader-prewarm plan."""
+    return json.dumps(
+        {
+            "class_type": class_type,
+            "inputs": copy.deepcopy(dict(inputs)),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _payload_loader_snapshot_profile_key(payload: Mapping[str, Any]) -> str:
+    """Return the stable loader snapshot profile key derivable from one payload."""
+    prompt_id = payload.get("prompt_id")
+    normalized_prompt_id = str(prompt_id) if prompt_id is not None else None
+    plan_signatures: set[str] = set()
+    for prompt_payload in _iter_loader_snapshot_prompt_payloads(payload):
+        subgraph_prompt = prompt_payload.get("subgraph_prompt")
+        if not isinstance(subgraph_prompt, Mapping):
+            continue
+        for node_id, prompt_node in subgraph_prompt.items():
+            if not isinstance(prompt_node, Mapping) or not _is_root_literal_loader_node(prompt_node):
+                continue
+            class_type = str(prompt_node.get("class_type") or "")
+            inputs = prompt_node.get("inputs")
+            if not isinstance(inputs, Mapping):
+                continue
+            plan_signatures.add(_loader_prewarm_plan_signature(class_type, inputs))
+            logger.debug(
+                "Derived rewrite-time loader prewarm plan for component=%s node=%s class_type=%s prompt_id=%s.",
+                payload.get("component_id"),
+                node_id,
+                class_type,
+                normalized_prompt_id,
+            )
+    if not plan_signatures:
+        return ""
+    profile_digest = hashlib.sha256(
+        json.dumps({"plan_signatures": sorted(plan_signatures)}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"loader-profile:{profile_digest}"
+
+
+def _stamp_snapshot_profile_key(payload: dict[str, Any], snapshot_profile_key: str) -> None:
+    """Attach one loader snapshot profile key to a payload and any split descendants."""
+    if not snapshot_profile_key:
+        return
+    payload["snapshot_profile_key"] = snapshot_profile_key
+    split_proxy_payloads = payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, dict):
+        for phase_payload in split_proxy_payloads.values():
+            if isinstance(phase_payload, dict):
+                phase_payload["snapshot_profile_key"] = snapshot_profile_key
+        return
+    if isinstance(split_proxy_payloads, list):
+        for phase_payload in split_proxy_payloads:
+            if isinstance(phase_payload, dict):
+                phase_payload["snapshot_profile_key"] = snapshot_profile_key
+
+
+def _attach_snapshot_profile_key(payload: dict[str, Any], settings: ModalSyncSettings) -> dict[str, Any]:
+    """Stamp a deterministic loader snapshot profile onto one payload when enabled."""
+    if not settings.enable_gpu_memory_snapshot or not settings.enable_loader_prewarm:
+        return payload
+    snapshot_profile_key = _payload_loader_snapshot_profile_key(payload)
+    if snapshot_profile_key:
+        _stamp_snapshot_profile_key(payload, snapshot_profile_key)
+        logger.info(
+            "Attached rewrite-time loader snapshot profile %s to component=%s payload_kind=%s.",
+            snapshot_profile_key,
+            payload.get("component_id"),
+            payload.get("payload_kind"),
+        )
+    return payload
 
 
 def _boundary_source_signature(
@@ -1812,6 +1925,7 @@ def _build_component_payload(
     component_prompt: dict[str, Any],
     signature_prompt: dict[str, Any],
     extra_data: dict[str, Any] | None,
+    settings: ModalSyncSettings,
     requires_volume_reload: bool,
     volume_reload_marker: str | None,
     custom_nodes_bundle: SyncedAsset | None,
@@ -2072,7 +2186,10 @@ def _build_component_payload(
 
     split_phase_payloads = build_phase_payloads_for_transportable_splits()
     if split_phase_payloads is not None:
-        return {"split_proxy_payloads": split_phase_payloads}
+        return _attach_snapshot_profile_key(
+            {"split_proxy_payloads": split_phase_payloads},
+            settings,
+        )
 
     payload = {
         "payload_kind": "mapped_subgraph" if component.mapped_boundary_input_name else "subgraph",
@@ -2235,7 +2352,7 @@ def _build_component_payload(
             "execute_node_ids": list(component.mapped_execute_node_ids),
         }
         if not component.static_node_ids:
-            return payload
+            return _attach_snapshot_profile_key(payload, settings)
         remote_session = RemoteSessionHandle(
             session_id=uuid.uuid4().hex,
             prompt_id=(str(prompt_id) if prompt_id is not None else None),
@@ -2330,7 +2447,7 @@ def _build_component_payload(
                 )
             ),
         }
-    return payload
+    return _attach_snapshot_profile_key(payload, settings)
 
 
 def _component_uploaded_volume_paths(
@@ -2739,6 +2856,7 @@ def rewrite_prompt_for_modal(
             component_prompt=synced_component_prompts[component.representative_node_id],
             signature_prompt=prompt,
             extra_data=extra_data,
+            settings=resolved_settings,
             requires_volume_reload=bool(uploaded_volume_paths),
             volume_reload_marker=volume_reload_marker,
             custom_nodes_bundle=summary.custom_nodes_bundle,

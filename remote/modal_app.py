@@ -3709,12 +3709,18 @@ def _lookup_deployed_remote_engine(
     affinity_key = affinity_key_override
     if affinity_key is None:
         affinity_key = _remote_worker_affinity_key(payload)
+    loader_prewarm_plans: list[dict[str, Any]] = _build_loader_prewarm_plans(payload)
     snapshot_profile_key = ""
     payload_snapshot_profile_key = payload.get("snapshot_profile_key")
     if isinstance(payload_snapshot_profile_key, str):
         snapshot_profile_key = payload_snapshot_profile_key.strip()
-    if not snapshot_profile_key:
-        snapshot_profile_key = _store_loader_snapshot_profile(_build_loader_prewarm_plans(payload))
+    if snapshot_profile_key:
+        stored_snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
+        if stored_snapshot_profile_key:
+            snapshot_profile_key = stored_snapshot_profile_key
+            payload["snapshot_profile_key"] = snapshot_profile_key
+    else:
+        snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
         if snapshot_profile_key:
             payload["snapshot_profile_key"] = snapshot_profile_key
     logger.info(

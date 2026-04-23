@@ -3038,6 +3038,78 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
     assert payload["snapshot_profile_key"] == result["snapshot_profile_key"]
 
 
+def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_when_possible(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Deployed lookups should backfill snapshot records even when the payload already carries the key."""
+    observed_kwargs: list[dict[str, Any]] = []
+    snapshot_profiles: dict[str, Any] = {}
+
+    class FakeModal:
+        """Minimal modal SDK double that captures class construction kwargs."""
+
+        class Dict:
+            """Namespace for fake dict lookups."""
+
+            @staticmethod
+            def from_name(dict_name: str, create_if_missing: bool = False) -> Any:
+                """Return the shared fake snapshot profile store."""
+                assert dict_name == "comfy-modal-sync-snapshot-profiles"
+                assert create_if_missing is True
+                return snapshot_profiles
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a factory that records the provided class parameters."""
+                assert app_name == "comfy-modal-sync"
+                assert class_name == "RemoteEngine"
+
+                def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
+                    """Record one synthesized Modal class constructor call."""
+                    observed_kwargs.append(kwargs)
+                    return kwargs
+
+                return build_remote_engine
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    expected_snapshot_profile_key = remote_modal_app_module._loader_snapshot_profile_key(
+        [
+            {
+                "signature": remote_modal_app_module._loader_prewarm_plan_signature(
+                    "UNETLoader",
+                    {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
+                )
+            }
+        ]
+    )
+    payload = {
+        "component_id": "component-1",
+        "snapshot_profile_key": expected_snapshot_profile_key,
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
+            }
+        },
+    }
+    try:
+        result = remote_modal_app_module._lookup_deployed_remote_engine(payload)
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+
+    assert result["snapshot_profile_key"] == expected_snapshot_profile_key
+    assert observed_kwargs == [result]
+    assert expected_snapshot_profile_key in snapshot_profiles
+
+
 def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_sessions(
     remote_modal_app_module: Any,
     monkeypatch: Any,
