@@ -8,6 +8,7 @@ const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
 const SETUP_BORDER_COLOR = "#f59e0b";
+const FINALIZING_BORDER_COLOR = "#3b82f6";
 const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";
 const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";
 const ACTIVE_BORDER_COLOR = "#a855f7";
@@ -298,7 +299,7 @@ function refreshGlobalStatusElement() {
   } else if (activeState.phase === STATE_FINALIZING) {
     element.style.borderColor = "rgba(59, 130, 246, 0.55)";
     element.style.background = "rgba(15, 23, 42, 0.94)";
-    dot.style.background = READY_BORDER_COLOR;
+    dot.style.background = FINALIZING_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(59, 130, 246, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
     text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";

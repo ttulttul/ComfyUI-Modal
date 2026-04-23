@@ -81,11 +81,14 @@ def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> No
     """The frontend should surface detailed setup and result-receive messages in the global pill."""
     source = _modal_toggle_source()
 
+    assert 'const FINALIZING_BORDER_COLOR = "#3b82f6";' in source
     assert "detail.status_message ?? null" in source
     assert "detail.status_current ?? null" in source
     assert "detail.status_total ?? null" in source
     assert "setGlobalStatusPhase(promptId, STATE_SETUP, nodeIds.length, {" in source
     assert "if (detail.phase === STATE_FINALIZING) {" in source
+    assert "dot.style.background = FINALIZING_BORDER_COLOR;" in source
+    assert "READY_BORDER_COLOR" not in source
     assert 'text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";' in source
 
 
