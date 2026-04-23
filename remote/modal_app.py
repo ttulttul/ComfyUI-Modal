@@ -3715,6 +3715,8 @@ def _lookup_deployed_remote_engine(
         snapshot_profile_key = payload_snapshot_profile_key.strip()
     if not snapshot_profile_key:
         snapshot_profile_key = _store_loader_snapshot_profile(_build_loader_prewarm_plans(payload))
+        if snapshot_profile_key:
+            payload["snapshot_profile_key"] = snapshot_profile_key
     logger.info(
         "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s snapshot_profile=%s gpu_snapshot_enabled=%s.",
         settings.app_name,
