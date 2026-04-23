@@ -3561,7 +3561,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                 for lane_index in range(parallelism)
             ]
             logger.info(
-                "Seeding %d mapped worker lane(s) for component=%s before per-item dispatch.",
+                "Seeding %d mapped worker lane(s) for component=%s and allowing ready lanes to start item dispatch independently.",
                 parallelism,
                 payload.get("component_id"),
             )
@@ -3580,10 +3580,6 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     lane_seed_payload,
                     serialize_node_inputs(broadcast_inputs),
                 )
-
-            await asyncio.gather(
-                *(seed_lane(lane_index) for lane_index in range(parallelism))
-            )
         elif static_execute_node_ids:
             static_response = await invoke_remote_engine_async(
                 _build_static_mapped_payload(hybrid_payload),
@@ -3604,6 +3600,8 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         async def run_worker(lane_index: int) -> None:
             """Execute queued implicit mapped items through one stable local worker lane."""
             nonlocal completed_items
+            if use_seeded_remote_lanes:
+                await seed_lane(lane_index)
             while True:
                 item_index = await item_queue.get()
                 if item_index is None:
