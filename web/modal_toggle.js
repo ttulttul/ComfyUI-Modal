@@ -1473,6 +1473,34 @@ function isNodeInActiveComponent(promptId, nodeIdValue) {
 }
 
 /**
+ * Trace one rounded-rectangle path, using the native canvas helper when available.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {number} x
+ * @param {number} y
+ * @param {number} width
+ * @param {number} height
+ * @param {number} radius
+ */
+function traceRoundedRectPath(ctx, x, y, width, height, radius) {
+  const safeRadius = Math.max(0, Math.min(radius, width / 2, height / 2));
+  ctx.beginPath();
+  if (typeof ctx.roundRect === "function") {
+    ctx.roundRect(x, y, width, height, safeRadius);
+    return;
+  }
+  ctx.moveTo(x + safeRadius, y);
+  ctx.lineTo(x + width - safeRadius, y);
+  ctx.arcTo(x + width, y, x + width, y + safeRadius, safeRadius);
+  ctx.lineTo(x + width, y + height - safeRadius);
+  ctx.arcTo(x + width, y + height, x + width - safeRadius, y + height, safeRadius);
+  ctx.lineTo(x + safeRadius, y + height);
+  ctx.arcTo(x, y + height, x, y + height - safeRadius, safeRadius);
+  ctx.lineTo(x, y + safeRadius);
+  ctx.arcTo(x, y, x + safeRadius, y, safeRadius);
+  ctx.closePath();
+}
+
+/**
  * Draw the remote execution border and shading for a node.
  * @param {LGraphNode} node
  * @param {CanvasRenderingContext2D} ctx
@@ -1486,6 +1514,7 @@ function drawRemoteNodeDecoration(node, ctx) {
   const titleHeight = node.constructor?.title_height ?? LiteGraph.NODE_TITLE_HEIGHT ?? 24;
   const scale = app.canvas?.ds?.scale ?? 1;
   const borderWidth = 3 / scale;
+  const cornerRadius = 12 / scale;
   const elapsed = performance.now() / 1000;
 
   let borderColor = IDLE_BORDER_COLOR;
@@ -1538,23 +1567,29 @@ function drawRemoteNodeDecoration(node, ctx) {
   ctx.save();
   if (fillColor) {
     ctx.fillStyle = fillColor;
-    ctx.fillRect(
+    traceRoundedRectPath(
+      ctx,
       borderWidth,
       -titleHeight + borderWidth,
       Math.max(0, node.size[0] - borderWidth * 2),
       Math.max(0, node.size[1] + titleHeight - borderWidth * 2),
+      Math.max(0, cornerRadius - borderWidth),
     );
+    ctx.fill();
   }
   ctx.strokeStyle = borderColor;
   ctx.lineWidth = borderWidth;
   ctx.shadowColor = shadowColor;
   ctx.shadowBlur = 8 / scale;
-  ctx.strokeRect(
+  traceRoundedRectPath(
+    ctx,
     -borderWidth,
     -titleHeight,
     node.size[0] + borderWidth * 2,
     node.size[1] + titleHeight + borderWidth,
+    cornerRadius,
   );
+  ctx.stroke();
   ctx.restore();
 
   const progressLanes = Array.isArray(state?.progressLanes) ? state.progressLanes : [];
