@@ -48,6 +48,7 @@ const transformedSource = `${[
   "  handlePromptInterruption,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
+  "  modalGlobalStatusStates,",
   "  modalNodeStates,",
   "  modalNodeProgress,",
   "  modalNodeProgressLanes,",
@@ -55,6 +56,7 @@ const transformedSource = `${[
   "  modalPromptStates,",
   "  STATE_READY,",
   "  STATE_ACTIVE,",
+  "  STATE_COMPLETE,",
   "  EXECUTION_PHASE,",
   "};",
 ].join("\n")}`;
@@ -254,3 +256,33 @@ modalToggle.handleModalStatus({
 assert.equal(modalToggle.modalPromptStates.has("prompt-f"), false);
 assert.equal(modalToggle.modalNodeStates.has("20"), false);
 assert.equal(modalToggle.modalNodeStates.has("21"), false);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-g", ["30", "31"], [
+  {
+    representative_node_id: "30",
+    node_ids: ["30", "31"],
+  },
+]);
+modalToggle.handleExecutionPhase(
+  {
+    detail: {
+      prompt_id: "prompt-g",
+      node: "30",
+    },
+  },
+  modalToggle.EXECUTION_PHASE,
+);
+assert.equal(modalToggle.modalGlobalStatusStates.has("prompt-g"), true);
+modalToggle.handleExecutionPhase(
+  {
+    detail: {
+      prompt_id: "prompt-g",
+      node: "30",
+    },
+  },
+  modalToggle.STATE_COMPLETE,
+);
+assert.equal(modalToggle.modalNodeStates.get("30")?.phase, modalToggle.STATE_COMPLETE);
+assert.equal(modalToggle.modalNodeStates.get("31")?.phase, modalToggle.STATE_COMPLETE);
+assert.equal(modalToggle.modalGlobalStatusStates.has("prompt-g"), false);

@@ -4,6 +4,7 @@
 
 - Nested workflow-marker resolution has to stop at the first matching composed prompt-id suffix, not union every suffix. If a subgraph node `195:27` is marked remote and the prompt also contains an unrelated root node `27`, collecting both matches makes the real nested node look local during boundary validation and proxy rewrite.
 - Frontend interruption cleanup has to key off `prompt_id`, not the native execution event's node fields. ComfyUI can emit `execution_interrupted` without a representative remote node id, and if Modal UI teardown depends on resolving that node the cancelled prompt stays visually stuck in ready/active state even though interrupt propagation worked.
+- The global Modal status pill cannot infer liveness from `STATE_COMPLETE` remote node states. If a prompt-level cleanup event is delayed or missing, treating completed remote nodes as still "executing" leaves stale `waiting/executing/finalizing` pill entries behind. The pill needs an explicit "does this prompt still have live remote work?" reconciliation pass when remote nodes complete.
 
 ## 2026-04-22
 

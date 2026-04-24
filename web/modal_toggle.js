@@ -186,10 +186,64 @@ function effectiveGlobalStatusPhase(promptId, phase) {
   if (nodeStates.some((state) => state.phase === STATE_ACTIVE)) {
     return EXECUTION_PHASE;
   }
-  if (nodeStates.some((state) => state.phase === STATE_READY || state.phase === STATE_COMPLETE)) {
+  if (nodeStates.some((state) => state.phase === STATE_READY)) {
     return EXECUTION_PHASE;
   }
   return phase;
+}
+
+/**
+ * Return whether one prompt still has active remote work that should keep the global pill visible.
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function promptHasLiveRemoteWork(promptId) {
+  const promptState = modalPromptStates.get(promptId);
+  if (!promptState) {
+    return false;
+  }
+
+  if (promptState.activeNodeId) {
+    return true;
+  }
+
+  if (promptState.remoteNodeIds.some((nodeIdValue) => hasLiveNodeProgress(nodeIdValue, promptId))) {
+    return true;
+  }
+
+  return promptState.remoteNodeIds.some((nodeIdValue) => {
+    const nodeState = modalNodeStates.get(String(nodeIdValue));
+    return (
+      nodeState?.promptId === promptId &&
+      [STATE_SETUP, STATE_READY, STATE_ACTIVE].includes(nodeState.phase)
+    );
+  });
+}
+
+/**
+ * Drop one prompt's stale global-status entry once it no longer has live remote work.
+ * @param {string} promptId
+ */
+function reconcilePromptGlobalStatus(promptId) {
+  if (!promptId) {
+    return;
+  }
+  const globalStatusState = modalGlobalStatusStates.get(promptId);
+  if (!globalStatusState) {
+    return;
+  }
+  if (syntheticPromptUiStates.has(promptId)) {
+    return;
+  }
+  if (globalStatusState.phase === STATE_ERROR || globalStatusState.phase === STATE_SETUP) {
+    return;
+  }
+  if (promptHasLiveRemoteWork(promptId)) {
+    refreshGlobalStatusElement();
+    return;
+  }
+  modalGlobalStatusStates.delete(promptId);
+  refreshGlobalStatusElement();
 }
 
 /**
@@ -1897,6 +1951,7 @@ function handleExecutionPhase(event, phase) {
       clearNodeProgress(nodeIdValue, promptId);
     }
     setNodesPhase(componentNodeIds, STATE_COMPLETE, promptId, detail.exception_message);
+    reconcilePromptGlobalStatus(promptId);
   }
 }
 
