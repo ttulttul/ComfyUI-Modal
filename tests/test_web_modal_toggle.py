@@ -213,6 +213,7 @@ def test_ready_nodes_distinguish_active_component_members_and_cached_nodes() -> 
     """Ready nodes should visually distinguish active-component membership and cache hits."""
     source = _modal_toggle_source()
 
+    assert "function traceRoundedRectPath(ctx, x, y, width, height, radius)" in source
     assert "function activeProgressNodeIds(promptId)" in source
     assert "function isNodeInActiveComponent(promptId, nodeIdValue)" in source
     assert "const promptActiveNodeId = promptState.activeNodeId;" in source
@@ -223,6 +224,9 @@ def test_ready_nodes_distinguish_active_component_members_and_cached_nodes() -> 
     assert "borderColor = state?.isActiveComponentMember" in source
     assert "READY_INACTIVE_COMPONENT_BORDER_COLOR" in source
     assert "READY_ACTIVE_COMPONENT_BORDER_COLOR" in source
+    assert "const cornerRadius = 12 / scale;" in source
+    assert "traceRoundedRectPath(" in source
+    assert "ctx.strokeRect(" not in source
 
 
 def test_cached_node_hits_are_marked_without_fake_progress() -> None:
