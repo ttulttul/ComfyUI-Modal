@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import importlib
 import importlib.util
+import inspect
 from io import BytesIO
 import json
 import logging
@@ -54,8 +55,10 @@ from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
+_REMOTE_APP_PROTOCOL_VERSION = 2
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
+_MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None]] = set()
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
@@ -163,6 +166,10 @@ class RemoteSubgraphExecutionError(RuntimeError):
 
 class ModalRemoteInvocationError(RuntimeError):
     """Raised when the Modal client cannot invoke the remote runtime."""
+
+
+class ModalRemoteAppOutOfDateError(ModalRemoteInvocationError):
+    """Raised when a deployed Modal app is incompatible with the local client."""
 
 
 def _is_remote_container_log_stream_enabled() -> bool:
@@ -3928,6 +3935,168 @@ def _modal_deploy_cache_key() -> tuple[str, str | None]:
     return (settings.app_name, _modal_environment_name())
 
 
+def _call_modal_method(method: Any, *args: Any, **kwargs: Any) -> Any:
+    """Invoke a Modal method handle or an in-process test double."""
+    remote_method = getattr(method, "remote", None)
+    if callable(remote_method):
+        return remote_method(*args, **kwargs)
+    return method(*args, **kwargs)
+
+
+def _remote_engine_runtime_version(remote_engine: Any) -> dict[str, Any] | None:
+    """Return runtime version metadata from a deployed engine when available."""
+    version_method = getattr(remote_engine, "runtime_version", None)
+    if version_method is None:
+        return None
+    version_payload = _call_modal_method(version_method)
+    if not isinstance(version_payload, dict):
+        return None
+    return version_payload
+
+
+def _remote_engine_protocol_version(remote_engine: Any) -> int | None:
+    """Return the deployed remote app protocol version when the app reports one."""
+    version_payload = _remote_engine_runtime_version(remote_engine)
+    if version_payload is None:
+        return None
+    protocol_version = version_payload.get("protocol_version")
+    if isinstance(protocol_version, bool):
+        return None
+    if isinstance(protocol_version, int):
+        return protocol_version
+    return None
+
+
+def _is_remote_engine_protocol_current(remote_engine: Any) -> bool:
+    """Return whether a deployed engine is compatible with this local client."""
+    return _remote_engine_protocol_version(remote_engine) == _REMOTE_APP_PROTOCOL_VERSION
+
+
+def _stop_modal_app_via_sdk(app_name: str) -> bool:
+    """Try to stop a Modal app through the SDK if this SDK version exposes app stopping."""
+    if modal is None:
+        return False
+    app_namespace = getattr(modal, "App", None)
+    app_lookup = getattr(app_namespace, "lookup", None)
+    if not callable(app_lookup):
+        return False
+    try:
+        lookup_signature = inspect.signature(app_lookup)
+    except (TypeError, ValueError):
+        lookup_signature = None
+    lookup_kwargs: dict[str, Any] = {}
+    if lookup_signature is not None:
+        if "create_if_missing" in lookup_signature.parameters:
+            lookup_kwargs["create_if_missing"] = False
+        elif "create" in lookup_signature.parameters:
+            lookup_kwargs["create"] = False
+    try:
+        app_handle = app_lookup(app_name, **lookup_kwargs)
+    except _modal_lookup_error_types():
+        return True
+    stop_method = getattr(app_handle, "stop", None)
+    if not callable(stop_method):
+        return False
+    _call_modal_method(stop_method)
+    return True
+
+
+def _stop_modal_app_via_cli(app_name: str) -> bool:
+    """Try to stop a Modal app through the Modal CLI."""
+    modal_cli = shutil.which("modal")
+    if modal_cli is None:
+        return False
+    command = [modal_cli, "app", "stop", app_name]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if completed.returncode != 0:
+        logger.warning(
+            "Modal CLI app stop failed for app=%s exit_code=%s stderr=%s",
+            app_name,
+            completed.returncode,
+            completed.stderr.strip(),
+        )
+        return False
+    return True
+
+
+def _stop_modal_app_for_replacement(app_name: str) -> None:
+    """Stop an out-of-date Modal app before replacing it with a fresh deployment."""
+    if _stop_modal_app_via_sdk(app_name):
+        logger.warning("Stopped out-of-date Modal app %s through the Modal SDK.", app_name)
+        return
+    if _stop_modal_app_via_cli(app_name):
+        logger.warning("Stopped out-of-date Modal app %s through the Modal CLI.", app_name)
+        return
+    raise ModalRemoteInvocationError(
+        f"Deployed Modal app {app_name!r} is out of date, but Modal-Sync could not stop it automatically. "
+        f"Stop it manually with `modal app stop {app_name}` and retry."
+    )
+
+
+def _mark_modal_deploy_state_not_ready(deploy_key: tuple[str, str | None]) -> None:
+    """Invalidate the local in-process deploy readiness cache for one app."""
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        deploy_state = _MODAL_AUTO_DEPLOY_STATES.get(deploy_key)
+    if deploy_state is None:
+        return
+    with deploy_state.condition:
+        deploy_state.ready = False
+        deploy_state.last_error = None
+        deploy_state.condition.notify_all()
+
+
+def _replace_outdated_modal_app(
+    payload: dict[str, Any],
+    remote_engine: Any,
+) -> Any:
+    """Stop and auto-deploy a replacement for an incompatible deployed app."""
+    settings = get_settings()
+    deploy_key = _modal_deploy_cache_key()
+    protocol_version = _remote_engine_protocol_version(remote_engine)
+    logger.warning(
+        "Deployed Modal app %s is out of date for component=%s remote_protocol=%s local_protocol=%s; stopping and replacing it.",
+        settings.app_name,
+        payload.get("component_id"),
+        protocol_version,
+        _REMOTE_APP_PROTOCOL_VERSION,
+    )
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        _MODAL_REMOTE_APP_VERSION_OK.discard(deploy_key)
+    _mark_modal_deploy_state_not_ready(deploy_key)
+    _stop_modal_app_for_replacement(settings.app_name)
+    stale_error = ModalRemoteAppOutOfDateError(
+        f"Modal app {settings.app_name!r} protocol {protocol_version!r} does not match local protocol "
+        f"{_REMOTE_APP_PROTOCOL_VERSION}."
+    )
+    replacement_engine = _auto_deploy_modal_app(payload, stale_error)
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        _MODAL_REMOTE_APP_VERSION_OK.add(deploy_key)
+    return replacement_engine
+
+
+def _ensure_remote_engine_protocol_current(remote_engine: Any, payload: dict[str, Any]) -> Any:
+    """Return a compatible remote engine, replacing the deployed app when allowed."""
+    deploy_key = _modal_deploy_cache_key()
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        if deploy_key in _MODAL_REMOTE_APP_VERSION_OK:
+            return remote_engine
+    if _is_remote_engine_protocol_current(remote_engine):
+        with _MODAL_AUTO_DEPLOY_LOCK:
+            _MODAL_REMOTE_APP_VERSION_OK.add(deploy_key)
+        return remote_engine
+    if not get_settings().auto_deploy:
+        raise ModalRemoteInvocationError(
+            "Deployed Modal app is out of date and COMFY_MODAL_AUTO_DEPLOY=false prevents automatic replacement."
+        )
+    return _replace_outdated_modal_app(payload, remote_engine)
+
+
 def _modal_auto_deploy_state(
     deploy_key: tuple[str, str | None],
 ) -> _ModalAutoDeployState:
@@ -4294,7 +4463,10 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
     settings = get_settings()
     if lookup_error_types:
         try:
-            remote_engine = _lookup_deployed_remote_engine(warmup_request)
+            remote_engine = _ensure_remote_engine_protocol_current(
+                _lookup_deployed_remote_engine(warmup_request),
+                warmup_request,
+            )
             return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
         except lookup_error_types as exc:
             if settings.auto_deploy:
@@ -4312,7 +4484,10 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
                     f"Lookup failed for app={settings.app_name!r}: {exc}."
                 ) from exc
     else:
-        remote_engine = _lookup_deployed_remote_engine(warmup_request)
+        remote_engine = _ensure_remote_engine_protocol_current(
+            _lookup_deployed_remote_engine(warmup_request),
+            warmup_request,
+        )
         return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
 
     cloud_module = _load_modal_cloud_module()
@@ -4586,6 +4761,11 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
             time.perf_counter() - deploy_started_at,
         )
         remote_engine = _lookup_deployed_remote_engine_with_retry(payload)
+        if not _is_remote_engine_protocol_current(remote_engine):
+            raise ModalRemoteInvocationError(
+                f"Auto-deployed Modal app {settings.app_name!r} did not report expected protocol "
+                f"{_REMOTE_APP_PROTOCOL_VERSION}."
+            )
     except BaseException as exc:
         with deploy_state.condition:
             deploy_state.deploy_in_progress = False
@@ -4598,6 +4778,8 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
         deploy_state.ready = True
         deploy_state.last_error = None
         deploy_state.condition.notify_all()
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        _MODAL_REMOTE_APP_VERSION_OK.add(deploy_key)
     logger.info(
         "Deployed Modal app %s for env=%s is now lookup-ready.",
         settings.app_name,
@@ -4697,7 +4879,10 @@ def _invoke_modal_payload_blocking(
     settings = get_settings()
     if lookup_error_types:
         try:
-            remote_engine = _lookup_deployed_remote_engine(payload)
+            remote_engine = _ensure_remote_engine_protocol_current(
+                _lookup_deployed_remote_engine(payload),
+                payload,
+            )
             logger.info(
                 "Using deployed Modal app %s for component %s.",
                 settings.app_name,
@@ -4740,7 +4925,10 @@ def _invoke_modal_payload_blocking(
                 exc,
             )
     else:
-        remote_engine = _lookup_deployed_remote_engine(payload)
+        remote_engine = _ensure_remote_engine_protocol_current(
+            _lookup_deployed_remote_engine(payload),
+            payload,
+        )
         logger.info(
             "Using deployed Modal app %s for component %s.",
             settings.app_name,
