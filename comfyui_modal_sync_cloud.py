@@ -1958,6 +1958,70 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
             _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
 
 
+def _prompt_missing_node_class_types(
+    prompt: Mapping[str, Any],
+    node_mapping: Mapping[str, type[Any]],
+) -> list[str]:
+    """Return sorted prompt class types that are absent from the active node registry."""
+    missing_class_types: set[str] = set()
+    for prompt_node in prompt.values():
+        if not isinstance(prompt_node, Mapping):
+            continue
+        class_type = prompt_node.get("class_type")
+        if isinstance(class_type, str) and class_type not in node_mapping:
+            missing_class_types.add(class_type)
+    return sorted(missing_class_types)
+
+
+def _reload_external_custom_nodes_for_missing_classes(
+    custom_nodes_root: Path | None,
+) -> None:
+    """Re-run external custom-node import once when a prompt references missing node classes."""
+    if custom_nodes_root is None:
+        return
+
+    custom_nodes_root_key = str(custom_nodes_root.resolve())
+    with _COMFY_RUNTIME_INIT_LOCK:
+        _register_custom_nodes_root(custom_nodes_root)
+        logger.warning(
+            "Re-running external custom-node import for %s because the active prompt referenced unregistered node classes.",
+            custom_nodes_root_key,
+        )
+        nodes_module = _load_nodes_module()
+        with _timed_phase("init_external_custom_nodes_retry", custom_nodes=custom_nodes_root_key):
+            asyncio.run(nodes_module.init_external_custom_nodes())
+        _install_loader_cache_wrappers()
+        _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
+
+
+def _ensure_prompt_node_classes_registered(
+    *,
+    component_id: str,
+    prompt: Mapping[str, Any],
+    custom_nodes_root: Path | None,
+) -> Mapping[str, type[Any]]:
+    """Return the active node mapping or raise a clear error for missing prompt node types."""
+    nodes_module = _load_nodes_module()
+    resolved_node_mapping = nodes_module.NODE_CLASS_MAPPINGS
+    missing_class_types = _prompt_missing_node_class_types(prompt, resolved_node_mapping)
+    if missing_class_types and custom_nodes_root is not None:
+        logger.warning(
+            "Remote prompt component=%s references missing node classes after initial custom-node import: %s",
+            component_id,
+            missing_class_types,
+        )
+        _reload_external_custom_nodes_for_missing_classes(custom_nodes_root)
+        resolved_node_mapping = nodes_module.NODE_CLASS_MAPPINGS
+        missing_class_types = _prompt_missing_node_class_types(prompt, resolved_node_mapping)
+    if missing_class_types:
+        raise RemoteSubgraphExecutionError(
+            "Remote subgraph references node classes that are not registered in the Modal worker: "
+            f"{missing_class_types}. Ensure custom-node sync is enabled and the required custom-node package "
+            "imports successfully inside Modal."
+        )
+    return resolved_node_mapping
+
+
 def _load_execution_module() -> Any:
     """Import the ComfyUI execution module lazily."""
     _ensure_comfyui_support_packages()
@@ -3364,7 +3428,11 @@ def _execute_subgraph_prompt(
     with _timed_phase("load_execution_module", component=component_id):
         execution = _load_execution_module()
         cache_type, cache_args = _prompt_executor_cache_config(execution)
-        resolved_node_mapping = _load_nodes_module().NODE_CLASS_MAPPINGS
+        resolved_node_mapping = _ensure_prompt_node_classes_registered(
+            component_id=component_id,
+            prompt=prompt,
+            custom_nodes_root=custom_nodes_root,
+        )
     _coerce_prompt_primitive_input_values(prompt, resolved_node_mapping)
     _validate_prompt_input_shapes(
         prompt,
