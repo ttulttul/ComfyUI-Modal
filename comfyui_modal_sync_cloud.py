@@ -2029,10 +2029,16 @@ def _custom_node_package_for_candidate_file(custom_nodes_root: Path, candidate_f
 def _missing_node_class_diagnostics(
     missing_class_types: Sequence[str],
     custom_nodes_root: Path | None,
+    custom_nodes_bundle_path: str | None,
 ) -> str:
     """Return a concise diagnostic summary for missing prompt node classes."""
     if custom_nodes_root is None:
-        return "No custom_nodes bundle was available in the Modal worker."
+        if custom_nodes_bundle_path:
+            return (
+                "Payload requested custom_nodes_bundle="
+                f"{custom_nodes_bundle_path!r}, but it was not available in Modal worker storage."
+            )
+        return "No custom_nodes_bundle path was present in the remote payload."
     if not custom_nodes_root.exists():
         return f"Extracted custom_nodes root does not exist: {custom_nodes_root}."
 
@@ -2055,6 +2061,7 @@ def _ensure_prompt_node_classes_registered(
     component_id: str,
     prompt: Mapping[str, Any],
     custom_nodes_root: Path | None,
+    custom_nodes_bundle_path: str | None = None,
 ) -> Mapping[str, type[Any]]:
     """Return the active node mapping or raise a clear error for missing prompt node types."""
     nodes_module = _load_nodes_module()
@@ -2074,7 +2081,7 @@ def _ensure_prompt_node_classes_registered(
             "Remote subgraph references node classes that are not registered in the Modal worker: "
             f"{missing_class_types}. Ensure custom-node sync is enabled and the required custom-node package "
             "imports successfully inside Modal. "
-            f"Diagnostics: {_missing_node_class_diagnostics(missing_class_types, custom_nodes_root)}"
+            f"Diagnostics: {_missing_node_class_diagnostics(missing_class_types, custom_nodes_root, custom_nodes_bundle_path)}"
         )
     return resolved_node_mapping
 
@@ -3485,10 +3492,14 @@ def _execute_subgraph_prompt(
     with _timed_phase("load_execution_module", component=component_id):
         execution = _load_execution_module()
         cache_type, cache_args = _prompt_executor_cache_config(execution)
+        custom_nodes_bundle_path = normalized_payload.get("custom_nodes_bundle")
         resolved_node_mapping = _ensure_prompt_node_classes_registered(
             component_id=component_id,
             prompt=prompt,
             custom_nodes_root=custom_nodes_root,
+            custom_nodes_bundle_path=(
+                custom_nodes_bundle_path if isinstance(custom_nodes_bundle_path, str) else None
+            ),
         )
     _coerce_prompt_primitive_input_values(prompt, resolved_node_mapping)
     _validate_prompt_input_shapes(

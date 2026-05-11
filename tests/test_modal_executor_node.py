@@ -2390,6 +2390,27 @@ def test_modal_cloud_missing_prompt_node_class_raises_clear_error(
     assert "package=Skoogeer-Noise" in message
 
 
+def test_modal_cloud_missing_prompt_node_class_reports_unavailable_bundle_path(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Missing-class diagnostics should distinguish absent payload metadata from unavailable storage."""
+    fake_nodes_module = types.SimpleNamespace(NODE_CLASS_MAPPINGS={})
+    monkeypatch.setitem(sys.modules, "nodes", fake_nodes_module)
+
+    with pytest.raises(modal_cloud_module.RemoteSubgraphExecutionError) as exc_info:
+        modal_cloud_module._ensure_prompt_node_classes_registered(
+            component_id="component-1",
+            prompt={"2": {"class_type": "KSamplerLoraSigmaInverse", "inputs": {}}},
+            custom_nodes_root=None,
+            custom_nodes_bundle_path="/custom_nodes/manifest.json",
+        )
+
+    message = str(exc_info.value)
+    assert "custom_nodes_bundle='/custom_nodes/manifest.json'" in message
+    assert "not available in Modal worker storage" in message
+
+
 def test_modal_cloud_retries_custom_node_import_for_missing_prompt_class(
     modal_cloud_module: Any,
     monkeypatch: Any,

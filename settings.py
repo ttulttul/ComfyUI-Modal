@@ -10,6 +10,42 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_SETTINGS_ENV_KEYS = (
+    "COMFYUI_ROOT",
+    "COMFY_MODAL_COMFYUI_ROOT",
+    "COMFY_MODAL_CUSTOM_NODES_DIR",
+    "COMFY_MODAL_EXECUTION_MODE",
+    "COMFY_MODAL_SYNC_CUSTOM_NODES",
+    "COMFY_MODAL_LOCAL_STORAGE_ROOT",
+    "COMFY_MODAL_APP_NAME",
+    "COMFY_MODAL_AUTO_DEPLOY",
+    "COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK",
+    "COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT",
+    "COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT",
+    "COMFY_MODAL_VOLUME_NAME",
+    "COMFY_MODAL_ROUTE_PATH",
+    "COMFY_MODAL_MARKER_PROPERTY",
+    "COMFY_MODAL_REMOTE_STORAGE_ROOT",
+    "COMFY_MODAL_CUSTOM_NODES_ARCHIVE",
+    "COMFY_MODAL_INTERRUPT_DICT_NAME",
+    "COMFY_MODAL_NODE_CACHE_DICT_NAME",
+    "COMFY_MODAL_SESSION_BRIDGE_DICT_NAME",
+    "COMFY_MODAL_SYNC_INDEX_DICT_NAME",
+    "COMFY_MODAL_SNAPSHOT_PROFILE_DICT_NAME",
+    "COMFY_MODAL_NODE_CACHE_MAX_BYTES",
+    "COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR",
+    "COMFY_MODAL_GPU",
+    "COMFY_MODAL_MIN_CONTAINERS",
+    "COMFY_MODAL_MAX_CONTAINERS",
+    "COMFY_MODAL_BUFFER_CONTAINERS",
+    "COMFY_MODAL_SCALEDOWN_WINDOW",
+    "COMFY_MODAL_ENABLE_LOADER_PREWARM",
+    "COMFY_MODAL_MAX_LOADER_PREWARMS_PER_COMPONENT",
+    "COMFY_MODAL_ENABLE_PROACTIVE_WARMUP",
+    "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
+    "COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS",
+)
+
 
 @dataclass(frozen=True)
 class ModalSyncSettings:
@@ -152,9 +188,17 @@ def _discover_custom_nodes_dir(repo_root: Path, comfyui_root: Path | None) -> Pa
     return None
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> ModalSyncSettings:
-    """Return cached extension settings derived from the environment."""
+def _settings_env_signature() -> tuple[tuple[str, str | None], ...]:
+    """Return the environment values that affect resolved Modal-Sync settings."""
+    return tuple((key, os.getenv(key)) for key in _SETTINGS_ENV_KEYS)
+
+
+@lru_cache(maxsize=8)
+def _get_settings_cached(
+    env_signature: tuple[tuple[str, str | None], ...],
+) -> ModalSyncSettings:
+    """Return cached extension settings for one environment signature."""
+    del env_signature
     repo_root = _discover_repo_root()
     comfyui_root = _discover_comfyui_root(repo_root)
     custom_nodes_dir = _discover_custom_nodes_dir(repo_root, comfyui_root)
@@ -229,3 +273,11 @@ def get_settings() -> ModalSyncSettings:
     )
     logger.debug("Resolved Modal-Sync settings: %s", settings)
     return settings
+
+
+def get_settings() -> ModalSyncSettings:
+    """Return extension settings derived from the current environment."""
+    return _get_settings_cached(_settings_env_signature())
+
+
+get_settings.cache_clear = _get_settings_cached.cache_clear  # type: ignore[attr-defined]

@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 class _FakeRemoteModelNode:
     """Fake node that produces a non-transportable MODEL output."""
@@ -78,6 +80,55 @@ class _FakeRemoteImageConsumerNode:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     OUTPUT_IS_LIST = (False,)
+
+
+def test_rewrite_remote_mode_rejects_local_sync_backend(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Remote execution must not queue payloads whose synced assets only exist in local mirror storage."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=sync_engine_module.LocalMirrorVolume(settings.local_storage_root),
+        settings=settings,
+    )
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {"RemoteImage": _FakeRemoteImageNode},
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    with pytest.raises(api_intercept_module.ModalPromptValidationError) as exc_info:
+        api_intercept_module.rewrite_prompt_for_modal(
+            prompt={"1": {"class_type": "RemoteImage", "inputs": {}}},
+            workflow={"nodes": [{"id": 1, "properties": {"is_modal_remote": True}}]},
+            sync_engine=sync_engine,
+            settings=settings,
+            nodes_module=fake_nodes_module,
+        )
+
+    assert "requires asset sync to use the Modal volume backend" in str(exc_info.value)
 
 
 class _FakeRemoteModelAndImageNode:
