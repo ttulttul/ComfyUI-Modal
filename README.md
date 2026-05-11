@@ -169,7 +169,7 @@ Remote deployment behavior:
 
 Remote runtime behavior:
 
-- The deployed class reads its GPU type from `COMFY_MODAL_GPU`.
+- The deployed class reads its GPU type from `COMFY_MODAL_GPU`. If a Modal app with the configured `COMFY_MODAL_APP_NAME` already exists while the cloud entrypoint is being built, Modal-Sync now fails fast and asks you to delete the existing app first instead of redeploying over hardware that may have been created with a different GPU type.
 - CPU memory snapshots are enabled by default.
 - GPU memory snapshots remain opt-in.
 - When GPU snapshots are enabled, Modal-Sync now derives a stable snapshot profile from root literal loader nodes and runs those loaders in `@modal.enter(snap=True)`, so later cold restarts for the same model set can restore post-loader GPU state instead of reloading those weights from scratch.

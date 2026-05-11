@@ -7,6 +7,7 @@ import copy
 from concurrent.futures import Future
 import importlib.util
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -2348,6 +2349,134 @@ def test_modal_cloud_pins_cu128_pytorch_stack(
         "torchaudio==2.10.0",
     )
     assert modal_cloud_module._PYTORCH_CUDA_INDEX_URL == "https://download.pytorch.org/whl/cu128"
+
+
+def test_modal_cloud_existing_app_guard_uses_non_creating_sdk_lookup(
+    modal_cloud_module: Any,
+) -> None:
+    """Deploy-time app construction should fail if the configured Modal app already exists."""
+
+    class FakeNotFoundError(Exception):
+        """Stand-in for Modal app lookup misses."""
+
+    lookup_calls: list[tuple[str, bool]] = []
+
+    class FakeApp:
+        """Minimal Modal App namespace with non-creating lookup support."""
+
+        @staticmethod
+        def lookup(app_name: str, create_if_missing: bool = True) -> object:
+            """Record lookup arguments and return an existing app."""
+            lookup_calls.append((app_name, create_if_missing))
+            return object()
+
+    fake_modal = types.SimpleNamespace(
+        App=FakeApp,
+        exception=types.SimpleNamespace(NotFoundError=FakeNotFoundError),
+        is_local=lambda: True,
+    )
+    settings = types.SimpleNamespace(app_name="comfy-modal-sync")
+
+    with pytest.raises(modal_cloud_module.ExistingModalAppError) as exc_info:
+        modal_cloud_module._guard_against_existing_modal_app(settings, fake_modal)
+
+    assert lookup_calls == [("comfy-modal-sync", False)]
+    assert "Delete the existing app" in str(exc_info.value)
+    assert "COMFY_MODAL_GPU" in str(exc_info.value)
+
+
+def test_modal_cloud_existing_app_guard_allows_missing_sdk_lookup(
+    modal_cloud_module: Any,
+) -> None:
+    """A missing Modal app should not block first-run app construction."""
+
+    class FakeNotFoundError(Exception):
+        """Stand-in for Modal app lookup misses."""
+
+    class FakeApp:
+        """Minimal Modal App namespace that reports a missing app."""
+
+        @staticmethod
+        def lookup(app_name: str, create_if_missing: bool = True) -> object:
+            """Raise the SDK's not-found error without creating the app."""
+            del app_name, create_if_missing
+            raise FakeNotFoundError("app not found")
+
+    fake_modal = types.SimpleNamespace(
+        App=FakeApp,
+        exception=types.SimpleNamespace(NotFoundError=FakeNotFoundError),
+        is_local=lambda: True,
+    )
+
+    modal_cloud_module._guard_against_existing_modal_app(
+        types.SimpleNamespace(app_name="comfy-modal-sync"),
+        fake_modal,
+    )
+
+
+def test_modal_cloud_existing_app_guard_falls_back_to_cli_json(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """SDKs without a non-creating lookup should fall back to `modal app list --json`."""
+
+    class FakeApp:
+        """Modal App namespace whose lookup signature cannot safely check existence."""
+
+        @staticmethod
+        def lookup(app_name: str) -> object:
+            """This must not be called because it may create the app."""
+            raise AssertionError(f"unsafe lookup called for {app_name}")
+
+    completed = subprocess.CompletedProcess(
+        args=["modal", "app", "list", "--json"],
+        returncode=0,
+        stdout=json.dumps([{"name": "other"}, {"name": "comfy-modal-sync"}]),
+        stderr="",
+    )
+    observed_commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Return a deterministic Modal CLI app list response."""
+        del kwargs
+        observed_commands.append(command)
+        return completed
+
+    monkeypatch.setattr(modal_cloud_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(modal_cloud_module.subprocess, "run", fake_run)
+    fake_modal = types.SimpleNamespace(App=FakeApp, exception=types.SimpleNamespace(), is_local=lambda: True)
+
+    with pytest.raises(modal_cloud_module.ExistingModalAppError):
+        modal_cloud_module._guard_against_existing_modal_app(
+            types.SimpleNamespace(app_name="comfy-modal-sync"),
+            fake_modal,
+        )
+
+    assert observed_commands == [["/usr/bin/modal", "app", "list", "--json"]]
+
+
+def test_modal_cloud_existing_app_guard_skips_remote_container_import(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The guard should not run inside Modal worker containers that import the same module."""
+
+    class FakeApp:
+        """Modal App namespace that would fail if the guard tried a lookup."""
+
+        @staticmethod
+        def lookup(app_name: str, create_if_missing: bool = True) -> object:
+            """Raise if remote-container imports accidentally perform local deploy checks."""
+            del app_name, create_if_missing
+            raise AssertionError("remote container import should not query Modal apps")
+
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-123")
+    fake_modal = types.SimpleNamespace(App=FakeApp, exception=types.SimpleNamespace(), is_local=lambda: False)
+
+    modal_cloud_module._guard_against_existing_modal_app(
+        types.SimpleNamespace(app_name="comfy-modal-sync"),
+        fake_modal,
+    )
 
 
 def test_modal_cloud_builds_snapshot_enabled_cls_options(
