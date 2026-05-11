@@ -59,6 +59,27 @@ def test_settings_reads_modal_gpu_override(
     assert settings.modal_gpu == "L40S"
 
 
+def test_settings_cache_tracks_execution_mode_env_changes(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Changing Modal execution mode should not leave callers with stale cached settings."""
+    settings_module.get_settings.cache_clear()
+    try:
+        monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
+        local_settings = settings_module.get_settings()
+
+        monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+        remote_settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert local_settings.execution_mode == "local"
+    assert local_settings.sync_custom_nodes is False
+    assert remote_settings.execution_mode == "remote"
+    assert remote_settings.sync_custom_nodes is True
+
+
 def test_settings_enable_gpu_memory_snapshot_defaults_true(
     settings_module: Any,
     monkeypatch: Any,

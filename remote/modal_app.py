@@ -4973,7 +4973,7 @@ def _invoke_modal_payload_blocking(
 
 def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal when configured, or fall back to local in-process execution."""
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
+    execution_mode = get_settings().execution_mode
     if payload.get("payload_kind") == "mapped_subgraph":
         if execution_mode == "local" or modal is None:
             hydrated_inputs = deserialize_node_inputs(kwargs_payload)
@@ -5036,7 +5036,7 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
 
 async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
     """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
+    execution_mode = get_settings().execution_mode
     if payload.get("payload_kind") == "mapped_subgraph":
         if execution_mode == "local" or modal is None:
             return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)

@@ -22,7 +22,7 @@ from .modal_executor_node import (
 )
 from .session_state import RemoteSessionHandle
 from .settings import ModalSyncSettings, get_settings
-from .sync_engine import ModalAssetSyncEngine, SyncedAsset
+from .sync_engine import ModalAssetSyncEngine, ModalVolumeBackend, SyncedAsset
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,23 @@ class RemoteNodeAnalysis:
 
 class ModalPromptValidationError(ValueError):
     """Raised when a prompt cannot be executed with the current Modal transport."""
+
+
+def _ensure_remote_sync_backend(
+    settings: ModalSyncSettings,
+    sync_engine: ModalAssetSyncEngine,
+) -> None:
+    """Fail before queueing when remote execution cannot write to Modal-visible storage."""
+    if settings.execution_mode == "local":
+        return
+    if isinstance(sync_engine.volume, ModalVolumeBackend):
+        return
+    raise ModalPromptValidationError(
+        "Remote Modal execution requires asset sync to use the Modal volume backend, "
+        f"but the active sync backend is {type(sync_engine.volume).__name__}. "
+        "Restart ComfyUI with COMFY_MODAL_EXECUTION_MODE=remote and the Modal SDK available "
+        "so synced assets and custom_nodes bundles are visible inside Modal workers."
+    )
 
 
 def _emit_modal_status(
@@ -2244,11 +2261,12 @@ def _build_component_payload(
         ),
     }
     logger.info(
-        "Built remote payload for component %s: boundary_inputs=%d boundary_outputs=%d execute_nodes=%s",
+        "Built remote payload for component %s: boundary_inputs=%d boundary_outputs=%d execute_nodes=%s custom_nodes_bundle=%s",
         component.representative_node_id,
         len(payload["boundary_inputs"]),
         len(payload["boundary_outputs"]),
         payload["execute_node_ids"],
+        payload["custom_nodes_bundle"],
     )
     logger.info(
         "Remote payload for component %s requires_volume_reload=%s volume_reload_marker=%s",
@@ -2780,6 +2798,7 @@ def rewrite_prompt_for_modal(
 
     resolved_nodes_module = nodes_module or _get_nodes_module()
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
+    _ensure_remote_sync_backend(resolved_settings, resolved_sync_engine)
     rewritten_prompt = copy.deepcopy(prompt)
     expanded_remote_node_ids, _ = _expand_remote_node_ids_for_non_transportable_inputs(
         prompt=rewritten_prompt,
