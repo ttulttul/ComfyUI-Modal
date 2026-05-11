@@ -2351,6 +2351,65 @@ def test_modal_cloud_pins_cu128_pytorch_stack(
     assert modal_cloud_module._PYTORCH_CUDA_INDEX_URL == "https://download.pytorch.org/whl/cu128"
 
 
+def test_modal_cloud_missing_prompt_node_class_raises_clear_error(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Missing custom-node classes should fail before ComfyUI cache setup raises KeyError."""
+    fake_nodes_module = types.SimpleNamespace(NODE_CLASS_MAPPINGS={"KnownNode": object})
+    monkeypatch.setitem(sys.modules, "nodes", fake_nodes_module)
+
+    with pytest.raises(modal_cloud_module.RemoteSubgraphExecutionError) as exc_info:
+        modal_cloud_module._ensure_prompt_node_classes_registered(
+            component_id="component-1",
+            prompt={
+                "1": {"class_type": "KnownNode", "inputs": {}},
+                "2": {"class_type": "KSamplerLoraSigmaInverse", "inputs": {}},
+            },
+            custom_nodes_root=None,
+        )
+
+    message = str(exc_info.value)
+    assert "KSamplerLoraSigmaInverse" in message
+    assert "custom-node sync is enabled" in message
+
+
+def test_modal_cloud_retries_custom_node_import_for_missing_prompt_class(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A missing prompt class should trigger one external custom-node import retry."""
+    import_calls: list[str] = []
+    custom_nodes_root = tmp_path / "custom_nodes_bundle"
+    custom_nodes_root.mkdir()
+
+    class RegisteredLaterNode:
+        """Node type registered by the retry import."""
+
+    async def fake_init_external_custom_nodes() -> None:
+        """Register the custom class when the retry import runs."""
+        import_calls.append("init")
+        fake_nodes_module.NODE_CLASS_MAPPINGS["KSamplerLoraSigmaInverse"] = RegisteredLaterNode
+
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        init_external_custom_nodes=fake_init_external_custom_nodes,
+    )
+    monkeypatch.setitem(sys.modules, "nodes", fake_nodes_module)
+    monkeypatch.setattr(modal_cloud_module, "_register_custom_nodes_root", lambda path: import_calls.append(str(path)))
+    monkeypatch.setattr(modal_cloud_module, "_install_loader_cache_wrappers", lambda: import_calls.append("wrappers"))
+
+    resolved_mapping = modal_cloud_module._ensure_prompt_node_classes_registered(
+        component_id="component-1",
+        prompt={"2": {"class_type": "KSamplerLoraSigmaInverse", "inputs": {}}},
+        custom_nodes_root=custom_nodes_root,
+    )
+
+    assert resolved_mapping["KSamplerLoraSigmaInverse"] is RegisteredLaterNode
+    assert import_calls == [str(custom_nodes_root), "init", "wrappers"]
+
+
 def test_modal_cloud_existing_app_guard_uses_non_creating_sdk_lookup(
     modal_cloud_module: Any,
 ) -> None:
