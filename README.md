@@ -154,7 +154,7 @@ If a previously looked-up `RemoteEngine` handle later fails during `hydrate()` o
 If a previous attempt imported that cloud entrypoint only partially before failing, the loader now discards the stale cached module and retries the import cleanly before auto-deploy.
 The local and remote subgraph runners also canonicalize malformed singleton-list wrappers in rewritten prompts, including socket indexes like `["node", [0]]`, scalar inputs like `[4]`, and wrapped execute node ids like `["12"]`, before handing the prompt to ComfyUI.
 When the remote PromptExecutor still fails, the Modal worker now logs the normalized execute-node ids, boundary outputs, suspicious remaining wrapped prompt inputs, and the underlying ComfyUI `execution_error` payload to make the bad field visible.
-If ComfyUI's remote cache setup would fail because a prompt references a node class missing from the Modal worker registry, the worker now retries external custom-node import once for the synced bundle and then reports the missing class names directly instead of surfacing a raw `KeyError`.
+If ComfyUI's remote cache setup would fail because a prompt references a node class missing from the Modal worker registry, the worker now retries external custom-node import once for the synced bundle and then reports the missing class names and candidate files found in the extracted bundle instead of surfacing a raw `KeyError`.
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=remote

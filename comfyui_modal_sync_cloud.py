@@ -1994,6 +1994,61 @@ def _reload_external_custom_nodes_for_missing_classes(
         _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
 
 
+def _iter_missing_class_candidate_files(
+    custom_nodes_root: Path,
+    class_type: str,
+    *,
+    max_candidates: int = 5,
+) -> Iterator[Path]:
+    """Yield Python files in the extracted bundle that mention one missing class type."""
+    yielded_count = 0
+    for candidate_path in sorted(custom_nodes_root.rglob("*.py")):
+        if yielded_count >= max_candidates:
+            return
+        try:
+            if class_type not in candidate_path.read_text(encoding="utf-8", errors="ignore"):
+                continue
+        except OSError:
+            continue
+        yielded_count += 1
+        yield candidate_path
+
+
+def _custom_node_package_for_candidate_file(custom_nodes_root: Path, candidate_file: Path) -> str:
+    """Return the top-level extracted custom-node package name for one candidate file."""
+    try:
+        relative_path = candidate_file.relative_to(custom_nodes_root)
+    except ValueError:
+        return str(candidate_file)
+    if not relative_path.parts:
+        return str(candidate_file)
+    return relative_path.parts[0]
+
+
+def _missing_node_class_diagnostics(
+    missing_class_types: Sequence[str],
+    custom_nodes_root: Path | None,
+) -> str:
+    """Return a concise diagnostic summary for missing prompt node classes."""
+    if custom_nodes_root is None:
+        return "No custom_nodes bundle was available in the Modal worker."
+    if not custom_nodes_root.exists():
+        return f"Extracted custom_nodes root does not exist: {custom_nodes_root}."
+
+    diagnostics: list[str] = [f"extracted_custom_nodes_root={custom_nodes_root}"]
+    for class_type in missing_class_types:
+        candidate_files = list(_iter_missing_class_candidate_files(custom_nodes_root, class_type))
+        if not candidate_files:
+            diagnostics.append(f"{class_type}: no matching Python file found in extracted bundle")
+            continue
+        rendered_candidates = [
+            f"{path.relative_to(custom_nodes_root)} (package={_custom_node_package_for_candidate_file(custom_nodes_root, path)})"
+            for path in candidate_files
+        ]
+        diagnostics.append(f"{class_type}: found candidates {rendered_candidates}")
+    return "; ".join(diagnostics)
+
+
 def _ensure_prompt_node_classes_registered(
     *,
     component_id: str,
@@ -2017,7 +2072,8 @@ def _ensure_prompt_node_classes_registered(
         raise RemoteSubgraphExecutionError(
             "Remote subgraph references node classes that are not registered in the Modal worker: "
             f"{missing_class_types}. Ensure custom-node sync is enabled and the required custom-node package "
-            "imports successfully inside Modal."
+            "imports successfully inside Modal. "
+            f"Diagnostics: {_missing_node_class_diagnostics(missing_class_types, custom_nodes_root)}"
         )
     return resolved_node_mapping
 
