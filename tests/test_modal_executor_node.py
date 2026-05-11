@@ -2871,6 +2871,9 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         """Minimal deployed remote engine instance."""
 
         execute_payload = FakeExecuteMethod()
+        runtime_version = types.SimpleNamespace(
+            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+        )
 
     class FakeApp:
         """Minimal deployable cloud app double."""
@@ -2915,6 +2918,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {"component_id": "component-1"},
@@ -2923,6 +2927,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", None)]
@@ -2951,6 +2956,9 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
         """Minimal deployed remote engine instance."""
 
         execute_payload = FakeExecuteMethod()
+        runtime_version = types.SimpleNamespace(
+            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+        )
 
     class FakeApp:
         """Minimal deployable cloud app double."""
@@ -3000,6 +3008,7 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES[("comfy-modal-sync", "main")] = (
         remote_modal_app_module._ModalAutoDeployState(ready=True)
     )
@@ -3011,6 +3020,7 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", "main")]
@@ -3034,6 +3044,9 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
             """Record whether this engine should fail once as a stale handle."""
             self._stale = stale
             self.execute_payload = types.SimpleNamespace(remote=self._remote)
+            self.runtime_version = types.SimpleNamespace(
+                remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+            )
 
         def _remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
             """Raise the missing-app error for stale handles and otherwise succeed."""
@@ -3094,6 +3107,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {"component_id": "component-1"},
@@ -3102,6 +3116,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", "main")]
@@ -3125,6 +3140,9 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
             """Expose a warmup method that fails for stale handles."""
             self._stale = stale
             self.warmup_for_request = types.SimpleNamespace(remote=self._remote)
+            self.runtime_version = types.SimpleNamespace(
+                remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+            )
 
         def _remote(self, payload: dict[str, Any]) -> dict[str, Any]:
             """Raise the missing-app error for stale handles and otherwise succeed."""
@@ -3184,6 +3202,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         response = remote_modal_app_module._invoke_modal_warmup_blocking(
             {"component_id": "component-1::warmup:0"},
@@ -3191,8 +3210,119 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == {"component_id": "component-1::warmup:0"}
+    assert deploy_calls == [("comfy-modal-sync", "main")]
+
+
+def test_remote_modal_replaces_out_of_date_deployed_app(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A deployed app with an old protocol should be stopped and auto-deployed again."""
+
+    class FakeLookupError(Exception):
+        """Stand-in for Modal deployed lookup failures."""
+
+    deploy_calls: list[tuple[str | None, str | None]] = []
+    stop_calls: list[str] = []
+
+    class FakeExecuteMethod:
+        """Minimal Modal method handle that records remote calls."""
+
+        def remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Return deterministic remote bytes."""
+            del payload, kwargs_payload
+            return b"remote-response"
+
+    class FakeRemoteEngine:
+        """Minimal deployed remote engine with protocol metadata."""
+
+        def __init__(self, *, current: bool) -> None:
+            """Record whether this engine should report the current protocol."""
+            protocol_version = (
+                remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION
+                if current
+                else remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION - 1
+            )
+            self.execute_payload = FakeExecuteMethod()
+            self.runtime_version = types.SimpleNamespace(
+                remote=lambda: {"protocol_version": protocol_version}
+            )
+
+    class FakeApp:
+        """Minimal deployable cloud app double."""
+
+        def deploy(
+            self,
+            *,
+            name: str | None = None,
+            environment_name: str | None = None,
+            **_: Any,
+        ) -> "FakeApp":
+            """Record the deploy request and make subsequent lookups current."""
+            deploy_calls.append((name, environment_name))
+            FakeModal.deployed = True
+            FakeModal.current = True
+            return self
+
+    class FakeModal:
+        """Minimal Modal SDK double with an initially stale deployed app."""
+
+        deployed = True
+        current = False
+        exception = types.SimpleNamespace(
+            NotFoundError=FakeLookupError,
+            ExecutionError=FakeLookupError,
+            InvalidError=FakeLookupError,
+        )
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return the stale app first and the current replacement after deploy."""
+                del app_name, class_name
+                if not FakeModal.deployed:
+                    raise FakeLookupError("Lookup failed for Cls 'RemoteEngine': not deployed")
+                return lambda **kwargs: FakeRemoteEngine(current=FakeModal.current)
+
+        @staticmethod
+        def enable_output() -> Any:
+            """Provide a no-op output context manager."""
+            return nullcontext()
+
+    def fake_stop_app(app_name: str) -> None:
+        """Record that stale app replacement stopped the old deployment."""
+        stop_calls.append(app_name)
+        FakeModal.deployed = False
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(remote_modal_app_module, "_stop_modal_app_for_replacement", fake_stop_app)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_load_modal_cloud_module",
+        lambda: types.SimpleNamespace(app=FakeApp()),
+    )
+    monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    try:
+        response = remote_modal_app_module._invoke_modal_payload_blocking(
+            {"component_id": "component-1"},
+            b"{}",
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+
+    assert response == b"remote-response"
+    assert stop_calls == ["comfy-modal-sync"]
     assert deploy_calls == [("comfy-modal-sync", "main")]
 
 
@@ -3230,6 +3360,9 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
 
         execute_payload = FakeExecuteMethod()
         warmup_for_request = FakeWarmupMethod()
+        runtime_version = types.SimpleNamespace(
+            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+        )
 
     class FakeApp:
         """Minimal deployable cloud app double."""
@@ -3289,6 +3422,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     try:
         payload_response: list[bytes] = []
@@ -3328,6 +3462,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert thread_errors == []
     assert payload_response == [b"remote-response"]

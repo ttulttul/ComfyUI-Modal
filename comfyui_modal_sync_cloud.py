@@ -32,6 +32,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
 _LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
 _REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
+_REMOTE_APP_PROTOCOL_VERSION = 2
 _PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 _COMFYUI_TORCH_VERSION = "2.10.0"
 _COMFYUI_TORCHVISION_VERSION = "0.25.0"
@@ -4806,6 +4807,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def warmup_for_request(self, payload: dict[str, Any]) -> dict[str, Any]:
             """Prime the current or a newly started Modal container for one prompt."""
             return _prepare_warm_container_for_request(vol, payload)
+
+        @modal.method()
+        def runtime_version(self) -> dict[str, Any]:
+            """Return the deployed app protocol version expected by the local client."""
+            return {
+                "protocol_version": _REMOTE_APP_PROTOCOL_VERSION,
+                "app_name": settings.app_name,
+            }
 
         @modal.method()
         def execute_payload_stream(
