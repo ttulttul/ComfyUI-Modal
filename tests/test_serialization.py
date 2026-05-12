@@ -54,6 +54,39 @@ def test_serialize_mapping_supports_nested_tensors(serialization_module: Any) ->
     assert torch.equal(decoded_tensor, tensor)
 
 
+def test_conditioning_with_reference_latents_round_trips(serialization_module: Any) -> None:
+    """CONDITIONING payloads may include reference latent tensors in their metadata."""
+    torch = pytest.importorskip("torch")
+    conditioning = [
+        [
+            torch.arange(12, dtype=torch.float32).reshape(1, 3, 4),
+            {
+                "pooled_output": None,
+                "attention_mask": torch.ones((1, 4), dtype=torch.int64),
+                "reference_latents": [
+                    torch.arange(16, dtype=torch.float16).reshape(1, 4, 2, 2),
+                ],
+            },
+        ]
+    ]
+
+    encoded = serialization_module.serialize_node_inputs({"positive": conditioning})
+    decoded = serialization_module.deserialize_node_inputs(encoded)
+
+    decoded_conditioning = decoded["positive"]
+    assert len(decoded_conditioning) == 1
+    assert torch.equal(decoded_conditioning[0][0], conditioning[0][0])
+    assert decoded_conditioning[0][1]["pooled_output"] is None
+    assert torch.equal(
+        decoded_conditioning[0][1]["attention_mask"],
+        conditioning[0][1]["attention_mask"],
+    )
+    assert torch.equal(
+        decoded_conditioning[0][1]["reference_latents"][0],
+        conditioning[0][1]["reference_latents"][0],
+    )
+
+
 def test_coerce_serialized_node_outputs_accepts_raw_tensor_outputs(serialization_module: Any) -> None:
     """Raw node outputs should be normalized into transport bytes before crossing the wire."""
     torch = pytest.importorskip("torch")

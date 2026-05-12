@@ -3090,6 +3090,22 @@ def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
     return input_type_map
 
 
+def _node_required_input_names(node_class: type[Any]) -> set[str]:
+    """Return the declared required input names for one node class."""
+    input_types_callable = getattr(node_class, "INPUT_TYPES", None)
+    if not callable(input_types_callable):
+        return set()
+
+    raw_input_types = input_types_callable()
+    if not isinstance(raw_input_types, dict):
+        return set()
+
+    required_inputs = raw_input_types.get("required")
+    if not isinstance(required_inputs, dict):
+        return set()
+    return {str(input_name) for input_name in required_inputs}
+
+
 def _coerce_primitive_prompt_input_value(
     *,
     node_id: str,
@@ -3214,6 +3230,27 @@ def _validate_prompt_input_shapes(
                     f" input_name={input_name!r} declared_type={declared_type!r}"
                     f" received_value={literal_value!r}"
                 )
+
+
+def _validate_required_prompt_inputs(
+    prompt: dict[str, Any],
+    node_mapping: dict[str, type[Any]],
+) -> None:
+    """Reject remote prompt nodes that are missing declared required inputs."""
+    for node_id, prompt_node in sorted(prompt.items()):
+        class_type = str(prompt_node.get("class_type"))
+        node_class = node_mapping.get(class_type)
+        if node_class is None:
+            continue
+        inputs = prompt_node.get("inputs") or {}
+        missing_inputs = sorted(_node_required_input_names(node_class) - set(inputs.keys()))
+        if not missing_inputs:
+            continue
+        raise RemoteSubgraphExecutionError(
+            "Remote subgraph prompt is missing required node inputs before execution."
+            f" node_id={node_id!r} node_type={class_type!r}"
+            f" missing_inputs={missing_inputs!r} available_inputs={sorted(str(key) for key in inputs)!r}"
+        )
 
 
 def _log_prompt_executor_failure_details(
@@ -3507,6 +3544,7 @@ def _execute_subgraph_prompt(
         resolved_node_mapping,
         list(normalized_payload.get("boundary_inputs", [])),
     )
+    _validate_required_prompt_inputs(prompt, resolved_node_mapping)
 
     with (
         _temporary_node_mapping(None),
