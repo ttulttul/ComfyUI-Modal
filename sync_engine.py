@@ -370,7 +370,13 @@ class ModalVolumeBackend(_ModalSdkCaller):
             with self._volume.batch_upload() as batch:
                 batch.put_file(local_path, remote_path)
 
-        self._run_sdk_call(upload)
+        try:
+            self._run_sdk_call(upload)
+        except FileExistsError:
+            logger.info(
+                "Treating Modal volume upload for %s as successful because the content-addressed path already exists.",
+                remote_path,
+            )
         with self._exists_cache_lock:
             self._exists_cache[remote_path] = True
 
@@ -380,7 +386,13 @@ class ModalVolumeBackend(_ModalSdkCaller):
             with self._volume.batch_upload() as batch:
                 batch.put_file(io.BytesIO(payload), remote_path)
 
-        self._run_sdk_call(upload)
+        try:
+            self._run_sdk_call(upload)
+        except FileExistsError:
+            logger.info(
+                "Treating Modal volume byte upload for %s as successful because the content-addressed path already exists.",
+                remote_path,
+            )
         with self._exists_cache_lock:
             self._exists_cache[remote_path] = True
 

@@ -1064,6 +1064,80 @@ def test_modal_volume_backend_caches_exists_results_and_uploaded_paths(
     assert fake_volume.listdir_calls == 1
 
 
+def test_modal_volume_backend_ignores_file_exists_upload_race(
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Content-addressed Modal uploads should be idempotent when the path already exists remotely."""
+
+    class FakeBatch:
+        """Raise the same collision Modal raises when closing a duplicate upload batch."""
+
+        def __enter__(self) -> "FakeBatch":
+            """Return the active batch context."""
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            """Surface the duplicate remote file at batch close."""
+            raise FileExistsError("/custom_nodes/entries/package/hash_custom_nodes_bundle.zip")
+
+        def put_file(self, source: Any, remote_path: str) -> None:
+            """Accept the upload request before the batch close detects the duplicate."""
+            del source, remote_path
+
+    class FakeVolume:
+        """Minimal Modal volume double with duplicate-upload behavior."""
+
+        def __init__(self) -> None:
+            """Initialize fake storage state."""
+            self.listdir_calls = 0
+
+        def listdir(self, remote_path: str, recursive: bool = False) -> list[str]:
+            """Return a listing for known paths while counting calls."""
+            del recursive
+            self.listdir_calls += 1
+            return [remote_path]
+
+        def batch_upload(self) -> FakeBatch:
+            """Return a fake uploader."""
+            return FakeBatch()
+
+    fake_volume = FakeVolume()
+
+    class FakeModal:
+        """Minimal modal SDK double exposing a duplicate-prone fake volume."""
+
+        exception = type(
+            "FakeExceptionNamespace",
+            (),
+            {
+                "NotFoundError": FileNotFoundError,
+            },
+        )
+
+        class Volume:
+            """Namespace for volume lookups."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> FakeVolume:
+                """Return the fake volume for any lookup."""
+                del name, create_if_missing
+                return fake_volume
+
+    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    backend = sync_engine_module.ModalVolumeBackend("volume")
+    local_path = tmp_path / "bundle.zip"
+    local_path.write_bytes(b"bundle")
+
+    backend.put_file(local_path, "/custom_nodes/entries/package/hash_custom_nodes_bundle.zip")
+    backend.put_bytes(b"{}", "/custom_nodes/manifests/hash_manifest.json")
+
+    assert backend.exists("/custom_nodes/entries/package/hash_custom_nodes_bundle.zip") is True
+    assert backend.exists("/custom_nodes/manifests/hash_manifest.json") is True
+    assert fake_volume.listdir_calls == 0
+
+
 def test_modal_volume_backend_retries_rate_limited_calls(
     sync_engine_module: Any,
     monkeypatch: Any,
