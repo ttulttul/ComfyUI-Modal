@@ -9057,6 +9057,42 @@ def test_apply_boundary_inputs_preserves_singleton_conditioning_lists(
         ("modal_cloud_module",),
     ],
 )
+def test_validate_required_prompt_inputs_reports_missing_latent_image(
+    request: Any,
+    module_fixture_name: str,
+) -> None:
+    """Remote execution should fail before PromptExecutor calls samplers with missing required inputs."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    prompt = {
+        "3": {
+            "class_type": "KSamplerLoraSigmaInverse",
+            "inputs": {
+                "seed": 1,
+                "steps": 24,
+                "positive": [["cond", {"reference_latents": ["reference"]}]],
+            },
+        }
+    }
+
+    with pytest.raises(target_module.RemoteSubgraphExecutionError) as exc_info:
+        target_module._validate_required_prompt_inputs(
+            prompt,
+            {"KSamplerLoraSigmaInverse": _FakeImplicitBatchKSamplerNode},
+        )
+
+    message = str(exc_info.value)
+    assert "missing required node inputs" in message
+    assert "latent_image" in message
+    assert "available_inputs=['positive', 'seed', 'steps']" in message
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
 def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
     request: Any,
     module_fixture_name: str,

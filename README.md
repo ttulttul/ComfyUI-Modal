@@ -158,6 +158,7 @@ When the remote PromptExecutor still fails, the Modal worker now logs the normal
 If ComfyUI's remote cache setup would fail because a prompt references a node class missing from the Modal worker registry, the worker now retries external custom-node import once for the synced bundle and then reports the missing class names and candidate files found in the extracted bundle instead of surfacing a raw `KeyError`.
 Remote queue rewrite now also rejects remote execution when the sync engine is still using the local mirror backend, because those `/custom_nodes/...` and `/assets/...` paths are not visible inside Modal workers.
 Modal volume uploads are idempotent for content-addressed paths: if Modal reports that an uploaded asset or custom-node archive already exists, the sync engine treats that as a successful reuse.
+The remote worker preflights declared required inputs before invoking `PromptExecutor`, so a malformed remote prompt now reports missing inputs like `latent_image` directly instead of surfacing a later Python method-arity error from the node implementation.
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=remote
