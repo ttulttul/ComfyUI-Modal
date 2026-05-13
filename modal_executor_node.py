@@ -8,7 +8,8 @@ import inspect
 import json
 import logging
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -74,6 +75,9 @@ _PROXY_EXECUTION_CONTEXTS_LOCK = threading.Lock()
 _PROXY_EXECUTION_CONTEXTS: dict[str, "_ProxyExecutionContext"] = {}
 _MODAL_MAP_WARMUP_CONTEXTS_LOCK = threading.Lock()
 _MODAL_MAP_WARMUP_CONTEXTS: dict[str, "_ModalMapWarmupContext"] = {}
+_MODAL_WORKFLOW_EXECUTION_GATE = threading.Condition()
+_MODAL_WORKFLOW_ACTIVE_PROMPT_ID: str | None = None
+_MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,95 @@ def set_remote_executor_client_factory(
 def get_remote_executor_client() -> RemoteExecutorClient:
     """Instantiate the configured execution client."""
     return _REMOTE_EXECUTOR_CLIENT_FACTORY()
+
+
+def _acquire_modal_workflow_execution_slot(
+    prompt_id: str | None,
+    component_id: Any,
+) -> bool:
+    """Reserve a remote execution slot for one prompt, waiting behind older prompts."""
+    if prompt_id is None:
+        return False
+
+    global _MODAL_WORKFLOW_ACTIVE_PROMPT_ID
+    global _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS
+
+    waited = False
+    with _MODAL_WORKFLOW_EXECUTION_GATE:
+        while (
+            _MODAL_WORKFLOW_ACTIVE_PROMPT_ID is not None
+            and _MODAL_WORKFLOW_ACTIVE_PROMPT_ID != prompt_id
+        ):
+            if not waited:
+                logger.info(
+                    "Waiting to start Modal component=%s for prompt=%s until active prompt=%s finishes remote execution.",
+                    component_id,
+                    prompt_id,
+                    _MODAL_WORKFLOW_ACTIVE_PROMPT_ID,
+                )
+                waited = True
+            _MODAL_WORKFLOW_EXECUTION_GATE.wait()
+
+        _MODAL_WORKFLOW_ACTIVE_PROMPT_ID = prompt_id
+        _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS += 1
+        logger.debug(
+            "Acquired Modal workflow execution slot for prompt=%s component=%s active_remote_calls=%d.",
+            prompt_id,
+            component_id,
+            _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS,
+        )
+    return True
+
+
+def _release_modal_workflow_execution_slot(prompt_id: str | None, component_id: Any) -> None:
+    """Release a prompt-scoped remote execution slot and unblock the next prompt if idle."""
+    if prompt_id is None:
+        return
+
+    global _MODAL_WORKFLOW_ACTIVE_PROMPT_ID
+    global _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS
+
+    with _MODAL_WORKFLOW_EXECUTION_GATE:
+        if _MODAL_WORKFLOW_ACTIVE_PROMPT_ID != prompt_id:
+            logger.warning(
+                "Ignoring Modal workflow gate release for prompt=%s component=%s because active prompt is %s.",
+                prompt_id,
+                component_id,
+                _MODAL_WORKFLOW_ACTIVE_PROMPT_ID,
+            )
+            return
+
+        _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS = max(0, _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS - 1)
+        logger.debug(
+            "Released Modal workflow execution slot for prompt=%s component=%s active_remote_calls=%d.",
+            prompt_id,
+            component_id,
+            _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS,
+        )
+        if _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS == 0:
+            _MODAL_WORKFLOW_ACTIVE_PROMPT_ID = None
+            _MODAL_WORKFLOW_EXECUTION_GATE.notify_all()
+
+
+@asynccontextmanager
+async def _modal_workflow_execution_slot(payload: Mapping[str, Any]) -> AsyncIterator[None]:
+    """Async context that serializes remote work across different prompt ids."""
+    prompt_id = _normalize_prompt_id(payload.get("prompt_id"))
+    component_id = payload.get("component_id")
+    acquired = await asyncio.to_thread(
+        _acquire_modal_workflow_execution_slot,
+        prompt_id,
+        component_id,
+    )
+    try:
+        yield
+    finally:
+        if acquired:
+            await asyncio.to_thread(
+                _release_modal_workflow_execution_slot,
+                prompt_id,
+                component_id,
+            )
 
 
 async def _execute_payload_async(
@@ -391,13 +484,14 @@ def _build_proxy_node_class(
                 unique_id=unique_id,
             )
 
-            outputs = tuple(
-                await _execute_payload_async(
-                    get_remote_executor_client(),
-                    payload,
-                    _normalize_proxy_kwargs(kwargs),
+            async with _modal_workflow_execution_slot(payload):
+                outputs = tuple(
+                    await _execute_payload_async(
+                        get_remote_executor_client(),
+                        payload,
+                        _normalize_proxy_kwargs(kwargs),
+                    )
                 )
-            )
             logger.debug(
                 "Remote execution completed for payload kind=%s with %d outputs.",
                 payload.get("payload_kind"),
