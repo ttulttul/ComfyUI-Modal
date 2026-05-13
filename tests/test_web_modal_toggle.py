@@ -50,6 +50,8 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "function effectiveGlobalStatusPhase(promptId, phase)" in source
     assert "function promptHasLiveRemoteWork(promptId)" in source
     assert "function reconcilePromptGlobalStatus(promptId)" in source
+    assert "function promptRemoteNodeCount(promptId, fallbackCount = 1)" in source
+    assert "nodeCount: promptRemoteNodeCount(promptId, nodeCount)," in source
 
 
 def test_remote_modal_status_tracks_active_node_ids() -> None:
@@ -68,8 +70,12 @@ def test_interrupted_prompts_clear_modal_ui_by_prompt_id() -> None:
     """Interrupt cleanup should not depend on native execution events naming a specific node."""
     source = _modal_toggle_source()
 
+    assert "const modalTerminalPromptStates = new Map();" in source
+    assert "function isPromptTerminal(promptId)" in source
+    assert "function markPromptTerminal(promptId, phase)" in source
     assert 'if (detail.phase === "execution_interrupted") {' in source
     assert "function handlePromptInterruption(promptId)" in source
+    assert 'markPromptTerminal(promptId, "execution_interrupted");' in source
     assert "clearGlobalStatusPhase(promptId);" in source
     assert "clearPromptRemoteStates(promptId);" in source
     assert 'api.addEventListener("execution_interrupted", (event) => {' in source

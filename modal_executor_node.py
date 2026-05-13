@@ -112,28 +112,19 @@ def _acquire_modal_workflow_execution_slot(
     prompt_id: str | None,
     component_id: Any,
 ) -> bool:
-    """Reserve a remote execution slot for one prompt, waiting behind older prompts."""
+    """Try to reserve a remote execution slot for one prompt."""
     if prompt_id is None:
         return False
 
     global _MODAL_WORKFLOW_ACTIVE_PROMPT_ID
     global _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS
 
-    waited = False
     with _MODAL_WORKFLOW_EXECUTION_GATE:
-        while (
+        if (
             _MODAL_WORKFLOW_ACTIVE_PROMPT_ID is not None
             and _MODAL_WORKFLOW_ACTIVE_PROMPT_ID != prompt_id
         ):
-            if not waited:
-                logger.info(
-                    "Waiting to start Modal component=%s for prompt=%s until active prompt=%s finishes remote execution.",
-                    component_id,
-                    prompt_id,
-                    _MODAL_WORKFLOW_ACTIVE_PROMPT_ID,
-                )
-                waited = True
-            _MODAL_WORKFLOW_EXECUTION_GATE.wait()
+            return False
 
         _MODAL_WORKFLOW_ACTIVE_PROMPT_ID = prompt_id
         _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS += 1
@@ -181,11 +172,28 @@ async def _modal_workflow_execution_slot(payload: Mapping[str, Any]) -> AsyncIte
     """Async context that serializes remote work across different prompt ids."""
     prompt_id = _normalize_prompt_id(payload.get("prompt_id"))
     component_id = payload.get("component_id")
-    acquired = await asyncio.to_thread(
-        _acquire_modal_workflow_execution_slot,
-        prompt_id,
-        component_id,
-    )
+    if prompt_id is None:
+        yield
+        return
+
+    acquired = False
+    waiting_logged = False
+    while not acquired:
+        acquired = await asyncio.to_thread(
+            _acquire_modal_workflow_execution_slot,
+            prompt_id,
+            component_id,
+        )
+        if not acquired:
+            if not waiting_logged:
+                logger.info(
+                    "Waiting to start Modal component=%s for prompt=%s until active prompt=%s finishes remote execution.",
+                    component_id,
+                    prompt_id,
+                    _MODAL_WORKFLOW_ACTIVE_PROMPT_ID,
+                )
+                waiting_logged = True
+            await asyncio.sleep(0.1)
     try:
         yield
     finally:
