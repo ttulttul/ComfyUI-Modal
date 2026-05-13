@@ -137,6 +137,166 @@ class _FakeRewriteLocalSinkNode:
     OUTPUT_IS_LIST = (False,)
 
 
+def test_modal_proxy_waits_for_active_prompt_before_starting_next_prompt(
+    modal_executor_module: Any,
+) -> None:
+    """A Modal proxy from a later prompt should wait until the active prompt's remote work drains."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    proxy_node_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=("STRING",),
+        output_names=("value",),
+        output_is_list=(False,),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    observed_events: list[str] = []
+
+    class FakeClient:
+        """Fake async remote client that records when each prompt reaches execution."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str]:
+            """Block the first prompt so the second prompt has to wait at the gate."""
+            component_id = str(payload["component_id"])
+            observed_events.append(f"start:{component_id}")
+            if component_id == "component-1":
+                first_started.set()
+                await release_first.wait()
+            if component_id == "component-2":
+                second_started.set()
+            observed_events.append(f"finish:{component_id}")
+            return (component_id,)
+
+    async def run_scenario() -> tuple[Any, Any]:
+        """Run two prompts concurrently and verify prompt-level serialization."""
+        first_task = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "prompt-1",
+                    "component_id": "component-1",
+                },
+                unique_id="component-1",
+            )
+        )
+        await first_started.wait()
+        second_task = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "prompt-2",
+                    "component_id": "component-2",
+                },
+                unique_id="component-2",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not second_started.is_set()
+        release_first.set()
+        return await asyncio.gather(first_task, second_task)
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        first_output, second_output = asyncio.run(run_scenario())
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert first_output.result == ("component-1",)
+    assert second_output.result == ("component-2",)
+    assert observed_events == [
+        "start:component-1",
+        "finish:component-1",
+        "start:component-2",
+        "finish:component-2",
+    ]
+
+
+def test_modal_proxy_allows_same_prompt_components_to_overlap(
+    modal_executor_module: Any,
+) -> None:
+    """Modal proxies from the same prompt should be allowed to execute concurrently."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    proxy_node_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=("STRING",),
+        output_names=("value",),
+        output_is_list=(False,),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    started_components: set[str] = set()
+    both_started = asyncio.Event()
+    release_components = asyncio.Event()
+    observed_events: list[str] = []
+
+    class FakeClient:
+        """Fake async remote client that waits until both same-prompt components start."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str]:
+            """Record concurrent same-prompt starts before returning."""
+            component_id = str(payload["component_id"])
+            observed_events.append(f"start:{component_id}")
+            started_components.add(component_id)
+            if started_components == {"component-1", "component-2"}:
+                both_started.set()
+            await release_components.wait()
+            observed_events.append(f"finish:{component_id}")
+            return (component_id,)
+
+    async def run_scenario() -> tuple[Any, Any]:
+        """Run two same-prompt proxy components concurrently."""
+        first_task = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "prompt-1",
+                    "component_id": "component-1",
+                },
+                unique_id="component-1",
+            )
+        )
+        second_task = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "prompt-1",
+                    "component_id": "component-2",
+                },
+                unique_id="component-2",
+            )
+        )
+        await asyncio.wait_for(both_started.wait(), timeout=1.0)
+        release_components.set()
+        return await asyncio.gather(first_task, second_task)
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        first_output, second_output = asyncio.run(run_scenario())
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert first_output.result == ("component-1",)
+    assert second_output.result == ("component-2",)
+    assert observed_events[:2] == ["start:component-1", "start:component-2"]
+
+
 class _FakeImplicitBatchKSamplerNode:
     """Fake sampler node exposing ComfyUI-style LATENT and primitive socket types."""
 
