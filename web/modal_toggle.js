@@ -24,6 +24,7 @@ const STATE_ACTIVE = "active";
 const STATE_COMPLETE = "complete";
 const STATE_ERROR = "error";
 const ERROR_CLEAR_DELAY_MS = 5000;
+const TERMINAL_PROMPT_RETENTION_MS = 60000;
 
 const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
@@ -32,6 +33,7 @@ const modalNodeBatchProgress = new Map();
 const modalNodeCachedStates = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
+const modalTerminalPromptStates = new Map();
 const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 
@@ -85,6 +87,57 @@ function nowMs() {
 }
 
 /**
+ * Remove terminal prompt markers after their stale-event guard window expires.
+ */
+function pruneTerminalPromptStates() {
+  const cutoffMs = nowMs() - TERMINAL_PROMPT_RETENTION_MS;
+  for (const [promptId, terminalState] of modalTerminalPromptStates.entries()) {
+    if ((terminalState?.terminalAt ?? 0) < cutoffMs) {
+      modalTerminalPromptStates.delete(promptId);
+    }
+  }
+}
+
+/**
+ * Return whether late events for a prompt should be ignored.
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function isPromptTerminal(promptId) {
+  if (!promptId) {
+    return false;
+  }
+  pruneTerminalPromptStates();
+  return modalTerminalPromptStates.has(promptId);
+}
+
+/**
+ * Mark a prompt as terminal so late remote events cannot resurrect stale UI state.
+ * @param {string} promptId
+ * @param {string} phase
+ */
+function markPromptTerminal(promptId, phase) {
+  if (!promptId) {
+    return;
+  }
+  modalTerminalPromptStates.set(promptId, {
+    phase,
+    terminalAt: nowMs(),
+  });
+}
+
+/**
+ * Allow a newly queued prompt id to receive state updates.
+ * @param {string} promptId
+ */
+function clearPromptTerminal(promptId) {
+  if (!promptId) {
+    return;
+  }
+  modalTerminalPromptStates.delete(promptId);
+}
+
+/**
  * Read a node id as a stable string.
  * @param {LGraphNode} node
  * @returns {string}
@@ -135,7 +188,12 @@ function ensureGlobalStatusElement() {
  * Remove orphaned global status entries that no longer have any live prompt state.
  */
 function pruneGlobalStatusStates() {
+  pruneTerminalPromptStates();
   for (const promptId of Array.from(modalGlobalStatusStates.keys())) {
+    if (isPromptTerminal(promptId)) {
+      modalGlobalStatusStates.delete(promptId);
+      continue;
+    }
     if (modalPromptStates.has(promptId) || syntheticPromptUiStates.has(promptId)) {
       continue;
     }
@@ -150,6 +208,18 @@ function pruneGlobalStatusStates() {
  */
 function promptNodeStates(promptId) {
   return Array.from(modalNodeStates.values()).filter((state) => state?.promptId === promptId);
+}
+
+/**
+ * Return the best known remote node count for one prompt.
+ * @param {string} promptId
+ * @param {number} fallbackCount
+ * @returns {number}
+ */
+function promptRemoteNodeCount(promptId, fallbackCount = 1) {
+  const promptState = modalPromptStates.get(promptId);
+  const remoteCount = promptState?.remoteNodeIds?.length ?? 0;
+  return Math.max(1, Number(remoteCount || fallbackCount) || 1);
 }
 
 /**
@@ -390,15 +460,18 @@ function setGlobalStatusPhase(promptId, phase, nodeCount, details = null) {
   if (!promptId) {
     return;
   }
+  if (isPromptTerminal(promptId) && phase !== STATE_ERROR) {
+    return;
+  }
   const existingState = modalGlobalStatusStates.get(promptId);
   modalGlobalStatusStates.set(promptId, {
     phase: effectiveGlobalStatusPhase(promptId, phase),
-    nodeCount: Math.max(1, Number(nodeCount) || 1),
+    nodeCount: promptRemoteNodeCount(promptId, nodeCount),
     batchValue: existingState?.batchValue ?? null,
     batchMax: existingState?.batchMax ?? null,
-    statusMessage: details?.message ?? null,
-    statusCurrent: details?.current ?? null,
-    statusTotal: details?.total ?? null,
+    statusMessage: details?.message ?? existingState?.statusMessage ?? null,
+    statusCurrent: details?.current ?? existingState?.statusCurrent ?? null,
+    statusTotal: details?.total ?? existingState?.statusTotal ?? null,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -414,14 +487,20 @@ function setGlobalStatusBatchProgress(promptId, value, maxValue) {
   if (!promptId) {
     return;
   }
+  if (isPromptTerminal(promptId)) {
+    return;
+  }
   const existingState = modalGlobalStatusStates.get(promptId);
   const safeMaxValue = Math.max(1, Number(maxValue) || 1);
   const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
   modalGlobalStatusStates.set(promptId, {
     phase: effectiveGlobalStatusPhase(promptId, existingState?.phase ?? EXECUTION_PHASE),
-    nodeCount: Math.max(1, Number(existingState?.nodeCount) || 1),
+    nodeCount: promptRemoteNodeCount(promptId, existingState?.nodeCount ?? 1),
     batchValue: safeValue,
     batchMax: safeMaxValue,
+    statusMessage: existingState?.statusMessage ?? null,
+    statusCurrent: existingState?.statusCurrent ?? null,
+    statusTotal: existingState?.statusTotal ?? null,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -456,6 +535,9 @@ function refreshModalUiAfterVisibilityChange() {
  * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
  */
 function ensurePromptState(promptId) {
+  if (isPromptTerminal(promptId)) {
+    return null;
+  }
   if (!modalPromptStates.has(promptId)) {
     modalPromptStates.set(promptId, {
       startedAt: nowMs(),
@@ -479,6 +561,9 @@ function ensurePromptState(promptId) {
  * @returns {boolean}
  */
 function shouldApplyPromptState(nodeIdValue, promptId) {
+  if (isPromptTerminal(promptId)) {
+    return false;
+  }
   const incomingPromptState = modalPromptStates.get(promptId);
   if (!incomingPromptState) {
     return true;
@@ -604,6 +689,9 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
  */
 function registerPromptComponents(promptId, remoteNodeIds, components) {
   const promptState = ensurePromptState(promptId);
+  if (!promptState) {
+    return;
+  }
   if (components.length > 0) {
     const mergedRemoteNodeIds = new Set(remoteNodeIds.map((nodeIdValue) => String(nodeIdValue)));
     promptState.componentsByRepresentative.clear();
@@ -740,6 +828,9 @@ function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage) {
  */
 function setPromptActiveNode(promptId, activeNodeId) {
   const promptState = ensurePromptState(promptId);
+  if (!promptState) {
+    return;
+  }
   promptState.activeNodeId = activeNodeId ? String(activeNodeId) : null;
 }
 
@@ -971,6 +1062,9 @@ function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, ite
   const safeMaxValue = Math.max(1, Number(maxValue) || 1);
   const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
   const promptState = ensurePromptState(promptId);
+  if (!promptState) {
+    return;
+  }
   const previousNodeId = promptState.laneNodeIdsByLane.get(safeLaneKey);
   if (previousNodeId && previousNodeId !== safeNodeIdValue) {
     deleteNodeProgressLane(previousNodeId, promptId, safeLaneId);
@@ -1755,12 +1849,18 @@ function handleModalStatus(event) {
   if (!promptId) {
     return;
   }
+  if (isPromptTerminal(promptId) && detail.phase !== STATE_SETUP) {
+    return;
+  }
   const nodeIds = (detail.node_ids ?? []).map((value) => String(value));
   const components = detail.components ?? [];
   if (components.length > 0 || nodeIds.length > 0) {
     registerPromptComponents(promptId, nodeIds, components);
   }
   const promptState = ensurePromptState(promptId);
+  if (!promptState) {
+    return;
+  }
 
   if (detail.phase === STATE_SETUP) {
     beginSyntheticExecutionUi(promptId, nodeIds);
@@ -1803,10 +1903,12 @@ function handleModalStatus(event) {
       clearNodeProgress(nodeIdValue, promptId);
     }
     setNodesPhase(nodeIds, STATE_ERROR, promptId, detail.error_message);
+    markPromptTerminal(promptId, STATE_ERROR);
     return;
   }
 
   if (detail.phase === "execution_interrupted") {
+    markPromptTerminal(promptId, "execution_interrupted");
     endSyntheticExecutionUi(promptId);
     handlePromptInterruption(promptId);
     return;
@@ -1851,6 +1953,7 @@ function handlePromptInterruption(promptId) {
   if (!promptId) {
     return;
   }
+  markPromptTerminal(promptId, "execution_interrupted");
   clearGlobalStatusPhase(promptId);
   clearPromptRemoteStates(promptId);
 }
@@ -1866,9 +1969,15 @@ function handleModalProgress(event) {
   if (!promptId || !progressNodeId) {
     return;
   }
+  if (isPromptTerminal(promptId)) {
+    return;
+  }
 
   endSyntheticExecutionUi(promptId);
   const promptState = ensurePromptState(promptId);
+  if (!promptState) {
+    return;
+  }
   const componentNodeIds = resolveComponentNodeIds(promptId, progressNodeId);
   const readyNodeIds = (componentNodeIds ?? []).filter((nodeIdValue) => nodeIdValue !== progressNodeId);
   promptState.hasStreamedProgress = true;
@@ -1950,6 +2059,9 @@ function handleExecutionPhase(event, phase) {
   const promptId = String(detail.prompt_id ?? "");
   const representativeNodeId = String(detail.display_node ?? detail.node ?? detail.node_id ?? "");
   if (!promptId || !representativeNodeId) {
+    return;
+  }
+  if (isPromptTerminal(promptId)) {
     return;
   }
 
@@ -2072,6 +2184,7 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds) {
   if (remoteNodeIds.length === 0 || syntheticPromptUiStates.has(promptId)) {
     return;
   }
+  clearPromptTerminal(promptId);
 
   const displayNode = remoteNodeIds[0];
   syntheticPromptUiStates.set(promptId, { displayNode });
@@ -2141,11 +2254,14 @@ function registerExecutionListeners() {
     handleExecutionPhase(event, STATE_COMPLETE);
   });
   api.addEventListener("execution_error", (event) => {
-    endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""), true);
+    const promptId = String(eventDetail(event).prompt_id ?? "");
+    endSyntheticExecutionUi(promptId, true);
     handleExecutionPhase(event, STATE_ERROR);
+    markPromptTerminal(promptId, STATE_ERROR);
   });
   api.addEventListener("execution_interrupted", (event) => {
     const promptId = String(eventDetail(event).prompt_id ?? "");
+    markPromptTerminal(promptId, "execution_interrupted");
     endSyntheticExecutionUi(promptId);
     handlePromptInterruption(promptId);
   });
@@ -2155,6 +2271,7 @@ function registerExecutionListeners() {
     if (!promptId) {
       return;
     }
+    markPromptTerminal(promptId, "execution_success");
     endSyntheticExecutionUi(promptId);
     clearGlobalStatusPhase(promptId);
     clearPromptRemoteStates(promptId);
@@ -2183,6 +2300,7 @@ function patchQueuePrompt() {
   api.queuePrompt = async function modalQueuePrompt(number, data, options) {
     const { output: prompt, workflow } = data;
     const promptId = createPromptId();
+    clearPromptTerminal(promptId);
     const remoteNodeIds = extractRemoteNodeIds(workflow);
     registerPromptComponents(promptId, remoteNodeIds, []);
     if (remoteNodeIds.length > 0) {

@@ -48,12 +48,14 @@ const transformedSource = `${[
   "  handlePromptInterruption,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
+  "  currentGlobalStatus,",
   "  modalGlobalStatusStates,",
   "  modalNodeStates,",
   "  modalNodeProgress,",
   "  modalNodeProgressLanes,",
   "  modalNodeBatchProgress,",
   "  modalPromptStates,",
+  "  modalTerminalPromptStates,",
   "  STATE_READY,",
   "  STATE_ACTIVE,",
   "  STATE_COMPLETE,",
@@ -70,6 +72,7 @@ function resetFrontendState() {
   modalToggle.modalNodeProgressLanes.clear();
   modalToggle.modalNodeBatchProgress.clear();
   modalToggle.modalPromptStates.clear();
+  modalToggle.modalTerminalPromptStates.clear();
 }
 
 resetFrontendState();
@@ -256,6 +259,27 @@ modalToggle.handleModalStatus({
 assert.equal(modalToggle.modalPromptStates.has("prompt-f"), false);
 assert.equal(modalToggle.modalNodeStates.has("20"), false);
 assert.equal(modalToggle.modalNodeStates.has("21"), false);
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-f",
+    node_id: "20",
+    display_node_id: "20",
+    real_node_id: "21",
+    value: 1,
+    max: 4,
+  },
+});
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-f",
+    phase: "executing",
+    node_ids: ["20", "21"],
+    active_node_id: "21",
+  },
+});
+assert.equal(modalToggle.modalPromptStates.has("prompt-f"), false);
+assert.equal(modalToggle.modalGlobalStatusStates.has("prompt-f"), false);
+assert.equal(modalToggle.modalNodeProgress.has("21"), false);
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-g", ["30", "31"], [
@@ -286,3 +310,24 @@ modalToggle.handleExecutionPhase(
 assert.equal(modalToggle.modalNodeStates.get("30")?.phase, modalToggle.STATE_COMPLETE);
 assert.equal(modalToggle.modalNodeStates.get("31")?.phase, modalToggle.STATE_COMPLETE);
 assert.equal(modalToggle.modalGlobalStatusStates.has("prompt-g"), false);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-h", ["40", "41", "42"], [
+  {
+    representative_node_id: "40",
+    node_ids: ["40"],
+  },
+  {
+    representative_node_id: "41",
+    node_ids: ["41", "42"],
+  },
+]);
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-h",
+    phase: "executing",
+    node_ids: ["41"],
+    active_node_id: "41",
+  },
+});
+assert.equal(modalToggle.currentGlobalStatus()?.nodeCount, 3);
