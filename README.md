@@ -99,6 +99,7 @@ The list above is the shortest accurate summary. If you want the execution path 
     - Preview images
   - The local frontend updates node overlays and global status from those events.
   - Prompt success, failure, and interruption mark that prompt terminal in the frontend so late remote progress cannot resurrect stale node overlays or the global status pill.
+  - When a local prompt is cancelled while Modal work is already in flight, the local proxy requests remote interruption but keeps the prompt gate held until the remote call actually finishes.
 
 - **7. Return to the local workflow**
   1. The proxy node receives the serialized result.
