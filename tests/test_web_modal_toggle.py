@@ -163,6 +163,9 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     """The frontend should listen for numeric Modal node progress and render it on the node."""
     source = _modal_toggle_source()
 
+    assert 'const PROGRESS_FADE_MS = 900;' in source
+    assert "function fadeNodeProgress(nodeIdValue, promptId)" in source
+    assert "function progressVisualOpacity(progressState)" in source
     assert 'api.addEventListener("modal_progress", handleModalProgress);' in source
     assert "function handleModalProgress(event)" in source
     assert "if (detail.aggregate_only) {" in source
@@ -171,6 +174,7 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false)" in source
     assert "function clearNodeProgressLane(nodeIdValue, promptId, laneId)" in source
     assert "function clearNodeProgress(nodeIdValue, promptId)" in source
+    assert "fadeNodeProgress(nodeIdValue, promptId);" in source
     assert "state?.progress" in source
     assert "state?.progressLanes" in source
     assert "detail.lane_id != null" in source

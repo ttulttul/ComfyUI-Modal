@@ -25,6 +25,7 @@ const STATE_COMPLETE = "complete";
 const STATE_ERROR = "error";
 const ERROR_CLEAR_DELAY_MS = 5000;
 const TERMINAL_PROMPT_RETENTION_MS = 60000;
+const PROGRESS_FADE_MS = 900;
 
 const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
@@ -640,7 +641,11 @@ function refreshCanvasAnimation() {
     [STATE_SETUP, STATE_READY, STATE_ACTIVE, STATE_ERROR].includes(state.phase),
   );
   const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;
-  if (!hasAnimatedState && !hasCachedPulse) {
+  const hasProgressState =
+    modalNodeProgress.size > 0 ||
+    modalNodeProgressLanes.size > 0 ||
+    modalNodeBatchProgress.size > 0;
+  if (!hasAnimatedState && !hasCachedPulse && !hasProgressState) {
     animationFrameHandle = null;
     return;
   }
@@ -716,7 +721,10 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     if (phase === STATE_SETUP || phase === STATE_ERROR) {
       clearNodeCached(currentNodeId, promptId);
     }
-    if (phase === STATE_COMPLETE || phase === STATE_ERROR) {
+    if (phase === STATE_COMPLETE) {
+      fadeNodeProgress(currentNodeId, promptId);
+    }
+    if (phase === STATE_ERROR) {
       clearNodeProgress(currentNodeId, promptId);
     }
     for (const ancestorNodeId of ancestorNodeIds(currentNodeId)) {
@@ -924,6 +932,23 @@ function hasLiveNodeProgress(nodeIdValue, promptId) {
 }
 
 /**
+ * Return opacity for one progress payload while it fades after completion.
+ * @param {{ fadingStartedAt?: number | null } | null | undefined} progressState
+ * @returns {number}
+ */
+function progressVisualOpacity(progressState) {
+  if (!progressState) {
+    return 0;
+  }
+  const fadingStartedAt = Number(progressState?.fadingStartedAt ?? 0);
+  if (!fadingStartedAt) {
+    return 1;
+  }
+  const fadeRatio = (nowMs() - fadingStartedAt) / PROGRESS_FADE_MS;
+  return Math.max(0, Math.min(1, 1 - fadeRatio));
+}
+
+/**
  * Derive the displayed node phase from the stored phase plus live progress.
  * @param {string | undefined} phase
  * @param {boolean} hasLiveProgress
@@ -931,6 +956,9 @@ function hasLiveNodeProgress(nodeIdValue, promptId) {
  */
 function deriveRemoteNodePhase(phase, hasLiveProgress) {
   if ([STATE_ERROR, STATE_SETUP].includes(phase ?? "")) {
+    return phase;
+  }
+  if (phase === STATE_COMPLETE) {
     return phase;
   }
   if (hasLiveProgress) {
@@ -986,6 +1014,92 @@ function clearNodeProgress(nodeIdValue, promptId) {
       continue;
     }
     modalNodeProgressLanes.delete(progressNodeId);
+  }
+}
+
+/**
+ * Remove one faded progress entry if it still belongs to the same prompt.
+ * @param {string} progressNodeId
+ * @param {string} promptId
+ * @param {number} fadingStartedAt
+ */
+function clearFadedNodeProgress(progressNodeId, promptId, fadingStartedAt) {
+  const progressState = modalNodeProgress.get(progressNodeId);
+  if (progressState?.promptId === promptId && progressState.fadingStartedAt === fadingStartedAt) {
+    modalNodeProgress.delete(progressNodeId);
+  }
+
+  const batchState = modalNodeBatchProgress.get(progressNodeId);
+  if (batchState?.promptId === promptId && batchState.fadingStartedAt === fadingStartedAt) {
+    modalNodeBatchProgress.delete(progressNodeId);
+  }
+
+  const laneState = modalNodeProgressLanes.get(progressNodeId);
+  if (laneState?.promptId === promptId) {
+    for (const [laneId, laneProgress] of Array.from(laneState.lanes.entries())) {
+      if (laneProgress.fadingStartedAt === fadingStartedAt) {
+        laneState.lanes.delete(laneId);
+      }
+    }
+    if (laneState.lanes.size === 0) {
+      modalNodeProgressLanes.delete(progressNodeId);
+    }
+  }
+
+  ensureAnimationLoop();
+  reconcilePromptGlobalStatus(promptId);
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+/**
+ * Fade stored progress for one completed node and its visible ancestors.
+ * @param {string} nodeIdValue
+ * @param {string | undefined} promptId
+ */
+function fadeNodeProgress(nodeIdValue, promptId) {
+  const fadingStartedAt = nowMs();
+  const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
+  let fadedAnyProgress = false;
+
+  for (const progressNodeId of progressNodeIds) {
+    let fadedNodeProgress = false;
+    const progressState = modalNodeProgress.get(progressNodeId);
+    if (progressState && (!promptId || progressState.promptId === promptId)) {
+      progressState.fadingStartedAt = fadingStartedAt;
+      progressState.value = progressState.max;
+      fadedAnyProgress = true;
+      fadedNodeProgress = true;
+    }
+
+    const batchState = modalNodeBatchProgress.get(progressNodeId);
+    if (batchState && (!promptId || batchState.promptId === promptId)) {
+      batchState.fadingStartedAt = fadingStartedAt;
+      batchState.value = batchState.max;
+      fadedAnyProgress = true;
+      fadedNodeProgress = true;
+    }
+
+    const laneState = modalNodeProgressLanes.get(progressNodeId);
+    if (laneState && (!promptId || laneState.promptId === promptId)) {
+      for (const laneProgress of laneState.lanes.values()) {
+        laneProgress.fadingStartedAt = fadingStartedAt;
+        laneProgress.value = laneProgress.max;
+        fadedAnyProgress = true;
+        fadedNodeProgress = true;
+      }
+    }
+
+    if (fadedNodeProgress && promptId) {
+      setTimeout(
+        () => clearFadedNodeProgress(progressNodeId, promptId, fadingStartedAt),
+        PROGRESS_FADE_MS,
+      );
+    }
+  }
+
+  if (fadedAnyProgress) {
+    ensureAnimationLoop();
+    app.graph?.setDirtyCanvas(true, true);
   }
 }
 
@@ -1738,16 +1852,38 @@ function drawRemoteNodeDecoration(node, ctx) {
   const progressLanes = Array.isArray(state?.progressLanes) ? state.progressLanes : [];
   const setupProgressLanes = progressLanes.filter((laneProgress) => laneProgress.setupOnly);
   const activeProgressLanes = progressLanes.filter((laneProgress) => !laneProgress.setupOnly);
+  const visibleActiveProgressLanes = activeProgressLanes.filter(
+    (laneProgress) => progressVisualOpacity(laneProgress) > 0,
+  );
   const batchProgress = state?.batchProgress ?? null;
-  const hasAggregateProgress = Boolean(state?.progress && state.phase === STATE_ACTIVE);
+  const progressOpacity = progressVisualOpacity(state?.progress);
+  const batchOpacity = progressVisualOpacity(batchProgress);
+  const laneOpacity = Math.max(
+    0,
+    ...visibleActiveProgressLanes.map((laneProgress) => progressVisualOpacity(laneProgress)),
+    ...setupProgressLanes.map((laneProgress) => progressVisualOpacity(laneProgress)),
+  );
+  const progressPanelOpacity = Math.max(progressOpacity, batchOpacity, laneOpacity);
+  const hasAggregateProgress = Boolean(
+    state?.progress &&
+      progressOpacity > 0 &&
+      [STATE_ACTIVE, STATE_COMPLETE].includes(state.phase),
+  );
   const hasSetupLaneProgress = setupProgressLanes.length > 0;
-  const hasLaneProgress = activeProgressLanes.length > 0 && state?.phase === STATE_ACTIVE;
-  const hasBatchBadge = Boolean(batchProgress && state?.phase === STATE_ACTIVE && !hasAggregateProgress);
+  const hasLaneProgress =
+    visibleActiveProgressLanes.length > 0 && [STATE_ACTIVE, STATE_COMPLETE].includes(state?.phase);
+  const hasBatchBadge = Boolean(
+    batchProgress &&
+      batchOpacity > 0 &&
+      [STATE_ACTIVE, STATE_COMPLETE].includes(state?.phase) &&
+      !hasAggregateProgress,
+  );
   if (!hasAggregateProgress && !hasLaneProgress && !hasSetupLaneProgress && !hasBatchBadge) {
     return;
   }
 
   ctx.save();
+  ctx.globalAlpha *= progressPanelOpacity;
   const barWidth = node.size[0] + borderWidth * 2;
   const aggregateHeight = 8 / scale;
   const laneHeight = 5 / scale;
@@ -1756,7 +1892,7 @@ function drawRemoteNodeDecoration(node, ctx) {
   const panelPaddingX = 6 / scale;
   const panelPaddingY = 6 / scale;
   const headerHeight = 16 / scale;
-  const visibleLaneProgress = hasLaneProgress ? activeProgressLanes : setupProgressLanes;
+  const visibleLaneProgress = hasLaneProgress ? visibleActiveProgressLanes : setupProgressLanes;
   const hasVisibleLaneProgress = visibleLaneProgress.length > 0;
   const laneBlockHeight = hasVisibleLaneProgress
     ? visibleLaneProgress.length * laneHeight + (visibleLaneProgress.length - 1) * laneGap
@@ -1982,7 +2118,7 @@ function handleModalStatus(event) {
     setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length);
     setNodesPhase(nodeIds, STATE_READY, promptId);
     if (previousActiveNodeId && previousActiveNodeId !== nextActiveNodeId) {
-      clearNodeProgress(previousActiveNodeId, promptId);
+      fadeNodeProgress(previousActiveNodeId, promptId);
       setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
     }
     if (nextActiveNodeId) {
@@ -1996,7 +2132,7 @@ function handleModalStatus(event) {
     clearPromptQueued(promptId);
     promptState.hasStreamedProgress = true;
     if (promptState.activeNodeId) {
-      clearNodeProgress(promptState.activeNodeId, promptId);
+      fadeNodeProgress(promptState.activeNodeId, promptId);
       setNodesPhase([promptState.activeNodeId], STATE_COMPLETE, promptId);
     }
     setPromptActiveNode(promptId, null);
@@ -2157,7 +2293,7 @@ function handleExecutionPhase(event, phase) {
   if (phase === STATE_COMPLETE) {
     setPromptActiveNode(promptId, null);
     for (const nodeIdValue of componentNodeIds) {
-      clearNodeProgress(nodeIdValue, promptId);
+      fadeNodeProgress(nodeIdValue, promptId);
     }
     setNodesPhase(componentNodeIds, STATE_COMPLETE, promptId, detail.exception_message);
     reconcilePromptGlobalStatus(promptId);
