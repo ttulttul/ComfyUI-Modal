@@ -49,6 +49,7 @@ const transformedSource = `${[
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  currentGlobalStatus,",
+  "  fadeNodeProgress,",
   "  markPromptQueuedBehindActiveModal,",
   "  isPromptQueuedBehindActiveModal,",
   "  modalGlobalStatusStates,",
@@ -314,6 +315,36 @@ modalToggle.handleExecutionPhase(
 assert.equal(modalToggle.modalNodeStates.get("30")?.phase, modalToggle.STATE_COMPLETE);
 assert.equal(modalToggle.modalNodeStates.get("31")?.phase, modalToggle.STATE_COMPLETE);
 assert.equal(modalToggle.modalGlobalStatusStates.has("prompt-g"), false);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-g-fade", ["32"], [
+  {
+    representative_node_id: "32",
+    node_ids: ["32"],
+  },
+]);
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-g-fade",
+    node_id: "32",
+    display_node_id: "32",
+    real_node_id: "32",
+    value: 10,
+    max: 10,
+  },
+});
+modalToggle.handleExecutionPhase(
+  {
+    detail: {
+      prompt_id: "prompt-g-fade",
+      node: "32",
+    },
+  },
+  modalToggle.STATE_COMPLETE,
+);
+assert.equal(modalToggle.modalNodeStates.get("32")?.phase, modalToggle.STATE_COMPLETE);
+assert.equal(modalToggle.getRemoteVisualState({ id: "32" })?.phase, modalToggle.STATE_COMPLETE);
+assert.equal(modalToggle.modalNodeProgress.get("32")?.fadingStartedAt > 0, true);
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-h", ["40", "41", "42"], [
