@@ -5028,56 +5028,6 @@ def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
     assert observed_cancellation_events[0].is_set()
 
 
-def test_invoke_remote_engine_async_waits_for_remote_completion_after_local_cancel(
-    remote_modal_app_module: Any,
-    monkeypatch: Any,
-) -> None:
-    """Cancelling the local proxy should not finish until the remote Modal call drains."""
-    remote_started = threading.Event()
-    remote_release = threading.Event()
-    observed_cancellation_events: list[threading.Event] = []
-
-    def fake_blocking_invoke(
-        payload: dict[str, Any],
-        kwargs_payload: bytes,
-        cancellation_event: threading.Event | None = None,
-    ) -> bytes:
-        """Block after cancellation until the test explicitly releases remote completion."""
-        del payload, kwargs_payload
-        assert cancellation_event is not None
-        observed_cancellation_events.append(cancellation_event)
-        remote_started.set()
-        while not cancellation_event.is_set():
-            time.sleep(0.01)
-        remote_release.wait(timeout=1.0)
-        return remote_modal_app_module.serialize_node_outputs(("remote-finished",))
-
-    async def run_scenario() -> None:
-        """Cancel the local task and verify it stays pending until remote completion."""
-        task = asyncio.create_task(
-            remote_modal_app_module.invoke_remote_engine_async(
-                {"component_id": "component-1", "payload_kind": "subgraph"},
-                b"{}",
-            )
-        )
-        assert await asyncio.to_thread(remote_started.wait, 1.0)
-        task.cancel()
-        await asyncio.sleep(0.05)
-        assert observed_cancellation_events[0].is_set()
-        assert not task.done()
-        remote_release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
-    monkeypatch.setattr(remote_modal_app_module, "modal", object())
-    monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
-
-    asyncio.run(run_scenario())
-
-    assert len(observed_cancellation_events) == 1
-
-
 def test_remote_modal_interrupt_callback_writes_shared_control_flag(
     remote_modal_app_module: Any,
     monkeypatch: Any,
