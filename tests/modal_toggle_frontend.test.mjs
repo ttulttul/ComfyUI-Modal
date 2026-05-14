@@ -49,6 +49,8 @@ const transformedSource = `${[
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  currentGlobalStatus,",
+  "  markPromptQueuedBehindActiveModal,",
+  "  isPromptQueuedBehindActiveModal,",
   "  modalGlobalStatusStates,",
   "  modalNodeStates,",
   "  modalNodeProgress,",
@@ -56,6 +58,7 @@ const transformedSource = `${[
   "  modalNodeBatchProgress,",
   "  modalPromptStates,",
   "  modalTerminalPromptStates,",
+  "  modalQueuedPromptIds,",
   "  STATE_READY,",
   "  STATE_ACTIVE,",
   "  STATE_COMPLETE,",
@@ -73,6 +76,7 @@ function resetFrontendState() {
   modalToggle.modalNodeBatchProgress.clear();
   modalToggle.modalPromptStates.clear();
   modalToggle.modalTerminalPromptStates.clear();
+  modalToggle.modalQueuedPromptIds.clear();
 }
 
 resetFrontendState();
@@ -331,3 +335,51 @@ modalToggle.handleModalStatus({
   },
 });
 assert.equal(modalToggle.currentGlobalStatus()?.nodeCount, 3);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-active", ["50", "51"], [
+  {
+    representative_node_id: "50",
+    node_ids: ["50", "51"],
+  },
+]);
+modalToggle.handleExecutionPhase(
+  {
+    detail: {
+      prompt_id: "prompt-active",
+      node: "50",
+    },
+  },
+  modalToggle.EXECUTION_PHASE,
+);
+modalToggle.registerPromptComponents("prompt-queued", ["60", "61"], [
+  {
+    representative_node_id: "60",
+    node_ids: ["60", "61"],
+  },
+]);
+assert.equal(modalToggle.markPromptQueuedBehindActiveModal("prompt-queued"), true);
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-queued",
+    phase: "setup",
+    node_ids: ["60", "61"],
+  },
+});
+assert.equal(modalToggle.isPromptQueuedBehindActiveModal("prompt-queued"), true);
+assert.equal(modalToggle.modalNodeStates.has("60"), false);
+assert.equal(modalToggle.modalNodeStates.has("61"), false);
+assert.equal(modalToggle.currentGlobalStatus()?.promptId, "prompt-active");
+
+modalToggle.handleExecutionPhase(
+  {
+    detail: {
+      prompt_id: "prompt-queued",
+      node: "60",
+    },
+  },
+  modalToggle.EXECUTION_PHASE,
+);
+assert.equal(modalToggle.isPromptQueuedBehindActiveModal("prompt-queued"), false);
+assert.equal(modalToggle.modalNodeStates.get("60")?.phase, modalToggle.STATE_READY);
+assert.equal(modalToggle.modalNodeStates.get("61")?.phase, modalToggle.STATE_READY);
