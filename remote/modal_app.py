@@ -3933,6 +3933,18 @@ async def _invoke_bound_remote_engine_async(
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()
+        logger.info(
+            "Local task cancelled while Modal bound-engine invocation was running for component=%s; waiting for remote completion before releasing prompt state.",
+            payload.get("component_id"),
+        )
+        try:
+            await asyncio.shield(wrapped_future)
+        except Exception:
+            logger.debug(
+                "Modal bound-engine invocation finished after local cancellation for component=%s.",
+                payload.get("component_id"),
+                exc_info=True,
+            )
         raise
     except Exception:
         if cancellation_event.is_set() or _local_processing_interrupted():
@@ -5109,6 +5121,18 @@ async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: by
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()
+        logger.info(
+            "Local task cancelled while Modal invocation was running for component=%s; waiting for remote completion before releasing prompt state.",
+            payload.get("component_id"),
+        )
+        try:
+            await asyncio.shield(wrapped_future)
+        except Exception:
+            logger.debug(
+                "Modal invocation finished after local cancellation for component=%s.",
+                payload.get("component_id"),
+                exc_info=True,
+            )
         raise
     except Exception:
         if cancellation_event.is_set() or _local_processing_interrupted():
