@@ -98,6 +98,7 @@ The list above is the shortest accurate summary. If you want the execution path 
     - Executed UI payloads
     - Preview images
   - The local frontend updates node overlays and global status from those events.
+  - If another Modal prompt is already active when a new prompt is submitted, queue-time setup updates for the new prompt are held back so its nodes do not repaint until ComfyUI actually starts executing it.
   - Prompt success, failure, and interruption mark that prompt terminal in the frontend so late remote progress cannot resurrect stale node overlays or the global status pill.
 
 - **7. Return to the local workflow**

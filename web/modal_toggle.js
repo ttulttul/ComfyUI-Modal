@@ -34,6 +34,7 @@ const modalNodeCachedStates = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
 const modalTerminalPromptStates = new Map();
+const modalQueuedPromptIds = new Set();
 const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 
@@ -135,6 +136,7 @@ function clearPromptTerminal(promptId) {
     return;
   }
   modalTerminalPromptStates.delete(promptId);
+  clearPromptQueued(promptId);
 }
 
 /**
@@ -288,6 +290,53 @@ function promptHasLiveRemoteWork(promptId) {
       [STATE_SETUP, STATE_READY, STATE_ACTIVE].includes(nodeState.phase)
     );
   });
+}
+
+/**
+ * Return whether any older Modal prompt is still visually or remotely active.
+ * @param {string | null} excludedPromptId
+ * @returns {boolean}
+ */
+function hasActiveModalPrompt(excludedPromptId = null) {
+  for (const promptId of modalPromptStates.keys()) {
+    if (promptId === excludedPromptId || isPromptTerminal(promptId)) {
+      continue;
+    }
+    if (syntheticPromptUiStates.has(promptId) || promptHasLiveRemoteWork(promptId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Mark a submitted prompt as queued behind an already active Modal prompt.
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function markPromptQueuedBehindActiveModal(promptId) {
+  if (!promptId || !hasActiveModalPrompt(promptId)) {
+    return false;
+  }
+  modalQueuedPromptIds.add(promptId);
+  return true;
+}
+
+/**
+ * Return whether queue-time UI updates should be suppressed for one prompt.
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function isPromptQueuedBehindActiveModal(promptId) {
+  return modalQueuedPromptIds.has(promptId);
+}
+
+/**
+ * Allow normal execution UI updates for a prompt once ComfyUI actually starts it.
+ * @param {string} promptId
+ */
+function clearPromptQueued(promptId) {
+  modalQueuedPromptIds.delete(promptId);
 }
 
 /**
@@ -1863,6 +1912,9 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === STATE_SETUP) {
+    if (isPromptQueuedBehindActiveModal(promptId)) {
+      return;
+    }
     beginSyntheticExecutionUi(promptId, nodeIds);
     setGlobalStatusPhase(promptId, STATE_SETUP, nodeIds.length, {
       message: detail.status_message ?? null,
@@ -1875,6 +1927,9 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === STATE_WAITING) {
+    if (isPromptQueuedBehindActiveModal(promptId)) {
+      return;
+    }
     setGlobalStatusPhase(promptId, STATE_WAITING, nodeIds.length, {
       message: detail.status_message ?? null,
       current: detail.status_current ?? null,
@@ -1885,6 +1940,7 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === STATE_FINALIZING) {
+    clearPromptQueued(promptId);
     setGlobalStatusPhase(promptId, STATE_FINALIZING, nodeIds.length, {
       message: detail.status_message ?? null,
       current: detail.status_current ?? null,
@@ -1895,6 +1951,7 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === STATE_ERROR) {
+    clearPromptQueued(promptId);
     endSyntheticExecutionUi(promptId, true);
     setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
@@ -1909,12 +1966,14 @@ function handleModalStatus(event) {
 
   if (detail.phase === "execution_interrupted") {
     markPromptTerminal(promptId, "execution_interrupted");
+    clearPromptQueued(promptId);
     endSyntheticExecutionUi(promptId);
     handlePromptInterruption(promptId);
     return;
   }
 
   if (detail.phase === EXECUTION_PHASE) {
+    clearPromptQueued(promptId);
     endSyntheticExecutionUi(promptId);
     const nextActiveNodeId =
       detail.active_node_id != null ? String(detail.active_node_id) : null;
@@ -1934,6 +1993,7 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === "execution_success") {
+    clearPromptQueued(promptId);
     promptState.hasStreamedProgress = true;
     if (promptState.activeNodeId) {
       clearNodeProgress(promptState.activeNodeId, promptId);
@@ -1972,6 +2032,7 @@ function handleModalProgress(event) {
   if (isPromptTerminal(promptId)) {
     return;
   }
+  clearPromptQueued(promptId);
 
   endSyntheticExecutionUi(promptId);
   const promptState = ensurePromptState(promptId);
@@ -2064,6 +2125,7 @@ function handleExecutionPhase(event, phase) {
   if (isPromptTerminal(promptId)) {
     return;
   }
+  clearPromptQueued(promptId);
 
   const componentNodeIds = resolveComponentNodeIds(promptId, representativeNodeId);
   if (!componentNodeIds) {
@@ -2132,6 +2194,7 @@ function clearPromptRemoteStates(promptId) {
     }
   }
   modalPromptStates.delete(promptId);
+  clearPromptQueued(promptId);
   pruneGlobalStatusStates();
   refreshGlobalStatusElement();
   app.graph?.setDirtyCanvas(true, true);
@@ -2303,9 +2366,13 @@ function patchQueuePrompt() {
     clearPromptTerminal(promptId);
     const remoteNodeIds = extractRemoteNodeIds(workflow);
     registerPromptComponents(promptId, remoteNodeIds, []);
+    const queuedBehindActiveModal =
+      remoteNodeIds.length > 0 && markPromptQueuedBehindActiveModal(promptId);
     if (remoteNodeIds.length > 0) {
-      setNodesPhase(remoteNodeIds, STATE_SETUP, promptId);
-      beginSyntheticExecutionUi(promptId, remoteNodeIds);
+      if (!queuedBehindActiveModal) {
+        setNodesPhase(remoteNodeIds, STATE_SETUP, promptId);
+        beginSyntheticExecutionUi(promptId, remoteNodeIds);
+      }
     }
 
     const body = {
@@ -2355,15 +2422,18 @@ function patchQueuePrompt() {
         const promptState = ensurePromptState(promptId);
         const acceptedRemoteNodeIds =
           promptState.remoteNodeIds.length > 0 ? promptState.remoteNodeIds : remoteNodeIds;
-        endSyntheticExecutionUi(promptId);
-        setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
-          message: "Waiting for Modal startup",
-        });
-        setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);
+        if (!isPromptQueuedBehindActiveModal(promptId)) {
+          endSyntheticExecutionUi(promptId);
+          setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
+            message: "Waiting for Modal startup",
+          });
+          setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);
+        }
       }
 
       return responsePayload;
     } catch (error) {
+      clearPromptQueued(promptId);
       endSyntheticExecutionUi(promptId, true);
       markQueueFailure(remoteNodeIds, promptId, error);
       throw error;

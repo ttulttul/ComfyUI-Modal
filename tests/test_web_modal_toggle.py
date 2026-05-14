@@ -117,6 +117,11 @@ def test_queue_success_marks_all_remote_nodes_ready_before_component_execution()
     """Once the Modal route accepts the prompt, all remote nodes should flip from setup to ready."""
     source = _modal_toggle_source()
 
+    assert "const modalQueuedPromptIds = new Set();" in source
+    assert "function markPromptQueuedBehindActiveModal(promptId)" in source
+    assert "function isPromptQueuedBehindActiveModal(promptId)" in source
+    assert "const queuedBehindActiveModal =" in source
+    assert "if (!queuedBehindActiveModal) {" in source
     assert "const resolvedRemoteNodeIds = (responsePayload.modal_remote_node_ids ?? []).map((nodeIdValue) =>" in source
     assert "const resolvedComponents = Array.isArray(responsePayload.modal_components)" in source
     assert "registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);" in source
@@ -148,7 +153,7 @@ def test_streamed_modal_execution_ends_synthetic_setup_without_waiting_for_final
     """Real streamed execution should end synthetic setup on progress, not on the first executed node."""
     source = _modal_toggle_source()
 
-    assert "if (detail.phase === EXECUTION_PHASE) {\n    endSyntheticExecutionUi(promptId);" in source
+    assert "if (detail.phase === EXECUTION_PHASE) {\n    clearPromptQueued(promptId);\n    endSyntheticExecutionUi(promptId);" in source
     assert "function handleModalProgress(event)" in source
     assert "  endSyntheticExecutionUi(promptId);" in source
     assert 'endSyntheticExecutionUi(String(eventDetail(event).prompt_id ?? ""));' not in source
