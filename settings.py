@@ -43,6 +43,7 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_MAX_LOADER_PREWARMS_PER_COMPONENT",
     "COMFY_MODAL_ENABLE_PROACTIVE_WARMUP",
     "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
+    "COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS",
     "COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS",
 )
 
@@ -81,6 +82,7 @@ class ModalSyncSettings:
     enable_proactive_warmup: bool = True
     enable_loader_prewarm: bool = True
     proactive_warmup_head_start_seconds: float = 2.0
+    remote_cancel_grace_seconds: float = 2.0
     stream_remote_container_logs: bool = False
 
 
@@ -266,6 +268,10 @@ def _get_settings_cached(
         enable_loader_prewarm=_read_bool_env("COMFY_MODAL_ENABLE_LOADER_PREWARM") is not False,
         proactive_warmup_head_start_seconds=_read_float_env(
             "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
+            2.0,
+        ),
+        remote_cancel_grace_seconds=_read_float_env(
+            "COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS",
             2.0,
         ),
         stream_remote_container_logs=_read_bool_env("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS")

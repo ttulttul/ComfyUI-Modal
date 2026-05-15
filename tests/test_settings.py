@@ -129,6 +129,21 @@ def test_settings_reads_proactive_warmup_override(
     assert settings.enable_proactive_warmup is False
 
 
+def test_settings_reads_remote_cancel_grace_override(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The post-interrupt remote wait should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS", "0.25")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.remote_cancel_grace_seconds == 0.25
+
+
 def test_settings_defaults_interrupt_dict_name_from_app_name(
     settings_module: Any,
     monkeypatch: Any,

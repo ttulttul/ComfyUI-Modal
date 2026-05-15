@@ -5152,6 +5152,51 @@ def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_out
     assert interrupt_calls == ["interrupt"]
 
 
+def test_invoke_remote_engine_payload_releases_local_prompt_after_cancel_grace(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local proxy should not wait forever for a cancelled Modal call to unwind."""
+    cancellation_event = threading.Event()
+    interrupt_calls: list[str] = []
+    interrupt_checks = iter([False, True, True, True])
+
+    def fake_local_processing_interrupted() -> bool:
+        """Report a local interrupt after the first poll interval."""
+        return next(interrupt_checks, True)
+
+    def fake_interrupt_remote_call() -> None:
+        """Record the propagated remote interrupt."""
+        interrupt_calls.append("interrupt")
+
+    def never_returns() -> bytes:
+        """Simulate a Modal call stuck in remote work after cancellation."""
+        while True:
+            time.sleep(0.01)
+
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS", "0.05")
+    remote_modal_app_module.get_settings.cache_clear()
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_local_processing_interrupted",
+        fake_local_processing_interrupted,
+    )
+
+    try:
+        with pytest.raises(remote_modal_app_module.ModalRemoteInvocationError):
+            remote_modal_app_module._invoke_remote_call_with_interrupts(
+                payload={"prompt_id": "prompt-1", "component_id": "component-1"},
+                invoke_remote_call=never_returns,
+                interrupt_remote_call=fake_interrupt_remote_call,
+                cancellation_event=cancellation_event,
+            )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert cancellation_event.is_set()
+    assert interrupt_calls == ["interrupt"]
+
+
 def test_invoke_mapped_remote_engine_async_runs_explicit_mapped_phase_items(
     remote_modal_app_module: Any,
     serialization_module: Any,
@@ -8242,11 +8287,11 @@ def test_modal_cloud_class_options_do_not_use_deprecated_concurrency_flag(
     assert "@modal.concurrent(max_inputs=1)" in module_source
 
 
-def test_modal_cloud_registered_execution_clears_shared_interrupt_flags(
+def test_modal_cloud_registered_execution_preserves_pre_start_interrupt_flags(
     modal_cloud_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Remote execution registration should clear stale shared interrupt flags on entry and exit."""
+    """Remote execution registration should not delete a valid cancel flag on entry."""
 
     class FakeInterruptFlags:
         """Simple Modal Dict double that records cleared keys."""
@@ -8268,9 +8313,9 @@ def test_modal_cloud_registered_execution_clears_shared_interrupt_flags(
         {"prompt_id": "prompt-1", "component_id": "component-2"}
     ) as execution_control:
         assert execution_control.interrupt_flag_key == "prompt-1:component-2"
+        assert interrupt_flags.pop_calls == []
 
     assert interrupt_flags.pop_calls == [
-        ("prompt-1:component-2", None),
         ("prompt-1:component-2", None),
     ]
 

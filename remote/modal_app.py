@@ -2488,6 +2488,7 @@ def _invoke_remote_call_with_interrupts(
 ) -> bytes:
     """Run one blocking remote call while optionally propagating cancellation to Modal."""
     result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+    cancellation_started_at: float | None = None
 
     def execute_remote_call() -> None:
         """Run the blocking Modal request in a worker thread."""
@@ -2508,19 +2509,33 @@ def _invoke_remote_call_with_interrupts(
             try:
                 result_kind, result_payload = result_queue.get(timeout=0.1)
             except queue.Empty:
-                if (
-                    _sync_local_interrupt_to_cancellation_event(payload, cancellation_event)
-                    and not interrupt_sent
-                ):
-                    _propagate_remote_interrupt_request(payload, interrupt_remote_call)
-                    interrupt_sent = True
+                if _sync_local_interrupt_to_cancellation_event(payload, cancellation_event):
+                    if not interrupt_sent:
+                        _propagate_remote_interrupt_request(payload, interrupt_remote_call)
+                        interrupt_sent = True
+                        cancellation_started_at = time.monotonic()
+                    elif cancellation_started_at is not None:
+                        grace_seconds = max(0.0, get_settings().remote_cancel_grace_seconds)
+                        if time.monotonic() - cancellation_started_at >= grace_seconds:
+                            logger.info(
+                                "Modal component=%s did not return within %.3fs of local interrupt propagation; releasing the local prompt while remote cancellation continues.",
+                                payload.get("component_id"),
+                                grace_seconds,
+                            )
+                            raise ModalRemoteInvocationError(
+                                "Remote Modal call did not finish after local interrupt propagation."
+                            )
                 continue
 
             if result_kind == "result":
                 return bytes(result_payload)
             raise result_payload
     finally:
-        request_thread.join(timeout=1.0)
+        request_thread.join(
+            timeout=0.1
+            if cancellation_event is not None and cancellation_event.is_set()
+            else 1.0
+        )
 
 
 def _consume_remote_payload_stream(
