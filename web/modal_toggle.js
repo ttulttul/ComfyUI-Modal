@@ -246,6 +246,7 @@ function effectiveGlobalStatusPhase(promptId, phase) {
   }
   if (phase === STATE_FINALIZING) {
     if (
+      promptState?.hasRemoteExecutionStarted ||
       promptState?.activeNodeId ||
       nodeStates.some((state) => state.phase === STATE_ACTIVE || state.phase === STATE_READY)
     ) {
@@ -253,13 +254,16 @@ function effectiveGlobalStatusPhase(promptId, phase) {
     }
     return STATE_FINALIZING;
   }
-  if (promptState?.activeNodeId) {
+  if (promptState?.hasRemoteExecutionStarted && promptState?.activeNodeId) {
     return EXECUTION_PHASE;
   }
-  if (nodeStates.some((state) => state.phase === STATE_ACTIVE)) {
+  if (promptState?.hasRemoteExecutionStarted && nodeStates.some((state) => state.phase === STATE_ACTIVE)) {
     return EXECUTION_PHASE;
   }
-  if (nodeStates.some((state) => state.phase === STATE_READY)) {
+  if (
+    promptState?.hasRemoteExecutionStarted &&
+    nodeStates.some((state) => state.phase === STATE_READY)
+  ) {
     return EXECUTION_PHASE;
   }
   return phase;
@@ -599,6 +603,7 @@ function ensurePromptState(promptId) {
       laneNodeIdsByLane: new Map(),
       activeNodeId: null,
       hasStreamedProgress: false,
+      hasRemoteExecutionStarted: false,
     });
   }
   return modalPromptStates.get(promptId);
@@ -2115,7 +2120,14 @@ function handleModalStatus(event) {
       detail.active_node_id != null ? String(detail.active_node_id) : null;
     const previousActiveNodeId = promptState.activeNodeId;
     promptState.hasStreamedProgress = true;
-    setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length);
+    if (nextActiveNodeId) {
+      promptState.hasRemoteExecutionStarted = true;
+      setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length);
+    } else {
+      setGlobalStatusPhase(promptId, STATE_WAITING, nodeIds.length, {
+        message: detail.status_message ?? "Waiting for Modal container",
+      });
+    }
     setNodesPhase(nodeIds, STATE_READY, promptId);
     if (previousActiveNodeId && previousActiveNodeId !== nextActiveNodeId) {
       fadeNodeProgress(previousActiveNodeId, promptId);
@@ -2131,6 +2143,7 @@ function handleModalStatus(event) {
   if (detail.phase === "execution_success") {
     clearPromptQueued(promptId);
     promptState.hasStreamedProgress = true;
+    promptState.hasRemoteExecutionStarted = true;
     if (promptState.activeNodeId) {
       fadeNodeProgress(promptState.activeNodeId, promptId);
       setNodesPhase([promptState.activeNodeId], STATE_COMPLETE, promptId);
@@ -2175,6 +2188,9 @@ function handleModalProgress(event) {
   if (!promptState) {
     return;
   }
+  if (!detail.cached_hit) {
+    promptState.hasRemoteExecutionStarted = true;
+  }
   const componentNodeIds = resolveComponentNodeIds(promptId, progressNodeId);
   const readyNodeIds = (componentNodeIds ?? []).filter((nodeIdValue) => nodeIdValue !== progressNodeId);
   promptState.hasStreamedProgress = true;
@@ -2204,6 +2220,9 @@ function handleModalProgress(event) {
     for (const cachedNodeId of cachedNodeIds) {
       markNodeCached(cachedNodeId, promptId);
     }
+    setGlobalStatusPhase(promptId, STATE_WAITING, promptState.remoteNodeIds.length || 1, {
+      message: "Restoring Modal cache",
+    });
     return;
   }
   setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
@@ -2274,8 +2293,9 @@ function handleExecutionPhase(event, phase) {
   if (phase === EXECUTION_PHASE) {
     setGlobalStatusPhase(
       promptId,
-      promptState.hasStreamedProgress ? EXECUTION_PHASE : STATE_WAITING,
+      promptState.hasRemoteExecutionStarted ? EXECUTION_PHASE : STATE_WAITING,
       componentNodeIds.length,
+      promptState.hasRemoteExecutionStarted ? null : { message: "Waiting for Modal container" },
     );
     setNodesPhase(componentNodeIds, STATE_READY, promptId, detail.exception_message);
     return;

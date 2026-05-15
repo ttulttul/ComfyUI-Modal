@@ -52,6 +52,8 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "function reconcilePromptGlobalStatus(promptId)" in source
     assert "function promptRemoteNodeCount(promptId, fallbackCount = 1)" in source
     assert "nodeCount: promptRemoteNodeCount(promptId, nodeCount)," in source
+    assert "hasRemoteExecutionStarted: false" in source
+    assert "Waiting for Modal container" in source
 
 
 def test_remote_modal_status_tracks_active_node_ids() -> None:
@@ -135,7 +137,7 @@ def test_completed_remote_nodes_clear_stale_global_status_entries() -> None:
     """The global pill should clear once a prompt has no active remote work left."""
     source = _modal_toggle_source()
 
-    assert "if (nodeStates.some((state) => state.phase === STATE_READY)) {" in source
+    assert "promptState?.hasRemoteExecutionStarted &&\n    nodeStates.some((state) => state.phase === STATE_READY)" in source
     assert "nodeStates.some((state) => state.phase === STATE_READY || state.phase === STATE_COMPLETE)" not in source
     assert "modalGlobalStatusStates.delete(promptId);" in source
     assert "reconcilePromptGlobalStatus(promptId);" in source
@@ -146,6 +148,7 @@ def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
     source = _modal_toggle_source()
 
     assert "promptState.hasStreamedProgress = true;" in source
+    assert "promptState.hasRemoteExecutionStarted = true;" in source
     assert "if (promptState.hasStreamedProgress && phase === EXECUTION_PHASE)" in source
 
 
