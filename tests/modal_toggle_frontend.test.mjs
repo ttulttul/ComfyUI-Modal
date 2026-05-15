@@ -109,6 +109,7 @@ modalToggle.handleExecutionPhase(
 assert.equal(modalToggle.modalNodeStates.get("10")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeStates.get("11")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeStates.get("12")?.phase, modalToggle.STATE_READY);
+assert.equal(modalToggle.currentGlobalStatus()?.phase, "waiting");
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-c", ["10", "11", "12"], [
@@ -129,6 +130,7 @@ modalToggle.handleModalProgress({
   },
 });
 assert.equal(modalToggle.modalPromptStates.get("prompt-c")?.activeNodeId ?? null, null);
+assert.equal(modalToggle.currentGlobalStatus()?.phase, modalToggle.EXECUTION_PHASE);
 assert.equal(modalToggle.modalNodeStates.get("10")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeStates.get("11")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeStates.get("12")?.phase, modalToggle.STATE_READY);
@@ -285,6 +287,33 @@ modalToggle.handleModalStatus({
 assert.equal(modalToggle.modalPromptStates.has("prompt-f"), false);
 assert.equal(modalToggle.modalGlobalStatusStates.has("prompt-f"), false);
 assert.equal(modalToggle.modalNodeProgress.has("21"), false);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-container-wait", ["24"], [
+  {
+    representative_node_id: "24",
+    node_ids: ["24"],
+  },
+]);
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-container-wait",
+    phase: "executing",
+    node_ids: ["24"],
+  },
+});
+assert.equal(modalToggle.currentGlobalStatus()?.phase, "waiting");
+assert.equal(modalToggle.currentGlobalStatus()?.statusMessage, "Waiting for Modal container");
+
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-container-wait",
+    phase: "executing",
+    node_ids: ["24"],
+    active_node_id: "24",
+  },
+});
+assert.equal(modalToggle.currentGlobalStatus()?.phase, modalToggle.EXECUTION_PHASE);
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-g", ["30", "31"], [
