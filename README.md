@@ -224,6 +224,7 @@ Remote runtime behavior:
 - Before handing a remote prompt to `PromptExecutor`, Modal-Sync now preflights primitive widget inputs and rejects raw list values on `INT`/`FLOAT`/`BOOLEAN`/`STRING` sockets with a specific node/input error. When `PromptExecutor` still fails, the surfaced remote exception message now includes the failing node context and current inputs instead of only the inner exception string.
 - Remote cancellation now uses a shared Modal `Dict` control store instead of a second RPC lane into the execution class, so per-container execution concurrency can stay at `1` without losing interrupt propagation.
 - The blocking Modal request bridge now polls ComfyUI cancellation itself, including the streamed `execute_payload_stream.remote_gen(...)` path, so a local cancel still writes the shared interrupt flag even if the outer proxy wrapper has not noticed the interrupt yet.
+- If the local UI cancels while Modal is still provisioning or while remote code is slow to observe ComfyUI's interrupt flag, the local proxy now releases the ComfyUI prompt after a short grace period instead of waiting indefinitely for the remote call to unwind.
 - If a remote execution crashes instead of being interrupted normally, the worker now schedules its own container process to exit after surfacing the exception. That retires the bad warm GPU container instead of leaving it idle and billable after a hard failure.
 - If a run is cancelled and restarted quickly, or a warm container is still releasing heavy model files, the remote worker now gives Modal volume reload a longer bounded retry window so recently released files can close before the next request needs a fresh `vol.reload()`.
 - Mapped remote execution now carries a per-request volume reload marker, so one warm container only performs `vol.reload()` once for that uploaded asset snapshot even if the local scheduler fans the component out into many per-item Modal calls.
@@ -423,6 +424,7 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP`: Start best-effort background warmup RPCs from runtime parallelism signals, such as exact mapped fan-out. Queue admission alone does not launch warmup containers. Default: `true`.
 - `COMFY_MODAL_ENABLE_LOADER_PREWARM`: During proactive warmup, execute synthetic one-node loader prompts for root literal model-loader nodes so fresh workers preload common models before the first real payload arrives. Default: `true`.
 - `COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS`: How long mapped execution may wait for newly requested exact warmup slots before it starts seeding lanes anyway. Default: `2.0`.
+- `COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS`: How long the local proxy waits after propagating a ComfyUI cancellation to Modal before releasing the local prompt while remote cancellation continues. Default: `2.0`.
 
 ## Development
 

@@ -1325,8 +1325,6 @@ def _registered_remote_execution(
         cancellation_event=threading.Event(),
         interrupt_flag_key=_remote_interrupt_flag_key(prompt_id, component_id),
     )
-    if modal is not None and "interrupt_flags" in globals():
-        interrupt_flags.pop(control.interrupt_flag_key, None)
     try:
         yield control
     finally:
