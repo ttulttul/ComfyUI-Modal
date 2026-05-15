@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -254,6 +255,139 @@ def test_queue_prompt_json_includes_resolved_modal_metadata(
             "node_ids": ["1", "2"],
         }
     ]
+
+
+def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
+    api_intercept_module: Any,
+    remote_modal_app_module: Any,
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Accepting a queued prompt should not launch Modal warmup containers."""
+
+    class FakeRoutes:
+        """Capture aiohttp route registrations."""
+
+        def __init__(self) -> None:
+            """Initialize the route handler map."""
+            self.handlers: dict[str, Any] = {}
+
+        def post(self, path: str) -> Any:
+            """Return a decorator that records one POST handler."""
+
+            def register(handler: Any) -> Any:
+                """Store the decorated handler unchanged."""
+                self.handlers[path] = handler
+                return handler
+
+            return register
+
+    class FakePromptQueue:
+        """Minimal prompt queue sink."""
+
+        def __init__(self) -> None:
+            """Initialize captured queue items."""
+            self.items: list[tuple[Any, ...]] = []
+
+        def put(self, item: tuple[Any, ...]) -> None:
+            """Record one queued prompt item."""
+            self.items.append(item)
+
+    class FakePromptServer:
+        """Minimal PromptServer double with route registration."""
+
+        def __init__(self) -> None:
+            """Initialize routing and queue state."""
+            self.number = 0
+            self.routes = FakeRoutes()
+            self.prompt_queue = FakePromptQueue()
+
+        def trigger_on_prompt(self, json_data: dict[str, Any]) -> dict[str, Any]:
+            """Return the prompt unchanged."""
+            return json_data
+
+    class FakeRequest:
+        """Minimal aiohttp request double."""
+
+        async def json(self) -> dict[str, Any]:
+            """Return one Modal-marked prompt request."""
+            return {
+                "prompt_id": "prompt-queue-warmup",
+                "prompt": {"1": {"class_type": "RemoteImage", "inputs": {}}},
+                "extra_data": {"extra_pnginfo": {"workflow": {"nodes": []}}},
+            }
+
+    class FakeExecutionModule:
+        """Minimal execution module exposing prompt validation."""
+
+        SENSITIVE_EXTRA_DATA_KEYS: tuple[str, ...] = ()
+
+        @staticmethod
+        async def validate_prompt(
+            prompt_id: str,
+            prompt: dict[str, Any],
+            partial_execution_targets: Any,
+        ) -> tuple[bool, None, list[str], list[Any]]:
+            """Accept the supplied prompt with one fake execution target."""
+            return True, None, ["1"], []
+
+    def fail_queue_time_warmup(*_args: Any, **_kwargs: Any) -> int:
+        """Fail the test if queue handling tries to launch proactive warmup."""
+        raise AssertionError("queue route must not schedule Modal warmup")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    prompt_server = FakePromptServer()
+    summary = api_intercept_module.RewriteSummary(
+        remote_node_ids=["1"],
+        remote_component_ids=["1"],
+        component_node_ids_by_representative={"1": ["1"]},
+        component_execution_stages=[["1"]],
+        estimated_max_parallel_requests=1,
+        max_parallel_requests_upper_bound=1,
+    )
+    monkeypatch.setattr(api_intercept_module, "_ROUTE_REGISTERED", False)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_get_server_module",
+        lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
+    )
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(api_intercept_module, "_emit_modal_status", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "rewrite_prompt_for_modal",
+        lambda **kwargs: (kwargs["prompt"], summary),
+    )
+    monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", fail_queue_time_warmup)
+
+    api_intercept_module.setup_modal_queue_route(
+        prompt_server=prompt_server,
+        sync_engine=object(),
+        settings=settings,
+    )
+    response = asyncio.run(prompt_server.routes.handlers["/modal/queue_prompt"](FakeRequest()))
+
+    response_payload = json.loads(response.text)
+    assert response_payload["prompt_id"] == "prompt-queue-warmup"
+    assert response_payload["modal_remote_node_ids"] == ["1"]
+    assert len(prompt_server.prompt_queue.items) == 1
 
 
 def test_rewrite_groups_connected_remote_nodes_into_single_proxy(

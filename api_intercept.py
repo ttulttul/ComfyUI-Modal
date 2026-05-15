@@ -3212,29 +3212,6 @@ def setup_modal_queue_route(
                     json_data["extra_data"]["modal"]["custom_nodes_bundle"] = (
                         summary.custom_nodes_bundle.remote_path
                     )
-                if summary.remote_component_ids:
-                    from .remote.modal_app import ensure_remote_warm_capacity
-
-                    warmup_target = (
-                        summary.max_parallel_requests_upper_bound
-                        or summary.estimated_max_parallel_requests
-                    )
-                    ensure_remote_warm_capacity(
-                        {
-                            "prompt_id": prompt_id,
-                            "component_id": summary.remote_component_ids[0],
-                            "requires_volume_reload": summary.requires_volume_reload,
-                            "volume_reload_marker": summary.volume_reload_marker,
-                            "uploaded_volume_paths": list(summary.uploaded_volume_paths),
-                            "custom_nodes_bundle": (
-                                summary.custom_nodes_bundle.remote_path
-                                if summary.custom_nodes_bundle is not None
-                                else None
-                            ),
-                        },
-                        warmup_target=warmup_target,
-                        reason="queue_time_structural_estimate",
-                    )
                 _emit_modal_status(
                     prompt_server=prompt_server,
                     phase="setup",
