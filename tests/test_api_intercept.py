@@ -1578,6 +1578,7 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
         mapped_execution_payload["remote_session"]["session_id"]
         == static_execution_payload["remote_session"]["session_id"]
     )
+    assert rewritten_prompt["1__mapped"]["inputs"]["remote_input_0"] == ["2", 0]
     assert rewritten_prompt["1__mapped"]["inputs"]["static_input_0"] == ["1", 1]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
     assert rewritten_prompt["8"]["inputs"]["image"] == ["1__mapped", 0]

@@ -2661,6 +2661,12 @@ def _rewrite_component_into_proxy(
             if bool(boundary_output.get("session_output"))
         }
         mapped_proxy_inputs = proxy_inputs_for_boundary_inputs(list(mapped_payload["boundary_inputs"]))
+        mapped_static_phase = mapped_payload.get("static_phase")
+        if isinstance(mapped_static_phase, dict):
+            for input_name, input_value in proxy_inputs_for_boundary_inputs(
+                list(mapped_static_phase.get("boundary_inputs", []))
+            ).items():
+                mapped_proxy_inputs.setdefault(input_name, input_value)
         for boundary_input in mapped_payload.get("boundary_inputs", []):
             proxy_input_name = str(boundary_input["proxy_input_name"])
             if proxy_input_name not in bridge_output_indices:
