@@ -2255,6 +2255,11 @@ function handleModalProgress(event) {
   if (readyNodeIds.length > 0) {
     setNodesPhase(readyNodeIds, STATE_READY, promptId);
   }
+  const previousActiveNodeId = promptState.activeNodeId;
+  if (previousActiveNodeId && previousActiveNodeId !== progressNodeId) {
+    fadeNodeProgress(previousActiveNodeId, promptId);
+    setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
+  }
   setPromptActiveNode(promptId, progressNodeId);
   setNodesPhase([progressNodeId], STATE_ACTIVE, promptId);
   setNodeProgress(

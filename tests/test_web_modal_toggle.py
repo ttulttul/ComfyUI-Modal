@@ -192,6 +192,17 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert 'const headerText = hasAggregateProgress' in source
 
 
+def test_streamed_modal_node_progress_fades_previous_active_node() -> None:
+    """When remote progress moves to another node, the old active node should stop rendering purple."""
+    source = _modal_toggle_source()
+
+    assert "const previousActiveNodeId = promptState.activeNodeId;" in source
+    assert "previousActiveNodeId && previousActiveNodeId !== progressNodeId" in source
+    assert "fadeNodeProgress(previousActiveNodeId, promptId);" in source
+    assert "setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);" in source
+    assert "setPromptActiveNode(promptId, progressNodeId);" in source
+
+
 def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     """Parallel mapped Modal runs should render one local progress lane per active worker."""
     source = _modal_toggle_source()
