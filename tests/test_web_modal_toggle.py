@@ -223,6 +223,17 @@ def test_streamed_modal_node_progress_fades_previous_active_node() -> None:
     assert "setPromptActiveNode(promptId, progressNodeId);" in source
 
 
+def test_streamed_modal_node_progress_completes_reported_ancestors() -> None:
+    """When a remote node becomes active, reported upstream nodes should be marked complete."""
+    source = _modal_toggle_source()
+
+    assert "function completeRemoteAncestorsBeforeActiveNode(promptId, ancestorNodeIds, activeNodeId)" in source
+    assert "detail.completed_ancestor_node_ids" in source
+    assert "setNodesPhase(completedNodeIds, STATE_COMPLETE, promptId);" in source
+    assert "completeRemoteAncestorsBeforeActiveNode(\n    promptId,\n    detail.completed_ancestor_node_ids,\n    progressNodeId,\n  );" in source
+    assert "completeRemoteAncestorsBeforeActiveNode(\n      promptId,\n      detail.completed_ancestor_node_ids,\n      nextActiveNodeId,\n    );" in source
+
+
 def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     """Parallel mapped Modal runs should render one local progress lane per active worker."""
     source = _modal_toggle_source()

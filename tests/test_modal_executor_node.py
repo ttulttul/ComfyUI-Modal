@@ -7947,6 +7947,54 @@ def test_consume_remote_payload_stream_keeps_static_execute_node_progress_when_s
     ]
 
 
+def test_consume_remote_payload_stream_marks_progress_node_ancestors_complete(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Streamed progress should tell the UI which upstream remote nodes can be completed."""
+    progress_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: progress_calls.append(kwargs),
+    )
+
+    payload = {
+        "component_id": "3",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["1", "2", "3"],
+        "extra_data": {"client_id": "client-1"},
+        "subgraph_prompt": {
+            "1": {"class_type": "Loader", "inputs": {}},
+            "2": {"class_type": "Condition", "inputs": {"model": ["1", 0]}},
+            "3": {"class_type": "Sampler", "inputs": {"model": ["1", 0], "conditioning": ["2", 0]}},
+        },
+    }
+    stream_events = iter(
+        [
+            {
+                "kind": "progress",
+                "event_type": "node_progress",
+                "node_id": "3",
+                "value": 1.0,
+                "max": 4.0,
+            },
+            {
+                "kind": "result",
+                "outputs": serialization_module.serialize_node_outputs(("done",)),
+            },
+        ]
+    )
+
+    response = remote_modal_app_module._consume_remote_payload_stream(payload, stream_events)
+
+    assert serialization_module.deserialize_node_outputs(response) == ("done",)
+    assert progress_calls[0]["node_id"] == "3"
+    assert progress_calls[0]["completed_ancestor_node_ids"] == ["1", "2"]
+
+
 def test_consume_remote_payload_stream_clears_static_execute_node_progress_on_suppressed_completion(
     remote_modal_app_module: Any,
     serialization_module: Any,
