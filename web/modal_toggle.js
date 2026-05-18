@@ -12,7 +12,9 @@ const FINALIZING_BORDER_COLOR = "#3b82f6";
 const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";
 const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";
 const ACTIVE_BORDER_COLOR = "#a855f7";
-const COMPLETE_BORDER_COLOR = "#16a34a";
+const COMPLETE_BORDER_COLOR = "#004FA4";
+const COMPLETE_FILL_COLOR = "#001C71";
+const FINALIZING_NODE_BORDER_COLOR = "#00358A";
 const ERROR_BORDER_COLOR = "#ef4444";
 
 const STATE_SETUP = "setup";
@@ -860,10 +862,14 @@ function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage) {
     ancestorPhase = STATE_ERROR;
   } else if (descendantStates.some((state) => state.phase === STATE_ACTIVE)) {
     ancestorPhase = STATE_ACTIVE;
+  } else if (descendantStates.every((state) => state.phase === STATE_FINALIZING)) {
+    ancestorPhase = STATE_FINALIZING;
   } else if (descendantStates.every((state) => state.phase === STATE_COMPLETE)) {
     ancestorPhase = STATE_COMPLETE;
   } else if (
-    descendantStates.some((state) => state.phase === STATE_READY || state.phase === STATE_COMPLETE)
+    descendantStates.some((state) =>
+      [STATE_READY, STATE_COMPLETE, STATE_FINALIZING].includes(state.phase),
+    )
   ) {
     ancestorPhase = STATE_READY;
   }
@@ -963,7 +969,7 @@ function deriveRemoteNodePhase(phase, hasLiveProgress) {
   if ([STATE_ERROR, STATE_SETUP].includes(phase ?? "")) {
     return phase;
   }
-  if (phase === STATE_COMPLETE) {
+  if (phase === STATE_COMPLETE || phase === STATE_FINALIZING) {
     return phase;
   }
   if (hasLiveProgress) {
@@ -1809,15 +1815,16 @@ function drawRemoteNodeDecoration(node, ctx) {
     shadowColor = `rgba(168, 85, 247, ${0.28 + pulse * 0.32})`;
     fillColor = `rgba(216, 180, 254, ${0.16 + pulse * 0.1})`;
   } else if (state?.phase === STATE_COMPLETE) {
-    const pulseRate = state?.isCachedRemoteNode ? 2 : 0;
-    const pulse = pulseRate > 0 ? (Math.sin(elapsed * pulseRate) + 1) / 2 : 0;
     borderColor = COMPLETE_BORDER_COLOR;
-    shadowColor = state?.isCachedRemoteNode
-      ? `rgba(34, 197, 94, ${0.16 + pulse * 0.12})`
-      : "rgba(34, 197, 94, 0.28)";
-    fillColor = state?.isCachedRemoteNode
-      ? `rgba(134, 239, 172, ${0.1 + pulse * 0.06})`
-      : "rgba(134, 239, 172, 0.14)";
+    shadowColor = "rgba(0, 79, 164, 0.28)";
+    fillColor = `${COMPLETE_FILL_COLOR}33`;
+  } else if (state?.phase === STATE_FINALIZING) {
+    const pulse = (Math.sin(elapsed * 5) + 1) / 2;
+    borderColor = FINALIZING_NODE_BORDER_COLOR;
+    shadowColor = `rgba(0, 53, 138, ${0.2 + pulse * 0.26})`;
+    fillColor = `${COMPLETE_FILL_COLOR}${Math.round((0.16 + pulse * 0.1) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
   } else if (state?.phase === STATE_ERROR) {
     const pulse = (Math.sin(elapsed * 6) + 1) / 2;
     borderColor = `${ERROR_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
@@ -2088,6 +2095,7 @@ function handleModalStatus(event) {
       total: detail.status_total ?? null,
     });
     setPromptActiveNode(promptId, null);
+    setNodesPhase(nodeIds, STATE_FINALIZING, promptId);
     return;
   }
 

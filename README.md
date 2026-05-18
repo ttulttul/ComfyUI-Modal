@@ -100,6 +100,7 @@ The list above is the shortest accurate summary. If you want the execution path 
   - The local frontend updates node overlays and global status from those events.
   - If another Modal prompt is already active when a new prompt is submitted, queue-time setup updates for the new prompt are held back so its nodes do not repaint until ComfyUI actually starts executing it.
   - Completed node progress fades out briefly instead of disappearing abruptly or remaining stuck at 100%.
+  - Completed remote nodes use a dark blue outline and fill while later remote nodes continue executing; during finalizing, completed nodes switch to a darker blue outline with pulsing fill while Modal outputs return locally.
   - The global status pill stays in the orange waiting state while Modal capacity is still starting up and only switches to running after streamed remote execution identifies an active node or emits real node progress.
   - Prompt success, failure, and interruption mark that prompt terminal in the frontend so late remote progress cannot resurrect stale node overlays or the global status pill.
 
