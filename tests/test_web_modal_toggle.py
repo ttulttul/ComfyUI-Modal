@@ -92,12 +92,18 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert 'const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";' in source
     assert 'const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";' in source
     assert 'const ACTIVE_BORDER_COLOR = "#a855f7";' in source
-    assert 'const COMPLETE_BORDER_COLOR = "#16a34a";' in source
+    assert 'const COMPLETE_BORDER_COLOR = "#004FA4";' in source
+    assert 'const COMPLETE_FILL_COLOR = "#001C71";' in source
+    assert 'const FINALIZING_NODE_BORDER_COLOR = "#00358A";' in source
     assert 'const STATE_WAITING = "waiting";' in source
     assert 'const STATE_FINALIZING = "finalizing";' in source
     assert 'const STATE_READY = "ready";' in source
     assert 'const STATE_ACTIVE = "active";' in source
     assert 'detail.phase === "execution_success"' in source
+    assert "phase === STATE_COMPLETE || phase === STATE_FINALIZING" in source
+    assert "state?.phase === STATE_FINALIZING" in source
+    assert "borderColor = FINALIZING_NODE_BORDER_COLOR;" in source
+    assert "setNodesPhase(nodeIds, STATE_FINALIZING, promptId);" in source
 
 
 def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> None:
