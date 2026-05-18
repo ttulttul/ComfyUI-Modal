@@ -715,6 +715,14 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     if (!shouldApplyPromptState(currentNodeId, promptId)) {
       continue;
     }
+    const existingState = modalNodeStates.get(currentNodeId);
+    if (
+      phase === STATE_READY &&
+      existingState?.promptId === promptId &&
+      [STATE_COMPLETE, STATE_FINALIZING, STATE_ERROR].includes(existingState.phase)
+    ) {
+      continue;
+    }
     clearNodeTimer(currentNodeId);
     modalNodeStates.set(currentNodeId, {
       phase,

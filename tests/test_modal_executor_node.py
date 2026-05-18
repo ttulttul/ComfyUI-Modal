@@ -7968,8 +7968,8 @@ def test_consume_remote_payload_stream_marks_progress_node_ancestors_complete(
         "extra_data": {"client_id": "client-1"},
         "subgraph_prompt": {
             "1": {"class_type": "Loader", "inputs": {}},
-            "2": {"class_type": "Condition", "inputs": {"model": ["1", 0]}},
-            "3": {"class_type": "Sampler", "inputs": {"model": ["1", 0], "conditioning": ["2", 0]}},
+            "2": {"class_type": "Condition", "inputs": {"model": [[["1", 0]]]}},
+            "3": {"class_type": "Sampler", "inputs": {"conditioning": ["2", 0]}},
         },
     }
     stream_events = iter(
