@@ -2104,11 +2104,7 @@ function handleModalStatus(event) {
     endSyntheticExecutionUi(promptId, true);
     setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
-    setPromptActiveNode(promptId, null);
-    for (const nodeIdValue of nodeIds) {
-      clearNodeProgress(nodeIdValue, promptId);
-    }
-    setNodesPhase(nodeIds, STATE_ERROR, promptId, detail.error_message);
+    clearPromptRemoteNodeVisuals(promptId);
     markPromptTerminal(promptId, STATE_ERROR);
     return;
   }
@@ -2316,11 +2312,7 @@ function handleExecutionPhase(event, phase) {
   if (phase === STATE_ERROR) {
     setGlobalStatusPhase(promptId, STATE_ERROR, componentNodeIds.length);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
-    setPromptActiveNode(promptId, null);
-    for (const nodeIdValue of componentNodeIds) {
-      clearNodeProgress(nodeIdValue, promptId);
-    }
-    setNodesPhase(componentNodeIds, STATE_ERROR, promptId, detail.exception_message);
+    clearPromptRemoteNodeVisuals(promptId);
     return;
   }
   if (phase === STATE_COMPLETE) {
@@ -2366,6 +2358,39 @@ function clearPromptRemoteStates(promptId) {
   clearPromptQueued(promptId);
   pruneGlobalStatusStates();
   refreshGlobalStatusElement();
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+/**
+ * Clear prompt-scoped remote node visuals while leaving the global status entry intact.
+ * @param {string} promptId
+ */
+function clearPromptRemoteNodeVisuals(promptId) {
+  const promptState = modalPromptStates.get(promptId);
+  const visualNodeIds = new Set();
+  if (promptState) {
+    for (const remoteNodeId of promptState.remoteNodeIds) {
+      visualNodeIds.add(String(remoteNodeId));
+    }
+    for (const ancestorNodeId of promptState.descendantNodeIdsByAncestor.keys()) {
+      visualNodeIds.add(String(ancestorNodeId));
+    }
+  }
+  for (const [nodeIdValue, state] of modalNodeStates.entries()) {
+    if (state?.promptId === promptId) {
+      visualNodeIds.add(String(nodeIdValue));
+    }
+  }
+  for (const nodeIdValue of visualNodeIds) {
+    clearNodeTimer(nodeIdValue);
+    clearNodeProgress(nodeIdValue, promptId);
+    clearNodeCached(nodeIdValue, promptId);
+    const currentState = modalNodeStates.get(nodeIdValue);
+    if (currentState?.promptId === promptId) {
+      modalNodeStates.delete(nodeIdValue);
+    }
+  }
+  setPromptActiveNode(promptId, null);
   app.graph?.setDirtyCanvas(true, true);
 }
 

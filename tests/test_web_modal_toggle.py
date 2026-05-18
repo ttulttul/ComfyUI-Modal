@@ -85,6 +85,20 @@ def test_interrupted_prompts_clear_modal_ui_by_prompt_id() -> None:
     assert "handlePromptInterruption(promptId);" in source
 
 
+def test_error_prompts_clear_remote_node_visual_state() -> None:
+    """Prompt errors should not leave stale remote node colors behind for the next submission."""
+    source = _modal_toggle_source()
+
+    assert "function clearPromptRemoteNodeVisuals(promptId)" in source
+    assert "for (const [nodeIdValue, state] of modalNodeStates.entries()) {" in source
+    assert "clearNodeTimer(nodeIdValue);" in source
+    assert "clearNodeProgress(nodeIdValue, promptId);" in source
+    assert "clearNodeCached(nodeIdValue, promptId);" in source
+    assert "modalNodeStates.delete(nodeIdValue);" in source
+    assert "clearPromptRemoteNodeVisuals(promptId);" in source
+    assert "setNodesPhase(componentNodeIds, STATE_ERROR, promptId, detail.exception_message);" not in source
+
+
 def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     """The frontend should distinguish ready, active, and completed remote nodes visually."""
     source = _modal_toggle_source()
