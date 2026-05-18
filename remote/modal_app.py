@@ -1513,6 +1513,20 @@ def _is_link(value: Any) -> bool:
     )
 
 
+def _iter_prompt_links(value: Any) -> Iterator[list[Any]]:
+    """Yield ComfyUI prompt links found inside a prompt input value."""
+    if _is_link(value):
+        yield value
+        return
+    if isinstance(value, Mapping):
+        for nested_value in value.values():
+            yield from _iter_prompt_links(nested_value)
+        return
+    if isinstance(value, list):
+        for nested_value in value:
+            yield from _iter_prompt_links(nested_value)
+
+
 def _normalize_link_output_index(value: Any) -> Any:
     """Unwrap a singleton list around a prompt-link output index when present."""
     while isinstance(value, list) and len(value) == 1:
@@ -2375,15 +2389,14 @@ def _remote_prompt_ancestor_node_ids(payload: dict[str, Any], node_id: str | Non
         if not isinstance(inputs, dict):
             continue
         for input_value in inputs.values():
-            if not _is_link(input_value):
-                continue
-            upstream_node_id = str(input_value[0])
-            if upstream_node_id == node_id or upstream_node_id in ancestors:
-                continue
-            if upstream_node_id not in prompt:
-                continue
-            ancestors.add(upstream_node_id)
-            pending.append(upstream_node_id)
+            for input_link in _iter_prompt_links(input_value):
+                upstream_node_id = str(input_link[0])
+                if upstream_node_id == node_id or upstream_node_id in ancestors:
+                    continue
+                if upstream_node_id not in prompt:
+                    continue
+                ancestors.add(upstream_node_id)
+                pending.append(upstream_node_id)
     return sorted(ancestors)
 
 

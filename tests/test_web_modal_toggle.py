@@ -234,6 +234,15 @@ def test_streamed_modal_node_progress_completes_reported_ancestors() -> None:
     assert "completeRemoteAncestorsBeforeActiveNode(\n      promptId,\n      detail.completed_ancestor_node_ids,\n      nextActiveNodeId,\n    );" in source
 
 
+def test_ready_updates_do_not_downgrade_completed_remote_nodes() -> None:
+    """Coarse execution status should not turn already completed remote nodes green again."""
+    source = _modal_toggle_source()
+
+    assert "const existingState = modalNodeStates.get(currentNodeId);" in source
+    assert "phase === STATE_READY &&\n      existingState?.promptId === promptId" in source
+    assert "[STATE_COMPLETE, STATE_FINALIZING, STATE_ERROR].includes(existingState.phase)" in source
+
+
 def test_mapped_parallel_modal_progress_renders_multiple_lane_bars() -> None:
     """Parallel mapped Modal runs should render one local progress lane per active worker."""
     source = _modal_toggle_source()
