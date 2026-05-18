@@ -2079,6 +2079,7 @@ def _emit_local_modal_status(
     status_message: str | None = None,
     status_current: int | None = None,
     status_total: int | None = None,
+    completed_ancestor_node_ids: list[str] | None = None,
 ) -> None:
     """Forward remote execution progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -2107,6 +2108,8 @@ def _emit_local_modal_status(
         payload["status_current"] = int(status_current)
     if status_total is not None:
         payload["status_total"] = int(status_total)
+    if completed_ancestor_node_ids:
+        payload["completed_ancestor_node_ids"] = list(completed_ancestor_node_ids)
     prompt_server.send_sync("modal_status", payload, client_id)
 
 
@@ -2125,6 +2128,7 @@ def _emit_local_modal_progress(
     aggregate_only: bool = False,
     setup_only: bool = False,
     cached_hit: bool = False,
+    completed_ancestor_node_ids: list[str] | None = None,
 ) -> None:
     """Forward remote numeric node progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -2156,6 +2160,8 @@ def _emit_local_modal_progress(
         payload["setup_only"] = True
     if cached_hit:
         payload["cached_hit"] = True
+    if completed_ancestor_node_ids:
+        payload["completed_ancestor_node_ids"] = list(completed_ancestor_node_ids)
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 
@@ -2348,6 +2354,37 @@ def _progress_stream_event_metadata(stream_event: dict[str, Any]) -> dict[str, s
         "real_node_id": real_node_id,
         "filter_node_id": filter_node_id,
     }
+
+
+def _remote_prompt_ancestor_node_ids(payload: dict[str, Any], node_id: str | None) -> list[str]:
+    """Return subgraph dependency ancestors for one currently executing remote node."""
+    if node_id is None:
+        return []
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict) or node_id not in prompt:
+        return []
+
+    ancestors: set[str] = set()
+    pending = [node_id]
+    while pending:
+        current_node_id = str(pending.pop())
+        prompt_node = prompt.get(current_node_id)
+        if not isinstance(prompt_node, dict):
+            continue
+        inputs = prompt_node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+        for input_value in inputs.values():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            if upstream_node_id == node_id or upstream_node_id in ancestors:
+                continue
+            if upstream_node_id not in prompt:
+                continue
+            ancestors.add(upstream_node_id)
+            pending.append(upstream_node_id)
+    return sorted(ancestors)
 
 
 def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
@@ -2608,6 +2645,10 @@ def _consume_remote_payload_stream(
                             progress_metadata["real_node_id"] if progress_metadata is not None else None
                         )
                         progress_node_id = real_node_id or display_node_id
+                        completed_ancestor_node_ids = _remote_prompt_ancestor_node_ids(
+                            payload,
+                            progress_node_id,
+                        )
                         if lane_id is not None:
                             _remember_mapped_lane_node_id(payload, lane_id, progress_node_id)
                         elif suppress_status_stream and not aggregate_only and progress_metadata is not None:
@@ -2625,17 +2666,17 @@ def _consume_remote_payload_stream(
                             stream_event.get("max"),
                             lane_id,
                         )
-                        _emit_local_modal_progress(
-                            prompt_id=prompt_id,
-                            client_id=client_id,
-                            node_id=str(reported_node_id),
-                            value=float(stream_event.get("value", 0.0)),
-                            max_value=float(stream_event.get("max", 1.0)),
-                            display_node_id=display_node_id,
-                            real_node_id=real_node_id,
-                            lane_id=lane_id,
-                            clear=bool(stream_event.get("clear", False)),
-                            item_index=(
+                        progress_kwargs = {
+                            "prompt_id": prompt_id,
+                            "client_id": client_id,
+                            "node_id": str(reported_node_id),
+                            "value": float(stream_event.get("value", 0.0)),
+                            "max_value": float(stream_event.get("max", 1.0)),
+                            "display_node_id": display_node_id,
+                            "real_node_id": real_node_id,
+                            "lane_id": lane_id,
+                            "clear": bool(stream_event.get("clear", False)),
+                            "item_index": (
                                 int(stream_event["item_index"])
                                 if stream_event.get("item_index") is not None
                                 else (
@@ -2644,8 +2685,13 @@ def _consume_remote_payload_stream(
                                     else None
                                 )
                             ),
-                            aggregate_only=aggregate_only,
-                        )
+                            "aggregate_only": aggregate_only,
+                        }
+                        if completed_ancestor_node_ids:
+                            progress_kwargs["completed_ancestor_node_ids"] = (
+                                completed_ancestor_node_ids
+                            )
+                        _emit_local_modal_progress(**progress_kwargs)
                     continue
                 if event_type == "executed":
                     reported_node_id = stream_event.get("node_id")
@@ -2825,6 +2871,12 @@ def _consume_remote_payload_stream(
                         if stream_event.get("active_node_id") is not None
                         else None
                     ),
+                    completed_ancestor_node_ids=_remote_prompt_ancestor_node_ids(
+                        payload,
+                        str(stream_event["active_node_id"])
+                        if stream_event.get("active_node_id") is not None
+                        else None,
+                    ) or None,
                     active_node_class_type=(
                         str(stream_event["active_node_class_type"])
                         if stream_event.get("active_node_class_type") is not None

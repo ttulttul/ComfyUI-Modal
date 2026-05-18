@@ -903,6 +903,32 @@ function setPromptActiveNode(promptId, activeNodeId) {
 }
 
 /**
+ * Mark known upstream remote nodes complete when a downstream node is executing.
+ * @param {string} promptId
+ * @param {any[] | undefined} ancestorNodeIds
+ * @param {string | null} activeNodeId
+ */
+function completeRemoteAncestorsBeforeActiveNode(promptId, ancestorNodeIds, activeNodeId) {
+  if (!Array.isArray(ancestorNodeIds) || ancestorNodeIds.length === 0) {
+    return;
+  }
+  const completedNodeIds = Array.from(
+    new Set(
+      ancestorNodeIds
+        .map((nodeIdValue) => String(nodeIdValue))
+        .filter((nodeIdValue) => nodeIdValue && nodeIdValue !== activeNodeId),
+    ),
+  );
+  if (completedNodeIds.length === 0) {
+    return;
+  }
+  for (const completedNodeId of completedNodeIds) {
+    fadeNodeProgress(completedNodeId, promptId);
+  }
+  setNodesPhase(completedNodeIds, STATE_COMPLETE, promptId);
+}
+
+/**
  * Return the numeric progress payload for one node when it belongs to the prompt.
  * @param {string} nodeIdValue
  * @param {string} promptId
@@ -2137,6 +2163,11 @@ function handleModalStatus(event) {
       fadeNodeProgress(previousActiveNodeId, promptId);
       setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
     }
+    completeRemoteAncestorsBeforeActiveNode(
+      promptId,
+      detail.completed_ancestor_node_ids,
+      nextActiveNodeId,
+    );
     if (nextActiveNodeId) {
       setNodesPhase([nextActiveNodeId], STATE_ACTIVE, promptId);
     }
@@ -2264,6 +2295,11 @@ function handleModalProgress(event) {
     fadeNodeProgress(previousActiveNodeId, promptId);
     setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
   }
+  completeRemoteAncestorsBeforeActiveNode(
+    promptId,
+    detail.completed_ancestor_node_ids,
+    progressNodeId,
+  );
   setPromptActiveNode(promptId, progressNodeId);
   setNodesPhase([progressNodeId], STATE_ACTIVE, promptId);
   setNodeProgress(

@@ -101,6 +101,7 @@ The list above is the shortest accurate summary. If you want the execution path 
   - If another Modal prompt is already active when a new prompt is submitted, queue-time setup updates for the new prompt are held back so its nodes do not repaint until ComfyUI actually starts executing it.
   - Completed node progress fades out briefly instead of disappearing abruptly or remaining stuck at 100%.
   - Completed remote nodes use a dark blue outline and fill while later remote nodes continue executing; during finalizing, completed nodes switch to a darker blue outline with pulsing fill while Modal outputs return locally.
+  - When a remote node starts executing, the local UI also marks its reported upstream remote ancestors complete, so quick or progress-less upstream nodes do not stay purple just because they never emitted their own completion update.
   - The global status pill stays in the orange waiting state while Modal capacity is still starting up and only switches to running after streamed remote execution identifies an active node or emits real node progress.
   - Prompt errors clear prompt-scoped remote node visual state immediately, so stale setup/ready colors do not leak into a resubmitted prompt.
   - Prompt success, failure, and interruption mark that prompt terminal in the frontend so late remote progress cannot resurrect stale node overlays or the global status pill.
