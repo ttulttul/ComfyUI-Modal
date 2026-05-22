@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
@@ -2654,6 +2654,7 @@ async def _restore_persisted_node_output_cache_entries(
     prompt_id: str,
     prompt: dict[str, Any],
     cache_store: Any,
+    required_materialized_node_ids: Iterable[str] | None = None,
     restored_cache_keys_by_node_id: dict[str, str] | None = None,
 ) -> list[str]:
     """Hydrate PromptExecutor output-cache misses from the shared Modal Dict."""
@@ -2668,8 +2669,20 @@ async def _restore_persisted_node_output_cache_entries(
         outputs_cache,
         prompt=prompt,
         cache_store=cache_store,
+        required_materialized_node_ids=required_materialized_node_ids,
         restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
     )
+
+
+def _node_output_cache_ancestor_ids(cache_key_set: Any, node_id: str) -> set[str]:
+    """Return the prompt ancestor ids used by one ComfyUI input-signature cache key."""
+    if not _is_input_signature_cache_key_set(cache_key_set):
+        return set()
+    dynprompt = cache_key_set.dynprompt
+    if not dynprompt.has_node(node_id):
+        return set()
+    ancestors, _order_mapping = cache_key_set.get_ordered_ancestry(dynprompt, node_id)
+    return {str(ancestor_id) for ancestor_id in ancestors}
 
 
 async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
@@ -2678,11 +2691,18 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
     *,
     prompt: dict[str, Any],
     cache_store: Any,
+    required_materialized_node_ids: Iterable[str] | None = None,
     restored_cache_keys_by_node_id: dict[str, str] | None = None,
 ) -> list[str]:
     """Hydrate one already-prepared PromptExecutor outputs cache from the shared Modal Dict."""
     restored_node_ids: list[str] = []
     pending_lookup_tasks: list[asyncio.Task[_NodeOutputCacheLookupResult]] = []
+    required_node_ids = {
+        str(node_id)
+        for node_id in (required_materialized_node_ids or [])
+        if str(node_id) in prompt
+    }
+    local_node_ids: set[str] = set()
 
     async def lookup_node(node_id: str) -> _NodeOutputCacheLookupResult:
         """Resolve one distributed cache candidate without mutating the live outputs cache."""
@@ -2708,13 +2728,22 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
                 "Node output cache lookup node=%s result=local-hit",
                 node_id,
             )
+            local_node_ids.add(str(node_id))
             continue
         pending_lookup_tasks.append(asyncio.create_task(lookup_node(str(node_id))))
 
     if not pending_lookup_tasks:
         return restored_node_ids
 
-    for lookup_result in await asyncio.gather(*pending_lookup_tasks):
+    lookup_results = await asyncio.gather(*pending_lookup_tasks)
+    restorable_node_ids = {
+        lookup_result.node_id
+        for lookup_result in lookup_results
+        if lookup_result.cache_key is not None and lookup_result.cache_entry is not None
+    }
+    available_node_ids = local_node_ids | restorable_node_ids
+
+    for lookup_result in lookup_results:
         node_id = lookup_result.node_id
         cache_key = lookup_result.cache_key
         if cache_key is None:
@@ -2737,6 +2766,19 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
                 result,
             )
             continue
+        missing_required_ancestors = sorted(
+            required_node_ids
+            & _node_output_cache_ancestor_ids(outputs_cache.cache_key_set, node_id)
+            - available_node_ids
+        )
+        if missing_required_ancestors:
+            _emit_cloud_info(
+                "Node output cache lookup node=%s key_prefix=%s result=skip reason=missing-required-boundary-ancestors ancestors=%s",
+                node_id,
+                _node_output_cache_key_preview(cache_key),
+                missing_required_ancestors,
+            )
+            continue
         outputs_cache.set(node_id, cache_entry)
         _emit_cloud_info(
             "Node output cache lookup node=%s key_prefix=%s result=hit",
@@ -2756,6 +2798,7 @@ def _install_prompt_executor_persisted_cache_restore(
     component_id: str,
     prompt: dict[str, Any],
     cache_store: Any,
+    required_materialized_node_ids: Iterable[str] | None = None,
 ) -> _PersistedNodeCacheRestoreState:
     """Patch one executor so persisted-cache restore runs after its live `set_prompt()` call."""
     restored_node_ids: list[str] = []
@@ -2772,6 +2815,7 @@ def _install_prompt_executor_persisted_cache_restore(
                 outputs_cache,
                 prompt=prompt,
                 cache_store=cache_store,
+                required_materialized_node_ids=required_materialized_node_ids,
                 restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
             )
 
@@ -2805,6 +2849,15 @@ def _emit_restored_node_cache_events(
                 "real_node_id": safe_node_id,
             }
         )
+
+
+def _boundary_output_node_ids(boundary_outputs: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Return node ids whose local cache entries must exist for boundary collection."""
+    return {
+        str(boundary_output.get("node_id"))
+        for boundary_output in boundary_outputs
+        if boundary_output.get("node_id") is not None
+    }
 
 
 def _persist_node_output_cache_entries(
@@ -3580,6 +3633,9 @@ def _execute_subgraph_prompt(
                         executor_state.executor,
                         component_id=component_id,
                         prompt=prompt,
+                        required_materialized_node_ids=_boundary_output_node_ids(
+                            normalized_payload.get("boundary_outputs", [])
+                        ),
                         cache_store=cache_store,
                     )
                 )
