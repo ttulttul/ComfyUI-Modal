@@ -1308,6 +1308,8 @@ def test_modal_cloud_installs_headless_prompt_server_instance(
     assert instance.client_id is None
     assert instance.last_node_id is None
 
+    instance.send_progress_text("width: 1024, height: 768", "104")
+
     instance.add_on_prompt_handler("handler")
     assert instance.on_prompt_handlers == ["handler"]
 
