@@ -3149,6 +3149,16 @@ def setup_modal_queue_route(
             remote_node_ids = sorted(
                 extract_remote_node_ids(workflow, resolved_settings, prompt_node_ids)
             )
+            if "prompt" in json_data and not remote_node_ids:
+                logger.info(
+                    "No workflow nodes are marked for Modal execution; forwarding prompt without Modal status or rewrite."
+                )
+                response = await _queue_prompt_json(prompt_server, json_data)
+                logger.info(
+                    "Modal queue request completed in %.3fs.",
+                    time.perf_counter() - request_started_at,
+                )
+                return response
 
             def emit_setup_status(
                 message: str,

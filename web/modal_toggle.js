@@ -2085,6 +2085,9 @@ function handleModalStatus(event) {
   }
   const nodeIds = (detail.node_ids ?? []).map((value) => String(value));
   const components = detail.components ?? [];
+  if (nodeIds.length === 0 && components.length === 0) {
+    return;
+  }
   if (components.length > 0 || nodeIds.length > 0) {
     registerPromptComponents(promptId, nodeIds, components);
   }

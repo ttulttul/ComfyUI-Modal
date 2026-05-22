@@ -56,6 +56,13 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "Waiting for Modal container" in source
 
 
+def test_empty_modal_status_events_do_not_show_global_pill() -> None:
+    """Queue requests without Modal-enabled nodes should not create global Modal UI state."""
+    source = _modal_toggle_source()
+
+    assert "if (nodeIds.length === 0 && components.length === 0) {\n    return;\n  }" in source
+
+
 def test_remote_modal_status_tracks_active_node_ids() -> None:
     """The frontend should track and highlight the currently active remote node."""
     source = _modal_toggle_source()
