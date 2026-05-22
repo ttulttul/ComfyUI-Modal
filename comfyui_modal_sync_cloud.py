@@ -942,6 +942,16 @@ class _HeadlessPromptServerInstance:
         """Discard sync websocket sends from import-time custom-node helpers."""
         logger.debug("Suppressed headless remote prompt event %s for client %s.", event, sid)
 
+    def send_progress_text(
+        self,
+        text: bytes | bytearray | str,
+        node_id: str,
+        sid: str | None = None,
+    ) -> None:
+        """Discard node progress text emitted by headless remote node execution."""
+        del text
+        logger.debug("Suppressed headless remote prompt text for node %s client %s.", node_id, sid)
+
     def add_on_prompt_handler(self, handler: Any) -> None:
         """Record prompt handlers registered by custom nodes during import."""
         self.on_prompt_handlers.append(handler)
