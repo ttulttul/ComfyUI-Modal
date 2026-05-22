@@ -315,7 +315,19 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
             return {
                 "prompt_id": "prompt-queue-warmup",
                 "prompt": {"1": {"class_type": "RemoteImage", "inputs": {}}},
-                "extra_data": {"extra_pnginfo": {"workflow": {"nodes": []}}},
+                "extra_data": {
+                    "extra_pnginfo": {
+                        "workflow": {
+                            "nodes": [
+                                {
+                                    "id": 1,
+                                    "type": "RemoteImage",
+                                    "properties": {"is_modal_remote": True},
+                                }
+                            ]
+                        }
+                    }
+                },
             }
 
     class FakeExecutionModule:
@@ -387,6 +399,129 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     response_payload = json.loads(response.text)
     assert response_payload["prompt_id"] == "prompt-queue-warmup"
     assert response_payload["modal_remote_node_ids"] == ["1"]
+    assert len(prompt_server.prompt_queue.items) == 1
+
+
+def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(
+    api_intercept_module: Any,
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Prompts with no Modal-enabled workflow nodes should queue without Modal UI setup."""
+
+    class FakeRoutes:
+        """Capture aiohttp route registrations."""
+
+        def __init__(self) -> None:
+            """Initialize the route handler map."""
+            self.handlers: dict[str, Any] = {}
+
+        def post(self, path: str) -> Any:
+            """Return a decorator that records one POST handler."""
+
+            def register(handler: Any) -> Any:
+                """Store the decorated handler unchanged."""
+                self.handlers[path] = handler
+                return handler
+
+            return register
+
+    class FakePromptQueue:
+        """Minimal prompt queue sink."""
+
+        def __init__(self) -> None:
+            """Initialize captured queue items."""
+            self.items: list[tuple[Any, ...]] = []
+
+        def put(self, item: tuple[Any, ...]) -> None:
+            """Record one queued prompt item."""
+            self.items.append(item)
+
+    class FakePromptServer:
+        """Minimal PromptServer double with route registration."""
+
+        def __init__(self) -> None:
+            """Initialize routing and queue state."""
+            self.number = 0
+            self.routes = FakeRoutes()
+            self.prompt_queue = FakePromptQueue()
+
+        def trigger_on_prompt(self, json_data: dict[str, Any]) -> dict[str, Any]:
+            """Return the prompt unchanged."""
+            return json_data
+
+    class FakeRequest:
+        """Minimal aiohttp request double."""
+
+        async def json(self) -> dict[str, Any]:
+            """Return one ordinary prompt request."""
+            return {
+                "prompt_id": "prompt-no-modal",
+                "prompt": {"1": {"class_type": "LocalImage", "inputs": {}}},
+                "extra_data": {"extra_pnginfo": {"workflow": {"nodes": []}}},
+            }
+
+    class FakeExecutionModule:
+        """Minimal execution module exposing prompt validation."""
+
+        SENSITIVE_EXTRA_DATA_KEYS: tuple[str, ...] = ()
+
+        @staticmethod
+        async def validate_prompt(
+            prompt_id: str,
+            prompt: dict[str, Any],
+            partial_execution_targets: Any,
+        ) -> tuple[bool, None, list[str], list[Any]]:
+            """Accept the supplied prompt with one fake execution target."""
+            return True, None, ["1"], []
+
+    def fail_modal_status(*_args: Any, **_kwargs: Any) -> None:
+        """Fail if the no-remote fast path emits Modal UI state."""
+        raise AssertionError("no-remote prompts must not emit Modal status")
+
+    def fail_rewrite(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any], Any]:
+        """Fail if the no-remote fast path enters Modal prompt rewriting."""
+        raise AssertionError("no-remote prompts must not be rewritten for Modal")
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    prompt_server = FakePromptServer()
+    monkeypatch.setattr(api_intercept_module, "_ROUTE_REGISTERED", False)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_get_server_module",
+        lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
+    )
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(api_intercept_module, "_emit_modal_status", fail_modal_status)
+    monkeypatch.setattr(api_intercept_module, "rewrite_prompt_for_modal", fail_rewrite)
+
+    api_intercept_module.setup_modal_queue_route(
+        prompt_server=prompt_server,
+        sync_engine=object(),
+        settings=settings,
+    )
+    response = asyncio.run(prompt_server.routes.handlers["/modal/queue_prompt"](FakeRequest()))
+
+    response_payload = json.loads(response.text)
+    assert response_payload["prompt_id"] == "prompt-no-modal"
+    assert "modal_remote_node_ids" not in response_payload
     assert len(prompt_server.prompt_queue.items) == 1
 
 
