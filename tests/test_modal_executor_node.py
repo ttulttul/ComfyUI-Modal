@@ -8739,10 +8739,11 @@ def test_modal_cloud_installs_persisted_cache_restore_after_live_set_prompt(
         *,
         prompt: dict[str, Any],
         cache_store: Any,
+        required_materialized_node_ids: Any = None,
         restored_cache_keys_by_node_id: dict[str, str] | None = None,
     ) -> list[str]:
         """Record the cache-key-set marker visible at restore time."""
-        del execution
+        del execution, required_materialized_node_ids
         if restored_cache_keys_by_node_id is not None:
             restored_cache_keys_by_node_id["12"] = "NC_example"
         observed_events.append(
@@ -8962,6 +8963,90 @@ def test_modal_cloud_restores_persisted_node_cache_entries_in_parallel(
         "node_2": {"cache_key": "NC_node_2"},
         "node_3": {"cache_key": "NC_node_3"},
     }
+
+
+def test_modal_cloud_skips_downstream_cache_hit_when_boundary_ancestor_is_missing(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A downstream distributed hit must not bypass a missing required boundary producer."""
+    restored_values: dict[str, Any] = {}
+    observed_logs: list[tuple[Any, ...]] = []
+
+    class FakeOutputsCache:
+        """Minimal outputs cache stub for boundary-aware restore tests."""
+
+        def __init__(self) -> None:
+            """Expose the cache-key-set marker read by restore."""
+            self.cache_key_set = object()
+
+        def get(self, node_id: str) -> Any:
+            """Return any previously restored entry."""
+            return restored_values.get(node_id)
+
+        def set(self, node_id: str, cache_entry: Any) -> None:
+            """Record one restored cache entry."""
+            restored_values[node_id] = cache_entry
+
+    async def fake_key_from_key_set(cache_key_set: Any, node_id: str) -> str:
+        """Return stable fake distributed cache keys."""
+        del cache_key_set
+        return f"NC_{node_id}"
+
+    async def fake_store_get(cache_store: Any, cache_key: str) -> Any:
+        """Only the downstream execute target has a distributed cache hit."""
+        del cache_store
+        if cache_key == "NC_11":
+            return {"cache_key": cache_key}
+        return None
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_key_from_key_set_async",
+        fake_key_from_key_set,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_store_get",
+        fake_store_get,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_deserialize_node_output_cache_entry",
+        lambda execution, record: record,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_node_output_cache_ancestor_ids",
+        lambda cache_key_set, node_id: {"14"} if node_id == "11" else set(),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_emit_cloud_info",
+        lambda message, *args: observed_logs.append((message, *args)),
+    )
+
+    restored_node_ids = asyncio.run(
+        modal_cloud_module._restore_persisted_node_output_cache_entries_into_prepared_cache(
+            object(),
+            FakeOutputsCache(),
+            prompt={
+                "11": {"class_type": "VAEDecode", "inputs": {"samples": ["14", 0]}},
+                "14": {"class_type": "LoraLoaderModelOnly", "inputs": {}},
+            },
+            cache_store={},
+            required_materialized_node_ids={"14"},
+        )
+    )
+
+    assert restored_node_ids == []
+    assert restored_values == {}
+    assert (
+        "Node output cache lookup node=%s key_prefix=%s result=skip reason=missing-required-boundary-ancestors ancestors=%s",
+        "11",
+        "NC_11",
+        ["14"],
+    ) in observed_logs
 
 
 def test_modal_cloud_materializes_synced_asset_paths(
