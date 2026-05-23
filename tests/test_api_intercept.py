@@ -2853,6 +2853,7 @@ def test_emit_modal_status_targets_prompt_client(
     api_intercept_module: Any,
 ) -> None:
     """Modal status events should preserve prompt and component metadata for the UI."""
+    api_intercept_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
 
     class FakePromptServer:
         """Capture websocket events emitted by the queue route."""
@@ -2898,3 +2899,62 @@ def test_emit_modal_status_targets_prompt_client(
             "client-1",
         )
     ]
+    replay_events = api_intercept_module.modal_ui_events_for_client("client-1")
+    assert replay_events == [
+        {
+            "event": "modal_status",
+            "payload": {
+                "phase": "executing",
+                "prompt_id": "prompt-1",
+                "node_ids": ["4", "5"],
+                "active_node_id": "5",
+                "active_node_class_type": "KSampler",
+                "active_node_role": "sampling",
+                "components": [
+                    {
+                        "representative_node_id": "4",
+                        "node_ids": ["4", "5"],
+                    }
+                ],
+            },
+            "updated_at": replay_events[0]["updated_at"],
+        }
+    ]
+
+
+def test_modal_ui_event_replay_is_client_scoped(api_intercept_module: Any) -> None:
+    """Refocus replay should only return events for the requesting ComfyUI client."""
+    api_intercept_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
+
+    api_intercept_module.record_modal_ui_event(
+        "modal_progress",
+        {"prompt_id": "prompt-1", "node_id": "4", "value": 2.0, "max": 10.0},
+        "client-1",
+    )
+    api_intercept_module.record_modal_ui_event(
+        "modal_status",
+        {"prompt_id": "prompt-2", "phase": "executing", "node_ids": ["9"]},
+        "client-2",
+    )
+
+    replay_events = api_intercept_module.modal_ui_events_for_client("client-1")
+
+    assert len(replay_events) == 1
+    assert replay_events[0]["event"] == "modal_progress"
+    assert replay_events[0]["payload"] == {
+        "prompt_id": "prompt-1",
+        "node_id": "4",
+        "value": 2.0,
+        "max": 10.0,
+    }
+    assert api_intercept_module.modal_ui_events_for_client(None) == []
+
+
+def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) -> None:
+    """The frontend should have a stable sibling route for Modal UI replay."""
+    assert api_intercept_module._progress_state_route_path("/modal/queue_prompt") == (
+        "/modal/progress_state"
+    )
+    assert api_intercept_module._progress_state_route_path("/custom/modal") == (
+        "/custom/modal/progress_state"
+    )

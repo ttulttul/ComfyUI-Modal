@@ -2080,6 +2080,19 @@ def _lookup_local_prompt_server() -> Any | None:
     return getattr(server.PromptServer, "instance", None)
 
 
+def _record_local_modal_ui_event(event: str, payload: Mapping[str, Any], client_id: str | None) -> None:
+    """Record one local Modal UI event for browser refocus replay when available."""
+    if client_id is None:
+        return
+    try:
+        from ..api_intercept import record_modal_ui_event
+    except (ImportError, AttributeError):
+        logger.debug("Modal UI event replay recorder is unavailable for event %s.", event)
+        return
+
+    record_modal_ui_event(event, payload, client_id)
+
+
 def _emit_local_modal_status(
     *,
     prompt_id: str | None,
@@ -2124,6 +2137,7 @@ def _emit_local_modal_status(
         payload["status_total"] = int(status_total)
     if completed_ancestor_node_ids:
         payload["completed_ancestor_node_ids"] = list(completed_ancestor_node_ids)
+    _record_local_modal_ui_event("modal_status", payload, client_id)
     prompt_server.send_sync("modal_status", payload, client_id)
 
 
@@ -2176,6 +2190,7 @@ def _emit_local_modal_progress(
         payload["cached_hit"] = True
     if completed_ancestor_node_ids:
         payload["completed_ancestor_node_ids"] = list(completed_ancestor_node_ids)
+    _record_local_modal_ui_event("modal_progress", payload, client_id)
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 

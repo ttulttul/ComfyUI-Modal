@@ -4,6 +4,7 @@ import { PromptExecutionError, api } from "../../scripts/api.js";
 const REMOTE_PROPERTY = "is_modal_remote";
 const MODAL_ROUTE = "/modal/queue_prompt";
 const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
+const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/progress_state");
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
@@ -43,6 +44,7 @@ const modalGlobalStatusStates = new Map();
 
 let animationFrameHandle = null;
 let modalGlobalStatusElement = null;
+let modalVisibilityRefreshInFlight = null;
 
 /**
  * Return whether a node should show the Modal toggle.
@@ -575,6 +577,48 @@ function clearGlobalStatusPhase(promptId) {
 }
 
 /**
+ * Replay one Modal UI event received from the backend refocus buffer.
+ * @param {{ event?: string, payload?: object }} eventRecord
+ */
+function replayModalUiEvent(eventRecord) {
+  const eventName = String(eventRecord?.event ?? "");
+  const payload = eventRecord?.payload;
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+  if (eventName === "modal_status") {
+    handleModalStatus({ detail: payload });
+  } else if (eventName === "modal_progress") {
+    handleModalProgress({ detail: payload });
+  }
+}
+
+/**
+ * Fetch recent Modal UI events that may have arrived while the browser was backgrounded.
+ * @returns {Promise<void>}
+ */
+async function replayModalUiEventsAfterVisibilityChange() {
+  const clientId = api.clientId == null ? "" : String(api.clientId);
+  if (!clientId || typeof api.fetchApi !== "function") {
+    return;
+  }
+
+  const response = await api.fetchApi(
+    `${MODAL_PROGRESS_STATE_ROUTE}?client_id=${encodeURIComponent(clientId)}`,
+    { method: "GET" },
+  );
+  if (response.status !== 200) {
+    return;
+  }
+
+  const payload = await response.json();
+  const events = Array.isArray(payload?.events) ? payload.events : [];
+  for (const eventRecord of events) {
+    replayModalUiEvent(eventRecord);
+  }
+}
+
+/**
  * Refresh the badge and canvas when the tab regains visibility.
  */
 function refreshModalUiAfterVisibilityChange() {
@@ -583,6 +627,21 @@ function refreshModalUiAfterVisibilityChange() {
     ensureAnimationLoop();
   }
   app.graph?.setDirtyCanvas(true, true);
+  if (modalVisibilityRefreshInFlight) {
+    return;
+  }
+  modalVisibilityRefreshInFlight = replayModalUiEventsAfterVisibilityChange()
+    .catch((error) => {
+      console.warn("Unable to refresh Modal UI state after visibility change.", error);
+    })
+    .finally(() => {
+      modalVisibilityRefreshInFlight = null;
+      refreshGlobalStatusElement();
+      if (Array.from(modalNodeStates.values()).length > 0) {
+        ensureAnimationLoop();
+      }
+      app.graph?.setDirtyCanvas(true, true);
+    });
 }
 
 /**

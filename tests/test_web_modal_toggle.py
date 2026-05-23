@@ -382,6 +382,13 @@ def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
     """Background-tab throttling should not leave the status pill stale after refocus."""
     source = _modal_toggle_source()
 
+    assert 'const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\\/queue_prompt$/, "/progress_state");' in source
     assert "function refreshModalUiAfterVisibilityChange()" in source
+    assert "function replayModalUiEventsAfterVisibilityChange()" in source
+    assert "function replayModalUiEvent(eventRecord)" in source
+    assert "modalVisibilityRefreshInFlight" in source
+    assert "api.fetchApi(" in source
+    assert "handleModalStatus({ detail: payload });" in source
+    assert "handleModalProgress({ detail: payload });" in source
     assert 'document.addEventListener("visibilitychange"' in source
     assert 'window.addEventListener("focus", refreshModalUiAfterVisibilityChange);' in source
