@@ -6,6 +6,7 @@
 - A visibility/focus redraw is not enough if the browser missed Modal websocket events while backgrounded. The local ComfyUI side needs to retain recent client-scoped `modal_status` and `modal_progress` payloads, and the frontend should replay that buffer on refocus before redrawing the status pill and node overlays.
 - Programmatic context-menu changes to `properties.is_modal_remote` also have to update the live `Run on Modal` widget value. Otherwise the saved workflow state and node border can be correct while the visible toggle still appears disabled.
 - Graph-wide Modal enablement should operate on live eligible nodes, not just serialized workflow JSON. Scanning the root graph plus nested subgraphs lets the action update both node properties and visible widgets in one pass.
+- Once Modal has several node context actions, putting them under one `Modal` submenu keeps labels short and prevents repeated prefixes from cluttering the main node menu.
 
 ## 2026-04-23
 

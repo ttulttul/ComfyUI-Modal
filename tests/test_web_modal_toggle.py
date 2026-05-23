@@ -334,14 +334,22 @@ def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
     assert 'api.fetchApi(MODAL_ANALYZE_ROUTE, {' in source
     assert "async beforeRegisterNodeDef(nodeType, nodeData)" in source
     assert "installModalContextMenu(nodeType, nodeData);" in source
-    assert '"Modal: Enable on Upstream Nodes"' in source
-    assert '"Modal: Enable on Upstream Nodes for Selection"' in source
-    assert '"Modal: Disable on Upstream Nodes"' in source
-    assert '"Modal: Disable on Upstream Nodes for Selection"' in source
-    assert '"Modal: Enable All Nodes"' in source
+    assert 'content: "Modal"' in source
+    assert "has_submenu: true" in source
+    assert "submenu: {" in source
+    assert '"Enable on Upstream Nodes"' in source
+    assert '"Enable on Upstream Nodes for Selection"' in source
+    assert '"Disable on Upstream Nodes"' in source
+    assert '"Disable on Upstream Nodes for Selection"' in source
+    assert '"Enable All Nodes"' in source
+    assert '"Disable All Nodes"' in source
+    assert '"Modal: Enable on Upstream Nodes"' not in source
+    assert '"Modal: Disable on Upstream Nodes"' not in source
+    assert '"Modal: Enable All Nodes"' not in source
     assert "analyzeAndSetUpstreamRemoteNodes(this, true)" in source
     assert "analyzeAndSetUpstreamRemoteNodes(this, false)" in source
-    assert "enableAllEligibleWorkflowNodes();" in source
+    assert "setAllEligibleWorkflowNodesRemote(true);" in source
+    assert "setAllEligibleWorkflowNodesRemote(false);" in source
 
 
 def test_modal_context_menu_marks_nodes_across_subgraphs() -> None:
@@ -358,15 +366,16 @@ def test_modal_context_menu_marks_nodes_across_subgraphs() -> None:
     assert "node.__modalToggleWidget.value = enabled;" in source
 
 
-def test_modal_context_menu_can_enable_all_eligible_nodes() -> None:
-    """The graph-wide menu action should toggle every eligible live workflow node."""
+def test_modal_context_menu_can_set_all_eligible_nodes() -> None:
+    """The graph-wide menu actions should toggle every eligible live workflow node."""
     source = _modal_toggle_source()
 
-    assert "function enableAllEligibleWorkflowNodes()" in source
+    assert "function setAllEligibleWorkflowNodesRemote(value)" in source
     assert "for (const node of allWorkflowNodes()) {" in source
     assert "if (!isEligibleNode(node)) {" in source
-    assert "setRemoteFlag(node, true);" in source
-    assert "Enabled Modal on ${appliedCount} node" in source
+    assert "setRemoteFlag(node, value);" in source
+    assert 'const actionLabel = value ? "Enabled" : "Disabled";' in source
+    assert "${actionLabel} Modal on ${appliedCount} node" in source
 
 
 def test_prompt_component_registration_does_not_shrink_remote_node_count() -> None:
