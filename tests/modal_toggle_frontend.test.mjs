@@ -47,7 +47,7 @@ const transformedSource = `${[
   "  handleExecutionPhase,",
   "  handlePromptInterruption,",
   "  setRemoteFlag,",
-  "  enableAllEligibleWorkflowNodes,",
+  "  setAllEligibleWorkflowNodesRemote,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  currentGlobalStatus,",
@@ -262,11 +262,18 @@ globalThis.__modalAppStub.rootGraph = {
     },
   ],
 };
-assert.equal(modalToggle.enableAllEligibleWorkflowNodes(), 3);
+assert.equal(modalToggle.setAllEligibleWorkflowNodesRemote(true), 3);
 assert.equal(eligibleNode.properties.is_modal_remote, true);
 assert.equal(eligibleNode.__modalToggleWidget.value, true);
 assert.equal(nestedEligibleNode.properties.is_modal_remote, true);
 assert.equal(nestedEligibleNode.__modalToggleWidget.value, true);
+assert.equal(internalNode.properties.is_modal_remote, undefined);
+assert.equal(internalNode.__modalToggleWidget.value, false);
+assert.equal(modalToggle.setAllEligibleWorkflowNodesRemote(false), 3);
+assert.equal(eligibleNode.properties.is_modal_remote, false);
+assert.equal(eligibleNode.__modalToggleWidget.value, false);
+assert.equal(nestedEligibleNode.properties.is_modal_remote, false);
+assert.equal(nestedEligibleNode.__modalToggleWidget.value, false);
 assert.equal(internalNode.properties.is_modal_remote, undefined);
 assert.equal(internalNode.__modalToggleWidget.value, false);
 globalThis.__modalAppStub.rootGraph = null;

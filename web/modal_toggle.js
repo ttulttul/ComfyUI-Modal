@@ -1668,22 +1668,24 @@ function setWorkflowNodePathsRemote(workflowNodePaths, value) {
 }
 
 /**
- * Enable Modal on every currently eligible node in the live workflow.
+ * Set Modal on every currently eligible node in the live workflow.
+ * @param {boolean} value
  * @returns {number}
  */
-function enableAllEligibleWorkflowNodes() {
+function setAllEligibleWorkflowNodesRemote(value) {
   let appliedCount = 0;
   for (const node of allWorkflowNodes()) {
     if (!isEligibleNode(node)) {
       continue;
     }
-    setRemoteFlag(node, true);
+    setRemoteFlag(node, value);
     appliedCount += 1;
   }
   app.graph?.setDirtyCanvas(true, true);
+  const actionLabel = value ? "Enabled" : "Disabled";
   notifyModal(
     appliedCount > 0
-      ? `Enabled Modal on ${appliedCount} node${appliedCount === 1 ? "" : "s"}.`
+      ? `${actionLabel} Modal on ${appliedCount} node${appliedCount === 1 ? "" : "s"}.`
       : "No Modal-eligible nodes were found in the workflow.",
   );
   return appliedCount;
@@ -1768,42 +1770,52 @@ function installModalContextMenu(nodeType, nodeData) {
     }
 
     const selectedNodePaths = selectedWorkflowNodePaths(this);
-    const enableMenuItemLabel =
+    const enableUpstreamMenuItemLabel =
       selectedNodePaths.length > 1
-        ? "Modal: Enable on Upstream Nodes for Selection"
-        : "Modal: Enable on Upstream Nodes";
-    const disableMenuItemLabel =
+        ? "Enable on Upstream Nodes for Selection"
+        : "Enable on Upstream Nodes";
+    const disableUpstreamMenuItemLabel =
       selectedNodePaths.length > 1
-        ? "Modal: Disable on Upstream Nodes for Selection"
-        : "Modal: Disable on Upstream Nodes";
-    const enableAllMenuItemLabel = "Modal: Enable All Nodes";
-    if (!targetOptions.some((option) => option?.content === enableMenuItemLabel)) {
+        ? "Disable on Upstream Nodes for Selection"
+        : "Disable on Upstream Nodes";
+    if (!targetOptions.some((option) => option?.content === "Modal")) {
       targetOptions.push(null, {
-        content: enableMenuItemLabel,
-        callback: () => {
-          void analyzeAndSetUpstreamRemoteNodes(this, true).catch((error) => {
-            console.error("Modal remote-node analysis failed.", error);
-            notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
-          });
-        },
-      });
-    }
-    if (!targetOptions.some((option) => option?.content === disableMenuItemLabel)) {
-      targetOptions.push({
-        content: disableMenuItemLabel,
-        callback: () => {
-          void analyzeAndSetUpstreamRemoteNodes(this, false).catch((error) => {
-            console.error("Modal remote-node analysis failed.", error);
-            notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
-          });
-        },
-      });
-    }
-    if (!targetOptions.some((option) => option?.content === enableAllMenuItemLabel)) {
-      targetOptions.push({
-        content: enableAllMenuItemLabel,
-        callback: () => {
-          enableAllEligibleWorkflowNodes();
+        content: "Modal",
+        has_submenu: true,
+        submenu: {
+          options: [
+            {
+              content: enableUpstreamMenuItemLabel,
+              callback: () => {
+                void analyzeAndSetUpstreamRemoteNodes(this, true).catch((error) => {
+                  console.error("Modal remote-node analysis failed.", error);
+                  notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
+                });
+              },
+            },
+            {
+              content: disableUpstreamMenuItemLabel,
+              callback: () => {
+                void analyzeAndSetUpstreamRemoteNodes(this, false).catch((error) => {
+                  console.error("Modal remote-node analysis failed.", error);
+                  notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
+                });
+              },
+            },
+            null,
+            {
+              content: "Enable All Nodes",
+              callback: () => {
+                setAllEligibleWorkflowNodesRemote(true);
+              },
+            },
+            {
+              content: "Disable All Nodes",
+              callback: () => {
+                setAllEligibleWorkflowNodesRemote(false);
+              },
+            },
+          ],
         },
       });
     }
