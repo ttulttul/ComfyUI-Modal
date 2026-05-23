@@ -301,7 +301,7 @@ For each connected region you want to offload:
 2. Enable it on every node that should be part of the same remote island.
 3. Confirm the node shows the blue remote-execution border.
 
-If queue-time validation tells you a remote node still depends on local-only runtime objects, you no longer have to hunt those upstream nodes manually. Right-click the node and use `Modal: Enable on Upstream Nodes` to ask the backend which extra nodes must join that remote island. Use `Modal: Disable on Upstream Nodes` to clear that same upstream selection. If multiple nodes are selected in the current graph, the same context menu applies to the whole selection at once.
+If queue-time validation tells you a remote node still depends on local-only runtime objects, you no longer have to hunt those upstream nodes manually. Right-click the node and use `Modal: Enable on Upstream Nodes` to ask the backend which extra nodes must join that remote island. Use `Modal: Disable on Upstream Nodes` to clear that same upstream selection. Use `Modal: Enable All Nodes` to enable every Modal-eligible node in the current workflow. If multiple nodes are selected in the current graph, the upstream context menu actions apply to the whole selection at once.
 
 The toggle stores `properties.is_modal_remote = true` in workflow metadata. The visible graph is not rewritten in the editor. Rewrite happens only at queue time.
 
