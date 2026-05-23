@@ -329,13 +329,17 @@ def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
     assert "function workflowNodePath(node)" in source
     assert "function findNodeByWorkflowPath(workflowPath)" in source
     assert "function selectedWorkflowNodePaths(node)" in source
-    assert "function analyzeAndMarkRequiredRemoteNodes(node)" in source
+    assert "function analyzeAndSetUpstreamRemoteNodes(node, value)" in source
     assert "function installModalContextMenu(nodeType, nodeData)" in source
     assert 'api.fetchApi(MODAL_ANALYZE_ROUTE, {' in source
     assert "async beforeRegisterNodeDef(nodeType, nodeData)" in source
     assert "installModalContextMenu(nodeType, nodeData);" in source
-    assert '"Modal: Include Required Upstream Nodes"' in source
-    assert '"Modal: Include Required Upstream Nodes for Selection"' in source
+    assert '"Modal: Enable on Upstream Nodes"' in source
+    assert '"Modal: Enable on Upstream Nodes for Selection"' in source
+    assert '"Modal: Disable on Upstream Nodes"' in source
+    assert '"Modal: Disable on Upstream Nodes for Selection"' in source
+    assert "analyzeAndSetUpstreamRemoteNodes(this, true)" in source
+    assert "analyzeAndSetUpstreamRemoteNodes(this, false)" in source
 
 
 def test_modal_context_menu_marks_nodes_across_subgraphs() -> None:
@@ -346,8 +350,9 @@ def test_modal_context_menu_marks_nodes_across_subgraphs() -> None:
     assert "function findSomethingInAllSubgraphs(matcher)" in source
     assert "function findContainingSubgraphNode(subgraphId)" in source
     assert "candidate.subgraph?.id === subgraphId" in source
-    assert "function markWorkflowNodePathsRemote(workflowNodePaths)" in source
-    assert "setRemoteFlag(node, true);" in source
+    assert "function setWorkflowNodePathsRemote(workflowNodePaths, value)" in source
+    assert "setRemoteFlag(node, value);" in source
+    assert "node.__modalToggleWidget.value = enabled;" in source
 
 
 def test_prompt_component_registration_does_not_shrink_remote_node_count() -> None:

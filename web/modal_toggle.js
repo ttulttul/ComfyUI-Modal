@@ -1617,11 +1617,12 @@ function notifyModal(value) {
 }
 
 /**
- * Apply the remote marker to the workflow nodes named by composed workflow paths.
+ * Apply the remote marker value to the workflow nodes named by composed workflow paths.
  * @param {string[]} workflowNodePaths
+ * @param {boolean} value
  * @returns {number}
  */
-function markWorkflowNodePathsRemote(workflowNodePaths) {
+function setWorkflowNodePathsRemote(workflowNodePaths, value) {
   let appliedCount = 0;
   for (const workflowPath of workflowNodePaths) {
     const node = findNodeByWorkflowPath(workflowPath);
@@ -1629,17 +1630,18 @@ function markWorkflowNodePathsRemote(workflowNodePaths) {
       console.warn("Unable to find Modal workflow node path in the live graph.", workflowPath);
       continue;
     }
-    setRemoteFlag(node, true);
+    setRemoteFlag(node, value);
     appliedCount += 1;
   }
   return appliedCount;
 }
 
 /**
- * Request required upstream nodes from the backend and mark them remote in the UI.
+ * Request required upstream nodes from the backend and set their Modal state in the UI.
  * @param {LGraphNode} node
+ * @param {boolean} value
  */
-async function analyzeAndMarkRequiredRemoteNodes(node) {
+async function analyzeAndSetUpstreamRemoteNodes(node, value) {
   const seedNodeIds = selectedWorkflowNodePaths(node);
   const graphSnapshot = await serializeCurrentGraphForModal();
   const response = await api.fetchApi(MODAL_ANALYZE_ROUTE, {
@@ -1660,11 +1662,19 @@ async function analyzeAndMarkRequiredRemoteNodes(node) {
   const result = await response.json();
   const resolvedWorkflowNodePaths = result.resolved_workflow_node_paths ?? [];
   const addedWorkflowNodePaths = result.added_workflow_node_paths ?? [];
-  const appliedCount = markWorkflowNodePathsRemote(resolvedWorkflowNodePaths);
+  const appliedCount = setWorkflowNodePathsRemote(resolvedWorkflowNodePaths, value);
   app.graph?.setDirtyCanvas(true, true);
 
+  if (!value) {
+    notifyModal(
+      appliedCount > 0
+        ? `Disabled Modal on ${appliedCount} upstream node${appliedCount === 1 ? "" : "s"}.`
+        : "Modal analysis finished, but no matching live nodes were found to update.",
+    );
+    return;
+  }
   if (addedWorkflowNodePaths.length > 0) {
-    notifyModal(`Marked ${addedWorkflowNodePaths.length} node${addedWorkflowNodePaths.length === 1 ? "" : "s"} for Modal.`);
+    notifyModal(`Enabled Modal on ${addedWorkflowNodePaths.length} upstream node${addedWorkflowNodePaths.length === 1 ? "" : "s"}.`);
     return;
   }
   notifyModal(
@@ -1705,15 +1715,30 @@ function installModalContextMenu(nodeType, nodeData) {
     }
 
     const selectedNodePaths = selectedWorkflowNodePaths(this);
-    const menuItemLabel =
+    const enableMenuItemLabel =
       selectedNodePaths.length > 1
-        ? "Modal: Include Required Upstream Nodes for Selection"
-        : "Modal: Include Required Upstream Nodes";
-    if (!targetOptions.some((option) => option?.content === menuItemLabel)) {
+        ? "Modal: Enable on Upstream Nodes for Selection"
+        : "Modal: Enable on Upstream Nodes";
+    const disableMenuItemLabel =
+      selectedNodePaths.length > 1
+        ? "Modal: Disable on Upstream Nodes for Selection"
+        : "Modal: Disable on Upstream Nodes";
+    if (!targetOptions.some((option) => option?.content === enableMenuItemLabel)) {
       targetOptions.push(null, {
-        content: menuItemLabel,
+        content: enableMenuItemLabel,
         callback: () => {
-          void analyzeAndMarkRequiredRemoteNodes(this).catch((error) => {
+          void analyzeAndSetUpstreamRemoteNodes(this, true).catch((error) => {
+            console.error("Modal remote-node analysis failed.", error);
+            notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
+          });
+        },
+      });
+    }
+    if (!targetOptions.some((option) => option?.content === disableMenuItemLabel)) {
+      targetOptions.push({
+        content: disableMenuItemLabel,
+        callback: () => {
+          void analyzeAndSetUpstreamRemoteNodes(this, false).catch((error) => {
             console.error("Modal remote-node analysis failed.", error);
             notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
           });
@@ -1733,8 +1758,12 @@ function installModalContextMenu(nodeType, nodeData) {
  */
 function setRemoteFlag(node, value) {
   node.properties ||= {};
-  node.properties[REMOTE_PROPERTY] = Boolean(value);
-  app.graph.setDirtyCanvas(true, true);
+  const enabled = Boolean(value);
+  node.properties[REMOTE_PROPERTY] = enabled;
+  if (node.__modalToggleWidget) {
+    node.__modalToggleWidget.value = enabled;
+  }
+  app.graph?.setDirtyCanvas(true, true);
 }
 
 /**
