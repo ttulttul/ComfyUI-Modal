@@ -46,6 +46,7 @@ const transformedSource = `${[
   "  handleModalStatus,",
   "  handleExecutionPhase,",
   "  handlePromptInterruption,",
+  "  setRemoteFlag,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  currentGlobalStatus,",
@@ -216,6 +217,17 @@ modalToggle.handleModalProgress({
   },
 });
 assert.equal(modalToggle.getRemoteVisualState({ id: "11" })?.phase, modalToggle.STATE_READY);
+
+const toggleSyncNode = {
+  properties: {},
+  __modalToggleWidget: { value: false },
+};
+modalToggle.setRemoteFlag(toggleSyncNode, true);
+assert.equal(toggleSyncNode.properties.is_modal_remote, true);
+assert.equal(toggleSyncNode.__modalToggleWidget.value, true);
+modalToggle.setRemoteFlag(toggleSyncNode, false);
+assert.equal(toggleSyncNode.properties.is_modal_remote, false);
+assert.equal(toggleSyncNode.__modalToggleWidget.value, false);
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-e", ["10", "11"], [
