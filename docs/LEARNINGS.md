@@ -3,6 +3,7 @@
 ## 2026-05-20
 
 - The Modal status pill should be driven by actual remote work, not by the custom node route being installed. Since the frontend patches every prompt through `/modal/queue_prompt`, the backend must fast-path prompts with zero `Run on Modal` nodes without emitting `modal_status`, and the frontend should ignore any empty Modal status event as a defensive guard.
+- A visibility/focus redraw is not enough if the browser missed Modal websocket events while backgrounded. The local ComfyUI side needs to retain recent client-scoped `modal_status` and `modal_progress` payloads, and the frontend should replay that buffer on refocus before redrawing the status pill and node overlays.
 
 ## 2026-04-23
 

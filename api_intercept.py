@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -27,6 +28,10 @@ from .sync_engine import ModalAssetSyncEngine, ModalVolumeBackend, SyncedAsset
 logger = logging.getLogger(__name__)
 
 _ROUTE_REGISTERED = False
+_MODAL_UI_EVENT_RETENTION_SECONDS = 2 * 60 * 60
+_MODAL_UI_EVENT_LIMIT_PER_CLIENT = 512
+_MODAL_UI_EVENTS_LOCK = threading.Lock()
+_MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
@@ -249,7 +254,47 @@ def _emit_modal_status(
     if status_total is not None:
         payload["status_total"] = int(status_total)
 
+    record_modal_ui_event("modal_status", payload, client_id)
     prompt_server.send_sync("modal_status", payload, client_id)
+
+
+def record_modal_ui_event(event: str, payload: Mapping[str, Any], client_id: str | None) -> None:
+    """Store one client-scoped Modal UI event so the browser can replay it after refocus."""
+    if client_id is None:
+        return
+
+    event_record = {
+        "event": event,
+        "payload": copy.deepcopy(dict(payload)),
+        "updated_at": time.time(),
+    }
+    with _MODAL_UI_EVENTS_LOCK:
+        client_events = _MODAL_UI_EVENTS_BY_CLIENT.setdefault(
+            client_id,
+            deque(maxlen=_MODAL_UI_EVENT_LIMIT_PER_CLIENT),
+        )
+        client_events.append(event_record)
+        _prune_modal_ui_events_locked(client_events)
+
+
+def modal_ui_events_for_client(client_id: str | None) -> list[dict[str, Any]]:
+    """Return recent Modal UI events for one websocket client."""
+    if not client_id:
+        return []
+
+    with _MODAL_UI_EVENTS_LOCK:
+        client_events = _MODAL_UI_EVENTS_BY_CLIENT.get(client_id)
+        if client_events is None:
+            return []
+        _prune_modal_ui_events_locked(client_events)
+        return [copy.deepcopy(event_record) for event_record in client_events]
+
+
+def _prune_modal_ui_events_locked(client_events: deque[dict[str, Any]]) -> None:
+    """Discard stale Modal UI events while the caller holds the event lock."""
+    cutoff = time.time() - _MODAL_UI_EVENT_RETENTION_SECONDS
+    while client_events and float(client_events[0].get("updated_at", 0.0)) < cutoff:
+        client_events.popleft()
 
 
 def _get_nodes_module() -> Any:
@@ -3039,6 +3084,13 @@ def _analysis_route_path(route_path: str) -> str:
     return f"{route_path.rstrip('/')}/analyze_remote_nodes"
 
 
+def _progress_state_route_path(route_path: str) -> str:
+    """Return the sibling HTTP route used for Modal UI event replay."""
+    if route_path.endswith("/queue_prompt"):
+        return f"{route_path.removesuffix('/queue_prompt')}/progress_state"
+    return f"{route_path.rstrip('/')}/progress_state"
+
+
 def setup_modal_queue_route(
     prompt_server: Any | None = None,
     sync_engine: ModalAssetSyncEngine | None = None,
@@ -3063,6 +3115,15 @@ def setup_modal_queue_route(
 
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     analysis_route_path = _analysis_route_path(resolved_settings.route_path)
+    progress_state_route_path = _progress_state_route_path(resolved_settings.route_path)
+
+    if hasattr(prompt_server.routes, "get"):
+
+        @prompt_server.routes.get(progress_state_route_path)
+        async def modal_progress_state(request: web.Request) -> web.Response:
+            """Return recent Modal UI events for the requesting ComfyUI client."""
+            client_id = request.query.get("client_id")
+            return web.json_response({"events": modal_ui_events_for_client(client_id)})
 
     @prompt_server.routes.post(analysis_route_path)
     async def modal_analyze_remote_nodes(request: web.Request) -> web.Response:
@@ -3301,7 +3362,8 @@ def setup_modal_queue_route(
 
     _ROUTE_REGISTERED = True
     logger.info(
-        "Registered Modal queue route at %s and analysis route at %s",
+        "Registered Modal queue route at %s, analysis route at %s, and progress state route at %s",
         resolved_settings.route_path,
         analysis_route_path,
+        progress_state_route_path,
     )
