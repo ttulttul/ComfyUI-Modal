@@ -1505,6 +1505,37 @@ function findSomethingInAllSubgraphs(matcher) {
 }
 
 /**
+ * Return all live workflow nodes across the root graph and any nested subgraphs.
+ * @returns {LGraphNode[]}
+ */
+function allWorkflowNodes() {
+  const graph = rootGraph();
+  if (!graph) {
+    return [];
+  }
+
+  const visitedGraphs = new Set();
+  const nodes = [];
+  const visitGraph = (candidateGraph) => {
+    if (!candidateGraph || visitedGraphs.has(candidateGraph)) {
+      return;
+    }
+    visitedGraphs.add(candidateGraph);
+    for (const node of candidateGraph.nodes ?? []) {
+      nodes.push(node);
+      visitGraph(node?.subgraph);
+    }
+    if (candidateGraph.subgraphs?.values) {
+      for (const subgraph of candidateGraph.subgraphs.values()) {
+        visitGraph(subgraph);
+      }
+    }
+  };
+  visitGraph(graph);
+  return nodes;
+}
+
+/**
  * Return the workflow node that owns one nested subgraph graph id.
  * @param {number | string | undefined} subgraphId
  * @returns {LGraphNode | null}
@@ -1637,6 +1668,28 @@ function setWorkflowNodePathsRemote(workflowNodePaths, value) {
 }
 
 /**
+ * Enable Modal on every currently eligible node in the live workflow.
+ * @returns {number}
+ */
+function enableAllEligibleWorkflowNodes() {
+  let appliedCount = 0;
+  for (const node of allWorkflowNodes()) {
+    if (!isEligibleNode(node)) {
+      continue;
+    }
+    setRemoteFlag(node, true);
+    appliedCount += 1;
+  }
+  app.graph?.setDirtyCanvas(true, true);
+  notifyModal(
+    appliedCount > 0
+      ? `Enabled Modal on ${appliedCount} node${appliedCount === 1 ? "" : "s"}.`
+      : "No Modal-eligible nodes were found in the workflow.",
+  );
+  return appliedCount;
+}
+
+/**
  * Request required upstream nodes from the backend and set their Modal state in the UI.
  * @param {LGraphNode} node
  * @param {boolean} value
@@ -1723,6 +1776,7 @@ function installModalContextMenu(nodeType, nodeData) {
       selectedNodePaths.length > 1
         ? "Modal: Disable on Upstream Nodes for Selection"
         : "Modal: Disable on Upstream Nodes";
+    const enableAllMenuItemLabel = "Modal: Enable All Nodes";
     if (!targetOptions.some((option) => option?.content === enableMenuItemLabel)) {
       targetOptions.push(null, {
         content: enableMenuItemLabel,
@@ -1742,6 +1796,14 @@ function installModalContextMenu(nodeType, nodeData) {
             console.error("Modal remote-node analysis failed.", error);
             notifyModal(`Modal remote-node analysis failed: ${String(error?.message ?? error)}`);
           });
+        },
+      });
+    }
+    if (!targetOptions.some((option) => option?.content === enableAllMenuItemLabel)) {
+      targetOptions.push({
+        content: enableAllMenuItemLabel,
+        callback: () => {
+          enableAllEligibleWorkflowNodes();
         },
       });
     }

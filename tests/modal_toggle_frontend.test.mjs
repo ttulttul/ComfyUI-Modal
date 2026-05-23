@@ -47,6 +47,7 @@ const transformedSource = `${[
   "  handleExecutionPhase,",
   "  handlePromptInterruption,",
   "  setRemoteFlag,",
+  "  enableAllEligibleWorkflowNodes,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  currentGlobalStatus,",
@@ -228,6 +229,47 @@ assert.equal(toggleSyncNode.__modalToggleWidget.value, true);
 modalToggle.setRemoteFlag(toggleSyncNode, false);
 assert.equal(toggleSyncNode.properties.is_modal_remote, false);
 assert.equal(toggleSyncNode.__modalToggleWidget.value, false);
+
+const eligibleNode = {
+  id: "eligible",
+  comfyClass: "KSampler",
+  properties: {},
+  __modalToggleWidget: { value: false },
+};
+const internalNode = {
+  id: "internal",
+  comfyClass: "ModalUniversalExecutor_deadbeef",
+  properties: {},
+  __modalToggleWidget: { value: false },
+};
+const nestedEligibleNode = {
+  id: "nested",
+  comfyClass: "CheckpointLoaderSimple",
+  properties: {},
+  __modalToggleWidget: { value: false },
+};
+globalThis.__modalAppStub.rootGraph = {
+  nodes: [
+    eligibleNode,
+    {
+      id: "subgraph-owner",
+      comfyClass: "Subgraph",
+      properties: {},
+      __modalToggleWidget: { value: false },
+      subgraph: {
+        nodes: [nestedEligibleNode, internalNode],
+      },
+    },
+  ],
+};
+assert.equal(modalToggle.enableAllEligibleWorkflowNodes(), 3);
+assert.equal(eligibleNode.properties.is_modal_remote, true);
+assert.equal(eligibleNode.__modalToggleWidget.value, true);
+assert.equal(nestedEligibleNode.properties.is_modal_remote, true);
+assert.equal(nestedEligibleNode.__modalToggleWidget.value, true);
+assert.equal(internalNode.properties.is_modal_remote, undefined);
+assert.equal(internalNode.__modalToggleWidget.value, false);
+globalThis.__modalAppStub.rootGraph = null;
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-e", ["10", "11"], [
