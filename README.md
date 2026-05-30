@@ -248,6 +248,7 @@ Remote runtime behavior:
 - The worker now logs mounted-volume reload diagnostics when open-file retries start, including the uploaded paths and referenced paths for that payload, so you can see exactly which files were relevant when reload got stuck behind open handles.
 - Custom-node bundle sync now treats the digest-index record as authoritative for dedupe and the hash-addressed volume path as the payload location. Once a bundle digest is indexed, later runs reuse it without reuploading or probing the volume for marker blobs.
 - Custom-node sync no longer rebuilds one monolithic archive for the whole `custom_nodes/` tree. It now writes one tiny whole-tree manifest plus one content-addressed archive per top-level custom-node package, so editing one package only rebuilds and reuploads that package's archive and the manifest.
+- When building the Modal image, Modal-Sync now scans each top-level synced custom-node package for `requirements.txt` and installs those Python package requirements into the remote environment. That keeps bundled custom nodes such as PiD from importing successfully locally but failing remotely because dependencies like `omegaconf` or `hydra-core` were absent from the Modal image.
 - Per-package custom-node archive creation and upload now run in parallel on the local side, and the Modal volume bridge no longer serializes every SDK call through a single worker thread. That lets the split-archive design actually overlap the mostly I/O-bound ZIP and transfer work.
 - Modal volume metadata calls are now intentionally capped and share one exponential rate-limit backoff window per backend instance. That keeps any remaining explicit volume probes from turning into a `VolumeListFiles` burst storm on newer Modal accounts with tighter metadata limits.
 - Content-addressed asset and `custom_nodes` dedupe no longer relies on per-file marker blobs plus `VolumeListFiles` probes. The sync engine now records mirrored digests in a dedicated Modal `Dict`, so unchanged runs can short-circuit on cheap digest-index lookups instead of hammering volume metadata APIs.
@@ -405,6 +406,8 @@ If a remote-marked node depends on a model filename that cannot be resolved to a
 - `COMFY_MODAL_LOCAL_STORAGE_ROOT`: Local mirror root used for sync tests and dry runs. Default: `/tmp/comfyui-modal-sync-storage`.
 - `COMFY_MODAL_CUSTOM_NODES_DIR`: Override the `custom_nodes` directory to bundle and mirror.
 - `COMFY_MODAL_SYNC_CUSTOM_NODES`: Force-enable or disable custom-node bundle sync. Default: disabled in `local` mode, enabled otherwise.
+
+When custom-node sync is enabled for remote execution, each top-level custom-node package's `requirements.txt` is also folded into the Modal image build. Requirement includes such as `-r other-file.txt` are followed relative to the declaring package; pip option and constraint lines are ignored.
 
 ### Execution and deployment
 

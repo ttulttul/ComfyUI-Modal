@@ -32,7 +32,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
 _LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
 _REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
-_REMOTE_APP_PROTOCOL_VERSION = 2
+_REMOTE_APP_PROTOCOL_VERSION = 3
 _PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 _COMFYUI_TORCH_VERSION = "2.10.0"
 _COMFYUI_TORCHVISION_VERSION = "0.25.0"
@@ -4312,6 +4312,79 @@ def _comfyui_runtime_packages() -> tuple[str, ...]:
     )
 
 
+def _strip_requirement_comment(line: str) -> str:
+    """Remove a requirements.txt comment while preserving URL fragments."""
+    for index, character in enumerate(line):
+        if character != "#":
+            continue
+        previous = line[index - 1] if index > 0 else ""
+        if not previous or previous.isspace():
+            return line[:index].strip()
+    return line.strip()
+
+
+def _custom_node_requirement_files(custom_nodes_dir: Path | None) -> tuple[Path, ...]:
+    """Return top-level custom-node requirements files in stable order."""
+    if custom_nodes_dir is None or not custom_nodes_dir.exists():
+        return ()
+    requirement_files: list[Path] = []
+    for entry_path in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name):
+        if not entry_path.is_dir():
+            continue
+        requirements_path = entry_path / "requirements.txt"
+        if requirements_path.is_file():
+            requirement_files.append(requirements_path)
+    return tuple(requirement_files)
+
+
+def _read_requirement_file(requirements_path: Path, seen: set[Path]) -> tuple[str, ...]:
+    """Read pip package specs from one requirements file, following relative includes."""
+    resolved_path = requirements_path.resolve()
+    if resolved_path in seen:
+        return ()
+    seen.add(resolved_path)
+
+    requirements: list[str] = []
+    for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = _strip_requirement_comment(raw_line)
+        if not line:
+            continue
+        if line.startswith(("-r ", "--requirement ")):
+            _, include_path = line.split(maxsplit=1)
+            requirements.extend(
+                _read_requirement_file((requirements_path.parent / include_path).resolve(), seen)
+            )
+            continue
+        if line.startswith(("-c ", "--constraint ")):
+            logger.info("Skipping custom-node pip constraint line from %s: %s", requirements_path, line)
+            continue
+        if line.startswith("-"):
+            logger.info("Skipping custom-node pip option line from %s: %s", requirements_path, line)
+            continue
+        requirements.append(line)
+    return tuple(requirements)
+
+
+def _custom_node_runtime_packages(custom_nodes_dir: Path | None) -> tuple[str, ...]:
+    """Return deduplicated pip package specs declared by bundled custom nodes."""
+    requirements: list[str] = []
+    seen_specs: set[str] = set()
+    seen_files: set[Path] = set()
+    for requirements_path in _custom_node_requirement_files(custom_nodes_dir):
+        for requirement in _read_requirement_file(requirements_path, seen_files):
+            if requirement in seen_specs:
+                continue
+            seen_specs.add(requirement)
+            requirements.append(requirement)
+    if requirements:
+        logger.info(
+            "Including %d custom-node Python requirement(s) in the Modal image from %s.",
+            len(requirements),
+            custom_nodes_dir,
+        )
+    return tuple(requirements)
+
+
 def _comfyui_torch_packages() -> tuple[str, ...]:
     """Return the pinned CUDA 12.8 PyTorch stack used by the remote Modal image."""
     return (
@@ -4805,10 +4878,12 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         settings.snapshot_profile_dict_name,
         create_if_missing=True,
     )
+    custom_node_packages = _custom_node_runtime_packages(settings.custom_nodes_dir)
+    image = modal.Image.debian_slim().pip_install(*_comfyui_runtime_packages())
+    if custom_node_packages:
+        image = image.pip_install(*custom_node_packages)
     image = (
-        modal.Image.debian_slim()
-        .pip_install(*_comfyui_runtime_packages())
-        .pip_install(*_comfyui_torch_packages(), index_url=_PYTORCH_CUDA_INDEX_URL)
+        image.pip_install(*_comfyui_torch_packages(), index_url=_PYTORCH_CUDA_INDEX_URL)
         .add_local_dir(
             _REPO_ROOT,
             remote_path="/root/comfyui_modal_sync_repo",
