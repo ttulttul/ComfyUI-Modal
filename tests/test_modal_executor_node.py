@@ -2594,6 +2594,58 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
     assert "kornia" in packages
 
 
+def test_modal_cloud_collects_custom_node_runtime_packages(
+    modal_cloud_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The Modal image should install requirements declared by bundled custom nodes."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    first_package = custom_nodes_dir / "first"
+    second_package = custom_nodes_dir / "second"
+    first_package.mkdir(parents=True)
+    second_package.mkdir(parents=True)
+    (first_package / "requirements.txt").write_text(
+        "\n".join(
+            [
+                "# comments are ignored",
+                "omegaconf==2.3.0",
+                "hydra-core==1.3.2 # inline comment",
+                "--extra-index-url https://example.invalid/simple",
+                "-r extra-requirements.txt",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (first_package / "extra-requirements.txt").write_text(
+        "diffusers>=0.37.0\n",
+        encoding="utf-8",
+    )
+    (second_package / "requirements.txt").write_text(
+        "omegaconf==2.3.0\nsoundfile\n",
+        encoding="utf-8",
+    )
+
+    packages = modal_cloud_module._custom_node_runtime_packages(custom_nodes_dir)
+
+    assert packages == (
+        "omegaconf==2.3.0",
+        "hydra-core==1.3.2",
+        "diffusers>=0.37.0",
+        "soundfile",
+    )
+
+
+def test_modal_cloud_returns_no_custom_node_packages_without_requirements(
+    modal_cloud_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Custom-node package installation should be skipped when no requirements exist."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    (custom_nodes_dir / "example").mkdir(parents=True)
+
+    assert modal_cloud_module._custom_node_runtime_packages(custom_nodes_dir) == ()
+
+
 def test_modal_cloud_pins_cu128_pytorch_stack(
     modal_cloud_module: Any,
 ) -> None:
