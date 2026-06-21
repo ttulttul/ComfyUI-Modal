@@ -437,6 +437,7 @@ When custom-node sync is enabled for remote execution, each top-level custom-nod
 - `COMFY_MODAL_ENABLE_LOADER_PREWARM`: During proactive warmup, execute synthetic one-node loader prompts for root literal model-loader nodes so fresh workers preload common models before the first real payload arrives. Default: `true`.
 - `COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS`: How long mapped execution may wait for newly requested exact warmup slots before it starts seeding lanes anyway. Default: `2.0`.
 - `COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS`: How long the local proxy waits after propagating a ComfyUI cancellation to Modal before releasing the local prompt while remote cancellation continues. Default: `2.0`.
+- `COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS`: How long a Modal worker waits after observing a remote cancellation request before exiting its own process if the prompt is still executing. This forces Modal to restart the remote ComfyUI runtime for stuck cancellations. Default: `1.0`.
 
 ## Development
 
