@@ -2569,6 +2569,9 @@ def test_modal_cloud_ignores_heavy_comfyui_paths(
     assert modal_cloud_module._should_ignore_comfyui_path(Path("models/checkpoint.safetensors"))
     assert modal_cloud_module._should_ignore_comfyui_path(Path("custom_nodes/example/__init__.py"))
     assert modal_cloud_module._should_ignore_comfyui_path(Path("output/run/output.png"))
+    assert modal_cloud_module._should_ignore_comfyui_path(
+        Path(".cache/strings/acfca22bde9a1a1fee53fe6e1299f4fe54a78a6f1d306dbb6cac2e71cf35d2c2.txt")
+    )
     assert modal_cloud_module._should_ignore_comfyui_path(Path("__pycache__/execution.pyc"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("execution.py"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("comfy/model_management.py"))

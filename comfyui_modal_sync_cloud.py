@@ -4338,7 +4338,7 @@ def _should_ignore_comfyui_path(path: Path) -> bool:
     if not parts:
         return False
 
-    if {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"} & set(parts):
+    if {".cache", ".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"} & set(parts):
         return True
 
     if parts[0] in {"custom_nodes", "input", "models", "output", "temp", "user"}:
