@@ -860,6 +860,56 @@ def _schedule_process_exit(delay_seconds: float, exit_code: int) -> None:
     ).start()
 
 
+def _schedule_process_exit_unless_cancelled(
+    *,
+    delay_seconds: float,
+    exit_code: int,
+    cancel_event: threading.Event,
+    reason: str,
+) -> None:
+    """Exit the current process after a delay unless the caller cancels first."""
+
+    def exit_later() -> None:
+        """Wait for cancellation or exit the worker if the delay expires."""
+        if delay_seconds > 0 and cancel_event.wait(timeout=delay_seconds):
+            logger.debug("Cancelled delayed Modal container restart for %s.", reason)
+            return
+        logger.error("Exiting Modal container process with code=%s after %s.", exit_code, reason)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
+
+    threading.Thread(
+        target=exit_later,
+        name="modal-container-cancel-restart",
+        daemon=True,
+    ).start()
+
+
+def _schedule_remote_cancel_restart(
+    *,
+    component_id: str,
+    completion_event: threading.Event,
+) -> bool:
+    """Restart the Modal worker if a cancelled remote prompt keeps executing."""
+    if not _is_modal_container_runtime():
+        return False
+
+    delay_seconds = max(0.0, get_settings().remote_cancel_restart_seconds)
+    logger.warning(
+        "Remote cancellation requested for component=%s; scheduling container restart in %.3fs unless execution stops first.",
+        component_id,
+        delay_seconds,
+    )
+    _schedule_process_exit_unless_cancelled(
+        delay_seconds=delay_seconds,
+        exit_code=0,
+        cancel_event=completion_event,
+        reason=f"remote cancellation timeout for component={component_id}",
+    )
+    return True
+
+
 def _is_interrupt_like_failure(exc: Exception) -> bool:
     """Return whether one remote failure represents an expected interruption rather than a crash."""
     return "interrupt" in str(exc).lower()
@@ -1612,6 +1662,8 @@ def _temporary_remote_interrupt_monitor(
     import nodes
 
     stop_event = threading.Event()
+    execution_completed_event = threading.Event()
+    restart_scheduled = False
     try:
         modal_exception_module = importlib.import_module("modal.exception")
     except ModuleNotFoundError:
@@ -1648,9 +1700,15 @@ def _temporary_remote_interrupt_monitor(
 
     def monitor_interrupts() -> None:
         """Set ComfyUI's interrupt flag once the caller requests cancellation."""
+        nonlocal restart_scheduled
         while not stop_event.is_set():
             if cancellation_event is not None and cancellation_event.wait(timeout=0.1):
                 logger.info("Remote interrupt monitor tripped local event for component=%s.", component_id)
+                if not restart_scheduled:
+                    restart_scheduled = _schedule_remote_cancel_restart(
+                        component_id=component_id,
+                        completion_event=execution_completed_event,
+                    )
                 nodes.interrupt_processing()
                 return
             if interrupt_store is None or interrupt_flag_key is None:
@@ -1666,6 +1724,11 @@ def _temporary_remote_interrupt_monitor(
                 return
             if cancellation_event is not None:
                 cancellation_event.set()
+            if not restart_scheduled:
+                restart_scheduled = _schedule_remote_cancel_restart(
+                    component_id=component_id,
+                    completion_event=execution_completed_event,
+                )
             nodes.interrupt_processing()
             return
 
@@ -1678,6 +1741,7 @@ def _temporary_remote_interrupt_monitor(
     try:
         yield
     finally:
+        execution_completed_event.set()
         stop_event.set()
         interrupt_thread.join(timeout=1.0)
 

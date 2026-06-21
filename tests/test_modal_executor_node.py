@@ -8470,6 +8470,72 @@ def test_modal_cloud_interrupt_monitor_consumes_shared_cancel_flag(
     assert cancellation_event.is_set()
 
 
+def test_modal_cloud_interrupt_monitor_schedules_container_restart_after_cancel(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote cancellation should restart the worker if the prompt ignores ComfyUI interrupt."""
+
+    class FakeInterruptFlags:
+        """Simple Modal Dict double that exposes one shared cancel flag."""
+
+        def __init__(self) -> None:
+            """Initialize the backing key set."""
+            self.keys = {"prompt-1:component-2"}
+
+        def contains(self, key: str) -> bool:
+            """Report whether the shared interrupt flag exists."""
+            return key in self.keys
+
+        def pop(self, key: str, default: Any = None) -> Any:
+            """Remove the shared interrupt flag once consumed."""
+            del default
+            self.keys.discard(key)
+            return None
+
+    scheduled_restarts: list[dict[str, Any]] = []
+    interrupt_calls: list[str] = []
+    cancellation_event = threading.Event()
+
+    def fake_schedule_process_exit_unless_cancelled(**kwargs: Any) -> None:
+        """Record the delayed restart request without exiting pytest."""
+        scheduled_restarts.append(kwargs)
+
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS", "0.25")
+    modal_cloud_module.get_settings.cache_clear()
+    monkeypatch.setattr(modal_cloud_module, "_is_modal_container_runtime", lambda: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_schedule_process_exit_unless_cancelled",
+        fake_schedule_process_exit_unless_cancelled,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nodes",
+        types.SimpleNamespace(interrupt_processing=lambda: interrupt_calls.append("interrupt")),
+    )
+
+    try:
+        with modal_cloud_module._temporary_remote_interrupt_monitor(
+            "component-2",
+            cancellation_event,
+            interrupt_store=FakeInterruptFlags(),
+            interrupt_flag_key="prompt-1:component-2",
+        ):
+            deadline = time.time() + 1.0
+            while not scheduled_restarts and time.time() < deadline:
+                time.sleep(0.01)
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+
+    assert interrupt_calls == ["interrupt"]
+    assert len(scheduled_restarts) == 1
+    assert scheduled_restarts[0]["delay_seconds"] == 0.25
+    assert scheduled_restarts[0]["exit_code"] == 0
+    assert scheduled_restarts[0]["cancel_event"].is_set()
+    assert "component=component-2" in scheduled_restarts[0]["reason"]
+
+
 def test_modal_cloud_interrupt_monitor_ignores_modal_client_shutdown(
     modal_cloud_module: Any,
     monkeypatch: Any,

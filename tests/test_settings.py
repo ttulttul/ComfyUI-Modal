@@ -144,6 +144,21 @@ def test_settings_reads_remote_cancel_grace_override(
     assert settings.remote_cancel_grace_seconds == 0.25
 
 
+def test_settings_reads_remote_cancel_restart_override(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The remote post-cancel restart timeout should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS", "0.75")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.remote_cancel_restart_seconds == 0.75
+
+
 def test_settings_defaults_interrupt_dict_name_from_app_name(
     settings_module: Any,
     monkeypatch: Any,
