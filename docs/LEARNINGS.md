@@ -3,6 +3,7 @@
 ## 2026-06-22
 
 - ComfyUI's `Dependency cycle detected` message can originate entirely in the local scheduler after Modal-Sync rewrites remote nodes into proxy phases, even when the Modal worker and individual remote sampler components finish successfully. The local queue path now logs compact rewritten-prompt diagnostics, including proxy dependency edges, component stages, payload summaries, and any static cycle path, so the next UI-only cycle error can be traced from `comfy.log` without guessing which remote phase was responsible.
+- Split-proxy phase ordering cannot consider only the remote component's internal links. A local feedback path such as `remote sampler A -> VAEDecode -> BetterGrok -> remote sampler B` is still a dependency from A to B when B's boundary input re-enters the remote island, and ignoring that path can make B produce shared model bridge outputs that A then depends on, creating a proxy-level cycle that the original workflow UI did not show.
 
 ## 2026-05-20
 
