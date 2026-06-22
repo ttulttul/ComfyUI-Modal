@@ -567,6 +567,28 @@ def _remote_session_bridge_replay_stack() -> set[str]:
     return replay_stack
 
 
+def _bridge_record_replays_sampling_node(record: RemoteSessionBridgeRecord) -> bool:
+    """Return whether replaying one bridge record would rerun a sampler-like execute node."""
+    execute_node_ids = {
+        str(node_id)
+        for node_id in record.producer_payload.get("execute_node_ids", [])
+        if str(node_id)
+    }
+    if not execute_node_ids:
+        return False
+    subgraph_prompt = record.producer_payload.get("subgraph_prompt")
+    if not isinstance(subgraph_prompt, Mapping):
+        return False
+    for node_id in execute_node_ids:
+        prompt_node = subgraph_prompt.get(node_id)
+        if not isinstance(prompt_node, Mapping):
+            continue
+        class_type = str(prompt_node.get("class_type") or "")
+        if "sampler" in class_type.lower():
+            return True
+    return False
+
+
 def _rehydrate_remote_session_bridge_value(
     ref: RemoteSessionBridgeRef,
     *,
@@ -630,6 +652,13 @@ def _rehydrate_remote_session_bridge_value(
     )
     if restored_value is not None:
         return restored_value
+    if _bridge_record_replays_sampling_node(record):
+        message = (
+            "Remote session bridge replay would rerun a sampler component "
+            f"for bridge_key={ref.bridge_key!r}; expected live or warm bridge reuse instead."
+        )
+        logger.error(message)
+        raise RemoteSessionStateError(message)
     replay_payload = copy.deepcopy(record.producer_payload)
     replay_payload["remote_session"] = target_session_handle.to_payload()
     replay_payload.pop("clear_remote_session", None)

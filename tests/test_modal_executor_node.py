@@ -2154,6 +2154,66 @@ def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_repl
     assert resolution_stats.session_restore_writes == 1
 
 
+def test_modal_cloud_refuses_sampler_bridge_replay(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Lost sampler bridge values should fail loudly instead of replaying sampling work."""
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_sampler_bridge",
+        node_id="sampler-1",
+        output_index=0,
+        session_id="session-source",
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_remote_session_bridge_record",
+        lambda bridge_key: modal_cloud_module.RemoteSessionBridgeRecord(
+            bridge_key=bridge_key,
+            node_id="sampler-1",
+            output_index=0,
+            producer_payload={
+                "component_id": "sampler-component",
+                "execute_node_ids": ["sampler-1"],
+                "subgraph_prompt": {
+                    "sampler-1": {
+                        "class_type": "KSampler",
+                        "inputs": {},
+                    }
+                },
+            },
+            producer_inputs={},
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("sampler bridge replay should be blocked")
+        ),
+    )
+    resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
+
+    with pytest.raises(modal_cloud_module.RemoteSessionStateError, match="rerun a sampler"):
+        modal_cloud_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            custom_nodes_root=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+            resolution_stats=resolution_stats,
+        )
+
+    assert resolution_stats.bridge_record_lookups == 1
+    assert resolution_stats.replay_count == 0
+
+
 def test_modal_cloud_skips_seed_execution_when_session_outputs_are_already_restored(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -6246,6 +6306,66 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
     assert resolution_stats.bridge_record_lookups == 1
     assert resolution_stats.replay_count == 0
     assert resolution_stats.session_restore_writes == 1
+
+
+def test_local_remote_app_refuses_sampler_bridge_replay(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local fallback should fail loudly rather than replaying sampler bridge producers."""
+    target_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_sampler_bridge",
+        node_id="sampler-1",
+        output_index=0,
+        session_id="session-source",
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        "get_record",
+        lambda bridge_key: remote_modal_app_module.RemoteSessionBridgeRecord(
+            bridge_key=bridge_key,
+            node_id="sampler-1",
+            output_index=0,
+            producer_payload={
+                "component_id": "sampler-component",
+                "execute_node_ids": ["sampler-1"],
+                "subgraph_prompt": {
+                    "sampler-1": {
+                        "class_type": "KSampler",
+                        "inputs": {},
+                    }
+                },
+            },
+            producer_inputs={},
+        ),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("sampler bridge replay should be blocked")
+        ),
+    )
+    resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        with pytest.raises(remote_modal_app_module.RemoteSessionStateError, match="rerun a sampler"):
+            remote_modal_app_module._rehydrate_remote_session_bridge_value(
+                bridge_ref,
+                target_session_handle=target_handle,
+                node_mapping=None,
+                resolution_stats=resolution_stats,
+            )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert resolution_stats.bridge_record_lookups == 1
+    assert resolution_stats.replay_count == 0
 
 
 def test_local_phase_payload_builder_preserves_remote_session_and_snapshot_profile(
