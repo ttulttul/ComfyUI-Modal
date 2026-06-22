@@ -83,6 +83,15 @@ class _FakeRemoteImageConsumerNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakePreviewImageNode:
+    """Fake preview node that behaves like a terminal UI output."""
+
+    RETURN_TYPES = ()
+    RETURN_NAMES = ()
+    OUTPUT_IS_LIST = ()
+    OUTPUT_NODE = True
+
+
 def test_rewrite_remote_mode_rejects_local_sync_backend(
     api_intercept_module: Any,
     settings_module: Any,
@@ -1091,6 +1100,203 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
     ]
     assert rewritten_prompt["2"]["inputs"]["remote_input_0"] == ["1", 0]
     assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
+
+
+def test_rewrite_absorbs_non_returning_local_preview_taps(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Local preview branches that never feed remote again should not split a remote chain."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteImage": _FakeRemoteImageNode,
+                "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
+                "LocalSink": _FakeLocalSinkNode,
+                "PreviewImage": _FakePreviewImageNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+            {"id": 9, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteImage",
+            "inputs": {},
+            "_meta": {"title": "Remote Image"},
+        },
+        "2": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["1", 0]},
+            "_meta": {"title": "Remote Image Consumer"},
+        },
+        "3": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["2", 0]},
+            "_meta": {"title": "Local Sink"},
+        },
+        "9": {
+            "class_type": "PreviewImage",
+            "inputs": {"images": ["1", 0]},
+            "_meta": {"title": "Interim Preview"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert set(rewritten_prompt) == {"1", "3"}
+    assert summary.remote_component_ids == ["1"]
+    assert summary.component_node_ids_by_representative == {"1": ["1", "2", "9"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "1", "9": "1"}
+
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["component_node_ids"] == ["1", "2", "9"]
+    assert payload["subgraph_prompt"]["9"]["class_type"] == "PreviewImage"
+    assert payload["execute_node_ids"] == ["2", "9"]
+    assert payload["boundary_inputs"] == []
+    assert payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "2_image",
+            "node_id": "2",
+            "output_index": 0,
+            "io_type": "IMAGE",
+            "is_list": False,
+            "preview_target_node_ids": [],
+        }
+    ]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 0]
+
+
+def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Local branches that later feed remote work are dependencies, not preview taps."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteImage": _FakeRemoteImageNode,
+                "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteImage",
+            "inputs": {},
+            "_meta": {"title": "Remote Image"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["1", 0]},
+            "_meta": {"title": "Local Transform"},
+        },
+        "2": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["4", 0]},
+            "_meta": {"title": "Remote Image Consumer"},
+        },
+        "3": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["2", 0]},
+            "_meta": {"title": "Local Sink"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert set(rewritten_prompt) == {"1", "2", "3", "4"}
+    assert summary.remote_component_ids == ["1", "2"]
+    assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
+    assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
+    assert rewritten_prompt["2"]["inputs"]["remote_input_0"] == ["4", 0]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
+
+    second_payload = rewritten_prompt["2"]["inputs"]["original_node_data"]
+    assert second_payload["component_node_ids"] == ["2"]
+    assert second_payload["boundary_inputs"] == [
+        {
+            "proxy_input_name": "remote_input_0",
+            "io_type": "IMAGE",
+            "targets": [{"node_id": "2", "input_name": "image"}],
+        }
+    ]
 
 
 def test_rewrite_reports_parallel_component_stages(

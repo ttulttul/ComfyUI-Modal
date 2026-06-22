@@ -133,6 +133,7 @@ class RemoteComponentPlan:
     mapped_execute_node_ids: list[str] = field(default_factory=list)
     static_execute_node_ids: list[str] = field(default_factory=list)
     static_to_mapped_boundaries: list[StaticToMappedBoundarySpec] = field(default_factory=list)
+    local_tap_node_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1116,6 +1117,106 @@ def _build_consumer_map(prompt: dict[str, Any]) -> dict[LinkedOutputRef, list[In
     return consumers
 
 
+def _node_output_refs(prompt: dict[str, Any], node_id: str, nodes_module: Any) -> list[LinkedOutputRef]:
+    """Return declared output refs for one prompt node."""
+    prompt_node = prompt.get(node_id)
+    if prompt_node is None:
+        return []
+    node_class = nodes_module.NODE_CLASS_MAPPINGS.get(str(prompt_node.get("class_type")))
+    if node_class is None:
+        return []
+    output_types, _, _ = _normalize_output_metadata(node_class)
+    return [
+        LinkedOutputRef(node_id=node_id, output_index=output_index)
+        for output_index, _io_type in enumerate(output_types)
+    ]
+
+
+def _downstream_node_ids_from_targets(
+    *,
+    prompt: dict[str, Any],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    seed_targets: list[InputTarget],
+    nodes_module: Any,
+) -> set[str]:
+    """Return every node reachable downstream from the supplied input targets."""
+    visited_node_ids: set[str] = set()
+    pending_node_ids = deque(str(target.node_id) for target in seed_targets)
+    while pending_node_ids:
+        node_id = pending_node_ids.popleft()
+        if node_id in visited_node_ids or node_id not in prompt:
+            continue
+        visited_node_ids.add(node_id)
+        for output_ref in _node_output_refs(prompt, node_id, nodes_module):
+            for downstream_target in consumers.get(output_ref, []):
+                downstream_node_id = str(downstream_target.node_id)
+                if downstream_node_id not in visited_node_ids:
+                    pending_node_ids.append(downstream_node_id)
+    return visited_node_ids
+
+
+def _non_returning_local_tap_node_ids(
+    *,
+    prompt: dict[str, Any],
+    component_node_ids: set[str],
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    nodes_module: Any,
+) -> set[str]:
+    """Return local downstream nodes that can run remotely as non-returning tap branches."""
+    local_tap_node_ids: set[str] = set()
+    for component_node_id in sorted(component_node_ids):
+        for source in _node_output_refs(prompt, component_node_id, nodes_module):
+            output_consumers = consumers.get(source, [])
+            local_consumers = [
+                target
+                for target in output_consumers
+                if target.node_id not in component_node_ids
+                and target.node_id not in remote_node_ids
+            ]
+            remote_consumers = [
+                target
+                for target in output_consumers
+                if target.node_id in remote_node_ids
+            ]
+            if not local_consumers or not remote_consumers:
+                continue
+            for local_consumer in local_consumers:
+                branch_node_ids = _downstream_node_ids_from_targets(
+                    prompt=prompt,
+                    consumers=consumers,
+                    seed_targets=[local_consumer],
+                    nodes_module=nodes_module,
+                )
+                if branch_node_ids & remote_node_ids:
+                    continue
+                local_tap_node_ids.update(branch_node_ids)
+    return local_tap_node_ids
+
+
+def _output_has_non_returning_local_tap(
+    *,
+    prompt: dict[str, Any],
+    source: LinkedOutputRef,
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    nodes_module: Any,
+) -> bool:
+    """Return whether one remote output also feeds a local branch that never returns remote."""
+    for target in consumers.get(source, []):
+        if target.node_id in remote_node_ids:
+            continue
+        branch_node_ids = _downstream_node_ids_from_targets(
+            prompt=prompt,
+            consumers=consumers,
+            seed_targets=[target],
+            nodes_module=nodes_module,
+        )
+        if branch_node_ids and not (branch_node_ids & remote_node_ids):
+            return True
+    return False
+
+
 def _remote_output_io_type(
     *,
     prompt: dict[str, Any],
@@ -1165,6 +1266,7 @@ def _remote_output_is_list(
 def _remote_component_partition_groups(
     prompt: dict[str, Any],
     remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
     nodes_module: Any,
 ) -> dict[str, set[str]]:
     """Return component groups after merging remote nodes across non-transportable edges."""
@@ -1204,16 +1306,32 @@ def _remote_component_partition_groups(
                 continue
             downstream_remote_node_ids_by_node_id[upstream_node_id].add(node_id)
             upstream_prompt_node = prompt.get(upstream_node_id)
+            source = LinkedOutputRef(node_id=upstream_node_id, output_index=int(input_value[1]))
             if (
                 upstream_prompt_node is not None
                 and str(upstream_prompt_node.get("class_type")) == MODAL_MAP_INPUT_NODE_ID
             ):
                 union(node_id, upstream_node_id)
                 continue
+            if _output_has_non_returning_local_tap(
+                prompt=prompt,
+                source=source,
+                remote_node_ids=remote_node_ids,
+                consumers=consumers,
+                nodes_module=nodes_module,
+            ):
+                logger.info(
+                    "Merging remote nodes %s -> %s because output %d has a non-returning local tap.",
+                    upstream_node_id,
+                    node_id,
+                    source.output_index,
+                )
+                union(node_id, upstream_node_id)
+                continue
             io_type = _remote_output_io_type(
                 prompt=prompt,
                 node_id=upstream_node_id,
-                output_index=int(input_value[1]),
+                output_index=source.output_index,
                 nodes_module=nodes_module,
             )
             if io_type is None or _is_transportable_output_type(io_type):
@@ -1467,10 +1585,16 @@ def _merge_cyclic_component_groups(
 def _build_remote_components(
     prompt: dict[str, Any],
     remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
     nodes_module: Any,
 ) -> list[list[str]]:
     """Partition remote-marked nodes into transport-aware DAG components."""
-    component_groups = _remote_component_partition_groups(prompt, remote_node_ids, nodes_module)
+    component_groups = _remote_component_partition_groups(
+        prompt,
+        remote_node_ids,
+        consumers,
+        nodes_module,
+    )
     components = _component_topological_order(prompt, component_groups)
     logger.info(
         "Partitioned %d remote nodes into %d transport-aware remote components: %s",
@@ -1622,11 +1746,27 @@ def _build_component_plan(
     component_node_ids: list[str],
     prompt: dict[str, Any],
     consumers: dict[LinkedOutputRef, list[InputTarget]],
+    remote_node_ids: set[str],
     nodes_module: Any,
 ) -> RemoteComponentPlan:
     """Build rewrite metadata for a connected remote component."""
-    component_node_id_set = set(component_node_ids)
+    original_component_node_id_set = set(component_node_ids)
     representative_node_id = component_node_ids[0]
+    local_tap_node_ids = _non_returning_local_tap_node_ids(
+        prompt=prompt,
+        component_node_ids=original_component_node_id_set,
+        remote_node_ids=remote_node_ids,
+        consumers=consumers,
+        nodes_module=nodes_module,
+    )
+    if local_tap_node_ids:
+        logger.info(
+            "Absorbing non-returning local tap nodes into remote component %s: %s",
+            representative_node_id,
+            sorted(local_tap_node_ids),
+        )
+    component_node_id_set = original_component_node_id_set | local_tap_node_ids
+    component_node_ids = sorted(component_node_id_set)
     boundary_inputs_by_source: dict[LinkedOutputRef, BoundaryInputSpec] = {}
     boundary_outputs_by_source: dict[LinkedOutputRef, BoundaryOutputSpec] = {}
     output_execution_targets: set[str] = set()
@@ -1812,9 +1952,10 @@ def _build_component_plan(
         mapped_execute_node_ids=mapped_execute_node_ids,
         static_execute_node_ids=static_execute_node_ids,
         static_to_mapped_boundaries=static_to_mapped_boundaries,
+        local_tap_node_ids=sorted(local_tap_node_ids),
     )
     logger.info(
-        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s static_nodes=%s mapped_nodes=%s mapped_execute_nodes=%s static_execute_nodes=%s static_to_mapped_boundaries=%s",
+        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s static_nodes=%s mapped_nodes=%s mapped_execute_nodes=%s static_execute_nodes=%s local_tap_nodes=%s static_to_mapped_boundaries=%s",
         component.representative_node_id,
         component.node_ids,
         len(component.boundary_inputs),
@@ -1826,6 +1967,7 @@ def _build_component_plan(
         component.mapped_node_ids,
         component.mapped_execute_node_ids,
         component.static_execute_node_ids,
+        component.local_tap_node_ids,
         [
             {
                 "proxy_name": boundary_spec.proxy_name,
@@ -2163,9 +2305,9 @@ def _build_component_plans(
 ) -> list[RemoteComponentPlan]:
     """Build plans for every connected remote component."""
     consumers = _build_consumer_map(prompt)
-    components = _build_remote_components(prompt, remote_node_ids, nodes_module)
+    components = _build_remote_components(prompt, remote_node_ids, consumers, nodes_module)
     return [
-        _build_component_plan(component, prompt, consumers, nodes_module)
+        _build_component_plan(component, prompt, consumers, remote_node_ids, nodes_module)
         for component in components
     ]
 
@@ -2407,6 +2549,13 @@ def _build_component_payload(
     def build_phase_payloads_for_transportable_splits() -> list[dict[str, Any]] | None:
         """Return ordered split-proxy phase payloads for a non-mapped coarse component."""
         if component.mapped_boundary_input_name is not None or len(component.execute_node_ids) <= 1:
+            return None
+        if component.local_tap_node_ids:
+            logger.info(
+                "Keeping remote component %s as one proxy because it contains non-returning local tap nodes %s.",
+                component.representative_node_id,
+                component.local_tap_node_ids,
+            )
             return None
 
         component_node_id_set = set(component.node_ids)
