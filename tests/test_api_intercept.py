@@ -400,6 +400,55 @@ def test_queue_prompt_json_logs_rewritten_modal_diagnostics_on_validation_failur
     ]
 
 
+def test_split_phase_order_accounts_for_local_feedback_dependencies(
+    api_intercept_module: Any,
+) -> None:
+    """Split phase ordering should treat local re-entry paths as real dependencies."""
+    prompt = {
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["14", 0]},
+        },
+        "11": {
+            "class_type": "VAEDecode",
+            "inputs": {"samples": ["3", 0]},
+        },
+        "14": {
+            "class_type": "RemoteModel",
+            "inputs": {},
+        },
+        "191": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["14", 0], "conditioning": ["358", 0]},
+        },
+        "357": {
+            "class_type": "BetterGrok",
+            "inputs": {"prompt_images": ["11", 0]},
+        },
+        "358": {
+            "class_type": "RemoteTextEncode",
+            "inputs": {"text": ["357", 1]},
+        },
+    }
+    component_prompt = {
+        "3": prompt["3"],
+        "14": prompt["14"],
+        "191": prompt["191"],
+        "358": prompt["358"],
+    }
+
+    ordered_execute_node_ids = (
+        api_intercept_module._order_execute_node_ids_for_transportable_splits(
+            prompt=prompt,
+            component_prompt=component_prompt,
+            component_node_ids={"3", "14", "191", "358"},
+            execute_node_ids=["191", "3"],
+        )
+    )
+
+    assert ordered_execute_node_ids == ["3", "191"]
+
+
 def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     api_intercept_module: Any,
     remote_modal_app_module: Any,

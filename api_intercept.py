@@ -1957,6 +1957,155 @@ def _component_upstream_closure(
     return reachable_node_ids
 
 
+def _component_ancestors_of_local_source(
+    *,
+    prompt: dict[str, Any],
+    source_node_id: str,
+    component_node_id_set: set[str],
+) -> set[str]:
+    """Return component nodes that feed one local boundary-input source."""
+    ancestor_node_ids: set[str] = set()
+    visited_node_ids: set[str] = set()
+    pending_node_ids = [source_node_id]
+
+    while pending_node_ids:
+        current_node_id = str(pending_node_ids.pop())
+        if current_node_id in visited_node_ids:
+            continue
+        visited_node_ids.add(current_node_id)
+        if current_node_id in component_node_id_set:
+            ancestor_node_ids.add(current_node_id)
+            continue
+        prompt_node = prompt.get(current_node_id)
+        if prompt_node is None:
+            continue
+        for input_value in (prompt_node.get("inputs") or {}).values():
+            if _is_link(input_value):
+                pending_node_ids.append(str(input_value[0]))
+    return ancestor_node_ids
+
+
+def _order_execute_node_ids_for_transportable_splits(
+    *,
+    prompt: dict[str, Any],
+    component_prompt: dict[str, Any],
+    component_node_ids: set[str],
+    execute_node_ids: list[str],
+) -> list[str]:
+    """Return split execute targets ordered by component and local feedback dependencies."""
+    base_order = list(execute_node_ids)
+    if len(base_order) <= 1:
+        return base_order
+
+    closure_by_execute_node_id = {
+        execute_node_id: _component_upstream_closure(
+            prompt=component_prompt,
+            seed_node_ids={execute_node_id},
+            candidate_node_ids=component_node_ids,
+        )
+        for execute_node_id in base_order
+    }
+    producer_execute_node_ids_by_component_node_id: dict[str, list[str]] = defaultdict(list)
+    for execute_node_id in base_order:
+        for component_node_id in closure_by_execute_node_id[execute_node_id]:
+            producer_execute_node_ids_by_component_node_id[component_node_id].append(execute_node_id)
+
+    base_index_by_execute_node_id = {
+        execute_node_id: index
+        for index, execute_node_id in enumerate(base_order)
+    }
+    dependency_edges: dict[str, set[str]] = {execute_node_id: set() for execute_node_id in base_order}
+    indegree_by_execute_node_id: dict[str, int] = {execute_node_id: 0 for execute_node_id in base_order}
+
+    def producer_for_component_node(component_node_id: str) -> str | None:
+        """Return the earliest execute target that produces a component node."""
+        producer_execute_node_ids = producer_execute_node_ids_by_component_node_id.get(
+            component_node_id,
+            [],
+        )
+        if not producer_execute_node_ids:
+            return None
+        exact_producers = [
+            execute_node_id
+            for execute_node_id in producer_execute_node_ids
+            if execute_node_id == component_node_id
+        ]
+        if exact_producers:
+            return exact_producers[0]
+        return min(
+            producer_execute_node_ids,
+            key=lambda execute_node_id: base_index_by_execute_node_id[execute_node_id],
+        )
+
+    for target_execute_node_id in base_order:
+        target_closure = closure_by_execute_node_id[target_execute_node_id]
+        for phase_node_id in sorted(target_closure):
+            prompt_node = component_prompt.get(phase_node_id)
+            if prompt_node is None:
+                continue
+            for input_value in (prompt_node.get("inputs") or {}).values():
+                if not _is_link(input_value):
+                    continue
+                source_node_id = str(input_value[0])
+                if source_node_id in component_node_ids:
+                    continue
+                source_ancestor_node_ids = _component_ancestors_of_local_source(
+                    prompt=prompt,
+                    source_node_id=source_node_id,
+                    component_node_id_set=component_node_ids,
+                )
+                for source_ancestor_node_id in sorted(source_ancestor_node_ids):
+                    if source_ancestor_node_id in target_closure:
+                        continue
+                    producer_execute_node_id = producer_for_component_node(source_ancestor_node_id)
+                    if (
+                        producer_execute_node_id is None
+                        or producer_execute_node_id == target_execute_node_id
+                        or target_execute_node_id in dependency_edges[producer_execute_node_id]
+                    ):
+                        continue
+                    dependency_edges[producer_execute_node_id].add(target_execute_node_id)
+                    indegree_by_execute_node_id[target_execute_node_id] += 1
+
+    ready_execute_node_ids = [
+        execute_node_id
+        for execute_node_id in base_order
+        if indegree_by_execute_node_id[execute_node_id] == 0
+    ]
+    ordered_execute_node_ids: list[str] = []
+    while ready_execute_node_ids:
+        ready_execute_node_ids.sort(key=lambda node_id: base_index_by_execute_node_id[node_id])
+        execute_node_id = ready_execute_node_ids.pop(0)
+        ordered_execute_node_ids.append(execute_node_id)
+        for downstream_execute_node_id in sorted(
+            dependency_edges[execute_node_id],
+            key=lambda node_id: base_index_by_execute_node_id[node_id],
+        ):
+            indegree_by_execute_node_id[downstream_execute_node_id] -= 1
+            if indegree_by_execute_node_id[downstream_execute_node_id] == 0:
+                ready_execute_node_ids.append(downstream_execute_node_id)
+
+    if len(ordered_execute_node_ids) != len(base_order):
+        logger.warning(
+            "Split phase local-feedback dependency ordering encountered a cycle; keeping base execute order %s.",
+            base_order,
+        )
+        return base_order
+
+    if ordered_execute_node_ids != base_order:
+        logger.info(
+            "Reordered split execute targets from %s to %s using local-feedback dependencies %s.",
+            base_order,
+            ordered_execute_node_ids,
+            {
+                execute_node_id: sorted(downstream_execute_node_ids)
+                for execute_node_id, downstream_execute_node_ids in dependency_edges.items()
+                if downstream_execute_node_ids
+            },
+        )
+    return ordered_execute_node_ids
+
+
 def _subgraph_topological_node_order(
     prompt: dict[str, Any],
     node_ids: set[str],
@@ -2268,6 +2417,12 @@ def _build_component_payload(
             for node_id in topological_node_ids
             if node_id in set(component.execute_node_ids)
         ]
+        remaining_execute_node_ids = _order_execute_node_ids_for_transportable_splits(
+            prompt=signature_prompt,
+            component_prompt=component_prompt,
+            component_node_ids=component_node_id_set,
+            execute_node_ids=remaining_execute_node_ids,
+        )
         if len(remaining_execute_node_ids) <= 1:
             return None
 
