@@ -58,6 +58,7 @@ The list above is the shortest accurate summary. If you want the execution path 
      - Include execute target node ids.
      - Include asset and volume-reload metadata.
   7. Rewrite each remote component into a single dynamic Modal proxy node.
+     - The rewrite logs compact local scheduler diagnostics for the final proxy graph, including node classes, dependency edges, Modal proxy payload summaries, planned stages, and any static dependency cycles detected before ComfyUI executes the prompt.
   8. Submit the rewritten prompt into ComfyUI's normal execution queue.
 
 - **3. Local execution reaches a proxy node**
@@ -168,6 +169,7 @@ The local and remote subgraph runners also canonicalize malformed singleton-list
 When the remote PromptExecutor still fails, the Modal worker now logs the normalized execute-node ids, boundary outputs, suspicious remaining wrapped prompt inputs, and the underlying ComfyUI `execution_error` payload to make the bad field visible.
 If ComfyUI's remote cache setup would fail because a prompt references a node class missing from the Modal worker registry, the worker now retries external custom-node import once for the synced bundle and then reports the missing class names and candidate files found in the extracted bundle instead of surfacing a raw `KeyError`.
 Remote queue rewrite now also rejects remote execution when the sync engine is still using the local mirror backend, because those `/custom_nodes/...` and `/assets/...` paths are not visible inside Modal workers.
+Local dependency-cycle errors after Modal rewrite now log the rewritten prompt graph in compact form, including proxy dependency edges, component stage metadata, Modal proxy payload summaries, and detected cycle paths. This helps debug ComfyUI UI errors like `Dependency cycle detected` that happen in the local scheduler rather than inside the Modal worker.
 Modal volume uploads are idempotent for content-addressed paths: if Modal reports that an uploaded asset or custom-node archive already exists, the sync engine treats that as a successful reuse.
 The remote worker preflights declared required inputs before invoking `PromptExecutor`, so a malformed remote prompt now reports missing inputs like `latent_image` directly instead of surfacing a later Python method-arity error from the node implementation.
 
