@@ -5,6 +5,8 @@ const REMOTE_PROPERTY = "is_modal_remote";
 const MODAL_ROUTE = "/modal/queue_prompt";
 const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
 const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/progress_state");
+const COMFY_QUEUE_ROUTE = "/queue";
+const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
@@ -29,6 +31,7 @@ const STATE_ERROR = "error";
 const ERROR_CLEAR_DELAY_MS = 5000;
 const TERMINAL_PROMPT_RETENTION_MS = 60000;
 const PROGRESS_FADE_MS = 900;
+const REFOCUS_STALE_PROMPT_GRACE_MS = 30000;
 
 const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
@@ -619,6 +622,152 @@ async function replayModalUiEventsAfterVisibilityChange() {
 }
 
 /**
+ * Return prompt ids that currently have temporary Modal UI state.
+ * @returns {string[]}
+ */
+function activeModalUiPromptIds() {
+  const promptIds = new Set();
+  for (const promptId of modalPromptStates.keys()) {
+    promptIds.add(String(promptId));
+  }
+  for (const promptId of modalGlobalStatusStates.keys()) {
+    promptIds.add(String(promptId));
+  }
+  for (const promptId of modalQueuedPromptIds.values()) {
+    promptIds.add(String(promptId));
+  }
+  for (const promptId of syntheticPromptUiStates.keys()) {
+    promptIds.add(String(promptId));
+  }
+  for (const state of modalNodeStates.values()) {
+    if (state?.promptId) {
+      promptIds.add(String(state.promptId));
+    }
+  }
+  return Array.from(promptIds).filter((promptId) => promptId && !isPromptTerminal(promptId));
+}
+
+/**
+ * Return the oldest age in milliseconds of a prompt's temporary Modal UI state.
+ * @param {string} promptId
+ * @returns {number}
+ */
+function promptUiStateAgeMs(promptId) {
+  const updatedAts = [];
+  const promptState = modalPromptStates.get(promptId);
+  if (promptState?.startedAt) {
+    updatedAts.push(promptState.startedAt);
+  }
+  const globalStatusState = modalGlobalStatusStates.get(promptId);
+  if (globalStatusState?.updatedAt) {
+    updatedAts.push(globalStatusState.updatedAt);
+  }
+  for (const state of modalNodeStates.values()) {
+    if (state?.promptId === promptId && state?.updatedAt) {
+      updatedAts.push(state.updatedAt);
+    }
+  }
+  if (updatedAts.length === 0) {
+    return 0;
+  }
+  return Math.max(0, nowMs() - Math.min(...updatedAts));
+}
+
+/**
+ * Return prompt ids reported by ComfyUI's queue endpoint.
+ * @param {any} queuePayload
+ * @returns {Set<string>}
+ */
+function promptIdsFromQueuePayload(queuePayload) {
+  const promptIds = new Set();
+  for (const queueName of ["queue_running", "queue_pending"]) {
+    const queueEntries = Array.isArray(queuePayload?.[queueName]) ? queuePayload[queueName] : [];
+    for (const entry of queueEntries) {
+      if (Array.isArray(entry) && entry.length > 1) {
+        promptIds.add(String(entry[1]));
+      } else if (entry?.prompt_id != null) {
+        promptIds.add(String(entry.prompt_id));
+      }
+    }
+  }
+  return promptIds;
+}
+
+/**
+ * Return whether one ComfyUI history response contains a prompt id.
+ * @param {any} historyPayload
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function historyPayloadHasPrompt(historyPayload, promptId) {
+  if (!historyPayload || typeof historyPayload !== "object") {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(historyPayload, promptId)) {
+    return true;
+  }
+  return String(historyPayload.prompt_id ?? "") === promptId;
+}
+
+/**
+ * Fetch JSON from the ComfyUI API when the endpoint returns a successful response.
+ * @param {string} route
+ * @returns {Promise<any | null>}
+ */
+async function fetchComfyJson(route) {
+  if (typeof api.fetchApi !== "function") {
+    return null;
+  }
+  const response = await api.fetchApi(route, { method: "GET" });
+  if (response.status !== 200) {
+    return null;
+  }
+  return response.json();
+}
+
+/**
+ * Clear refocus-stale Modal visuals once ComfyUI reports a prompt has finished.
+ * @param {string} promptId
+ * @param {string} phase
+ */
+function clearRefocusCompletedPrompt(promptId, phase) {
+  markPromptTerminal(promptId, phase);
+  endSyntheticExecutionUi(promptId);
+  clearGlobalStatusPhase(promptId);
+  clearPromptRemoteStates(promptId);
+}
+
+/**
+ * Reconcile temporary Modal UI state against ComfyUI queue/history after refocus.
+ * @returns {Promise<void>}
+ */
+async function reconcileModalUiAfterVisibilityChange() {
+  const promptIds = activeModalUiPromptIds();
+  if (promptIds.length === 0 || typeof api.fetchApi !== "function") {
+    return;
+  }
+
+  const queuePayload = await fetchComfyJson(COMFY_QUEUE_ROUTE);
+  if (!queuePayload) {
+    return;
+  }
+  const queuedPromptIds = promptIdsFromQueuePayload(queuePayload);
+  for (const promptId of promptIds) {
+    if (queuedPromptIds.has(promptId)) {
+      continue;
+    }
+    const historyPayload = await fetchComfyJson(
+      `${COMFY_HISTORY_ROUTE}/${encodeURIComponent(promptId)}`,
+    );
+    if (historyPayloadHasPrompt(historyPayload, promptId)) {
+      clearRefocusCompletedPrompt(promptId, "execution_success");
+    } else if (promptUiStateAgeMs(promptId) > REFOCUS_STALE_PROMPT_GRACE_MS) {
+      clearRefocusCompletedPrompt(promptId, "stale_refocus_cleanup");
+    }
+  }
+}
+
+/**
  * Refresh the badge and canvas when the tab regains visibility.
  */
 function refreshModalUiAfterVisibilityChange() {
@@ -631,6 +780,7 @@ function refreshModalUiAfterVisibilityChange() {
     return;
   }
   modalVisibilityRefreshInFlight = replayModalUiEventsAfterVisibilityChange()
+    .then(() => reconcileModalUiAfterVisibilityChange())
     .catch((error) => {
       console.warn("Unable to refresh Modal UI state after visibility change.", error);
     })

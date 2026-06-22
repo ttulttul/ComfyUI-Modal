@@ -411,11 +411,25 @@ def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
     source = _modal_toggle_source()
 
     assert 'const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\\/queue_prompt$/, "/progress_state");' in source
+    assert 'const COMFY_QUEUE_ROUTE = "/queue";' in source
+    assert 'const COMFY_HISTORY_ROUTE = "/history";' in source
+    assert "const REFOCUS_STALE_PROMPT_GRACE_MS = 30000;" in source
     assert "function refreshModalUiAfterVisibilityChange()" in source
     assert "function replayModalUiEventsAfterVisibilityChange()" in source
     assert "function replayModalUiEvent(eventRecord)" in source
+    assert "function reconcileModalUiAfterVisibilityChange()" in source
+    assert "function activeModalUiPromptIds()" in source
+    assert "function promptIdsFromQueuePayload(queuePayload)" in source
+    assert "function historyPayloadHasPrompt(historyPayload, promptId)" in source
+    assert "function clearRefocusCompletedPrompt(promptId, phase)" in source
     assert "modalVisibilityRefreshInFlight" in source
     assert "api.fetchApi(" in source
+    assert "fetchComfyJson(COMFY_QUEUE_ROUTE)" in source
+    assert "queuedPromptIds.has(promptId)" in source
+    assert "`${COMFY_HISTORY_ROUTE}/${encodeURIComponent(promptId)}`" in source
+    assert 'clearRefocusCompletedPrompt(promptId, "execution_success");' in source
+    assert 'clearRefocusCompletedPrompt(promptId, "stale_refocus_cleanup");' in source
+    assert ".then(() => reconcileModalUiAfterVisibilityChange())" in source
     assert "handleModalStatus({ detail: payload });" in source
     assert "handleModalProgress({ detail: payload });" in source
     assert 'document.addEventListener("visibilitychange"' in source
