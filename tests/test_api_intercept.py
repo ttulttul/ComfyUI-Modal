@@ -257,6 +257,149 @@ def test_queue_prompt_json_includes_resolved_modal_metadata(
     ]
 
 
+def test_rewritten_prompt_diagnostics_reports_dependency_cycles(
+    api_intercept_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rewritten prompt diagnostics should name local dependency cycles before Comfy executes."""
+    prompt = {
+        "1": {
+            "class_type": "ModalUniversalExecutor_a",
+            "inputs": {"remote_input_0": ["2", 0]},
+        },
+        "2": {
+            "class_type": "ModalUniversalExecutor_b",
+            "inputs": {"remote_input_0": ["1", 0]},
+        },
+    }
+
+    diagnostics = api_intercept_module._modal_rewritten_prompt_diagnostics(prompt)
+
+    assert diagnostics["cycles"] == [["1", "2", "1"]]
+
+    warning_messages: list[str] = []
+    log_messages: list[str] = []
+
+    def record_warning(message: str, *args: Any, **_kwargs: Any) -> None:
+        """Record one warning log message."""
+        warning_messages.append(message % args)
+
+    def record_log(_level: int, message: str, *args: Any, **_kwargs: Any) -> None:
+        """Record one generic log message."""
+        log_messages.append(message % args)
+
+    monkeypatch.setattr(api_intercept_module.logger, "warning", record_warning)
+    monkeypatch.setattr(api_intercept_module.logger, "log", record_log)
+
+    api_intercept_module._log_modal_rewritten_prompt_diagnostics(
+        prompt_id="prompt-cycle",
+        prompt=prompt,
+        reason="test",
+    )
+
+    assert any("Modal rewritten prompt contains dependency cycle(s)" in item for item in warning_messages)
+    assert any("prompt-cycle" in item for item in warning_messages)
+    assert any("Modal rewritten prompt diagnostics" in item for item in log_messages)
+
+
+def test_queue_prompt_json_logs_rewritten_modal_diagnostics_on_validation_failure(
+    api_intercept_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation failures for Modal prompts should log the rewritten dependency graph."""
+
+    class FakePromptQueue:
+        """Minimal prompt queue sink."""
+
+        def put(self, _item: tuple[Any, ...]) -> None:
+            """Fail if an invalid prompt reaches the queue."""
+            raise AssertionError("invalid prompt must not be queued")
+
+    class FakePromptServer:
+        """Minimal PromptServer double for validation-failure tests."""
+
+        number = 0
+        prompt_queue = FakePromptQueue()
+
+        def trigger_on_prompt(self, json_data: dict[str, Any]) -> dict[str, Any]:
+            """Return the prompt unchanged."""
+            return json_data
+
+    class FakeExecutionModule:
+        """Minimal execution module that rejects the prompt."""
+
+        SENSITIVE_EXTRA_DATA_KEYS: tuple[str, ...] = ()
+
+        @staticmethod
+        async def validate_prompt(
+            prompt_id: str,
+            prompt: dict[str, Any],
+            partial_execution_targets: Any,
+        ) -> tuple[bool, dict[str, Any], list[str], dict[str, Any]]:
+            """Reject the supplied prompt with a dependency-cycle shaped error."""
+            del prompt_id, prompt, partial_execution_targets
+            return (
+                False,
+                {
+                    "type": "execution_error",
+                    "message": "Dependency cycle detected",
+                    "details": "",
+                    "extra_info": {},
+                },
+                [],
+                {},
+            )
+
+    prompt = {
+        "1": {
+            "class_type": "ModalUniversalExecutor_a",
+            "inputs": {"remote_input_0": ["2", 0]},
+        },
+        "2": {
+            "class_type": "ModalUniversalExecutor_b",
+            "inputs": {"remote_input_0": ["1", 0]},
+        },
+    }
+
+    diagnostic_calls: list[dict[str, Any]] = []
+
+    def record_diagnostics(**kwargs: Any) -> None:
+        """Record one rewritten-prompt diagnostics request."""
+        diagnostic_calls.append(dict(kwargs))
+
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_log_modal_rewritten_prompt_diagnostics",
+        record_diagnostics,
+    )
+
+    response = asyncio.run(
+        api_intercept_module._queue_prompt_json(
+            FakePromptServer(),
+            {
+                "prompt_id": "prompt-cycle",
+                "prompt": prompt,
+                "extra_data": {
+                    "modal": {
+                        "remote_component_ids": ["1", "2"],
+                    }
+                },
+            },
+        )
+    )
+
+    assert response.status == 400
+    assert diagnostic_calls == [
+        {
+            "prompt_id": "prompt-cycle",
+            "prompt": prompt,
+            "reason": "comfy_validation_failure",
+            "level": api_intercept_module.logging.WARNING,
+        }
+    ]
+
+
 def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     api_intercept_module: Any,
     remote_modal_app_module: Any,

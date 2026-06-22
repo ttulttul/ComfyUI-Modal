@@ -1,5 +1,9 @@
 # Learnings
 
+## 2026-06-22
+
+- ComfyUI's `Dependency cycle detected` message can originate entirely in the local scheduler after Modal-Sync rewrites remote nodes into proxy phases, even when the Modal worker and individual remote sampler components finish successfully. The local queue path now logs compact rewritten-prompt diagnostics, including proxy dependency edges, component stages, payload summaries, and any static cycle path, so the next UI-only cycle error can be traced from `comfy.log` without guessing which remote phase was responsible.
+
 ## 2026-05-20
 
 - The Modal status pill should be driven by actual remote work, not by the custom node route being installed. Since the frontend patches every prompt through `/modal/queue_prompt`, the backend must fast-path prompts with zero `Run on Modal` nodes without emitting `modal_status`, and the frontend should ignore any empty Modal status event as a defensive guard.
