@@ -108,7 +108,7 @@ The list above is the shortest accurate summary. If you want the execution path 
   - Workflows with no nodes marked `Run on Modal` are forwarded without Modal setup events, so installing the node pack does not show the global Modal status pill for ordinary local prompts.
   - Prompt errors clear prompt-scoped remote node visual state immediately, so stale setup/ready colors do not leak into a resubmitted prompt.
   - Prompt success, failure, and interruption mark that prompt terminal in the frontend so late remote progress cannot resurrect stale node overlays or the global status pill.
-  - The local ComfyUI server keeps a short client-scoped replay buffer for Modal status and progress events. When the browser regains focus, the frontend fetches that buffer from `/modal/progress_state` before redrawing, so progress is restored even if websocket events were missed while the tab was backgrounded.
+  - The local ComfyUI server keeps a short client-scoped replay buffer for Modal status and progress events. When the browser regains focus, the frontend fetches that buffer from `/modal/progress_state` before redrawing, then reconciles temporary Modal UI state against ComfyUI's `/queue` and `/history/{prompt_id}` endpoints so finished prompts do not leave stale node colors behind if native completion events were missed while the tab was backgrounded.
 
 - **7. Return to the local workflow**
   1. The proxy node receives the serialized result.
