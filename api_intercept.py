@@ -1766,6 +1766,23 @@ def _build_component_plan(
             sorted(local_tap_node_ids),
         )
     component_node_id_set = original_component_node_id_set | local_tap_node_ids
+    if local_tap_node_ids:
+        expanded_component_node_id_set, _expansion_reasons = (
+            _expand_remote_node_ids_for_non_transportable_inputs(
+                prompt=prompt,
+                remote_node_ids=component_node_id_set,
+                nodes_module=nodes_module,
+            )
+        )
+        tap_dependency_node_ids = expanded_component_node_id_set - component_node_id_set
+        if tap_dependency_node_ids:
+            logger.info(
+                "Absorbing upstream non-transportable dependencies for remote component %s preview taps: %s",
+                representative_node_id,
+                sorted(tap_dependency_node_ids),
+            )
+            local_tap_node_ids.update(tap_dependency_node_ids)
+            component_node_id_set = expanded_component_node_id_set
     component_node_ids = sorted(component_node_id_set)
     boundary_inputs_by_source: dict[LinkedOutputRef, BoundaryInputSpec] = {}
     boundary_outputs_by_source: dict[LinkedOutputRef, BoundaryOutputSpec] = {}

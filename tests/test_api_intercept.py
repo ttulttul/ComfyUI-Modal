@@ -35,6 +35,22 @@ class _FakeRemoteSamplerNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeVAELoaderNode:
+    """Fake VAE loader that produces a non-transportable VAE output."""
+
+    RETURN_TYPES = ("VAE",)
+    RETURN_NAMES = ("vae",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeVAEDecodeNode:
+    """Fake VAE decoder that consumes latent and VAE inputs and produces an image."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    OUTPUT_IS_LIST = (False,)
+
+
 class _FakeLatentSourceNode:
     """Fake node that produces a transportable LATENT output."""
 
@@ -1196,6 +1212,133 @@ def test_rewrite_absorbs_non_returning_local_preview_taps(
             "node_id": "2",
             "output_index": 0,
             "io_type": "IMAGE",
+            "is_list": False,
+            "preview_target_node_ids": [],
+        }
+    ]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 0]
+
+
+def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Absorbed local decode previews should not leave VAE as a boundary input."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "LocalSink": _FakeLocalSinkNode,
+                "PreviewImage": _FakePreviewImageNode,
+                "VAEDecode": _FakeVAEDecodeNode,
+                "VAELoader": _FakeVAELoaderNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+            {"id": 9, "properties": {"is_modal_remote": False}},
+            {"id": 90, "properties": {"is_modal_remote": False}},
+            {"id": 192, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "9": {
+            "class_type": "VAELoader",
+            "inputs": {"vae_name": "vae.safetensors"},
+            "_meta": {"title": "VAE Loader"},
+        },
+        "1": {
+            "class_type": "RemoteSampler",
+            "inputs": {},
+            "_meta": {"title": "Remote Sampler 1"},
+        },
+        "192": {
+            "class_type": "VAEDecode",
+            "inputs": {"samples": ["1", 0], "vae": ["9", 0]},
+            "_meta": {"title": "VAE Decode Preview"},
+        },
+        "90": {
+            "class_type": "PreviewImage",
+            "inputs": {"images": ["192", 0]},
+            "_meta": {"title": "Preview"},
+        },
+        "2": {
+            "class_type": "RemoteSampler",
+            "inputs": {"latent": ["1", 0]},
+            "_meta": {"title": "Remote Sampler 2"},
+        },
+        "3": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["2", 0]},
+            "_meta": {"title": "Local Sink"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert set(rewritten_prompt) == {"1", "3"}
+    assert summary.remote_component_ids == ["1"]
+    assert set(summary.component_node_ids_by_representative["1"]) == {
+        "1",
+        "2",
+        "9",
+        "90",
+        "192",
+    }
+    assert summary.rewritten_node_id_map == {
+        "1": "1",
+        "2": "1",
+        "9": "1",
+        "90": "1",
+        "192": "1",
+    }
+
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert set(payload["component_node_ids"]) == {"1", "2", "9", "90", "192"}
+    assert payload["subgraph_prompt"]["9"]["class_type"] == "VAELoader"
+    assert payload["subgraph_prompt"]["192"]["class_type"] == "VAEDecode"
+    assert payload["execute_node_ids"] == ["2", "90"]
+    assert payload["boundary_inputs"] == []
+    assert payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "2_latent",
+            "node_id": "2",
+            "output_index": 0,
+            "io_type": "LATENT",
             "is_list": False,
             "preview_target_node_ids": [],
         }
