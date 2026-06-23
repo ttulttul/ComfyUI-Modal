@@ -100,6 +100,7 @@ The list above is the shortest accurate summary. If you want the execution path 
     - Executed UI payloads
     - Preview images
   - The local frontend updates node overlays and global status from those events.
+  - As soon as a local proxy dispatches a Modal component, it emits a `starting` status for that component so the affected remote island turns orange immediately while the Modal call is queued or provisioning.
   - If another Modal prompt is already active when a new prompt is submitted, queue-time setup updates for the new prompt are held back so its nodes do not repaint until ComfyUI actually starts executing it.
   - Completed node progress fades out briefly instead of disappearing abruptly or remaining stuck at 100%.
   - Completed remote nodes use a dark blue outline and fill while later remote nodes continue executing; during finalizing, completed nodes switch to a darker blue outline with pulsing fill while Modal outputs return locally.
@@ -341,6 +342,7 @@ Current mapped-execution rules:
 - mapped node highlighting now derives its purple/active state from live per-node lane or numeric progress, so overlapping `A -> B` work across different containers can keep both remote nodes active at once while ordinary non-mapped runs still use the older single-active-node behavior
 - worker lanes no longer emit a fake execution-progress bar on the component representative node before real node progress arrives, which avoids leaving stray lane bars behind on the first node in the remote island
 - mapped lane setup now emits its own `setup_only` lane events before a worker starts real node execution, and the frontend renders those as translucent pulsing lane bars. That makes cold-lane provisioning visible without pretending the worker is already doing sampler progress.
+- remote component dispatch now emits an immediate `starting` status before Modal streams real node progress, so long provisioning or worker-queue waits still show which remote island is pending instead of leaving the UI visually idle
 - ready-state node outlines now distinguish component membership: bright green means the node belongs to the component that is currently running, while dark green means the node is remote-ready but belongs to some other component waiting its turn
 - persisted Modal node-cache hits now emit lightweight `cached_hit` UI markers, and the frontend renders those nodes with a slower green pulse so users can see when outputs were reused instead of recomputed
 - once all mapped outputs are already complete, late failures from detached spare lanes are treated as benign background shutdown noise instead of aborting the finished ComfyUI prompt

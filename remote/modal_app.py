@@ -2262,6 +2262,25 @@ def _emit_local_modal_status(
     prompt_server.send_sync("modal_status", payload, client_id)
 
 
+def _emit_local_remote_dispatch_status(payload: dict[str, Any]) -> None:
+    """Tell the local UI a remote component was dispatched before Modal streams progress."""
+    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    extra_data = payload.get("extra_data") or {}
+    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    node_ids = [str(node_id) for node_id in payload.get("component_node_ids", []) if str(node_id)]
+    if not node_ids and payload.get("component_id") is not None:
+        node_ids = [str(payload["component_id"])]
+    if not prompt_id or not client_id or not node_ids:
+        return
+    _emit_local_modal_status(
+        prompt_id=prompt_id,
+        client_id=client_id,
+        phase="starting",
+        node_ids=node_ids,
+        status_message="Starting Modal component",
+    )
+
+
 def _emit_local_modal_progress(
     *,
     prompt_id: str | None,
@@ -5253,6 +5272,7 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
         payload.get("component_id"),
         payload.get("payload_kind"),
     )
+    _emit_local_remote_dispatch_status(payload)
     cancellation_event = threading.Event()
     future = _REMOTE_MODAL_CALL_EXECUTOR.submit(
         _invoke_modal_payload_blocking,
@@ -5311,6 +5331,7 @@ async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: by
         payload.get("component_id"),
         payload.get("payload_kind"),
     )
+    _emit_local_remote_dispatch_status(payload)
     cancellation_event = threading.Event()
     future = _REMOTE_MODAL_CALL_EXECUTOR.submit(
         _invoke_modal_payload_blocking,
