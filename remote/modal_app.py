@@ -2063,6 +2063,8 @@ def _is_missing_modal_deployment_error(exc: BaseException) -> bool:
         )
     ):
         return False
+    if "not deployed" in message:
+        return True
     if "not found" not in message:
         return False
     return any(
@@ -5069,7 +5071,8 @@ def _invoke_modal_payload_blocking(
                 cancellation_event,
             )
         except lookup_error_types as exc:
-            if settings.auto_deploy:
+            missing_deployment = _is_missing_modal_deployment_error(exc)
+            if settings.auto_deploy and missing_deployment:
                 remote_engine = _auto_deploy_modal_app(payload, exc)
                 try:
                     logger.info(
@@ -5085,6 +5088,9 @@ def _invoke_modal_payload_blocking(
                     )
                 except lookup_error_types as retry_exc:
                     exc = retry_exc
+                    missing_deployment = _is_missing_modal_deployment_error(exc)
+            if not missing_deployment:
+                raise
             if not settings.allow_ephemeral_fallback:
                 raise ModalRemoteInvocationError(
                     "Remote execution requires a deployed Modal app or a successful first-run auto-deploy. "
