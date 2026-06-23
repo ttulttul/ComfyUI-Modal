@@ -797,7 +797,7 @@ function refreshModalUiAfterVisibilityChange() {
 /**
  * Return the prompt metadata bucket, creating it if needed.
  * @param {string} promptId
- * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
+ * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, componentLabelByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
  */
 function ensurePromptState(promptId) {
   if (isPromptTerminal(promptId)) {
@@ -810,6 +810,7 @@ function ensurePromptState(promptId) {
       componentsByRepresentative: new Map(),
       componentNodeIdsByMember: new Map(),
       representativeNodeIdByMember: new Map(),
+      componentLabelByMember: new Map(),
       descendantNodeIdsByAncestor: new Map(),
       laneNodeIdsByLane: new Map(),
       activeNodeId: null,
@@ -978,22 +979,26 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
     promptState.componentsByRepresentative.clear();
     promptState.componentNodeIdsByMember.clear();
     promptState.representativeNodeIdByMember.clear();
+    promptState.componentLabelByMember.clear();
     promptState.activeNodeId = null;
     promptState.hasStreamedProgress = false;
-    for (const component of components) {
+    for (const [componentIndex, component] of components.entries()) {
       const componentNodeIds = Array.from(
         new Set(component.node_ids.map((nodeIdValue) => String(nodeIdValue))),
       );
       const representativeNodeId = String(component.representative_node_id);
+      const componentLabel = String(componentIndex + 1);
       promptState.componentsByRepresentative.set(
         representativeNodeId,
         componentNodeIds,
       );
       promptState.componentNodeIdsByMember.set(representativeNodeId, componentNodeIds);
       promptState.representativeNodeIdByMember.set(representativeNodeId, representativeNodeId);
+      promptState.componentLabelByMember.set(representativeNodeId, componentLabel);
       for (const componentNodeId of componentNodeIds) {
         promptState.componentNodeIdsByMember.set(componentNodeId, componentNodeIds);
         promptState.representativeNodeIdByMember.set(componentNodeId, representativeNodeId);
+        promptState.componentLabelByMember.set(componentNodeId, componentLabel);
         mergedRemoteNodeIds.add(componentNodeId);
       }
     }
@@ -2012,6 +2017,7 @@ function getRemoteVisualState(node) {
     isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === nodeId(node),
     isActiveComponentMember: isNodeInActiveComponent(state.promptId, nodeId(node)),
     isCachedRemoteNode: Boolean(cachedState),
+    componentLabel: promptState?.componentLabelByMember.get(nodeId(node)) ?? null,
     cachedAt: cachedState?.cachedAt ?? null,
     progress: progressState,
     batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,
@@ -2206,6 +2212,29 @@ function drawRemoteNodeDecoration(node, ctx) {
   );
   ctx.stroke();
   ctx.restore();
+
+  if (state?.componentLabel) {
+    ctx.save();
+    const badgeRadius = 10 / scale;
+    const badgeX = 10 / scale;
+    const badgeY = -titleHeight + 10 / scale;
+    ctx.fillStyle = "rgba(15, 23, 42, 0.92)";
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = 1.5 / scale;
+    ctx.shadowColor = shadowColor;
+    ctx.shadowBlur = 8 / scale;
+    ctx.beginPath();
+    ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#f8fafc";
+    ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(state.componentLabel), badgeX, badgeY + 0.5 / scale);
+    ctx.restore();
+  }
 
   const progressLanes = Array.isArray(state?.progressLanes) ? state.progressLanes : [];
   const setupProgressLanes = progressLanes.filter((laneProgress) => laneProgress.setupOnly);

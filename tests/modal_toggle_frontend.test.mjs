@@ -91,6 +91,14 @@ modalToggle.registerPromptComponents("prompt-a", ["10", "11", "12"], [
 ]);
 assert.deepEqual(modalToggle.resolveComponentNodeIds("prompt-a", "11"), ["10", "11", "12"]);
 assert.deepEqual(modalToggle.resolveComponentNodeIds("prompt-a", "10"), ["10", "11", "12"]);
+assert.equal(modalToggle.getRemoteVisualState({ id: "10" })?.componentLabel ?? null, null);
+
+modalToggle.modalNodeStates.set("10", {
+  phase: modalToggle.STATE_READY,
+  promptId: "prompt-a",
+  updatedAt: 1,
+});
+assert.equal(modalToggle.getRemoteVisualState({ id: "10" })?.componentLabel, "1");
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-b", ["10", "11", "12"], [
