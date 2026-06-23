@@ -597,8 +597,11 @@ def _restore_planned_remote_session_bridge_value(
         plan_payload = record.rehydration_plan.get("payload")
         if not isinstance(plan_payload, Mapping):
             return None
+        executable_payload = dict(plan_payload)
+        executable_payload["remote_session"] = target_session_handle.to_payload()
+        executable_payload.pop("clear_remote_session", None)
         outputs = _execute_subgraph_prompt(
-            dict(plan_payload),
+            executable_payload,
             deserialize_node_inputs(record.producer_inputs),
             custom_nodes_root,
             None,

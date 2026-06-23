@@ -2389,6 +2389,7 @@ def test_modal_cloud_rehydrates_linked_model_bridge_with_non_sampler_subgraph_pl
         del hydrated_inputs
         observed_payloads.append(copy.deepcopy(payload))
         assert payload["execute_node_ids"] == ["lora-1"]
+        assert payload["remote_session"]["session_id"] == target_handle.session_id
         assert sorted(payload["subgraph_prompt"]) == ["loader-1", "lora-1"]
         assert "sampler-1" not in payload["subgraph_prompt"]
         return (_FakeModelValue("restored-lora-model"),)
@@ -6859,6 +6860,7 @@ def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgra
         del hydrated_inputs, _node_mapping
         observed_payloads.append(copy.deepcopy(payload))
         assert payload["execute_node_ids"] == ["lora-1"]
+        assert payload["remote_session"]["session_id"] == target_handle.session_id
         assert sorted(payload["subgraph_prompt"]) == ["loader-1", "lora-1"]
         assert "sampler-1" not in payload["subgraph_prompt"]
         return (_FakeModelValue("restored-lora-model"),)
