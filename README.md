@@ -370,6 +370,7 @@ The frontend shows remote state directly on the canvas:
 - pulsing purple border: currently executing remotely
 - steady green border: finished for the current run
 - red border: queue-time or execution failure
+- numbered badge: remote component assignment for the current prompt, glowing with the node's current Modal state color
 
 When a remote node reports numeric progress through ComfyUI's progress hooks, the active Modal-marked node now also shows an in-node progress bar and percentage locally while the remote work is running. That is especially useful for sampler-style nodes such as `KSampler`.
 

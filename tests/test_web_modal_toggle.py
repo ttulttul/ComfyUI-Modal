@@ -127,6 +127,18 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert "setNodesPhase(nodeIds, STATE_FINALIZING, promptId);" in source
 
 
+def test_remote_modal_nodes_show_component_badges() -> None:
+    """Remote nodes should render a compact component label badge."""
+    source = _modal_toggle_source()
+
+    assert "componentLabelByMember: new Map()," in source
+    assert "promptState.componentLabelByMember.set(componentNodeId, componentLabel);" in source
+    assert "componentLabel: promptState?.componentLabelByMember.get(nodeId(node)) ?? null," in source
+    assert "if (state?.componentLabel) {" in source
+    assert "ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);" in source
+    assert "ctx.fillText(String(state.componentLabel), badgeX, badgeY + 0.5 / scale);" in source
+
+
 def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> None:
     """The frontend should surface detailed setup and result-receive messages in the global pill."""
     source = _modal_toggle_source()
