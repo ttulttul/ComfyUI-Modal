@@ -54,6 +54,7 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "nodeCount: promptRemoteNodeCount(promptId, nodeCount)," in source
     assert "hasRemoteExecutionStarted: false" in source
     assert "Waiting for Modal container" in source
+    assert "Starting Modal component" in source
 
 
 def test_empty_modal_status_events_do_not_show_global_pill() -> None:
@@ -116,15 +117,28 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert 'const COMPLETE_BORDER_COLOR = "#004FA4";' in source
     assert 'const COMPLETE_FILL_COLOR = "#001C71";' in source
     assert 'const FINALIZING_NODE_BORDER_COLOR = "#00358A";' in source
+    assert 'const STATE_STARTING = "starting";' in source
     assert 'const STATE_WAITING = "waiting";' in source
     assert 'const STATE_FINALIZING = "finalizing";' in source
     assert 'const STATE_READY = "ready";' in source
     assert 'const STATE_ACTIVE = "active";' in source
     assert 'detail.phase === "execution_success"' in source
     assert "phase === STATE_COMPLETE || phase === STATE_FINALIZING" in source
+    assert "state?.phase === STATE_SETUP || state?.phase === STATE_STARTING" in source
     assert "state?.phase === STATE_FINALIZING" in source
     assert "borderColor = FINALIZING_NODE_BORDER_COLOR;" in source
     assert "setNodesPhase(nodeIds, STATE_FINALIZING, promptId);" in source
+
+
+def test_starting_modal_status_marks_component_before_remote_progress() -> None:
+    """Dispatch-time Modal status should mark the component while remote progress is still pending."""
+    source = _modal_toggle_source()
+
+    assert "if (detail.phase === STATE_STARTING) {" in source
+    assert "setGlobalStatusPhase(promptId, STATE_STARTING, nodeIds.length, {" in source
+    assert "setNodesPhase(nodeIds, STATE_STARTING, promptId);" in source
+    assert "phases.find((state) => state.phase === STATE_STARTING)" in source
+    assert "[STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_ERROR]" in source
 
 
 def test_remote_modal_nodes_show_component_badges() -> None:

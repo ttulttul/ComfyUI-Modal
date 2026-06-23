@@ -21,6 +21,7 @@ const FINALIZING_NODE_BORDER_COLOR = "#00358A";
 const ERROR_BORDER_COLOR = "#ef4444";
 
 const STATE_SETUP = "setup";
+const STATE_STARTING = "starting";
 const STATE_WAITING = "waiting";
 const STATE_FINALIZING = "finalizing";
 const EXECUTION_PHASE = "executing";
@@ -245,7 +246,7 @@ function effectiveGlobalStatusPhase(promptId, phase) {
   if (phase === STATE_ERROR) {
     return STATE_ERROR;
   }
-  if (phase === STATE_SETUP || phase === STATE_WAITING) {
+  if (phase === STATE_SETUP || phase === STATE_STARTING || phase === STATE_WAITING) {
     return phase;
   }
   if (nodeStates.some((state) => state.phase === STATE_ERROR)) {
@@ -299,7 +300,7 @@ function promptHasLiveRemoteWork(promptId) {
     const nodeState = modalNodeStates.get(String(nodeIdValue));
     return (
       nodeState?.promptId === promptId &&
-      [STATE_SETUP, STATE_READY, STATE_ACTIVE].includes(nodeState.phase)
+      [STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE].includes(nodeState.phase)
     );
   });
 }
@@ -403,6 +404,7 @@ function currentGlobalStatus() {
   return (
     phases.find((state) => state.phase === STATE_ERROR) ??
     phases.find((state) => state.phase === STATE_SETUP) ??
+    phases.find((state) => state.phase === STATE_STARTING) ??
     phases.find((state) => state.phase === STATE_WAITING) ??
     phases.find((state) => state.phase === EXECUTION_PHASE) ??
     phases.find((state) => state.phase === STATE_FINALIZING) ??
@@ -461,7 +463,7 @@ function refreshGlobalStatusElement() {
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
     text.textContent = activeState.statusMessage ?? "Syncing graph with Modal";
-  } else if (activeState.phase === STATE_WAITING) {
+  } else if (activeState.phase === STATE_STARTING || activeState.phase === STATE_WAITING) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
     element.style.background = "rgba(61, 42, 9, 0.94)";
     dot.style.background = SETUP_BORDER_COLOR;
@@ -855,7 +857,7 @@ function shouldApplyPromptState(nodeIdValue, promptId) {
 function refreshCanvasAnimation() {
   app.graph?.setDirtyCanvas(true, true);
   const hasAnimatedState = Array.from(modalNodeStates.values()).some((state) =>
-    [STATE_SETUP, STATE_READY, STATE_ACTIVE, STATE_ERROR].includes(state.phase),
+    [STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_ERROR].includes(state.phase),
   );
   const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;
   const hasProgressState =
@@ -943,7 +945,7 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     if (phase === STATE_ERROR) {
       scheduleNodeClear(currentNodeId, promptId, ERROR_CLEAR_DELAY_MS);
     }
-    if (phase === STATE_SETUP || phase === STATE_ERROR) {
+    if (phase === STATE_SETUP || phase === STATE_STARTING || phase === STATE_ERROR) {
       clearNodeCached(currentNodeId, promptId);
     }
     if (phase === STATE_COMPLETE) {
@@ -1214,7 +1216,7 @@ function progressVisualOpacity(progressState) {
  * @returns {string | undefined}
  */
 function deriveRemoteNodePhase(phase, hasLiveProgress) {
-  if ([STATE_ERROR, STATE_SETUP].includes(phase ?? "")) {
+  if ([STATE_ERROR, STATE_SETUP, STATE_STARTING].includes(phase ?? "")) {
     return phase;
   }
   if (phase === STATE_COMPLETE || phase === STATE_FINALIZING) {
@@ -2141,7 +2143,7 @@ function drawRemoteNodeDecoration(node, ctx) {
   let shadowColor = "rgba(29, 155, 240, 0.35)";
   let fillColor = null;
 
-  if (state?.phase === STATE_SETUP) {
+  if (state?.phase === STATE_SETUP || state?.phase === STATE_STARTING) {
     const pulse = (Math.sin(elapsed * 5) + 1) / 2;
     borderColor = `${SETUP_BORDER_COLOR}${Math.round((0.65 + pulse * 0.35) * 255)
       .toString(16)
@@ -2462,6 +2464,20 @@ function handleModalStatus(event) {
       total: detail.status_total ?? null,
     });
     setPromptActiveNode(promptId, null);
+    return;
+  }
+
+  if (detail.phase === STATE_STARTING) {
+    if (isPromptQueuedBehindActiveModal(promptId)) {
+      return;
+    }
+    setGlobalStatusPhase(promptId, STATE_STARTING, nodeIds.length, {
+      message: detail.status_message ?? "Starting Modal component",
+      current: detail.status_current ?? null,
+      total: detail.status_total ?? null,
+    });
+    setPromptActiveNode(promptId, null);
+    setNodesPhase(nodeIds, STATE_STARTING, promptId);
     return;
   }
 

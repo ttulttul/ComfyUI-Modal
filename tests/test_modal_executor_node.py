@@ -4709,6 +4709,49 @@ def test_remote_modal_consumes_streamed_progress_and_result(
     ]
 
 
+def test_emit_local_remote_dispatch_status_marks_component_starting(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Dispatching a remote component should immediately tell the local UI it is starting."""
+
+    class FakePromptServer:
+        """Capture websocket events emitted by local dispatch status."""
+
+        def __init__(self) -> None:
+            """Initialize the event sink."""
+            self.messages: list[tuple[str, dict[str, Any], str | None]] = []
+
+        def send_sync(self, event: str, data: dict[str, Any], sid: str | None) -> None:
+            """Record one emitted websocket message."""
+            self.messages.append((event, data, sid))
+
+    prompt_server = FakePromptServer()
+    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+
+    remote_modal_app_module._emit_local_remote_dispatch_status(
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "component-1",
+            "component_node_ids": ["7", "8"],
+            "extra_data": {"client_id": "client-1"},
+        }
+    )
+
+    assert prompt_server.messages == [
+        (
+            "modal_status",
+            {
+                "phase": "starting",
+                "prompt_id": "prompt-1",
+                "node_ids": ["7", "8"],
+                "status_message": "Starting Modal component",
+            },
+            "client-1",
+        )
+    ]
+
+
 def test_emit_local_mapped_lane_progress_start_marks_lane_as_setup_only(
     remote_modal_app_module: Any,
     monkeypatch: Any,
