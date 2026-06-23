@@ -2052,6 +2052,17 @@ def _modal_lookup_error_types() -> tuple[type[BaseException], ...]:
 def _is_missing_modal_deployment_error(exc: BaseException) -> bool:
     """Return whether one Modal lookup failure indicates missing deployed app state."""
     message = str(exc).strip().lower()
+    if any(
+        marker in message
+        for marker in (
+            "could not deserialize remote exception",
+            "remote traceback",
+            "remotesubgraphexecutionerror",
+            "object of type",
+            "is not json serializable",
+        )
+    ):
+        return False
     if "not found" not in message:
         return False
     return any(
