@@ -2235,6 +2235,88 @@ def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_repl
     assert resolution_stats.session_restore_writes == 1
 
 
+def test_modal_cloud_rehydrates_linked_model_bridge_with_non_sampler_subgraph_plan(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Linked MODEL bridge plans should rerun only the non-sampler model dependency closure."""
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_linked_model_bridge",
+        node_id="lora-1",
+        output_index=0,
+        session_id="session-source",
+    )
+    record = modal_cloud_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "sampler-component",
+            "execute_node_ids": ["sampler-1"],
+            "subgraph_prompt": {
+                "loader-1": {
+                    "class_type": "UNETLoader",
+                    "inputs": {"unet_name": "base.safetensors"},
+                },
+                "lora-1": {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["loader-1", 0], "lora_name": "style.safetensors"},
+                },
+                "sampler-1": {
+                    "class_type": "KSampler",
+                    "inputs": {"model": ["lora-1", 0]},
+                },
+            },
+        },
+        hydrated_inputs={},
+        node_id="lora-1",
+        output_index=0,
+        io_type="MODEL",
+        output_value=_FakeModelValue("lora-model"),
+    )
+    assert record.rehydration_plan is not None
+    assert record.rehydration_plan["kind"] == "subgraph_output"
+    monkeypatch.setattr(modal_cloud_module, "_load_remote_session_bridge_record", lambda bridge_key: record)
+    observed_payloads: list[dict[str, Any]] = []
+
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        *_args: Any,
+    ) -> tuple[_FakeModelValue]:
+        """Assert the durable plan avoids rerunning the sampler component."""
+        del hydrated_inputs
+        observed_payloads.append(copy.deepcopy(payload))
+        assert payload["execute_node_ids"] == ["lora-1"]
+        assert sorted(payload["subgraph_prompt"]) == ["loader-1", "lora-1"]
+        assert "sampler-1" not in payload["subgraph_prompt"]
+        return (_FakeModelValue("restored-lora-model"),)
+
+    monkeypatch.setattr(modal_cloud_module, "_execute_subgraph_prompt", fake_execute_subgraph_prompt)
+    resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = modal_cloud_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            custom_nodes_root=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+            resolution_stats=resolution_stats,
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert isinstance(restored_value, _FakeModelValue)
+    assert restored_value.value == "restored-lora-model"
+    assert len(observed_payloads) == 1
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.replay_count == 0
+
+
 def test_modal_cloud_refuses_sampler_bridge_replay(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -6553,6 +6635,85 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
     assert resolution_stats.bridge_record_lookups == 1
     assert resolution_stats.replay_count == 0
     assert resolution_stats.session_restore_writes == 1
+
+
+def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgraph_plan(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local fallback should rehydrate linked MODEL bridges without sampler replay."""
+    target_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_linked_model_bridge",
+        node_id="lora-1",
+        output_index=0,
+        session_id="session-source",
+    )
+    record = remote_modal_app_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "sampler-component",
+            "execute_node_ids": ["sampler-1"],
+            "subgraph_prompt": {
+                "loader-1": {
+                    "class_type": "UNETLoader",
+                    "inputs": {"unet_name": "base.safetensors"},
+                },
+                "lora-1": {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["loader-1", 0], "lora_name": "style.safetensors"},
+                },
+                "sampler-1": {
+                    "class_type": "KSampler",
+                    "inputs": {"model": ["lora-1", 0]},
+                },
+            },
+        },
+        hydrated_inputs={},
+        node_id="lora-1",
+        output_index=0,
+        io_type="MODEL",
+        output_value=_FakeModelValue("lora-model"),
+    )
+    assert record.rehydration_plan is not None
+    assert record.rehydration_plan["kind"] == "subgraph_output"
+    monkeypatch.setattr(remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
+    observed_payloads: list[dict[str, Any]] = []
+
+    def fake_execute_subgraph_prompt(
+        payload: dict[str, Any],
+        hydrated_inputs: dict[str, Any],
+        _node_mapping: dict[str, type[Any]] | None = None,
+    ) -> tuple[_FakeModelValue]:
+        """Assert the durable plan avoids rerunning the sampler component."""
+        del hydrated_inputs, _node_mapping
+        observed_payloads.append(copy.deepcopy(payload))
+        assert payload["execute_node_ids"] == ["lora-1"]
+        assert sorted(payload["subgraph_prompt"]) == ["loader-1", "lora-1"]
+        assert "sampler-1" not in payload["subgraph_prompt"]
+        return (_FakeModelValue("restored-lora-model"),)
+
+    monkeypatch.setattr(remote_modal_app_module, "_execute_subgraph_prompt", fake_execute_subgraph_prompt)
+    resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            node_mapping=None,
+            resolution_stats=resolution_stats,
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert isinstance(restored_value, _FakeModelValue)
+    assert restored_value.value == "restored-lora-model"
+    assert len(observed_payloads) == 1
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.replay_count == 0
 
 
 def test_local_remote_app_refuses_sampler_bridge_replay(

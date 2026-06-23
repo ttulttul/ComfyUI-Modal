@@ -325,6 +325,7 @@ def _build_remote_session_bridge_record(
     rehydration_plan = _build_durable_bridge_rehydration_plan(
         payload=producer_payload,
         node_id=node_id,
+        output_index=output_index,
         io_type=io_type,
     )
     return RemoteSessionBridgeRecord(
@@ -468,6 +469,7 @@ def _build_durable_bridge_rehydration_plan(
     *,
     payload: dict[str, Any],
     node_id: str,
+    output_index: int,
     io_type: str,
 ) -> dict[str, Any] | None:
     """Return a direct rehydration plan when one bridge output can be rebuilt without replay."""
@@ -485,26 +487,77 @@ def _build_durable_bridge_rehydration_plan(
         return None
 
     normalized_inputs: dict[str, Any] = {}
+    has_linked_input = False
     for input_name, input_value in inputs.items():
         normalized_value = _normalize_prompt_input_value(copy.deepcopy(input_value))
         if _is_link(normalized_value):
-            logger.info(
-                "Skipping durable MODEL bridge rehydration plan for node_id=%s class_type=%s because input %s is still linked.",
-                node_id,
-                class_type,
-                input_name,
-            )
-            return None
+            has_linked_input = True
+            continue
         normalized_inputs[str(input_name)] = normalized_value
 
-    node_data: dict[str, Any] = {"class_type": class_type}
-    custom_nodes_bundle = payload.get("custom_nodes_bundle")
-    if isinstance(custom_nodes_bundle, str) and custom_nodes_bundle.strip():
-        node_data["custom_nodes_bundle"] = custom_nodes_bundle
+    if not has_linked_input:
+        node_data: dict[str, Any] = {"class_type": class_type}
+        custom_nodes_bundle = payload.get("custom_nodes_bundle")
+        if isinstance(custom_nodes_bundle, str) and custom_nodes_bundle.strip():
+            node_data["custom_nodes_bundle"] = custom_nodes_bundle
+        return {
+            "kind": "single_node_output",
+            "node_data": node_data,
+            "node_inputs": normalized_inputs,
+        }
+
+    required_node_ids = set(
+        _resolve_required_subgraph_nodes(
+            prompt=prompt,
+            execute_node_ids=[str(node_id)],
+        )
+    )
+    if str(node_id) not in required_node_ids:
+        return None
+    if _subgraph_contains_sampling_node(prompt, required_node_ids):
+        logger.info(
+            "Skipping durable MODEL bridge subgraph rehydration plan for node_id=%s class_type=%s because its dependency closure includes a sampler.",
+            node_id,
+            class_type,
+        )
+        return None
+
+    rehydration_payload = copy.deepcopy(payload)
+    rehydration_payload["component_id"] = f"{payload.get('component_id', 'component')}::rehydrate:{node_id}"
+    rehydration_payload["subgraph_prompt"] = {
+        str(current_node_id): copy.deepcopy(prompt[current_node_id])
+        for current_node_id in prompt
+        if str(current_node_id) in required_node_ids
+    }
+    rehydration_payload["component_node_ids"] = sorted(required_node_ids)
+    rehydration_payload["execute_node_ids"] = [str(node_id)]
+    rehydration_payload["mapped_execute_node_ids"] = []
+    rehydration_payload["static_execute_node_ids"] = []
+    rehydration_payload["boundary_inputs"] = [
+        {
+            **copy.deepcopy(boundary_input),
+            "targets": [
+                copy.deepcopy(target)
+                for target in boundary_input.get("targets", [])
+                if str(target.get("node_id")) in required_node_ids
+            ],
+        }
+        for boundary_input in payload.get("boundary_inputs", [])
+        if any(str(target.get("node_id")) in required_node_ids for target in boundary_input.get("targets", []))
+    ]
+    rehydration_payload["boundary_outputs"] = [
+        {
+            "node_id": str(node_id),
+            "output_index": int(output_index),
+            "io_type": str(io_type),
+            "is_list": False,
+            "session_output": False,
+            "proxy_output_name": f"{node_id}_rehydrated_{output_index}",
+        }
+    ]
     return {
-        "kind": "single_node_output",
-        "node_data": node_data,
-        "node_inputs": normalized_inputs,
+        "kind": "subgraph_output",
+        "payload": rehydration_payload,
     }
 
 
@@ -512,32 +565,53 @@ def _restore_planned_remote_session_bridge_value(
     record: RemoteSessionBridgeRecord,
     *,
     target_session_handle: RemoteSessionHandle,
+    custom_nodes_root: Path | None = None,
+    cancellation_event: threading.Event | None = None,
+    interrupt_store: Any | None = None,
+    interrupt_flag_key: str | None = None,
     resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> Any | None:
     """Restore one bridge value directly from a durable node rehydration plan."""
     if not isinstance(record.rehydration_plan, Mapping):
         return None
-    if str(record.rehydration_plan.get("kind") or "") != "single_node_output":
-        return None
-    node_data = record.rehydration_plan.get("node_data")
-    node_inputs = record.rehydration_plan.get("node_inputs")
-    if not isinstance(node_data, Mapping) or not isinstance(node_inputs, Mapping):
-        return None
 
     restore_started_at = time.perf_counter()
-    outputs = _execute_node_locally_raw(
-        dict(node_data),
-        dict(node_inputs),
-        node_mapping=None,
-        cancellation_event=None,
-        interrupt_store=None,
-        interrupt_flag_key=None,
-    )
-    if record.output_index < 0 or record.output_index >= len(outputs):
+    plan_kind = str(record.rehydration_plan.get("kind") or "")
+    if plan_kind == "single_node_output":
+        node_data = record.rehydration_plan.get("node_data")
+        node_inputs = record.rehydration_plan.get("node_inputs")
+        if not isinstance(node_data, Mapping) or not isinstance(node_inputs, Mapping):
+            return None
+        outputs = _execute_node_locally_raw(
+            dict(node_data),
+            dict(node_inputs),
+            node_mapping=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+        )
+        output_index = record.output_index
+    elif plan_kind == "subgraph_output":
+        plan_payload = record.rehydration_plan.get("payload")
+        if not isinstance(plan_payload, Mapping):
+            return None
+        outputs = _execute_subgraph_prompt(
+            dict(plan_payload),
+            deserialize_node_inputs(record.producer_inputs),
+            custom_nodes_root,
+            None,
+            cancellation_event,
+            interrupt_store,
+            interrupt_flag_key,
+        )
+        output_index = 0
+    else:
+        return None
+    if output_index < 0 or output_index >= len(outputs):
         raise RemoteSessionStateError(
             f"Durable bridge rehydration plan for {record.bridge_key!r} did not produce output index {record.output_index}."
         )
-    restored_value = outputs[record.output_index]
+    restored_value = outputs[output_index]
     _REMOTE_SESSION_STORE.put_output(
         target_session_handle,
         node_id=record.node_id,
@@ -579,7 +653,15 @@ def _bridge_record_replays_sampling_node(record: RemoteSessionBridgeRecord) -> b
     subgraph_prompt = record.producer_payload.get("subgraph_prompt")
     if not isinstance(subgraph_prompt, Mapping):
         return False
-    for node_id in execute_node_ids:
+    return _subgraph_contains_sampling_node(subgraph_prompt, execute_node_ids)
+
+
+def _subgraph_contains_sampling_node(
+    subgraph_prompt: Mapping[str, Any],
+    node_ids: Iterable[str],
+) -> bool:
+    """Return whether any selected node looks like sampler work."""
+    for node_id in node_ids:
         prompt_node = subgraph_prompt.get(node_id)
         if not isinstance(prompt_node, Mapping):
             continue
@@ -648,6 +730,10 @@ def _rehydrate_remote_session_bridge_value(
     restored_value = _restore_planned_remote_session_bridge_value(
         record,
         target_session_handle=target_session_handle,
+        custom_nodes_root=custom_nodes_root,
+        cancellation_event=cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key=interrupt_flag_key,
         resolution_stats=resolution_stats,
     )
     if restored_value is not None:
