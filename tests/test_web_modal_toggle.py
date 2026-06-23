@@ -55,6 +55,7 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "hasRemoteExecutionStarted: false" in source
     assert "Waiting for Modal container" in source
     assert "Starting Modal component" in source
+    assert "function promptActiveNodeIsLive(promptId)" in source
 
 
 def test_empty_modal_status_events_do_not_show_global_pill() -> None:
@@ -113,6 +114,7 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
 
     assert 'const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";' in source
     assert 'const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";' in source
+    assert 'const STARTING_BORDER_COLOR = "#eab308";' in source
     assert 'const ACTIVE_BORDER_COLOR = "#a855f7";' in source
     assert 'const COMPLETE_BORDER_COLOR = "#004FA4";' in source
     assert 'const COMPLETE_FILL_COLOR = "#001C71";' in source
@@ -124,7 +126,8 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert 'const STATE_ACTIVE = "active";' in source
     assert 'detail.phase === "execution_success"' in source
     assert "phase === STATE_COMPLETE || phase === STATE_FINALIZING" in source
-    assert "state?.phase === STATE_SETUP || state?.phase === STATE_STARTING" in source
+    assert "state?.phase === STATE_STARTING" in source
+    assert "dot.style.background = STARTING_BORDER_COLOR;" in source
     assert "state?.phase === STATE_FINALIZING" in source
     assert "borderColor = FINALIZING_NODE_BORDER_COLOR;" in source
     assert "setNodesPhase(nodeIds, STATE_FINALIZING, promptId);" in source
@@ -139,6 +142,8 @@ def test_starting_modal_status_marks_component_before_remote_progress() -> None:
     assert "setNodesPhase(nodeIds, STATE_STARTING, promptId);" in source
     assert "phases.find((state) => state.phase === STATE_STARTING)" in source
     assert "[STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_ERROR]" in source
+    assert "activeState.phase === STATE_STARTING" in source
+    assert "STARTING_BORDER_COLOR" in source
 
 
 def test_remote_modal_nodes_show_component_badges() -> None:
@@ -194,6 +199,9 @@ def test_completed_remote_nodes_clear_stale_global_status_entries() -> None:
     assert "nodeStates.some((state) => state.phase === STATE_READY || state.phase === STATE_COMPLETE)" not in source
     assert "modalGlobalStatusStates.delete(promptId);" in source
     assert "reconcilePromptGlobalStatus(promptId);" in source
+    assert "promptActiveNodeIsLive(promptId)" in source
+    assert "activeNodeState?.promptId === promptId && activeNodeState.phase === STATE_ACTIVE" in source
+    assert "if (promptState?.activeNodeId === String(currentNodeId))" in source
 
 
 def test_streamed_modal_progress_takes_precedence_over_proxy_events() -> None:
