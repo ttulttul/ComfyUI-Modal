@@ -3326,6 +3326,27 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     assert deploy_calls == [("comfy-modal-sync", None)]
 
 
+def test_remote_modal_does_not_classify_remote_execution_error_as_missing_app(
+    remote_modal_app_module: Any,
+) -> None:
+    """Remote execution tracebacks should surface directly instead of triggering redeploy."""
+    remote_error = RuntimeError(
+        "Could not deserialize remote exception due to local error:\n"
+        "Here is the remote traceback:\n"
+        "comfyui_modal_sync_cloud.RemoteSubgraphExecutionError: "
+        "Object of type CLIP is not JSON serializable\n"
+        "Lookup failed for Cls 'RemoteEngine' from the 'comfy-modal-sync' app: "
+        "App 'comfy-modal-sync' not found in environment 'main'."
+    )
+    missing_lookup_error = RuntimeError(
+        "Lookup failed for Cls 'RemoteEngine' from the 'comfy-modal-sync' app: "
+        "App 'comfy-modal-sync' not found in environment 'main'."
+    )
+
+    assert not remote_modal_app_module._is_missing_modal_deployment_error(remote_error)
+    assert remote_modal_app_module._is_missing_modal_deployment_error(missing_lookup_error)
+
+
 def test_remote_modal_redeploys_when_cached_app_was_deleted(
     remote_modal_app_module: Any,
     monkeypatch: Any,
