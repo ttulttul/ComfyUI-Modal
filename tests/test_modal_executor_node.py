@@ -71,6 +71,24 @@ class _FakeModelLoaderNode:
         return (_FakeModelValue(f"model::{ckpt_name}"),)
 
 
+class _FakeClipLoaderNode:
+    """Fake self-contained loader node that returns one CLIP-like object."""
+
+    RETURN_TYPES = ("CLIP",)
+    RETURN_NAMES = ("clip",)
+    OUTPUT_IS_LIST = (False,)
+    FUNCTION = "load_clip"
+
+    def load_clip(
+        self,
+        clip_name: str,
+        type: str = "stable_diffusion",
+        device: str = "default",
+    ) -> tuple[str]:
+        """Return a deterministic CLIP value derived from the loader inputs."""
+        return (f"clip::{clip_name}:{type}:{device}",)
+
+
 class _FakeSessionValueNode:
     """Fake node that produces one remote-only STRING value."""
 
@@ -2233,6 +2251,87 @@ def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_repl
     assert resolution_stats.bridge_record_lookups == 1
     assert resolution_stats.replay_count == 0
     assert resolution_stats.session_restore_writes == 1
+
+
+def test_modal_cloud_rehydrates_clip_bridge_refs_from_durable_plan_without_replay(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Durable CLIP bridge plans should rebuild one self-contained loader output without replay."""
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_clip_bridge",
+        node_id="clip-1",
+        output_index=0,
+        session_id="session-source",
+    )
+    record = modal_cloud_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "sampler-component",
+            "execute_node_ids": ["sampler-1"],
+            "subgraph_prompt": {
+                "clip-1": {
+                    "class_type": "CLIPLoader",
+                    "inputs": {
+                        "clip_name": "text.safetensors",
+                        "type": "flux",
+                        "device": "default",
+                    },
+                },
+                "sampler-1": {
+                    "class_type": "KSampler",
+                    "inputs": {"clip": ["clip-1", 0]},
+                },
+            },
+        },
+        hydrated_inputs={},
+        node_id="clip-1",
+        output_index=0,
+        io_type="CLIP",
+        output_value="seed-clip",
+    )
+    assert record.rehydration_plan is not None
+    assert record.rehydration_plan_io_type == "CLIP"
+    monkeypatch.setattr(modal_cloud_module, "_load_remote_session_bridge_record", lambda bridge_key: record)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("durable CLIP rehydration should skip replay")
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_node_locally_raw",
+        lambda node_data, kwargs_payload, **kwargs: (
+            "clip::"
+            f"{kwargs_payload['clip_name']}:"
+            f"{kwargs_payload['type']}:"
+            f"{kwargs_payload['device']}",
+        ),
+    )
+    resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = modal_cloud_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            custom_nodes_root=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+            resolution_stats=resolution_stats,
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert restored_value == "clip::text.safetensors:flux:default"
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.replay_count == 0
 
 
 def test_modal_cloud_rehydrates_linked_model_bridge_with_non_sampler_subgraph_plan(
@@ -6635,6 +6734,74 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
     assert resolution_stats.bridge_record_lookups == 1
     assert resolution_stats.replay_count == 0
     assert resolution_stats.session_restore_writes == 1
+
+
+def test_local_remote_app_rehydrates_clip_bridge_refs_from_durable_plan_without_replay(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local fallback should rebuild one CLIP bridge output from a durable plan."""
+    target_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_clip_bridge",
+        node_id="clip-1",
+        output_index=0,
+        session_id="session-source",
+    )
+    record = remote_modal_app_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "sampler-component",
+            "execute_node_ids": ["sampler-1"],
+            "subgraph_prompt": {
+                "clip-1": {
+                    "class_type": "CLIPLoader",
+                    "inputs": {
+                        "clip_name": "text.safetensors",
+                        "type": "flux",
+                        "device": "default",
+                    },
+                },
+                "sampler-1": {
+                    "class_type": "KSampler",
+                    "inputs": {"clip": ["clip-1", 0]},
+                },
+            },
+        },
+        hydrated_inputs={},
+        node_id="clip-1",
+        output_index=0,
+        io_type="CLIP",
+        output_value="seed-clip",
+    )
+    assert record.rehydration_plan is not None
+    assert record.rehydration_plan_io_type == "CLIP"
+    monkeypatch.setattr(remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("durable CLIP rehydration should skip local replay")
+        ),
+    )
+    resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            node_mapping={"CLIPLoader": _FakeClipLoaderNode},
+            resolution_stats=resolution_stats,
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert restored_value == "clip::text.safetensors:flux:default"
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.replay_count == 0
 
 
 def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgraph_plan(
