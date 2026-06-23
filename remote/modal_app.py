@@ -90,6 +90,7 @@ _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER: list[str] = []
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT = 32
 _DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset({"CONDITIONING", "LATENT"})
+_DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset({"CLIP", "MODEL", "VAE"})
 
 
 @dataclass
@@ -661,7 +662,7 @@ def _build_durable_bridge_rehydration_plan(
     io_type: str,
 ) -> dict[str, Any] | None:
     """Return a direct rehydration plan when one bridge output can be rebuilt without replay."""
-    if str(io_type or "") != "MODEL":
+    if str(io_type or "") not in _DURABLE_BRIDGE_REHYDRATION_IO_TYPES:
         return None
     prompt = payload.get("subgraph_prompt")
     if not isinstance(prompt, dict):
@@ -704,7 +705,8 @@ def _build_durable_bridge_rehydration_plan(
         return None
     if _subgraph_contains_sampling_node(prompt, required_node_ids):
         logger.info(
-            "Skipping durable MODEL bridge subgraph rehydration plan for node_id=%s class_type=%s because its dependency closure includes a sampler.",
+            "Skipping durable %s bridge subgraph rehydration plan for node_id=%s class_type=%s because its dependency closure includes a sampler.",
+            io_type,
             node_id,
             class_type,
         )
