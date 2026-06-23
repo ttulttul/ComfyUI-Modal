@@ -1477,6 +1477,55 @@ def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
     ]
 
 
+def test_component_local_reentry_dependency_detection(
+    api_intercept_module: Any,
+) -> None:
+    """Boundary inputs that trace back to the same component require a split-capable proxy."""
+    prompt = {
+        "1": {
+            "class_type": "RemoteImage",
+            "inputs": {},
+            "_meta": {"title": "Remote Image"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["1", 0]},
+            "_meta": {"title": "Local Transform"},
+        },
+        "2": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["4", 0]},
+            "_meta": {"title": "Remote Consumer"},
+        },
+    }
+    component = api_intercept_module.RemoteComponentPlan(
+        node_ids=["1", "2"],
+        representative_node_id="1",
+        boundary_inputs=[
+            api_intercept_module.BoundaryInputSpec(
+                proxy_input_name="remote_input_0",
+                source=api_intercept_module.LinkedOutputRef(node_id="4", output_index=0),
+                io_type="IMAGE",
+                targets=[
+                    api_intercept_module.InputTarget(
+                        node_id="2",
+                        input_name="image",
+                    )
+                ],
+            )
+        ],
+        boundary_outputs=[],
+        execute_node_ids=["1", "2"],
+        contains_output_node=False,
+        local_tap_node_ids=["9"],
+    )
+
+    assert api_intercept_module._component_has_local_reentry_dependency(
+        prompt=prompt,
+        component=component,
+    )
+
+
 def test_rewrite_reports_parallel_component_stages(
     api_intercept_module: Any,
     settings_module: Any,

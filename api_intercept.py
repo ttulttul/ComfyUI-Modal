@@ -2202,6 +2202,25 @@ def _component_ancestors_of_local_source(
     return ancestor_node_ids
 
 
+def _component_has_local_reentry_dependency(
+    *,
+    prompt: dict[str, Any],
+    component: RemoteComponentPlan,
+) -> bool:
+    """Return whether a component boundary input depends on that same component's output."""
+    component_node_id_set = set(component.node_ids)
+    for boundary_input in component.boundary_inputs:
+        if boundary_input.source.node_id in component_node_id_set:
+            continue
+        if _component_ancestors_of_local_source(
+            prompt=prompt,
+            source_node_id=boundary_input.source.node_id,
+            component_node_id_set=component_node_id_set,
+        ):
+            return True
+    return False
+
+
 def _order_execute_node_ids_for_transportable_splits(
     *,
     prompt: dict[str, Any],
@@ -2626,12 +2645,21 @@ def _build_component_payload(
         if component.mapped_boundary_input_name is not None or len(component.execute_node_ids) <= 1:
             return None
         if component.local_tap_node_ids:
+            if not _component_has_local_reentry_dependency(
+                prompt=signature_prompt,
+                component=component,
+            ):
+                logger.info(
+                    "Keeping remote component %s as one proxy because it contains non-returning local tap nodes %s.",
+                    component.representative_node_id,
+                    component.local_tap_node_ids,
+                )
+                return None
             logger.info(
-                "Keeping remote component %s as one proxy because it contains non-returning local tap nodes %s.",
+                "Allowing remote component %s with local tap nodes %s to split because it has a local re-entry dependency.",
                 component.representative_node_id,
                 component.local_tap_node_ids,
             )
-            return None
 
         component_node_id_set = set(component.node_ids)
         topological_node_ids = _subgraph_topological_node_order(component_prompt, component_node_id_set)
