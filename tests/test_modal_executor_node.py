@@ -3347,6 +3347,73 @@ def test_remote_modal_does_not_classify_remote_execution_error_as_missing_app(
     assert remote_modal_app_module._is_missing_modal_deployment_error(missing_lookup_error)
 
 
+def test_remote_modal_does_not_redeploy_after_remote_execution_error(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The deployed invocation path should not auto-deploy after a remote runtime failure."""
+
+    class FakeLookupError(Exception):
+        """Stand-in for Modal errors that share the lookup error type."""
+
+    class FakeExecuteMethod:
+        """Minimal Modal method handle that raises a remote execution failure."""
+
+        def remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Raise the wrapped remote traceback from the deployed call."""
+            del payload, kwargs_payload
+            raise FakeLookupError(
+                "Could not deserialize remote exception due to local error:\n"
+                "Here is the remote traceback:\n"
+                "comfyui_modal_sync_cloud.RemoteSubgraphExecutionError: "
+                "Object of type CLIP is not JSON serializable\n"
+                "App 'comfy-modal-sync' not found in environment 'main'."
+            )
+
+    class FakeRemoteEngine:
+        """Minimal deployed remote engine instance."""
+
+        execute_payload = FakeExecuteMethod()
+        runtime_version = types.SimpleNamespace(
+            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+        )
+
+    class FakeModal:
+        """Minimal Modal SDK double with shared lookup/runtime error types."""
+
+        exception = types.SimpleNamespace(
+            NotFoundError=FakeLookupError,
+            ExecutionError=FakeLookupError,
+            InvalidError=FakeLookupError,
+        )
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a deployed class successfully."""
+                del app_name, class_name
+                return lambda **kwargs: FakeRemoteEngine()
+
+    def fail_load_cloud_module() -> Any:
+        """Fail if runtime errors attempt auto-deploy."""
+        raise AssertionError("remote execution errors must not trigger auto-deploy")
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(remote_modal_app_module, "_load_modal_cloud_module", fail_load_cloud_module)
+    monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        with pytest.raises(FakeLookupError, match="Object of type CLIP"):
+            remote_modal_app_module._invoke_modal_payload_blocking(
+                {"component_id": "component-1"},
+                b"{}",
+            )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+
 def test_remote_modal_redeploys_when_cached_app_was_deleted(
     remote_modal_app_module: Any,
     monkeypatch: Any,
