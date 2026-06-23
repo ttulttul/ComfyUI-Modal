@@ -1217,6 +1217,63 @@ def _output_has_non_returning_local_tap(
     return False
 
 
+def _expand_component_for_non_transportable_local_outputs(
+    *,
+    prompt: dict[str, Any],
+    component_node_ids: set[str],
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    nodes_module: Any,
+) -> tuple[set[str], set[str]]:
+    """Absorb local consumers needed to avoid non-transportable component outputs."""
+    expanded_node_ids = set(component_node_ids)
+    added_node_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        upstream_expanded_node_ids, _expansion_reasons = (
+            _expand_remote_node_ids_for_non_transportable_inputs(
+                prompt=prompt,
+                remote_node_ids=expanded_node_ids,
+                nodes_module=nodes_module,
+            )
+        )
+        upstream_added_node_ids = upstream_expanded_node_ids - expanded_node_ids
+        if upstream_added_node_ids:
+            expanded_node_ids = upstream_expanded_node_ids
+            added_node_ids.update(upstream_added_node_ids)
+            changed = True
+
+        for node_id in sorted(expanded_node_ids):
+            prompt_node = prompt.get(node_id)
+            if prompt_node is None:
+                continue
+            node_class = nodes_module.NODE_CLASS_MAPPINGS.get(str(prompt_node.get("class_type")))
+            if node_class is None:
+                continue
+            output_types, _, _ = _normalize_output_metadata(node_class)
+            for output_index, io_type in enumerate(output_types):
+                if _is_transportable_output_type(str(io_type)):
+                    continue
+                source = LinkedOutputRef(node_id=node_id, output_index=output_index)
+                for target in consumers.get(source, []):
+                    target_node_id = str(target.node_id)
+                    if target_node_id in expanded_node_ids or target_node_id in remote_node_ids:
+                        continue
+                    if target_node_id not in prompt:
+                        continue
+                    expanded_node_ids.add(target_node_id)
+                    added_node_ids.add(target_node_id)
+                    changed = True
+                    logger.info(
+                        "Absorbing local node %s because it consumes non-transportable output %s:%d from a preview-tap remote component.",
+                        target_node_id,
+                        source.node_id,
+                        source.output_index,
+                    )
+    return expanded_node_ids, added_node_ids
+
+
 def _remote_output_io_type(
     *,
     prompt: dict[str, Any],
@@ -1767,17 +1824,18 @@ def _build_component_plan(
         )
     component_node_id_set = original_component_node_id_set | local_tap_node_ids
     if local_tap_node_ids:
-        expanded_component_node_id_set, _expansion_reasons = (
-            _expand_remote_node_ids_for_non_transportable_inputs(
+        expanded_component_node_id_set, tap_dependency_node_ids = (
+            _expand_component_for_non_transportable_local_outputs(
                 prompt=prompt,
-                remote_node_ids=component_node_id_set,
+                component_node_ids=component_node_id_set,
+                remote_node_ids=remote_node_ids,
+                consumers=consumers,
                 nodes_module=nodes_module,
             )
         )
-        tap_dependency_node_ids = expanded_component_node_id_set - component_node_id_set
         if tap_dependency_node_ids:
             logger.info(
-                "Absorbing upstream non-transportable dependencies for remote component %s preview taps: %s",
+                "Absorbing non-transportable boundary dependencies for remote component %s preview taps: %s",
                 representative_node_id,
                 sorted(tap_dependency_node_ids),
             )

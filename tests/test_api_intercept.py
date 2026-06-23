@@ -51,6 +51,14 @@ class _FakeVAEDecodeNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeVAEEncodeNode:
+    """Fake VAE encoder that consumes image and VAE inputs and produces a latent."""
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    OUTPUT_IS_LIST = (False,)
+
+
 class _FakeLatentSourceNode:
     """Fake node that produces a transportable LATENT output."""
 
@@ -1254,6 +1262,7 @@ def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
                 "LocalSink": _FakeLocalSinkNode,
                 "PreviewImage": _FakePreviewImageNode,
                 "VAEDecode": _FakeVAEDecodeNode,
+                "VAEEncode": _FakeVAEEncodeNode,
                 "VAELoader": _FakeVAELoaderNode,
             },
             "NODE_DISPLAY_NAME_MAPPINGS": {},
@@ -1264,7 +1273,10 @@ def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
             {"id": 1, "properties": {"is_modal_remote": True}},
             {"id": 2, "properties": {"is_modal_remote": True}},
             {"id": 3, "properties": {"is_modal_remote": False}},
+            {"id": 7, "properties": {"is_modal_remote": False}},
+            {"id": 8, "properties": {"is_modal_remote": False}},
             {"id": 9, "properties": {"is_modal_remote": False}},
+            {"id": 11, "properties": {"is_modal_remote": False}},
             {"id": 90, "properties": {"is_modal_remote": False}},
             {"id": 192, "properties": {"is_modal_remote": False}},
         ]
@@ -1284,6 +1296,21 @@ def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
             "class_type": "VAEDecode",
             "inputs": {"samples": ["1", 0], "vae": ["9", 0]},
             "_meta": {"title": "VAE Decode Preview"},
+        },
+        "8": {
+            "class_type": "VAEEncode",
+            "inputs": {"pixels": ["192", 0], "vae": ["9", 0]},
+            "_meta": {"title": "Local VAE Encode"},
+        },
+        "7": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["8", 0]},
+            "_meta": {"title": "Local Encoded Sink"},
+        },
+        "11": {
+            "class_type": "VAEDecode",
+            "inputs": {"samples": ["1", 0], "vae": ["9", 0]},
+            "_meta": {"title": "Local VAE Decode"},
         },
         "90": {
             "class_type": "PreviewImage",
@@ -1314,22 +1341,30 @@ def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
     assert summary.remote_component_ids == ["1"]
     assert set(summary.component_node_ids_by_representative["1"]) == {
         "1",
+        "11",
         "2",
+        "7",
+        "8",
         "9",
         "90",
         "192",
     }
     assert summary.rewritten_node_id_map == {
         "1": "1",
+        "11": "1",
         "2": "1",
+        "7": "1",
+        "8": "1",
         "9": "1",
         "90": "1",
         "192": "1",
     }
 
     payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
-    assert set(payload["component_node_ids"]) == {"1", "2", "9", "90", "192"}
+    assert set(payload["component_node_ids"]) == {"1", "2", "7", "8", "9", "11", "90", "192"}
     assert payload["subgraph_prompt"]["9"]["class_type"] == "VAELoader"
+    assert payload["subgraph_prompt"]["8"]["class_type"] == "VAEEncode"
+    assert payload["subgraph_prompt"]["11"]["class_type"] == "VAEDecode"
     assert payload["subgraph_prompt"]["192"]["class_type"] == "VAEDecode"
     assert payload["execute_node_ids"] == ["2", "90"]
     assert payload["boundary_inputs"] == []
@@ -1341,7 +1376,7 @@ def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
             "io_type": "LATENT",
             "is_list": False,
             "preview_target_node_ids": [],
-        }
+        },
     ]
     assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 0]
 
