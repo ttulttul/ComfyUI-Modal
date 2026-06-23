@@ -32,7 +32,8 @@
    If the coarse transport-aware split would create a cyclic quotient between components, the backend merges that SCC back into one larger remote component before rewrite.
 5. Each component is replaced with a generated `ModalUniversalExecutor_<hash>` proxy node.
 6. Boundary inputs are serialized, referenced assets are synced, and the component executes locally or remotely.
-7. Exported boundary outputs are deserialized back into normal ComfyUI values for the rest of the graph.
+7. Unmarked local branches, including preview/UI side-effect nodes from custom node packs, remain local and consume exported proxy outputs; they are not added to remote execution just because they tap a remote value.
+8. Exported boundary outputs are deserialized back into normal ComfyUI values for the rest of the graph.
 
 The list above is the shortest accurate summary. If you want the execution path in a more algorithmic form, the pipeline below follows the same request from the frontend toggle through queue-time rewrite, remote dispatch, remote execution, and reintegration into the local graph.
 

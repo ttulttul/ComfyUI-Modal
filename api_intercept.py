@@ -134,6 +134,7 @@ class RemoteComponentPlan:
     static_execute_node_ids: list[str] = field(default_factory=list)
     static_to_mapped_boundaries: list[StaticToMappedBoundarySpec] = field(default_factory=list)
     local_tap_node_ids: list[str] = field(default_factory=list)
+    local_tap_terminal_node_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1155,6 +1156,21 @@ def _downstream_node_ids_from_targets(
     return visited_node_ids
 
 
+def _is_non_returning_tap_terminal_node(
+    *,
+    prompt_node: dict[str, Any] | None,
+    nodes_module: Any,
+) -> bool:
+    """Return whether a local tap node should stay local instead of being absorbed."""
+    if prompt_node is None:
+        return False
+    class_type = str(prompt_node.get("class_type"))
+    if class_type == "PreviewImage":
+        return True
+    node_class = nodes_module.NODE_CLASS_MAPPINGS.get(class_type)
+    return bool(getattr(node_class, "OUTPUT_NODE", False))
+
+
 def _non_returning_local_tap_node_ids(
     *,
     prompt: dict[str, Any],
@@ -1162,9 +1178,10 @@ def _non_returning_local_tap_node_ids(
     remote_node_ids: set[str],
     consumers: dict[LinkedOutputRef, list[InputTarget]],
     nodes_module: Any,
-) -> set[str]:
-    """Return local downstream nodes that can run remotely as non-returning tap branches."""
+) -> tuple[set[str], set[str]]:
+    """Return non-returning local tap branches without making local nodes remote."""
     local_tap_node_ids: set[str] = set()
+    local_tap_terminal_node_ids: set[str] = set()
     for component_node_id in sorted(component_node_ids):
         for source in _node_output_refs(prompt, component_node_id, nodes_module):
             output_consumers = consumers.get(source, [])
@@ -1190,8 +1207,8 @@ def _non_returning_local_tap_node_ids(
                 )
                 if branch_node_ids & remote_node_ids:
                     continue
-                local_tap_node_ids.update(branch_node_ids)
-    return local_tap_node_ids
+                local_tap_terminal_node_ids.update(branch_node_ids)
+    return local_tap_node_ids, local_tap_terminal_node_ids
 
 
 def _output_has_non_returning_local_tap(
@@ -1261,6 +1278,11 @@ def _expand_component_for_non_transportable_local_outputs(
                     if target_node_id in expanded_node_ids or target_node_id in remote_node_ids:
                         continue
                     if target_node_id not in prompt:
+                        continue
+                    if _is_non_returning_tap_terminal_node(
+                        prompt_node=prompt.get(target_node_id),
+                        nodes_module=nodes_module,
+                    ):
                         continue
                     expanded_node_ids.add(target_node_id)
                     added_node_ids.add(target_node_id)
@@ -1809,7 +1831,7 @@ def _build_component_plan(
     """Build rewrite metadata for a connected remote component."""
     original_component_node_id_set = set(component_node_ids)
     representative_node_id = component_node_ids[0]
-    local_tap_node_ids = _non_returning_local_tap_node_ids(
+    local_tap_node_ids, local_tap_terminal_node_ids = _non_returning_local_tap_node_ids(
         prompt=prompt,
         component_node_ids=original_component_node_id_set,
         remote_node_ids=remote_node_ids,
@@ -1821,6 +1843,12 @@ def _build_component_plan(
             "Absorbing non-returning local tap nodes into remote component %s: %s",
             representative_node_id,
             sorted(local_tap_node_ids),
+        )
+    if local_tap_terminal_node_ids:
+        logger.info(
+            "Keeping non-returning local tap terminal nodes outside remote component %s: %s",
+            representative_node_id,
+            sorted(local_tap_terminal_node_ids),
         )
     component_node_id_set = original_component_node_id_set | local_tap_node_ids
     if local_tap_node_ids:
@@ -2028,9 +2056,10 @@ def _build_component_plan(
         static_execute_node_ids=static_execute_node_ids,
         static_to_mapped_boundaries=static_to_mapped_boundaries,
         local_tap_node_ids=sorted(local_tap_node_ids),
+        local_tap_terminal_node_ids=sorted(local_tap_terminal_node_ids),
     )
     logger.info(
-        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s static_nodes=%s mapped_nodes=%s mapped_execute_nodes=%s static_execute_nodes=%s local_tap_nodes=%s static_to_mapped_boundaries=%s",
+        "Planned remote component %s: nodes=%s boundary_inputs=%d boundary_outputs=%d execute_nodes=%s output_node=%s mapped_input=%s static_nodes=%s mapped_nodes=%s mapped_execute_nodes=%s static_execute_nodes=%s local_tap_nodes=%s local_tap_terminal_nodes=%s static_to_mapped_boundaries=%s",
         component.representative_node_id,
         component.node_ids,
         len(component.boundary_inputs),
@@ -2043,6 +2072,7 @@ def _build_component_plan(
         component.mapped_execute_node_ids,
         component.static_execute_node_ids,
         component.local_tap_node_ids,
+        component.local_tap_terminal_node_ids,
         [
             {
                 "proxy_name": boundary_spec.proxy_name,

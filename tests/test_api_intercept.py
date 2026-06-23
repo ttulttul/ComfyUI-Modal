@@ -1126,13 +1126,13 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
     assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 
 
-def test_rewrite_absorbs_non_returning_local_preview_taps(
+def test_rewrite_keeps_non_returning_local_preview_taps_local(
     api_intercept_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Local preview branches that never feed remote again should not split a remote chain."""
+    """Local preview branches should stay local even when a remote chain continues."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -1204,36 +1204,32 @@ def test_rewrite_absorbs_non_returning_local_preview_taps(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "3"}
-    assert summary.remote_component_ids == ["1"]
-    assert summary.component_node_ids_by_representative == {"1": ["1", "2", "9"]}
-    assert summary.rewritten_node_id_map == {"1": "1", "2": "1", "9": "1"}
+    assert set(rewritten_prompt) == {"1", "2", "3", "9"}
+    assert summary.remote_component_ids == ["1", "2"]
+    assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
 
-    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
-    assert payload["component_node_ids"] == ["1", "2", "9"]
-    assert payload["subgraph_prompt"]["9"]["class_type"] == "PreviewImage"
-    assert payload["execute_node_ids"] == ["2", "9"]
-    assert payload["boundary_inputs"] == []
-    assert payload["boundary_outputs"] == [
-        {
-            "proxy_output_name": "2_image",
-            "node_id": "2",
-            "output_index": 0,
-            "io_type": "IMAGE",
-            "is_list": False,
-            "preview_target_node_ids": [],
-        }
+    remote_payloads = [
+        rewritten_node["inputs"]["original_node_data"]
+        for rewritten_node in rewritten_prompt.values()
+        if isinstance(rewritten_node.get("inputs"), dict)
+        and "original_node_data" in rewritten_node["inputs"]
     ]
-    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 0]
+    assert remote_payloads
+    assert all("9" not in payload["component_node_ids"] for payload in remote_payloads)
+    assert all("9" not in payload["subgraph_prompt"] for payload in remote_payloads)
+    assert all("9" not in payload["execute_node_ids"] for payload in remote_payloads)
+    assert rewritten_prompt["9"]["inputs"]["images"] == ["1", 0]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 
 
-def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
+def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
     api_intercept_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Absorbed local decode previews should not leave VAE as a boundary input."""
+    """Unmarked preview producer nodes must not execute remotely."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -1337,48 +1333,25 @@ def test_rewrite_absorbed_preview_taps_pull_non_transportable_upstream_deps(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "3"}
-    assert summary.remote_component_ids == ["1"]
-    assert set(summary.component_node_ids_by_representative["1"]) == {
-        "1",
-        "11",
-        "2",
-        "7",
-        "8",
-        "9",
-        "90",
-        "192",
-    }
-    assert summary.rewritten_node_id_map == {
-        "1": "1",
-        "11": "1",
-        "2": "1",
-        "7": "1",
-        "8": "1",
-        "9": "1",
-        "90": "1",
-        "192": "1",
-    }
+    assert set(rewritten_prompt) == {"1", "2", "3", "7", "8", "9", "11", "90", "192"}
+    assert summary.remote_component_ids == ["1", "2"]
+    assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
 
-    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
-    assert set(payload["component_node_ids"]) == {"1", "2", "7", "8", "9", "11", "90", "192"}
-    assert payload["subgraph_prompt"]["9"]["class_type"] == "VAELoader"
-    assert payload["subgraph_prompt"]["8"]["class_type"] == "VAEEncode"
-    assert payload["subgraph_prompt"]["11"]["class_type"] == "VAEDecode"
-    assert payload["subgraph_prompt"]["192"]["class_type"] == "VAEDecode"
-    assert payload["execute_node_ids"] == ["2", "90"]
-    assert payload["boundary_inputs"] == []
-    assert payload["boundary_outputs"] == [
-        {
-            "proxy_output_name": "2_latent",
-            "node_id": "2",
-            "output_index": 0,
-            "io_type": "LATENT",
-            "is_list": False,
-            "preview_target_node_ids": [],
-        },
+    remote_payloads = [
+        rewritten_node["inputs"]["original_node_data"]
+        for rewritten_node in rewritten_prompt.values()
+        if isinstance(rewritten_node.get("inputs"), dict)
+        and "original_node_data" in rewritten_node["inputs"]
     ]
-    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 0]
+    local_node_ids = {"7", "8", "9", "11", "90", "192"}
+    assert len(remote_payloads) == 2
+    for payload in remote_payloads:
+        assert not (local_node_ids & set(payload["component_node_ids"]))
+        assert not (local_node_ids & set(payload["subgraph_prompt"]))
+        assert not (local_node_ids & set(payload["execute_node_ids"]))
+    assert rewritten_prompt["90"]["inputs"]["images"] == ["192", 0]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 
 
 def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
