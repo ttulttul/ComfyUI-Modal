@@ -246,14 +246,25 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
 
 
 def test_streamed_modal_node_progress_fades_previous_active_node() -> None:
-    """When remote progress moves to another node, the old active node should stop rendering purple."""
+    """Only same-component progress should complete the previous active node."""
     source = _modal_toggle_source()
 
+    assert "function nodesShareRemoteComponent(promptId, leftNodeId, rightNodeId)" in source
     assert "const previousActiveNodeId = promptState.activeNodeId;" in source
-    assert "previousActiveNodeId && previousActiveNodeId !== progressNodeId" in source
+    assert "previousActiveNodeId !== progressNodeId" in source
+    assert "nodesShareRemoteComponent(promptId, previousActiveNodeId, progressNodeId)" in source
     assert "fadeNodeProgress(previousActiveNodeId, promptId);" in source
     assert "setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);" in source
     assert "setPromptActiveNode(promptId, progressNodeId);" in source
+
+
+def test_parallel_component_progress_does_not_complete_other_active_nodes() -> None:
+    """Parallel component progress should not treat the prompt-wide previous active node as complete."""
+    source = _modal_toggle_source()
+
+    assert "nodesShareRemoteComponent(promptId, previousActiveNodeId, nextActiveNodeId)" in source
+    assert "nodesShareRemoteComponent(promptId, previousActiveNodeId, progressNodeId)" in source
+    assert "promptState.activeNodeId && nodeIds.includes(promptState.activeNodeId)" in source
 
 
 def test_streamed_modal_node_progress_completes_reported_ancestors() -> None:

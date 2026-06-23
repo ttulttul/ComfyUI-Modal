@@ -1153,6 +1153,24 @@ function completeRemoteAncestorsBeforeActiveNode(promptId, ancestorNodeIds, acti
 }
 
 /**
+ * Return whether two nodes belong to the same known remote component.
+ * @param {string} promptId
+ * @param {string | null | undefined} leftNodeId
+ * @param {string | null | undefined} rightNodeId
+ * @returns {boolean}
+ */
+function nodesShareRemoteComponent(promptId, leftNodeId, rightNodeId) {
+  if (!leftNodeId || !rightNodeId) {
+    return false;
+  }
+  const leftComponentNodeIds = resolveComponentNodeIds(promptId, leftNodeId);
+  if (!leftComponentNodeIds?.length) {
+    return String(leftNodeId) === String(rightNodeId);
+  }
+  return leftComponentNodeIds.map((nodeIdValue) => String(nodeIdValue)).includes(String(rightNodeId));
+}
+
+/**
  * Return the numeric progress payload for one node when it belongs to the prompt.
  * @param {string} nodeIdValue
  * @param {string} promptId
@@ -2527,7 +2545,11 @@ function handleModalStatus(event) {
       });
     }
     setNodesPhase(nodeIds, STATE_READY, promptId);
-    if (previousActiveNodeId && previousActiveNodeId !== nextActiveNodeId) {
+    if (
+      previousActiveNodeId &&
+      previousActiveNodeId !== nextActiveNodeId &&
+      nodesShareRemoteComponent(promptId, previousActiveNodeId, nextActiveNodeId)
+    ) {
       fadeNodeProgress(previousActiveNodeId, promptId);
       setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
     }
@@ -2547,11 +2569,11 @@ function handleModalStatus(event) {
     clearPromptQueued(promptId);
     promptState.hasStreamedProgress = true;
     promptState.hasRemoteExecutionStarted = true;
-    if (promptState.activeNodeId) {
+    if (promptState.activeNodeId && nodeIds.includes(promptState.activeNodeId)) {
       fadeNodeProgress(promptState.activeNodeId, promptId);
       setNodesPhase([promptState.activeNodeId], STATE_COMPLETE, promptId);
+      setPromptActiveNode(promptId, null);
     }
-    setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_COMPLETE, promptId);
     return;
   }
@@ -2659,7 +2681,11 @@ function handleModalProgress(event) {
     setNodesPhase(readyNodeIds, STATE_READY, promptId);
   }
   const previousActiveNodeId = promptState.activeNodeId;
-  if (previousActiveNodeId && previousActiveNodeId !== progressNodeId) {
+  if (
+    previousActiveNodeId &&
+    previousActiveNodeId !== progressNodeId &&
+    nodesShareRemoteComponent(promptId, previousActiveNodeId, progressNodeId)
+  ) {
     fadeNodeProgress(previousActiveNodeId, promptId);
     setNodesPhase([previousActiveNodeId], STATE_COMPLETE, promptId);
   }
