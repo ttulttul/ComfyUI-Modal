@@ -11,6 +11,7 @@ const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
 const SETUP_BORDER_COLOR = "#f59e0b";
+const STARTING_BORDER_COLOR = "#eab308";
 const FINALIZING_BORDER_COLOR = "#3b82f6";
 const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";
 const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";
@@ -255,14 +256,14 @@ function effectiveGlobalStatusPhase(promptId, phase) {
   if (phase === STATE_FINALIZING) {
     if (
       promptState?.hasRemoteExecutionStarted ||
-      promptState?.activeNodeId ||
+      promptActiveNodeIsLive(promptId) ||
       nodeStates.some((state) => state.phase === STATE_ACTIVE || state.phase === STATE_READY)
     ) {
       return EXECUTION_PHASE;
     }
     return STATE_FINALIZING;
   }
-  if (promptState?.hasRemoteExecutionStarted && promptState?.activeNodeId) {
+  if (promptState?.hasRemoteExecutionStarted && promptActiveNodeIsLive(promptId)) {
     return EXECUTION_PHASE;
   }
   if (promptState?.hasRemoteExecutionStarted && nodeStates.some((state) => state.phase === STATE_ACTIVE)) {
@@ -288,7 +289,7 @@ function promptHasLiveRemoteWork(promptId) {
     return false;
   }
 
-  if (promptState.activeNodeId) {
+  if (promptActiveNodeIsLive(promptId)) {
     return true;
   }
 
@@ -303,6 +304,24 @@ function promptHasLiveRemoteWork(promptId) {
       [STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE].includes(nodeState.phase)
     );
   });
+}
+
+/**
+ * Return whether the prompt-wide active node still represents live execution.
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function promptActiveNodeIsLive(promptId) {
+  const promptState = modalPromptStates.get(promptId);
+  const activeNodeId = promptState?.activeNodeId;
+  if (!activeNodeId) {
+    return false;
+  }
+  if (hasLiveNodeProgress(activeNodeId, promptId)) {
+    return true;
+  }
+  const activeNodeState = modalNodeStates.get(String(activeNodeId));
+  return activeNodeState?.promptId === promptId && activeNodeState.phase === STATE_ACTIVE;
 }
 
 /**
@@ -463,7 +482,14 @@ function refreshGlobalStatusElement() {
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
     text.textContent = activeState.statusMessage ?? "Syncing graph with Modal";
-  } else if (activeState.phase === STATE_STARTING || activeState.phase === STATE_WAITING) {
+  } else if (activeState.phase === STATE_STARTING) {
+    element.style.borderColor = "rgba(234, 179, 8, 0.58)";
+    element.style.background = "rgba(54, 45, 6, 0.94)";
+    dot.style.background = STARTING_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(234, 179, 8, 0.2)";
+    dot.style.animation = "modal-status-pulse 0.85s ease-in-out infinite";
+    text.textContent = activeState.statusMessage ?? "Starting Modal component";
+  } else if (activeState.phase === STATE_WAITING) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
     element.style.background = "rgba(61, 42, 9, 0.94)";
     dot.style.background = SETUP_BORDER_COLOR;
@@ -909,6 +935,7 @@ function scheduleNodeClear(nodeIdValue, promptId, delayMs) {
     modalNodeStates.delete(nodeIdValue);
     modalNodeClearTimers.delete(nodeIdValue);
     ensureAnimationLoop();
+    reconcilePromptGlobalStatus(promptId);
     app.graph?.setDirtyCanvas(true, true);
   }, delayMs);
   modalNodeClearTimers.set(nodeIdValue, timerId);
@@ -923,6 +950,7 @@ function scheduleNodeClear(nodeIdValue, promptId, delayMs) {
  */
 function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
   const affectedAncestorNodeIds = new Set();
+  const promptState = promptId ? modalPromptStates.get(promptId) : null;
   for (const currentNodeId of nodeIds) {
     if (!shouldApplyPromptState(currentNodeId, promptId)) {
       continue;
@@ -950,6 +978,9 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     }
     if (phase === STATE_COMPLETE) {
       fadeNodeProgress(currentNodeId, promptId);
+      if (promptState?.activeNodeId === String(currentNodeId)) {
+        promptState.activeNodeId = null;
+      }
     }
     if (phase === STATE_ERROR) {
       clearNodeProgress(currentNodeId, promptId);
@@ -962,6 +993,9 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage);
   }
   ensureAnimationLoop();
+  if ([STATE_COMPLETE, STATE_FINALIZING, STATE_ERROR].includes(phase)) {
+    reconcilePromptGlobalStatus(promptId);
+  }
   app.graph?.setDirtyCanvas(true, true);
 }
 
@@ -2161,12 +2195,19 @@ function drawRemoteNodeDecoration(node, ctx) {
   let shadowColor = "rgba(29, 155, 240, 0.35)";
   let fillColor = null;
 
-  if (state?.phase === STATE_SETUP || state?.phase === STATE_STARTING) {
+  if (state?.phase === STATE_SETUP) {
     const pulse = (Math.sin(elapsed * 5) + 1) / 2;
     borderColor = `${SETUP_BORDER_COLOR}${Math.round((0.65 + pulse * 0.35) * 255)
       .toString(16)
       .padStart(2, "0")}`;
     shadowColor = `rgba(245, 158, 11, ${0.25 + pulse * 0.35})`;
+  } else if (state?.phase === STATE_STARTING) {
+    const pulse = (Math.sin(elapsed * 8) + 1) / 2;
+    borderColor = `${STARTING_BORDER_COLOR}${Math.round((0.58 + pulse * 0.42) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(234, 179, 8, ${0.2 + pulse * 0.42})`;
+    fillColor = `rgba(250, 204, 21, ${0.08 + pulse * 0.08})`;
   } else if (state?.phase === STATE_READY) {
     const pulseRate = state?.isCachedRemoteNode ? 2 : 6;
     const pulse = (Math.sin(elapsed * pulseRate) + 1) / 2;
