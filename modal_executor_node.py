@@ -78,7 +78,7 @@ _MODAL_MAP_WARMUP_CONTEXTS: dict[str, "_ModalMapWarmupContext"] = {}
 _MODAL_WORKFLOW_EXECUTION_GATE = threading.Condition()
 _MODAL_WORKFLOW_ACTIVE_PROMPT_ID: str | None = None
 _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS = 0
-_MODAL_WORKFLOW_ABANDONED_PROMPT_IDS: set[str] = set()
+_MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID: dict[str, int] = {}
 
 
 @dataclass(frozen=True)
@@ -145,17 +145,26 @@ def _release_modal_workflow_execution_slot(prompt_id: str | None, component_id: 
 
     global _MODAL_WORKFLOW_ACTIVE_PROMPT_ID
     global _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS
-    global _MODAL_WORKFLOW_ABANDONED_PROMPT_IDS
+    global _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID
 
     with _MODAL_WORKFLOW_EXECUTION_GATE:
         if _MODAL_WORKFLOW_ACTIVE_PROMPT_ID != prompt_id:
-            if prompt_id in _MODAL_WORKFLOW_ABANDONED_PROMPT_IDS:
+            abandoned_release_count = _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID.get(
+                prompt_id,
+                0,
+            )
+            if abandoned_release_count > 0:
                 logger.debug(
                     "Ignoring Modal workflow gate release for abandoned prompt=%s component=%s.",
                     prompt_id,
                     component_id,
                 )
-                _MODAL_WORKFLOW_ABANDONED_PROMPT_IDS.discard(prompt_id)
+                if abandoned_release_count == 1:
+                    _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID.pop(prompt_id, None)
+                else:
+                    _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID[prompt_id] = (
+                        abandoned_release_count - 1
+                    )
             else:
                 logger.warning(
                     "Ignoring Modal workflow gate release for prompt=%s component=%s because active prompt is %s.",
@@ -174,7 +183,7 @@ def _release_modal_workflow_execution_slot(prompt_id: str | None, component_id: 
         )
         if _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS == 0:
             _MODAL_WORKFLOW_ACTIVE_PROMPT_ID = None
-            _MODAL_WORKFLOW_ABANDONED_PROMPT_IDS.discard(prompt_id)
+            _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID.pop(prompt_id, None)
             _MODAL_WORKFLOW_EXECUTION_GATE.notify_all()
 
 
@@ -186,7 +195,7 @@ def abandon_modal_workflow_execution_prompt(prompt_id: str | None, reason: str) 
 
     global _MODAL_WORKFLOW_ACTIVE_PROMPT_ID
     global _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS
-    global _MODAL_WORKFLOW_ABANDONED_PROMPT_IDS
+    global _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID
 
     with _MODAL_WORKFLOW_EXECUTION_GATE:
         if _MODAL_WORKFLOW_ACTIVE_PROMPT_ID != normalized_prompt_id:
@@ -198,7 +207,9 @@ def abandon_modal_workflow_execution_prompt(prompt_id: str | None, reason: str) 
             _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS,
             reason,
         )
-        _MODAL_WORKFLOW_ABANDONED_PROMPT_IDS.add(normalized_prompt_id)
+        _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID[normalized_prompt_id] = (
+            _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS
+        )
         _MODAL_WORKFLOW_ACTIVE_PROMPT_ID = None
         _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS = 0
         _MODAL_WORKFLOW_EXECUTION_GATE.notify_all()

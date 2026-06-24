@@ -278,7 +278,7 @@ def test_modal_proxy_allows_same_prompt_components_to_overlap(
             observed_events.append(f"finish:{component_id}")
             return (component_id,)
 
-    async def run_scenario() -> tuple[Any, Any]:
+    async def run_scenario() -> tuple[Any, Any, Any]:
         """Run two same-prompt proxy components concurrently."""
         first_task = asyncio.create_task(
             proxy_class.execute(
@@ -426,13 +426,14 @@ def test_abandoned_modal_prompt_gate_unblocks_next_prompt(
         is_output_node=False,
     )
     proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
-    first_started = asyncio.Event()
+    started_first_components: set[str] = set()
+    first_components_started = asyncio.Event()
     second_started = asyncio.Event()
-    release_first = asyncio.Event()
+    release_first_components = asyncio.Event()
     observed_events: list[str] = []
 
     class FakeClient:
-        """Fake async remote client that lets one cancelled prompt stay stuck."""
+        """Fake async remote client that lets cancelled prompt components stay stuck."""
 
         async def execute_payload_async(
             self,
@@ -443,9 +444,11 @@ def test_abandoned_modal_prompt_gate_unblocks_next_prompt(
             del kwargs
             component_id = str(payload["component_id"])
             observed_events.append(f"start:{component_id}")
-            if component_id == "component-1":
-                first_started.set()
-                await release_first.wait()
+            if component_id in {"component-1a", "component-1b"}:
+                started_first_components.add(component_id)
+                if started_first_components == {"component-1a", "component-1b"}:
+                    first_components_started.set()
+                await release_first_components.wait()
             if component_id == "component-2":
                 second_started.set()
             observed_events.append(f"finish:{component_id}")
@@ -453,17 +456,27 @@ def test_abandoned_modal_prompt_gate_unblocks_next_prompt(
 
     async def run_scenario() -> tuple[Any, Any]:
         """Abandon prompt one, then prove prompt two can start before prompt one exits."""
-        first_task = asyncio.create_task(
+        first_task_a = asyncio.create_task(
             proxy_class.execute(
                 original_node_data={
                     "payload_kind": "subgraph",
                     "prompt_id": "prompt-1",
-                    "component_id": "component-1",
+                    "component_id": "component-1a",
                 },
-                unique_id="component-1",
+                unique_id="component-1a",
             )
         )
-        await first_started.wait()
+        first_task_b = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "prompt-1",
+                    "component_id": "component-1b",
+                },
+                unique_id="component-1b",
+            )
+        )
+        await first_components_started.wait()
 
         second_task = asyncio.create_task(
             proxy_class.execute(
@@ -485,24 +498,22 @@ def test_abandoned_modal_prompt_gate_unblocks_next_prompt(
         await asyncio.wait_for(second_started.wait(), timeout=1.0)
         second_output = await second_task
 
-        release_first.set()
-        first_output = await first_task
-        return first_output, second_output
+        release_first_components.set()
+        first_output_a, first_output_b = await asyncio.gather(first_task_a, first_task_b)
+        return first_output_a, first_output_b, second_output
 
     modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
     try:
-        first_output, second_output = asyncio.run(run_scenario())
+        first_output_a, first_output_b, second_output = asyncio.run(run_scenario())
     finally:
         modal_executor_module.set_remote_executor_client_factory(None)
 
-    assert first_output.result == ("component-1",)
+    assert first_output_a.result == ("component-1a",)
+    assert first_output_b.result == ("component-1b",)
     assert second_output.result == ("component-2",)
-    assert observed_events == [
-        "start:component-1",
-        "start:component-2",
-        "finish:component-2",
-        "finish:component-1",
-    ]
+    assert set(observed_events[:2]) == {"start:component-1a", "start:component-1b"}
+    assert observed_events[2:4] == ["start:component-2", "finish:component-2"]
+    assert set(observed_events[4:]) == {"finish:component-1a", "finish:component-1b"}
 
 
 class _FakeImplicitBatchKSamplerNode:
