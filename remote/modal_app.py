@@ -2763,6 +2763,38 @@ def _propagate_remote_interrupt_request(
         )
 
 
+def _handle_modal_wait_cancellation(
+    payload: dict[str, Any],
+    cancellation_event: threading.Event,
+    *,
+    interrupt_sent: bool,
+    cancellation_started_at: float | None,
+) -> tuple[bool, float | None]:
+    """Propagate and bound local waiting after cancellation during any Modal wait phase."""
+    if not _sync_local_interrupt_to_cancellation_event(payload, cancellation_event):
+        return interrupt_sent, cancellation_started_at
+
+    if not interrupt_sent:
+        _request_remote_interrupt(payload)
+        return True, time.monotonic()
+
+    if cancellation_started_at is None:
+        return interrupt_sent, time.monotonic()
+
+    grace_seconds = max(0.0, get_settings().remote_cancel_grace_seconds)
+    if time.monotonic() - cancellation_started_at >= grace_seconds:
+        logger.info(
+            "Modal component=%s did not reach a cancellable remote call within %.3fs of local interrupt; releasing the local prompt while remote cancellation continues.",
+            payload.get("component_id"),
+            grace_seconds,
+        )
+        raise ModalRemoteInvocationError(
+            "Remote Modal call did not reach a cancellable remote phase after local interrupt propagation."
+        )
+
+    return interrupt_sent, cancellation_started_at
+
+
 def _invoke_remote_call_with_interrupts(
     *,
     payload: dict[str, Any],
@@ -5160,6 +5192,12 @@ def _invoke_remote_engine_payload(
     cancellation_event: threading.Event | None,
 ) -> bytes:
     """Invoke one prepared remote engine instance with optional progress streaming."""
+    if cancellation_event is not None and cancellation_event.is_set():
+        _request_remote_interrupt(payload)
+        raise ModalRemoteInvocationError(
+            "Remote Modal payload dispatch was cancelled before the remote call started."
+        )
+
     stream_method = getattr(remote_engine, "execute_payload_stream", None)
     interrupt_remote_call = _build_remote_interrupt_callback(remote_engine, payload)
     if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
@@ -5363,13 +5401,20 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
         kwargs_payload,
         cancellation_event,
     )
+    interrupt_sent = False
+    cancellation_started_at: float | None = None
     try:
         while True:
             try:
                 response = future.result(timeout=0.1)
                 break
             except FutureTimeoutError:
-                _sync_local_interrupt_to_cancellation_event(payload, cancellation_event)
+                interrupt_sent, cancellation_started_at = _handle_modal_wait_cancellation(
+                    payload,
+                    cancellation_event,
+                    interrupt_sent=interrupt_sent,
+                    cancellation_started_at=cancellation_started_at,
+                )
                 continue
     except Exception:
         if cancellation_event.is_set() or _local_processing_interrupted():
@@ -5423,13 +5468,20 @@ async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: by
         cancellation_event,
     )
     wrapped_future = asyncio.wrap_future(future)
+    interrupt_sent = False
+    cancellation_started_at: float | None = None
     try:
         while True:
             try:
                 response = await asyncio.wait_for(asyncio.shield(wrapped_future), timeout=0.1)
                 break
             except asyncio.TimeoutError:
-                _sync_local_interrupt_to_cancellation_event(payload, cancellation_event)
+                interrupt_sent, cancellation_started_at = _handle_modal_wait_cancellation(
+                    payload,
+                    cancellation_event,
+                    interrupt_sent=interrupt_sent,
+                    cancellation_started_at=cancellation_started_at,
+                )
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()
