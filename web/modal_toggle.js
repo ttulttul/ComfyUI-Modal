@@ -13,6 +13,7 @@ const IDLE_BORDER_COLOR = "#1d9bf0";
 const SETUP_BORDER_COLOR = "#f59e0b";
 const STARTING_BORDER_COLOR = "#eab308";
 const FINALIZING_BORDER_COLOR = "#3b82f6";
+const CANCELLING_BORDER_COLOR = "#fb7185";
 const READY_ACTIVE_COMPONENT_BORDER_COLOR = "#22c55e";
 const READY_INACTIVE_COMPONENT_BORDER_COLOR = "#166534";
 const ACTIVE_BORDER_COLOR = "#a855f7";
@@ -25,6 +26,7 @@ const STATE_SETUP = "setup";
 const STATE_STARTING = "starting";
 const STATE_WAITING = "waiting";
 const STATE_FINALIZING = "finalizing";
+const STATE_CANCELLING = "cancelling";
 const EXECUTION_PHASE = "executing";
 const STATE_READY = "ready";
 const STATE_ACTIVE = "active";
@@ -43,6 +45,7 @@ const modalNodeCachedStates = new Map();
 const modalNodeClearTimers = new Map();
 const modalPromptStates = new Map();
 const modalTerminalPromptStates = new Map();
+const modalCancellingPromptIds = new Set();
 const modalQueuedPromptIds = new Set();
 const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
@@ -131,6 +134,7 @@ function markPromptTerminal(promptId, phase) {
   if (!promptId) {
     return;
   }
+  modalCancellingPromptIds.delete(promptId);
   modalTerminalPromptStates.set(promptId, {
     phase,
     terminalAt: nowMs(),
@@ -146,7 +150,17 @@ function clearPromptTerminal(promptId) {
     return;
   }
   modalTerminalPromptStates.delete(promptId);
+  modalCancellingPromptIds.delete(promptId);
   clearPromptQueued(promptId);
+}
+
+/**
+ * Return whether one prompt has a user-requested cancellation in progress.
+ * @param {string} promptId
+ * @returns {boolean}
+ */
+function isPromptCancelling(promptId) {
+  return Boolean(promptId) && modalCancellingPromptIds.has(promptId);
 }
 
 /**
@@ -246,6 +260,9 @@ function effectiveGlobalStatusPhase(promptId, phase) {
 
   if (phase === STATE_ERROR) {
     return STATE_ERROR;
+  }
+  if (phase === STATE_CANCELLING || nodeStates.some((state) => state.phase === STATE_CANCELLING)) {
+    return STATE_CANCELLING;
   }
   if (phase === STATE_SETUP || phase === STATE_STARTING || phase === STATE_WAITING) {
     return phase;
@@ -422,6 +439,7 @@ function currentGlobalStatus() {
 
   return (
     phases.find((state) => state.phase === STATE_ERROR) ??
+    phases.find((state) => state.phase === STATE_CANCELLING) ??
     phases.find((state) => state.phase === STATE_SETUP) ??
     phases.find((state) => state.phase === STATE_STARTING) ??
     phases.find((state) => state.phase === STATE_WAITING) ??
@@ -516,6 +534,13 @@ function refreshGlobalStatusElement() {
     dot.style.boxShadow = "0 0 0 6px rgba(59, 130, 246, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
     text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";
+  } else if (activeState.phase === STATE_CANCELLING) {
+    element.style.borderColor = "rgba(251, 113, 133, 0.58)";
+    element.style.background = "rgba(76, 5, 25, 0.94)";
+    dot.style.background = CANCELLING_BORDER_COLOR;
+    dot.style.boxShadow = "0 0 0 6px rgba(251, 113, 133, 0.2)";
+    dot.style.animation = "modal-status-pulse 0.75s ease-in-out infinite";
+    text.textContent = activeState.statusMessage ?? "Cancelling Modal workflow";
   } else if (activeState.phase === STATE_ERROR) {
     element.style.borderColor = "rgba(239, 68, 68, 0.55)";
     element.style.background = "rgba(69, 10, 10, 0.94)";
@@ -605,6 +630,80 @@ function clearGlobalStatusPhase(promptId) {
   }
   modalGlobalStatusStates.delete(promptId);
   refreshGlobalStatusElement();
+}
+
+/**
+ * Show immediate cancellation feedback for one Modal prompt.
+ * @param {string} promptId
+ */
+function markPromptCancellationRequested(promptId) {
+  if (!promptId || isPromptTerminal(promptId)) {
+    return;
+  }
+  const promptState = modalPromptStates.get(promptId);
+  const stateNodeIds = Array.from(modalNodeStates.entries())
+    .filter(([, state]) => state?.promptId === promptId)
+    .map(([nodeIdValue]) => nodeIdValue);
+  const remoteNodeIds = promptState?.remoteNodeIds?.length ? promptState.remoteNodeIds : stateNodeIds;
+  if (remoteNodeIds.length === 0 && !modalGlobalStatusStates.has(promptId)) {
+    return;
+  }
+  modalCancellingPromptIds.add(promptId);
+  clearPromptQueued(promptId);
+  endSyntheticExecutionUi(promptId);
+  setPromptActiveNode(promptId, null);
+  setGlobalStatusPhase(promptId, STATE_CANCELLING, remoteNodeIds.length || 1, {
+    message: "Cancelling Modal workflow",
+  });
+  if (remoteNodeIds.length > 0) {
+    setNodesPhase(remoteNodeIds, STATE_CANCELLING, promptId);
+  }
+}
+
+/**
+ * Return prompt ids targeted by one ComfyUI interrupt request.
+ * @param {any} resource
+ * @param {any} options
+ * @returns {string[]}
+ */
+function promptIdsFromInterruptRequest(resource, options) {
+  const route = String(resource?.url ?? resource ?? "");
+  const method = String(options?.method ?? resource?.method ?? "GET").toUpperCase();
+  if (!route.includes("/interrupt") || method !== "POST") {
+    return [];
+  }
+
+  const body = options?.body ?? resource?.body;
+  if (typeof body === "string" && body.trim()) {
+    try {
+      const payload = JSON.parse(body);
+      if (payload?.prompt_id != null) {
+        return [String(payload.prompt_id)];
+      }
+    } catch (error) {
+      console.debug("Unable to parse ComfyUI interrupt request body for Modal cancellation UI.", error);
+    }
+  }
+
+  return activeModalUiPromptIds();
+}
+
+/**
+ * Patch fetchApi so Modal prompts show cancellation feedback as soon as the user clicks cancel.
+ */
+function patchInterruptFeedback() {
+  if (api.__modalInterruptFeedbackPatched || typeof api.fetchApi !== "function") {
+    return;
+  }
+  const originalFetchApi = api.fetchApi;
+  api.fetchApi = function modalFetchApi(resource, options) {
+    const promptIds = promptIdsFromInterruptRequest(resource, options);
+    for (const promptId of promptIds) {
+      markPromptCancellationRequested(promptId);
+    }
+    return originalFetchApi.apply(this, arguments);
+  };
+  api.__modalInterruptFeedbackPatched = true;
 }
 
 /**
@@ -883,7 +982,9 @@ function shouldApplyPromptState(nodeIdValue, promptId) {
 function refreshCanvasAnimation() {
   app.graph?.setDirtyCanvas(true, true);
   const hasAnimatedState = Array.from(modalNodeStates.values()).some((state) =>
-    [STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_ERROR].includes(state.phase),
+    [STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_CANCELLING, STATE_ERROR].includes(
+      state.phase,
+    ),
   );
   const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;
   const hasProgressState =
@@ -973,7 +1074,7 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
     if (phase === STATE_ERROR) {
       scheduleNodeClear(currentNodeId, promptId, ERROR_CLEAR_DELAY_MS);
     }
-    if (phase === STATE_SETUP || phase === STATE_STARTING || phase === STATE_ERROR) {
+    if ([STATE_SETUP, STATE_STARTING, STATE_CANCELLING, STATE_ERROR].includes(phase)) {
       clearNodeCached(currentNodeId, promptId);
     }
     if (phase === STATE_COMPLETE) {
@@ -982,7 +1083,7 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
         promptState.activeNodeId = null;
       }
     }
-    if (phase === STATE_ERROR) {
+    if (phase === STATE_ERROR || phase === STATE_CANCELLING) {
       clearNodeProgress(currentNodeId, promptId);
     }
     for (const ancestorNodeId of ancestorNodeIds(currentNodeId)) {
@@ -2238,6 +2339,13 @@ function drawRemoteNodeDecoration(node, ctx) {
     fillColor = `${COMPLETE_FILL_COLOR}${Math.round((0.16 + pulse * 0.1) * 255)
       .toString(16)
       .padStart(2, "0")}`;
+  } else if (state?.phase === STATE_CANCELLING) {
+    const pulse = (Math.sin(elapsed * 9) + 1) / 2;
+    borderColor = `${CANCELLING_BORDER_COLOR}${Math.round((0.64 + pulse * 0.36) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(251, 113, 133, ${0.24 + pulse * 0.36})`;
+    fillColor = `rgba(251, 113, 133, ${0.1 + pulse * 0.08})`;
   } else if (state?.phase === STATE_ERROR) {
     const pulse = (Math.sin(elapsed * 6) + 1) / 2;
     borderColor = `${ERROR_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
@@ -2482,6 +2590,9 @@ function handleModalStatus(event) {
   if (!promptId) {
     return;
   }
+  if (isPromptCancelling(promptId) && ![STATE_ERROR, "execution_interrupted"].includes(detail.phase)) {
+    return;
+  }
   if (isPromptTerminal(promptId) && detail.phase !== STATE_SETUP) {
     return;
   }
@@ -2628,6 +2739,7 @@ function handlePromptInterruption(promptId) {
   if (!promptId) {
     return;
   }
+  modalCancellingPromptIds.delete(promptId);
   markPromptTerminal(promptId, "execution_interrupted");
   clearGlobalStatusPhase(promptId);
   clearPromptRemoteStates(promptId);
@@ -2642,6 +2754,9 @@ function handleModalProgress(event) {
   const promptId = String(detail.prompt_id ?? "");
   const progressNodeId = String(detail.real_node_id ?? detail.display_node_id ?? detail.node_id ?? "");
   if (!promptId || !progressNodeId) {
+    return;
+  }
+  if (isPromptCancelling(promptId)) {
     return;
   }
   if (isPromptTerminal(promptId)) {
@@ -2755,6 +2870,9 @@ function handleExecutionPhase(event, phase) {
   const promptId = String(detail.prompt_id ?? "");
   const representativeNodeId = String(detail.display_node ?? detail.node ?? detail.node_id ?? "");
   if (!promptId || !representativeNodeId) {
+    return;
+  }
+  if (isPromptCancelling(promptId) && phase !== STATE_ERROR) {
     return;
   }
   if (isPromptTerminal(promptId)) {
@@ -3133,6 +3251,7 @@ app.registerExtension({
 
   async init() {
     installGlobalStatusStyles();
+    patchInterruptFeedback();
     patchQueuePrompt();
     registerExecutionListeners();
   },

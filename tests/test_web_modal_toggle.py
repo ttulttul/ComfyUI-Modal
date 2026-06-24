@@ -55,6 +55,7 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "hasRemoteExecutionStarted: false" in source
     assert "Waiting for Modal container" in source
     assert "Starting Modal component" in source
+    assert "Cancelling Modal workflow" in source
     assert "function promptActiveNodeIsLive(promptId)" in source
 
 
@@ -82,10 +83,13 @@ def test_interrupted_prompts_clear_modal_ui_by_prompt_id() -> None:
     source = _modal_toggle_source()
 
     assert "const modalTerminalPromptStates = new Map();" in source
+    assert "const modalCancellingPromptIds = new Set();" in source
     assert "function isPromptTerminal(promptId)" in source
+    assert "function isPromptCancelling(promptId)" in source
     assert "function markPromptTerminal(promptId, phase)" in source
     assert 'if (detail.phase === "execution_interrupted") {' in source
     assert "function handlePromptInterruption(promptId)" in source
+    assert "modalCancellingPromptIds.delete(promptId);" in source
     assert 'markPromptTerminal(promptId, "execution_interrupted");' in source
     assert "clearGlobalStatusPhase(promptId);" in source
     assert "clearPromptRemoteStates(promptId);" in source
@@ -119,9 +123,11 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert 'const COMPLETE_BORDER_COLOR = "#004FA4";' in source
     assert 'const COMPLETE_FILL_COLOR = "#001C71";' in source
     assert 'const FINALIZING_NODE_BORDER_COLOR = "#00358A";' in source
+    assert 'const CANCELLING_BORDER_COLOR = "#fb7185";' in source
     assert 'const STATE_STARTING = "starting";' in source
     assert 'const STATE_WAITING = "waiting";' in source
     assert 'const STATE_FINALIZING = "finalizing";' in source
+    assert 'const STATE_CANCELLING = "cancelling";' in source
     assert 'const STATE_READY = "ready";' in source
     assert 'const STATE_ACTIVE = "active";' in source
     assert 'detail.phase === "execution_success"' in source
@@ -133,6 +139,22 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert "setNodesPhase(nodeIds, STATE_FINALIZING, promptId);" in source
 
 
+def test_cancel_click_shows_immediate_modal_cancelling_feedback() -> None:
+    """Cancel should paint Modal prompts as cancelling before backend cleanup finishes."""
+    source = _modal_toggle_source()
+
+    assert "function patchInterruptFeedback()" in source
+    assert "api.fetchApi = function modalFetchApi(resource, options) {" in source
+    assert "function promptIdsFromInterruptRequest(resource, options)" in source
+    assert 'route.includes("/interrupt")' in source
+    assert "function markPromptCancellationRequested(promptId)" in source
+    assert "modalCancellingPromptIds.add(promptId);" in source
+    assert "setGlobalStatusPhase(promptId, STATE_CANCELLING" in source
+    assert "setNodesPhase(remoteNodeIds, STATE_CANCELLING, promptId);" in source
+    assert "if (isPromptCancelling(promptId)) {\n    return;\n  }" in source
+    assert "patchInterruptFeedback();" in source
+
+
 def test_starting_modal_status_marks_component_before_remote_progress() -> None:
     """Dispatch-time Modal status should mark the component while remote progress is still pending."""
     source = _modal_toggle_source()
@@ -141,7 +163,7 @@ def test_starting_modal_status_marks_component_before_remote_progress() -> None:
     assert "setGlobalStatusPhase(promptId, STATE_STARTING, nodeIds.length, {" in source
     assert "setNodesPhase(nodeIds, STATE_STARTING, promptId);" in source
     assert "phases.find((state) => state.phase === STATE_STARTING)" in source
-    assert "[STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_ERROR]" in source
+    assert "[STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_CANCELLING, STATE_ERROR]" in source
     assert "activeState.phase === STATE_STARTING" in source
     assert "STARTING_BORDER_COLOR" in source
 
