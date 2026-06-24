@@ -2672,8 +2672,13 @@ def _build_component_payload(
         return payload
 
     def build_phase_payloads_for_transportable_splits() -> list[dict[str, Any]] | None:
-        """Return ordered split-proxy phase payloads for a non-mapped coarse component."""
-        if component.mapped_boundary_input_name is not None or len(component.execute_node_ids) <= 1:
+        """Return ordered split-proxy phase payloads for components with local feedback."""
+        if len(component.execute_node_ids) <= 1:
+            return None
+        if component.mapped_boundary_input_name is not None and not _component_has_local_reentry_dependency(
+            prompt=signature_prompt,
+            component=component,
+        ):
             return None
         if component.local_tap_node_ids:
             if not _component_has_local_reentry_dependency(
@@ -3320,6 +3325,19 @@ def _rewrite_component_into_proxy(
                 is_output_node=contains_output_node(list(phase_payload["component_node_ids"])),
             )
 
+        if component.mapped_boundary_source_node_id is not None:
+            mapped_node_id_set = set(component.mapped_node_ids)
+            for phase_payload in phase_payloads:
+                phase_node_ids = {str(node_id) for node_id in phase_payload.get("component_node_ids", [])}
+                if not (phase_node_ids & mapped_node_id_set):
+                    continue
+                register_modal_map_input_warmup_context(
+                    component.mapped_boundary_source_node_id,
+                    phase_payload,
+                    str(component.mapped_boundary_input_io_type or "*"),
+                )
+                break
+
         for node_id, prompt_node in list(rewritten_prompt.items()):
             if node_id in component_proxy_node_ids:
                 continue
@@ -3611,12 +3629,15 @@ def rewrite_prompt_for_modal(
             continue
         if isinstance(split_proxy_payloads, list):
             summary.remote_component_ids.extend(proxy_node_ids)
+            mapped_node_id_set = set(component.mapped_node_ids)
             for phase_payload in split_proxy_payloads:
                 phase_proxy_node_id = str(phase_payload["component_id"])
                 phase_component_node_ids = [str(node_id) for node_id in phase_payload["component_node_ids"]]
                 summary.component_node_ids_by_representative[phase_proxy_node_id] = phase_component_node_ids
                 for node_id in phase_component_node_ids:
                     summary.rewritten_node_id_map[node_id] = phase_proxy_node_id
+                if mapped_node_id_set and mapped_node_id_set.intersection(phase_component_node_ids):
+                    mapped_proxy_component_ids.add(phase_proxy_node_id)
             continue
 
         summary.remote_component_ids.extend(proxy_node_ids)
