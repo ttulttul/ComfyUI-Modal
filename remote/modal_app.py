@@ -2634,6 +2634,7 @@ def _lookup_modal_interrupt_store() -> Any | None:
 
 def _request_remote_interrupt(payload: dict[str, Any]) -> bool:
     """Write one remote cancellation request into the shared Modal interrupt store."""
+    _abandon_local_modal_workflow_gate(payload, "local interrupt requested")
     interrupt_store = _lookup_modal_interrupt_store()
     if interrupt_store is None:
         return False
@@ -2698,6 +2699,10 @@ def _registered_active_remote_invocation(
 def request_remote_modal_prompt_interrupt(prompt_id: str) -> bool:
     """Request cancellation for every active Modal invocation belonging to one prompt."""
     normalized_prompt_id = str(prompt_id)
+    _abandon_local_modal_workflow_gate(
+        {"prompt_id": normalized_prompt_id},
+        "prompt-level interrupt requested",
+    )
     with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
         invocations = list(_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.get(normalized_prompt_id, {}).values())
     if not invocations:
@@ -2733,7 +2738,23 @@ def _sync_local_interrupt_to_cancellation_event(
             payload.get("component_id"),
         )
         cancellation_event.set()
+    _abandon_local_modal_workflow_gate(payload, "observed local interrupt")
     return True
+
+
+def _abandon_local_modal_workflow_gate(payload: dict[str, Any], reason: str) -> None:
+    """Release the local prompt gate for a Modal prompt that ComfyUI has cancelled."""
+    prompt_id = payload.get("prompt_id")
+    if prompt_id is None:
+        return
+
+    try:
+        from ..modal_executor_node import abandon_modal_workflow_execution_prompt
+    except ImportError:
+        logger.debug("Unable to import Modal workflow gate helper while abandoning prompt.")
+        return
+
+    abandon_modal_workflow_execution_prompt(str(prompt_id), reason)
 
 
 def _propagate_remote_interrupt_request(

@@ -410,6 +410,101 @@ def test_modal_proxy_cancellation_while_waiting_does_not_leak_workflow_gate(
     ]
 
 
+def test_abandoned_modal_prompt_gate_unblocks_next_prompt(
+    modal_executor_module: Any,
+) -> None:
+    """Cancelling an active Modal prompt should not leave later prompts stuck behind its gate."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    proxy_node_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=("STRING",),
+        output_names=("value",),
+        output_is_list=(False,),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    observed_events: list[str] = []
+
+    class FakeClient:
+        """Fake async remote client that lets one cancelled prompt stay stuck."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str]:
+            """Record remote dispatch while prompt one waits for cleanup."""
+            del kwargs
+            component_id = str(payload["component_id"])
+            observed_events.append(f"start:{component_id}")
+            if component_id == "component-1":
+                first_started.set()
+                await release_first.wait()
+            if component_id == "component-2":
+                second_started.set()
+            observed_events.append(f"finish:{component_id}")
+            return (component_id,)
+
+    async def run_scenario() -> tuple[Any, Any]:
+        """Abandon prompt one, then prove prompt two can start before prompt one exits."""
+        first_task = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "prompt-1",
+                    "component_id": "component-1",
+                },
+                unique_id="component-1",
+            )
+        )
+        await first_started.wait()
+
+        second_task = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "prompt-2",
+                    "component_id": "component-2",
+                },
+                unique_id="component-2",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not second_started.is_set()
+
+        modal_executor_module.abandon_modal_workflow_execution_prompt(
+            "prompt-1",
+            "test cancellation",
+        )
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        second_output = await second_task
+
+        release_first.set()
+        first_output = await first_task
+        return first_output, second_output
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        first_output, second_output = asyncio.run(run_scenario())
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert first_output.result == ("component-1",)
+    assert second_output.result == ("component-2",)
+    assert observed_events == [
+        "start:component-1",
+        "start:component-2",
+        "finish:component-2",
+        "finish:component-1",
+    ]
+
+
 class _FakeImplicitBatchKSamplerNode:
     """Fake sampler node exposing ComfyUI-style LATENT and primitive socket types."""
 
