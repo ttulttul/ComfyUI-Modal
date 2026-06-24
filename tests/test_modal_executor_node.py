@@ -155,6 +155,14 @@ class _FakeRewriteLocalSinkNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeRewriteLocalFeedbackNode:
+    """Fake local node that turns a remote latent into a transportable remote input."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+
+
 def test_modal_proxy_waits_for_active_prompt_before_starting_next_prompt(
     modal_executor_module: Any,
 ) -> None:
@@ -7553,6 +7561,125 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
         "local_sink:static-latent",
         "mapped_proxy_finish",
     ]
+
+
+def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A mapped input should not collapse local feedback back into the same remote proxy."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRewriteRemoteModelNode,
+                "RemoteSampler": _FakeRewriteRemoteSamplerNode,
+                "LatentSource": _FakeRewriteLatentSourceNode,
+                "ModalMapInput": _FakeRewriteModalMapInputNode,
+                "LocalFeedback": _FakeRewriteLocalFeedbackNode,
+                "LocalSink": _FakeRewriteLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+            {"id": 5, "properties": {"is_modal_remote": False}},
+            {"id": 6, "properties": {"is_modal_remote": False}},
+            {"id": 7, "properties": {"is_modal_remote": True}},
+            {"id": 8, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteModel",
+            "inputs": {},
+            "_meta": {"title": "Shared Model"},
+        },
+        "2": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Single Latent"},
+        },
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["2", 0]},
+            "_meta": {"title": "First Sampler"},
+        },
+        "4": {
+            "class_type": "LocalFeedback",
+            "inputs": {"image": ["3", 0]},
+            "_meta": {"title": "Local Feedback"},
+        },
+        "5": {
+            "class_type": "LatentSource",
+            "inputs": {},
+            "_meta": {"title": "Batch Values"},
+        },
+        "6": {
+            "class_type": "ModalMapInput",
+            "inputs": {"value": ["5", 0]},
+            "_meta": {"title": "Map Input"},
+        },
+        "7": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["1", 0], "latent": ["6", 0], "prompt": ["4", 0]},
+            "_meta": {"title": "Mapped Sampler"},
+        },
+        "8": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["7", 0]},
+            "_meta": {"title": "Local Sink"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert api_intercept_module._find_prompt_dependency_cycles(rewritten_prompt) == []
+    assert summary.mapped_component_ids == ["7"]
+    assert summary.component_execution_stages == [["3"], ["7"]]
+    assert rewritten_prompt["4"]["inputs"]["image"] == ["3", 0]
+    assert rewritten_prompt["7"]["inputs"]["remote_input_2"] == ["4", 0]
+    first_payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
+    mapped_payload = rewritten_prompt["7"]["inputs"]["original_node_data"]
+    assert first_payload["component_node_ids"] == ["1", "3"]
+    assert mapped_payload["component_node_ids"] == ["7"]
+    assert {
+        boundary_input["proxy_input_name"]
+        for boundary_input in mapped_payload["boundary_inputs"]
+    } == {"phase_bridge_0", "remote_input_1", "remote_input_2"}
 
 
 def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
