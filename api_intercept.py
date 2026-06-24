@@ -32,6 +32,7 @@ _MODAL_UI_EVENT_RETENTION_SECONDS = 2 * 60 * 60
 _MODAL_UI_EVENT_LIMIT_PER_CLIENT = 512
 _MODAL_UI_EVENTS_LOCK = threading.Lock()
 _MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
+_MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_installed"
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
@@ -3766,6 +3767,37 @@ def _progress_state_route_path(route_path: str) -> str:
     return f"{route_path.rstrip('/')}/progress_state"
 
 
+def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
+    """Expose active Modal prompts to ComfyUI's targeted interrupt route."""
+    prompt_queue = getattr(prompt_server, "prompt_queue", None)
+    if prompt_queue is None or getattr(prompt_queue, _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR, False):
+        return
+
+    original_get_current_queue = getattr(prompt_queue, "get_current_queue", None)
+    if not callable(original_get_current_queue):
+        logger.debug("Prompt queue does not expose get_current_queue(); skipping Modal interrupt bridge.")
+        return
+
+    def modal_get_current_queue() -> tuple[list[Any], Any]:
+        """Return ComfyUI's current queue plus synthetic active Modal prompt entries."""
+        running, queued = original_get_current_queue()
+        running_items = list(running)
+        running_prompt_ids = {str(item[1]) for item in running_items if len(item) > 1}
+        try:
+            from .remote.modal_app import active_remote_modal_prompt_ids
+        except ImportError:
+            return running_items, queued
+
+        active_prompt_ids = active_remote_modal_prompt_ids()
+        for prompt_id in sorted(active_prompt_ids - running_prompt_ids):
+            running_items.append((0, prompt_id, {}, {}, [], {}))
+        return running_items, queued
+
+    setattr(prompt_queue, "get_current_queue", modal_get_current_queue)
+    setattr(prompt_queue, _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR, True)
+    logger.info("Installed Modal targeted interrupt bridge on ComfyUI prompt queue.")
+
+
 def setup_modal_queue_route(
     prompt_server: Any | None = None,
     sync_engine: ModalAssetSyncEngine | None = None,
@@ -3791,6 +3823,7 @@ def setup_modal_queue_route(
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     analysis_route_path = _analysis_route_path(resolved_settings.route_path)
     progress_state_route_path = _progress_state_route_path(resolved_settings.route_path)
+    _install_modal_interrupt_queue_bridge(prompt_server)
 
     if hasattr(prompt_server.routes, "get"):
 

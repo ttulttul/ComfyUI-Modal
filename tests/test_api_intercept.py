@@ -3556,3 +3556,32 @@ def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) 
     assert api_intercept_module._progress_state_route_path("/custom/modal") == (
         "/custom/modal/progress_state"
     )
+
+
+def test_modal_interrupt_queue_bridge_exposes_active_remote_prompts(
+    api_intercept_module: Any,
+    remote_modal_app_module: Any,
+) -> None:
+    """Targeted ComfyUI interrupts should see prompts currently blocked on Modal work."""
+
+    class FakePromptQueue:
+        """Minimal ComfyUI prompt queue with no native running prompts."""
+
+        def get_current_queue(self) -> tuple[list[Any], list[Any]]:
+            """Return an empty running queue and one pending item."""
+            return [], ["queued"]
+
+    prompt_queue = FakePromptQueue()
+    prompt_server = SimpleNamespace(prompt_queue=prompt_queue)
+    cancellation_event = remote_modal_app_module.threading.Event()
+
+    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+    with remote_modal_app_module._registered_active_remote_invocation(
+        {"prompt_id": "prompt-1", "component_id": "component-1"},
+        cancellation_event,
+        None,
+    ):
+        running, queued = prompt_queue.get_current_queue()
+
+    assert queued == ["queued"]
+    assert [item[1] for item in running] == ["prompt-1"]

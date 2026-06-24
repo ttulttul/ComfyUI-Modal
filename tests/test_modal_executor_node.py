@@ -5597,6 +5597,26 @@ def test_remote_modal_interrupt_callback_writes_shared_control_flag(
     assert isinstance(interrupt_value["requested_at"], float)
 
 
+def test_request_remote_modal_prompt_interrupt_cancels_active_components(
+    remote_modal_app_module: Any,
+) -> None:
+    """Prompt-level cancellation should interrupt every active remote component."""
+    cancellation_event = threading.Event()
+    interrupt_calls: list[str] = []
+
+    with remote_modal_app_module._registered_active_remote_invocation(
+        {"prompt_id": "prompt-1", "component_id": "component-1"},
+        cancellation_event,
+        lambda: interrupt_calls.append("component-1"),
+    ):
+        assert remote_modal_app_module.active_remote_modal_prompt_ids() == {"prompt-1"}
+        assert remote_modal_app_module.request_remote_modal_prompt_interrupt("prompt-1") is True
+
+    assert cancellation_event.is_set()
+    assert interrupt_calls == ["component-1"]
+    assert remote_modal_app_module.active_remote_modal_prompt_ids() == set()
+
+
 def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_outer_sync(
     remote_modal_app_module: Any,
     serialization_module: Any,
