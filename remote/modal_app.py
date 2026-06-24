@@ -82,6 +82,8 @@ _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()
 _REMOTE_CONTAINER_LOG_STREAMS: dict[str, "_RemoteContainerLogStreamState"] = {}
 _REMOTE_CONTAINER_LOG_STDERR_LOCK = threading.Lock()
+_ACTIVE_REMOTE_INVOCATIONS_LOCK = threading.Lock()
+_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT: dict[str, dict[str, "_ActiveRemoteInvocation"]] = {}
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
 _REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
@@ -128,6 +130,16 @@ class _RemoteContainerLogStreamState:
     stop_event: threading.Event
     thread: threading.Thread
     refcount: int = 0
+
+
+@dataclass
+class _ActiveRemoteInvocation:
+    """Track one local proxy call that is currently waiting on remote Modal work."""
+
+    prompt_id: str
+    component_id: str
+    cancellation_event: threading.Event | None
+    interrupt_remote_call: Callable[[], Any] | None
 
 
 @dataclass
@@ -2639,6 +2651,73 @@ def _request_remote_interrupt(payload: dict[str, Any]) -> bool:
     return True
 
 
+def active_remote_modal_prompt_ids() -> set[str]:
+    """Return prompt ids that currently have local proxies waiting on Modal work."""
+    with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
+        return set(_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT)
+
+
+@contextmanager
+def _registered_active_remote_invocation(
+    payload: dict[str, Any],
+    cancellation_event: threading.Event | None,
+    interrupt_remote_call: Callable[[], Any] | None,
+) -> Iterator[None]:
+    """Register one active Modal call so targeted ComfyUI interrupts can find it."""
+    prompt_id, component_id = _remote_interrupt_key(payload)
+    invocation = _ActiveRemoteInvocation(
+        prompt_id=prompt_id,
+        component_id=component_id,
+        cancellation_event=cancellation_event,
+        interrupt_remote_call=interrupt_remote_call,
+    )
+    with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
+        prompt_invocations = _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.setdefault(prompt_id, {})
+        prompt_invocations[component_id] = invocation
+    logger.info(
+        "Registered active Modal invocation prompt=%s component=%s for targeted cancellation.",
+        prompt_id,
+        component_id,
+    )
+    try:
+        yield
+    finally:
+        with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
+            prompt_invocations = _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.get(prompt_id)
+            if prompt_invocations is not None:
+                prompt_invocations.pop(component_id, None)
+                if not prompt_invocations:
+                    _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.pop(prompt_id, None)
+        logger.info(
+            "Unregistered active Modal invocation prompt=%s component=%s.",
+            prompt_id,
+            component_id,
+        )
+
+
+def request_remote_modal_prompt_interrupt(prompt_id: str) -> bool:
+    """Request cancellation for every active Modal invocation belonging to one prompt."""
+    normalized_prompt_id = str(prompt_id)
+    with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
+        invocations = list(_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.get(normalized_prompt_id, {}).values())
+    if not invocations:
+        return False
+
+    logger.info(
+        "Requesting remote Modal cancellation for prompt=%s across %d active component(s).",
+        normalized_prompt_id,
+        len(invocations),
+    )
+    for invocation in invocations:
+        if invocation.cancellation_event is not None:
+            invocation.cancellation_event.set()
+        _propagate_remote_interrupt_request(
+            {"prompt_id": invocation.prompt_id, "component_id": invocation.component_id},
+            invocation.interrupt_remote_call,
+        )
+    return True
+
+
 def _sync_local_interrupt_to_cancellation_event(
     payload: dict[str, Any],
     cancellation_event: threading.Event | None,
@@ -2710,31 +2789,32 @@ def _invoke_remote_call_with_interrupts(
     request_thread.start()
     interrupt_sent = False
     try:
-        while True:
-            try:
-                result_kind, result_payload = result_queue.get(timeout=0.1)
-            except queue.Empty:
-                if _sync_local_interrupt_to_cancellation_event(payload, cancellation_event):
-                    if not interrupt_sent:
-                        _propagate_remote_interrupt_request(payload, interrupt_remote_call)
-                        interrupt_sent = True
-                        cancellation_started_at = time.monotonic()
-                    elif cancellation_started_at is not None:
-                        grace_seconds = max(0.0, get_settings().remote_cancel_grace_seconds)
-                        if time.monotonic() - cancellation_started_at >= grace_seconds:
-                            logger.info(
-                                "Modal component=%s did not return within %.3fs of local interrupt propagation; releasing the local prompt while remote cancellation continues.",
-                                payload.get("component_id"),
-                                grace_seconds,
-                            )
-                            raise ModalRemoteInvocationError(
-                                "Remote Modal call did not finish after local interrupt propagation."
-                            )
-                continue
+        with _registered_active_remote_invocation(payload, cancellation_event, interrupt_remote_call):
+            while True:
+                try:
+                    result_kind, result_payload = result_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if _sync_local_interrupt_to_cancellation_event(payload, cancellation_event):
+                        if not interrupt_sent:
+                            _propagate_remote_interrupt_request(payload, interrupt_remote_call)
+                            interrupt_sent = True
+                            cancellation_started_at = time.monotonic()
+                        elif cancellation_started_at is not None:
+                            grace_seconds = max(0.0, get_settings().remote_cancel_grace_seconds)
+                            if time.monotonic() - cancellation_started_at >= grace_seconds:
+                                logger.info(
+                                    "Modal component=%s did not return within %.3fs of local interrupt propagation; releasing the local prompt while remote cancellation continues.",
+                                    payload.get("component_id"),
+                                    grace_seconds,
+                                )
+                                raise ModalRemoteInvocationError(
+                                    "Remote Modal call did not finish after local interrupt propagation."
+                                )
+                    continue
 
-            if result_kind == "result":
-                return bytes(result_payload)
-            raise result_payload
+                if result_kind == "result":
+                    return bytes(result_payload)
+                raise result_payload
     finally:
         request_thread.join(
             timeout=0.1
@@ -4168,6 +4248,9 @@ async def _invoke_bound_remote_engine_async(
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()
+        prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+        if prompt_id is not None:
+            request_remote_modal_prompt_interrupt(prompt_id)
         raise
     except Exception:
         if cancellation_event.is_set() or _local_processing_interrupted():
@@ -5350,6 +5433,9 @@ async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: by
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()
+        prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+        if prompt_id is not None:
+            request_remote_modal_prompt_interrupt(prompt_id)
         raise
     except Exception:
         if cancellation_event.is_set() or _local_processing_interrupted():
