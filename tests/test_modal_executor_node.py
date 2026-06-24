@@ -5803,6 +5803,80 @@ def test_remote_modal_interrupt_callback_writes_shared_control_flag(
     assert isinstance(interrupt_value["requested_at"], float)
 
 
+def test_request_remote_interrupt_async_uses_shared_control_async_put(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Async local cancellation should use Modal Dict.put.aio instead of blocking put."""
+
+    class FakePut:
+        """Modal Dict put double that records sync and async writes separately."""
+
+        def __init__(self) -> None:
+            """Initialize captured writes."""
+            self.sync_calls: list[tuple[str, Any]] = []
+            self.async_calls: list[tuple[str, Any]] = []
+
+        def __call__(self, key: str, value: Any, *, skip_if_exists: bool = False) -> bool:
+            """Record one blocking write."""
+            del skip_if_exists
+            self.sync_calls.append((key, value))
+            return True
+
+        async def aio(self, key: str, value: Any, *, skip_if_exists: bool = False) -> bool:
+            """Record one async write."""
+            del skip_if_exists
+            self.async_calls.append((key, value))
+            return True
+
+    class FakeInterruptStore:
+        """Simple Modal Dict double exposing put.aio."""
+
+        def __init__(self) -> None:
+            """Initialize the fake async put handle."""
+            self.put = FakePut()
+
+    interrupt_store = FakeInterruptStore()
+
+    class FakeModalDict:
+        """Minimal modal.Dict shim that returns the fake interrupt store."""
+
+        @staticmethod
+        def from_name(
+            name: str,
+            *,
+            environment_name: str | None = None,
+            create_if_missing: bool = False,
+            client: Any | None = None,
+        ) -> FakeInterruptStore:
+            return interrupt_store
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "modal",
+        types.SimpleNamespace(Dict=FakeModalDict),
+    )
+    monkeypatch.setenv("COMFY_MODAL_INTERRUPT_DICT_NAME", "shared-interrupts")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+    try:
+        wrote_interrupt = asyncio.run(
+            remote_modal_app_module._request_remote_interrupt_async(
+                {"prompt_id": "prompt-1", "component_id": "component-2"}
+            )
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+
+    assert wrote_interrupt is True
+    assert interrupt_store.put.sync_calls == []
+    assert len(interrupt_store.put.async_calls) == 1
+    interrupt_key, interrupt_value = interrupt_store.put.async_calls[0]
+    assert interrupt_key == "prompt-1:component-2"
+    assert isinstance(interrupt_value["requested_at"], float)
+
+
 def test_request_remote_modal_prompt_interrupt_cancels_active_components(
     remote_modal_app_module: Any,
 ) -> None:
