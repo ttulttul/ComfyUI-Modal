@@ -66,6 +66,7 @@ The list above is the shortest accurate summary. If you want the execution path 
   - Local nodes execute normally until a rewritten Modal proxy node is reached.
   - Proxy nodes use the prompt id as a workflow gate: Modal components from the same prompt may overlap, but a later prompt waits until the active prompt's remote components finish.
   - Active Modal proxy calls are exposed to ComfyUI's targeted interrupt check, so pressing cancel can interrupt remote work even if the native queue no longer considers the local prompt running.
+  - If cancellation happens while Modal is still deploying or provisioning, the local proxy writes the shared cancel flag, releases ComfyUI after the configured grace period, and prevents the later remote payload dispatch from starting.
   - The proxy node serializes its boundary inputs.
   - It checks the payload kind.
     - If the payload is a normal remote component, it dispatches a `subgraph` payload.

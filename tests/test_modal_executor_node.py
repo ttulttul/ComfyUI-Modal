@@ -5539,6 +5539,106 @@ def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
     assert observed_cancellation_events[0].is_set()
 
 
+def test_invoke_remote_engine_releases_prompt_when_cancelled_during_deploy(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Cancellation during Modal deploy/provisioning should release the local prompt promptly."""
+
+    class FakeInterrupt(Exception):
+        """Stand-in for ComfyUI's InterruptProcessingException."""
+
+    release_blocking_call = threading.Event()
+    observed_cancellation_events: list[threading.Event] = []
+    interrupt_checks = iter([False, True, True, True])
+    remote_interrupt_payloads: list[dict[str, Any]] = []
+
+    def fake_blocking_invoke(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        cancellation_event: threading.Event | None = None,
+    ) -> bytes:
+        """Simulate a worker stuck in Modal deployment until the test releases it."""
+        del payload, kwargs_payload
+        assert cancellation_event is not None
+        observed_cancellation_events.append(cancellation_event)
+        release_blocking_call.wait(timeout=5.0)
+        return b"late-response"
+
+    def fake_local_processing_interrupted() -> bool:
+        """Report a local interrupt after the first outer wait poll."""
+        return next(interrupt_checks, True)
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS", "0.01")
+    remote_modal_app_module.get_settings.cache_clear()
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_local_processing_interrupted",
+        fake_local_processing_interrupted,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_request_remote_interrupt",
+        lambda payload: remote_interrupt_payloads.append(dict(payload)) or True,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_raise_local_interrupt",
+        lambda: (_ for _ in ()).throw(FakeInterrupt()),
+    )
+
+    try:
+        with pytest.raises(FakeInterrupt):
+            remote_modal_app_module.invoke_remote_engine(
+                {"prompt_id": "prompt-1", "component_id": "component-1", "payload_kind": "subgraph"},
+                b"{}",
+            )
+    finally:
+        release_blocking_call.set()
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert len(observed_cancellation_events) == 1
+    assert observed_cancellation_events[0].is_set()
+    assert [payload["component_id"] for payload in remote_interrupt_payloads] == ["component-1"]
+
+
+def test_invoke_remote_engine_payload_refuses_dispatch_after_prestart_cancel(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A cancellation observed during deploy should prevent the later remote payload call."""
+    cancellation_event = threading.Event()
+    cancellation_event.set()
+    remote_interrupt_payloads: list[dict[str, Any]] = []
+
+    class FakeExecuteMethod:
+        """Remote method double that must not be called after cancellation."""
+
+        def remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+            """Fail if the cancelled payload reaches Modal execution."""
+            del payload, kwargs_payload
+            raise AssertionError("cancelled payload should not dispatch")
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_request_remote_interrupt",
+        lambda payload: remote_interrupt_payloads.append(dict(payload)) or True,
+    )
+
+    with pytest.raises(remote_modal_app_module.ModalRemoteInvocationError, match="cancelled before"):
+        remote_modal_app_module._invoke_remote_engine_payload(
+            types.SimpleNamespace(execute_payload=FakeExecuteMethod()),
+            {"prompt_id": "prompt-1", "component_id": "component-1"},
+            b"{}",
+            cancellation_event,
+        )
+
+    assert [payload["component_id"] for payload in remote_interrupt_payloads] == ["component-1"]
+
+
 def test_remote_modal_interrupt_callback_writes_shared_control_flag(
     remote_modal_app_module: Any,
     monkeypatch: Any,
