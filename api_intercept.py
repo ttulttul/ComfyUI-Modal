@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -3829,7 +3830,15 @@ def _modal_cache_dict_names(settings: ModalSyncSettings) -> list[str]:
     ]
 
 
-def delete_modal_cache_dicts(settings: ModalSyncSettings) -> dict[str, Any]:
+async def _call_modal_sdk(method: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call a Modal SDK method without blocking the aiohttp event loop."""
+    async_method = getattr(method, "aio", None)
+    if callable(async_method):
+        return await async_method(*args, **kwargs)
+    return await asyncio.to_thread(method, *args, **kwargs)
+
+
+async def delete_modal_cache_dicts(settings: ModalSyncSettings) -> dict[str, Any]:
     """Delete all configured Modal Dict caches and return a reset summary."""
     if modal is None:
         raise RuntimeError("Modal SDK is unavailable; cannot delete Modal caches.")
@@ -3842,24 +3851,28 @@ def delete_modal_cache_dicts(settings: ModalSyncSettings) -> dict[str, Any]:
     not_found_errors = _modal_not_found_error_types()
     for dict_name in _modal_cache_dict_names(settings):
         try:
-            cache = modal_dict.from_name(dict_name, create_if_missing=False)
+            cache = await _call_modal_sdk(
+                modal_dict.from_name,
+                dict_name,
+                create_if_missing=False,
+            )
         except not_found_errors:
             skipped.append(dict_name)
             continue
         clear_method = getattr(cache, "clear", None)
         if callable(clear_method):
-            clear_method()
+            await _call_modal_sdk(clear_method)
         delete_method = getattr(cache, "delete", None)
         if not callable(delete_method):
             raise RuntimeError(f"Modal Dict {dict_name!r} does not expose delete().")
-        delete_method()
+        await _call_modal_sdk(delete_method, dict_name)
         deleted.append(dict_name)
 
     logger.info("Deleted Modal cache Dicts deleted=%s skipped=%s.", deleted, skipped)
     return {"deleted": deleted, "skipped": skipped}
 
 
-def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
+async def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
     """Delete the configured Modal Volume and return a reset summary."""
     if modal is None:
         raise RuntimeError("Modal SDK is unavailable; cannot delete Modal volume.")
@@ -3868,7 +3881,11 @@ def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
         raise RuntimeError("Modal SDK does not expose modal.Volume; cannot delete Modal volume.")
 
     try:
-        volume = modal_volume.from_name(settings.volume_name, create_if_missing=False)
+        volume = await _call_modal_sdk(
+            modal_volume.from_name,
+            settings.volume_name,
+            create_if_missing=False,
+        )
     except _modal_not_found_error_types():
         logger.info("Skipped deleting missing Modal Volume %s.", settings.volume_name)
         return {"deleted": [], "skipped": [settings.volume_name]}
@@ -3876,7 +3893,7 @@ def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
     delete_method = getattr(volume, "delete", None)
     if not callable(delete_method):
         raise RuntimeError(f"Modal Volume {settings.volume_name!r} does not expose delete().")
-    delete_method()
+    await _call_modal_sdk(delete_method, settings.volume_name)
     logger.info("Deleted Modal Volume %s.", settings.volume_name)
     return {"deleted": [settings.volume_name], "skipped": []}
 
@@ -4012,7 +4029,7 @@ def setup_modal_queue_route(
         del request
         logger.info("Received Modal cache deletion request.")
         try:
-            return web.json_response(delete_modal_cache_dicts(resolved_settings))
+            return web.json_response(await delete_modal_cache_dicts(resolved_settings))
         except RuntimeError as exc:
             logger.warning("Modal cache deletion request failed: %s", exc)
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
@@ -4023,7 +4040,7 @@ def setup_modal_queue_route(
         del request
         logger.info("Received Modal volume deletion request.")
         try:
-            return web.json_response(delete_modal_volume(resolved_settings))
+            return web.json_response(await delete_modal_volume(resolved_settings))
         except RuntimeError as exc:
             logger.warning("Modal volume deletion request failed: %s", exc)
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
