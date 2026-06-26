@@ -151,8 +151,9 @@ def test_remote_session_store_resolves_bridge_refs_via_replay_callback(
     def bridge_resolver(ref: Any) -> str:
         """Populate the target session and return the replayed value."""
         observed_bridge_keys.append(ref.bridge_key)
-        store.put_output(
+        store.put_bridge_output(
             target_handle,
+            bridge_key=ref.bridge_key,
             node_id=ref.node_id,
             output_index=ref.output_index,
             value="rehydrated-value",
@@ -177,6 +178,62 @@ def test_remote_session_store_resolves_bridge_refs_via_replay_callback(
         == "rehydrated-value"
     )
     assert observed_bridge_keys == ["RSB_bridge"]
+
+
+def test_remote_session_store_resolves_same_output_bridge_refs_by_bridge_key(
+    session_state_module: Any,
+) -> None:
+    """Different bridge keys from the same node output must not collapse to the first value."""
+    store = session_state_module.InMemoryRemoteSessionStore()
+    target_handle = session_state_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    first_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_first",
+        node_id="508",
+        output_index=0,
+        session_id="session-source",
+    )
+    second_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_second",
+        node_id="508",
+        output_index=0,
+        session_id="session-source",
+    )
+    values_by_bridge_key = {
+        "RSB_first": "conditioning-a",
+        "RSB_second": "conditioning-b",
+    }
+    observed_bridge_keys: list[str] = []
+
+    def bridge_resolver(ref: Any) -> str:
+        """Populate the target session using the bridge key, as remote rehydration does."""
+        observed_bridge_keys.append(ref.bridge_key)
+        value = values_by_bridge_key[ref.bridge_key]
+        store.put_bridge_output(
+            target_handle,
+            bridge_key=ref.bridge_key,
+            node_id=ref.node_id,
+            output_index=ref.output_index,
+            value=value,
+        )
+        return value
+
+    assert store.resolve_value_with_bridges(
+        [first_ref.to_payload(), second_ref.to_payload()],
+        target_session_handle=target_handle,
+        bridge_resolver=bridge_resolver,
+    ) == ["conditioning-a", "conditioning-b"]
+    assert observed_bridge_keys == ["RSB_first", "RSB_second"]
+
+    assert store.resolve_value_with_bridges(
+        [first_ref.to_payload(), second_ref.to_payload()],
+        target_session_handle=target_handle,
+        bridge_resolver=bridge_resolver,
+    ) == ["conditioning-a", "conditioning-b"]
+    assert observed_bridge_keys == ["RSB_first", "RSB_second"]
 
 
 def test_remote_session_store_resolves_nested_bridge_ref_lists(
