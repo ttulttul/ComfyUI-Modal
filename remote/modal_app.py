@@ -27,16 +27,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from ..serialization import (
-    join_mapped_values,
     coerce_serialized_node_outputs,
     deserialize_value,
     deserialize_node_inputs,
     deserialize_node_outputs,
+    is_mapped_output_value,
+    join_mapped_values,
     serialize_mapping,
+    serialize_node_inputs,
+    serialize_node_outputs,
     serialize_value,
     split_mapped_value,
-    serialize_node_outputs,
-    serialize_node_inputs,
+    unwrap_mapped_output_value,
 )
 from ..session_state import (
     InMemoryRemoteSessionBridgeStore,
@@ -1258,7 +1260,7 @@ def _apply_boundary_inputs(
         proxy_input_name = str(boundary_input["proxy_input_name"])
         if proxy_input_name not in hydrated_inputs:
             raise KeyError(f"Missing hydrated boundary input {proxy_input_name!r}.")
-        value = hydrated_inputs[proxy_input_name]
+        value = unwrap_mapped_output_value(hydrated_inputs[proxy_input_name])
         io_type = (
             str(boundary_input["io_type"])
             if boundary_input.get("io_type") is not None
@@ -3840,6 +3842,7 @@ def _split_batch_boundary_inputs(
         )
         if (
             isinstance(input_value, list)
+            and not is_mapped_output_value(input_value)
             and not is_session_ref_list
             and io_type not in (
             implicitly_batchable_scalar_io_types | implicitly_batchable_transport_io_types

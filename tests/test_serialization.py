@@ -113,6 +113,21 @@ def test_split_mapped_value_treats_scalar_as_single_item(serialization_module: A
     assert items == [7]
 
 
+def test_mapped_conditioning_output_round_trips_with_item_metadata(serialization_module: Any) -> None:
+    """Mapped CONDITIONING outputs should preserve item boundaries across transport."""
+    values = [
+        [["cond-a", {"pooled_output": "pool-a"}]],
+        [["cond-b", {"pooled_output": "pool-b"}]],
+    ]
+    mapped_value = serialization_module.join_mapped_values(values, "CONDITIONING", is_list=False)
+    encoded = serialization_module.serialize_node_outputs((mapped_value,))
+    decoded = serialization_module.deserialize_node_outputs(encoded)[0]
+
+    assert isinstance(decoded, list)
+    assert serialization_module.split_mapped_value(decoded, "CONDITIONING") == values
+    assert serialization_module.unwrap_mapped_output_value(decoded) == values
+
+
 def test_split_and_join_tensor_batch_for_mapped_execution(serialization_module: Any) -> None:
     """Mapped execution should split and reassemble tensor batches on the leading dimension."""
     torch = pytest.importorskip("torch")

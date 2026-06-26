@@ -8944,6 +8944,102 @@ def test_implicitly_mapped_subgraph_keeps_conditioning_lists_broadcast(
     ]
 
 
+def test_implicitly_mapped_subgraph_splits_mapped_conditioning_outputs(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped CONDITIONING aggregates should feed downstream mapped items in lockstep."""
+    conditioning_items = [
+        [["cond-a", {"pooled_output": "pool-a"}]],
+        [["cond-b", {"pooled_output": "pool-b"}]],
+        [["cond-c", {"pooled_output": "pool-c"}]],
+    ]
+    mapped_conditioning = serialization_module.join_mapped_values(
+        conditioning_items,
+        "CONDITIONING",
+        is_list=False,
+    )
+    latent_items = ["latent-a", "latent-b", "latent-c"]
+    observed_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        observed_calls.append((str(payload["component_id"]), hydrated_inputs))
+        return serialization_module.serialize_node_outputs(
+            (f"{hydrated_inputs['remote_input_0'][0][0]}:{hydrated_inputs['remote_input_1']}",)
+        )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "positive": 0,
+                    "latent_image": 0,
+                },
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "12", "input_name": "positive"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "LATENT",
+                "targets": [{"node_id": "12", "input_name": "latent_image"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "12", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "remote_input_0": mapped_conditioning,
+                    "remote_input_1": latent_items,
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["cond-a:latent-a", "cond-b:latent-b", "cond-c:latent-c"],
+    )
+    assert observed_calls == [
+        (
+            "17::item:0",
+            {"remote_input_0": conditioning_items[0], "remote_input_1": latent_items[0]},
+        ),
+        (
+            "17::item:1",
+            {"remote_input_0": conditioning_items[1], "remote_input_1": latent_items[1]},
+        ),
+        (
+            "17::item:2",
+            {"remote_input_0": conditioning_items[2], "remote_input_1": latent_items[2]},
+        ),
+    ]
+
+
 def test_implicitly_mapped_subgraph_splits_wildcard_latent_lists_for_latent_targets(
     remote_modal_app_module: Any,
     serialization_module: Any,
