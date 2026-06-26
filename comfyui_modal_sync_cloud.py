@@ -32,7 +32,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
 _LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
 _REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
-_REMOTE_APP_PROTOCOL_VERSION = 3
+_REMOTE_APP_PROTOCOL_VERSION = 4
 _PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 _COMFYUI_TORCH_VERSION = "2.10.0"
 _COMFYUI_TORCHVISION_VERSION = "0.25.0"
@@ -2462,7 +2462,7 @@ def _build_node_output_cache_immediate_signature(
             boundary_signature = None
             if isinstance(boundary_input_signatures, dict):
                 candidate_signature = boundary_input_signatures.get(str(key))
-                if isinstance(candidate_signature, str) and candidate_signature:
+                if candidate_signature is not None:
                     boundary_signature = candidate_signature
             if boundary_signature is not None:
                 signature.append((key, ("BOUNDARY_SOURCE", boundary_signature)))
@@ -3230,10 +3230,75 @@ def _execute_node_locally_raw(
             return _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
 
 
+def _remote_session_ref_cache_signature(value: Any) -> Any | None:
+    """Return cache-key metadata for any remote-session refs nested in `value`."""
+    if is_remote_session_bridge_ref_payload(value):
+        return {
+            "kind": "remote_session_bridge_ref",
+            "bridge_key": value.get("bridge_key"),
+            "node_id": value.get("node_id"),
+            "output_index": value.get("output_index"),
+        }
+    if is_remote_session_value_ref_payload(value):
+        return {
+            "kind": "remote_session_value_ref",
+            "session_id": value.get("session_id"),
+            "node_id": value.get("node_id"),
+            "output_index": value.get("output_index"),
+        }
+    if isinstance(value, list):
+        items = [
+            _remote_session_ref_cache_signature(item)
+            for item in value
+        ]
+        if any(item is not None for item in items):
+            return {"kind": "list", "items": items}
+        return None
+    if isinstance(value, tuple):
+        items = [
+            _remote_session_ref_cache_signature(item)
+            for item in value
+        ]
+        if any(item is not None for item in items):
+            return {"kind": "tuple", "items": items}
+        return None
+    if isinstance(value, Mapping):
+        items = {
+            str(key): _remote_session_ref_cache_signature(item)
+            for key, item in value.items()
+        }
+        filtered_items = {
+            key: item
+            for key, item in items.items()
+            if item is not None
+        }
+        if filtered_items:
+            return {"kind": "mapping", "items": filtered_items}
+    return None
+
+
+def _boundary_input_cache_signature(
+    *,
+    source_signature: Any,
+    cache_value: Any,
+) -> Any | None:
+    """Return a cache signature for one boundary input and its unresolved source value."""
+    ref_signature = _remote_session_ref_cache_signature(cache_value)
+    if ref_signature is None:
+        if isinstance(source_signature, str) and source_signature:
+            return source_signature
+        return None
+    return {
+        "source_signature": source_signature if isinstance(source_signature, str) else None,
+        "remote_session_refs": ref_signature,
+    }
+
+
 def _apply_boundary_inputs(
     prompt: dict[str, Any],
     boundary_input_specs: list[dict[str, Any]],
     hydrated_inputs: dict[str, Any],
+    cache_signature_inputs: dict[str, Any] | None = None,
 ) -> None:
     """Inject hydrated local boundary inputs into a remote subgraph prompt."""
     for boundary_input in boundary_input_specs:
@@ -3254,11 +3319,19 @@ def _apply_boundary_inputs(
                 value,
                 io_type=io_type,
             )
-            source_signature = boundary_input.get("source_signature")
-            if isinstance(source_signature, str) and source_signature:
+            cache_signature = _boundary_input_cache_signature(
+                source_signature=boundary_input.get("source_signature"),
+                cache_value=(
+                    cache_signature_inputs.get(proxy_input_name)
+                    if cache_signature_inputs is not None
+                    and proxy_input_name in cache_signature_inputs
+                    else value
+                ),
+            )
+            if cache_signature is not None:
                 boundary_signatures = prompt_node.setdefault(_BOUNDARY_INPUT_SIGNATURES_KEY, {})
                 if isinstance(boundary_signatures, dict):
-                    boundary_signatures[input_name] = source_signature
+                    boundary_signatures[input_name] = cache_signature
 
 
 def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
@@ -3788,6 +3861,7 @@ def _execute_subgraph_prompt(
             prompt=prompt,
             boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
             hydrated_inputs=resolved_inputs,
+            cache_signature_inputs=hydrated_inputs,
         )
     with _timed_phase("load_execution_module", component=component_id):
         execution = _load_execution_module()

@@ -3051,6 +3051,94 @@ def test_modal_cloud_node_cache_key_uses_boundary_source_signature_for_unhashabl
     assert different_key != first_key
 
 
+def test_modal_cloud_node_cache_key_includes_remote_session_bridge_key(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Mapped remote-session bridge inputs should not collide in the distributed cache."""
+
+    class FakeDynPrompt:
+        """Minimal dynamic prompt wrapper backed by one mutable prompt dict."""
+
+        def __init__(self, prompt: dict[str, Any]) -> None:
+            """Store the prompt used by the cache-key rebuild."""
+            self._prompt = prompt
+
+        def has_node(self, node_id: str) -> bool:
+            """Return whether the requested node exists in the prompt."""
+            return str(node_id) in self._prompt
+
+        def get_node(self, node_id: str) -> dict[str, Any]:
+            """Return the stored node payload."""
+            return self._prompt[str(node_id)]
+
+    class FakeConditioning:
+        """Stand-in for a resolved CONDITIONING object."""
+
+    def build_prompt(bridge_key: str) -> dict[str, Any]:
+        """Build one sampler prompt with a resolved conditioning and original bridge ref metadata."""
+        prompt = {
+            "507": {
+                "class_type": "FakeSampler",
+                "inputs": {},
+            }
+        }
+        boundary_spec = [
+            {
+                "proxy_input_name": "phase_bridge_3",
+                "io_type": "CONDITIONING",
+                "source_signature": "SRC_node_508_output_0",
+                "targets": [{"node_id": "507", "input_name": "positive"}],
+            }
+        ]
+        bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+            bridge_key=bridge_key,
+            node_id="508",
+            output_index=0,
+            session_id="session_1",
+        ).to_payload()
+        modal_cloud_module._apply_boundary_inputs(
+            prompt,
+            boundary_spec,
+            {"phase_bridge_3": FakeConditioning()},
+            cache_signature_inputs={"phase_bridge_3": bridge_ref},
+        )
+        return prompt
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_nodes_module",
+        lambda: types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_include_unique_id_in_input_signature",
+        lambda class_type: False,
+    )
+
+    def cache_key_for(prompt: dict[str, Any]) -> str | None:
+        """Build one distributed cache key for the prepared prompt."""
+        cache_key_set = types.SimpleNamespace(
+            dynprompt=FakeDynPrompt(prompt),
+            is_changed_cache=types.SimpleNamespace(is_changed={"507": False}),
+            get_ordered_ancestry=lambda current_dynprompt, node_id: ([], {}),
+            include_node_id_in_input=lambda: False,
+            get_data_key=lambda node_id: None,
+        )
+        return modal_cloud_module._node_output_cache_key_from_key_set_sync(cache_key_set, "507")
+
+    first_key = cache_key_for(build_prompt("RSB_first"))
+    same_key = cache_key_for(build_prompt("RSB_first"))
+    second_key = cache_key_for(build_prompt("RSB_second"))
+
+    assert isinstance(first_key, str)
+    assert first_key.startswith("NC_")
+    assert same_key == first_key
+    assert second_key != first_key
+
+
 def test_modal_cloud_node_cache_key_treats_nested_two_item_lists_as_data(
     modal_cloud_module: Any,
     monkeypatch: Any,
