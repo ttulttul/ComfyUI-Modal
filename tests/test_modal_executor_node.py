@@ -8629,6 +8629,94 @@ def test_implicitly_mapped_subgraph_clears_remote_session_once_after_all_items_f
     assert observed_calls[-1] == ("17::cleanup", True, (), {})
 
 
+def test_implicitly_mapped_subgraph_stops_queued_items_after_local_interrupt(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    session_state_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Implicit mapped cancellation should not dispatch queued items or cleanup work."""
+
+    class FakeInterrupt(Exception):
+        """Stand-in for ComfyUI's InterruptProcessingException."""
+
+    observed_calls: list[str] = []
+    local_interrupted = False
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        nonlocal local_interrupted
+        del kwargs_payload
+        component_id = str(payload["component_id"])
+        observed_calls.append(component_id)
+        if component_id.endswith("::cleanup"):
+            raise AssertionError("interrupted mapped execution should not run cleanup")
+        local_interrupted = True
+        return serialization_module.serialize_node_outputs((component_id,))
+
+    def fake_local_processing_interrupted() -> bool:
+        return local_interrupted
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "boost_mapped_component_warmup",
+        lambda payload, *, total_items, reason: (1, 1),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_local_processing_interrupted",
+        fake_local_processing_interrupted,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_raise_local_interrupt",
+        lambda: (_ for _ in ()).throw(FakeInterrupt()),
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["12"],
+        "execute_node_ids": ["12"],
+        "subgraph_prompt": {
+            "12": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 0},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "12", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [{"node_id": "12", "io_type": "STRING", "is_list": False}],
+        "extra_data": {"client_id": "client-1"},
+        "remote_session": session_state_module.RemoteSessionHandle(
+            session_id="session-1",
+            prompt_id="prompt-1",
+            owner_component_id="17",
+        ).to_payload(),
+        "clear_remote_session": True,
+    }
+
+    with pytest.raises(FakeInterrupt):
+        asyncio.run(
+            remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+                payload,
+                serialization_module.serialize_node_inputs({"remote_input_0": [10, 11, 12]}),
+            )
+        )
+
+    assert observed_calls == ["17::item:0"]
+
+
 def test_implicitly_mapped_subgraph_keeps_conditioning_lists_broadcast(
     remote_modal_app_module: Any,
     serialization_module: Any,

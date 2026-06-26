@@ -2598,6 +2598,14 @@ def _raise_local_interrupt() -> None:
     raise comfy.model_management.InterruptProcessingException()
 
 
+def _exception_indicates_interruption(exc: BaseException) -> bool:
+    """Return whether an exception represents cancellation or interrupted execution."""
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    message = str(exc).lower()
+    return "interrupt" in message or "cancel" in message
+
+
 def _remote_interrupt_key(payload: dict[str, Any]) -> tuple[str, str]:
     """Return the prompt/component pair used to interrupt one remote execution."""
     prompt_id = str(payload.get("prompt_id") or payload.get("component_id") or "modal-subgraph")
@@ -4185,6 +4193,8 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         per_item_outputs: list[tuple[Any, ...] | None] = [None] * total_items
         completed_items = 0
         all_items_completed = asyncio.Event()
+        stop_dispatch_requested = asyncio.Event()
+        skip_cleanup_after_interrupt = False
         worker_failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
         item_queue: asyncio.Queue[int | None] = asyncio.Queue()
         for item_index in range(total_items):
@@ -4192,19 +4202,35 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         for _ in range(parallelism):
             item_queue.put_nowait(None)
 
+        def request_interrupt_stop() -> None:
+            """Stop queued mapped item dispatch and suppress cleanup after interruption."""
+            nonlocal skip_cleanup_after_interrupt
+            skip_cleanup_after_interrupt = True
+            stop_dispatch_requested.set()
+
+        def raise_if_local_interrupted() -> None:
+            """Raise the native ComfyUI interrupt after marking mapped dispatch as stopped."""
+            if _local_processing_interrupted():
+                request_interrupt_stop()
+                _raise_local_interrupt()
+
         async def run_worker(lane_index: int) -> None:
             """Execute queued implicit mapped items through one stable local worker lane."""
             nonlocal completed_items
             try:
+                raise_if_local_interrupted()
                 if use_seeded_remote_lanes:
                     _emit_local_mapped_lane_progress_start(payload, lane_index)
                     await seed_lane(lane_index)
                 while True:
+                    if stop_dispatch_requested.is_set():
+                        return
                     item_index = await item_queue.get()
                     if item_index is None:
                         return
-                    if _local_processing_interrupted():
-                        _raise_local_interrupt()
+                    if stop_dispatch_requested.is_set():
+                        return
+                    raise_if_local_interrupted()
                     try:
                         item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
                         item_inputs = dict(broadcast_inputs)
@@ -4221,6 +4247,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                                 item_payload,
                                 serialize_node_inputs(item_inputs),
                             )
+                        raise_if_local_interrupted()
                         per_item_outputs[item_index] = deserialize_node_outputs(item_response)
                         completed_items += 1
                         _emit_local_mapped_progress(payload, completed_items, total_items)
@@ -4237,6 +4264,9 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                         exc,
                     )
                     return
+                stop_dispatch_requested.set()
+                if _exception_indicates_interruption(exc):
+                    request_interrupt_stop()
                 if not worker_failure.done():
                     worker_failure.set_result(exc)
                 raise
@@ -4262,15 +4292,20 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                 if completion_task in done or all_items_completed.is_set():
                     break
                 if worker_failure in done:
+                    stop_dispatch_requested.set()
                     raise worker_failure.result()
                 for task in done:
                     if task in tasks:
                         task_exc = task.exception()
                         if task_exc is not None:
+                            stop_dispatch_requested.set()
                             raise task_exc
             if not all(item_outputs is not None for item_outputs in per_item_outputs):
                 await asyncio.gather(*tasks)
-        except BaseException:
+        except BaseException as exc:
+            stop_dispatch_requested.set()
+            if _exception_indicates_interruption(exc):
+                skip_cleanup_after_interrupt = True
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -4297,7 +4332,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
             )
         )
     finally:
-        if cleanup_payload is not None:
+        if cleanup_payload is not None and not skip_cleanup_after_interrupt:
             if use_seeded_remote_lanes and lane_remote_engines:
                 await asyncio.gather(
                     *(
@@ -4319,6 +4354,11 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     cleanup_payload,
                     serialize_node_inputs({}),
                 )
+        elif cleanup_payload is not None:
+            logger.info(
+                "Skipping remote-session cleanup for implicitly mapped Modal component=%s because execution was interrupted.",
+                payload.get("component_id"),
+            )
 
 
 async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
