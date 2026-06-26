@@ -16,7 +16,43 @@ _VALUE_KEY = "value"
 _TENSOR_KIND = "tensor"
 _BYTES_KIND = "bytes"
 _TUPLE_KIND = "tuple"
+_MAPPED_OUTPUT_KIND = "mapped_output"
 _BATCHABLE_TENSOR_IO_TYPES = frozenset({"IMAGE", "MASK", "NOISE", "SIGMAS"})
+
+
+class MappedOutputValue(list[Any]):
+    """Ordered value produced by mapped execution and intended for per-item reuse."""
+
+    def __init__(self, items: Sequence[Any], io_type: str, is_list: bool) -> None:
+        """Initialize a list-like mapped output with scheduler metadata."""
+        super().__init__(items)
+        self.io_type = str(io_type)
+        self.is_list = bool(is_list)
+
+    @property
+    def items(self) -> tuple[Any, ...]:
+        """Return mapped items as an immutable tuple."""
+        return tuple(self)
+
+
+def unwrap_mapped_output_value(value: Any) -> Any:
+    """Return the ordinary runtime value represented by a mapped output wrapper."""
+    if isinstance(value, MappedOutputValue):
+        if value.is_list:
+            flattened: list[Any] = []
+            for item in value.items:
+                if isinstance(item, list):
+                    flattened.extend(item)
+                    continue
+                flattened.append(item)
+            return flattened
+        return list(value.items)
+    return value
+
+
+def is_mapped_output_value(value: Any) -> bool:
+    """Return whether a value carries mapped-output item metadata."""
+    return isinstance(value, MappedOutputValue)
 
 
 def _is_scalar(value: Any) -> bool:
@@ -57,6 +93,14 @@ def serialize_value(value: Any) -> Any:
     """Convert a Python value into a JSON-safe execution payload."""
     if _is_scalar(value):
         return value
+
+    if isinstance(value, MappedOutputValue):
+        return {
+            _KIND_KEY: _MAPPED_OUTPUT_KIND,
+            "items": [serialize_value(item) for item in value.items],
+            "io_type": value.io_type,
+            "is_list": value.is_list,
+        }
 
     try:
         torch = _import_torch()
@@ -115,6 +159,12 @@ def deserialize_value(payload: Any) -> Any:
         return base64.b64decode(encoded.encode("ascii"))
     if kind == _TUPLE_KIND:
         return tuple(deserialize_value(item) for item in payload["items"])
+    if kind == _MAPPED_OUTPUT_KIND:
+        return MappedOutputValue(
+            items=tuple(deserialize_value(item) for item in payload["items"]),
+            io_type=str(payload.get("io_type", "*")),
+            is_list=bool(payload.get("is_list", False)),
+        )
 
     return {str(key): deserialize_value(value) for key, value in payload.items()}
 
@@ -212,6 +262,9 @@ def _split_latent_batch(value: Mapping[str, Any]) -> list[Any]:
 
 def split_mapped_value(value: Any, io_type: str) -> list[Any]:
     """Split one mapped input value into ordered per-item values."""
+    if isinstance(value, MappedOutputValue):
+        return list(value.items)
+
     if isinstance(value, list):
         if len(value) == 0:
             raise ValueError("Mapped list inputs must contain at least one item.")
@@ -277,6 +330,14 @@ def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> An
     if not values:
         raise ValueError("Mapped execution produced no outputs to aggregate.")
 
+    normalized_io_type = str(io_type)
+    if normalized_io_type == "CONDITIONING":
+        return MappedOutputValue(
+            items=tuple(copy.deepcopy(value) for value in values),
+            io_type=normalized_io_type,
+            is_list=is_list,
+        )
+
     if is_list:
         flattened: list[Any] = []
         for value in values:
@@ -286,7 +347,6 @@ def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> An
             flattened.append(value)
         return flattened
 
-    normalized_io_type = str(io_type)
     if normalized_io_type == "LATENT":
         try:
             return _join_latent_batches(values)
