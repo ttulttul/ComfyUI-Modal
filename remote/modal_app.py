@@ -3841,31 +3841,42 @@ def _split_batch_boundary_inputs(
     implicitly_batchable_scalar_io_types = frozenset({"BOOLEAN", "FLOAT", "INT", "STRING"})
     implicitly_batchable_transport_io_types = frozenset({"IMAGE", "LATENT", "MASK", "NOISE", "SIGMAS"})
     split_inputs: dict[str, list[Any]] = {}
+
+    def is_session_ref_list(value: Any) -> bool:
+        """Return whether `value` is a non-empty list of remote session refs."""
+        return (
+            isinstance(value, list)
+            and len(value) > 0
+            and all(
+                is_remote_session_value_ref_payload(item)
+                or is_remote_session_bridge_ref_payload(item)
+                for item in value
+            )
+        )
+
+    def unwrap_singleton_session_ref_list(value: Any) -> Any:
+        """Unwrap Comfy's output-list wrapper around mapped remote session refs."""
+        if isinstance(value, list) and len(value) == 1 and is_session_ref_list(value[0]):
+            return value[0]
+        return value
+
     for boundary_input in payload.get("boundary_inputs", []):
         proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
         if not proxy_input_name or proxy_input_name not in hydrated_inputs:
             continue
-        input_value = hydrated_inputs[proxy_input_name]
+        input_value = unwrap_singleton_session_ref_list(hydrated_inputs[proxy_input_name])
         io_type = _implicit_batch_boundary_effective_io_type(
             payload=payload,
             boundary_input=boundary_input,
             input_value=input_value,
         )
-        is_session_ref_list = (
-            isinstance(input_value, list)
-            and len(input_value) > 0
-            and all(
-                is_remote_session_value_ref_payload(item)
-                or is_remote_session_bridge_ref_payload(item)
-                for item in input_value
-            )
-        )
+        input_is_session_ref_list = is_session_ref_list(input_value)
         if (
             isinstance(input_value, list)
             and not is_mapped_output_value(input_value)
-            and not is_session_ref_list
+            and not input_is_session_ref_list
             and io_type not in (
-            implicitly_batchable_scalar_io_types | implicitly_batchable_transport_io_types
+                implicitly_batchable_scalar_io_types | implicitly_batchable_transport_io_types
             )
         ):
             logger.info(
