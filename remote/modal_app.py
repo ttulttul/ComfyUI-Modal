@@ -4099,7 +4099,11 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
             payload.get("component_id"),
             input_is_list_target_node_ids,
         )
-        return await invoke_remote_engine_async(payload, kwargs_payload)
+        return await invoke_remote_engine_async(
+            payload,
+            kwargs_payload,
+            allow_implicit_mapping=False,
+        )
 
     parallelism, refined_prompt_warmup_target = boost_mapped_component_warmup(
         payload,
@@ -5543,7 +5547,12 @@ def _invoke_modal_payload_blocking(
     return result
 
 
-def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+def invoke_remote_engine(
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    *,
+    allow_implicit_mapping: bool = True,
+) -> bytes:
     """Invoke Modal when configured, or fall back to local in-process execution."""
     execution_mode = get_settings().execution_mode
     if payload.get("payload_kind") == "mapped_subgraph":
@@ -5552,7 +5561,7 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
             return serialize_node_outputs(
                 _execute_mapped_subgraph_payload(payload, hydrated_inputs)
             )
-    if payload.get("payload_kind") == "subgraph":
+    if allow_implicit_mapping and payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
             return asyncio.run(_invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload))
@@ -5614,18 +5623,28 @@ def invoke_remote_engine(payload: dict[str, Any], kwargs_payload: bytes) -> byte
     return response
 
 
-async def invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+async def invoke_remote_engine_async(
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    *,
+    allow_implicit_mapping: bool = True,
+) -> bytes:
     """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
     execution_mode = get_settings().execution_mode
     if payload.get("payload_kind") == "mapped_subgraph":
         if execution_mode == "local" or modal is None:
             return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
-    if payload.get("payload_kind") == "subgraph":
+    if allow_implicit_mapping and payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
             return await _invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload)
     if execution_mode == "local" or modal is None:
-        return await asyncio.to_thread(invoke_remote_engine, payload, kwargs_payload)
+        return await asyncio.to_thread(
+            invoke_remote_engine,
+            payload,
+            kwargs_payload,
+            allow_implicit_mapping=allow_implicit_mapping,
+        )
 
     logger.info(
         "Dispatching async Modal remote invocation for component=%s payload_kind=%s.",
