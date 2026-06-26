@@ -8507,7 +8507,13 @@ def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets
     )()
     monkeypatch.setattr(remote_modal_app_module, "_load_nodes_module", lambda: fake_nodes_module)
 
-    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+    async def fake_invoke_remote_engine_async(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        *,
+        allow_implicit_mapping: bool = True,
+    ) -> bytes:
+        del allow_implicit_mapping
         hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
         execute_node_ids = tuple(str(node_id) for node_id in payload.get("execute_node_ids", []))
         observed_calls.append((str(payload["component_id"]), execute_node_ids, hydrated_inputs))
@@ -8565,6 +8571,86 @@ def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets
     )
     assert observed_calls == [
         ("17", ("4", "12"), {"remote_input_0": [10, 11, 12]}),
+    ]
+
+
+def test_invoke_remote_engine_async_bypasses_implicit_mapping_once_for_input_is_list_targets(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The async dispatcher should not recurse when implicit fan-out is suppressed."""
+    observed_calls: list[tuple[bool, dict[str, Any]]] = []
+
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "ImplicitBatchListSource": _ImplicitBatchListSourceNode,
+                "ImplicitBatchScalarConsumer": _ImplicitBatchScalarConsumerNode,
+                "ImplicitBatchListConsumer": _ImplicitBatchListConsumerNode,
+            }
+        },
+    )()
+    monkeypatch.setattr(remote_modal_app_module, "_load_nodes_module", lambda: fake_nodes_module)
+
+    def fake_invoke_remote_engine(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        *,
+        allow_implicit_mapping: bool = True,
+    ) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        observed_calls.append((allow_implicit_mapping, hydrated_inputs))
+        return serialization_module.serialize_node_outputs(("ordinary-subgraph",))
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine",
+        fake_invoke_remote_engine,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "17",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["4", "12", "17"],
+        "execute_node_ids": ["4", "12"],
+        "subgraph_prompt": {
+            "17": {"class_type": "ImplicitBatchListSource", "inputs": {"values": 0}},
+            "4": {
+                "class_type": "ImplicitBatchScalarConsumer",
+                "inputs": {"value": ["17", 0]},
+            },
+            "12": {
+                "class_type": "ImplicitBatchListConsumer",
+                "inputs": {"values": ["17", 1]},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "INT",
+                "targets": [{"node_id": "17", "input_name": "values"}],
+            }
+        ],
+        "boundary_outputs": [
+            {"node_id": "4", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module.invoke_remote_engine_async(
+            payload,
+            serialization_module.serialize_node_inputs({"remote_input_0": [10, 11, 12]}),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == ("ordinary-subgraph",)
+    assert observed_calls == [
+        (False, {"remote_input_0": [10, 11, 12]}),
     ]
 
 
