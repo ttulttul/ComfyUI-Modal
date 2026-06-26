@@ -236,6 +236,49 @@ def test_remote_session_store_resolves_same_output_bridge_refs_by_bridge_key(
     assert observed_bridge_keys == ["RSB_first", "RSB_second"]
 
 
+def test_remote_session_store_does_not_resolve_bridge_refs_by_ambiguous_node_slot(
+    session_state_module: Any,
+) -> None:
+    """Bridge refs from mapped same-node outputs must not use the overwritten node slot."""
+    store = session_state_module.InMemoryRemoteSessionStore()
+    source_handle = session_state_module.RemoteSessionHandle(
+        session_id="session-source",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    target_handle = session_state_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    first_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_first",
+        node_id="508",
+        output_index=0,
+        session_id=source_handle.session_id,
+    )
+
+    store.put_output(
+        source_handle,
+        node_id=first_ref.node_id,
+        output_index=first_ref.output_index,
+        value="conditioning-b",
+    )
+    observed_bridge_keys: list[str] = []
+
+    def bridge_resolver(ref: Any) -> str:
+        """Return the durable bridge value instead of the ambiguous source node slot."""
+        observed_bridge_keys.append(ref.bridge_key)
+        return "conditioning-a"
+
+    assert store.resolve_value_with_bridges(
+        first_ref.to_payload(),
+        target_session_handle=target_handle,
+        bridge_resolver=bridge_resolver,
+    ) == "conditioning-a"
+    assert observed_bridge_keys == ["RSB_first"]
+
+
 def test_remote_session_store_resolves_nested_bridge_ref_lists(
     session_state_module: Any,
 ) -> None:
@@ -246,14 +289,16 @@ def test_remote_session_store_resolves_nested_bridge_ref_lists(
         prompt_id="prompt-1",
         owner_component_id="component-1",
     )
-    first_ref = store.put_output(
+    first_ref = store.put_bridge_output(
         source_handle,
+        bridge_key="RSB_a",
         node_id="node-7:item:0",
         output_index=0,
         value="conditioning-a",
     )
-    second_ref = store.put_output(
+    second_ref = store.put_bridge_output(
         source_handle,
+        bridge_key="RSB_b",
         node_id="node-7:item:1",
         output_index=0,
         value="conditioning-b",

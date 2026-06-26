@@ -593,30 +593,6 @@ class InMemoryRemoteSessionStore:
                         },
                     )
                 return live_value
-            found, live_value = self.try_get_output(
-                RemoteSessionValueRef(
-                    session_id=ref.session_id,
-                    node_id=ref.node_id,
-                    output_index=ref.output_index,
-                )
-            )
-            if found:
-                logger.info(
-                    "Resolved remote session bridge ref bridge_key=%s via source session_id=%s.",
-                    ref.bridge_key,
-                    ref.session_id,
-                )
-                if resolution_callback is not None:
-                    resolution_callback(
-                        "bridge-source-hit",
-                        {
-                            "bridge_key": ref.bridge_key,
-                            "session_id": ref.session_id,
-                            "node_id": ref.node_id,
-                            "output_index": ref.output_index,
-                        },
-                    )
-                return live_value
         if bridge_resolver is None:
             raise RemoteSessionStateError(
                 "Remote session bridge value was not found and no bridge_resolver was provided "
