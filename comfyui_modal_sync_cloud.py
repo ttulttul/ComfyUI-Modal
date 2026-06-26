@@ -2450,9 +2450,9 @@ def _build_node_output_cache_immediate_signature(
     boundary_input_signatures = node.get(_BOUNDARY_INPUT_SIGNATURES_KEY)
     for key in sorted(inputs.keys()):
         input_value = inputs[key]
-        if _is_link(input_value):
-            ancestor_id = str(input_value[0])
-            ancestor_socket = int(input_value[1])
+        ancestor_socket = _cache_signature_link_output_index(input_value)
+        ancestor_id = str(input_value[0]) if ancestor_socket is not None else None
+        if ancestor_socket is not None and ancestor_id in ancestor_order_mapping:
             ancestor_index = int(ancestor_order_mapping[ancestor_id])
             signature.append((key, ("ANCESTOR", ancestor_index, ancestor_socket)))
         else:
@@ -2466,6 +2466,21 @@ def _build_node_output_cache_immediate_signature(
             else:
                 signature.append((key, input_value))
     return signature
+
+
+def _cache_signature_link_output_index(value: Any) -> int | None:
+    """Return a prompt-link output index when `value` is safe to treat as graph wiring."""
+    if not _is_link(value):
+        return None
+
+    output_index = _normalize_link_output_index(value[1])
+    if isinstance(output_index, bool):
+        return None
+
+    try:
+        return int(output_index)
+    except (TypeError, ValueError):
+        return None
 
 
 async def _build_node_output_cache_signature_from_key_set_async(

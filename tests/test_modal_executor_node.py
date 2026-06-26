@@ -3051,6 +3051,61 @@ def test_modal_cloud_node_cache_key_uses_boundary_source_signature_for_unhashabl
     assert different_key != first_key
 
 
+def test_modal_cloud_node_cache_key_treats_nested_two_item_lists_as_data(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Nested conditioning-style two-item lists should not be mistaken for prompt links."""
+
+    class FakeDynPrompt:
+        """Minimal dynamic prompt wrapper for one data-only node."""
+
+        def has_node(self, node_id: str) -> bool:
+            """Return whether the requested node exists."""
+            return str(node_id) == "545"
+
+        def get_node(self, node_id: str) -> dict[str, Any]:
+            """Return a node with nested list data shaped like Comfy conditioning."""
+            if not self.has_node(node_id):
+                raise KeyError(node_id)
+            return {
+                "class_type": "AnythingToMarkdown",
+                "inputs": {
+                    "anything": [
+                        [
+                            {"pooled_output": "summary"},
+                            [["not-a-node-id"], ["not-an-output-index"]],
+                        ]
+                    ]
+                },
+            }
+
+    cache_key_set = types.SimpleNamespace(
+        dynprompt=FakeDynPrompt(),
+        is_changed_cache=types.SimpleNamespace(is_changed={"545": False}),
+        get_ordered_ancestry=lambda current_dynprompt, node_id: ([], {}),
+        include_node_id_in_input=lambda: False,
+        get_data_key=lambda node_id: None,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_nodes_module",
+        lambda: types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={"AnythingToMarkdown": type("AnythingToMarkdown", (), {})}
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_include_unique_id_in_input_signature",
+        lambda class_type: False,
+    )
+
+    cache_key = modal_cloud_module._node_output_cache_key_from_key_set_sync(cache_key_set, "545")
+
+    assert isinstance(cache_key, str)
+    assert cache_key.startswith("NC_")
+
+
 def test_modal_cloud_ignores_heavy_comfyui_paths(
     modal_cloud_module: Any,
 ) -> None:
