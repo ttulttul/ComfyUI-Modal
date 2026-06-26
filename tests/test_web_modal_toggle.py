@@ -397,8 +397,11 @@ def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
     assert "function findNodeByWorkflowPath(workflowPath)" in source
     assert "function selectedWorkflowNodePaths(node)" in source
     assert "function analyzeAndSetUpstreamRemoteNodes(node, value)" in source
+    assert "function requestModalMaintenance(route, successMessage)" in source
     assert "function installModalContextMenu(nodeType, nodeData)" in source
     assert 'api.fetchApi(MODAL_ANALYZE_ROUTE, {' in source
+    assert 'const MODAL_DELETE_CACHES_ROUTE = MODAL_ROUTE.replace(/\\/queue_prompt$/, "/delete_caches");' in source
+    assert 'const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\\/queue_prompt$/, "/delete_volume");' in source
     assert "async beforeRegisterNodeDef(nodeType, nodeData)" in source
     assert "installModalContextMenu(nodeType, nodeData);" in source
     assert 'content: "Modal"' in source
@@ -410,6 +413,8 @@ def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
     assert '"Disable on Upstream Nodes for Selection"' in source
     assert '"Enable All Nodes"' in source
     assert '"Disable All Nodes"' in source
+    assert '"Delete Modal Caches"' in source
+    assert '"Delete Modal Volume"' in source
     assert '"Modal: Enable on Upstream Nodes"' not in source
     assert '"Modal: Disable on Upstream Nodes"' not in source
     assert '"Modal: Enable All Nodes"' not in source
@@ -417,6 +422,9 @@ def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
     assert "analyzeAndSetUpstreamRemoteNodes(this, false)" in source
     assert "setAllEligibleWorkflowNodesRemote(true);" in source
     assert "setAllEligibleWorkflowNodesRemote(false);" in source
+    assert "requestModalMaintenance(" in source
+    assert "MODAL_DELETE_CACHES_ROUTE" in source
+    assert "MODAL_DELETE_VOLUME_ROUTE" in source
 
 
 def test_modal_context_menu_marks_nodes_across_subgraphs() -> None:

@@ -5,6 +5,8 @@ const REMOTE_PROPERTY = "is_modal_remote";
 const MODAL_ROUTE = "/modal/queue_prompt";
 const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
 const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/progress_state");
+const MODAL_DELETE_CACHES_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_caches");
+const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_volume");
 const COMFY_QUEUE_ROUTE = "/queue";
 const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
@@ -1958,6 +1960,22 @@ function notifyModal(value) {
 }
 
 /**
+ * Request one local Modal maintenance action from the backend.
+ * @param {string} route
+ * @param {string} successMessage
+ */
+async function requestModalMaintenance(route, successMessage) {
+  if (typeof api.fetchApi !== "function") {
+    throw new Error("ComfyUI API fetch is unavailable.");
+  }
+  const response = await api.fetchApi(route, { method: "POST" });
+  if (response.status !== 200) {
+    throw new PromptExecutionError(await response.json());
+  }
+  notifyModal(successMessage);
+}
+
+/**
  * Apply the remote marker value to the workflow nodes named by composed workflow paths.
  * @param {string[]} workflowNodePaths
  * @param {boolean} value
@@ -2123,6 +2141,36 @@ function installModalContextMenu(nodeType, nodeData) {
               content: "Disable All Nodes",
               callback: () => {
                 setAllEligibleWorkflowNodesRemote(false);
+              },
+            },
+            {
+              content: "Delete Modal Caches",
+              callback: () => {
+                void requestModalMaintenance(
+                  MODAL_DELETE_CACHES_ROUTE,
+                  "Deleted Modal caches.",
+                ).catch((error) => {
+                  console.error("Modal cache deletion failed.", error);
+                  notifyModal(`Modal cache deletion failed: ${String(error?.message ?? error)}`);
+                });
+              },
+            },
+            {
+              content: "Delete Modal Volume",
+              callback: () => {
+                if (typeof window !== "undefined" && typeof window.confirm === "function") {
+                  const confirmed = window.confirm("Delete the configured Modal volume?");
+                  if (!confirmed) {
+                    return;
+                  }
+                }
+                void requestModalMaintenance(
+                  MODAL_DELETE_VOLUME_ROUTE,
+                  "Deleted Modal volume.",
+                ).catch((error) => {
+                  console.error("Modal volume deletion failed.", error);
+                  notifyModal(`Modal volume deletion failed: ${String(error?.message ?? error)}`);
+                });
               },
             },
           ],
