@@ -977,21 +977,35 @@ def _resolve_remote_session_inputs(
     resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> dict[str, Any]:
     """Resolve any remote-session value refs embedded in boundary inputs."""
+    def count_refs(value: Any) -> int:
+        """Return the number of live or durable session refs nested in one value."""
+        if is_remote_session_value_ref_payload(value) or is_remote_session_bridge_ref_payload(value):
+            return 1
+        if isinstance(value, list | tuple):
+            return sum(count_refs(item) for item in value)
+        if isinstance(value, Mapping):
+            return sum(count_refs(item) for item in value.values())
+        return 0
+
+    ref_counts_by_input = {
+        input_name: count_refs(input_value)
+        for input_name, input_value in hydrated_inputs.items()
+    }
     ref_input_names = [
         input_name
-        for input_name, input_value in hydrated_inputs.items()
-        if is_remote_session_value_ref_payload(input_value)
-        or is_remote_session_bridge_ref_payload(input_value)
+        for input_name, ref_count in ref_counts_by_input.items()
+        if ref_count > 0
     ]
+    total_ref_count = sum(ref_counts_by_input.values())
     if ref_input_names:
         logger.info(
             "Resolving %d remote session input refs for component=%s inputs=%s.",
-            len(ref_input_names),
+            total_ref_count,
             component_id or "<unknown>",
             sorted(ref_input_names),
         )
     if resolution_stats is not None:
-        resolution_stats.input_ref_count += len(ref_input_names)
+        resolution_stats.input_ref_count += total_ref_count
     return {
         input_name: _REMOTE_SESSION_STORE.resolve_value_with_bridges(
             input_value,

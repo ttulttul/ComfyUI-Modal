@@ -440,6 +440,27 @@ class InMemoryRemoteSessionStore:
         resolution_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
     ) -> Any:
         """Resolve one possible live or durable session reference into the underlying value."""
+        if isinstance(value, list):
+            return [
+                self.resolve_value_with_bridges(
+                    item,
+                    target_session_handle=target_session_handle,
+                    bridge_resolver=bridge_resolver,
+                    resolution_callback=resolution_callback,
+                )
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                self.resolve_value_with_bridges(
+                    item,
+                    target_session_handle=target_session_handle,
+                    bridge_resolver=bridge_resolver,
+                    resolution_callback=resolution_callback,
+                )
+                for item in value
+            )
+
         if is_remote_session_value_ref_payload(value):
             ref = RemoteSessionValueRef.from_payload(value)
             logger.info(
@@ -460,6 +481,16 @@ class InMemoryRemoteSessionStore:
             return self.get_output(ref)
 
         if not is_remote_session_bridge_ref_payload(value):
+            if isinstance(value, Mapping):
+                return {
+                    str(key): self.resolve_value_with_bridges(
+                        item,
+                        target_session_handle=target_session_handle,
+                        bridge_resolver=bridge_resolver,
+                        resolution_callback=resolution_callback,
+                    )
+                    for key, item in value.items()
+                }
             return value
 
         ref = RemoteSessionBridgeRef.from_payload(value)

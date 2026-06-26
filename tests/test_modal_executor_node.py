@@ -6995,6 +6995,59 @@ def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_recor
     assert resolution_stats.session_restore_writes == 1
 
 
+def test_remote_session_input_resolution_handles_nested_conditioning_bridge_refs(
+    remote_modal_app_module: Any,
+) -> None:
+    """Boundary input resolution should resolve bridge refs nested inside list outputs."""
+    source_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-source",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    first_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_output(
+        source_handle,
+        node_id="508:item:0",
+        output_index=0,
+        value=[["conditioning-a", {"pooled_output": "pool-a"}]],
+    )
+    second_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_output(
+        source_handle,
+        node_id="508:item:1",
+        output_index=0,
+        value=[["conditioning-b", {"pooled_output": "pool-b"}]],
+    )
+    resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+    try:
+        resolved_inputs = remote_modal_app_module._resolve_remote_session_inputs(
+            {
+                "positive": [
+                    remote_modal_app_module.RemoteSessionBridgeRef(
+                        bridge_key="RSB_a",
+                        node_id=first_ref.node_id,
+                        output_index=first_ref.output_index,
+                        session_id=first_ref.session_id,
+                    ).to_payload(),
+                    remote_modal_app_module.RemoteSessionBridgeRef(
+                        bridge_key="RSB_b",
+                        node_id=second_ref.node_id,
+                        output_index=second_ref.output_index,
+                        session_id=second_ref.session_id,
+                    ).to_payload(),
+                ]
+            },
+            component_id="sampler-component",
+            resolution_stats=resolution_stats,
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(source_handle)
+
+    assert resolved_inputs["positive"] == [
+        [["conditioning-a", {"pooled_output": "pool-a"}]],
+        [["conditioning-b", {"pooled_output": "pool-b"}]],
+    ]
+    assert resolution_stats.input_ref_count == 2
+
+
 def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_record_without_replay(
     remote_modal_app_module: Any,
     monkeypatch: Any,

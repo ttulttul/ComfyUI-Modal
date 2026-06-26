@@ -177,3 +177,46 @@ def test_remote_session_store_resolves_bridge_refs_via_replay_callback(
         == "rehydrated-value"
     )
     assert observed_bridge_keys == ["RSB_bridge"]
+
+
+def test_remote_session_store_resolves_nested_bridge_ref_lists(
+    session_state_module: Any,
+) -> None:
+    """Bridge refs nested inside list outputs should resolve item by item."""
+    store = session_state_module.InMemoryRemoteSessionStore()
+    source_handle = session_state_module.RemoteSessionHandle(
+        session_id="session-source",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    first_ref = store.put_output(
+        source_handle,
+        node_id="node-7:item:0",
+        output_index=0,
+        value="conditioning-a",
+    )
+    second_ref = store.put_output(
+        source_handle,
+        node_id="node-7:item:1",
+        output_index=0,
+        value="conditioning-b",
+    )
+    nested_refs = [
+        session_state_module.RemoteSessionBridgeRef(
+            bridge_key="RSB_a",
+            node_id=first_ref.node_id,
+            output_index=first_ref.output_index,
+            session_id=first_ref.session_id,
+        ).to_payload(),
+        session_state_module.RemoteSessionBridgeRef(
+            bridge_key="RSB_b",
+            node_id=second_ref.node_id,
+            output_index=second_ref.output_index,
+            session_id=second_ref.session_id,
+        ).to_payload(),
+    ]
+
+    assert store.resolve_value_with_bridges(nested_refs) == [
+        "conditioning-a",
+        "conditioning-b",
+    ]
