@@ -335,6 +335,7 @@ Current mapped-execution rules:
 - non-mapped boundary inputs are broadcast unchanged to every per-item execution
 - mapped outputs are reassembled in item order, concatenating batchable tensors back together when possible and otherwise preserving the ordered per-item list when shapes differ
 - mapped `CONDITIONING` outputs preserve their per-item boundaries across downstream Modal proxy boundaries, so a later mapped sampler receives the conditioning item that matches its latent item instead of broadcasting the first conditioning payload
+- session bridge refs nested inside list-shaped outputs are resolved recursively, which keeps over-list remote `CONDITIONING` outputs from collapsing to repeated copies of the first item in downstream remote components
 - per-item remote node status updates are suppressed, and streamed UI events from mapped item runs are filtered to the nodes that actually belong to that per-item payload so static sibling branches do not repaint the UI on every item
 - aggregate mapped-batch completion now shades the global Modal status pill like a progress bar and shows counts such as `3/16`, while node-local progress bars remain reserved for real streamed node progress only
 - the representative remote node also shows a small non-bar batch badge like `3/16` during mapped execution so you can see which remote island owns the batch without implying that the node itself emits sampler-style progress
