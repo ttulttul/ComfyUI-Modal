@@ -3586,23 +3586,29 @@ def test_delete_modal_cache_dicts_deletes_configured_dicts(
         """Stand-in for Modal object misses."""
 
     class FakeDictObject:
-        """Minimal Modal Dict object that records maintenance calls."""
+        """Minimal Modal Dict object used only for existence checks."""
 
         def __init__(self, name: str) -> None:
             """Store the configured Dict name."""
             self.name = name
 
-        def clear(self) -> None:
-            """Record a clear call."""
-            cleared.append(self.name)
-
         def delete(self, name: str) -> None:
-            """Record a delete call."""
-            assert name == self.name
-            deleted.append(self.name)
+            """Fail if the deprecated instance deletion path is used."""
+            raise AssertionError(f"deprecated Dict.delete path used for {name}")
+
+    class FakeDictObjects:
+        """Minimal Modal Dict manager namespace."""
+
+        @staticmethod
+        def delete(name: str, allow_missing: bool = False) -> None:
+            """Record a manager delete call."""
+            assert allow_missing is True
+            deleted.append(name)
 
     class FakeDict:
         """Minimal Modal Dict namespace."""
+
+        objects = FakeDictObjects()
 
         @staticmethod
         def from_name(name: str, create_if_missing: bool = False) -> FakeDictObject:
@@ -3640,7 +3646,6 @@ def test_delete_modal_cache_dicts_deletes_configured_dicts(
         sync_index_dict_name="app-sync-index",
         snapshot_profile_dict_name="app-snapshot-profiles",
     )
-    cleared: list[str] = []
     deleted: list[str] = []
     monkeypatch.setattr(api_intercept_module, "modal", FakeModal)
 
@@ -3655,7 +3660,6 @@ def test_delete_modal_cache_dicts_deletes_configured_dicts(
         ],
         "skipped": ["app-interrupts"],
     }
-    assert cleared == result["deleted"]
     assert deleted == result["deleted"]
 
 
@@ -3668,19 +3672,29 @@ def test_delete_modal_volume_deletes_configured_volume(
     """Deleting the Modal volume should target only the configured volume name."""
 
     class FakeVolumeObject:
-        """Minimal Modal Volume object that records deletion."""
+        """Minimal Modal Volume object used only for existence checks."""
 
         def __init__(self, name: str) -> None:
             """Store the configured Volume name."""
             self.name = name
 
         def delete(self, name: str) -> None:
-            """Record a delete call."""
-            assert name == self.name
-            deleted.append(self.name)
+            """Fail if the deprecated instance deletion path is used."""
+            raise AssertionError(f"deprecated Volume.delete path used for {name}")
+
+    class FakeVolumeObjects:
+        """Minimal Modal Volume manager namespace."""
+
+        @staticmethod
+        def delete(name: str, allow_missing: bool = False) -> None:
+            """Record a manager delete call."""
+            assert allow_missing is True
+            deleted.append(name)
 
     class FakeVolume:
         """Minimal Modal Volume namespace."""
+
+        objects = FakeVolumeObjects()
 
         @staticmethod
         def from_name(name: str, create_if_missing: bool = False) -> FakeVolumeObject:
