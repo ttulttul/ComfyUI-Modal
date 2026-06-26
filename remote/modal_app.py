@@ -57,7 +57,7 @@ from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
-_REMOTE_APP_PROTOCOL_VERSION = 3
+_REMOTE_APP_PROTOCOL_VERSION = 4
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
 _MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None]] = set()
