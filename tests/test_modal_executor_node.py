@@ -7147,14 +7147,16 @@ def test_remote_session_input_resolution_handles_nested_conditioning_bridge_refs
         prompt_id="prompt-1",
         owner_component_id="component-1",
     )
-    first_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_output(
+    first_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_bridge_output(
         source_handle,
+        bridge_key="RSB_a",
         node_id="508:item:0",
         output_index=0,
         value=[["conditioning-a", {"pooled_output": "pool-a"}]],
     )
-    second_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_output(
+    second_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_bridge_output(
         source_handle,
+        bridge_key="RSB_b",
         node_id="508:item:1",
         output_index=0,
         value=[["conditioning-b", {"pooled_output": "pool-b"}]],
