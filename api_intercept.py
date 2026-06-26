@@ -23,7 +23,7 @@ from .modal_executor_node import (
 )
 from .session_state import RemoteSessionHandle
 from .settings import ModalSyncSettings, get_settings
-from .sync_engine import ModalAssetSyncEngine, ModalVolumeBackend, SyncedAsset
+from .sync_engine import ModalAssetSyncEngine, ModalVolumeBackend, SyncedAsset, modal
 
 logger = logging.getLogger(__name__)
 
@@ -3788,6 +3788,99 @@ def _progress_state_route_path(route_path: str) -> str:
     return f"{route_path.rstrip('/')}/progress_state"
 
 
+def _delete_modal_caches_route_path(route_path: str) -> str:
+    """Return the sibling HTTP route used to delete persistent Modal cache Dicts."""
+    if route_path.endswith("/queue_prompt"):
+        return f"{route_path.removesuffix('/queue_prompt')}/delete_caches"
+    return f"{route_path.rstrip('/')}/delete_caches"
+
+
+def _delete_modal_volume_route_path(route_path: str) -> str:
+    """Return the sibling HTTP route used to delete the configured Modal Volume."""
+    if route_path.endswith("/queue_prompt"):
+        return f"{route_path.removesuffix('/queue_prompt')}/delete_volume"
+    return f"{route_path.rstrip('/')}/delete_volume"
+
+
+def _modal_not_found_error_types() -> tuple[type[BaseException], ...]:
+    """Return Modal SDK exception classes that mean a named object is absent."""
+    if modal is None:
+        return ()
+    exception_namespace = getattr(modal, "exception", None)
+    candidates = [
+        getattr(exception_namespace, "NotFoundError", None),
+        getattr(exception_namespace, "InvalidError", None),
+    ]
+    return tuple(
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, type) and issubclass(candidate, BaseException)
+    )
+
+
+def _modal_cache_dict_names(settings: ModalSyncSettings) -> list[str]:
+    """Return the configured persistent Modal Dict names used as local-reset caches."""
+    return [
+        settings.interrupt_dict_name,
+        settings.node_output_cache_dict_name,
+        settings.session_bridge_dict_name,
+        settings.sync_index_dict_name,
+        settings.snapshot_profile_dict_name,
+    ]
+
+
+def delete_modal_cache_dicts(settings: ModalSyncSettings) -> dict[str, Any]:
+    """Delete all configured Modal Dict caches and return a reset summary."""
+    if modal is None:
+        raise RuntimeError("Modal SDK is unavailable; cannot delete Modal caches.")
+    modal_dict = getattr(modal, "Dict", None)
+    if modal_dict is None:
+        raise RuntimeError("Modal SDK does not expose modal.Dict; cannot delete Modal caches.")
+
+    deleted: list[str] = []
+    skipped: list[str] = []
+    not_found_errors = _modal_not_found_error_types()
+    for dict_name in _modal_cache_dict_names(settings):
+        try:
+            cache = modal_dict.from_name(dict_name, create_if_missing=False)
+        except not_found_errors:
+            skipped.append(dict_name)
+            continue
+        clear_method = getattr(cache, "clear", None)
+        if callable(clear_method):
+            clear_method()
+        delete_method = getattr(cache, "delete", None)
+        if not callable(delete_method):
+            raise RuntimeError(f"Modal Dict {dict_name!r} does not expose delete().")
+        delete_method()
+        deleted.append(dict_name)
+
+    logger.info("Deleted Modal cache Dicts deleted=%s skipped=%s.", deleted, skipped)
+    return {"deleted": deleted, "skipped": skipped}
+
+
+def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
+    """Delete the configured Modal Volume and return a reset summary."""
+    if modal is None:
+        raise RuntimeError("Modal SDK is unavailable; cannot delete Modal volume.")
+    modal_volume = getattr(modal, "Volume", None)
+    if modal_volume is None:
+        raise RuntimeError("Modal SDK does not expose modal.Volume; cannot delete Modal volume.")
+
+    try:
+        volume = modal_volume.from_name(settings.volume_name, create_if_missing=False)
+    except _modal_not_found_error_types():
+        logger.info("Skipped deleting missing Modal Volume %s.", settings.volume_name)
+        return {"deleted": [], "skipped": [settings.volume_name]}
+
+    delete_method = getattr(volume, "delete", None)
+    if not callable(delete_method):
+        raise RuntimeError(f"Modal Volume {settings.volume_name!r} does not expose delete().")
+    delete_method()
+    logger.info("Deleted Modal Volume %s.", settings.volume_name)
+    return {"deleted": [settings.volume_name], "skipped": []}
+
+
 def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
     """Expose active Modal prompts to ComfyUI's targeted interrupt route."""
     prompt_queue = getattr(prompt_server, "prompt_queue", None)
@@ -3844,6 +3937,8 @@ def setup_modal_queue_route(
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     analysis_route_path = _analysis_route_path(resolved_settings.route_path)
     progress_state_route_path = _progress_state_route_path(resolved_settings.route_path)
+    delete_caches_route_path = _delete_modal_caches_route_path(resolved_settings.route_path)
+    delete_volume_route_path = _delete_modal_volume_route_path(resolved_settings.route_path)
     _install_modal_interrupt_queue_bridge(prompt_server)
 
     if hasattr(prompt_server.routes, "get"):
@@ -3909,6 +4004,28 @@ def setup_modal_queue_route(
             )
         except (TypeError, ValueError) as exc:
             logger.warning("Modal remote-node analysis request was invalid: %s", exc)
+            return web.json_response({"error": str(exc), "node_errors": []}, status=400)
+
+    @prompt_server.routes.post(delete_caches_route_path)
+    async def modal_delete_caches(request: web.Request) -> web.Response:
+        """Delete persistent Modal cache Dicts for the active configuration."""
+        del request
+        logger.info("Received Modal cache deletion request.")
+        try:
+            return web.json_response(delete_modal_cache_dicts(resolved_settings))
+        except RuntimeError as exc:
+            logger.warning("Modal cache deletion request failed: %s", exc)
+            return web.json_response({"error": str(exc), "node_errors": []}, status=400)
+
+    @prompt_server.routes.post(delete_volume_route_path)
+    async def modal_delete_volume(request: web.Request) -> web.Response:
+        """Delete the configured Modal Volume for the active configuration."""
+        del request
+        logger.info("Received Modal volume deletion request.")
+        try:
+            return web.json_response(delete_modal_volume(resolved_settings))
+        except RuntimeError as exc:
+            logger.warning("Modal volume deletion request failed: %s", exc)
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
 
     @prompt_server.routes.post(resolved_settings.route_path)
@@ -4091,8 +4208,10 @@ def setup_modal_queue_route(
 
     _ROUTE_REGISTERED = True
     logger.info(
-        "Registered Modal queue route at %s, analysis route at %s, and progress state route at %s",
+        "Registered Modal queue route at %s, analysis route at %s, progress state route at %s, cache deletion route at %s, and volume deletion route at %s",
         resolved_settings.route_path,
         analysis_route_path,
         progress_state_route_path,
+        delete_caches_route_path,
+        delete_volume_route_path,
     )

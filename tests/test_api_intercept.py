@@ -3558,6 +3558,166 @@ def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) 
     )
 
 
+def test_modal_reset_route_paths_are_queue_route_siblings(api_intercept_module: Any) -> None:
+    """The frontend should have stable sibling routes for Modal maintenance actions."""
+    assert api_intercept_module._delete_modal_caches_route_path("/modal/queue_prompt") == (
+        "/modal/delete_caches"
+    )
+    assert api_intercept_module._delete_modal_volume_route_path("/modal/queue_prompt") == (
+        "/modal/delete_volume"
+    )
+    assert api_intercept_module._delete_modal_caches_route_path("/custom/modal") == (
+        "/custom/modal/delete_caches"
+    )
+    assert api_intercept_module._delete_modal_volume_route_path("/custom/modal") == (
+        "/custom/modal/delete_volume"
+    )
+
+
+def test_delete_modal_cache_dicts_deletes_configured_dicts(
+    api_intercept_module: Any,
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Deleting Modal caches should clear and delete every configured cache Dict."""
+
+    class FakeNotFoundError(Exception):
+        """Stand-in for Modal object misses."""
+
+    class FakeDictObject:
+        """Minimal Modal Dict object that records maintenance calls."""
+
+        def __init__(self, name: str) -> None:
+            """Store the configured Dict name."""
+            self.name = name
+
+        def clear(self) -> None:
+            """Record a clear call."""
+            cleared.append(self.name)
+
+        def delete(self) -> None:
+            """Record a delete call."""
+            deleted.append(self.name)
+
+    class FakeDict:
+        """Minimal Modal Dict namespace."""
+
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> FakeDictObject:
+            """Return fake Dict objects, except for one missing cache."""
+            assert create_if_missing is False
+            if name == "app-interrupts":
+                raise FakeNotFoundError(name)
+            return FakeDictObject(name)
+
+    class FakeModal:
+        """Minimal Modal SDK double."""
+
+        exception = SimpleNamespace(NotFoundError=FakeNotFoundError)
+        Dict = FakeDict
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+        interrupt_dict_name="app-interrupts",
+        node_output_cache_dict_name="app-node-cache",
+        session_bridge_dict_name="app-session-bridges",
+        sync_index_dict_name="app-sync-index",
+        snapshot_profile_dict_name="app-snapshot-profiles",
+    )
+    cleared: list[str] = []
+    deleted: list[str] = []
+    monkeypatch.setattr(api_intercept_module, "modal", FakeModal)
+
+    result = api_intercept_module.delete_modal_cache_dicts(settings)
+
+    assert result == {
+        "deleted": [
+            "app-node-cache",
+            "app-session-bridges",
+            "app-sync-index",
+            "app-snapshot-profiles",
+        ],
+        "skipped": ["app-interrupts"],
+    }
+    assert cleared == result["deleted"]
+    assert deleted == result["deleted"]
+
+
+def test_delete_modal_volume_deletes_configured_volume(
+    api_intercept_module: Any,
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Deleting the Modal volume should target only the configured volume name."""
+
+    class FakeVolumeObject:
+        """Minimal Modal Volume object that records deletion."""
+
+        def __init__(self, name: str) -> None:
+            """Store the configured Volume name."""
+            self.name = name
+
+        def delete(self) -> None:
+            """Record a delete call."""
+            deleted.append(self.name)
+
+    class FakeVolume:
+        """Minimal Modal Volume namespace."""
+
+        @staticmethod
+        def from_name(name: str, create_if_missing: bool = False) -> FakeVolumeObject:
+            """Return a fake Volume object."""
+            assert create_if_missing is False
+            return FakeVolumeObject(name)
+
+    class FakeModal:
+        """Minimal Modal SDK double."""
+
+        exception = SimpleNamespace()
+        Volume = FakeVolume
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=False,
+        volume_name="configured-volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(api_intercept_module, "modal", FakeModal)
+
+    result = api_intercept_module.delete_modal_volume(settings)
+
+    assert result == {"deleted": ["configured-volume"], "skipped": []}
+    assert deleted == ["configured-volume"]
+
+
 def test_modal_interrupt_queue_bridge_exposes_active_remote_prompts(
     api_intercept_module: Any,
     remote_modal_app_module: Any,
