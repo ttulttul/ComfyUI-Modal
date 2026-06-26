@@ -9353,6 +9353,99 @@ def test_implicitly_mapped_subgraph_splits_session_ref_lists_for_nontransportabl
     ]
 
 
+def test_implicitly_mapped_subgraph_splits_singleton_wrapped_bridge_ref_lists(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Comfy output wrappers around bridge-ref lists should still itemize mapped conditioning."""
+    first_conditioning_ref = {
+        "__comfy_modal_remote_session_bridge_ref__": True,
+        "bridge_key": "RSB_first",
+        "session_id": "session-1",
+        "node_id": "508",
+        "output_index": 0,
+    }
+    second_conditioning_ref = {
+        "__comfy_modal_remote_session_bridge_ref__": True,
+        "bridge_key": "RSB_second",
+        "session_id": "session-1",
+        "node_id": "508",
+        "output_index": 0,
+    }
+    observed_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_invoke_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        hydrated_inputs = serialization_module.deserialize_node_inputs(kwargs_payload)
+        observed_calls.append((str(payload["component_id"]), hydrated_inputs))
+        return serialization_module.serialize_node_outputs((f"seed:{hydrated_inputs['remote_input_1']}",))
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "507",
+        "prompt_id": "prompt-1",
+        "component_node_ids": ["507"],
+        "execute_node_ids": ["507"],
+        "subgraph_prompt": {
+            "507": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "positive": 0,
+                    "seed": 0,
+                },
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "phase_bridge_3",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "507", "input_name": "positive"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "507", "input_name": "seed"}],
+            },
+        ],
+        "boundary_outputs": [
+            {"node_id": "507", "io_type": "STRING", "is_list": False},
+        ],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    response = asyncio.run(
+        remote_modal_app_module._invoke_implicitly_mapped_subgraph_async(
+            payload,
+            serialization_module.serialize_node_inputs(
+                {
+                    "phase_bridge_3": [[first_conditioning_ref, second_conditioning_ref]],
+                    "remote_input_1": [10, 11],
+                }
+            ),
+        )
+    )
+
+    assert serialization_module.deserialize_node_outputs(response) == (
+        ["seed:10", "seed:11"],
+    )
+    assert observed_calls == [
+        (
+            "507::item:0",
+            {"phase_bridge_3": first_conditioning_ref, "remote_input_1": 10},
+        ),
+        (
+            "507::item:1",
+            {"phase_bridge_3": second_conditioning_ref, "remote_input_1": 11},
+        ),
+    ]
+
+
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
