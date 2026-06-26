@@ -218,6 +218,9 @@ def split_mapped_value(value: Any, io_type: str) -> list[Any]:
         return list(value)
 
     normalized_io_type = str(io_type)
+    if _is_scalar(value):
+        return [value]
+
     if normalized_io_type == "LATENT" and isinstance(value, Mapping):
         return _split_latent_batch(value)
 
@@ -234,7 +237,7 @@ def split_mapped_value(value: Any, io_type: str) -> list[Any]:
         return _split_tensor_batch(value)
 
     raise TypeError(
-        "Mapped execution only supports Python lists, tensor batches, and LATENT dictionaries. "
+        "Mapped execution only supports scalar values, Python lists, tensor batches, and LATENT dictionaries. "
         f"Unsupported mapped value type {type(value)!r} for io_type={normalized_io_type!r}."
     )
 

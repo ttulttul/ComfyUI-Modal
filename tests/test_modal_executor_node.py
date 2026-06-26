@@ -971,6 +971,60 @@ def test_modal_map_input_execute_boosts_exact_warmup_for_registered_context(
     }
 
 
+def test_modal_map_input_execute_accepts_scalar_for_single_item_warmup(
+    modal_executor_module: Any,
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A scalar Modal Map Input should pass through and warm one mapped item."""
+    observed_boost: dict[str, Any] = {}
+
+    def fake_boost_mapped_component_warmup(
+        payload: dict[str, Any],
+        *,
+        total_items: int,
+        reason: str,
+    ) -> tuple[int, int]:
+        """Record the scalar warmup boost request without touching Modal."""
+        observed_boost["payload"] = dict(payload)
+        observed_boost["total_items"] = total_items
+        observed_boost["reason"] = reason
+        return 1, 1
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "boost_mapped_component_warmup",
+        fake_boost_mapped_component_warmup,
+    )
+    with modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS_LOCK:
+        modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS.clear()
+    modal_executor_module.register_modal_map_input_warmup_context(
+        "map-node-1",
+        {
+            "prompt_id": "prompt-1",
+            "component_id": "mapped-component-1",
+            "extra_data": {"modal": {"mapped_component_ids": ["mapped-component-1"]}},
+        },
+        "INT",
+    )
+
+    result = modal_executor_module.ModalMapInput.execute(
+        value=7,
+        unique_id="map-node-1",
+    )
+
+    assert result.result == (7,)
+    assert observed_boost == {
+        "payload": {
+            "prompt_id": "prompt-1",
+            "component_id": "mapped-component-1",
+            "extra_data": {"modal": {"mapped_component_ids": ["mapped-component-1"]}},
+        },
+        "total_items": 1,
+        "reason": "modal_map_input_execute",
+    }
+
+
 def test_local_remote_app_executes_original_node(
     remote_modal_app_module: Any,
     serialization_module: Any,

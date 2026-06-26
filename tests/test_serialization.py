@@ -106,6 +106,13 @@ def test_split_mapped_value_accepts_python_lists(serialization_module: Any) -> N
     assert items == ["a", "b", "c"]
 
 
+def test_split_mapped_value_treats_scalar_as_single_item(serialization_module: Any) -> None:
+    """Mapped execution should treat scalar marker inputs as a one-item map."""
+    items = serialization_module.split_mapped_value(7, "INT")
+
+    assert items == [7]
+
+
 def test_split_and_join_tensor_batch_for_mapped_execution(serialization_module: Any) -> None:
     """Mapped execution should split and reassemble tensor batches on the leading dimension."""
     torch = pytest.importorskip("torch")
