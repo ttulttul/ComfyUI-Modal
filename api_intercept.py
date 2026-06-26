@@ -3838,6 +3838,21 @@ async def _call_modal_sdk(method: Any, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(method, *args, **kwargs)
 
 
+async def _delete_modal_named_object(namespace: Any, name: str, *, object_label: str) -> None:
+    """Delete a named Modal object using the non-deprecated manager API when available."""
+    objects_manager = getattr(namespace, "objects", None)
+    manager_delete = getattr(objects_manager, "delete", None)
+    if callable(manager_delete):
+        await _call_modal_sdk(manager_delete, name, allow_missing=True)
+        return
+
+    instance = await _call_modal_sdk(namespace.from_name, name, create_if_missing=False)
+    delete_method = getattr(instance, "delete", None)
+    if not callable(delete_method):
+        raise RuntimeError(f"Modal {object_label} {name!r} does not expose delete().")
+    await _call_modal_sdk(delete_method, name)
+
+
 async def delete_modal_cache_dicts(settings: ModalSyncSettings) -> dict[str, Any]:
     """Delete all configured Modal Dict caches and return a reset summary."""
     if modal is None:
@@ -3851,7 +3866,7 @@ async def delete_modal_cache_dicts(settings: ModalSyncSettings) -> dict[str, Any
     not_found_errors = _modal_not_found_error_types()
     for dict_name in _modal_cache_dict_names(settings):
         try:
-            cache = await _call_modal_sdk(
+            await _call_modal_sdk(
                 modal_dict.from_name,
                 dict_name,
                 create_if_missing=False,
@@ -3859,13 +3874,7 @@ async def delete_modal_cache_dicts(settings: ModalSyncSettings) -> dict[str, Any
         except not_found_errors:
             skipped.append(dict_name)
             continue
-        clear_method = getattr(cache, "clear", None)
-        if callable(clear_method):
-            await _call_modal_sdk(clear_method)
-        delete_method = getattr(cache, "delete", None)
-        if not callable(delete_method):
-            raise RuntimeError(f"Modal Dict {dict_name!r} does not expose delete().")
-        await _call_modal_sdk(delete_method, dict_name)
+        await _delete_modal_named_object(modal_dict, dict_name, object_label="Dict")
         deleted.append(dict_name)
 
     logger.info("Deleted Modal cache Dicts deleted=%s skipped=%s.", deleted, skipped)
@@ -3881,7 +3890,7 @@ async def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
         raise RuntimeError("Modal SDK does not expose modal.Volume; cannot delete Modal volume.")
 
     try:
-        volume = await _call_modal_sdk(
+        await _call_modal_sdk(
             modal_volume.from_name,
             settings.volume_name,
             create_if_missing=False,
@@ -3890,10 +3899,7 @@ async def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
         logger.info("Skipped deleting missing Modal Volume %s.", settings.volume_name)
         return {"deleted": [], "skipped": [settings.volume_name]}
 
-    delete_method = getattr(volume, "delete", None)
-    if not callable(delete_method):
-        raise RuntimeError(f"Modal Volume {settings.volume_name!r} does not expose delete().")
-    await _call_modal_sdk(delete_method, settings.volume_name)
+    await _delete_modal_named_object(modal_volume, settings.volume_name, object_label="Volume")
     logger.info("Deleted Modal Volume %s.", settings.volume_name)
     return {"deleted": [settings.volume_name], "skipped": []}
 
