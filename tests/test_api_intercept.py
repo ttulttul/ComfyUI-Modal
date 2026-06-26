@@ -3596,8 +3596,9 @@ def test_delete_modal_cache_dicts_deletes_configured_dicts(
             """Record a clear call."""
             cleared.append(self.name)
 
-        def delete(self) -> None:
+        def delete(self, name: str) -> None:
             """Record a delete call."""
+            assert name == self.name
             deleted.append(self.name)
 
     class FakeDict:
@@ -3643,7 +3644,7 @@ def test_delete_modal_cache_dicts_deletes_configured_dicts(
     deleted: list[str] = []
     monkeypatch.setattr(api_intercept_module, "modal", FakeModal)
 
-    result = api_intercept_module.delete_modal_cache_dicts(settings)
+    result = asyncio.run(api_intercept_module.delete_modal_cache_dicts(settings))
 
     assert result == {
         "deleted": [
@@ -3673,8 +3674,9 @@ def test_delete_modal_volume_deletes_configured_volume(
             """Store the configured Volume name."""
             self.name = name
 
-        def delete(self) -> None:
+        def delete(self, name: str) -> None:
             """Record a delete call."""
+            assert name == self.name
             deleted.append(self.name)
 
     class FakeVolume:
@@ -3712,7 +3714,7 @@ def test_delete_modal_volume_deletes_configured_volume(
     deleted: list[str] = []
     monkeypatch.setattr(api_intercept_module, "modal", FakeModal)
 
-    result = api_intercept_module.delete_modal_volume(settings)
+    result = asyncio.run(api_intercept_module.delete_modal_volume(settings))
 
     assert result == {"deleted": ["configured-volume"], "skipped": []}
     assert deleted == ["configured-volume"]
