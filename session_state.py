@@ -283,6 +283,7 @@ class _RemoteSessionBucket:
 
     handle: RemoteSessionHandle
     values: dict[tuple[str, int], Any] = field(default_factory=dict)
+    bridge_values: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
 
@@ -356,6 +357,40 @@ class InMemoryRemoteSessionStore:
         )
         return ref
 
+    def put_bridge_output(
+        self,
+        handle: RemoteSessionHandle,
+        *,
+        bridge_key: str,
+        node_id: str,
+        output_index: int,
+        value: Any,
+    ) -> RemoteSessionValueRef:
+        """Store one bridge value under both its durable key and node output coordinates."""
+        ref = self.put_output(
+            handle,
+            node_id=node_id,
+            output_index=output_index,
+            value=value,
+        )
+        normalized_bridge_key = str(bridge_key or "").strip()
+        if not normalized_bridge_key:
+            raise RemoteSessionStateError("Remote session bridge values must define bridge_key.")
+        with self._lock:
+            bucket = self._sessions[handle.session_id]
+            replacing_existing = normalized_bridge_key in bucket.bridge_values
+            bucket.bridge_values[normalized_bridge_key] = value
+        logger.info(
+            "Stored remote session bridge value session_id=%s bridge_key=%s node_id=%s output_index=%d result=%s bridge_value_count=%d.",
+            ref.session_id,
+            normalized_bridge_key,
+            ref.node_id,
+            ref.output_index,
+            "replace" if replacing_existing else "create",
+            len(bucket.bridge_values),
+        )
+        return ref
+
     def get_output(self, ref: RemoteSessionValueRef) -> Any:
         """Return one stored output value or raise when it no longer exists."""
         with self._lock:
@@ -405,6 +440,23 @@ class InMemoryRemoteSessionStore:
             if value_key not in bucket.values:
                 return False, None
             return True, bucket.values[value_key]
+
+    def try_get_bridge_output(
+        self,
+        handle: RemoteSessionHandle,
+        bridge_key: str,
+    ) -> tuple[bool, Any | None]:
+        """Return whether a bridge-keyed live output exists without falling back to node coordinates."""
+        normalized_bridge_key = str(bridge_key or "").strip()
+        if not normalized_bridge_key:
+            return False, None
+        with self._lock:
+            bucket = self._sessions.get(handle.session_id)
+            if bucket is None:
+                return False, None
+            if normalized_bridge_key not in bucket.bridge_values:
+                return False, None
+            return True, bucket.bridge_values[normalized_bridge_key]
 
     def clear_session(self, handle: RemoteSessionHandle) -> None:
         """Drop one prompt-scoped session and every value stored inside it."""
@@ -503,16 +555,10 @@ class InMemoryRemoteSessionStore:
             ref.session_id,
         )
         if target_session_handle is not None:
-            found, live_value = self.try_get_output(
-                RemoteSessionValueRef(
-                    session_id=target_session_handle.session_id,
-                    node_id=ref.node_id,
-                    output_index=ref.output_index,
-                )
-            )
+            found, live_value = self.try_get_bridge_output(target_session_handle, ref.bridge_key)
             if found:
                 logger.info(
-                    "Resolved remote session bridge ref bridge_key=%s via target session_id=%s.",
+                    "Resolved remote session bridge ref bridge_key=%s via target session bridge cache session_id=%s.",
                     ref.bridge_key,
                     target_session_handle.session_id,
                 )
@@ -528,6 +574,25 @@ class InMemoryRemoteSessionStore:
                     )
                 return live_value
         if ref.session_id:
+            source_handle = RemoteSessionHandle(session_id=ref.session_id)
+            found, live_value = self.try_get_bridge_output(source_handle, ref.bridge_key)
+            if found:
+                logger.info(
+                    "Resolved remote session bridge ref bridge_key=%s via source session bridge cache session_id=%s.",
+                    ref.bridge_key,
+                    ref.session_id,
+                )
+                if resolution_callback is not None:
+                    resolution_callback(
+                        "bridge-source-hit",
+                        {
+                            "bridge_key": ref.bridge_key,
+                            "session_id": ref.session_id,
+                            "node_id": ref.node_id,
+                            "output_index": ref.output_index,
+                        },
+                    )
+                return live_value
             found, live_value = self.try_get_output(
                 RemoteSessionValueRef(
                     session_id=ref.session_id,

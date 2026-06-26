@@ -648,8 +648,9 @@ def _restore_serialized_remote_session_bridge_value(
 
     restore_started_at = time.perf_counter()
     restored_value = deserialize_value(record.serialized_output)
-    _REMOTE_SESSION_STORE.put_output(
+    _REMOTE_SESSION_STORE.put_bridge_output(
         target_session_handle,
+        bridge_key=record.bridge_key,
         node_id=record.node_id,
         output_index=record.output_index,
         value=restored_value,
@@ -809,8 +810,9 @@ def _restore_planned_remote_session_bridge_value(
             f"Durable bridge rehydration plan for {record.bridge_key!r} did not produce output index {record.output_index}."
         )
     restored_value = outputs[output_index]
-    _REMOTE_SESSION_STORE.put_output(
+    _REMOTE_SESSION_STORE.put_bridge_output(
         target_session_handle,
+        bridge_key=record.bridge_key,
         node_id=record.node_id,
         output_index=record.output_index,
         value=restored_value,
@@ -884,8 +886,9 @@ def _rehydrate_remote_session_bridge_value(
     cached_value = _get_remote_session_bridge_value(ref.bridge_key)
     if cached_value is not None:
         restore_started_at = time.perf_counter()
-        _REMOTE_SESSION_STORE.put_output(
+        _REMOTE_SESSION_STORE.put_bridge_output(
             target_session_handle,
+            bridge_key=ref.bridge_key,
             node_id=ref.node_id,
             output_index=ref.output_index,
             value=cached_value,
@@ -1851,12 +1854,6 @@ def _execute_subgraph_with_mapping(
                 raise RemoteSessionStateError(
                     "Session-backed boundary outputs require payload.remote_session."
                 )
-            live_ref = _REMOTE_SESSION_STORE.put_output(
-                session_handle,
-                node_id=node_id,
-                output_index=output_index,
-                value=output_value,
-            )
             bridge_record = _build_remote_session_bridge_record(
                 payload=normalized_payload,
                 hydrated_inputs=hydrated_inputs,
@@ -1867,6 +1864,13 @@ def _execute_subgraph_with_mapping(
             )
             _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
             _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
+            live_ref = _REMOTE_SESSION_STORE.put_bridge_output(
+                session_handle,
+                bridge_key=bridge_record.bridge_key,
+                node_id=node_id,
+                output_index=output_index,
+                value=output_value,
+            )
             output_value = RemoteSessionBridgeRef(
                 bridge_key=bridge_record.bridge_key,
                 node_id=node_id,
@@ -2007,12 +2011,6 @@ def _execute_subgraph_prompt(
                     raise RemoteSessionStateError(
                         "Session-backed boundary outputs require payload.remote_session."
                     )
-                live_ref = _REMOTE_SESSION_STORE.put_output(
-                    session_handle,
-                    node_id=node_id,
-                    output_index=output_index,
-                    value=output_value,
-                )
                 bridge_record = _build_remote_session_bridge_record(
                     payload=normalized_payload,
                     hydrated_inputs=hydrated_inputs,
@@ -2023,6 +2021,13 @@ def _execute_subgraph_prompt(
                 )
                 _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
                 _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
+                live_ref = _REMOTE_SESSION_STORE.put_bridge_output(
+                    session_handle,
+                    bridge_key=bridge_record.bridge_key,
+                    node_id=node_id,
+                    output_index=output_index,
+                    value=output_value,
+                )
                 output_value = RemoteSessionBridgeRef(
                     bridge_key=bridge_record.bridge_key,
                     node_id=node_id,
@@ -2070,12 +2075,6 @@ def _short_circuit_restored_session_output_subgraph(
         except RemoteSessionStateError:
             return None
 
-        live_ref = _REMOTE_SESSION_STORE.put_output(
-            session_handle,
-            node_id=node_id,
-            output_index=output_index,
-            value=output_value,
-        )
         bridge_record = _build_remote_session_bridge_record(
             payload=payload,
             hydrated_inputs=hydrated_inputs,
@@ -2086,6 +2085,13 @@ def _short_circuit_restored_session_output_subgraph(
         )
         _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
         _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
+        live_ref = _REMOTE_SESSION_STORE.put_bridge_output(
+            session_handle,
+            bridge_key=bridge_record.bridge_key,
+            node_id=node_id,
+            output_index=output_index,
+            value=output_value,
+        )
         restored_outputs.append(
             RemoteSessionBridgeRef(
                 bridge_key=bridge_record.bridge_key,
