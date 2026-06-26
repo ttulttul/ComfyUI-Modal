@@ -1,5 +1,9 @@
 # Learnings
 
+## 2026-06-26
+
+- The README should stay a user guide and operational reference, not a running release-note log. Remote runtime details are easiest to maintain when grouped by stable user-facing concepts such as deployment, snapshots, warmup, mapped execution, session bridges, cancellation, and sync behavior; commit-by-commit implementation notes belong in this file instead.
+
 ## 2026-06-22
 
 - ComfyUI's `Dependency cycle detected` message can originate entirely in the local scheduler after Modal-Sync rewrites remote nodes into proxy phases, even when the Modal worker and individual remote sampler components finish successfully. The local queue path now logs compact rewritten-prompt diagnostics, including proxy dependency edges, component stages, payload summaries, and any static cycle path, so the next UI-only cycle error can be traced from `comfy.log` without guessing which remote phase was responsible.
