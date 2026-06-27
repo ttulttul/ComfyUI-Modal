@@ -151,6 +151,9 @@ def test_cancel_click_shows_immediate_modal_cancelling_feedback() -> None:
     assert "modalCancellingPromptIds.add(promptId);" in source
     assert "setGlobalStatusPhase(promptId, STATE_CANCELLING" in source
     assert "setNodesPhase(remoteNodeIds, STATE_CANCELLING, promptId);" in source
+    assert "function clearSupersededCancellingPrompts(activePromptId)" in source
+    assert 'markPromptTerminal(promptId, "superseded_by_new_prompt");' in source
+    assert "clearSupersededCancellingPrompts(promptId);" in source
     assert "if (isPromptCancelling(promptId)) {\n    return;\n  }" in source
     assert "patchInterruptFeedback();" in source
 
