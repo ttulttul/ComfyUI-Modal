@@ -11036,6 +11036,40 @@ def test_modal_cloud_accepts_absolute_asset_paths_in_folder_lookup(
         modal_cloud_module.get_settings.cache_clear()
 
 
+def test_modal_cloud_aliases_flux_rms_norm_weight_keys_for_model_detection(
+    modal_cloud_module: Any,
+) -> None:
+    """Saved Flux models using RMSNorm `.weight` keys should gain `.scale` aliases."""
+    state_dict = {
+        "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight": object(),
+        "model.diffusion_model.double_blocks.0.img_attn.norm.query_norm.weight": object(),
+        "model.diffusion_model.double_blocks.0.txt_attn.norm.key_norm.weight": object(),
+        "model.diffusion_model.double_blocks.0.txt_attn.norm.query_norm.weight": object(),
+        "model.diffusion_model.img_in.weight": object(),
+    }
+
+    alias_count = modal_cloud_module._alias_flux_rms_norm_weight_keys(state_dict)
+
+    assert alias_count == 4
+    assert (
+        state_dict["model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale"]
+        is state_dict["model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight"]
+    )
+    assert (
+        state_dict["model.diffusion_model.double_blocks.0.img_attn.norm.query_norm.scale"]
+        is state_dict["model.diffusion_model.double_blocks.0.img_attn.norm.query_norm.weight"]
+    )
+    assert (
+        state_dict["model.diffusion_model.double_blocks.0.txt_attn.norm.key_norm.scale"]
+        is state_dict["model.diffusion_model.double_blocks.0.txt_attn.norm.key_norm.weight"]
+    )
+    assert (
+        state_dict["model.diffusion_model.double_blocks.0.txt_attn.norm.query_norm.scale"]
+        is state_dict["model.diffusion_model.double_blocks.0.txt_attn.norm.query_norm.weight"]
+    )
+    assert modal_cloud_module._alias_flux_rms_norm_weight_keys(state_dict) == 0
+
+
 def test_modal_cloud_force_imports_comfyui_utils_package(
     modal_cloud_module: Any,
     monkeypatch: Any,

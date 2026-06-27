@@ -78,6 +78,7 @@ _COMFY_RUNTIME_CUSTOM_NODE_ROOTS: set[str] = set()
 _EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
 _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
+_MODEL_STATE_DICT_COMPAT_WRAPPED = False
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _LOADER_CACHE_METRICS_LOCK = threading.Lock()
 _LOADER_CACHE_METRICS: dict[str, int] = {"hit": 0, "miss": 0}
@@ -2055,6 +2056,58 @@ def _install_loader_cache_wrappers() -> None:
         _wrap_loader_method_with_cache(class_type, node_class, method_name, cache_key_builder)
 
 
+def _alias_flux_rms_norm_weight_keys(state_dict: dict[str, Any]) -> int:
+    """Add ComfyUI Flux RMSNorm `.scale` aliases for saved files that use `.weight`."""
+    alias_count = 0
+    replacements = {
+        ".norm.key_norm.weight": ".norm.key_norm.scale",
+        ".norm.query_norm.weight": ".norm.query_norm.scale",
+    }
+    for key, value in list(state_dict.items()):
+        for source_suffix, target_suffix in replacements.items():
+            if not key.endswith(source_suffix):
+                continue
+            target_key = f"{key[: -len(source_suffix)]}{target_suffix}"
+            if target_key in state_dict:
+                continue
+            state_dict[target_key] = value
+            alias_count += 1
+    return alias_count
+
+
+def _install_model_state_dict_compatibility_wrappers() -> None:
+    """Patch ComfyUI model loading for known cross-version saved-model key aliases."""
+    global _MODEL_STATE_DICT_COMPAT_WRAPPED
+
+    if _MODEL_STATE_DICT_COMPAT_WRAPPED:
+        return
+
+    import comfy.sd
+
+    original_load_diffusion_model_state_dict = comfy.sd.load_diffusion_model_state_dict
+
+    def compatible_load_diffusion_model_state_dict(
+        sd: dict[str, Any],
+        model_options: dict[str, Any] = {},
+        metadata: Any = None,
+    ) -> Any:
+        """Load diffusion models after adding non-destructive state-dict aliases."""
+        alias_count = _alias_flux_rms_norm_weight_keys(sd)
+        if alias_count:
+            logger.info(
+                "Added %d Flux RMSNorm .scale aliases for a diffusion model state_dict saved with .weight keys.",
+                alias_count,
+            )
+        return original_load_diffusion_model_state_dict(
+            sd,
+            model_options=model_options,
+            metadata=metadata,
+        )
+
+    comfy.sd.load_diffusion_model_state_dict = compatible_load_diffusion_model_state_dict
+    _MODEL_STATE_DICT_COMPAT_WRAPPED = True
+
+
 def _rewrite_modal_asset_references(value: Any) -> Any:
     """Recursively replace mirrored asset markers with container-local absolute file paths."""
     if isinstance(value, str):
@@ -2132,6 +2185,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                             init_api_nodes=True,
                         )
                     )
+                _install_model_state_dict_compatibility_wrappers()
                 _install_loader_cache_wrappers()
                 _COMFY_RUNTIME_BASE_INITIALIZED = True
                 if custom_nodes_root_key is not None:
@@ -2143,6 +2197,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                     "Reusing initialized remote ComfyUI runtime for custom_nodes=%s without re-running custom node import.",
                     custom_nodes_root_key or "<default>",
                 )
+                _install_model_state_dict_compatibility_wrappers()
                 _install_loader_cache_wrappers()
                 return
 
@@ -2150,6 +2205,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
             logger.info("Loading extracted remote custom nodes from %s.", custom_nodes_root)
             with _timed_phase("init_external_custom_nodes", custom_nodes=custom_nodes_root_key):
                 asyncio.run(nodes_module.init_external_custom_nodes())
+            _install_model_state_dict_compatibility_wrappers()
             _install_loader_cache_wrappers()
             _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
 
