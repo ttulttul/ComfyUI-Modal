@@ -55,6 +55,7 @@ const modalGlobalStatusStates = new Map();
 let animationFrameHandle = null;
 let modalGlobalStatusElement = null;
 let modalVisibilityRefreshInFlight = null;
+let modalReplayedEventUpdatedAtMs = null;
 
 /**
  * Return whether a node should show the Modal toggle.
@@ -739,10 +740,18 @@ function replayModalUiEvent(eventRecord) {
   if (!payload || typeof payload !== "object") {
     return;
   }
-  if (eventName === "modal_status") {
-    handleModalStatus({ detail: payload });
-  } else if (eventName === "modal_progress") {
-    handleModalProgress({ detail: payload });
+  const updatedAtSeconds = Number(eventRecord?.updated_at ?? 0);
+  modalReplayedEventUpdatedAtMs = Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0
+    ? updatedAtSeconds * 1000
+    : null;
+  try {
+    if (eventName === "modal_status") {
+      handleModalStatus({ detail: payload });
+    } else if (eventName === "modal_progress") {
+      handleModalProgress({ detail: payload });
+    }
+  } finally {
+    modalReplayedEventUpdatedAtMs = null;
   }
 }
 
@@ -794,6 +803,26 @@ function activeModalUiPromptIds() {
       promptIds.add(String(state.promptId));
     }
   }
+  for (const progressState of modalNodeProgress.values()) {
+    if (progressState?.promptId) {
+      promptIds.add(String(progressState.promptId));
+    }
+  }
+  for (const laneState of modalNodeProgressLanes.values()) {
+    if (laneState?.promptId) {
+      promptIds.add(String(laneState.promptId));
+    }
+  }
+  for (const batchState of modalNodeBatchProgress.values()) {
+    if (batchState?.promptId) {
+      promptIds.add(String(batchState.promptId));
+    }
+  }
+  for (const cachedState of modalNodeCachedStates.values()) {
+    if (cachedState?.promptId) {
+      promptIds.add(String(cachedState.promptId));
+    }
+  }
   return Array.from(promptIds).filter((promptId) => promptId && !isPromptTerminal(promptId));
 }
 
@@ -815,6 +844,31 @@ function promptUiStateAgeMs(promptId) {
   for (const state of modalNodeStates.values()) {
     if (state?.promptId === promptId && state?.updatedAt) {
       updatedAts.push(state.updatedAt);
+    }
+  }
+  for (const progressState of modalNodeProgress.values()) {
+    if (progressState?.promptId === promptId && progressState?.updatedAt) {
+      updatedAts.push(progressState.updatedAt);
+    }
+  }
+  for (const laneState of modalNodeProgressLanes.values()) {
+    if (laneState?.promptId !== promptId) {
+      continue;
+    }
+    for (const laneProgress of laneState.lanes.values()) {
+      if (laneProgress?.updatedAt) {
+        updatedAts.push(laneProgress.updatedAt);
+      }
+    }
+  }
+  for (const batchState of modalNodeBatchProgress.values()) {
+    if (batchState?.promptId === promptId && batchState?.updatedAt) {
+      updatedAts.push(batchState.updatedAt);
+    }
+  }
+  for (const cachedState of modalNodeCachedStates.values()) {
+    if (cachedState?.promptId === promptId && cachedState?.cachedAt) {
+      updatedAts.push(cachedState.cachedAt);
     }
   }
   if (updatedAts.length === 0) {
@@ -954,8 +1008,9 @@ function ensurePromptState(promptId) {
     return null;
   }
   if (!modalPromptStates.has(promptId)) {
+    const startedAt = modalReplayedEventUpdatedAtMs ?? nowMs();
     modalPromptStates.set(promptId, {
-      startedAt: nowMs(),
+      startedAt,
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
       componentNodeIdsByMember: new Map(),
@@ -969,6 +1024,33 @@ function ensurePromptState(promptId) {
     });
   }
   return modalPromptStates.get(promptId);
+}
+
+/**
+ * Clear prompt-scoped progress and cache maps even when prompt metadata is already gone.
+ * @param {string} promptId
+ */
+function clearPromptProgressStates(promptId) {
+  for (const [nodeIdValue, progressState] of Array.from(modalNodeProgress.entries())) {
+    if (progressState?.promptId === promptId) {
+      modalNodeProgress.delete(nodeIdValue);
+    }
+  }
+  for (const [nodeIdValue, laneState] of Array.from(modalNodeProgressLanes.entries())) {
+    if (laneState?.promptId === promptId) {
+      modalNodeProgressLanes.delete(nodeIdValue);
+    }
+  }
+  for (const [nodeIdValue, batchState] of Array.from(modalNodeBatchProgress.entries())) {
+    if (batchState?.promptId === promptId) {
+      modalNodeBatchProgress.delete(nodeIdValue);
+    }
+  }
+  for (const [nodeIdValue, cachedState] of Array.from(modalNodeCachedStates.entries())) {
+    if (cachedState?.promptId === promptId) {
+      modalNodeCachedStates.delete(nodeIdValue);
+    }
+  }
 }
 
 /**
@@ -2990,10 +3072,13 @@ function handleExecutionPhase(event, phase) {
 function clearPromptRemoteStates(promptId) {
   const promptState = modalPromptStates.get(promptId);
   if (!promptState) {
+    clearPromptProgressStates(promptId);
     pruneGlobalStatusStates();
     refreshGlobalStatusElement();
+    app.graph?.setDirtyCanvas(true, true);
     return;
   }
+  clearPromptProgressStates(promptId);
   for (const remoteNodeId of promptState.remoteNodeIds) {
     clearNodeTimer(remoteNodeId);
     clearNodeProgress(remoteNodeId, promptId);

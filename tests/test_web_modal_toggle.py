@@ -495,11 +495,17 @@ def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
     assert "function refreshModalUiAfterVisibilityChange()" in source
     assert "function replayModalUiEventsAfterVisibilityChange()" in source
     assert "function replayModalUiEvent(eventRecord)" in source
+    assert "modalReplayedEventUpdatedAtMs = Number.isFinite(updatedAtSeconds)" in source
     assert "function reconcileModalUiAfterVisibilityChange()" in source
     assert "function activeModalUiPromptIds()" in source
+    assert "for (const laneState of modalNodeProgressLanes.values())" in source
+    assert "for (const batchState of modalNodeBatchProgress.values())" in source
     assert "function promptIdsFromQueuePayload(queuePayload)" in source
     assert "function historyPayloadHasPrompt(historyPayload, promptId)" in source
     assert "function clearRefocusCompletedPrompt(promptId, phase)" in source
+    assert "function clearPromptProgressStates(promptId)" in source
+    assert "clearPromptProgressStates(promptId);" in source
+    assert "const startedAt = modalReplayedEventUpdatedAtMs ?? nowMs();" in source
     assert "modalVisibilityRefreshInFlight" in source
     assert "api.fetchApi(" in source
     assert "fetchComfyJson(COMFY_QUEUE_ROUTE)" in source

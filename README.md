@@ -83,7 +83,7 @@ The frontend shows remote state directly on the canvas:
 - red border: queue-time or execution failure
 - numbered badge: remote component assignment for the current prompt
 
-Remote sampler-style progress is rendered in a small temporary panel near the node. Preview images and ComfyUI UI payloads emitted by remote nodes are streamed back into the local PromptServer while the remote component is still running.
+Remote sampler-style progress is rendered in a small temporary panel near the node. Preview images and ComfyUI UI payloads emitted by remote nodes are streamed back into the local PromptServer while the remote component is still running. When the browser regains focus, Modal-Sync replays recent UI events and reconciles them against ComfyUI queue/history state so cancelled or completed prompts do not leave stale progress bars behind.
 
 Cancelling a local prompt propagates a targeted interrupt to the active Modal work. If Modal is still deploying, provisioning, or slow to observe the interrupt, the local proxy releases the ComfyUI prompt after the configured grace period while remote cleanup continues.
 
