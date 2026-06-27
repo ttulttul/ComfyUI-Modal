@@ -2,6 +2,7 @@
 
 ## 2026-06-26
 
+- Frontend canvas animation should be driven by visuals that actually change over time, not by the mere presence of progress or cache state. Static Modal progress can redraw on websocket updates; only pulsing phases, setup placeholder lanes, and fade-outs need a throttled rAF loop, and prompt cleanup should cancel that loop once the last animated state is gone.
 - The README should stay a user guide and operational reference, not a running release-note log. Remote runtime details are easiest to maintain when grouped by stable user-facing concepts such as deployment, snapshots, warmup, mapped execution, session bridges, cancellation, and sync behavior; commit-by-commit implementation notes belong in this file instead.
 
 ## 2026-06-22

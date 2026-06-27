@@ -166,7 +166,8 @@ def test_starting_modal_status_marks_component_before_remote_progress() -> None:
     assert "setGlobalStatusPhase(promptId, STATE_STARTING, nodeIds.length, {" in source
     assert "setNodesPhase(nodeIds, STATE_STARTING, promptId);" in source
     assert "phases.find((state) => state.phase === STATE_STARTING)" in source
-    assert "[STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_CANCELLING, STATE_ERROR]" in source
+    assert "function isPulsingNodePhase(phase)" in source
+    assert "STATE_FINALIZING" in source
     assert "activeState.phase === STATE_STARTING" in source
     assert "STARTING_BORDER_COLOR" in source
 
@@ -276,6 +277,24 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert 'const panelY = node.size[1] + 6 / scale;' in source
     assert 'ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);' in source
     assert 'const headerText = hasAggregateProgress' in source
+
+
+def test_modal_canvas_animation_loop_is_selective_and_throttled() -> None:
+    """Static progress data should not keep an unbounded canvas rAF loop alive."""
+    source = _modal_toggle_source()
+
+    assert "const MODAL_ANIMATION_FRAME_INTERVAL_MS = 100;" in source
+    assert "let modalLastAnimationRedrawAt = 0;" in source
+    assert "function shouldAnimateModalVisuals()" in source
+    assert "function progressNeedsAnimation()" in source
+    assert "function stopAnimationLoopIfIdle()" in source
+    assert "function isPulsingNodePhase(phase)" in source
+    assert "progressFadeNeedsAnimation(progressState)" in source
+    assert "if (laneProgress.setupOnly || progressFadeNeedsAnimation(laneProgress))" in source
+    assert "timestamp - modalLastAnimationRedrawAt >= MODAL_ANIMATION_FRAME_INTERVAL_MS" in source
+    assert "cancelAnimationFrame(animationFrameHandle);" in source
+    assert "const hasProgressState =" not in source
+    assert "const hasCachedPulse =" not in source
 
 
 def test_streamed_modal_node_progress_fades_previous_active_node() -> None:
@@ -388,7 +407,8 @@ def test_cached_node_hits_are_marked_without_fake_progress() -> None:
     assert "[detail.node_id, detail.display_node_id, detail.real_node_id]" in source
     assert "for (const cachedNodeId of cachedNodeIds) {" in source
     assert "markNodeCached(cachedNodeId, promptId);" in source
-    assert "const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;" in source
+    assert "function shouldAnimateModalVisuals()" in source
+    assert "const hasCachedPulse =" not in source
 
 
 def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
@@ -505,6 +525,8 @@ def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
     assert "function clearRefocusCompletedPrompt(promptId, phase)" in source
     assert "function clearPromptProgressStates(promptId)" in source
     assert "clearPromptProgressStates(promptId);" in source
+    assert "stopAnimationLoopIfIdle();" in source
+    assert "for (const [nodeIdValue, state] of Array.from(modalNodeStates.entries()))" in source
     assert "const startedAt = modalReplayedEventUpdatedAtMs ?? nowMs();" in source
     assert "modalVisibilityRefreshInFlight" in source
     assert "api.fetchApi(" in source

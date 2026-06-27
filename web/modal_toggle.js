@@ -38,6 +38,7 @@ const ERROR_CLEAR_DELAY_MS = 5000;
 const TERMINAL_PROMPT_RETENTION_MS = 60000;
 const PROGRESS_FADE_MS = 900;
 const REFOCUS_STALE_PROMPT_GRACE_MS = 30000;
+const MODAL_ANIMATION_FRAME_INTERVAL_MS = 100;
 
 const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
@@ -53,6 +54,7 @@ const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 
 let animationFrameHandle = null;
+let modalLastAnimationRedrawAt = 0;
 let modalGlobalStatusElement = null;
 let modalVisibilityRefreshInFlight = null;
 let modalReplayedEventUpdatedAtMs = null;
@@ -1051,6 +1053,7 @@ function clearPromptProgressStates(promptId) {
       modalNodeCachedStates.delete(nodeIdValue);
     }
   }
+  stopAnimationLoopIfIdle();
 }
 
 /**
@@ -1082,23 +1085,92 @@ function shouldApplyPromptState(nodeIdValue, promptId) {
 }
 
 /**
- * Mark the canvas dirty and keep animation alive while visual states are active.
+ * Return whether a remote phase changes visually over time.
+ * @param {string | undefined} phase
+ * @returns {boolean}
  */
-function refreshCanvasAnimation() {
-  app.graph?.setDirtyCanvas(true, true);
-  const hasAnimatedState = Array.from(modalNodeStates.values()).some((state) =>
-    [STATE_SETUP, STATE_STARTING, STATE_READY, STATE_ACTIVE, STATE_CANCELLING, STATE_ERROR].includes(
-      state.phase,
-    ),
+function isPulsingNodePhase(phase) {
+  return [
+    STATE_SETUP,
+    STATE_STARTING,
+    STATE_READY,
+    STATE_ACTIVE,
+    STATE_FINALIZING,
+    STATE_CANCELLING,
+    STATE_ERROR,
+  ].includes(phase);
+}
+
+/**
+ * Return whether a progress payload has an active time-based fade.
+ * @param {{ fadingStartedAt?: number | null } | null | undefined} progressState
+ * @returns {boolean}
+ */
+function progressFadeNeedsAnimation(progressState) {
+  return Boolean(progressState?.fadingStartedAt && progressVisualOpacity(progressState) > 0);
+}
+
+/**
+ * Return whether any progress overlay is currently changing without websocket input.
+ * @returns {boolean}
+ */
+function progressNeedsAnimation() {
+  for (const progressState of modalNodeProgress.values()) {
+    if (progressFadeNeedsAnimation(progressState)) {
+      return true;
+    }
+  }
+  for (const batchState of modalNodeBatchProgress.values()) {
+    if (progressFadeNeedsAnimation(batchState)) {
+      return true;
+    }
+  }
+  for (const laneState of modalNodeProgressLanes.values()) {
+    for (const laneProgress of laneState.lanes.values()) {
+      if (laneProgress.setupOnly || progressFadeNeedsAnimation(laneProgress)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Return whether any Modal canvas decoration needs a scheduled redraw.
+ * @returns {boolean}
+ */
+function shouldAnimateModalVisuals() {
+  const hasPulsingState = Array.from(modalNodeStates.values()).some((state) =>
+    isPulsingNodePhase(state.phase),
   );
-  const hasCachedPulse = Array.from(modalNodeCachedStates.values()).length > 0;
-  const hasProgressState =
-    modalNodeProgress.size > 0 ||
-    modalNodeProgressLanes.size > 0 ||
-    modalNodeBatchProgress.size > 0;
-  if (!hasAnimatedState && !hasCachedPulse && !hasProgressState) {
-    animationFrameHandle = null;
+  return hasPulsingState || progressNeedsAnimation();
+}
+
+/**
+ * Stop the scheduled redraw loop when no Modal visuals are moving.
+ */
+function stopAnimationLoopIfIdle() {
+  if (shouldAnimateModalVisuals()) {
     return;
+  }
+  if (animationFrameHandle !== null && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(animationFrameHandle);
+  }
+  animationFrameHandle = null;
+}
+
+/**
+ * Mark the canvas dirty at a bounded cadence while visual states are active.
+ * @param {number | undefined} timestamp
+ */
+function refreshCanvasAnimation(timestamp = performance.now()) {
+  animationFrameHandle = null;
+  if (!shouldAnimateModalVisuals()) {
+    return;
+  }
+  if (timestamp - modalLastAnimationRedrawAt >= MODAL_ANIMATION_FRAME_INTERVAL_MS) {
+    app.graph?.setDirtyCanvas(true, true);
+    modalLastAnimationRedrawAt = timestamp;
   }
   animationFrameHandle = requestAnimationFrame(refreshCanvasAnimation);
 }
@@ -1107,6 +1179,10 @@ function refreshCanvasAnimation() {
  * Ensure the redraw loop is running while remote visual effects are active.
  */
 function ensureAnimationLoop() {
+  if (!shouldAnimateModalVisuals()) {
+    stopAnimationLoopIfIdle();
+    return;
+  }
   if (animationFrameHandle !== null) {
     return;
   }
@@ -1140,7 +1216,7 @@ function scheduleNodeClear(nodeIdValue, promptId, delayMs) {
     }
     modalNodeStates.delete(nodeIdValue);
     modalNodeClearTimers.delete(nodeIdValue);
-    ensureAnimationLoop();
+    stopAnimationLoopIfIdle();
     reconcilePromptGlobalStatus(promptId);
     app.graph?.setDirtyCanvas(true, true);
   }, delayMs);
@@ -1534,6 +1610,7 @@ function clearNodeProgress(nodeIdValue, promptId) {
     }
     modalNodeProgressLanes.delete(progressNodeId);
   }
+  stopAnimationLoopIfIdle();
 }
 
 /**
@@ -1565,7 +1642,7 @@ function clearFadedNodeProgress(progressNodeId, promptId, fadingStartedAt) {
     }
   }
 
-  ensureAnimationLoop();
+  stopAnimationLoopIfIdle();
   reconcilePromptGlobalStatus(promptId);
   app.graph?.setDirtyCanvas(true, true);
 }
@@ -1670,6 +1747,7 @@ function clearNodeCached(nodeIdValue, promptId) {
     }
     modalNodeCachedStates.delete(progressNodeId);
   }
+  stopAnimationLoopIfIdle();
 }
 
 /**
@@ -1800,7 +1878,7 @@ function clearNodeProgressLane(nodeIdValue, promptId, laneId) {
   }
   deleteNodeProgressLane(safeNodeIdValue, promptId, safeLaneId);
 
-  ensureAnimationLoop();
+  stopAnimationLoopIfIdle();
   app.graph?.setDirtyCanvas(true, true);
 }
 
@@ -3073,8 +3151,15 @@ function clearPromptRemoteStates(promptId) {
   const promptState = modalPromptStates.get(promptId);
   if (!promptState) {
     clearPromptProgressStates(promptId);
+    for (const [nodeIdValue, state] of Array.from(modalNodeStates.entries())) {
+      if (state?.promptId === promptId) {
+        clearNodeTimer(nodeIdValue);
+        modalNodeStates.delete(nodeIdValue);
+      }
+    }
     pruneGlobalStatusStates();
     refreshGlobalStatusElement();
+    stopAnimationLoopIfIdle();
     app.graph?.setDirtyCanvas(true, true);
     return;
   }
@@ -3101,6 +3186,7 @@ function clearPromptRemoteStates(promptId) {
   clearPromptQueued(promptId);
   pruneGlobalStatusStates();
   refreshGlobalStatusElement();
+  stopAnimationLoopIfIdle();
   app.graph?.setDirtyCanvas(true, true);
 }
 
@@ -3134,6 +3220,7 @@ function clearPromptRemoteNodeVisuals(promptId) {
     }
   }
   setPromptActiveNode(promptId, null);
+  stopAnimationLoopIfIdle();
   app.graph?.setDirtyCanvas(true, true);
 }
 
