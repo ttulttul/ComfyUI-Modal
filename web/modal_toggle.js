@@ -663,6 +663,27 @@ function markPromptCancellationRequested(promptId) {
 }
 
 /**
+ * Remove older cancellation UI before a newer Modal prompt takes over the global badge.
+ * @param {string} activePromptId
+ */
+function clearSupersededCancellingPrompts(activePromptId) {
+  for (const [promptId, state] of Array.from(modalGlobalStatusStates.entries())) {
+    if (promptId === activePromptId) {
+      continue;
+    }
+    if (effectiveGlobalStatusPhase(promptId, state.phase) !== STATE_CANCELLING) {
+      continue;
+    }
+    if (promptHasLiveRemoteWork(promptId)) {
+      continue;
+    }
+    markPromptTerminal(promptId, "superseded_by_new_prompt");
+    clearPromptRemoteNodeVisuals(promptId);
+    clearPromptRemoteStates(promptId);
+  }
+}
+
+/**
  * Return prompt ids targeted by one ComfyUI interrupt request.
  * @param {any} resource
  * @param {any} options
@@ -3195,6 +3216,7 @@ function patchQueuePrompt() {
     const { output: prompt, workflow } = data;
     const promptId = createPromptId();
     clearPromptTerminal(promptId);
+    clearSupersededCancellingPrompts(promptId);
     const remoteNodeIds = extractRemoteNodeIds(workflow);
     registerPromptComponents(promptId, remoteNodeIds, []);
     const queuedBehindActiveModal =
