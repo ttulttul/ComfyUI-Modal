@@ -249,6 +249,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 - Changed `COMFY_MODAL_GPU`: delete or stop the old Modal app before redeploying; hardware is fixed at deploy time.
 - Remote mode still uses local mirror storage: restart ComfyUI with `COMFY_MODAL_EXECUTION_MODE=remote` and the Modal SDK available so sync and invocation resolve the same mode.
 - Missing custom node class in Modal: ensure custom-node sync is enabled, check the worker logs for import failures, and confirm the package's Python dependencies are present in its `requirements.txt`.
+- `UNETLoader` reports `Could not detect model type` for a synced Flux-style model: Modal-Sync aliases saved RMSNorm `.weight` keys to ComfyUI's `.scale` key form in memory before remote model detection, but the model still has to be supported by the ComfyUI checkout packaged into the Modal app.
 - Boundary validation fails on `MODEL`, `CLIP`, `VAE`, `CONDITIONING`, or similar values: include the upstream producer in the remote island or use `Enable on Upstream Nodes`.
 - ComfyUI reports `Dependency cycle detected` after rewrite: inspect local `comfy.log` for the Modal-Sync proxy graph diagnostics and cycle path.
 - Cancellation appears to finish locally while Modal is still busy: the local prompt has been released after the grace window, and remote cleanup or worker retirement may still be completing.
