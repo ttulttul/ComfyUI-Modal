@@ -147,13 +147,13 @@ CPU memory snapshots are enabled by default. GPU memory snapshots are also enabl
 
 Warm containers can reuse loaded model state, `PromptExecutor` state, remote session bridge values, and worker-local loader cache entries across compatible requests. The default Modal `scaledown_window` is `600` seconds with `min_containers=0`, so compute can scale down to zero between runs while still benefiting from warm reuse when capacity remains alive.
 
-Independent Modal-backed components can overlap through ComfyUI's async proxy path and the local Modal call executor. Each Modal GPU container handles one active workflow execution at a time, so parallel ready components can scale out across containers instead of multiplexing several active executions onto one worker.
+Independent Modal-backed components can overlap through ComfyUI's async proxy path and the local Modal call executor. Each Modal GPU container handles one active workflow execution at a time, so parallel ready components can scale out across containers instead of multiplexing several active executions onto one worker. `COMFY_MODAL_MAX_INFLIGHT_CALLS` bounds local dispatch independently from the local CPU count and the remote autoscaler.
 
 Split proxies and mapped phases use prompt-scoped remote sessions for live non-transportable values. Durable bridge metadata is stored in a Modal `Dict` so later phases can rehydrate selected values after container churn. Sampler-producing bridges are not replayed as a fallback; losing those values is surfaced as a session-state error.
 
 Remote subgraph runs can persist transport-safe node outputs into a shared Modal `Dict` using ComfyUI input-signature semantics. The cache skips non-serializable outputs and entries above the configured size cap.
 
-Cancellation uses a shared Modal `Dict` control store plus local polling of ComfyUI cancellation. Remote workers can retire themselves after crashes or stuck cancellation so a bad warm GPU container is not left idle and billable.
+Cancellation uses a shared Modal `Dict` control store plus local polling of ComfyUI cancellation. Remote workers retire themselves after poisoned CUDA/runtime failures or stuck cancellation, while deterministic prompt and custom-node errors preserve healthy warm workers.
 
 ## Asset And Custom Node Sync
 
@@ -230,6 +230,9 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_MIN_CONTAINERS` | `0` | Minimum warm containers. |
 | `COMFY_MODAL_MAX_CONTAINERS` | unset | Optional upper bound on simultaneously scaled Modal containers. |
 | `COMFY_MODAL_BUFFER_CONTAINERS` | unset | Optional spare warm containers above current load. |
+| `COMFY_MODAL_MAX_INFLIGHT_CALLS` | `4` | Maximum local Modal calls dispatched at once; mapped fan-out is clamped to this budget. |
+| `COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS` | `3600` | Maximum runtime for one Modal workflow call. |
+| `COMFY_MODAL_STARTUP_TIMEOUT_SECONDS` | `900` | Maximum Modal container startup and snapshot-restore time. |
 | `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP` | `true` | Start background warmup from runtime parallelism signals such as mapped fan-out. |
 | `COMFY_MODAL_ENABLE_LOADER_PREWARM` | `true` | During warmup, execute synthetic loader prompts for root literal model-loader nodes. |
 | `COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS` | `2.0` | Bounded wait for exact mapped warmup slots before lane seeding starts. |

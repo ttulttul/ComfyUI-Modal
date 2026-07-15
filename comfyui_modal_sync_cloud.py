@@ -25,6 +25,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -114,6 +115,14 @@ class RemoteSubgraphExecutionError(RuntimeError):
 
 class ExistingModalAppError(RuntimeError):
     """Raised when deploying would overwrite an existing Modal app."""
+
+
+class RemoteFailureDisposition(str, Enum):
+    """Describe whether one remote failure implies poisoned worker state."""
+
+    EXPECTED = "expected"
+    DETERMINISTIC = "deterministic"
+    POISONED_WORKER = "poisoned-worker"
 
 
 def _modal_exception_types(
@@ -1046,6 +1055,28 @@ def _is_session_state_like_failure(exc: Exception) -> bool:
     return "remote session" in str(exc).lower()
 
 
+def _remote_failure_disposition(exc: Exception) -> RemoteFailureDisposition:
+    """Classify one execution failure for worker-retirement decisions."""
+    if _is_interrupt_like_failure(exc) or _is_session_state_like_failure(exc):
+        return RemoteFailureDisposition.EXPECTED
+    if isinstance(exc, MemoryError):
+        return RemoteFailureDisposition.POISONED_WORKER
+
+    message = str(exc).lower()
+    poisoned_runtime_markers = (
+        "cuda out of memory",
+        "cuda error",
+        "device-side assert",
+        "illegal memory access",
+        "cublas_status",
+        "cudnn_status",
+        "hip error",
+    )
+    if any(marker in message for marker in poisoned_runtime_markers):
+        return RemoteFailureDisposition.POISONED_WORKER
+    return RemoteFailureDisposition.DETERMINISTIC
+
+
 def _maybe_schedule_container_termination_on_error(
     payload: dict[str, Any],
     exc: Exception,
@@ -1055,12 +1086,12 @@ def _maybe_schedule_container_termination_on_error(
         return False
     if not bool(payload.get("terminate_container_on_error", True)):
         return False
-    if _is_interrupt_like_failure(exc):
-        return False
-    if _is_session_state_like_failure(exc):
+    disposition = _remote_failure_disposition(exc)
+    if disposition is not RemoteFailureDisposition.POISONED_WORKER:
         logger.warning(
-            "Skipping Modal container termination for component=%s because the failure looks like a remote session routing/state miss.",
+            "Skipping Modal container termination for component=%s failure_disposition=%s because the worker is safe to reuse.",
             payload.get("component_id"),
+            disposition.value,
             exc_info=(type(exc), exc, exc.__traceback__),
         )
         return False
@@ -4781,6 +4812,8 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
         "min_containers": settings.min_containers,
         "image": image,
         "enable_memory_snapshot": settings.enable_memory_snapshot,
+        "timeout": int(getattr(settings, "execution_timeout_seconds", 3600)),
+        "startup_timeout": int(getattr(settings, "startup_timeout_seconds", 900)),
     }
     max_containers = getattr(settings, "max_containers", None)
     buffer_containers = getattr(settings, "buffer_containers", None)

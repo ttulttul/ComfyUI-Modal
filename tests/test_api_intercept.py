@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -625,6 +626,48 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     assert response_payload["prompt_id"] == "prompt-queue-warmup"
     assert response_payload["modal_remote_node_ids"] == ["1"]
     assert len(prompt_server.prompt_queue.items) == 1
+
+
+def test_modal_prompt_rewrite_keeps_event_loop_responsive(
+    api_intercept_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Hashing and upload preparation should execute outside the ComfyUI event loop."""
+    rewrite_started = threading.Event()
+    release_rewrite = threading.Event()
+
+    def blocking_rewrite(**kwargs: Any) -> tuple[dict[str, Any], Any]:
+        """Hold one fake rewrite until the async test proves the loop is responsive."""
+        rewrite_started.set()
+        assert release_rewrite.wait(timeout=1.0)
+        return kwargs["prompt"], api_intercept_module.RewriteSummary()
+
+    monkeypatch.setattr(api_intercept_module, "rewrite_prompt_for_modal", blocking_rewrite)
+
+    async def run_test() -> None:
+        """Run the blocking rewrite and an independent event-loop callback together."""
+        rewrite_task = asyncio.create_task(
+            api_intercept_module.rewrite_prompt_for_modal_async(
+                prompt={"1": {"class_type": "RemoteImage", "inputs": {}}},
+                workflow=None,
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while not rewrite_started.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("background rewrite did not start")
+            await asyncio.sleep(0)
+
+        loop_progress: list[str] = []
+        asyncio.get_running_loop().call_soon(loop_progress.append, "responsive")
+        await asyncio.sleep(0)
+        assert loop_progress == ["responsive"]
+        assert not rewrite_task.done()
+
+        release_rewrite.set()
+        await asyncio.wait_for(rewrite_task, timeout=1.0)
+
+    asyncio.run(run_test())
 
 
 def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(

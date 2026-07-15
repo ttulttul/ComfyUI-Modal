@@ -1039,24 +1039,24 @@ def test_local_remote_app_executes_original_node(
     assert outputs == ("hello", 1)
 
 
-def test_remote_modal_call_worker_count_allows_parallel_blocking_calls(
+def test_remote_modal_call_worker_count_is_bounded_independently_of_local_cpus(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """The local Modal dispatch pool should have more than one worker."""
+    """Local CPU count should not determine expensive remote GPU concurrency."""
     monkeypatch.setattr(remote_modal_app_module.os, "cpu_count", lambda: 8)
     remote_modal_app_module.get_settings.cache_clear()
 
-    assert remote_modal_app_module._remote_modal_call_worker_count() == 8
+    assert remote_modal_app_module._remote_modal_call_worker_count() == 4
 
 
-def test_remote_modal_call_worker_count_honors_max_container_limit(
+def test_remote_modal_call_worker_count_honors_explicit_inflight_limit(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """The local Modal dispatch pool should scale up to the configured max container count."""
+    """Operators should be able to choose the local remote-call budget explicitly."""
     monkeypatch.setattr(remote_modal_app_module.os, "cpu_count", lambda: 8)
-    monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "12")
+    monkeypatch.setenv("COMFY_MODAL_MAX_INFLIGHT_CALLS", "12")
     remote_modal_app_module.get_settings.cache_clear()
     try:
         assert remote_modal_app_module._remote_modal_call_worker_count() == 12
@@ -1700,11 +1700,11 @@ def test_modal_cloud_skips_reload_when_uploaded_paths_are_already_visible(
     assert recorded_markers == ["marker-1"]
 
 
-def test_modal_cloud_schedules_container_exit_for_remote_failures(
+def test_modal_cloud_preserves_worker_for_deterministic_remote_failures(
     modal_cloud_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Unhandled remote execution failures should retire the current Modal container."""
+    """Ordinary node failures should not discard a healthy warm Modal worker."""
     scheduled_exits: list[tuple[float, int]] = []
     original_flag = modal_cloud_module._CONTAINER_TERMINATION_SCHEDULED
     monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", False)
@@ -1718,6 +1718,32 @@ def test_modal_cloud_schedules_container_exit_for_remote_failures(
         scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
             {"component_id": "component-1", "terminate_container_on_error": True},
             RuntimeError("boom"),
+        )
+    finally:
+        monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
+
+    assert scheduled is False
+    assert scheduled_exits == []
+
+
+def test_modal_cloud_retires_worker_for_poisoned_cuda_runtime(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """CUDA failures that can poison process state should retire the worker."""
+    scheduled_exits: list[tuple[float, int]] = []
+    original_flag = modal_cloud_module._CONTAINER_TERMINATION_SCHEDULED
+    monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", False)
+    monkeypatch.setattr(modal_cloud_module, "_is_modal_container_runtime", lambda: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_schedule_process_exit",
+        lambda delay_seconds, exit_code: scheduled_exits.append((delay_seconds, exit_code)),
+    )
+    try:
+        scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
+            {"component_id": "component-1", "terminate_container_on_error": True},
+            RuntimeError("CUDA error: an illegal memory access was encountered"),
         )
     finally:
         monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
@@ -3542,6 +3568,8 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
     assert options["volumes"] == {"/storage": "volume"}
     assert options["scaledown_window"] == 600
     assert options["min_containers"] == 0
+    assert options["timeout"] == 3600
+    assert options["startup_timeout"] == 900
 
     gpu_snapshot_settings = types.SimpleNamespace(
         remote_storage_root="/storage",
@@ -10157,6 +10185,8 @@ def test_modal_cloud_class_options_do_not_use_deprecated_concurrency_flag(
         min_containers=0,
         max_containers=4,
         buffer_containers=1,
+        execution_timeout_seconds=1800,
+        startup_timeout_seconds=600,
         enable_memory_snapshot=True,
         enable_gpu_memory_snapshot=False,
     )
@@ -10170,6 +10200,8 @@ def test_modal_cloud_class_options_do_not_use_deprecated_concurrency_flag(
     assert "allow_concurrent_inputs" not in options
     assert options["max_containers"] == 4
     assert options["buffer_containers"] == 1
+    assert options["timeout"] == 1800
+    assert options["startup_timeout"] == 600
     module_source = Path(modal_cloud_module.__file__).read_text(encoding="utf-8")
     assert "@modal.concurrent(max_inputs=1)" in module_source
 

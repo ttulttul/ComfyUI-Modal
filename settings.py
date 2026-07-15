@@ -38,7 +38,10 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_MIN_CONTAINERS",
     "COMFY_MODAL_MAX_CONTAINERS",
     "COMFY_MODAL_BUFFER_CONTAINERS",
+    "COMFY_MODAL_MAX_INFLIGHT_CALLS",
     "COMFY_MODAL_SCALEDOWN_WINDOW",
+    "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS",
+    "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS",
     "COMFY_MODAL_ENABLE_LOADER_PREWARM",
     "COMFY_MODAL_MAX_LOADER_PREWARMS_PER_COMPONENT",
     "COMFY_MODAL_ENABLE_PROACTIVE_WARMUP",
@@ -80,6 +83,9 @@ class ModalSyncSettings:
     min_containers: int = 0
     max_containers: int | None = None
     buffer_containers: int | None = None
+    max_inflight_calls: int = 4
+    execution_timeout_seconds: int = 3600
+    startup_timeout_seconds: int = 900
     enable_proactive_warmup: bool = True
     enable_loader_prewarm: bool = True
     proactive_warmup_head_start_seconds: float = 2.0
@@ -266,6 +272,18 @@ def _get_settings_cached(
         min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),
         max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),
         buffer_containers=_read_optional_int_env("COMFY_MODAL_BUFFER_CONTAINERS"),
+        max_inflight_calls=max(
+            1,
+            _read_int_env("COMFY_MODAL_MAX_INFLIGHT_CALLS", 4),
+        ),
+        execution_timeout_seconds=max(
+            1,
+            _read_int_env("COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS", 3600),
+        ),
+        startup_timeout_seconds=max(
+            1,
+            _read_int_env("COMFY_MODAL_STARTUP_TIMEOUT_SECONDS", 900),
+        ),
         enable_proactive_warmup=_read_bool_env("COMFY_MODAL_ENABLE_PROACTIVE_WARMUP") is not False,
         enable_loader_prewarm=_read_bool_env("COMFY_MODAL_ENABLE_LOADER_PREWARM") is not False,
         proactive_warmup_head_start_seconds=_read_float_env(

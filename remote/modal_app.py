@@ -162,8 +162,7 @@ class _RemoteSessionBridgeResolutionStats:
 
 def _remote_modal_call_worker_count() -> int:
     """Return the number of local worker threads reserved for blocking Modal calls."""
-    configured_parallelism = get_settings().max_containers or 0
-    return max(4, os.cpu_count() or 1, configured_parallelism)
+    return max(1, int(get_settings().max_inflight_calls))
 
 
 _REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=_remote_modal_call_worker_count())
@@ -3356,7 +3355,9 @@ def _consume_remote_payload_stream(
 def _mapped_execution_parallelism(item_count: int) -> int:
     """Return the local worker width used to schedule mapped Modal item executions."""
     settings = get_settings()
-    configured_limit = settings.max_containers or _remote_modal_call_worker_count()
+    configured_limit = settings.max_inflight_calls
+    if settings.max_containers is not None:
+        configured_limit = min(configured_limit, settings.max_containers)
     return max(1, min(item_count, configured_limit))
 
 
