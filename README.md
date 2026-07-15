@@ -282,6 +282,16 @@ uv run pytest
 
 Tests look for ComfyUI in `COMFYUI_ROOT` first, then `COMFY_MODAL_COMFYUI_ROOT`, then an installed parent checkout, then `~/git/ComfyUI`.
 
+The live Modal canaries are opt-in because they authenticate, deploy when needed, start GPU containers, and therefore may incur Modal charges. They validate the deployed runtime fingerprint, binary tensor transport plus durable duplicate replay, two-call remote concurrency through a shared barrier, and prompt cancellation propagation:
+
+```bash
+COMFY_MODAL_RUN_LIVE_CANARIES=1 \
+COMFY_MODAL_EXECUTION_MODE=remote \
+uv run --extra remote pytest -q tests/test_live_modal_canary.py
+```
+
+The canaries use the normal `COMFY_MODAL_APP_NAME`, environment, GPU, timeout, and container-limit settings. The parallel canary skips when either the local in-flight limit or the configured Modal container limit is below two. All ordinary tests remain local-only and do not require Modal credentials.
+
 To run tests against a temporary checkout:
 
 ```bash
