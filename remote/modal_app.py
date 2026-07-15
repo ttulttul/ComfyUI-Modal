@@ -45,6 +45,7 @@ from ..durable_state import (
     DurableObjectRef,
     DurableStateError,
     FileDurableObjectStore,
+    read_modal_volume_file,
     stable_remote_invocation_id,
 )
 from ..session_state import (
@@ -557,22 +558,27 @@ def _durable_object_store() -> FileDurableObjectStore:
             return _DURABLE_OBJECT_STORE
         settings = get_settings()
         commit_callback: Callable[[], Any] | None = None
-        reload_callback: Callable[[], Any] | None = None
+        committed_read_callback: Callable[[str], bytes] | None = None
         if os.getenv("MODAL_IS_REMOTE") == "1" or os.getenv("MODAL_TASK_ID"):
             object_root = Path(settings.remote_storage_root) / "durable_objects"
             volume = globals().get("vol")
             volume_commit = getattr(volume, "commit", None)
             if callable(volume_commit):
                 commit_callback = volume_commit
-            volume_reload = getattr(volume, "reload", None)
-            if callable(volume_reload):
-                reload_callback = volume_reload
+            if callable(getattr(volume, "read_file", None)):
+
+                def read_committed_object(object_path: str) -> bytes:
+                    """Read one durable object without reloading the mounted volume."""
+                    volume_path = (Path("durable_objects") / object_path).as_posix()
+                    return read_modal_volume_file(volume, volume_path)
+
+                committed_read_callback = read_committed_object
         else:
             object_root = settings.local_storage_root / "durable_objects"
         _DURABLE_OBJECT_STORE = FileDurableObjectStore(
             object_root,
             commit_callback=commit_callback,
-            reload_callback=reload_callback,
+            committed_read_callback=committed_read_callback,
         )
         return _DURABLE_OBJECT_STORE
 

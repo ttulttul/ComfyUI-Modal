@@ -97,11 +97,11 @@ def test_content_addressed_store_rejects_unsafe_reference_paths(
         store.get(object_ref)
 
 
-def test_content_addressed_store_reloads_missing_mounted_object(
+def test_content_addressed_store_reads_missing_object_from_committed_storage(
     durable_state_module: Any,
     tmp_path: Path,
 ) -> None:
-    """A stale mounted Volume view should reload once before reporting a miss."""
+    """A stale mount should use direct committed reads without materializing files."""
     payload = b"arrived-from-another-container"
     digest = hashlib.sha256(payload).hexdigest()
     object_ref = durable_state_module.DurableObjectRef(
@@ -109,23 +109,71 @@ def test_content_addressed_store_reloads_missing_mounted_object(
         sha256=digest,
         size_bytes=len(payload),
     )
-    reload_count = 0
+    requested_paths: list[str] = []
 
-    def reload_volume() -> None:
-        """Simulate Modal exposing an object after Volume.reload()."""
-        nonlocal reload_count
-        reload_count += 1
-        target_path = tmp_path / object_ref.object_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(payload)
+    def read_committed_object(object_path: str) -> bytes:
+        """Return one object from a simulated committed-volume API."""
+        requested_paths.append(object_path)
+        return payload
 
     store = durable_state_module.FileDurableObjectStore(
         tmp_path,
-        reload_callback=reload_volume,
+        committed_read_callback=read_committed_object,
     )
 
     assert store.get(object_ref) == payload
-    assert reload_count == 1
+    assert requested_paths == [object_ref.object_path]
+    assert not (tmp_path / object_ref.object_path).exists()
+
+
+def test_content_addressed_store_reports_missing_committed_object(
+    durable_state_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A missing mounted and committed object should remain a durable-state error."""
+    object_ref = durable_state_module.DurableObjectRef(
+        object_path="results/ab/missing.bin",
+        sha256="a" * 64,
+        size_bytes=1,
+    )
+
+    def read_missing_object(object_path: str) -> bytes:
+        """Simulate Modal reporting that the committed object is absent."""
+        raise FileNotFoundError(object_path)
+
+    store = durable_state_module.FileDurableObjectStore(
+        tmp_path,
+        committed_read_callback=read_missing_object,
+    )
+
+    with pytest.raises(durable_state_module.DurableStateError, match="was not found"):
+        store.get(object_ref)
+
+
+def test_content_addressed_store_validates_direct_committed_read(
+    durable_state_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Direct committed reads must retain content-address integrity checks."""
+    expected_payload = b"expected"
+    object_ref = durable_state_module.DurableObjectRef(
+        object_path="results/ab/expected.bin",
+        sha256=hashlib.sha256(expected_payload).hexdigest(),
+        size_bytes=len(expected_payload),
+    )
+
+    def read_corrupt_object(object_path: str) -> bytes:
+        """Return same-sized bytes with the wrong content digest."""
+        del object_path
+        return b"corrupt!"
+
+    store = durable_state_module.FileDurableObjectStore(
+        tmp_path,
+        committed_read_callback=read_corrupt_object,
+    )
+
+    with pytest.raises(durable_state_module.DurableStateError, match="SHA256 mismatch"):
+        store.get(object_ref)
 
 
 def test_remote_invocation_id_is_stable_and_input_sensitive(

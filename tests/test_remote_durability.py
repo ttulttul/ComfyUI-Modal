@@ -2,12 +2,72 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
+
+
+@pytest.mark.parametrize(
+    "module_fixture_name",
+    ["modal_cloud_module", "remote_modal_app_module"],
+)
+def test_modal_durable_store_reads_committed_object_without_volume_reload(
+    module_fixture_name: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stale mounted object should be fetched through Volume.read_file()."""
+    runtime_module = request.getfixturevalue(module_fixture_name)
+    payload = b"committed-in-another-container"
+    digest = hashlib.sha256(payload).hexdigest()
+    object_ref = runtime_module.DurableObjectRef(
+        object_path=f"bridge_inputs/{digest[:2]}/{digest}.bin",
+        sha256=digest,
+        size_bytes=len(payload),
+    )
+
+    class FakeVolume:
+        """Expose direct reads while rejecting any accidental mounted reload."""
+
+        def __init__(self) -> None:
+            """Initialize observed direct-read paths."""
+            self.read_paths: list[str] = []
+
+        def commit(self) -> None:
+            """Accept unused durable commits for store construction."""
+
+        def read_file(self, volume_path: str) -> Iterator[bytes]:
+            """Yield the committed payload in multiple Modal-style chunks."""
+            self.read_paths.append(volume_path)
+            yield payload[:8]
+            yield payload[8:]
+
+        def reload(self) -> None:
+            """Fail if the obsolete mounted-volume fallback is attempted."""
+            raise AssertionError("Volume.reload() must not serve durable object reads.")
+
+    volume = FakeVolume()
+    monkeypatch.setattr(runtime_module, "vol", volume, raising=False)
+    monkeypatch.setattr(runtime_module, "_DURABLE_OBJECT_STORE", None)
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(tmp_path / "storage"))
+    if module_fixture_name == "modal_cloud_module":
+        monkeypatch.setattr(runtime_module, "_is_modal_container_runtime", lambda: True)
+    else:
+        monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+    runtime_module.get_settings.cache_clear()
+
+    try:
+        restored_payload = runtime_module._durable_object_store().get(object_ref)
+    finally:
+        runtime_module.get_settings.cache_clear()
+
+    assert restored_payload == payload
+    assert volume.read_paths == [f"durable_objects/{object_ref.object_path}"]
 
 
 def test_cloud_invocation_replays_completed_result_without_reexecution(

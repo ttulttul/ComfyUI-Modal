@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -16,6 +17,8 @@ from typing import Any, Callable, Iterator, Mapping
 _DURABLE_OBJECT_REF_MARKER = "__comfy_modal_durable_object_ref__"
 _REMOTE_INVOCATION_RECORD_MARKER = "__comfy_modal_remote_invocation_record__"
 _REMOTE_INVOCATION_STATES = frozenset({"running", "completed", "failed"})
+
+logger = logging.getLogger(__name__)
 
 
 class DurableStateError(RuntimeError):
@@ -81,13 +84,13 @@ class FileDurableObjectStore:
         root: Path,
         *,
         commit_callback: Callable[[], Any] | None = None,
-        reload_callback: Callable[[], Any] | None = None,
+        committed_read_callback: Callable[[str], bytes] | None = None,
     ) -> None:
         """Initialize the object root and optional mounted-volume callbacks."""
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._commit_callback = commit_callback
-        self._reload_callback = reload_callback
+        self._committed_read_callback = committed_read_callback
         self._write_lock = threading.Lock()
         self._commit_batch_state = threading.local()
 
@@ -175,18 +178,22 @@ class FileDurableObjectStore:
         target_path = self._resolve_object_path(object_ref.object_path)
         try:
             payload = target_path.read_bytes()
-        except FileNotFoundError as exc:
-            if self._reload_callback is not None:
-                self._reload_callback()
+        except FileNotFoundError as mounted_read_error:
+            if self._committed_read_callback is not None:
+                logger.info(
+                    "Durable object %s is absent from the mounted snapshot; reading committed bytes directly.",
+                    object_ref.object_path,
+                )
                 try:
-                    payload = target_path.read_bytes()
-                except FileNotFoundError:
-                    pass
-                else:
-                    return self._validate_loaded_object(object_ref, payload)
+                    payload = self._committed_read_callback(object_ref.object_path)
+                except FileNotFoundError as committed_read_error:
+                    raise DurableStateError(
+                        f"Durable object {object_ref.object_path!r} was not found."
+                    ) from committed_read_error
+                return self._validate_loaded_object(object_ref, payload)
             raise DurableStateError(
                 f"Durable object {object_ref.object_path!r} was not found."
-            ) from exc
+            ) from mounted_read_error
         return self._validate_loaded_object(object_ref, payload)
 
     def _validate_loaded_object(
@@ -240,6 +247,14 @@ class FileDurableObjectStore:
             raise DurableStateError(
                 f"Existing durable object {target_path} failed its content-address check."
             )
+
+
+def read_modal_volume_file(volume: Any, volume_path: str) -> bytes:
+    """Read one committed file through Modal's direct Volume API."""
+    read_file = getattr(volume, "read_file", None)
+    if not callable(read_file):
+        raise DurableStateError("The configured Modal volume does not support read_file().")
+    return b"".join(read_file(volume_path))
 
 
 @dataclass(frozen=True)
