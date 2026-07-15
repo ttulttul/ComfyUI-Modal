@@ -51,7 +51,7 @@ export COMFY_MODAL_EXECUTION_MODE=remote
 
 For repository development, `uv sync --extra remote --group test` installs the same pinned SDK. Remote mode uses the stable cloud entrypoint in [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py). On first use, Modal-Sync can auto-deploy the configured Modal app if it does not exist.
 
-The deployed image uses Python 3.11 plus an exact ComfyUI support and CUDA package set. Before every process's first remote invocation, Modal-Sync compares the deployed worker's runtime fingerprint with the local source, ComfyUI source, custom-node requirements, and runtime-shaping settings. A missing or mismatched fingerprint is treated as stale and replaced automatically when `COMFY_MODAL_AUTO_DEPLOY=true`.
+The deployed image uses Python 3.11 plus an exact ComfyUI support and CUDA package set. Its local build context is limited to the ComfyUI source packages, top-level Python modules, and runtime configuration needed by the headless worker; model directories, custom nodes, caches, tests, virtual environments, user data, and unknown top-level directories stay out of the image snapshot. Before every process's first remote invocation, Modal-Sync compares the deployed worker's runtime fingerprint with the local source, ComfyUI source, custom-node requirements, and runtime-shaping settings. A missing or mismatched fingerprint is treated as stale and replaced automatically when `COMFY_MODAL_AUTO_DEPLOY=true`.
 
 ## Using It In ComfyUI
 
@@ -177,11 +177,13 @@ In remote mode, assets and custom-node archives are uploaded into the configured
 
 Asset paths are planned once per queued prompt. Repeated references across nodes or remote components share one hash, sync-index lookup, and upload decision while every component still receives the same content-addressed remote path and reload metadata.
 
-Custom-node sync is enabled by default in remote mode and disabled by default in local mode. When enabled, Modal-Sync packages `custom_nodes/` as a whole-tree manifest plus content-addressed archives for each top-level custom-node package. Unchanged package digests are reused through a Modal `Dict` sync index instead of probing the volume for many marker files.
+Custom-node sync is enabled by default in remote mode and disabled by default in local mode. When enabled, Modal-Sync packages `custom_nodes/` as a whole-tree manifest plus content-addressed code archives for each top-level custom-node package. Package-owned model artifacts such as `.pth`, `.safetensors`, `.gguf`, and `.onnx` files are stored separately and linked into the extracted package on the worker, so a code edit does not recompress or reupload a multi-gigabyte model. Nested virtual environments, caches, compiled Python artifacts, logs, and temporary files are excluded. Unchanged code and asset digests are reused through a Modal `Dict` sync index instead of probing the volume for many marker files.
 
 When a synced top-level custom-node package has a `requirements.txt`, those requirements are folded into the Modal image build. `-r other-file.txt` includes are followed relative to the declaring package; pip option and constraint lines are ignored.
 
 Warm workers call `vol.reload()` only for uploaded mounted-volume paths that the current payload can reference. Reload markers are deduped across one queued workflow so multiple components do not repeatedly reload the same asset snapshot.
+
+Durable bridge objects and oversized invocation results share one content-addressed object store. Writes produced during one invocation are committed to the Modal volume as one completion batch on the stream-owning request lifecycle, before completed invocation metadata is published for retry replay.
 
 ## Configuration
 

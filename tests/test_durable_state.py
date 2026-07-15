@@ -28,6 +28,46 @@ def test_content_addressed_store_deduplicates_and_validates(
     assert commits == [True]
 
 
+def test_content_addressed_store_batches_commits_across_multiple_objects(
+    durable_state_module: Any,
+    tmp_path: Path,
+) -> None:
+    """One logical invocation should commit all new objects in one callback."""
+    commits: list[bool] = []
+    store = durable_state_module.FileDurableObjectStore(
+        tmp_path,
+        commit_callback=lambda: commits.append(True),
+    )
+
+    with store.batch_commits():
+        store.put("bridges", b"bridge-inputs")
+        store.put("bridges", b"bridge-output")
+        store.put("results", b"invocation-result")
+
+    assert commits == [True]
+
+
+def test_content_addressed_store_transfers_deferred_batch_before_commit(
+    durable_state_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A streaming worker's deferred writes should join its caller's completion batch."""
+    commits: list[bool] = []
+    store = durable_state_module.FileDurableObjectStore(
+        tmp_path,
+        commit_callback=lambda: commits.append(True),
+    )
+
+    with store.batch_commits(commit_on_exit=False) as worker_batch:
+        store.put("bridges", b"worker-object")
+    with store.batch_commits() as completion_batch:
+        completion_batch.absorb(worker_batch)
+        store.put("results", b"main-object")
+
+    assert worker_batch.wrote_object is False
+    assert commits == [True]
+
+
 def test_content_addressed_store_rejects_corruption(
     durable_state_module: Any,
     tmp_path: Path,

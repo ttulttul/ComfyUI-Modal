@@ -8,9 +8,10 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 _DURABLE_OBJECT_REF_MARKER = "__comfy_modal_durable_object_ref__"
 _REMOTE_INVOCATION_RECORD_MARKER = "__comfy_modal_remote_invocation_record__"
@@ -60,6 +61,18 @@ def is_durable_object_ref_payload(payload: Any) -> bool:
     return isinstance(payload, Mapping) and bool(payload.get(_DURABLE_OBJECT_REF_MARKER))
 
 
+@dataclass
+class DurableObjectCommitBatch:
+    """Track whether one logical operation created durable filesystem objects."""
+
+    wrote_object: bool = False
+
+    def absorb(self, other: "DurableObjectCommitBatch") -> None:
+        """Merge pending object writes from another execution context."""
+        self.wrote_object = self.wrote_object or other.wrote_object
+        other.wrote_object = False
+
+
 class FileDurableObjectStore:
     """Filesystem-backed content-addressed object store with integrity checks."""
 
@@ -76,6 +89,36 @@ class FileDurableObjectStore:
         self._commit_callback = commit_callback
         self._reload_callback = reload_callback
         self._write_lock = threading.Lock()
+        self._commit_batch_state = threading.local()
+
+    @contextmanager
+    def batch_commits(
+        self,
+        *,
+        commit_on_exit: bool = True,
+    ) -> Iterator[DurableObjectCommitBatch]:
+        """Coalesce object writes into one optional mounted-volume commit."""
+        batch = DurableObjectCommitBatch()
+        batch_stack = self._commit_batch_stack()
+        batch_stack.append(batch)
+        try:
+            yield batch
+        finally:
+            popped_batch = batch_stack.pop()
+            if popped_batch is not batch:
+                raise DurableStateError("Durable object commit batches exited out of order.")
+            if batch_stack:
+                batch_stack[-1].absorb(batch)
+            elif commit_on_exit:
+                self.commit_batch(batch)
+
+    def commit_batch(self, batch: DurableObjectCommitBatch) -> None:
+        """Commit pending object writes from a completed logical operation once."""
+        if not batch.wrote_object:
+            return
+        if self._commit_callback is not None:
+            self._commit_callback()
+        batch.wrote_object = False
 
     def put(self, namespace: str, payload: bytes) -> DurableObjectRef:
         """Persist bytes under a content-addressed namespace and return their ref."""
@@ -101,13 +144,31 @@ class FileDurableObjectStore:
                     wrote_object = True
                 finally:
                     temporary_path.unlink(missing_ok=True)
-        if wrote_object and self._commit_callback is not None:
-            self._commit_callback()
+        if wrote_object:
+            active_batch = self._active_commit_batch()
+            if active_batch is None:
+                if self._commit_callback is not None:
+                    self._commit_callback()
+            else:
+                active_batch.wrote_object = True
         return DurableObjectRef(
             object_path=relative_path.as_posix(),
             sha256=sha256,
             size_bytes=len(payload),
         )
+
+    def _commit_batch_stack(self) -> list[DurableObjectCommitBatch]:
+        """Return this thread's active durable-object commit batch stack."""
+        batch_stack = getattr(self._commit_batch_state, "stack", None)
+        if batch_stack is None:
+            batch_stack = []
+            self._commit_batch_state.stack = batch_stack
+        return batch_stack
+
+    def _active_commit_batch(self) -> DurableObjectCommitBatch | None:
+        """Return this thread's innermost commit batch when one is active."""
+        batch_stack = self._commit_batch_stack()
+        return batch_stack[-1] if batch_stack else None
 
     def get(self, object_ref: DurableObjectRef) -> bytes:
         """Load and validate one referenced object."""

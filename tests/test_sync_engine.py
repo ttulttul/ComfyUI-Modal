@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import threading
 import time
 from typing import Any
+import zipfile
 
 
 def test_sync_file_deduplicates_by_hash(
@@ -284,8 +286,8 @@ def test_sync_custom_nodes_directory_emits_packaging_and_upload_status(
     )
 
     assert observed_statuses == [
-        ("Packaging custom nodes ZIP for Modal", None, None),
-        ("Uploading custom nodes ZIP to Modal", None, None),
+        ("Packaging custom-node code for Modal", None, None),
+        ("Uploading custom-node code and assets to Modal", None, None),
     ]
 
 
@@ -514,8 +516,66 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
     assert second_bundle is not None
     assert second_bundle.sha256 == first_bundle.sha256
     assert second_bundle.uploaded is False
-    entry_hash = second_engine._hash_directory(custom_nodes_dir / "example")
+    entry_hash = second_engine._custom_nodes_archive_specs(custom_nodes_dir)[0].sha256
     assert second_engine._cached_custom_nodes_archive_path("example", entry_hash).exists()
+
+
+def test_sync_custom_nodes_separates_code_assets_and_nested_virtualenv(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Code ZIPs should exclude mounted model assets and nested virtual environments."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    model_path = package_dir / "checkpoints" / "model.pth"
+    model_path.parent.mkdir()
+    model_path.write_bytes(b"package-model-weights")
+    venv_path = package_dir / ".venv" / "lib" / "site-packages" / "ignored.py"
+    venv_path.parent.mkdir(parents=True)
+    venv_path.write_text("raise RuntimeError('must not ship')\n", encoding="utf-8")
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="remote",
+        sync_custom_nodes=True,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    bundle = engine.sync_custom_nodes_directory()
+
+    assert bundle is not None
+    manifest_path = settings.local_storage_root / bundle.remote_path.lstrip("/")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["version"] == 2
+    [entry] = manifest["entries"]
+    [asset] = entry["assets"]
+    assert asset["relative_path"] == "example/checkpoints/model.pth"
+    assert asset["size_bytes"] == len(b"package-model-weights")
+    asset_path = settings.local_storage_root / asset["remote_path"].lstrip("/")
+    assert asset_path.read_bytes() == b"package-model-weights"
+
+    archive_path = settings.local_storage_root / entry["remote_path"].lstrip("/")
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        archived_names = archive.namelist()
+    assert "example/__init__.py" in archived_names
+    assert "example/checkpoints/model.pth" not in archived_names
+    assert not any(".venv" in name for name in archived_names)
 
 
 def test_sync_file_reuses_sync_index_record_for_existing_remote_payload(

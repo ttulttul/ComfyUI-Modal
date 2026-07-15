@@ -42,6 +42,20 @@ _SKIP_FILE_SUFFIXES = {
     ".swp",
     ".tmp",
 }
+_CUSTOM_NODES_MANIFEST_VERSION = 2
+_CUSTOM_NODE_ASSET_SUFFIXES = frozenset(
+    {
+        ".bin",
+        ".ckpt",
+        ".engine",
+        ".gguf",
+        ".onnx",
+        ".pt",
+        ".pth",
+        ".safetensors",
+        ".vae",
+    }
+)
 
 try:
     import modal  # type: ignore
@@ -161,6 +175,29 @@ class _CustomNodesArchiveSyncResult:
     entry_name: str
     display_name: str
     sha256: str
+    remote_path: str
+    uploaded: bool
+
+
+@dataclass(frozen=True)
+class _CustomNodeAssetSpec:
+    """Describe one package-owned model asset excluded from a code archive."""
+
+    entry_name: str
+    local_path: Path
+    relative_path: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class _CustomNodeAssetSyncResult:
+    """Describe one content-addressed package asset and its upload result."""
+
+    entry_name: str
+    relative_path: str
+    sha256: str
+    size_bytes: int
     remote_path: str
     uploaded: bool
 
@@ -647,7 +684,7 @@ class ModalAssetSyncEngine:
             )
         remote_path = self._custom_nodes_manifest_remote_path(directory_hash)
 
-        archive_specs = self._custom_nodes_archive_specs(custom_nodes_dir)
+        archive_specs, asset_specs = self._custom_nodes_bundle_specs(custom_nodes_dir)
         if not archive_specs:
             logger.info("Custom_nodes directory %s contained no syncable files.", custom_nodes_dir)
             return None
@@ -659,20 +696,34 @@ class ModalAssetSyncEngine:
             ).exists()
             for archive_spec in archive_specs
         ):
-            _emit_sync_status(status_callback, "Packaging custom nodes ZIP for Modal")
-        _emit_sync_status(status_callback, "Uploading custom nodes ZIP to Modal")
+            _emit_sync_status(status_callback, "Packaging custom-node code for Modal")
+        _emit_sync_status(status_callback, "Uploading custom-node code and assets to Modal")
 
         archive_results = self._sync_custom_nodes_archives_parallel(
             custom_nodes_dir=custom_nodes_dir,
             archive_specs=archive_specs,
         )
-        uploaded = any(archive_result.uploaded for archive_result in archive_results)
+        asset_results = self._sync_custom_node_assets_parallel(asset_specs)
+        uploaded = any(
+            result.uploaded for result in [*archive_results, *asset_results]
+        )
+        assets_by_entry: dict[str, list[dict[str, Any]]] = {}
+        for asset_result in asset_results:
+            assets_by_entry.setdefault(asset_result.entry_name, []).append(
+                {
+                    "relative_path": asset_result.relative_path,
+                    "sha256": asset_result.sha256,
+                    "size_bytes": asset_result.size_bytes,
+                    "remote_path": asset_result.remote_path,
+                }
+            )
         manifest_entries = [
             {
                 "entry_name": archive_result.entry_name,
                 "display_name": archive_result.display_name,
                 "sha256": archive_result.sha256,
                 "remote_path": archive_result.remote_path,
+                "assets": assets_by_entry.get(archive_result.entry_name, []),
             }
             for archive_result in archive_results
         ]
@@ -689,7 +740,7 @@ class ModalAssetSyncEngine:
             manifest_path.write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": _CUSTOM_NODES_MANIFEST_VERSION,
                         "bundle_sha256": directory_hash,
                         "entries": manifest_entries,
                     },
@@ -703,7 +754,7 @@ class ModalAssetSyncEngine:
             remote_path=remote_path,
             sync_key=manifest_sync_key,
             source_description=str(custom_nodes_dir),
-            upload_status_message="Uploading custom nodes ZIP to Modal",
+            upload_status_message="Uploading custom-node manifest to Modal",
         )
         uploaded = uploaded or manifest_sync_result.uploaded
 
@@ -848,6 +899,44 @@ class ModalAssetSyncEngine:
             uploaded=entry_uploaded.uploaded,
         )
 
+    def _sync_custom_node_assets_parallel(
+        self,
+        asset_specs: list[_CustomNodeAssetSpec],
+    ) -> list[_CustomNodeAssetSyncResult]:
+        """Upload package-owned model assets without embedding them in code ZIPs."""
+        if not asset_specs:
+            return []
+        max_workers = min(len(asset_specs), _modal_volume_worker_count())
+        if max_workers <= 1:
+            return [self._sync_custom_node_asset_spec(spec) for spec in asset_specs]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(self._sync_custom_node_asset_spec, spec)
+                for spec in asset_specs
+            ]
+            return [future.result() for future in futures]
+
+    def _sync_custom_node_asset_spec(
+        self,
+        asset_spec: _CustomNodeAssetSpec,
+    ) -> _CustomNodeAssetSyncResult:
+        """Upload one package-owned model asset to its content-addressed path."""
+        remote_path = self._custom_nodes_asset_remote_path(asset_spec)
+        sync_result = self._sync_content_addressed_file(
+            local_path=asset_spec.local_path,
+            remote_path=remote_path,
+            sync_key=self._custom_nodes_asset_sync_index_key(asset_spec.sha256),
+            source_description=str(asset_spec.local_path),
+        )
+        return _CustomNodeAssetSyncResult(
+            entry_name=asset_spec.entry_name,
+            relative_path=asset_spec.relative_path,
+            sha256=asset_spec.sha256,
+            size_bytes=asset_spec.size_bytes,
+            remote_path=sync_result.remote_path,
+            uploaded=sync_result.uploaded,
+        )
+
     def _lookup_sync_record(self, sync_key: str) -> dict[str, Any] | None:
         """Return one normalized sync-index record when the key is present."""
         assert self.sync_index is not None
@@ -883,7 +972,10 @@ class ModalAssetSyncEngine:
 
     def _custom_nodes_manifest_sync_index_key(self, directory_hash: str) -> str:
         """Return the sync-index key for one whole-tree custom_nodes manifest digest."""
-        return f"{self._sync_index_scope_prefix()}:custom_nodes_manifest:{directory_hash}"
+        return (
+            f"{self._sync_index_scope_prefix()}:custom_nodes_manifest:"
+            f"v{_CUSTOM_NODES_MANIFEST_VERSION}:{directory_hash}"
+        )
 
     def _custom_nodes_entry_sync_index_key(self, entry_name: str, entry_hash: str) -> str:
         """Return the sync-index key for one top-level custom_nodes entry archive digest."""
@@ -891,6 +983,10 @@ class ModalAssetSyncEngine:
             f"{self._sync_index_scope_prefix()}:custom_nodes_entry:"
             f"{self._custom_nodes_entry_slug(entry_name)}:{entry_hash}"
         )
+
+    def _custom_nodes_asset_sync_index_key(self, asset_hash: str) -> str:
+        """Return the sync-index key for one package-owned model asset digest."""
+        return f"{self._sync_index_scope_prefix()}:custom_nodes_asset:{asset_hash}"
 
     def _sync_index_scope_prefix(self) -> str:
         """Return the active sync-index scope prefix for this storage backend."""
@@ -1145,18 +1241,28 @@ class ModalAssetSyncEngine:
         return (
             self.settings.local_storage_root
             / "custom_nodes_manifests"
-            / f"{directory_hash}_custom_nodes_bundle_manifest.json"
+            / f"{directory_hash}_custom_nodes_bundle_manifest_v{_CUSTOM_NODES_MANIFEST_VERSION}.json"
         )
 
     def _custom_nodes_manifest_remote_path(self, directory_hash: str) -> str:
         """Return the remote storage path for a whole-tree custom_nodes manifest."""
-        return f"/custom_nodes/manifests/{directory_hash}_custom_nodes_bundle_manifest.json"
+        return (
+            f"/custom_nodes/manifests/{directory_hash}_custom_nodes_bundle_"
+            f"manifest_v{_CUSTOM_NODES_MANIFEST_VERSION}.json"
+        )
 
     def _custom_nodes_archive_remote_path(self, entry_name: str, entry_hash: str) -> str:
         """Return the remote storage path for one content-addressed custom_nodes slice archive."""
         return (
             f"/custom_nodes/entries/{self._custom_nodes_entry_slug(entry_name)}/"
             f"{entry_hash}_{self.settings.custom_nodes_archive_name}"
+        )
+
+    def _custom_nodes_asset_remote_path(self, asset_spec: _CustomNodeAssetSpec) -> str:
+        """Return the content-addressed remote path for one custom-node model asset."""
+        return (
+            f"/custom_nodes/assets/{self._custom_nodes_entry_slug(asset_spec.entry_name)}/"
+            f"{asset_spec.sha256}_{asset_spec.local_path.name}"
         )
 
     def _custom_nodes_entry_slug(self, entry_name: str) -> str:
@@ -1167,11 +1273,15 @@ class ModalAssetSyncEngine:
             for character in normalized_name
         )
 
-    def _custom_nodes_archive_specs(self, custom_nodes_dir: Path) -> list[_CustomNodesArchiveSpec]:
-        """Return deterministic archive specs for each top-level custom_nodes payload slice."""
+    def _custom_nodes_bundle_specs(
+        self,
+        custom_nodes_dir: Path,
+    ) -> tuple[list[_CustomNodesArchiveSpec], list[_CustomNodeAssetSpec]]:
+        """Split custom-node source archives from package-owned model assets."""
         resolved_root = custom_nodes_dir.resolve()
         root_files: list[Path] = []
         archive_specs: list[_CustomNodesArchiveSpec] = []
+        asset_specs: list[_CustomNodeAssetSpec] = []
 
         for child in sorted(resolved_root.iterdir(), key=lambda item: item.name):
             if child.name in _SKIP_DIRS:
@@ -1182,34 +1292,90 @@ class ModalAssetSyncEngine:
                 root_files.append(child)
                 continue
             if child.is_dir():
-                files = sorted(
+                entry_files = sorted(
                     self._iter_files(child),
                     key=lambda item: item.relative_to(resolved_root).as_posix(),
                 )
-                if not files:
+                code_files, entry_assets = self._partition_custom_node_files(entry_files)
+                if not code_files:
                     continue
                 archive_specs.append(
                     _CustomNodesArchiveSpec(
                         entry_name=child.name,
                         display_name=child.name,
                         source_description=str(child),
-                        files=tuple(files),
-                        sha256=self._hash_directory(child),
+                        files=tuple(code_files),
+                        sha256=self._hash_file_group(resolved_root, code_files),
+                    )
+                )
+                asset_specs.extend(
+                    self._custom_node_asset_specs(
+                        resolved_root,
+                        child.name,
+                        entry_assets,
                     )
                 )
 
         if root_files:
+            code_files, root_assets = self._partition_custom_node_files(root_files)
+        else:
+            code_files, root_assets = [], []
+        if code_files:
             archive_specs.append(
                 _CustomNodesArchiveSpec(
                     entry_name="root_files",
                     display_name="root files",
                     source_description=str(resolved_root),
-                    files=tuple(root_files),
-                    sha256=self._hash_file_group(resolved_root, root_files),
+                    files=tuple(code_files),
+                    sha256=self._hash_file_group(resolved_root, code_files),
+                )
+            )
+            asset_specs.extend(
+                self._custom_node_asset_specs(
+                    resolved_root,
+                    "root_files",
+                    root_assets,
                 )
             )
 
+        return archive_specs, asset_specs
+
+    def _custom_nodes_archive_specs(self, custom_nodes_dir: Path) -> list[_CustomNodesArchiveSpec]:
+        """Return code-only archive specs for compatibility with existing callers."""
+        archive_specs, _ = self._custom_nodes_bundle_specs(custom_nodes_dir)
         return archive_specs
+
+    def _partition_custom_node_files(
+        self,
+        files: list[Path],
+    ) -> tuple[list[Path], list[Path]]:
+        """Partition custom-node files into code resources and mounted model assets."""
+        code_files: list[Path] = []
+        asset_files: list[Path] = []
+        for file_path in files:
+            if file_path.suffix.lower() in _CUSTOM_NODE_ASSET_SUFFIXES:
+                asset_files.append(file_path)
+            else:
+                code_files.append(file_path)
+        return code_files, asset_files
+
+    def _custom_node_asset_specs(
+        self,
+        custom_nodes_root: Path,
+        entry_name: str,
+        asset_files: list[Path],
+    ) -> list[_CustomNodeAssetSpec]:
+        """Build deterministic metadata for package-owned model assets."""
+        return [
+            _CustomNodeAssetSpec(
+                entry_name=entry_name,
+                local_path=asset_path,
+                relative_path=asset_path.relative_to(custom_nodes_root).as_posix(),
+                sha256=self._hash_file(asset_path),
+                size_bytes=asset_path.stat().st_size,
+            )
+            for asset_path in asset_files
+        ]
 
     def _directory_fingerprint(self, root: Path, files: list[Path]) -> str:
         """Return a metadata-only fingerprint for a directory tree."""

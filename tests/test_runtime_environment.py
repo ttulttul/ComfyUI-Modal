@@ -136,3 +136,31 @@ def test_runtime_identity_tracks_custom_node_requirements_but_ignores_payload_so
 
     assert source_changed.fingerprint == baseline.fingerprint
     assert dependency_changed.fingerprint != baseline.fingerprint
+
+
+def test_runtime_identity_ignores_comfyui_directories_outside_image_context(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Unshipped ComfyUI scratch source should not trigger a full app rebuild."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    runtime_package = comfyui_root / "comfy"
+    scratch_package = comfyui_root / "False"
+    repo_root.mkdir()
+    runtime_package.mkdir(parents=True)
+    scratch_package.mkdir(parents=True)
+    (repo_root / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+    runtime_source = runtime_package / "model_management.py"
+    scratch_source = scratch_package / "developer_copy.py"
+    runtime_source.write_text("VALUE = 1\n", encoding="utf-8")
+    scratch_source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    baseline = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+    scratch_source.write_text("VALUE = 2\n", encoding="utf-8")
+    scratch_changed = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+    runtime_source.write_text("VALUE = 2\n", encoding="utf-8")
+    runtime_changed = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+
+    assert scratch_changed.fingerprint == baseline.fingerprint
+    assert runtime_changed.fingerprint != scratch_changed.fingerprint

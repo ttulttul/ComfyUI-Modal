@@ -88,6 +88,52 @@ def test_cloud_invocation_offloads_large_result_and_retries_failures(
     assert object_store.get(completed_record.result_object) == serialized_outputs
 
 
+def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Streaming execution should batch worker writes into one consumer commit."""
+    invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
+    commit_thread_ids: list[int | None] = []
+    object_store = modal_cloud_module.FileDurableObjectStore(
+        tmp_path,
+        commit_callback=lambda: commit_thread_ids.append(threading.current_thread().ident),
+    )
+    serialized_outputs = modal_cloud_module.serialize_node_outputs(("large-result",))
+
+    def execute_node_locally(payload: Any, kwargs_payload: Any) -> bytes:
+        """Write worker-produced bridge state before returning the node result."""
+        del payload, kwargs_payload
+        object_store.put("bridge_outputs", b"bridge-result")
+        return serialized_outputs
+
+    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
+    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    monkeypatch.setattr(modal_cloud_module, "execute_node_locally", execute_node_locally)
+    monkeypatch.setenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", "1")
+    modal_cloud_module.get_settings.cache_clear()
+    consumer_thread_id = threading.current_thread().ident
+
+    try:
+        events = list(
+            modal_cloud_module._stream_remote_payload_events(
+                {"invocation_id": "RIV_stream", "component_id": "component-1"},
+                b"inputs",
+            )
+        )
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+
+    completed_record = invocation_store.get_record("RIV_stream")
+    assert events == [{"kind": "result", "outputs": serialized_outputs}]
+    assert completed_record.state == "completed"
+    assert completed_record.result_object is not None
+    assert object_store.get(completed_record.result_object) == serialized_outputs
+    assert commit_thread_ids == [consumer_thread_id]
+
+
 def test_cloud_invocation_rejects_duplicate_active_attempt(
     modal_cloud_module: Any,
     monkeypatch: pytest.MonkeyPatch,

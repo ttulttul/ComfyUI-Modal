@@ -58,8 +58,31 @@ _IGNORED_DIRECTORY_NAMES = frozenset(
         "__pycache__",
     }
 )
-_IGNORED_COMFYUI_TOP_LEVEL_DIRECTORIES = frozenset(
-    {"custom_nodes", "input", "models", "output", "temp", "user"}
+COMFYUI_RUNTIME_SOURCE_DIRECTORIES = frozenset(
+    {
+        "alembic_db",
+        "api_server",
+        "app",
+        "blueprints",
+        "comfy",
+        "comfy_api",
+        "comfy_api_nodes",
+        "comfy_config",
+        "comfy_execution",
+        "comfy_extras",
+        "middleware",
+        "utils",
+        "web",
+    }
+)
+COMFYUI_RUNTIME_SOURCE_FILES = frozenset(
+    {
+        "alembic.ini",
+        "manager_requirements.txt",
+        "pyproject.toml",
+        "requirements.txt",
+        "uv.lock",
+    }
 )
 
 
@@ -194,6 +217,7 @@ def _tree_digest(
     included_suffixes: frozenset[str],
     included_names: frozenset[str] = frozenset(),
     ignored_top_level_directories: frozenset[str] = frozenset(),
+    included_top_level_directories: frozenset[str] | None = None,
 ) -> str:
     """Hash the selected files in one directory tree using stable relative paths."""
     if root is None or not root.is_dir():
@@ -211,6 +235,11 @@ def _tree_digest(
             and not (
                 relative_directory == Path(".")
                 and directory_name in ignored_top_level_directories
+            )
+            and not (
+                relative_directory == Path(".")
+                and included_top_level_directories is not None
+                and directory_name not in included_top_level_directories
             )
         )
         for file_name in sorted(file_names):
@@ -277,8 +306,8 @@ def build_remote_runtime_identity(
         "comfyui_source_digest": _tree_digest(
             comfyui_root,
             included_suffixes=frozenset({".py"}),
-            included_names=frozenset({"pyproject.toml", "requirements.txt", "uv.lock"}),
-            ignored_top_level_directories=_IGNORED_COMFYUI_TOP_LEVEL_DIRECTORIES,
+            included_names=COMFYUI_RUNTIME_SOURCE_FILES,
+            included_top_level_directories=COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
         ),
         "runtime_options": _runtime_options(settings),
     }

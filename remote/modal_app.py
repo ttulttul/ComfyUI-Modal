@@ -1248,11 +1248,20 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
         logger.warning("Custom nodes bundle %s was not found in local storage.", local_bundle)
         return
 
-    extraction_root = Path(tempfile.gettempdir()) / "comfy-modal-sync-custom-nodes"
+    extraction_root = (
+        Path(tempfile.gettempdir())
+        / "comfy-modal-sync-custom-nodes"
+        / local_bundle.stem
+    )
     extraction_root.mkdir(parents=True, exist_ok=True)
     for archive_path in _resolve_local_custom_nodes_archives(local_bundle, settings.local_storage_root):
         with zipfile.ZipFile(archive_path, "r") as archive:
             archive.extractall(extraction_root)
+    _materialize_local_custom_node_assets(
+        local_bundle,
+        settings.local_storage_root,
+        extraction_root,
+    )
 
     if str(extraction_root) not in sys.path:
         sys.path.insert(0, str(extraction_root))
@@ -1268,12 +1277,7 @@ def _resolve_local_custom_nodes_archives(local_bundle: Path, storage_root: Path)
             f"Unsupported custom_nodes bundle format {local_bundle.suffix!r} for {local_bundle}."
         )
 
-    try:
-        manifest_payload = json.loads(local_bundle.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} is unreadable.") from exc
-    if not isinstance(manifest_payload, dict):
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} must be a JSON object.")
+    manifest_payload = _load_local_custom_nodes_manifest(local_bundle)
     entry_payloads = manifest_payload.get("entries")
     if not isinstance(entry_payloads, list):
         raise RuntimeError(f"Custom nodes manifest {local_bundle} did not contain a valid entries list.")
@@ -1292,6 +1296,90 @@ def _resolve_local_custom_nodes_archives(local_bundle: Path, storage_root: Path)
             )
         archive_paths.append(archive_path)
     return archive_paths
+
+
+def _load_local_custom_nodes_manifest(local_bundle: Path) -> dict[str, Any]:
+    """Load and validate one local custom-node bundle manifest."""
+    try:
+        manifest_payload = json.loads(local_bundle.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} is unreadable.") from exc
+    if not isinstance(manifest_payload, dict):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} must be a JSON object.")
+    if manifest_payload.get("version", 1) not in {1, 2}:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} has an unsupported version.")
+    return manifest_payload
+
+
+def _materialize_local_custom_node_assets(
+    local_bundle: Path,
+    storage_root: Path,
+    extraction_root: Path,
+) -> None:
+    """Link version-two package assets into the local fallback extraction tree."""
+    if local_bundle.suffix.lower() != ".json":
+        return
+    manifest_payload = _load_local_custom_nodes_manifest(local_bundle)
+    if manifest_payload.get("version", 1) < 2:
+        return
+    for asset_payload in _iter_local_custom_node_assets(local_bundle, manifest_payload):
+        relative_path = _validated_local_custom_node_asset_path(local_bundle, asset_payload)
+        source_path = storage_root / str(asset_payload["remote_path"]).lstrip("/")
+        if not source_path.is_file():
+            raise RuntimeError(f"Custom-node asset {source_path} was not found in local storage.")
+        if source_path.stat().st_size != int(asset_payload["size_bytes"]):
+            raise RuntimeError(f"Custom-node asset {source_path} size did not match its manifest.")
+        destination = extraction_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() and destination.resolve() == source_path.resolve():
+                continue
+            raise RuntimeError(f"Custom-node asset destination {destination} already exists.")
+        destination.symlink_to(source_path)
+
+
+def _iter_local_custom_node_assets(
+    local_bundle: Path,
+    manifest_payload: Mapping[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """Yield asset objects from one validated version-two local manifest."""
+    entries = manifest_payload.get("entries")
+    if not isinstance(entries, list):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} has no valid entries list.")
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("assets", []), list):
+            raise RuntimeError(f"Custom nodes manifest {local_bundle} contains invalid assets.")
+        for asset_payload in entry.get("assets", []):
+            if not isinstance(asset_payload, dict):
+                raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset.")
+            yield asset_payload
+
+
+def _validated_local_custom_node_asset_path(
+    local_bundle: Path,
+    asset_payload: Mapping[str, Any],
+) -> Path:
+    """Return one safe local extraction-relative package asset path."""
+    relative_path = asset_payload.get("relative_path")
+    remote_path = asset_payload.get("remote_path")
+    sha256 = asset_payload.get("sha256")
+    size_bytes = asset_payload.get("size_bytes")
+    if not isinstance(relative_path, str) or not relative_path:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an asset without a path.")
+    if not isinstance(remote_path, str) or not remote_path:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an asset without storage.")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or not Path(remote_path).name.startswith(f"{sha256}_")
+    ):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset digest.")
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset size.")
+    normalized_path = Path(relative_path)
+    if normalized_path.is_absolute() or ".." in normalized_path.parts:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an unsafe asset path.")
+    return normalized_path
 
 
 def _load_nodes_module() -> Any:
