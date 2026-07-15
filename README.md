@@ -183,7 +183,7 @@ When a synced top-level custom-node package has a `requirements.txt`, those requ
 
 Warm workers call `vol.reload()` only for uploaded mounted-volume paths that the current payload can reference. Reload markers are deduped across one queued workflow so multiple components do not repeatedly reload the same asset snapshot.
 
-Durable bridge objects and oversized invocation results share one content-addressed object store. Writes produced during one invocation are committed to the Modal volume as one completion batch on the stream-owning request lifecycle, before completed invocation metadata is published for retry replay.
+Durable bridge objects and oversized invocation results share one content-addressed object store. Writes produced during one invocation are committed to the Modal volume as one completion batch on the stream-owning request lifecycle, before completed invocation metadata is published for retry replay. When a warm worker's mounted snapshot predates an object produced by another worker, Modal-Sync reads that committed object directly through `Volume.read_file()` instead of reloading the mount and disturbing memory-mapped model files.
 
 ## Configuration
 
