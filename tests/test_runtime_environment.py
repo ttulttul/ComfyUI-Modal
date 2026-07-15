@@ -25,6 +25,7 @@ def _runtime_settings(**overrides: Any) -> SimpleNamespace:
         "session_bridge_dict_name": "comfy-modal-sync-session-bridges",
         "snapshot_profile_dict_name": "comfy-modal-sync-snapshot-profiles",
         "startup_timeout_seconds": 900,
+        "stream_event_queue_maxsize": 256,
         "sync_index_dict_name": "comfy-modal-sync-sync-index",
         "volume_name": "comfy-universal-storage",
     }

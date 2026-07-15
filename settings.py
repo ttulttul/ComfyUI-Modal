@@ -48,6 +48,7 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
     "COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS",
     "COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS",
+    "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE",
     "COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS",
 )
 
@@ -91,6 +92,7 @@ class ModalSyncSettings:
     proactive_warmup_head_start_seconds: float = 2.0
     remote_cancel_grace_seconds: float = 2.0
     remote_cancel_restart_seconds: float = 1.0
+    stream_event_queue_maxsize: int = 256
     stream_remote_container_logs: bool = False
 
 
@@ -297,6 +299,10 @@ def _get_settings_cached(
         remote_cancel_restart_seconds=_read_float_env(
             "COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS",
             1.0,
+        ),
+        stream_event_queue_maxsize=max(
+            4,
+            _read_int_env("COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE", 256),
         ),
         stream_remote_container_logs=_read_bool_env("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS")
         or False,
