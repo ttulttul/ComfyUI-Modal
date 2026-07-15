@@ -1664,6 +1664,37 @@ def test_modal_cloud_streams_tensor_safe_progress_and_result_events(
     assert torch.equal(decoded_outputs[0], tensor)
 
 
+def test_modal_cloud_stream_buffer_coalesces_progress_and_preserves_terminal_events(
+    modal_cloud_module: Any,
+) -> None:
+    """A slow stream consumer should have bounded progress memory without losing results."""
+    event_buffer = modal_cloud_module._BoundedStreamEventBuffer(maxsize=4)
+    for value in range(100):
+        event_buffer.publish_progress({"value": value})
+
+    terminal_thread = threading.Thread(
+        target=lambda: (
+            event_buffer.publish_terminal("result", b"outputs"),
+            event_buffer.publish_terminal("done", None),
+        )
+    )
+    terminal_thread.start()
+    observed_events: list[tuple[str, Any]] = []
+    while True:
+        event = event_buffer.get()
+        observed_events.append(event)
+        if event[0] == "done":
+            break
+    terminal_thread.join(timeout=1.0)
+    event_buffer.close()
+
+    progress_values = [payload["value"] for kind, payload in observed_events if kind == "progress"]
+    assert progress_values == [96, 97, 98, 99]
+    assert observed_events[-2:] == [("result", b"outputs"), ("done", None)]
+    assert event_buffer.dropped_progress_events == 96
+    assert not terminal_thread.is_alive()
+
+
 def test_modal_cloud_only_reloads_volume_for_requests_with_new_uploads(
     modal_cloud_module: Any,
 ) -> None:

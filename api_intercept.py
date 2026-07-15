@@ -24,7 +24,13 @@ from .modal_executor_node import (
 )
 from .session_state import RemoteSessionHandle
 from .settings import ModalSyncSettings, get_settings
-from .sync_engine import ModalAssetSyncEngine, ModalVolumeBackend, SyncedAsset, modal
+from .sync_engine import (
+    AssetSyncRequestCache,
+    ModalAssetSyncEngine,
+    ModalVolumeBackend,
+    SyncedAsset,
+    modal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2578,6 +2584,7 @@ def _sync_component_prompt_inputs(
     component: RemoteComponentPlan,
     rewritten_prompt: dict[str, Any],
     sync_engine: ModalAssetSyncEngine,
+    request_cache: AssetSyncRequestCache,
     status_callback: Any | None = None,
 ) -> tuple[dict[str, Any], list[SyncedAsset]]:
     """Build a synced prompt payload for one remote component."""
@@ -2593,6 +2600,7 @@ def _sync_component_prompt_inputs(
         synced_inputs, node_assets = sync_engine.sync_prompt_inputs(
             copy.deepcopy(prompt_node.get("inputs", {})),
             status_callback=status_callback,
+            request_cache=request_cache,
         )
         synced_assets.extend(node_assets)
         component_prompt[node_id] = {
@@ -2612,6 +2620,14 @@ def _sync_component_prompt_inputs(
         len(synced_assets),
     )
     return component_prompt, synced_assets
+
+
+def _deduplicate_synced_assets(synced_assets: list[SyncedAsset]) -> list[SyncedAsset]:
+    """Return one request summary record per content-addressed remote path."""
+    unique_assets_by_remote_path: dict[str, SyncedAsset] = {}
+    for synced_asset in synced_assets:
+        unique_assets_by_remote_path.setdefault(synced_asset.remote_path, synced_asset)
+    return list(unique_assets_by_remote_path.values())
 
 
 def _build_component_payload(
@@ -3554,16 +3570,24 @@ def rewrite_prompt_for_modal(
 
     synced_component_prompts: dict[str, dict[str, Any]] = {}
     synced_assets_by_component_id: dict[str, list[SyncedAsset]] = {}
+    request_asset_cache = resolved_sync_engine.create_request_asset_cache(
+        rewritten_prompt[node_id].get("inputs", {})
+        for component in components
+        for node_id in component.node_ids
+    )
     for component in components:
         component_prompt, synced_assets = _sync_component_prompt_inputs(
             component=component,
             rewritten_prompt=rewritten_prompt,
             sync_engine=resolved_sync_engine,
+            request_cache=request_asset_cache,
             status_callback=status_callback,
         )
         synced_component_prompts[component.representative_node_id] = component_prompt
         synced_assets_by_component_id[component.representative_node_id] = list(synced_assets)
         summary.synced_assets.extend(synced_assets)
+
+    summary.synced_assets = _deduplicate_synced_assets(summary.synced_assets)
 
     requires_volume_reload = any(asset.uploaded for asset in summary.synced_assets) or (
         summary.custom_nodes_bundle is not None and summary.custom_nodes_bundle.uploaded

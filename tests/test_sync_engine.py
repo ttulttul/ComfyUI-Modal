@@ -51,6 +51,62 @@ def test_sync_file_deduplicates_by_hash(
     assert first.remote_path in sync_index_path.read_text(encoding="utf-8")
 
 
+def test_request_asset_cache_syncs_repeated_prompt_asset_once(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Repeated references across remote nodes should share one request sync decision."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"model-bytes")
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    sync_calls: list[Path] = []
+    original_sync_file = engine.sync_file
+
+    def recording_sync_file(local_path: Path, *args: Any, **kwargs: Any) -> Any:
+        """Record actual request sync decisions before delegating."""
+        sync_calls.append(local_path.resolve())
+        return original_sync_file(local_path, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "sync_file", recording_sync_file)
+    request_cache = engine.create_request_asset_cache(
+        ({"model": str(asset_path)}, {"second_model": str(asset_path)})
+    )
+
+    first_inputs, first_assets = engine.sync_prompt_inputs(
+        {"model": str(asset_path)},
+        request_cache=request_cache,
+    )
+    second_inputs, second_assets = engine.sync_prompt_inputs(
+        {"second_model": str(asset_path)},
+        request_cache=request_cache,
+    )
+
+    assert sync_calls == [asset_path.resolve()]
+    assert first_inputs["model"] == second_inputs["second_model"]
+    assert first_assets == second_assets
+    assert request_cache.synced_assets() == (first_assets[0],)
+
+
 def test_sync_file_emits_upload_status(
     settings_module: Any,
     sync_engine_module: Any,

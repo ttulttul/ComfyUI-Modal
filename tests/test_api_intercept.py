@@ -1754,8 +1754,10 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
         component: Any,
         rewritten_prompt: dict[str, Any],
         sync_engine: Any,
+        request_cache: Any,
         status_callback: Any = None,
     ) -> tuple[dict[str, Any], list[Any]]:
+        del sync_engine, request_cache, status_callback
         if component.representative_node_id == "1":
             return {"1": rewritten_prompt["1"]}, []
         return {

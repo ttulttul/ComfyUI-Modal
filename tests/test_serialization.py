@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -35,6 +36,47 @@ def test_tensor_round_trip(serialization_module: Any) -> None:
 
     assert len(decoded) == 1
     assert torch.equal(decoded[0], tensor)
+
+
+def test_tensor_transport_uses_raw_binary_attachments(serialization_module: Any) -> None:
+    """Tensor transport should avoid base64's one-third payload expansion."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(256 * 1024, dtype=torch.float32)
+
+    encoded = serialization_module.serialize_node_inputs({"tensor": tensor})
+    legacy_json = json.dumps(
+        serialization_module.serialize_mapping({"tensor": tensor}),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert encoded.startswith(serialization_module._BINARY_ENVELOPE_MAGIC)
+    assert len(encoded) < len(legacy_json) * 0.8
+    assert torch.equal(
+        serialization_module.deserialize_node_inputs(encoded)["tensor"],
+        tensor,
+    )
+
+
+def test_binary_transport_keeps_legacy_json_compatibility(serialization_module: Any) -> None:
+    """New readers should continue to accept already-deployed JSON/base64 payloads."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(8, dtype=torch.float32)
+    legacy_payload = json.dumps(
+        serialization_module.serialize_mapping({"tensor": tensor, "bytes": b"abc"})
+    ).encode("utf-8")
+
+    decoded = serialization_module.deserialize_node_inputs(legacy_payload)
+
+    assert torch.equal(decoded["tensor"], tensor)
+    assert decoded["bytes"] == b"abc"
+
+
+def test_binary_transport_rejects_truncated_attachments(serialization_module: Any) -> None:
+    """A partial Modal payload should fail explicitly instead of decoding corrupted data."""
+    encoded = serialization_module.serialize_node_inputs({"bytes": b"abcdef"})
+
+    with pytest.raises(ValueError, match="truncated inside an attachment"):
+        serialization_module.deserialize_node_inputs(encoded[:-1])
 
 
 def test_serialize_mapping_supports_nested_tensors(serialization_module: Any) -> None:

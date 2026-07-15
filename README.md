@@ -156,6 +156,8 @@ Split proxies and mapped phases use prompt-scoped remote sessions for live non-t
 
 Remote subgraph runs can persist transport-safe node outputs into a shared Modal `Dict` using ComfyUI input-signature semantics. The cache skips non-serializable outputs and entries above the configured size cap.
 
+Tensor and byte boundary values use a versioned binary envelope, so safetensors bytes cross Modal directly instead of expanding through base64 JSON. Readers remain compatible with legacy JSON payloads during deployment replacement. Streamed progress uses a bounded queue that coalesces stale progress when a consumer falls behind while preserving result, error, and completion events.
+
 Cancellation uses a shared Modal `Dict` control store plus local polling of ComfyUI cancellation. Remote workers retire themselves after poisoned CUDA/runtime failures or stuck cancellation, while deterministic prompt and custom-node errors preserve healthy warm workers.
 
 ## Asset And Custom Node Sync
@@ -170,6 +172,8 @@ The sync engine automatically looks for inputs that resolve to files ending in:
 Absolute paths and model names resolvable through ComfyUI `folder_paths` work. Arbitrary unresolved strings do not sync. If a remote-marked node depends on a model filename that cannot be resolved locally, prompt queueing fails instead of sending a broken remote request.
 
 In remote mode, assets and custom-node archives are uploaded into the configured Modal volume. In local mode, the default backend is a local mirror used for development and tests.
+
+Asset paths are planned once per queued prompt. Repeated references across nodes or remote components share one hash, sync-index lookup, and upload decision while every component still receives the same content-addressed remote path and reload metadata.
 
 Custom-node sync is enabled by default in remote mode and disabled by default in local mode. When enabled, Modal-Sync packages `custom_nodes/` as a whole-tree manifest plus content-addressed archives for each top-level custom-node package. Unchanged package digests are reused through a Modal `Dict` sync index instead of probing the volume for many marker files.
 
@@ -236,6 +240,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_MAX_INFLIGHT_CALLS` | `4` | Maximum local Modal calls dispatched at once; mapped fan-out is clamped to this budget. |
 | `COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS` | `3600` | Maximum runtime for one Modal workflow call. |
 | `COMFY_MODAL_STARTUP_TIMEOUT_SECONDS` | `900` | Maximum Modal container startup and snapshot-restore time. |
+| `COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE` | `256` | Maximum buffered remote progress/result envelopes; stale progress is coalesced when full. |
 | `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP` | `true` | Start background warmup from runtime parallelism signals such as mapped fan-out. |
 | `COMFY_MODAL_ENABLE_LOADER_PREWARM` | `true` | During warmup, execute synthetic loader prompts for root literal model-loader nodes. |
 | `COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS` | `2.0` | Bounded wait for exact mapped warmup slots before lane seeding starts. |

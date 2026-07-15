@@ -14,7 +14,7 @@ import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from .settings import ModalSyncSettings, get_settings
 
@@ -104,6 +104,43 @@ class SyncedAsset:
     remote_path: str
     sha256: str
     uploaded: bool
+
+
+@dataclass
+class AssetSyncRequestCache:
+    """Deduplicate asset hashing, index lookup, and upload within one queued prompt."""
+
+    planned_paths: tuple[Path, ...]
+    _assets_by_path: dict[Path, SyncedAsset] = field(default_factory=dict)
+    _positions_by_path: dict[Path, int] = field(init=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Index stable request progress positions once."""
+        self._positions_by_path = {
+            path.resolve(): index
+            for index, path in enumerate(self.planned_paths, start=1)
+        }
+
+    def get(self, local_path: Path) -> SyncedAsset | None:
+        """Return a previously synced asset for this request when available."""
+        return self._assets_by_path.get(local_path.resolve())
+
+    def put(self, synced_asset: SyncedAsset) -> None:
+        """Remember one request-scoped sync result by its resolved local path."""
+        self._assets_by_path[synced_asset.local_path.resolve()] = synced_asset
+
+    def progress(self, local_path: Path) -> tuple[int, int]:
+        """Return the stable one-based progress position for a planned asset."""
+        resolved_path = local_path.resolve()
+        return self._positions_by_path[resolved_path], len(self.planned_paths)
+
+    def synced_assets(self) -> tuple[SyncedAsset, ...]:
+        """Return unique sync results in request planning order."""
+        return tuple(
+            self._assets_by_path[path]
+            for path in self.planned_paths
+            if path in self._assets_by_path
+        )
 
 
 @dataclass(frozen=True)
@@ -485,6 +522,7 @@ class ModalAssetSyncEngine:
         inputs: dict[str, Any],
         *,
         status_callback: SyncStatusCallback | None = None,
+        request_cache: AssetSyncRequestCache | None = None,
     ) -> tuple[dict[str, Any], list[SyncedAsset]]:
         """Rewrite file-like prompt inputs to mirrored storage paths."""
         synced_assets: list[SyncedAsset] = []
@@ -498,13 +536,24 @@ class ModalAssetSyncEngine:
             if isinstance(value, str):
                 maybe_path = self._resolve_model_path(value)
                 if maybe_path is not None:
-                    syncable_asset_index += 1
+                    cached_asset = request_cache.get(maybe_path) if request_cache is not None else None
+                    if cached_asset is not None:
+                        synced_assets.append(cached_asset)
+                        return cached_asset.remote_path
+                    if request_cache is None:
+                        syncable_asset_index += 1
+                        item_index = syncable_asset_index
+                        total_items = len(syncable_asset_paths)
+                    else:
+                        item_index, total_items = request_cache.progress(maybe_path)
                     synced_asset = self.sync_file(
                         maybe_path,
                         status_callback=status_callback,
-                        item_index=syncable_asset_index,
-                        total_items=len(syncable_asset_paths),
+                        item_index=item_index,
+                        total_items=total_items,
                     )
+                    if request_cache is not None:
+                        request_cache.put(synced_asset)
                     synced_assets.append(synced_asset)
                     return synced_asset.remote_path
                 return value
@@ -521,6 +570,17 @@ class ModalAssetSyncEngine:
             len(synced_assets),
         )
         return rewritten_inputs, synced_assets
+
+    def create_request_asset_cache(
+        self,
+        prompt_input_values: Iterable[Any],
+    ) -> AssetSyncRequestCache:
+        """Plan unique syncable assets for one queued prompt in stable encounter order."""
+        unique_paths: dict[Path, None] = {}
+        for prompt_input_value in prompt_input_values:
+            for local_path in self._collect_syncable_asset_paths(prompt_input_value):
+                unique_paths.setdefault(local_path.resolve(), None)
+        return AssetSyncRequestCache(planned_paths=tuple(unique_paths))
 
     def sync_custom_nodes_directory(
         self,

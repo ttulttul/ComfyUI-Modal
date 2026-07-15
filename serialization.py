@@ -6,6 +6,7 @@ import base64
 import copy
 import json
 import logging
+import struct
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -18,6 +19,10 @@ _BYTES_KIND = "bytes"
 _TUPLE_KIND = "tuple"
 _MAPPED_OUTPUT_KIND = "mapped_output"
 _BATCHABLE_TENSOR_IO_TYPES = frozenset({"IMAGE", "MASK", "NOISE", "SIGMAS"})
+_BINARY_ENVELOPE_MAGIC = b"CMODALB1"
+_BINARY_ENVELOPE_VERSION = 1
+_BINARY_HEADER_LENGTH_BYTES = 8
+_MAX_BINARY_HEADER_BYTES = 16 * 1024 * 1024
 
 
 class MappedOutputValue(list[Any]):
@@ -87,6 +92,23 @@ def _deserialize_tensor(payload: Mapping[str, Any]) -> Any:
     encoded = payload["payload"]
     tensor_map = load(base64.b64decode(encoded.encode("ascii")))
     return tensor_map[_VALUE_KEY]
+
+
+def _serialize_tensor_bytes(value: Any) -> bytes:
+    """Serialize a tensor directly to safetensors bytes without base64 expansion."""
+    from safetensors.torch import save
+
+    torch = _import_torch()
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("Expected a torch.Tensor payload.")
+    return save({_VALUE_KEY: value.detach().contiguous()})
+
+
+def _deserialize_tensor_bytes(payload: bytes) -> Any:
+    """Deserialize direct safetensors bytes back into a tensor."""
+    from safetensors.torch import load
+
+    return load(payload)[_VALUE_KEY]
 
 
 def serialize_value(value: Any) -> Any:
@@ -169,30 +191,206 @@ def deserialize_value(payload: Any) -> Any:
     return {str(key): deserialize_value(value) for key, value in payload.items()}
 
 
+def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
+    """Convert one value into JSON metadata plus raw binary attachments."""
+    if _is_scalar(value):
+        return value
+
+    if isinstance(value, MappedOutputValue):
+        return {
+            _KIND_KEY: _MAPPED_OUTPUT_KIND,
+            "items": [_serialize_transport_value(item, attachments) for item in value.items],
+            "io_type": value.io_type,
+            "is_list": value.is_list,
+        }
+
+    try:
+        torch = _import_torch()
+    except ModuleNotFoundError:
+        torch = None
+
+    if torch is not None and isinstance(value, torch.Tensor):
+        attachment_index = len(attachments)
+        attachments.append(_serialize_tensor_bytes(value))
+        return {_KIND_KEY: _TENSOR_KIND, "attachment": attachment_index}
+
+    if isinstance(value, bytes):
+        attachment_index = len(attachments)
+        attachments.append(value)
+        return {_KIND_KEY: _BYTES_KIND, "attachment": attachment_index}
+
+    if isinstance(value, tuple):
+        return {
+            _KIND_KEY: _TUPLE_KIND,
+            "items": [_serialize_transport_value(item, attachments) for item in value],
+        }
+
+    if isinstance(value, list):
+        return [_serialize_transport_value(item, attachments) for item in value]
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _serialize_transport_value(item, attachments)
+            for key, item in value.items()
+        }
+
+    raise TypeError(
+        "ComfyUI-Modal can only serialize JSON-compatible values, bytes, "
+        "and torch tensors. Unsupported value type: "
+        f"{type(value)!r}"
+    )
+
+
+def _serialize_transport_payload(value: Any, *, sort_keys: bool) -> bytes:
+    """Serialize one transport payload, using raw attachments when needed."""
+    attachments: list[bytes] = []
+    metadata = _serialize_transport_value(value, attachments)
+    if not attachments:
+        return json.dumps(metadata, sort_keys=sort_keys).encode("utf-8")
+
+    header = json.dumps(
+        {
+            "version": _BINARY_ENVELOPE_VERSION,
+            "payload": metadata,
+            "attachment_lengths": [len(attachment) for attachment in attachments],
+        },
+        sort_keys=sort_keys,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return b"".join(
+        (
+            _BINARY_ENVELOPE_MAGIC,
+            struct.pack(">Q", len(header)),
+            header,
+            *attachments,
+        )
+    )
+
+
+def _deserialize_transport_value(payload: Any, attachments: tuple[bytes, ...]) -> Any:
+    """Reconstruct one value from metadata and binary attachments."""
+    if _is_scalar(payload):
+        return payload
+    if isinstance(payload, list):
+        return [_deserialize_transport_value(item, attachments) for item in payload]
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"Unsupported payload type: {type(payload)!r}")
+
+    kind = payload.get(_KIND_KEY)
+    attachment_index = payload.get("attachment")
+    if kind in {_TENSOR_KIND, _BYTES_KIND} and attachment_index is not None:
+        if isinstance(attachment_index, bool) or not isinstance(attachment_index, int):
+            raise ValueError("Binary attachment indices must be integers.")
+        if attachment_index < 0 or attachment_index >= len(attachments):
+            raise ValueError(f"Binary attachment index {attachment_index} is out of range.")
+        attachment = attachments[attachment_index]
+        if kind == _TENSOR_KIND:
+            return _deserialize_tensor_bytes(attachment)
+        return attachment
+    if kind == _TENSOR_KIND:
+        return _deserialize_tensor(payload)
+    if kind == _BYTES_KIND:
+        encoded = payload["payload"]
+        return base64.b64decode(encoded.encode("ascii"))
+    if kind == _TUPLE_KIND:
+        return tuple(
+            _deserialize_transport_value(item, attachments)
+            for item in payload["items"]
+        )
+    if kind == _MAPPED_OUTPUT_KIND:
+        return MappedOutputValue(
+            items=tuple(
+                _deserialize_transport_value(item, attachments)
+                for item in payload["items"]
+            ),
+            io_type=str(payload.get("io_type", "*")),
+            is_list=bool(payload.get("is_list", False)),
+        )
+    return {
+        str(key): _deserialize_transport_value(value, attachments)
+        for key, value in payload.items()
+    }
+
+
+def _deserialize_binary_envelope(payload: bytes) -> tuple[Any, tuple[bytes, ...]]:
+    """Parse one validated binary transport envelope."""
+    length_offset = len(_BINARY_ENVELOPE_MAGIC)
+    header_offset = length_offset + _BINARY_HEADER_LENGTH_BYTES
+    if len(payload) < header_offset:
+        raise ValueError("Binary transport envelope is truncated before its header.")
+    header_length = struct.unpack(">Q", payload[length_offset:header_offset])[0]
+    if header_length > _MAX_BINARY_HEADER_BYTES:
+        raise ValueError(
+            f"Binary transport header exceeds {_MAX_BINARY_HEADER_BYTES} bytes."
+        )
+    attachment_offset = header_offset + header_length
+    if attachment_offset > len(payload):
+        raise ValueError("Binary transport envelope is truncated inside its header.")
+    try:
+        header = json.loads(payload[header_offset:attachment_offset].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Binary transport envelope header is invalid JSON.") from exc
+    if not isinstance(header, Mapping):
+        raise ValueError("Binary transport envelope header must be a mapping.")
+    if header.get("version") != _BINARY_ENVELOPE_VERSION:
+        raise ValueError(f"Unsupported binary transport version {header.get('version')!r}.")
+    attachment_lengths = header.get("attachment_lengths")
+    if not isinstance(attachment_lengths, list):
+        raise ValueError("Binary transport envelope is missing attachment lengths.")
+
+    attachments: list[bytes] = []
+    next_offset = attachment_offset
+    for attachment_length in attachment_lengths:
+        if (
+            isinstance(attachment_length, bool)
+            or not isinstance(attachment_length, int)
+            or attachment_length < 0
+        ):
+            raise ValueError("Binary attachment lengths must be non-negative integers.")
+        next_attachment_offset = next_offset + attachment_length
+        if next_attachment_offset > len(payload):
+            raise ValueError("Binary transport envelope is truncated inside an attachment.")
+        attachments.append(bytes(memoryview(payload)[next_offset:next_attachment_offset]))
+        next_offset = next_attachment_offset
+    if next_offset != len(payload):
+        raise ValueError("Binary transport envelope contains trailing bytes.")
+    return header.get("payload"), tuple(attachments)
+
+
+def _deserialize_transport_payload(payload: bytes | bytearray | str) -> tuple[Any, tuple[bytes, ...]]:
+    """Decode either the binary transport or the legacy JSON representation."""
+    if isinstance(payload, str):
+        return json.loads(payload), ()
+    normalized_payload = bytes(payload)
+    if normalized_payload.startswith(_BINARY_ENVELOPE_MAGIC):
+        return _deserialize_binary_envelope(normalized_payload)
+    return json.loads(normalized_payload.decode("utf-8")), ()
+
+
 def serialize_node_inputs(inputs: Mapping[str, Any]) -> bytes:
     """Serialize node keyword arguments into transport bytes."""
-    payload = serialize_mapping(inputs)
-    return json.dumps(payload, sort_keys=True).encode("utf-8")
+    return _serialize_transport_payload(dict(inputs), sort_keys=True)
 
 
 def deserialize_node_inputs(payload: bytes | bytearray | str | Mapping[str, Any]) -> dict[str, Any]:
     """Deserialize node keyword arguments from transport bytes."""
     if isinstance(payload, Mapping):
         raw_payload = dict(payload)
+        attachments: tuple[bytes, ...] = ()
     else:
-        if isinstance(payload, (bytes, bytearray)):
-            payload = payload.decode("utf-8")
-        raw_payload = json.loads(payload)
+        raw_payload, attachments = _deserialize_transport_payload(payload)
 
     if not isinstance(raw_payload, Mapping):
         raise TypeError("Serialized node inputs must decode to a mapping.")
-    return {str(key): deserialize_value(value) for key, value in raw_payload.items()}
+    return {
+        str(key): _deserialize_transport_value(value, attachments)
+        for key, value in raw_payload.items()
+    }
 
 
 def serialize_node_outputs(outputs: Sequence[Any]) -> bytes:
     """Serialize node outputs into transport bytes."""
-    payload = [serialize_value(value) for value in outputs]
-    return json.dumps(payload).encode("utf-8")
+    return _serialize_transport_payload(list(outputs), sort_keys=False)
 
 
 def coerce_serialized_node_outputs(outputs: bytes | bytearray | str | Sequence[Any] | Any) -> bytes:
@@ -212,14 +410,16 @@ def deserialize_node_outputs(payload: bytes | bytearray | str | Sequence[Any]) -
     """Deserialize node outputs from transport bytes."""
     if isinstance(payload, Sequence) and not isinstance(payload, (bytes, bytearray, str)):
         raw_payload = list(payload)
+        attachments: tuple[bytes, ...] = ()
     else:
-        if isinstance(payload, (bytes, bytearray)):
-            payload = payload.decode("utf-8")
-        raw_payload = json.loads(payload)
+        raw_payload, attachments = _deserialize_transport_payload(payload)
 
     if not isinstance(raw_payload, list):
         raise TypeError("Serialized node outputs must decode to a list.")
-    return tuple(deserialize_value(value) for value in raw_payload)
+    return tuple(
+        _deserialize_transport_value(value, attachments)
+        for value in raw_payload
+    )
 
 
 def _split_tensor_batch(value: Any) -> list[Any]:

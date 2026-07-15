@@ -122,6 +122,7 @@ def test_settings_reads_remote_invocation_runtime_controls(
     monkeypatch.setenv("COMFY_MODAL_MAX_INFLIGHT_CALLS", "7")
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS", "1800")
     monkeypatch.setenv("COMFY_MODAL_STARTUP_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE", "32")
     settings_module.get_settings.cache_clear()
     try:
         settings = settings_module.get_settings()
@@ -131,6 +132,7 @@ def test_settings_reads_remote_invocation_runtime_controls(
     assert settings.max_inflight_calls == 7
     assert settings.execution_timeout_seconds == 1800
     assert settings.startup_timeout_seconds == 600
+    assert settings.stream_event_queue_maxsize == 32
 
 
 def test_settings_reads_proactive_warmup_override(

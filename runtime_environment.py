@@ -81,6 +81,7 @@ class RemoteRuntimeSettings(Protocol):
     session_bridge_dict_name: str
     snapshot_profile_dict_name: str
     startup_timeout_seconds: int
+    stream_event_queue_maxsize: int
     sync_index_dict_name: str
     volume_name: str
 
@@ -241,6 +242,7 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "session_bridge_dict_name": settings.session_bridge_dict_name,
         "snapshot_profile_dict_name": settings.snapshot_profile_dict_name,
         "startup_timeout_seconds": settings.startup_timeout_seconds,
+        "stream_event_queue_maxsize": settings.stream_event_queue_maxsize,
         "sync_index_dict_name": settings.sync_index_dict_name,
         "volume_name": settings.volume_name,
     }

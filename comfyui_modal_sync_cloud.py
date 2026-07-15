@@ -4543,6 +4543,59 @@ def _execute_mapped_subgraph_payload(
     )
 
 
+class _BoundedStreamEventBuffer:
+    """Bound progress memory while preserving terminal stream events."""
+
+    def __init__(self, maxsize: int) -> None:
+        """Initialize a bounded event queue and close signal."""
+        self._queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=max(4, maxsize))
+        self._closed = threading.Event()
+        self._dropped_progress_events = 0
+        self._dropped_lock = threading.Lock()
+
+    @property
+    def dropped_progress_events(self) -> int:
+        """Return how many stale progress events were coalesced away."""
+        with self._dropped_lock:
+            return self._dropped_progress_events
+
+    def publish_progress(self, payload: Any) -> None:
+        """Publish the newest progress event without exceeding the queue bound."""
+        event = ("progress", payload)
+        while not self._closed.is_set():
+            try:
+                self._queue.put_nowait(event)
+                return
+            except queue.Full:
+                try:
+                    discarded_event = self._queue.get_nowait()
+                except queue.Empty:
+                    continue
+                if discarded_event[0] != "progress":
+                    self._queue.put_nowait(discarded_event)
+                    return
+                with self._dropped_lock:
+                    self._dropped_progress_events += 1
+
+    def publish_terminal(self, event_kind: str, payload: Any) -> bool:
+        """Publish a result, error, or completion unless the consumer closed."""
+        while not self._closed.is_set():
+            try:
+                self._queue.put((event_kind, payload), timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def get(self) -> tuple[str, Any]:
+        """Wait for and return the next buffered stream event."""
+        return self._queue.get()
+
+    def close(self) -> None:
+        """Release any producer waiting after the consumer stops."""
+        self._closed.set()
+
+
 def _stream_remote_payload_events(
     payload: dict[str, Any],
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
@@ -4551,12 +4604,14 @@ def _stream_remote_payload_events(
     interrupt_flag_key: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield progress and result events for one remote payload execution."""
-    event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+    event_buffer = _BoundedStreamEventBuffer(
+        get_settings().stream_event_queue_maxsize
+    )
     task_id = os.getenv("MODAL_TASK_ID")
 
     def publish_status(progress_state: dict[str, Any]) -> None:
         """Queue a progress envelope for the remote caller."""
-        event_queue.put(("progress", serialize_mapping(progress_state)))
+        event_buffer.publish_progress(serialize_mapping(progress_state))
 
     def execute_payload() -> None:
         """Run the payload in a worker thread and enqueue the terminal outcome."""
@@ -4599,11 +4654,11 @@ def _stream_remote_payload_events(
                     execute_node_kwargs["interrupt_flag_key"] = interrupt_flag_key
                 outputs = execute_node_locally(payload, kwargs_payload, **execute_node_kwargs)
         except Exception as exc:  # pragma: no cover - exercised through generator consumer tests.
-            event_queue.put(("error", exc))
+            event_buffer.publish_terminal("error", exc)
         else:
-            event_queue.put(("result", outputs))
+            event_buffer.publish_terminal("result", outputs)
         finally:
-            event_queue.put(("done", None))
+            event_buffer.publish_terminal("done", None)
 
     worker_thread = threading.Thread(
         target=execute_payload,
@@ -4615,7 +4670,7 @@ def _stream_remote_payload_events(
     worker_thread.start()
     try:
         while True:
-            event_kind, event_payload = event_queue.get()
+            event_kind, event_payload = event_buffer.get()
             if event_kind == "progress":
                 yield {"kind": "progress", **event_payload}
                 continue
@@ -4627,7 +4682,14 @@ def _stream_remote_payload_events(
             if event_kind == "done":
                 return
     finally:
+        event_buffer.close()
         worker_thread.join(timeout=1.0)
+        if event_buffer.dropped_progress_events:
+            logger.info(
+                "Coalesced %d stale remote progress event(s) for component=%s to keep the stream buffer bounded.",
+                event_buffer.dropped_progress_events,
+                payload.get("component_id"),
+            )
 
 
 def _should_ignore_repo_path(path: Path) -> bool:
@@ -5154,7 +5216,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     )
     image = (
         modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
-        .env({"COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_identity.fingerprint})
+        .env(
+            {
+                "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_identity.fingerprint,
+                "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE": str(
+                    settings.stream_event_queue_maxsize
+                ),
+            }
+        )
         .pip_install(*_comfyui_runtime_packages())
     )
     if custom_node_packages:

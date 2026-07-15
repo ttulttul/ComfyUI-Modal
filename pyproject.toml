@@ -20,12 +20,18 @@ Repository = "https://github.com/ttulttul/ComfyUI-Modal"
 [dependency-groups]
 test = [
     "aiohttp",
+    "einops",
     "numpy",
     "pillow",
+    "psutil",
     "pytest",
+    "pyyaml",
     "safetensors",
+    "scipy",
     "torch",
+    "torchvision",
     "tqdm",
+    "transformers",
 ]
 
 [tool.comfy]
