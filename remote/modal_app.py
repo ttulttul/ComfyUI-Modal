@@ -23,6 +23,7 @@ import time
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
@@ -53,14 +54,19 @@ from ..session_state import (
     is_remote_session_value_ref_payload,
     stable_session_bridge_key,
 )
-from ..settings import get_settings
+from ..runtime_environment import (
+    REMOTE_APP_PROTOCOL_VERSION,
+    RemoteRuntimeIdentity,
+    build_remote_runtime_identity,
+)
+from ..settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
-_REMOTE_APP_PROTOCOL_VERSION = 4
+_REMOTE_APP_PROTOCOL_VERSION = REMOTE_APP_PROTOCOL_VERSION
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
-_MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None]] = set()
+_MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None, str]] = set()
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
@@ -4536,6 +4542,34 @@ def _modal_deploy_cache_key() -> tuple[str, str | None]:
     return (settings.app_name, _modal_environment_name())
 
 
+@lru_cache(maxsize=8)
+def _remote_runtime_identity_for_settings(
+    settings: ModalSyncSettings,
+) -> RemoteRuntimeIdentity:
+    """Build and cache the local runtime identity for one resolved settings object."""
+    return build_remote_runtime_identity(
+        repo_root=Path(__file__).resolve().parents[1],
+        comfyui_root=settings.comfyui_root,
+        custom_nodes_dir=settings.custom_nodes_dir,
+        settings=settings,
+    )
+
+
+def _expected_remote_runtime_fingerprint() -> str:
+    """Return the exact deployment fingerprint required by this local client."""
+    return _remote_runtime_identity_for_settings(get_settings()).fingerprint
+
+
+def _modal_runtime_cache_key() -> tuple[str, str | None, str]:
+    """Return the version cache key for the current app, environment, and runtime."""
+    settings = get_settings()
+    return (
+        settings.app_name,
+        _modal_environment_name(),
+        _expected_remote_runtime_fingerprint(),
+    )
+
+
 def _call_modal_method(method: Any, *args: Any, **kwargs: Any) -> Any:
     """Invoke a Modal method handle or an in-process test double."""
     remote_method = getattr(method, "remote", None)
@@ -4555,22 +4589,34 @@ def _remote_engine_runtime_version(remote_engine: Any) -> dict[str, Any] | None:
     return version_payload
 
 
-def _remote_engine_protocol_version(remote_engine: Any) -> int | None:
-    """Return the deployed remote app protocol version when the app reports one."""
-    version_payload = _remote_engine_runtime_version(remote_engine)
+def _runtime_fingerprint_from_payload(version_payload: dict[str, Any] | None) -> str | None:
+    """Return a normalized runtime fingerprint from remote version metadata."""
     if version_payload is None:
         return None
-    protocol_version = version_payload.get("protocol_version")
-    if isinstance(protocol_version, bool):
+    runtime_fingerprint = version_payload.get("runtime_fingerprint")
+    if not isinstance(runtime_fingerprint, str):
         return None
-    if isinstance(protocol_version, int):
-        return protocol_version
-    return None
+    normalized = runtime_fingerprint.strip()
+    return normalized or None
 
 
-def _is_remote_engine_protocol_current(remote_engine: Any) -> bool:
-    """Return whether a deployed engine is compatible with this local client."""
-    return _remote_engine_protocol_version(remote_engine) == _REMOTE_APP_PROTOCOL_VERSION
+def _is_runtime_version_payload_current(version_payload: dict[str, Any] | None) -> bool:
+    """Return whether remote version metadata exactly matches this local runtime."""
+    if version_payload is None:
+        return False
+    protocol_version = version_payload.get("protocol_version")
+    if isinstance(protocol_version, bool) or not isinstance(protocol_version, int):
+        return False
+    return (
+        protocol_version == _REMOTE_APP_PROTOCOL_VERSION
+        and _runtime_fingerprint_from_payload(version_payload)
+        == _expected_remote_runtime_fingerprint()
+    )
+
+
+def _is_remote_engine_runtime_current(remote_engine: Any) -> bool:
+    """Return whether a deployed engine exactly matches this local runtime."""
+    return _is_runtime_version_payload_current(_remote_engine_runtime_version(remote_engine))
 
 
 def _stop_modal_app_via_sdk(app_name: str) -> bool:
@@ -4655,47 +4701,67 @@ def _mark_modal_deploy_state_not_ready(deploy_key: tuple[str, str | None]) -> No
 def _replace_outdated_modal_app(
     payload: dict[str, Any],
     remote_engine: Any,
+    *,
+    version_payload: dict[str, Any] | None = None,
 ) -> Any:
     """Stop and auto-deploy a replacement for an incompatible deployed app."""
     settings = get_settings()
     deploy_key = _modal_deploy_cache_key()
-    protocol_version = _remote_engine_protocol_version(remote_engine)
+    runtime_cache_key = _modal_runtime_cache_key()
+    if version_payload is None:
+        version_payload = _remote_engine_runtime_version(remote_engine)
+    protocol_version = (
+        version_payload.get("protocol_version")
+        if isinstance(version_payload, dict)
+        else None
+    )
+    remote_fingerprint = _runtime_fingerprint_from_payload(version_payload)
+    local_fingerprint = _expected_remote_runtime_fingerprint()
     logger.warning(
-        "Deployed Modal app %s is out of date for component=%s remote_protocol=%s local_protocol=%s; stopping and replacing it.",
+        "Deployed Modal app %s is out of date for component=%s remote_protocol=%s local_protocol=%s remote_fingerprint=%s local_fingerprint=%s; stopping and replacing it.",
         settings.app_name,
         payload.get("component_id"),
         protocol_version,
         _REMOTE_APP_PROTOCOL_VERSION,
+        remote_fingerprint,
+        local_fingerprint,
     )
     with _MODAL_AUTO_DEPLOY_LOCK:
-        _MODAL_REMOTE_APP_VERSION_OK.discard(deploy_key)
+        _MODAL_REMOTE_APP_VERSION_OK.discard(runtime_cache_key)
     _mark_modal_deploy_state_not_ready(deploy_key)
     _stop_modal_app_for_replacement(settings.app_name)
     stale_error = ModalRemoteAppOutOfDateError(
-        f"Modal app {settings.app_name!r} protocol {protocol_version!r} does not match local protocol "
-        f"{_REMOTE_APP_PROTOCOL_VERSION}."
+        f"Modal app {settings.app_name!r} runtime identity does not match the local client "
+        f"(remote protocol={protocol_version!r}, local protocol={_REMOTE_APP_PROTOCOL_VERSION}, "
+        f"remote fingerprint={remote_fingerprint!r}, local fingerprint={local_fingerprint!r})."
     )
     replacement_engine = _auto_deploy_modal_app(payload, stale_error)
     with _MODAL_AUTO_DEPLOY_LOCK:
-        _MODAL_REMOTE_APP_VERSION_OK.add(deploy_key)
+        _MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
     return replacement_engine
 
 
 def _ensure_remote_engine_protocol_current(remote_engine: Any, payload: dict[str, Any]) -> Any:
     """Return a compatible remote engine, replacing the deployed app when allowed."""
-    deploy_key = _modal_deploy_cache_key()
+    runtime_cache_key = _modal_runtime_cache_key()
     with _MODAL_AUTO_DEPLOY_LOCK:
-        if deploy_key in _MODAL_REMOTE_APP_VERSION_OK:
+        if runtime_cache_key in _MODAL_REMOTE_APP_VERSION_OK:
             return remote_engine
-    if _is_remote_engine_protocol_current(remote_engine):
+    version_payload = _remote_engine_runtime_version(remote_engine)
+    if _is_runtime_version_payload_current(version_payload):
         with _MODAL_AUTO_DEPLOY_LOCK:
-            _MODAL_REMOTE_APP_VERSION_OK.add(deploy_key)
+            _MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
         return remote_engine
     if not get_settings().auto_deploy:
         raise ModalRemoteInvocationError(
-            "Deployed Modal app is out of date and COMFY_MODAL_AUTO_DEPLOY=false prevents automatic replacement."
+            "Deployed Modal app runtime fingerprint is out of date and "
+            "COMFY_MODAL_AUTO_DEPLOY=false prevents automatic replacement."
         )
-    return _replace_outdated_modal_app(payload, remote_engine)
+    return _replace_outdated_modal_app(
+        payload,
+        remote_engine,
+        version_payload=version_payload,
+    )
 
 
 def _modal_auto_deploy_state(
@@ -5362,10 +5428,11 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
             time.perf_counter() - deploy_started_at,
         )
         remote_engine = _lookup_deployed_remote_engine_with_retry(payload)
-        if not _is_remote_engine_protocol_current(remote_engine):
+        if not _is_remote_engine_runtime_current(remote_engine):
             raise ModalRemoteInvocationError(
                 f"Auto-deployed Modal app {settings.app_name!r} did not report expected protocol "
-                f"{_REMOTE_APP_PROTOCOL_VERSION}."
+                f"{_REMOTE_APP_PROTOCOL_VERSION} and fingerprint "
+                f"{_expected_remote_runtime_fingerprint()!r}."
             )
     except BaseException as exc:
         with deploy_state.condition:
@@ -5380,7 +5447,7 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
         deploy_state.last_error = None
         deploy_state.condition.notify_all()
     with _MODAL_AUTO_DEPLOY_LOCK:
-        _MODAL_REMOTE_APP_VERSION_OK.add(deploy_key)
+        _MODAL_REMOTE_APP_VERSION_OK.add(_modal_runtime_cache_key())
     logger.info(
         "Deployed Modal app %s for env=%s is now lookup-ready.",
         settings.app_name,

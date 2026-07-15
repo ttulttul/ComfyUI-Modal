@@ -125,6 +125,12 @@ def session_state_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def runtime_environment_module(extension_package: object) -> object:
+    """Return the pinned remote runtime identity module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.runtime_environment")
+
+
+@pytest.fixture(scope="session")
 def sync_engine_module(extension_package: object) -> object:
     """Return the sync engine module."""
     return importlib.import_module(f"{PACKAGE_NAME}.sync_engine")

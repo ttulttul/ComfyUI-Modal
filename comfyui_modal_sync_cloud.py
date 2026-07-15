@@ -33,11 +33,6 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
 _LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
 _REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
-_REMOTE_APP_PROTOCOL_VERSION = 4
-_PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
-_COMFYUI_TORCH_VERSION = "2.10.0"
-_COMFYUI_TORCHVISION_VERSION = "0.25.0"
-_COMFYUI_TORCHAUDIO_VERSION = "2.10.0"
 for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_COMFYUI_ROOT):
     candidate_str = str(candidate)
     try:
@@ -46,6 +41,16 @@ for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_CO
         candidate_exists = False
     if candidate_exists and candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
+
+from runtime_environment import (
+    PYTORCH_CUDA_INDEX_URL as _PYTORCH_CUDA_INDEX_URL,
+    REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
+    REMOTE_PYTHON_VERSION,
+    build_remote_runtime_identity,
+    custom_node_runtime_packages as _custom_node_runtime_packages,
+    remote_runtime_packages as _comfyui_runtime_packages,
+    remote_torch_packages as _comfyui_torch_packages,
+)
 
 from serialization import (
     coerce_serialized_node_outputs,
@@ -4648,117 +4653,6 @@ def _should_ignore_comfyui_path(path: Path) -> bool:
     return path.suffix.lower() in {".bin", ".ckpt", ".log", ".pt", ".pyc", ".pyo", ".safetensors", ".swp", ".tmp"}
 
 
-def _comfyui_runtime_packages() -> tuple[str, ...]:
-    """Return the Python packages needed to import and execute ComfyUI core inside Modal."""
-    return (
-        "aiohttp",
-        "alembic",
-        "av",
-        "comfy-kitchen>=0.2.7",
-        "einops",
-        "kornia",
-        "numpy",
-        "opencv-python-headless",
-        "packaging",
-        "pillow",
-        "psutil",
-        "pydantic",
-        "pydantic-settings",
-        "pyyaml",
-        "requests",
-        "safetensors",
-        "scipy",
-        "sentencepiece",
-        "spandrel",
-        "sqlalchemy",
-        "torchsde",
-        "tqdm",
-        "transformers",
-    )
-
-
-def _strip_requirement_comment(line: str) -> str:
-    """Remove a requirements.txt comment while preserving URL fragments."""
-    for index, character in enumerate(line):
-        if character != "#":
-            continue
-        previous = line[index - 1] if index > 0 else ""
-        if not previous or previous.isspace():
-            return line[:index].strip()
-    return line.strip()
-
-
-def _custom_node_requirement_files(custom_nodes_dir: Path | None) -> tuple[Path, ...]:
-    """Return top-level custom-node requirements files in stable order."""
-    if custom_nodes_dir is None or not custom_nodes_dir.exists():
-        return ()
-    requirement_files: list[Path] = []
-    for entry_path in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name):
-        if not entry_path.is_dir():
-            continue
-        requirements_path = entry_path / "requirements.txt"
-        if requirements_path.is_file():
-            requirement_files.append(requirements_path)
-    return tuple(requirement_files)
-
-
-def _read_requirement_file(requirements_path: Path, seen: set[Path]) -> tuple[str, ...]:
-    """Read pip package specs from one requirements file, following relative includes."""
-    resolved_path = requirements_path.resolve()
-    if resolved_path in seen:
-        return ()
-    seen.add(resolved_path)
-
-    requirements: list[str] = []
-    for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
-        line = _strip_requirement_comment(raw_line)
-        if not line:
-            continue
-        if line.startswith(("-r ", "--requirement ")):
-            _, include_path = line.split(maxsplit=1)
-            requirements.extend(
-                _read_requirement_file((requirements_path.parent / include_path).resolve(), seen)
-            )
-            continue
-        if line.startswith(("-c ", "--constraint ")):
-            logger.info("Skipping custom-node pip constraint line from %s: %s", requirements_path, line)
-            continue
-        if line.startswith("-"):
-            logger.info("Skipping custom-node pip option line from %s: %s", requirements_path, line)
-            continue
-        requirements.append(line)
-    return tuple(requirements)
-
-
-def _custom_node_runtime_packages(custom_nodes_dir: Path | None) -> tuple[str, ...]:
-    """Return deduplicated pip package specs declared by bundled custom nodes."""
-    requirements: list[str] = []
-    seen_specs: set[str] = set()
-    seen_files: set[Path] = set()
-    for requirements_path in _custom_node_requirement_files(custom_nodes_dir):
-        for requirement in _read_requirement_file(requirements_path, seen_files):
-            if requirement in seen_specs:
-                continue
-            seen_specs.add(requirement)
-            requirements.append(requirement)
-    if requirements:
-        logger.info(
-            "Including %d custom-node Python requirement(s) in the Modal image from %s.",
-            len(requirements),
-            custom_nodes_dir,
-        )
-    return tuple(requirements)
-
-
-def _comfyui_torch_packages() -> tuple[str, ...]:
-    """Return the pinned CUDA 12.8 PyTorch stack used by the remote Modal image."""
-    return (
-        f"torch=={_COMFYUI_TORCH_VERSION}",
-        f"torchvision=={_COMFYUI_TORCHVISION_VERSION}",
-        f"torchaudio=={_COMFYUI_TORCHAUDIO_VERSION}",
-    )
-
-
 def _prewarm_snapshot_state(
     *,
     gpu_snapshot_enabled: bool,
@@ -5246,7 +5140,23 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         create_if_missing=True,
     )
     custom_node_packages = _custom_node_runtime_packages(settings.custom_nodes_dir)
-    image = modal.Image.debian_slim().pip_install(*_comfyui_runtime_packages())
+    runtime_identity = build_remote_runtime_identity(
+        repo_root=_REPO_ROOT,
+        comfyui_root=settings.comfyui_root,
+        custom_nodes_dir=settings.custom_nodes_dir,
+        settings=settings,
+    )
+    logger.info(
+        "Building Modal runtime fingerprint=%s protocol=%d python=%s.",
+        runtime_identity.fingerprint,
+        _REMOTE_APP_PROTOCOL_VERSION,
+        REMOTE_PYTHON_VERSION,
+    )
+    image = (
+        modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
+        .env({"COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_identity.fingerprint})
+        .pip_install(*_comfyui_runtime_packages())
+    )
     if custom_node_packages:
         image = image.pip_install(*custom_node_packages)
     image = (
@@ -5365,10 +5275,15 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
 
         @modal.method()
         def runtime_version(self) -> dict[str, Any]:
-            """Return the deployed app protocol version expected by the local client."""
+            """Return the deployed runtime identity expected by the local client."""
             return {
                 "protocol_version": _REMOTE_APP_PROTOCOL_VERSION,
                 "app_name": settings.app_name,
+                "runtime_fingerprint": os.environ.get(
+                    "COMFY_MODAL_RUNTIME_FINGERPRINT",
+                    "",
+                ),
+                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
             }
 
         @modal.method()

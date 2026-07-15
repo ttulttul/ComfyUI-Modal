@@ -163,6 +163,14 @@ class _FakeRewriteLocalFeedbackNode:
     OUTPUT_IS_LIST = (False,)
 
 
+def _current_remote_runtime_payload(remote_modal_app_module: Any) -> dict[str, Any]:
+    """Return version metadata for a compatible remote-engine test double."""
+    return {
+        "protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION,
+        "runtime_fingerprint": remote_modal_app_module._expected_remote_runtime_fingerprint(),
+    }
+
+
 def test_modal_proxy_waits_for_active_prompt_before_starting_next_prompt(
     modal_executor_module: Any,
 ) -> None:
@@ -3242,19 +3250,23 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
     modal_cloud_module: Any,
 ) -> None:
     """The Modal cloud image should include the core packages ComfyUI imports at runtime."""
-    packages = set(modal_cloud_module._comfyui_runtime_packages())
+    packages = modal_cloud_module._comfyui_runtime_packages()
+    package_names = {package.split("==", maxsplit=1)[0] for package in packages}
 
-    assert "psutil" in packages
-    assert "torchsde" in packages
-    assert "transformers" in packages
-    assert "sentencepiece" in packages
-    assert "aiohttp" in packages
-    assert "opencv-python-headless" in packages
-    assert "comfy-kitchen>=0.2.7" in packages
-    assert "alembic" in packages
-    assert "pydantic-settings" in packages
-    assert "spandrel" in packages
-    assert "kornia" in packages
+    assert all("==" in package for package in packages)
+    assert {
+        "aiohttp",
+        "alembic",
+        "comfy-kitchen",
+        "kornia",
+        "opencv-python-headless",
+        "pydantic-settings",
+        "psutil",
+        "sentencepiece",
+        "spandrel",
+        "torchsde",
+        "transformers",
+    } <= package_names
 
 
 def test_modal_cloud_collects_custom_node_runtime_packages(
@@ -3867,7 +3879,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
         execute_payload = FakeExecuteMethod()
         runtime_version = types.SimpleNamespace(
-            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+            remote=lambda: _current_remote_runtime_payload(remote_modal_app_module)
         )
 
     class FakeApp:
@@ -3977,7 +3989,7 @@ def test_remote_modal_does_not_redeploy_after_remote_execution_error(
 
         execute_payload = FakeExecuteMethod()
         runtime_version = types.SimpleNamespace(
-            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+            remote=lambda: _current_remote_runtime_payload(remote_modal_app_module)
         )
 
     class FakeModal:
@@ -4040,7 +4052,7 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
 
         execute_payload = FakeExecuteMethod()
         runtime_version = types.SimpleNamespace(
-            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+            remote=lambda: _current_remote_runtime_payload(remote_modal_app_module)
         )
 
     class FakeApp:
@@ -4128,7 +4140,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
             self._stale = stale
             self.execute_payload = types.SimpleNamespace(remote=self._remote)
             self.runtime_version = types.SimpleNamespace(
-                remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+                remote=lambda: _current_remote_runtime_payload(remote_modal_app_module)
             )
 
         def _remote(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
@@ -4224,7 +4236,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
             self._stale = stale
             self.warmup_for_request = types.SimpleNamespace(remote=self._remote)
             self.runtime_version = types.SimpleNamespace(
-                remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+                remote=lambda: _current_remote_runtime_payload(remote_modal_app_module)
             )
 
         def _remote(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4324,14 +4336,14 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
 
         def __init__(self, *, current: bool) -> None:
             """Record whether this engine should report the current protocol."""
-            protocol_version = (
-                remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION
-                if current
-                else remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION - 1
-            )
+            version_payload = _current_remote_runtime_payload(remote_modal_app_module)
+            if not current:
+                version_payload["protocol_version"] = (
+                    remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION - 1
+                )
             self.execute_payload = FakeExecuteMethod()
             self.runtime_version = types.SimpleNamespace(
-                remote=lambda: {"protocol_version": protocol_version}
+                remote=lambda: version_payload
             )
 
     class FakeApp:
@@ -4409,6 +4421,33 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
     assert deploy_calls == [("comfy-modal-sync", "main")]
 
 
+def test_remote_modal_rejects_fingerprint_mismatch_when_auto_deploy_is_disabled(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A same-protocol worker with different source or settings must not execute."""
+    stale_version_payload = _current_remote_runtime_payload(remote_modal_app_module)
+    stale_version_payload["runtime_fingerprint"] = "stale-runtime"
+    remote_engine = types.SimpleNamespace(
+        runtime_version=types.SimpleNamespace(remote=lambda: stale_version_payload)
+    )
+    monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "false")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    try:
+        with pytest.raises(
+            remote_modal_app_module.ModalRemoteInvocationError,
+            match="runtime fingerprint is out of date",
+        ):
+            remote_modal_app_module._ensure_remote_engine_protocol_current(
+                remote_engine,
+                {"component_id": "component-1"},
+            )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+
+
 def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -4444,7 +4483,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
         execute_payload = FakeExecuteMethod()
         warmup_for_request = FakeWarmupMethod()
         runtime_version = types.SimpleNamespace(
-            remote=lambda: {"protocol_version": remote_modal_app_module._REMOTE_APP_PROTOCOL_VERSION}
+            remote=lambda: _current_remote_runtime_payload(remote_modal_app_module)
         )
 
     class FakeApp:

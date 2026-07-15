@@ -8,6 +8,11 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
+[project.optional-dependencies]
+remote = [
+    "modal==1.4.2",
+]
+
 [project.urls]
 Repository = "https://github.com/ttulttul/ComfyUI-Modal"
 "Bug Tracker" = "https://github.com/ttulttul/ComfyUI-Modal/issues"
