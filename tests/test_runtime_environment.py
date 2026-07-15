@@ -54,11 +54,13 @@ def _runtime_identity(
 
 def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> None:
     """The supported Python, ComfyUI, and CUDA environments should not float."""
+    apt_packages = runtime_environment_module.remote_apt_packages()
     runtime_packages = runtime_environment_module.remote_runtime_packages()
     torch_packages = runtime_environment_module.remote_torch_packages()
 
     assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION >= 5
     assert runtime_environment_module.REMOTE_PYTHON_VERSION == "3.11"
+    assert apt_packages == ("libgl1", "libglib2.0-0")
     assert all("==" in requirement for requirement in runtime_packages)
     assert all("==" in requirement for requirement in torch_packages)
     assert len(runtime_packages) == len(set(runtime_packages))
@@ -92,6 +94,21 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
 
     assert source_changed.fingerprint != baseline.fingerprint
     assert option_changed.fingerprint != source_changed.fingerprint
+
+
+def test_runtime_identity_records_system_packages(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The deployment manifest should record system libraries installed in the image."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    repo_root.mkdir()
+    comfyui_root.mkdir()
+
+    identity = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+
+    assert identity.manifest["apt_packages"] == ["libgl1", "libglib2.0-0"]
 
 
 def test_runtime_identity_tracks_custom_node_requirements_but_ignores_payload_source(
