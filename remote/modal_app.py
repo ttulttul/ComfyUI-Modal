@@ -41,6 +41,12 @@ from ..serialization import (
     split_mapped_value,
     unwrap_mapped_output_value,
 )
+from ..durable_state import (
+    DurableObjectRef,
+    DurableStateError,
+    FileDurableObjectStore,
+    stable_remote_invocation_id,
+)
 from ..session_state import (
     InMemoryRemoteSessionBridgeStore,
     InMemoryRemoteSessionStore,
@@ -94,6 +100,8 @@ _ACTIVE_REMOTE_INVOCATIONS_LOCK = threading.Lock()
 _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT: dict[str, dict[str, "_ActiveRemoteInvocation"]] = {}
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
+_DURABLE_OBJECT_STORE_LOCK = threading.Lock()
+_DURABLE_OBJECT_STORE: FileDurableObjectStore | None = None
 _REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
@@ -540,6 +548,92 @@ def _sanitize_payload_for_session_bridge_record(payload: dict[str, Any]) -> dict
     return sanitized_payload
 
 
+def _durable_object_store() -> FileDurableObjectStore:
+    """Return the process-local handle for durable binary objects."""
+    global _DURABLE_OBJECT_STORE
+
+    with _DURABLE_OBJECT_STORE_LOCK:
+        if _DURABLE_OBJECT_STORE is not None:
+            return _DURABLE_OBJECT_STORE
+        settings = get_settings()
+        commit_callback: Callable[[], Any] | None = None
+        reload_callback: Callable[[], Any] | None = None
+        if os.getenv("MODAL_IS_REMOTE") == "1" or os.getenv("MODAL_TASK_ID"):
+            object_root = Path(settings.remote_storage_root) / "durable_objects"
+            volume = globals().get("vol")
+            volume_commit = getattr(volume, "commit", None)
+            if callable(volume_commit):
+                commit_callback = volume_commit
+            volume_reload = getattr(volume, "reload", None)
+            if callable(volume_reload):
+                reload_callback = volume_reload
+        else:
+            object_root = settings.local_storage_root / "durable_objects"
+        _DURABLE_OBJECT_STORE = FileDurableObjectStore(
+            object_root,
+            commit_callback=commit_callback,
+            reload_callback=reload_callback,
+        )
+        return _DURABLE_OBJECT_STORE
+
+
+def _json_payload_size_bytes(payload: Any) -> int:
+    """Return the compact UTF-8 size of one JSON-safe payload."""
+    return len(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _offload_large_bridge_payloads(
+    *,
+    hydrated_inputs: Mapping[str, Any],
+    producer_inputs: dict[str, Any],
+    output_value: Any,
+    serialized_output: Any | None,
+) -> tuple[
+    dict[str, Any],
+    DurableObjectRef | None,
+    Any | None,
+    DurableObjectRef | None,
+]:
+    """Move oversized bridge inputs and outputs into durable binary objects."""
+    max_inline_bytes = get_settings().bridge_inline_max_bytes
+    producer_inputs_object: DurableObjectRef | None = None
+    serialized_output_object: DurableObjectRef | None = None
+    if _json_payload_size_bytes(producer_inputs) > max_inline_bytes:
+        producer_inputs_object = _durable_object_store().put(
+            "bridge_objects",
+            serialize_node_inputs(hydrated_inputs),
+        )
+        producer_inputs = {}
+    if (
+        serialized_output is not None
+        and _json_payload_size_bytes(serialized_output) > max_inline_bytes
+    ):
+        serialized_output_object = _durable_object_store().put(
+            "bridge_objects",
+            serialize_node_outputs((output_value,)),
+        )
+        serialized_output = None
+    return (
+        producer_inputs,
+        producer_inputs_object,
+        serialized_output,
+        serialized_output_object,
+    )
+
+
+def _deserialize_remote_session_bridge_producer_inputs(
+    record: RemoteSessionBridgeRecord,
+) -> dict[str, Any]:
+    """Restore bridge producer inputs from inline metadata or durable storage."""
+    if record.producer_inputs_object is not None:
+        return deserialize_node_inputs(
+            _durable_object_store().get(record.producer_inputs_object)
+        )
+    return deserialize_node_inputs(record.producer_inputs)
+
+
 def _build_remote_session_bridge_record(
     *,
     payload: dict[str, Any],
@@ -553,6 +647,23 @@ def _build_remote_session_bridge_record(
     producer_payload = _sanitize_payload_for_session_bridge_record(payload)
     producer_inputs = serialize_mapping(hydrated_inputs)
     serialized_output = _serialize_durable_bridge_output(output_value, io_type)
+    bridge_key = stable_session_bridge_key(
+        producer_payload=producer_payload,
+        producer_inputs=producer_inputs,
+        node_id=node_id,
+        output_index=output_index,
+    )
+    (
+        producer_inputs,
+        producer_inputs_object,
+        serialized_output,
+        serialized_output_object,
+    ) = _offload_large_bridge_payloads(
+        hydrated_inputs=hydrated_inputs,
+        producer_inputs=producer_inputs,
+        output_value=output_value,
+        serialized_output=serialized_output,
+    )
     rehydration_plan = _build_durable_bridge_rehydration_plan(
         payload=producer_payload,
         node_id=node_id,
@@ -560,18 +671,19 @@ def _build_remote_session_bridge_record(
         io_type=io_type,
     )
     return RemoteSessionBridgeRecord(
-        bridge_key=stable_session_bridge_key(
-            producer_payload=producer_payload,
-            producer_inputs=producer_inputs,
-            node_id=node_id,
-            output_index=output_index,
-        ),
+        bridge_key=bridge_key,
         node_id=node_id,
         output_index=output_index,
         producer_payload=producer_payload,
         producer_inputs=producer_inputs,
+        producer_inputs_object=producer_inputs_object,
         serialized_output=serialized_output,
-        serialized_output_io_type=(str(io_type) if serialized_output is not None else None),
+        serialized_output_object=serialized_output_object,
+        serialized_output_io_type=(
+            str(io_type)
+            if serialized_output is not None or serialized_output_object is not None
+            else None
+        ),
         rehydration_plan=rehydration_plan,
         rehydration_plan_io_type=(str(io_type) if rehydration_plan is not None else None),
     )
@@ -648,11 +760,24 @@ def _restore_serialized_remote_session_bridge_value(
     resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> Any | None:
     """Restore one bridge value directly from a durable serialized payload."""
-    if record.serialized_output is None:
+    if record.serialized_output is None and record.serialized_output_object is None:
         return None
 
     restore_started_at = time.perf_counter()
-    restored_value = deserialize_value(record.serialized_output)
+    if record.serialized_output_object is not None:
+        restored_outputs = deserialize_node_outputs(
+            _durable_object_store().get(record.serialized_output_object)
+        )
+        if len(restored_outputs) != 1:
+            raise DurableStateError(
+                f"Bridge object {record.serialized_output_object.object_path!r} "
+                "must contain exactly one output."
+            )
+        restored_value = restored_outputs[0]
+        storage_kind = "object-backed"
+    else:
+        restored_value = deserialize_value(record.serialized_output)
+        storage_kind = "inline"
     _REMOTE_SESSION_STORE.put_bridge_output(
         target_session_handle,
         bridge_key=record.bridge_key,
@@ -666,8 +791,9 @@ def _restore_serialized_remote_session_bridge_value(
         resolution_stats.session_restore_writes += 1
         resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
     logger.info(
-        "Resolved remote session bridge bridge_key=%s from durable serialized %s payload into session_id=%s.",
+        "Resolved remote session bridge bridge_key=%s from durable %s serialized %s payload into session_id=%s.",
         record.bridge_key,
+        storage_kind,
         record.serialized_output_io_type or "bridge",
         target_session_handle.session_id,
     )
@@ -804,7 +930,7 @@ def _restore_planned_remote_session_bridge_value(
         executable_payload.pop("clear_remote_session", None)
         outputs = _execute_subgraph_prompt(
             executable_payload,
-            deserialize_node_inputs(record.producer_inputs),
+            _deserialize_remote_session_bridge_producer_inputs(record),
             node_mapping,
         )
         output_index = 0
@@ -949,7 +1075,7 @@ def _rehydrate_remote_session_bridge_value(
     replay_payload.pop("clear_remote_session", None)
     if target_session_handle.prompt_id is not None:
         replay_payload["prompt_id"] = target_session_handle.prompt_id
-    replay_inputs = deserialize_node_inputs(record.producer_inputs)
+    replay_inputs = _deserialize_remote_session_bridge_producer_inputs(record)
 
     logger.info(
         "Replaying remote session bridge bridge_key=%s into session_id=%s via component=%s.",
@@ -5514,6 +5640,11 @@ def _invoke_remote_engine_payload_with_recovery(
     cancellation_event: threading.Event | None,
 ) -> bytes:
     """Retry one payload call after auto-deploy when a stale deployed handle vanishes."""
+    payload = dict(payload)
+    payload.setdefault(
+        "invocation_id",
+        stable_remote_invocation_id(payload, kwargs_payload),
+    )
     lookup_error_types = _modal_lookup_error_types()
     settings = get_settings()
     try:

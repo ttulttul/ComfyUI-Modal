@@ -71,6 +71,8 @@ class RemoteRuntimeSettings(Protocol):
     enable_gpu_memory_snapshot: bool
     enable_memory_snapshot: bool
     execution_timeout_seconds: int
+    invocation_dict_name: str
+    invocation_result_inline_max_bytes: int
     interrupt_dict_name: str
     max_containers: int | None
     min_containers: int
@@ -79,6 +81,7 @@ class RemoteRuntimeSettings(Protocol):
     remote_storage_root: str
     scaledown_window_seconds: int
     session_bridge_dict_name: str
+    bridge_inline_max_bytes: int
     snapshot_profile_dict_name: str
     startup_timeout_seconds: int
     stream_event_queue_maxsize: int
@@ -232,6 +235,8 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "enable_gpu_memory_snapshot": settings.enable_gpu_memory_snapshot,
         "enable_memory_snapshot": settings.enable_memory_snapshot,
         "execution_timeout_seconds": settings.execution_timeout_seconds,
+        "invocation_dict_name": settings.invocation_dict_name,
+        "invocation_result_inline_max_bytes": settings.invocation_result_inline_max_bytes,
         "interrupt_dict_name": settings.interrupt_dict_name,
         "max_containers": settings.max_containers,
         "min_containers": settings.min_containers,
@@ -240,6 +245,7 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "remote_storage_root": settings.remote_storage_root,
         "scaledown_window_seconds": settings.scaledown_window_seconds,
         "session_bridge_dict_name": settings.session_bridge_dict_name,
+        "bridge_inline_max_bytes": settings.bridge_inline_max_bytes,
         "snapshot_profile_dict_name": settings.snapshot_profile_dict_name,
         "startup_timeout_seconds": settings.startup_timeout_seconds,
         "stream_event_queue_maxsize": settings.stream_event_queue_maxsize,

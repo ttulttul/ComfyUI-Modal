@@ -152,7 +152,9 @@ Warm containers can reuse loaded model state, `PromptExecutor` state, remote ses
 
 Independent Modal-backed components can overlap through ComfyUI's async proxy path and the local Modal call executor. Each Modal GPU container handles one active workflow execution at a time, so parallel ready components can scale out across containers instead of multiplexing several active executions onto one worker. `COMFY_MODAL_MAX_INFLIGHT_CALLS` bounds local dispatch independently from the local CPU count and the remote autoscaler.
 
-Split proxies and mapped phases use prompt-scoped remote sessions for live non-transportable values. Durable bridge metadata is stored in a Modal `Dict` so later phases can rehydrate selected values after container churn. Sampler-producing bridges are not replayed as a fallback; losing those values is surfaced as a session-state error.
+Split proxies and mapped phases use prompt-scoped remote sessions for live non-transportable values. Durable bridge metadata is stored in a Modal `Dict` so later phases can rehydrate selected values after container churn. Oversized serialized bridge inputs and outputs are stored as integrity-checked, content-addressed objects on the shared Modal Volume instead of being embedded in `Dict` records. Sampler-producing bridges are not replayed as a fallback; losing those values is surfaced as a session-state error.
+
+Each remote payload also carries a stable invocation id. The worker records its lifecycle in a shared Modal `Dict`, replays a completed result when the local client retries the same call, and rejects an overlapping duplicate while the first attempt is active. Large completed results use the same content-addressed Volume store, while failed attempts remain retryable.
 
 Remote subgraph runs can persist transport-safe node outputs into a shared Modal `Dict` using ComfyUI input-signature semantics. The cache skips non-serializable outputs and entries above the configured size cap.
 
@@ -222,9 +224,12 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_INTERRUPT_DICT_NAME` | `<app_name>-interrupts` | Shared Modal `Dict` for cancellation flags. |
 | `COMFY_MODAL_NODE_CACHE_DICT_NAME` | `<app_name>-node-cache` | Shared Modal `Dict` for persisted transport-safe node outputs. |
 | `COMFY_MODAL_SESSION_BRIDGE_DICT_NAME` | `<app_name>-session-bridges` | Shared Modal `Dict` for durable session bridge metadata. |
+| `COMFY_MODAL_INVOCATION_DICT_NAME` | `<app_name>-invocations` | Shared Modal `Dict` for idempotent invocation lifecycle and result metadata. |
 | `COMFY_MODAL_SYNC_INDEX_DICT_NAME` | `<app_name>-sync-index` | Shared Modal `Dict` for mirrored asset and bundle digests. |
 | `COMFY_MODAL_SNAPSHOT_PROFILE_DICT_NAME` | `<app_name>-snapshot-profiles` | Shared Modal `Dict` for loader snapshot profile records. |
 | `COMFY_MODAL_NODE_CACHE_MAX_BYTES` | `5242880` | Maximum raw output size eligible for persisted node caching; set `0` to disable. |
+| `COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES` | `4194304` | Maximum serialized bridge input or output size retained inline before Volume offload. |
+| `COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES` | `4194304` | Maximum completed invocation result retained inline before Volume offload. |
 
 ### Runtime Sizing And Warmup
 

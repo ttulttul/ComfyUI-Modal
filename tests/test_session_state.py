@@ -130,6 +130,38 @@ def test_stable_session_bridge_key_ignores_transient_session_ids(
     assert first_key == second_key
 
 
+def test_remote_session_bridge_record_round_trips_object_refs(
+    session_state_module: Any,
+) -> None:
+    """Bridge metadata should preserve object-backed producer inputs and outputs."""
+    producer_inputs_object = session_state_module.DurableObjectRef(
+        object_path="bridge_objects/aa/inputs.bin",
+        sha256="a" * 64,
+        size_bytes=10,
+    )
+    serialized_output_object = session_state_module.DurableObjectRef(
+        object_path="bridge_objects/bb/output.bin",
+        sha256="b" * 64,
+        size_bytes=20,
+    )
+    record = session_state_module.RemoteSessionBridgeRecord(
+        bridge_key="RSB_object_backed",
+        node_id="node-1",
+        output_index=0,
+        producer_payload={"component_id": "component-1"},
+        producer_inputs={},
+        producer_inputs_object=producer_inputs_object,
+        serialized_output_object=serialized_output_object,
+        serialized_output_io_type="LATENT",
+    )
+
+    restored = session_state_module.RemoteSessionBridgeRecord.from_payload(
+        record.to_payload()
+    )
+
+    assert restored == record
+
+
 def test_remote_session_store_resolves_bridge_refs_via_replay_callback(
     session_state_module: Any,
 ) -> None:
