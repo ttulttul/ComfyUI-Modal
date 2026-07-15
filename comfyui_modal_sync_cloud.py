@@ -50,6 +50,7 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     REMOTE_PYTHON_VERSION,
     build_remote_runtime_identity,
     custom_node_runtime_packages as _custom_node_runtime_packages,
+    remote_apt_packages as _comfyui_apt_packages,
     remote_runtime_packages as _comfyui_runtime_packages,
     remote_torch_packages as _comfyui_torch_packages,
 )
@@ -5898,6 +5899,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     )
     image = (
         modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
+        .apt_install(*_comfyui_apt_packages())
         .env(
             {
                 "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_identity.fingerprint,

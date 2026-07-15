@@ -17,6 +17,10 @@ REMOTE_PYTHON_VERSION = "3.11"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 
+_REMOTE_APT_PACKAGES = (
+    "libgl1",
+    "libglib2.0-0",
+)
 _REMOTE_RUNTIME_PACKAGES = (
     "aiohttp==3.13.3",
     "alembic==1.18.4",
@@ -123,6 +127,11 @@ class RemoteRuntimeIdentity:
 def remote_runtime_packages() -> tuple[str, ...]:
     """Return the exact ComfyUI support package set used by Modal images."""
     return _REMOTE_RUNTIME_PACKAGES
+
+
+def remote_apt_packages() -> tuple[str, ...]:
+    """Return system libraries required by Python packages in the Modal image."""
+    return _REMOTE_APT_PACKAGES
 
 
 def remote_torch_packages() -> tuple[str, ...]:
@@ -295,6 +304,7 @@ def build_remote_runtime_identity(
         "protocol_version": REMOTE_APP_PROTOCOL_VERSION,
         "python_version": REMOTE_PYTHON_VERSION,
         "modal_sdk_spec": REMOTE_MODAL_SDK_SPEC,
+        "apt_packages": list(remote_apt_packages()),
         "runtime_packages": list(remote_runtime_packages()),
         "torch_packages": list(remote_torch_packages()),
         "custom_node_packages": list(custom_node_runtime_packages(custom_nodes_dir)),
