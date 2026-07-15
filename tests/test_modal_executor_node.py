@@ -1458,6 +1458,123 @@ def test_modal_cloud_extracts_custom_nodes_manifest_with_multiple_archives(
     assert (extraction_root / "example_b" / "__init__.py").exists()
 
 
+def test_modal_cloud_links_version_two_custom_node_assets(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Version-two manifests should keep model assets on mounted storage."""
+    storage_root = tmp_path / "storage"
+    asset_sha256 = "a" * 64
+    archive_path = storage_root / "custom_nodes/entries/example/code_bundle.zip"
+    asset_path = storage_root / f"custom_nodes/assets/example/{asset_sha256}_model.pth"
+    manifest_path = storage_root / "custom_nodes/manifests/bundle_manifest_v2.json"
+    archive_path.parent.mkdir(parents=True)
+    asset_path.parent.mkdir(parents=True)
+    manifest_path.parent.mkdir(parents=True)
+    asset_path.write_bytes(b"mounted-model")
+    import zipfile
+
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("example/__init__.py", "NODE_CLASS_MAPPINGS = {}\n")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "bundle_sha256": "bundle-hash",
+                "entries": [
+                    {
+                        "entry_name": "example",
+                        "display_name": "example",
+                        "sha256": "code-hash",
+                        "remote_path": "/custom_nodes/entries/example/code_bundle.zip",
+                        "assets": [
+                            {
+                                "relative_path": "example/checkpoints/model.pth",
+                                "sha256": asset_sha256,
+                                "size_bytes": len(b"mounted-model"),
+                                "remote_path": (
+                                    f"/custom_nodes/assets/example/{asset_sha256}_model.pth"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(storage_root))
+    modal_cloud_module.get_settings.cache_clear()
+    original_cache = dict(modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES)
+    modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+    try:
+        extraction_root = modal_cloud_module._extract_custom_nodes_bundle(
+            "/custom_nodes/manifests/bundle_manifest_v2.json"
+        )
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
+
+    assert extraction_root is not None
+    linked_asset = extraction_root / "example/checkpoints/model.pth"
+    assert linked_asset.is_symlink()
+    assert linked_asset.read_bytes() == b"mounted-model"
+
+
+def test_local_fallback_links_version_two_custom_node_assets(
+    remote_modal_app_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The non-Modal extractor should preserve version-two package asset links."""
+    storage_root = tmp_path / "storage"
+    extraction_root = tmp_path / "extracted"
+    asset_sha256 = "b" * 64
+    asset_path = storage_root / f"custom_nodes/assets/example/{asset_sha256}_model.pth"
+    manifest_path = storage_root / "custom_nodes/manifests/bundle_manifest_v2.json"
+    asset_path.parent.mkdir(parents=True)
+    manifest_path.parent.mkdir(parents=True)
+    extraction_root.mkdir()
+    asset_path.write_bytes(b"local-mounted-model")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "entries": [
+                    {
+                        "entry_name": "example",
+                        "assets": [
+                            {
+                                "relative_path": "example/checkpoints/model.pth",
+                                "sha256": asset_sha256,
+                                "size_bytes": len(b"local-mounted-model"),
+                                "remote_path": (
+                                    f"/custom_nodes/assets/example/{asset_sha256}_model.pth"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    remote_modal_app_module._materialize_local_custom_node_assets(
+        manifest_path,
+        storage_root,
+        extraction_root,
+    )
+
+    linked_asset = extraction_root / "example/checkpoints/model.pth"
+    assert linked_asset.is_symlink()
+    assert linked_asset.read_bytes() == b"local-mounted-model"
+
+
 def test_modal_cloud_traces_remote_node_execution_spans(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -3272,7 +3389,11 @@ def test_modal_cloud_ignores_heavy_comfyui_paths(
         Path(".cache/strings/acfca22bde9a1a1fee53fe6e1299f4fe54a78a6f1d306dbb6cac2e71cf35d2c2.txt")
     )
     assert modal_cloud_module._should_ignore_comfyui_path(Path("__pycache__/execution.pyc"))
+    assert modal_cloud_module._should_ignore_comfyui_path(Path("False/checkpoints/model.pth"))
+    assert modal_cloud_module._should_ignore_comfyui_path(Path("tests/test_execution.py"))
+    assert modal_cloud_module._should_ignore_comfyui_path(Path("unexpected/code.py"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("execution.py"))
+    assert not modal_cloud_module._should_ignore_comfyui_path(Path("requirements.txt"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("comfy/model_management.py"))
     assert not modal_cloud_module._should_ignore_comfyui_path(Path("comfy/ldm/models/diffusion/ddpm.py"))
 

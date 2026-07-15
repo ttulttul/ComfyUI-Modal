@@ -43,6 +43,8 @@ for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_CO
         sys.path.insert(0, candidate_str)
 
 from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
+    COMFYUI_RUNTIME_SOURCE_DIRECTORIES as _COMFYUI_IMAGE_RUNTIME_DIRECTORIES,
+    COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
     PYTORCH_CUDA_INDEX_URL as _PYTORCH_CUDA_INDEX_URL,
     REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
     REMOTE_PYTHON_VERSION,
@@ -52,6 +54,7 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     remote_torch_packages as _comfyui_torch_packages,
 )
 from durable_state import (  # noqa: E402 - paths are bootstrapped above.
+    DurableObjectCommitBatch,
     DurableObjectRef,
     DurableStateError,
     FileDurableObjectStore,
@@ -413,17 +416,23 @@ def _begin_remote_invocation(
 def _complete_remote_invocation(
     running_record: RemoteInvocationRecord,
     serialized_outputs: bytes,
+    *,
+    pending_batch: DurableObjectCommitBatch | None = None,
 ) -> None:
-    """Persist one successful invocation result inline or in the object store."""
+    """Commit successful object writes before publishing completed metadata."""
     settings = get_settings()
     result_inline: bytes | None = serialized_outputs
     result_object = None
-    if len(serialized_outputs) > settings.invocation_result_inline_max_bytes:
-        result_object = _durable_object_store().put(
-            "invocation_results",
-            serialized_outputs,
-        )
-        result_inline = None
+    object_store = _durable_object_store()
+    with object_store.batch_commits() as completion_batch:
+        if pending_batch is not None:
+            completion_batch.absorb(pending_batch)
+        if len(serialized_outputs) > settings.invocation_result_inline_max_bytes:
+            result_object = object_store.put(
+                "invocation_results",
+                serialized_outputs,
+            )
+            result_inline = None
     _store_remote_invocation_record(
         RemoteInvocationRecord(
             invocation_id=running_record.invocation_id,
@@ -463,14 +472,25 @@ def _execute_with_durable_invocation(
     running_record, completed_result = _begin_remote_invocation(payload)
     if completed_result is not None:
         return completed_result
+    object_store = _durable_object_store()
+    pending_batch: DurableObjectCommitBatch | None = None
     try:
-        serialized_outputs = coerce_serialized_node_outputs(execute_once())
+        with object_store.batch_commits(commit_on_exit=False) as pending_batch:
+            serialized_outputs = coerce_serialized_node_outputs(execute_once())
     except Exception as exc:
+        if pending_batch is not None:
+            object_store.commit_batch(pending_batch)
         if running_record is not None:
             _fail_remote_invocation(running_record, exc)
         raise
     if running_record is not None:
-        _complete_remote_invocation(running_record, serialized_outputs)
+        _complete_remote_invocation(
+            running_record,
+            serialized_outputs,
+            pending_batch=pending_batch,
+        )
+    elif pending_batch is not None:
+        object_store.commit_batch(pending_batch)
     return serialized_outputs
 
 
@@ -2091,12 +2111,19 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
         return cached_extraction_root
 
     extraction_root = Path(tempfile.gettempdir()) / "comfy-modal-sync-custom-nodes" / local_bundle.stem
+    if extraction_root.exists():
+        shutil.rmtree(extraction_root)
     extraction_root.mkdir(parents=True, exist_ok=True)
     with _timed_phase("extract_custom_nodes_bundle", bundle=local_bundle.name):
         archives_to_extract = _resolve_custom_nodes_archives(local_bundle, storage_roots)
         for archive_path in archives_to_extract:
             with zipfile.ZipFile(archive_path, "r") as archive:
                 archive.extractall(extraction_root)
+        _materialize_custom_nodes_manifest_assets(
+            local_bundle,
+            storage_roots,
+            extraction_root,
+        )
 
     if str(extraction_root) not in sys.path:
         sys.path.insert(0, str(extraction_root))
@@ -2116,13 +2143,7 @@ def _resolve_custom_nodes_archives(
         raise RuntimeError(
             f"Unsupported custom_nodes bundle format {local_bundle.suffix!r} for {local_bundle}."
         )
-
-    try:
-        manifest_payload = json.loads(local_bundle.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} is unreadable.") from exc
-    if not isinstance(manifest_payload, dict):
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} must be a JSON object.")
+    manifest_payload = _load_custom_nodes_manifest(local_bundle)
     entry_payloads = manifest_payload.get("entries")
     if not isinstance(entry_payloads, list):
         raise RuntimeError(f"Custom nodes manifest {local_bundle} did not contain a valid entries list.")
@@ -2141,6 +2162,119 @@ def _resolve_custom_nodes_archives(
             )
         archive_paths.append(archive_path)
     return archive_paths
+
+
+def _load_custom_nodes_manifest(local_bundle: Path) -> dict[str, Any]:
+    """Load and validate one versioned custom-node bundle manifest."""
+    try:
+        manifest_payload = json.loads(local_bundle.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} is unreadable.") from exc
+    if not isinstance(manifest_payload, dict):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} must be a JSON object.")
+    manifest_version = manifest_payload.get("version", 1)
+    if manifest_version not in {1, 2}:
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} uses unsupported version {manifest_version!r}."
+        )
+    return manifest_payload
+
+
+def _materialize_custom_nodes_manifest_assets(
+    local_bundle: Path,
+    storage_roots: list[Path],
+    extraction_root: Path,
+) -> None:
+    """Link version-two package assets from mounted storage into extracted code."""
+    if local_bundle.suffix.lower() != ".json":
+        return
+    manifest_payload = _load_custom_nodes_manifest(local_bundle)
+    if manifest_payload.get("version", 1) < 2:
+        return
+    materialized_count = 0
+    materialized_bytes = 0
+    for asset_payload in _iter_custom_nodes_manifest_assets(local_bundle, manifest_payload):
+        relative_path = _validated_custom_node_asset_relative_path(
+            local_bundle,
+            asset_payload,
+        )
+        remote_path = str(asset_payload["remote_path"])
+        asset_path = _resolve_custom_nodes_bundle_path(remote_path, storage_roots)
+        if asset_path is None:
+            raise RuntimeError(
+                f"Custom-node asset {remote_path!r} referenced by {local_bundle} was not found."
+            )
+        expected_size = int(asset_payload["size_bytes"])
+        if asset_path.stat().st_size != expected_size:
+            raise RuntimeError(
+                f"Custom-node asset {remote_path!r} size did not match its manifest."
+            )
+        destination = extraction_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() and destination.resolve() == asset_path.resolve():
+                continue
+            raise RuntimeError(
+                f"Custom-node asset destination {destination} already exists in the code archive."
+            )
+        destination.symlink_to(asset_path)
+        materialized_count += 1
+        materialized_bytes += expected_size
+    if materialized_count:
+        logger.info(
+            "Linked %d custom-node model asset(s) totaling %d bytes from mounted storage.",
+            materialized_count,
+            materialized_bytes,
+        )
+
+
+def _iter_custom_nodes_manifest_assets(
+    local_bundle: Path,
+    manifest_payload: Mapping[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """Yield validated asset objects from one version-two manifest."""
+    entry_payloads = manifest_payload.get("entries")
+    if not isinstance(entry_payloads, list):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} has no valid entries list.")
+    for entry_payload in entry_payloads:
+        if not isinstance(entry_payload, dict):
+            raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid entry.")
+        asset_payloads = entry_payload.get("assets", [])
+        if not isinstance(asset_payloads, list):
+            raise RuntimeError(f"Custom nodes manifest {local_bundle} contains invalid assets.")
+        for asset_payload in asset_payloads:
+            if not isinstance(asset_payload, dict):
+                raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset.")
+            yield asset_payload
+
+
+def _validated_custom_node_asset_relative_path(
+    local_bundle: Path,
+    asset_payload: Mapping[str, Any],
+) -> Path:
+    """Return one safe extraction-relative custom-node asset path."""
+    relative_path_value = asset_payload.get("relative_path")
+    remote_path = asset_payload.get("remote_path")
+    sha256 = asset_payload.get("sha256")
+    size_bytes = asset_payload.get("size_bytes")
+    if not isinstance(relative_path_value, str) or not relative_path_value:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an asset without a path.")
+    if not isinstance(remote_path, str) or not remote_path:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an asset without storage.")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or not Path(remote_path).name.startswith(f"{sha256}_")
+    ):
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset digest.")
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset size.")
+    relative_path = Path(relative_path_value)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} contains unsafe asset path {relative_path_value!r}."
+        )
+    return relative_path
 
 
 def _resolve_custom_nodes_bundle_path(bundle_path: str, storage_roots: list[Path]) -> Path | None:
@@ -5119,14 +5253,18 @@ def _stream_remote_payload_events(
             execute_node_kwargs["interrupt_flag_key"] = interrupt_flag_key
         return execute_node_locally(payload, kwargs_payload, **execute_node_kwargs)
 
+    object_store = _durable_object_store()
+
     def execute_payload() -> None:
-        """Run the payload in a worker thread and enqueue the terminal outcome."""
+        """Run compute in a worker thread while deferring Modal volume commits."""
+        pending_batch: DurableObjectCommitBatch | None = None
         try:
-            outputs = _execute_with_durable_invocation(payload, execute_once)
+            with object_store.batch_commits(commit_on_exit=False) as pending_batch:
+                outputs = coerce_serialized_node_outputs(execute_once())
         except Exception as exc:  # pragma: no cover - exercised through generator consumer tests.
-            event_buffer.publish_terminal("error", exc)
+            event_buffer.publish_terminal("error", (exc, pending_batch))
         else:
-            event_buffer.publish_terminal("result", outputs)
+            event_buffer.publish_terminal("result", (outputs, pending_batch))
         finally:
             event_buffer.publish_terminal("done", None)
 
@@ -5137,6 +5275,10 @@ def _stream_remote_payload_events(
     )
     if task_id:
         yield {"kind": "remote_logs", "task_id": task_id}
+    running_record, completed_result = _begin_remote_invocation(payload)
+    if completed_result is not None:
+        yield {"kind": "result", "outputs": completed_result}
+        return
     worker_thread.start()
     try:
         while True:
@@ -5145,10 +5287,25 @@ def _stream_remote_payload_events(
                 yield {"kind": "progress", **event_payload}
                 continue
             if event_kind == "result":
-                yield {"kind": "result", "outputs": coerce_serialized_node_outputs(event_payload)}
+                outputs, pending_batch = event_payload
+                serialized_outputs = coerce_serialized_node_outputs(outputs)
+                if running_record is not None:
+                    _complete_remote_invocation(
+                        running_record,
+                        serialized_outputs,
+                        pending_batch=pending_batch,
+                    )
+                elif pending_batch is not None:
+                    object_store.commit_batch(pending_batch)
+                yield {"kind": "result", "outputs": serialized_outputs}
                 continue
             if event_kind == "error":
-                raise event_payload
+                error, pending_batch = event_payload
+                if pending_batch is not None:
+                    object_store.commit_batch(pending_batch)
+                if running_record is not None:
+                    _fail_remote_invocation(running_record, error)
+                raise error
             if event_kind == "done":
                 return
     finally:
@@ -5170,19 +5327,64 @@ def _should_ignore_repo_path(path: Path) -> bool:
     return path.suffix.lower() in {".log", ".pyc", ".pyo", ".swp", ".tmp"}
 
 
+_COMFYUI_IMAGE_EXCLUDED_SUFFIXES = frozenset(
+    {
+        ".bin",
+        ".ckpt",
+        ".engine",
+        ".gguf",
+        ".log",
+        ".onnx",
+        ".pt",
+        ".pth",
+        ".pyc",
+        ".pyo",
+        ".safetensors",
+        ".swp",
+        ".tmp",
+        ".vae",
+    }
+)
+
+
+def _comfyui_image_relative_parts(path: Path) -> tuple[str, ...]:
+    """Return normalized ComfyUI-relative path parts for one image candidate."""
+    candidate = path
+    if path.is_absolute():
+        comfyui_root = get_settings().comfyui_root
+        if comfyui_root is None:
+            return ()
+        try:
+            candidate = path.relative_to(comfyui_root)
+        except ValueError:
+            return ()
+    return tuple(part for part in candidate.parts if part not in {"", "."})
+
+
 def _should_ignore_comfyui_path(path: Path) -> bool:
-    """Return whether a local ComfyUI path should be omitted from the Modal image mount."""
-    parts = path.parts
+    """Allow only source and configuration required by the headless Modal runtime."""
+    parts = _comfyui_image_relative_parts(path)
     if not parts:
         return False
 
-    if {".cache", ".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"} & set(parts):
+    if {
+        ".cache",
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    } & set(parts):
         return True
-
-    if parts[0] in {"custom_nodes", "input", "models", "output", "temp", "user"}:
+    if path.suffix.lower() in _COMFYUI_IMAGE_EXCLUDED_SUFFIXES:
         return True
-
-    return path.suffix.lower() in {".bin", ".ckpt", ".log", ".pt", ".pyc", ".pyo", ".safetensors", ".swp", ".tmp"}
+    if parts[0] in _COMFYUI_IMAGE_RUNTIME_DIRECTORIES:
+        return False
+    return not (
+        len(parts) == 1
+        and (path.suffix.lower() == ".py" or parts[0] in _COMFYUI_IMAGE_RUNTIME_FILES)
+    )
 
 
 def _prewarm_snapshot_state(
