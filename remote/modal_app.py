@@ -2429,6 +2429,20 @@ def _emit_local_modal_status(
 
 def _emit_local_remote_dispatch_status(payload: dict[str, Any]) -> None:
     """Tell the local UI a remote component was dispatched before Modal streams progress."""
+    _emit_local_remote_startup_status(
+        payload,
+        phase="starting",
+        status_message="Starting Modal component",
+    )
+
+
+def _emit_local_remote_startup_status(
+    payload: Mapping[str, Any],
+    *,
+    phase: str,
+    status_message: str,
+) -> None:
+    """Show one prompt-scoped Modal startup phase in the local global status pill."""
     prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
     extra_data = payload.get("extra_data") or {}
     client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
@@ -2440,9 +2454,9 @@ def _emit_local_remote_dispatch_status(payload: dict[str, Any]) -> None:
     _emit_local_modal_status(
         prompt_id=prompt_id,
         client_id=client_id,
-        phase="starting",
+        phase=phase,
         node_ids=node_ids,
-        status_message="Starting Modal component",
+        status_message=status_message,
     )
 
 
@@ -5517,8 +5531,14 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
                     deploy_key[1] or "<default>",
                     payload.get("component_id"),
                 )
+                _emit_local_remote_startup_status(
+                    payload,
+                    phase="setup",
+                    status_message="Waiting for Modal app rebuild",
+                )
                 deploy_state.condition.wait()
                 if deploy_state.ready:
+                    _emit_local_remote_dispatch_status(payload)
                     return _lookup_deployed_remote_engine(payload)
                 if deploy_state.last_error is not None:
                     logger.warning(
@@ -5532,6 +5552,11 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
             deploy_state.last_error = None
             break
 
+    _emit_local_remote_startup_status(
+        payload,
+        phase="setup",
+        status_message="Rebuilding Modal app",
+    )
     try:
         logger.warning(
             "Deployed Modal app lookup failed for app=%s component=%s: %s. "
@@ -5579,6 +5604,7 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
         settings.app_name,
         deploy_key[1] or "<default>",
     )
+    _emit_local_remote_dispatch_status(payload)
     return remote_engine
 
 
