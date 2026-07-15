@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
 from typing import Any
 
@@ -113,6 +114,117 @@ def test_cloud_invocation_rejects_duplicate_active_attempt(
             {"invocation_id": "RIV_running"},
             lambda: b"must-not-run",
         )
+
+
+def test_cloud_canary_echo_reports_binary_transport(
+    modal_cloud_module: Any,
+) -> None:
+    """The dependency-light canary should round-trip tensors through binary RPC bytes."""
+    import torch
+
+    value = torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2)
+    kwargs_payload = modal_cloud_module.serialize_node_inputs({"value": value})
+
+    response = modal_cloud_module._execute_canary_payload(
+        {"payload_kind": "canary", "component_id": "canary-echo"},
+        kwargs_payload,
+        cancellation_event=threading.Event(),
+        interrupt_store=None,
+        interrupt_flag_key=None,
+    )
+    restored_value, metadata = modal_cloud_module.deserialize_node_outputs(response)
+
+    assert kwargs_payload.startswith(b"CMODALB1")
+    assert response.startswith(b"CMODALB1")
+    assert torch.equal(restored_value, value)
+    assert metadata["transport_kind"] == "binary"
+    assert metadata["component_id"] == "canary-echo"
+
+
+def test_cloud_canary_observes_cancellation_before_work(
+    modal_cloud_module: Any,
+) -> None:
+    """A canary should fail immediately when its local cancellation event is set."""
+    cancellation_event = threading.Event()
+    cancellation_event.set()
+
+    with pytest.raises(
+        modal_cloud_module.RemoteCanaryInterruptedError,
+        match="interrupted",
+    ):
+        modal_cloud_module._execute_canary_payload(
+            {
+                "payload_kind": "canary",
+                "component_id": "canary-cancel",
+                "canary_delay_seconds": 1.0,
+            },
+            modal_cloud_module.serialize_node_inputs({"value": "unused"}),
+            cancellation_event=cancellation_event,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+        )
+
+
+def test_cloud_canary_consumes_shared_interrupt_flag(
+    modal_cloud_module: Any,
+) -> None:
+    """The live canary should consume the same Modal Dict flag as real prompts."""
+
+    class InterruptStore(dict[str, Any]):
+        """Minimal Modal Dict-like interrupt store for the canary helper."""
+
+        def contains(self, key: str) -> bool:
+            """Return whether one interrupt key is present."""
+            return key in self
+
+    cancellation_event = threading.Event()
+    interrupt_store = InterruptStore({"prompt-1:component-1": {"requested_at": time.time()}})
+
+    with pytest.raises(
+        modal_cloud_module.RemoteCanaryInterruptedError,
+        match="interrupted",
+    ):
+        modal_cloud_module._execute_canary_payload(
+            {
+                "payload_kind": "canary",
+                "component_id": "component-1",
+                "canary_delay_seconds": 1.0,
+            },
+            modal_cloud_module.serialize_node_inputs({"value": "unused"}),
+            cancellation_event=cancellation_event,
+            interrupt_store=interrupt_store,
+            interrupt_flag_key="prompt-1:component-1",
+        )
+
+    assert cancellation_event.is_set()
+    assert "prompt-1:component-1" not in interrupt_store
+
+
+def test_cloud_canary_barrier_coordinates_shared_store_members(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel canaries should rendezvous through their shared Modal Dict markers."""
+    barrier_store: dict[str, Any] = {
+        "CANARY_BARRIER:barrier-1:member-b": {"ready_at": time.time()}
+    }
+    monkeypatch.setattr(modal_cloud_module, "invocation_records", barrier_store, raising=False)
+
+    released_at = modal_cloud_module._wait_for_canary_barrier(
+        {
+            "barrier_id": "barrier-1",
+            "member_id": "member-a",
+            "members": ["member-a", "member-b"],
+            "timeout_seconds": 1.0,
+        },
+        component_id="canary-a",
+        cancellation_event=threading.Event(),
+        interrupt_store=None,
+        interrupt_flag_key=None,
+    )
+
+    assert released_at is not None
+    assert "CANARY_BARRIER:barrier-1:member-a" in barrier_store
 
 
 def test_cloud_large_bridge_inputs_and_output_use_object_store(

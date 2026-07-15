@@ -134,6 +134,14 @@ class RemoteInvocationInProgressError(RuntimeError):
     """Raised when an idempotent invocation is already running remotely."""
 
 
+class RemoteCanaryInterruptedError(RuntimeError):
+    """Raised when a live remote canary observes its shared interrupt flag."""
+
+
+class RemoteCanaryBarrierTimeoutError(TimeoutError):
+    """Raised when live canary calls fail to overlap before their deadline."""
+
+
 class ExistingModalAppError(RuntimeError):
     """Raised when deploying would overwrite an existing Modal app."""
 
@@ -464,6 +472,178 @@ def _execute_with_durable_invocation(
     if running_record is not None:
         _complete_remote_invocation(running_record, serialized_outputs)
     return serialized_outputs
+
+
+def _canary_interrupt_requested(
+    *,
+    cancellation_event: threading.Event | None,
+    interrupt_store: Any | None,
+    interrupt_flag_key: str | None,
+) -> bool:
+    """Consume and report one local or shared live-canary interrupt request."""
+    if cancellation_event is not None and cancellation_event.is_set():
+        return True
+    if interrupt_store is None or interrupt_flag_key is None:
+        return False
+    if not bool(interrupt_store.contains(interrupt_flag_key)):
+        return False
+    interrupt_store.pop(interrupt_flag_key, None)
+    if cancellation_event is not None:
+        cancellation_event.set()
+    return True
+
+
+def _raise_if_canary_interrupted(
+    *,
+    component_id: str,
+    cancellation_event: threading.Event | None,
+    interrupt_store: Any | None,
+    interrupt_flag_key: str | None,
+) -> None:
+    """Raise the canary interruption error when either cancellation source trips."""
+    if _canary_interrupt_requested(
+        cancellation_event=cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key=interrupt_flag_key,
+    ):
+        raise RemoteCanaryInterruptedError(
+            f"Live Modal canary for component {component_id!r} was interrupted."
+        )
+
+
+def _put_canary_barrier_marker(marker_key: str, marker_payload: Mapping[str, Any]) -> None:
+    """Publish one live-canary barrier marker through shared invocation storage."""
+    store = _invocation_record_store()
+    put_method = getattr(store, "put", None)
+    if callable(put_method):
+        put_method(marker_key, dict(marker_payload))
+        return
+    store[marker_key] = dict(marker_payload)
+
+
+def _canary_barrier_marker_exists(marker_key: str) -> bool:
+    """Return whether one live-canary barrier member has reached its worker."""
+    store = _invocation_record_store()
+    contains_method = getattr(store, "contains", None)
+    if callable(contains_method):
+        return bool(contains_method(marker_key))
+    return store.get(marker_key) is not None
+
+
+def _canary_barrier_marker_key(barrier_id: str, member_id: str) -> str:
+    """Return the shared invocation-store key for one canary barrier member."""
+    return f"CANARY_BARRIER:{barrier_id}:{member_id}"
+
+
+def _wait_for_canary_barrier(
+    barrier: Mapping[str, Any],
+    *,
+    component_id: str,
+    cancellation_event: threading.Event | None,
+    interrupt_store: Any | None,
+    interrupt_flag_key: str | None,
+) -> float | None:
+    """Coordinate multiple live Modal calls and return their release timestamp."""
+    barrier_id = str(barrier.get("barrier_id") or "").strip()
+    member_id = str(barrier.get("member_id") or "").strip()
+    raw_members = barrier.get("members")
+    if not barrier_id and not member_id and raw_members is None:
+        return None
+    if not barrier_id or not member_id or not isinstance(raw_members, list):
+        raise ValueError("Live Modal canary barriers require id, member, and member list.")
+    members = [str(member).strip() for member in raw_members if str(member).strip()]
+    if member_id not in members or len(set(members)) != len(members):
+        raise ValueError("Live Modal canary barrier members must be unique and include this call.")
+    timeout_seconds = float(barrier.get("timeout_seconds", 60.0))
+    if timeout_seconds <= 0.0 or timeout_seconds > 300.0:
+        raise ValueError("Live Modal canary barrier timeout must be within (0, 300] seconds.")
+
+    _put_canary_barrier_marker(
+        _canary_barrier_marker_key(barrier_id, member_id),
+        {
+            "component_id": component_id,
+            "ready_at": time.time(),
+            "task_id": os.getenv("MODAL_TASK_ID"),
+        },
+    )
+    deadline = time.monotonic() + timeout_seconds
+    member_keys = [
+        _canary_barrier_marker_key(barrier_id, current_member)
+        for current_member in members
+    ]
+    while not all(_canary_barrier_marker_exists(key) for key in member_keys):
+        _raise_if_canary_interrupted(
+            component_id=component_id,
+            cancellation_event=cancellation_event,
+            interrupt_store=interrupt_store,
+            interrupt_flag_key=interrupt_flag_key,
+        )
+        if time.monotonic() >= deadline:
+            raise RemoteCanaryBarrierTimeoutError(
+                f"Live Modal canary barrier {barrier_id!r} did not reach "
+                f"all {len(member_keys)} members within {timeout_seconds:.1f}s."
+            )
+        time.sleep(0.05)
+    return time.time()
+
+
+def _execute_canary_payload(
+    payload: Mapping[str, Any],
+    kwargs_payload: bytes | bytearray | str | Mapping[str, Any],
+    *,
+    cancellation_event: threading.Event | None,
+    interrupt_store: Any | None,
+    interrupt_flag_key: str | None,
+) -> bytes:
+    """Execute a dependency-light live canary inside the deployed Modal worker."""
+    component_id = str(payload.get("component_id") or "live-canary")
+    started_at = time.time()
+    barrier = payload.get("canary_barrier")
+    barrier_released_at = _wait_for_canary_barrier(
+        barrier if isinstance(barrier, Mapping) else {},
+        component_id=component_id,
+        cancellation_event=cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key=interrupt_flag_key,
+    )
+    delay_seconds = float(payload.get("canary_delay_seconds", 0.0))
+    if delay_seconds < 0.0 or delay_seconds > 300.0:
+        raise ValueError("Live Modal canary delay must be within [0, 300] seconds.")
+    delay_deadline = time.monotonic() + delay_seconds
+    while time.monotonic() < delay_deadline:
+        _raise_if_canary_interrupted(
+            component_id=component_id,
+            cancellation_event=cancellation_event,
+            interrupt_store=interrupt_store,
+            interrupt_flag_key=interrupt_flag_key,
+        )
+        time.sleep(min(0.05, max(0.0, delay_deadline - time.monotonic())))
+    _raise_if_canary_interrupted(
+        component_id=component_id,
+        cancellation_event=cancellation_event,
+        interrupt_store=interrupt_store,
+        interrupt_flag_key=interrupt_flag_key,
+    )
+    hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    normalized_transport = (
+        bytes(kwargs_payload)
+        if isinstance(kwargs_payload, bytes | bytearray)
+        else None
+    )
+    metadata = {
+        "barrier_released_at": barrier_released_at,
+        "component_id": component_id,
+        "finished_at": time.time(),
+        "modal_task_id": os.getenv("MODAL_TASK_ID"),
+        "started_at": started_at,
+        "transport_kind": (
+            "binary"
+            if normalized_transport is not None
+            and normalized_transport.startswith(b"CMODALB1")
+            else "legacy"
+        ),
+    }
+    return serialize_node_outputs((hydrated_inputs.get("value"), metadata))
 
 
 def _snapshot_profile_store() -> Any | None:
@@ -4894,6 +5074,14 @@ def _stream_remote_payload_events(
 
     def execute_once() -> bytes:
         """Run the underlying payload once and return serialized outputs."""
+        if payload.get("payload_kind") == "canary":
+            return _execute_canary_payload(
+                payload,
+                kwargs_payload,
+                cancellation_event=cancellation_event,
+                interrupt_store=interrupt_store,
+                interrupt_flag_key=interrupt_flag_key,
+            )
         if payload.get("payload_kind") == "mapped_subgraph":
             custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
             _ensure_comfy_runtime_initialized(custom_nodes_root)
@@ -5605,6 +5793,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
 
                         def execute_once() -> bytes:
                             """Execute the underlying payload once inside this request context."""
+                            if payload.get("payload_kind") == "canary":
+                                return _execute_canary_payload(
+                                    payload,
+                                    kwargs_payload,
+                                    cancellation_event=execution_control.cancellation_event,
+                                    interrupt_store=interrupt_flags,
+                                    interrupt_flag_key=execution_control.interrupt_flag_key,
+                                )
                             if payload.get("payload_kind") == "mapped_subgraph":
                                 custom_nodes_root = _extract_custom_nodes_bundle(
                                     payload.get("custom_nodes_bundle")

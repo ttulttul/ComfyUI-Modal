@@ -46,6 +46,9 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live_modal: opt-in tests that use authenticated, billable Modal resources",
+]
 
 [tool.uv]
 package = false
