@@ -240,6 +240,21 @@ def test_settings_defaults_session_bridge_dict_name_from_app_name(
     assert settings.session_bridge_dict_name == "my-modal-app-session-bridges"
 
 
+def test_settings_defaults_invocation_dict_name_from_app_name(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The durable invocation dict should default to one derived from the app name."""
+    monkeypatch.setenv("COMFY_MODAL_APP_NAME", "my-modal-app")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.invocation_dict_name == "my-modal-app-invocations"
+
+
 def test_settings_defaults_node_cache_max_bytes_to_five_mib(
     settings_module: Any,
     monkeypatch: Any,
@@ -285,6 +300,25 @@ def test_settings_reads_session_bridge_dict_name_override(
         settings_module.get_settings.cache_clear()
 
     assert settings.session_bridge_dict_name == "custom-session-bridges"
+
+
+def test_settings_reads_durable_invocation_and_bridge_limits(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Durable state metadata stores and inline byte limits should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_INVOCATION_DICT_NAME", "custom-invocations")
+    monkeypatch.setenv("COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES", "1234")
+    monkeypatch.setenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", "5678")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.invocation_dict_name == "custom-invocations"
+    assert settings.bridge_inline_max_bytes == 1234
+    assert settings.invocation_result_inline_max_bytes == 5678
 
 
 def test_settings_reads_terminate_container_on_error_override(

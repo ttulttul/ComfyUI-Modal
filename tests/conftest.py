@@ -113,6 +113,12 @@ def serialization_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def durable_state_module(extension_package: object) -> object:
+    """Return the durable invocation and object-storage helpers module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.durable_state")
+
+
+@pytest.fixture(scope="session")
 def settings_module(extension_package: object) -> object:
     """Return the settings module."""
     return importlib.import_module(f"{PACKAGE_NAME}.settings")
@@ -154,6 +160,8 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.delenv("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT", raising=False)
     monkeypatch.delenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", raising=False)
     monkeypatch.delenv("COMFY_MODAL_INTERRUPT_DICT_NAME", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_INVOCATION_DICT_NAME", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", raising=False)
     monkeypatch.delenv("COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR", raising=False)
     monkeypatch.delenv("COMFY_MODAL_MAX_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_BUFFER_CONTAINERS", raising=False)
@@ -164,6 +172,7 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.delenv("COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_SESSION_BRIDGE_DICT_NAME", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES", raising=False)
     monkeypatch.delenv("COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE", raising=False)
     monkeypatch.delenv("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_SCALEDOWN_WINDOW", raising=False)

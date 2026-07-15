@@ -10,6 +10,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+try:
+    from .durable_state import DurableObjectRef
+except ImportError:  # pragma: no cover - stable cloud entry imports this module top-level.
+    from durable_state import DurableObjectRef
+
 logger = logging.getLogger(__name__)
 
 _REMOTE_SESSION_HANDLE_MARKER = "__comfy_modal_remote_session_handle__"
@@ -141,7 +146,9 @@ class RemoteSessionBridgeRecord:
     output_index: int
     producer_payload: dict[str, Any]
     producer_inputs: dict[str, Any]
+    producer_inputs_object: DurableObjectRef | None = None
     serialized_output: Any | None = None
+    serialized_output_object: DurableObjectRef | None = None
     serialized_output_io_type: str | None = None
     rehydration_plan: dict[str, Any] | None = None
     rehydration_plan_io_type: str | None = None
@@ -155,7 +162,17 @@ class RemoteSessionBridgeRecord:
             "output_index": self.output_index,
             "producer_payload": self.producer_payload,
             "producer_inputs": self.producer_inputs,
+            "producer_inputs_object": (
+                self.producer_inputs_object.to_payload()
+                if self.producer_inputs_object is not None
+                else None
+            ),
             "serialized_output": self.serialized_output,
+            "serialized_output_object": (
+                self.serialized_output_object.to_payload()
+                if self.serialized_output_object is not None
+                else None
+            ),
             "serialized_output_io_type": self.serialized_output_io_type,
             "rehydration_plan": self.rehydration_plan,
             "rehydration_plan_io_type": self.rehydration_plan_io_type,
@@ -182,6 +199,8 @@ class RemoteSessionBridgeRecord:
                 "Remote session bridge records must define mapping producer_payload and producer_inputs."
             )
         serialized_output_io_type = payload.get("serialized_output_io_type")
+        producer_inputs_object_payload = payload.get("producer_inputs_object")
+        serialized_output_object_payload = payload.get("serialized_output_object")
         rehydration_plan = payload.get("rehydration_plan")
         rehydration_plan_io_type = payload.get("rehydration_plan_io_type")
         return cls(
@@ -190,7 +209,17 @@ class RemoteSessionBridgeRecord:
             output_index=int(output_index),
             producer_payload=dict(producer_payload),
             producer_inputs=dict(producer_inputs),
+            producer_inputs_object=(
+                DurableObjectRef.from_payload(producer_inputs_object_payload)
+                if isinstance(producer_inputs_object_payload, Mapping)
+                else None
+            ),
             serialized_output=payload.get("serialized_output"),
+            serialized_output_object=(
+                DurableObjectRef.from_payload(serialized_output_object_payload)
+                if isinstance(serialized_output_object_payload, Mapping)
+                else None
+            ),
             serialized_output_io_type=(
                 str(serialized_output_io_type)
                 if serialized_output_io_type is not None and str(serialized_output_io_type).strip()

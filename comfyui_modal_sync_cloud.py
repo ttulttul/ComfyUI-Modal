@@ -42,7 +42,7 @@ for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_CO
     if candidate_exists and candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-from runtime_environment import (
+from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     PYTORCH_CUDA_INDEX_URL as _PYTORCH_CUDA_INDEX_URL,
     REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
     REMOTE_PYTHON_VERSION,
@@ -51,17 +51,26 @@ from runtime_environment import (
     remote_runtime_packages as _comfyui_runtime_packages,
     remote_torch_packages as _comfyui_torch_packages,
 )
+from durable_state import (  # noqa: E402 - paths are bootstrapped above.
+    DurableObjectRef,
+    DurableStateError,
+    FileDurableObjectStore,
+    InMemoryRemoteInvocationStore,
+    RemoteInvocationRecord,
+    new_running_invocation_record,
+)
 
-from serialization import (
+from serialization import (  # noqa: E402 - paths are bootstrapped above.
     coerce_serialized_node_outputs,
     deserialize_node_inputs,
     deserialize_node_outputs,
     deserialize_value,
     serialize_mapping,
+    serialize_node_inputs,
     serialize_node_outputs,
     serialize_value,
 )
-from session_state import (
+from session_state import (  # noqa: E402 - paths are bootstrapped above.
     InMemoryRemoteSessionBridgeStore,
     InMemoryRemoteSessionStore,
     RemoteSessionBridgeRecord,
@@ -74,7 +83,7 @@ from session_state import (
     is_remote_session_value_ref_payload,
     stable_session_bridge_key,
 )
-from settings import get_settings
+from settings import get_settings  # noqa: E402 - paths are bootstrapped above.
 
 logger = logging.getLogger(__name__)
 _CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
@@ -100,6 +109,9 @@ _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
+_REMOTE_INVOCATION_STORE = InMemoryRemoteInvocationStore()
+_DURABLE_OBJECT_STORE_LOCK = threading.Lock()
+_DURABLE_OBJECT_STORE: FileDurableObjectStore | None = None
 _REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
@@ -116,6 +128,10 @@ except ModuleNotFoundError:  # pragma: no cover - remote entrypoint only.
 
 class RemoteSubgraphExecutionError(RuntimeError):
     """Raised when remote subgraph execution fails."""
+
+
+class RemoteInvocationInProgressError(RuntimeError):
+    """Raised when an idempotent invocation is already running remotely."""
 
 
 class ExistingModalAppError(RuntimeError):
@@ -273,7 +289,181 @@ def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHand
 
 def _session_bridge_store() -> Any:
     """Return the durable store used to replay session-backed outputs across containers."""
-    return globals().get("session_bridge_cache") or _REMOTE_SESSION_BRIDGE_STORE
+    shared_store = globals().get("session_bridge_cache")
+    return shared_store if shared_store is not None else _REMOTE_SESSION_BRIDGE_STORE
+
+
+def _durable_object_store() -> FileDurableObjectStore:
+    """Return the process-local handle for volume-backed durable binary objects."""
+    global _DURABLE_OBJECT_STORE
+
+    with _DURABLE_OBJECT_STORE_LOCK:
+        if _DURABLE_OBJECT_STORE is not None:
+            return _DURABLE_OBJECT_STORE
+        settings = get_settings()
+        commit_callback: Callable[[], Any] | None = None
+        reload_callback: Callable[[], Any] | None = None
+        if _is_modal_container_runtime():
+            object_root = Path(settings.remote_storage_root) / "durable_objects"
+            volume = globals().get("vol")
+            volume_commit = getattr(volume, "commit", None)
+            if callable(volume_commit):
+                commit_callback = volume_commit
+            volume_reload = getattr(volume, "reload", None)
+            if callable(volume_reload):
+                reload_callback = volume_reload
+        else:
+            object_root = settings.local_storage_root / "durable_objects"
+        _DURABLE_OBJECT_STORE = FileDurableObjectStore(
+            object_root,
+            commit_callback=commit_callback,
+            reload_callback=reload_callback,
+        )
+        return _DURABLE_OBJECT_STORE
+
+
+def _invocation_record_store() -> Any:
+    """Return the shared lifecycle store for idempotent remote invocations."""
+    shared_store = globals().get("invocation_records")
+    return shared_store if shared_store is not None else _REMOTE_INVOCATION_STORE
+
+
+def _load_remote_invocation_record(
+    invocation_id: str,
+) -> RemoteInvocationRecord | None:
+    """Load one invocation record from the configured shared store."""
+    store = _invocation_record_store()
+    get_record = getattr(store, "get_record", None)
+    if callable(get_record):
+        return get_record(invocation_id)
+    payload = store.get(invocation_id)
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise DurableStateError(
+            f"Remote invocation record {invocation_id!r} is not a mapping."
+        )
+    return RemoteInvocationRecord.from_payload(payload)
+
+
+def _store_remote_invocation_record(record: RemoteInvocationRecord) -> None:
+    """Persist one invocation lifecycle update to the configured shared store."""
+    store = _invocation_record_store()
+    put_record = getattr(store, "put_record", None)
+    if callable(put_record):
+        put_record(record)
+        return
+    store[record.invocation_id] = record.to_payload()
+
+
+def _load_completed_remote_invocation_result(record: RemoteInvocationRecord) -> bytes:
+    """Load the validated result for one completed invocation record."""
+    if record.result_inline is not None:
+        return record.result_inline
+    if record.result_object is not None:
+        return _durable_object_store().get(record.result_object)
+    raise DurableStateError(
+        f"Completed remote invocation {record.invocation_id!r} has no result."
+    )
+
+
+def _begin_remote_invocation(
+    payload: Mapping[str, Any],
+) -> tuple[RemoteInvocationRecord | None, bytes | None]:
+    """Start an invocation attempt or return its already-completed result."""
+    invocation_id = str(payload.get("invocation_id") or "").strip()
+    if not invocation_id:
+        return None, None
+    previous_record = _load_remote_invocation_record(invocation_id)
+    if previous_record is not None and previous_record.state == "completed":
+        logger.info(
+            "Replaying completed remote invocation invocation_id=%s attempt=%d.",
+            invocation_id,
+            previous_record.attempt,
+        )
+        return None, _load_completed_remote_invocation_result(previous_record)
+    if previous_record is not None and previous_record.state == "running":
+        settings = get_settings()
+        stale_after_seconds = (
+            settings.execution_timeout_seconds + settings.startup_timeout_seconds
+        )
+        if time.time() - previous_record.updated_at <= stale_after_seconds:
+            raise RemoteInvocationInProgressError(
+                f"Remote invocation {invocation_id!r} is already running "
+                f"(attempt {previous_record.attempt})."
+            )
+        logger.warning(
+            "Recovering stale remote invocation invocation_id=%s attempt=%d.",
+            invocation_id,
+            previous_record.attempt,
+        )
+    running_record = new_running_invocation_record(invocation_id, previous_record)
+    _store_remote_invocation_record(running_record)
+    return running_record, None
+
+
+def _complete_remote_invocation(
+    running_record: RemoteInvocationRecord,
+    serialized_outputs: bytes,
+) -> None:
+    """Persist one successful invocation result inline or in the object store."""
+    settings = get_settings()
+    result_inline: bytes | None = serialized_outputs
+    result_object = None
+    if len(serialized_outputs) > settings.invocation_result_inline_max_bytes:
+        result_object = _durable_object_store().put(
+            "invocation_results",
+            serialized_outputs,
+        )
+        result_inline = None
+    _store_remote_invocation_record(
+        RemoteInvocationRecord(
+            invocation_id=running_record.invocation_id,
+            state="completed",
+            attempt=running_record.attempt,
+            created_at=running_record.created_at,
+            updated_at=time.time(),
+            result_inline=result_inline,
+            result_object=result_object,
+        )
+    )
+
+
+def _fail_remote_invocation(
+    running_record: RemoteInvocationRecord,
+    error: Exception,
+) -> None:
+    """Persist a failed invocation attempt while allowing a later retry."""
+    _store_remote_invocation_record(
+        RemoteInvocationRecord(
+            invocation_id=running_record.invocation_id,
+            state="failed",
+            attempt=running_record.attempt,
+            created_at=running_record.created_at,
+            updated_at=time.time(),
+            error_type=type(error).__name__,
+            error_message=str(error)[:4096],
+        )
+    )
+
+
+def _execute_with_durable_invocation(
+    payload: Mapping[str, Any],
+    execute_once: Callable[[], bytes | bytearray | str | Sequence[Any] | Any],
+) -> bytes:
+    """Execute once and durably replay the result for duplicate retries."""
+    running_record, completed_result = _begin_remote_invocation(payload)
+    if completed_result is not None:
+        return completed_result
+    try:
+        serialized_outputs = coerce_serialized_node_outputs(execute_once())
+    except Exception as exc:
+        if running_record is not None:
+            _fail_remote_invocation(running_record, exc)
+        raise
+    if running_record is not None:
+        _complete_remote_invocation(running_record, serialized_outputs)
+    return serialized_outputs
 
 
 def _snapshot_profile_store() -> Any | None:
@@ -325,6 +515,63 @@ def _sanitize_payload_for_session_bridge_record(payload: dict[str, Any]) -> dict
     return sanitized_payload
 
 
+def _json_payload_size_bytes(payload: Any) -> int:
+    """Return the compact UTF-8 size of one JSON-safe payload."""
+    return len(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _offload_large_bridge_payloads(
+    *,
+    hydrated_inputs: Mapping[str, Any],
+    producer_inputs: dict[str, Any],
+    output_value: Any,
+    serialized_output: Any | None,
+) -> tuple[
+    dict[str, Any],
+    DurableObjectRef | None,
+    Any | None,
+    DurableObjectRef | None,
+]:
+    """Move oversized bridge inputs and outputs into durable binary objects."""
+    max_inline_bytes = get_settings().bridge_inline_max_bytes
+    producer_inputs_object: DurableObjectRef | None = None
+    serialized_output_object: DurableObjectRef | None = None
+    if _json_payload_size_bytes(producer_inputs) > max_inline_bytes:
+        producer_inputs_object = _durable_object_store().put(
+            "bridge_objects",
+            serialize_node_inputs(hydrated_inputs),
+        )
+        producer_inputs = {}
+    if (
+        serialized_output is not None
+        and _json_payload_size_bytes(serialized_output) > max_inline_bytes
+    ):
+        serialized_output_object = _durable_object_store().put(
+            "bridge_objects",
+            serialize_node_outputs((output_value,)),
+        )
+        serialized_output = None
+    return (
+        producer_inputs,
+        producer_inputs_object,
+        serialized_output,
+        serialized_output_object,
+    )
+
+
+def _deserialize_remote_session_bridge_producer_inputs(
+    record: RemoteSessionBridgeRecord,
+) -> dict[str, Any]:
+    """Restore bridge producer inputs from inline metadata or durable storage."""
+    if record.producer_inputs_object is not None:
+        return deserialize_node_inputs(
+            _durable_object_store().get(record.producer_inputs_object)
+        )
+    return deserialize_node_inputs(record.producer_inputs)
+
+
 def _build_remote_session_bridge_record(
     *,
     payload: dict[str, Any],
@@ -338,6 +585,23 @@ def _build_remote_session_bridge_record(
     producer_payload = _sanitize_payload_for_session_bridge_record(payload)
     producer_inputs = serialize_mapping(hydrated_inputs)
     serialized_output = _serialize_durable_bridge_output(output_value, io_type)
+    bridge_key = stable_session_bridge_key(
+        producer_payload=producer_payload,
+        producer_inputs=producer_inputs,
+        node_id=node_id,
+        output_index=output_index,
+    )
+    (
+        producer_inputs,
+        producer_inputs_object,
+        serialized_output,
+        serialized_output_object,
+    ) = _offload_large_bridge_payloads(
+        hydrated_inputs=hydrated_inputs,
+        producer_inputs=producer_inputs,
+        output_value=output_value,
+        serialized_output=serialized_output,
+    )
     rehydration_plan = _build_durable_bridge_rehydration_plan(
         payload=producer_payload,
         node_id=node_id,
@@ -345,18 +609,19 @@ def _build_remote_session_bridge_record(
         io_type=io_type,
     )
     return RemoteSessionBridgeRecord(
-        bridge_key=stable_session_bridge_key(
-            producer_payload=producer_payload,
-            producer_inputs=producer_inputs,
-            node_id=node_id,
-            output_index=output_index,
-        ),
+        bridge_key=bridge_key,
         node_id=node_id,
         output_index=output_index,
         producer_payload=producer_payload,
         producer_inputs=producer_inputs,
+        producer_inputs_object=producer_inputs_object,
         serialized_output=serialized_output,
-        serialized_output_io_type=(str(io_type) if serialized_output is not None else None),
+        serialized_output_object=serialized_output_object,
+        serialized_output_io_type=(
+            str(io_type)
+            if serialized_output is not None or serialized_output_object is not None
+            else None
+        ),
         rehydration_plan=rehydration_plan,
         rehydration_plan_io_type=(str(io_type) if rehydration_plan is not None else None),
     )
@@ -456,11 +721,24 @@ def _restore_serialized_remote_session_bridge_value(
     resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> Any | None:
     """Restore one bridge value directly from a durable serialized payload."""
-    if record.serialized_output is None:
+    if record.serialized_output is None and record.serialized_output_object is None:
         return None
 
     restore_started_at = time.perf_counter()
-    restored_value = deserialize_value(record.serialized_output)
+    if record.serialized_output_object is not None:
+        restored_outputs = deserialize_node_outputs(
+            _durable_object_store().get(record.serialized_output_object)
+        )
+        if len(restored_outputs) != 1:
+            raise DurableStateError(
+                f"Bridge object {record.serialized_output_object.object_path!r} "
+                "must contain exactly one output."
+            )
+        restored_value = restored_outputs[0]
+        storage_kind = "object-backed"
+    else:
+        restored_value = deserialize_value(record.serialized_output)
+        storage_kind = "inline"
     _REMOTE_SESSION_STORE.put_bridge_output(
         target_session_handle,
         bridge_key=record.bridge_key,
@@ -474,8 +752,9 @@ def _restore_serialized_remote_session_bridge_value(
         resolution_stats.session_restore_writes += 1
         resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
     logger.info(
-        "Restored remote session bridge bridge_key=%s from durable serialized %s payload into session_id=%s.",
+        "Restored remote session bridge bridge_key=%s from durable %s serialized %s payload into session_id=%s.",
         record.bridge_key,
+        storage_kind,
         record.serialized_output_io_type or "bridge",
         target_session_handle.session_id,
     )
@@ -618,7 +897,7 @@ def _restore_planned_remote_session_bridge_value(
         executable_payload.pop("clear_remote_session", None)
         outputs = _execute_subgraph_prompt(
             executable_payload,
-            deserialize_node_inputs(record.producer_inputs),
+            _deserialize_remote_session_bridge_producer_inputs(record),
             custom_nodes_root,
             None,
             cancellation_event,
@@ -773,7 +1052,7 @@ def _rehydrate_remote_session_bridge_value(
     replay_payload.pop("clear_remote_session", None)
     if target_session_handle.prompt_id is not None:
         replay_payload["prompt_id"] = target_session_handle.prompt_id
-    replay_inputs = deserialize_node_inputs(record.producer_inputs)
+    replay_inputs = _deserialize_remote_session_bridge_producer_inputs(record)
 
     logger.info(
         "Replaying remote session bridge bridge_key=%s into session_id=%s via component=%s.",
@@ -4613,46 +4892,49 @@ def _stream_remote_payload_events(
         """Queue a progress envelope for the remote caller."""
         event_buffer.publish_progress(serialize_mapping(progress_state))
 
+    def execute_once() -> bytes:
+        """Run the underlying payload once and return serialized outputs."""
+        if payload.get("payload_kind") == "mapped_subgraph":
+            custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
+            _ensure_comfy_runtime_initialized(custom_nodes_root)
+            hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+            return serialize_node_outputs(
+                _execute_mapped_subgraph_payload(
+                    payload,
+                    hydrated_inputs,
+                    custom_nodes_root,
+                    status_callback=publish_status,
+                    cancellation_event=cancellation_event,
+                    interrupt_store=interrupt_store,
+                    interrupt_flag_key=interrupt_flag_key,
+                )
+            )
+        if payload.get("payload_kind") == "subgraph":
+            execute_subgraph_kwargs: dict[str, Any] = {"status_callback": publish_status}
+            if "cancellation_event" in inspect.signature(execute_subgraph_locally).parameters:
+                execute_subgraph_kwargs["cancellation_event"] = cancellation_event
+            if "interrupt_store" in inspect.signature(execute_subgraph_locally).parameters:
+                execute_subgraph_kwargs["interrupt_store"] = interrupt_store
+            if "interrupt_flag_key" in inspect.signature(execute_subgraph_locally).parameters:
+                execute_subgraph_kwargs["interrupt_flag_key"] = interrupt_flag_key
+            return execute_subgraph_locally(
+                payload,
+                kwargs_payload,
+                **execute_subgraph_kwargs,
+            )
+        execute_node_kwargs: dict[str, Any] = {}
+        if "cancellation_event" in inspect.signature(execute_node_locally).parameters:
+            execute_node_kwargs["cancellation_event"] = cancellation_event
+        if "interrupt_store" in inspect.signature(execute_node_locally).parameters:
+            execute_node_kwargs["interrupt_store"] = interrupt_store
+        if "interrupt_flag_key" in inspect.signature(execute_node_locally).parameters:
+            execute_node_kwargs["interrupt_flag_key"] = interrupt_flag_key
+        return execute_node_locally(payload, kwargs_payload, **execute_node_kwargs)
+
     def execute_payload() -> None:
         """Run the payload in a worker thread and enqueue the terminal outcome."""
         try:
-            if payload.get("payload_kind") == "mapped_subgraph":
-                custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
-                _ensure_comfy_runtime_initialized(custom_nodes_root)
-                hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-                outputs = serialize_node_outputs(
-                    _execute_mapped_subgraph_payload(
-                        payload,
-                        hydrated_inputs,
-                        custom_nodes_root,
-                        status_callback=publish_status,
-                        cancellation_event=cancellation_event,
-                        interrupt_store=interrupt_store,
-                        interrupt_flag_key=interrupt_flag_key,
-                    )
-                )
-            elif payload.get("payload_kind") == "subgraph":
-                execute_subgraph_kwargs: dict[str, Any] = {"status_callback": publish_status}
-                if "cancellation_event" in inspect.signature(execute_subgraph_locally).parameters:
-                    execute_subgraph_kwargs["cancellation_event"] = cancellation_event
-                if "interrupt_store" in inspect.signature(execute_subgraph_locally).parameters:
-                    execute_subgraph_kwargs["interrupt_store"] = interrupt_store
-                if "interrupt_flag_key" in inspect.signature(execute_subgraph_locally).parameters:
-                    execute_subgraph_kwargs["interrupt_flag_key"] = interrupt_flag_key
-                outputs = execute_subgraph_locally(
-                    payload,
-                    kwargs_payload,
-                    **execute_subgraph_kwargs,
-                )
-            else:
-                execute_node_kwargs: dict[str, Any] = {}
-                if "cancellation_event" in inspect.signature(execute_node_locally).parameters:
-                    execute_node_kwargs["cancellation_event"] = cancellation_event
-                if "interrupt_store" in inspect.signature(execute_node_locally).parameters:
-                    execute_node_kwargs["interrupt_store"] = interrupt_store
-                if "interrupt_flag_key" in inspect.signature(execute_node_locally).parameters:
-                    execute_node_kwargs["interrupt_flag_key"] = interrupt_flag_key
-                outputs = execute_node_locally(payload, kwargs_payload, **execute_node_kwargs)
+            outputs = _execute_with_durable_invocation(payload, execute_once)
         except Exception as exc:  # pragma: no cover - exercised through generator consumer tests.
             event_buffer.publish_terminal("error", exc)
         else:
@@ -5197,6 +5479,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         settings.session_bridge_dict_name,
         create_if_missing=True,
     )
+    invocation_records = modal.Dict.from_name(
+        settings.invocation_dict_name,
+        create_if_missing=True,
+    )
     snapshot_profiles = modal.Dict.from_name(
         settings.snapshot_profile_dict_name,
         create_if_missing=True,
@@ -5221,6 +5507,18 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_identity.fingerprint,
                 "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE": str(
                     settings.stream_event_queue_maxsize
+                ),
+                "COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES": str(
+                    settings.bridge_inline_max_bytes
+                ),
+                "COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES": str(
+                    settings.invocation_result_inline_max_bytes
+                ),
+                "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS": str(
+                    settings.execution_timeout_seconds
+                ),
+                "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS": str(
+                    settings.startup_timeout_seconds
                 ),
             }
         )
@@ -5304,35 +5602,42 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                             )
                         else:
                             _emit_modal_volume_reload_skip(component_id, payload)
-                        if payload.get("payload_kind") == "mapped_subgraph":
-                            custom_nodes_root = _extract_custom_nodes_bundle(payload.get("custom_nodes_bundle"))
-                            _ensure_comfy_runtime_initialized(custom_nodes_root)
-                            hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-                            return serialize_node_outputs(
-                                _execute_mapped_subgraph_payload(
+
+                        def execute_once() -> bytes:
+                            """Execute the underlying payload once inside this request context."""
+                            if payload.get("payload_kind") == "mapped_subgraph":
+                                custom_nodes_root = _extract_custom_nodes_bundle(
+                                    payload.get("custom_nodes_bundle")
+                                )
+                                _ensure_comfy_runtime_initialized(custom_nodes_root)
+                                hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+                                return serialize_node_outputs(
+                                    _execute_mapped_subgraph_payload(
+                                        payload,
+                                        hydrated_inputs,
+                                        custom_nodes_root,
+                                        cancellation_event=execution_control.cancellation_event,
+                                        interrupt_store=interrupt_flags,
+                                        interrupt_flag_key=execution_control.interrupt_flag_key,
+                                    )
+                                )
+                            if payload.get("payload_kind") == "subgraph":
+                                return execute_subgraph_locally(
                                     payload,
-                                    hydrated_inputs,
-                                    custom_nodes_root,
+                                    kwargs_payload,
                                     cancellation_event=execution_control.cancellation_event,
                                     interrupt_store=interrupt_flags,
                                     interrupt_flag_key=execution_control.interrupt_flag_key,
                                 )
-                            )
-                        if payload.get("payload_kind") == "subgraph":
-                            return execute_subgraph_locally(
+                            return execute_node_locally(
                                 payload,
                                 kwargs_payload,
                                 cancellation_event=execution_control.cancellation_event,
                                 interrupt_store=interrupt_flags,
                                 interrupt_flag_key=execution_control.interrupt_flag_key,
                             )
-                        return execute_node_locally(
-                            payload,
-                            kwargs_payload,
-                            cancellation_event=execution_control.cancellation_event,
-                            interrupt_store=interrupt_flags,
-                            interrupt_flag_key=execution_control.interrupt_flag_key,
-                        )
+
+                        return _execute_with_durable_invocation(payload, execute_once)
             except Exception as exc:
                 _maybe_schedule_container_termination_on_error(payload, exc)
                 raise
