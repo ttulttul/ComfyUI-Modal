@@ -3897,6 +3897,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         """Stand-in for Modal deployed lookup failures."""
 
     deploy_calls: list[tuple[str | None, str | None]] = []
+    status_events: list[dict[str, Any]] = []
 
     class FakeExecuteMethod:
         """Minimal Modal method handle that records remote calls."""
@@ -3950,6 +3951,11 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
     monkeypatch.setattr(
         remote_modal_app_module,
+        "_emit_local_modal_status",
+        lambda **event: status_events.append(event),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
         "_load_modal_cloud_module",
         lambda: types.SimpleNamespace(app=FakeApp()),
     )
@@ -3959,7 +3965,12 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
-            {"component_id": "component-1"},
+            {
+                "component_id": "component-1",
+                "component_node_ids": ["node-1"],
+                "prompt_id": "prompt-1",
+                "extra_data": {"client_id": "client-1"},
+            },
             b"{}",
         )
     finally:
@@ -3969,6 +3980,13 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
     assert response == b"remote-response"
     assert deploy_calls == [("comfy-modal-sync", None)]
+    assert [
+        (event["phase"], event["status_message"])
+        for event in status_events
+    ] == [
+        ("setup", "Rebuilding Modal app"),
+        ("starting", "Starting Modal component"),
+    ]
 
 
 def test_remote_modal_does_not_classify_remote_execution_error_as_missing_app(
