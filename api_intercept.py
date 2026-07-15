@@ -3698,6 +3698,28 @@ def rewrite_prompt_for_modal(
     return rewritten_prompt, summary
 
 
+async def rewrite_prompt_for_modal_async(
+    prompt: dict[str, Any],
+    workflow: dict[str, Any] | None,
+    sync_engine: ModalAssetSyncEngine | None = None,
+    settings: ModalSyncSettings | None = None,
+    nodes_module: Any | None = None,
+    extra_data: dict[str, Any] | None = None,
+    status_callback: Any | None = None,
+) -> tuple[dict[str, Any], RewriteSummary]:
+    """Prepare one Modal prompt without blocking ComfyUI's event loop."""
+    return await asyncio.to_thread(
+        rewrite_prompt_for_modal,
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=nodes_module,
+        extra_data=extra_data,
+        status_callback=status_callback,
+    )
+
+
 async def _queue_prompt_json(
     prompt_server: Any,
     json_data: dict[str, Any],
@@ -4113,7 +4135,7 @@ def setup_modal_queue_route(
             if "prompt" in json_data:
                 emit_setup_status("Preparing Modal workflow")
                 rewrite_started_at = time.perf_counter()
-                rewritten_prompt, summary = rewrite_prompt_for_modal(
+                rewritten_prompt, summary = await rewrite_prompt_for_modal_async(
                     prompt=json_data["prompt"],
                     workflow=workflow,
                     sync_engine=resolved_sync_engine,

@@ -114,6 +114,25 @@ def test_settings_reads_modal_container_scaling_overrides(
     assert settings.buffer_containers == 2
 
 
+def test_settings_reads_remote_invocation_runtime_controls(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote call concurrency and Modal deadlines should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_MAX_INFLIGHT_CALLS", "7")
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS", "1800")
+    monkeypatch.setenv("COMFY_MODAL_STARTUP_TIMEOUT_SECONDS", "600")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.max_inflight_calls == 7
+    assert settings.execution_timeout_seconds == 1800
+    assert settings.startup_timeout_seconds == 600
+
+
 def test_settings_reads_proactive_warmup_override(
     settings_module: Any,
     monkeypatch: Any,
