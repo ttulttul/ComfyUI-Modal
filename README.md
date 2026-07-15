@@ -42,13 +42,16 @@ export COMFY_MODAL_EXECUTION_MODE=local
 
 Local mode still exercises marker resolution, prompt rewrite, sync planning, serialization, and proxy execution, but the rewritten component runs in the local ComfyUI process instead of in Modal.
 
-Use remote mode when the ComfyUI environment has the `modal` package and working Modal credentials:
+Use remote mode when the ComfyUI environment has the supported Modal SDK and working credentials:
 
 ```bash
+uv pip install "modal==1.4.2"
 export COMFY_MODAL_EXECUTION_MODE=remote
 ```
 
-Remote mode uses the stable cloud entrypoint in [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py). On first use, Modal-Sync can auto-deploy the configured Modal app if it does not exist.
+For repository development, `uv sync --extra remote --group test` installs the same pinned SDK. Remote mode uses the stable cloud entrypoint in [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py). On first use, Modal-Sync can auto-deploy the configured Modal app if it does not exist.
+
+The deployed image uses Python 3.11 plus an exact ComfyUI support and CUDA package set. Before every process's first remote invocation, Modal-Sync compares the deployed worker's runtime fingerprint with the local source, ComfyUI source, custom-node requirements, and runtime-shaping settings. A missing or mismatched fingerprint is treated as stale and replaced automatically when `COMFY_MODAL_AUTO_DEPLOY=true`.
 
 ## Using It In ComfyUI
 
@@ -204,7 +207,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_EXECUTION_MODE` | `local` | Set to `remote` for Modal-backed execution. |
 | `COMFY_MODAL_APP_NAME` | `comfy-modal-sync` | Modal app name. |
 | `COMFY_MODAL_VOLUME_NAME` | `comfy-universal-storage` | Modal volume name for synced assets and bundles. |
-| `COMFY_MODAL_AUTO_DEPLOY` | `true` | Deploy or replace the configured app when lookup requires it. |
+| `COMFY_MODAL_AUTO_DEPLOY` | `true` | Deploy or replace the configured app when lookup fails or its runtime fingerprint is stale. |
 | `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK` | `false` | Allow the older temporary `app.run()` fallback when deployed lookup fails. |
 | `COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR` | `true` | Make a remote worker exit after surfacing a crash. |
 
