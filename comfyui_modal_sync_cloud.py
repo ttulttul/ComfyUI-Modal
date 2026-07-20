@@ -115,6 +115,9 @@ _CONTAINER_TERMINATION_LOCK = threading.Lock()
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
 _REMOTE_INVOCATION_STORE = InMemoryRemoteInvocationStore()
+_REMOTE_INVOCATION_RETRY_WAIT_SECONDS = 5.0
+_REMOTE_INVOCATION_RETRY_POLL_SECONDS = 0.1
+_REMOTE_INVOCATION_ABANDON_JOIN_SECONDS = 0.5
 _DURABLE_OBJECT_STORE_LOCK = threading.Lock()
 _DURABLE_OBJECT_STORE: FileDurableObjectStore | None = None
 _REMOTE_SESSION_BRIDGE_REPLAY_STATE = threading.local()
@@ -137,6 +140,10 @@ class RemoteSubgraphExecutionError(RuntimeError):
 
 class RemoteInvocationInProgressError(RuntimeError):
     """Raised when an idempotent invocation is already running remotely."""
+
+
+class RemoteInvocationAbandonedError(RuntimeError):
+    """Raised when a streamed invocation loses its consumer before completion."""
 
 
 class RemoteCanaryInterruptedError(RuntimeError):
@@ -385,6 +392,35 @@ def _load_completed_remote_invocation_result(record: RemoteInvocationRecord) -> 
     )
 
 
+def _wait_for_running_remote_invocation(
+    running_record: RemoteInvocationRecord,
+) -> RemoteInvocationRecord | None:
+    """Wait briefly for an overlapping attempt to publish a terminal state."""
+    wait_seconds = max(0.0, _REMOTE_INVOCATION_RETRY_WAIT_SECONDS)
+    if wait_seconds <= 0.0:
+        return running_record
+
+    logger.warning(
+        "Waiting up to %.3fs for overlapping remote invocation invocation_id=%s attempt=%d.",
+        wait_seconds,
+        running_record.invocation_id,
+        running_record.attempt,
+    )
+    deadline = time.monotonic() + wait_seconds
+    poll_seconds = max(0.001, _REMOTE_INVOCATION_RETRY_POLL_SECONDS)
+    current_record: RemoteInvocationRecord | None = running_record
+    while time.monotonic() < deadline:
+        current_record = _load_remote_invocation_record(running_record.invocation_id)
+        if (
+            current_record is None
+            or current_record.state != "running"
+            or current_record.attempt != running_record.attempt
+        ):
+            return current_record
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+    return current_record
+
+
 def _begin_remote_invocation(
     payload: Mapping[str, Any],
 ) -> tuple[RemoteInvocationRecord | None, bytes | None]:
@@ -406,15 +442,25 @@ def _begin_remote_invocation(
             settings.execution_timeout_seconds + settings.startup_timeout_seconds
         )
         if time.time() - previous_record.updated_at <= stale_after_seconds:
-            raise RemoteInvocationInProgressError(
-                f"Remote invocation {invocation_id!r} is already running "
-                f"(attempt {previous_record.attempt})."
+            previous_record = _wait_for_running_remote_invocation(previous_record)
+            if previous_record is not None and previous_record.state == "completed":
+                logger.info(
+                    "Replaying completed remote invocation invocation_id=%s attempt=%d after overlap wait.",
+                    invocation_id,
+                    previous_record.attempt,
+                )
+                return None, _load_completed_remote_invocation_result(previous_record)
+            if previous_record is not None and previous_record.state == "running":
+                raise RemoteInvocationInProgressError(
+                    f"Remote invocation {invocation_id!r} is already running "
+                    f"(attempt {previous_record.attempt})."
+                )
+        else:
+            logger.warning(
+                "Recovering stale remote invocation invocation_id=%s attempt=%d.",
+                invocation_id,
+                previous_record.attempt,
             )
-        logger.warning(
-            "Recovering stale remote invocation invocation_id=%s attempt=%d.",
-            invocation_id,
-            previous_record.attempt,
-        )
     running_record = new_running_invocation_record(invocation_id, previous_record)
     _store_remote_invocation_record(running_record)
     return running_record, None
@@ -5196,6 +5242,33 @@ class _BoundedStreamEventBuffer:
         self._closed.set()
 
 
+def _abandon_streamed_remote_invocation(
+    *,
+    payload: Mapping[str, Any],
+    running_record: RemoteInvocationRecord | None,
+    cancellation_event: threading.Event | None,
+    event_buffer: _BoundedStreamEventBuffer,
+    worker_thread: threading.Thread,
+) -> None:
+    """Cancel unfinished compute and make its invocation record retryable."""
+    component_id = str(payload.get("component_id") or "payload")
+    if cancellation_event is not None:
+        cancellation_event.set()
+    event_buffer.close()
+    worker_thread.join(timeout=max(0.0, _REMOTE_INVOCATION_ABANDON_JOIN_SECONDS))
+    abandoned_error = RemoteInvocationAbandonedError(
+        f"Remote invocation stream for component {component_id!r} closed before completion."
+    )
+    if running_record is not None:
+        _fail_remote_invocation(running_record, abandoned_error)
+    logger.warning(
+        "Abandoned remote invocation stream component=%s invocation_id=%s worker_stopped=%s; the invocation is retryable.",
+        component_id,
+        running_record.invocation_id if running_record is not None else "none",
+        not worker_thread.is_alive(),
+    )
+
+
 def _stream_remote_payload_events(
     payload: dict[str, Any],
     kwargs_payload: bytes | bytearray | str | dict[str, Any],
@@ -5287,6 +5360,7 @@ def _stream_remote_payload_events(
         yield {"kind": "result", "outputs": completed_result}
         return
     worker_thread.start()
+    invocation_finalized = False
     try:
         while True:
             event_kind, event_payload = event_buffer.get()
@@ -5304,6 +5378,7 @@ def _stream_remote_payload_events(
                     )
                 elif pending_batch is not None:
                     object_store.commit_batch(pending_batch)
+                invocation_finalized = True
                 yield {"kind": "result", "outputs": serialized_outputs}
                 continue
             if event_kind == "error":
@@ -5312,12 +5387,22 @@ def _stream_remote_payload_events(
                     object_store.commit_batch(pending_batch)
                 if running_record is not None:
                     _fail_remote_invocation(running_record, error)
+                invocation_finalized = True
                 raise error
             if event_kind == "done":
                 return
     finally:
-        event_buffer.close()
-        worker_thread.join(timeout=1.0)
+        if invocation_finalized:
+            event_buffer.close()
+            worker_thread.join(timeout=1.0)
+        else:
+            _abandon_streamed_remote_invocation(
+                payload=payload,
+                running_record=running_record,
+                cancellation_event=cancellation_event,
+                event_buffer=event_buffer,
+                worker_thread=worker_thread,
+            )
         if event_buffer.dropped_progress_events:
             logger.info(
                 "Coalesced %d stale remote progress event(s) for component=%s to keep the stream buffer bounded.",
