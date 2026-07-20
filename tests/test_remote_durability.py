@@ -194,6 +194,177 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
     assert commit_thread_ids == [consumer_thread_id]
 
 
+def test_cloud_invocation_waits_for_active_attempt_and_replays_result(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An overlapping delivery should replay a result that finishes during its grace wait."""
+    invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
+    invocation_id = "RIV_wait_for_result"
+    created_at = time.time()
+    invocation_store.put_record(
+        modal_cloud_module.RemoteInvocationRecord(
+            invocation_id=invocation_id,
+            state="running",
+            attempt=1,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+    serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
+    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_POLL_SECONDS", 0.005)
+    execution_count = 0
+
+    def complete_original_attempt() -> None:
+        """Publish the original attempt's result after the retry begins waiting."""
+        time.sleep(0.02)
+        invocation_store.put_record(
+            modal_cloud_module.RemoteInvocationRecord(
+                invocation_id=invocation_id,
+                state="completed",
+                attempt=1,
+                created_at=created_at,
+                updated_at=time.time(),
+                result_inline=serialized_outputs,
+            )
+        )
+
+    def execute_once() -> bytes:
+        """Track any erroneous duplicate execution."""
+        nonlocal execution_count
+        execution_count += 1
+        return serialized_outputs
+
+    completion_thread = threading.Thread(target=complete_original_attempt)
+    completion_thread.start()
+    try:
+        result = modal_cloud_module._execute_with_durable_invocation(
+            {"invocation_id": invocation_id},
+            execute_once,
+        )
+    finally:
+        completion_thread.join(timeout=1.0)
+
+    assert result == serialized_outputs
+    assert execution_count == 0
+
+
+def test_cloud_stream_abandonment_cancels_and_retries_failed_attempt(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Losing a stream should cancel its worker and leave the invocation retryable."""
+    invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
+    commit_thread_ids: list[int | None] = []
+    object_store = modal_cloud_module.FileDurableObjectStore(
+        tmp_path,
+        commit_callback=lambda: commit_thread_ids.append(threading.current_thread().ident),
+    )
+    cancellation_event = threading.Event()
+    worker_stopped = threading.Event()
+    invocation_id = "RIV_abandoned_stream"
+
+    def execute_subgraph_locally(
+        payload: Any,
+        kwargs_payload: Any,
+        *,
+        status_callback: Any,
+        cancellation_event: threading.Event | None = None,
+        interrupt_store: Any = None,
+        interrupt_flag_key: str | None = None,
+    ) -> bytes:
+        """Emit progress, then block until stream abandonment requests cancellation."""
+        del payload, kwargs_payload, interrupt_store, interrupt_flag_key
+        object_store.put("bridge_outputs", b"uncommitted-abandoned-output")
+        status_callback({"event_type": "status", "phase": "executing"})
+        try:
+            assert cancellation_event is not None
+            assert cancellation_event.wait(timeout=2.0)
+            raise modal_cloud_module.RemoteSubgraphExecutionError(
+                "abandoned stream cancelled"
+            )
+        finally:
+            worker_stopped.set()
+
+    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
+    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "execute_subgraph_locally",
+        execute_subgraph_locally,
+    )
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_ABANDON_JOIN_SECONDS", 0.5)
+    payload = {
+        "invocation_id": invocation_id,
+        "component_id": "component-1",
+        "payload_kind": "subgraph",
+    }
+    stream = modal_cloud_module._stream_remote_payload_events(
+        payload,
+        b"inputs",
+        cancellation_event=cancellation_event,
+    )
+
+    assert next(stream)["kind"] == "progress"
+    stream.close()
+
+    failed_record = invocation_store.get_record(invocation_id)
+    assert cancellation_event.is_set()
+    assert worker_stopped.wait(timeout=1.0)
+    assert failed_record.state == "failed"
+    assert failed_record.error_type == "RemoteInvocationAbandonedError"
+    assert commit_thread_ids == []
+
+    retry_outputs = modal_cloud_module.serialize_node_outputs(("retried",))
+    retry_result = modal_cloud_module._execute_with_durable_invocation(
+        payload,
+        lambda: retry_outputs,
+    )
+    completed_record = invocation_store.get_record(invocation_id)
+
+    assert retry_result == retry_outputs
+    assert completed_record.state == "completed"
+    assert completed_record.attempt == 2
+    assert commit_thread_ids == []
+
+
+def test_cloud_stream_close_after_result_preserves_completed_record(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Closing after the terminal result must not downgrade completed metadata."""
+    invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
+    object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
+    serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
+    invocation_id = "RIV_close_after_result"
+
+    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
+    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "execute_node_locally",
+        lambda payload, kwargs_payload: serialized_outputs,
+    )
+    stream = modal_cloud_module._stream_remote_payload_events(
+        {"invocation_id": invocation_id, "component_id": "component-1"},
+        b"inputs",
+    )
+
+    assert next(stream) == {"kind": "result", "outputs": serialized_outputs}
+    stream.close()
+
+    completed_record = invocation_store.get_record(invocation_id)
+    assert completed_record.state == "completed"
+    assert completed_record.attempt == 1
+
+
 def test_cloud_invocation_rejects_duplicate_active_attempt(
     modal_cloud_module: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -211,6 +382,7 @@ def test_cloud_invocation_rejects_duplicate_active_attempt(
     )
     monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 0.0)
 
     with pytest.raises(
         modal_cloud_module.RemoteInvocationInProgressError,
