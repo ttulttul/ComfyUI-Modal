@@ -7,6 +7,7 @@ import copy
 from concurrent.futures import Future
 import importlib.util
 import json
+import pickle
 import subprocess
 import sys
 import threading
@@ -1854,6 +1855,153 @@ def test_modal_cloud_skips_reload_when_uploaded_paths_are_already_visible(
 
     assert modal_cloud_module._should_reload_modal_volume(payload) is False
     assert recorded_markers == ["marker-1"]
+
+
+def test_modal_cloud_reads_missing_committed_asset_without_reloading_volume(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A stale warm mount should read a committed asset into ephemeral storage."""
+
+    class FakeVolume:
+        """Modal Volume double that exposes committed file reads."""
+
+        def __init__(self) -> None:
+            """Record direct read paths."""
+            self.read_paths: list[str] = []
+
+        def read_file(self, path: str) -> Iterator[bytes]:
+            """Yield one committed model file in chunks."""
+            self.read_paths.append(path)
+            yield b"model-"
+            yield b"weights"
+
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    readthrough_root = tmp_path / "readthrough"
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_REMOTE_VOLUME_READTHROUGH_ROOT",
+        readthrough_root,
+    )
+    payload = {
+        "component_id": "component-1",
+        "requires_volume_reload": False,
+        "subgraph_prompt": {
+            "14": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "/assets/hash_style.safetensors"},
+            }
+        },
+    }
+
+    volume = FakeVolume()
+    hydrated_paths = modal_cloud_module._hydrate_missing_payload_volume_paths(volume, payload)
+
+    cached_path = readthrough_root / "assets" / "hash_style.safetensors"
+    assert hydrated_paths == [cached_path]
+    assert cached_path.read_bytes() == b"model-weights"
+    assert volume.read_paths == ["assets/hash_style.safetensors"]
+    assert modal_cloud_module._should_reload_modal_volume(payload) is False
+    assert (
+        modal_cloud_module._resolve_runtime_asset_path("/assets/hash_style.safetensors")
+        == str(cached_path)
+    )
+
+
+def test_modal_cloud_reloads_when_reused_referenced_asset_is_still_missing(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A sync-index hit must not suppress recovery for a missing runtime asset."""
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_REMOTE_VOLUME_READTHROUGH_ROOT",
+        tmp_path / "readthrough",
+    )
+    payload = {
+        "requires_volume_reload": False,
+        "subgraph_prompt": {
+            "14": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "/assets/missing_style.safetensors"},
+            }
+        },
+    }
+
+    assert modal_cloud_module._should_reload_modal_volume(payload) is True
+
+
+def test_modal_cloud_readthrough_hydrates_custom_node_manifest_dependencies(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Read-through hydration should include archives and assets named by a manifest."""
+    manifest_payload = json.dumps(
+        {
+            "version": 2,
+            "entries": [
+                {
+                    "remote_path": "/custom_nodes/packages/hash_package.zip",
+                    "assets": [
+                        {"remote_path": "/custom_nodes/assets/hash_model.safetensors"}
+                    ],
+                }
+            ],
+        }
+    ).encode()
+    committed_files = {
+        "custom_nodes/manifests/hash_manifest.json": manifest_payload,
+        "custom_nodes/packages/hash_package.zip": b"package",
+        "custom_nodes/assets/hash_model.safetensors": b"model",
+    }
+
+    class FakeVolume:
+        """Modal Volume double backed by committed in-memory files."""
+
+        def read_file(self, path: str) -> Iterator[bytes]:
+            """Yield the requested committed file."""
+            yield committed_files[path]
+
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    readthrough_root = tmp_path / "readthrough"
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_REMOTE_VOLUME_READTHROUGH_ROOT",
+        readthrough_root,
+    )
+
+    hydrated_paths = modal_cloud_module._hydrate_missing_payload_volume_paths(
+        FakeVolume(),
+        {"custom_nodes_bundle": "/custom_nodes/manifests/hash_manifest.json"},
+    )
+
+    assert hydrated_paths == [
+        readthrough_root / "custom_nodes" / "manifests" / "hash_manifest.json",
+        readthrough_root / "custom_nodes" / "assets" / "hash_model.safetensors",
+        readthrough_root / "custom_nodes" / "packages" / "hash_package.zip",
+    ]
 
 
 def test_modal_cloud_preserves_worker_for_deterministic_remote_failures(
@@ -5124,6 +5272,41 @@ def test_load_modal_cloud_module_reloads_stale_partial_module(
 
     assert reloaded_module is not stale_module
     assert getattr(reloaded_module, "app", None) == "fresh-app"
+
+
+def test_remote_modal_installs_cloud_exception_compatibility_module(
+    remote_modal_app_module: Any,
+) -> None:
+    """Deployed remote exceptions should have importable local definitions."""
+    module_name = remote_modal_app_module._MODAL_CLOUD_MODULE_NAME
+    original_module = sys.modules.pop(module_name, None)
+    serialization_module = types.ModuleType(module_name)
+    serialization_module.RemoteSubgraphExecutionError = type(
+        "RemoteSubgraphExecutionError",
+        (RuntimeError,),
+        {"__module__": module_name},
+    )
+    sys.modules[module_name] = serialization_module
+    serialized_error = pickle.dumps(
+        serialization_module.RemoteSubgraphExecutionError("remote failure")
+    )
+    sys.modules.pop(module_name)
+    try:
+        remote_modal_app_module._install_modal_cloud_exception_compatibility_module()
+
+        compatibility_module = sys.modules[module_name]
+        assert (
+            compatibility_module.RemoteSubgraphExecutionError
+            is remote_modal_app_module.RemoteSubgraphExecutionError
+        )
+        assert issubclass(compatibility_module.RemoteInvocationAbandonedError, RuntimeError)
+        restored_error = pickle.loads(serialized_error)
+        assert isinstance(restored_error, remote_modal_app_module.RemoteSubgraphExecutionError)
+        assert str(restored_error) == "remote failure"
+    finally:
+        sys.modules.pop(module_name, None)
+        if original_module is not None:
+            sys.modules[module_name] = original_module
 
 
 def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(

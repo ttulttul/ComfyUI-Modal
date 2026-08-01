@@ -112,6 +112,7 @@ _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
+_REMOTE_VOLUME_READTHROUGH_ROOT = Path(tempfile.gettempdir()) / "comfy-modal-volume-readthrough"
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
 _REMOTE_INVOCATION_STORE = InMemoryRemoteInvocationStore()
@@ -2138,6 +2139,7 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> Path | None:
 
     settings = get_settings()
     storage_roots = [Path(settings.remote_storage_root)]
+    storage_roots.append(_REMOTE_VOLUME_READTHROUGH_ROOT)
     if settings.local_storage_root is not None:
         storage_roots.append(settings.local_storage_root)
 
@@ -2587,6 +2589,27 @@ def _materialize_remote_asset_path(value: str) -> str:
     return value
 
 
+def _readthrough_cache_path(volume_path: Path) -> Path | None:
+    """Return the safe ephemeral cache path for one mounted-volume path."""
+    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
+    resolved_volume_path = volume_path.resolve()
+    if not resolved_volume_path.is_relative_to(remote_storage_root):
+        return None
+    relative_path = resolved_volume_path.relative_to(remote_storage_root)
+    return _REMOTE_VOLUME_READTHROUGH_ROOT / relative_path
+
+
+def _resolve_runtime_asset_path(value: str) -> str:
+    """Resolve an asset through the mount first and the committed read-through cache second."""
+    materialized_path = Path(_materialize_remote_asset_path(value))
+    if not materialized_path.is_absolute() or materialized_path.exists():
+        return str(materialized_path)
+    cache_path = _readthrough_cache_path(materialized_path)
+    if cache_path is not None and cache_path.exists():
+        return str(cache_path)
+    return str(materialized_path)
+
+
 def _clone_loader_cache_value(value: Any) -> Any:
     """Clone a cached loader output when the runtime object supports safe cloning."""
     clone_method = getattr(value, "clone", None)
@@ -2811,7 +2834,7 @@ def _patched_folder_paths_absolute_lookup() -> Iterator[None]:
 
     def patched_get_full_path(folder_name: str, filename: str) -> str | None:
         """Return the absolute file when the prompt already points at a materialized asset."""
-        resolved_filename = _materialize_remote_asset_path(filename)
+        resolved_filename = _resolve_runtime_asset_path(filename)
         if os.path.isabs(resolved_filename) and Path(resolved_filename).is_file():
             return resolved_filename
         return original_get_full_path(folder_name, resolved_filename)
@@ -5548,6 +5571,8 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
 
 def _should_reload_modal_volume(payload: dict[str, Any]) -> bool:
     """Return whether this request needs the mounted Modal volume reloaded."""
+    if _payload_volume_paths(payload) and not _payload_volume_paths_visible(payload):
+        return True
     if not bool(payload.get("requires_volume_reload", True)):
         return False
     if _payload_uploaded_volume_paths_visible(payload):
@@ -5696,7 +5721,15 @@ def _payload_uploaded_volume_paths_visible(payload: dict[str, Any]) -> bool:
     uploaded_paths = _payload_uploaded_volume_paths(payload)
     if not uploaded_paths:
         return False
-    return all(path.exists() for path in uploaded_paths)
+    return all(_runtime_volume_path_visible(path) for path in uploaded_paths)
+
+
+def _runtime_volume_path_visible(volume_path: Path) -> bool:
+    """Return whether a mounted path is available directly or through read-through storage."""
+    if volume_path.exists():
+        return True
+    cache_path = _readthrough_cache_path(volume_path)
+    return cache_path is not None and cache_path.exists()
 
 
 def _payload_volume_paths_visible(payload: dict[str, Any]) -> bool:
@@ -5704,7 +5737,133 @@ def _payload_volume_paths_visible(payload: dict[str, Any]) -> bool:
     referenced_paths = _payload_volume_paths(payload)
     if not referenced_paths:
         return False
-    return all(path.exists() for path in referenced_paths)
+    return all(_runtime_volume_path_visible(path) for path in referenced_paths)
+
+
+def _download_committed_volume_path(volume: Any, volume_path: Path, cache_path: Path) -> None:
+    """Stream one committed Modal Volume file into the worker's ephemeral cache."""
+    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
+    relative_path = volume_path.resolve().relative_to(remote_storage_root).as_posix()
+    read_file_into_fileobj = getattr(volume, "read_file_into_fileobj", None)
+    read_file = getattr(volume, "read_file", None)
+    if not callable(read_file_into_fileobj) and not callable(read_file):
+        raise AttributeError("The configured Modal Volume does not support committed file reads.")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{cache_path.name}.",
+        suffix=".tmp",
+        dir=cache_path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        with temporary_path.open("wb") as cache_file:
+            if callable(read_file_into_fileobj):
+                read_file_into_fileobj(relative_path, cache_file)
+            else:
+                assert callable(read_file)
+                for chunk in read_file(relative_path):
+                    cache_file.write(chunk)
+        os.replace(temporary_path, cache_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _custom_nodes_manifest_dependency_paths(
+    volume_path: Path,
+    runtime_path: Path,
+) -> set[Path]:
+    """Return mounted-volume dependencies declared by one custom-node manifest."""
+    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
+    custom_nodes_root = remote_storage_root / "custom_nodes"
+    if volume_path.suffix.lower() != ".json" or not volume_path.resolve().is_relative_to(
+        custom_nodes_root
+    ):
+        return set()
+    try:
+        manifest_payload = _load_custom_nodes_manifest(runtime_path)
+    except RuntimeError:
+        return set()
+
+    dependency_paths: set[Path] = set()
+    entry_payloads = manifest_payload.get("entries", [])
+    if not isinstance(entry_payloads, list):
+        return dependency_paths
+    for entry_payload in entry_payloads:
+        if not isinstance(entry_payload, dict):
+            continue
+        candidate_payloads = [entry_payload]
+        asset_payloads = entry_payload.get("assets", [])
+        if isinstance(asset_payloads, list):
+            candidate_payloads.extend(
+                asset_payload for asset_payload in asset_payloads if isinstance(asset_payload, dict)
+            )
+        for candidate_payload in candidate_payloads:
+            remote_path = candidate_payload.get("remote_path")
+            if not isinstance(remote_path, str) or not remote_path.strip():
+                continue
+            materialized_path = Path(_materialize_remote_asset_path(remote_path))
+            if _readthrough_cache_path(materialized_path) is not None:
+                dependency_paths.add(materialized_path)
+    return dependency_paths
+
+
+def _hydrate_missing_payload_volume_paths(volume: Any, payload: dict[str, Any]) -> list[Path]:
+    """Cache committed payload files that are absent from this worker's mounted snapshot."""
+    candidate_paths = _payload_volume_paths(payload) | _payload_uploaded_volume_paths(payload)
+    if not candidate_paths:
+        return []
+    if not callable(getattr(volume, "read_file_into_fileobj", None)) and not callable(
+        getattr(volume, "read_file", None)
+    ):
+        return []
+
+    hydrated_paths: list[Path] = []
+    pending_paths = sorted(candidate_paths)
+    visited_paths: set[Path] = set()
+    component_id = str(payload.get("component_id") or "modal-subgraph")
+    while pending_paths:
+        volume_path = pending_paths.pop(0)
+        if volume_path in visited_paths:
+            continue
+        visited_paths.add(volume_path)
+        runtime_path = Path(_resolve_runtime_asset_path(str(volume_path)))
+        if not _runtime_volume_path_visible(volume_path):
+            cache_path = _readthrough_cache_path(volume_path)
+            if cache_path is None:
+                continue
+            try:
+                with _timed_phase(
+                    "committed_volume_readthrough",
+                    component=component_id,
+                    path=volume_path.name,
+                ):
+                    _download_committed_volume_path(volume, volume_path, cache_path)
+            except FileNotFoundError:
+                logger.warning(
+                    "Committed Modal Volume path %s was unavailable for component=%s; falling back to mounted-volume reload.",
+                    volume_path,
+                    component_id,
+                )
+                continue
+            hydrated_paths.append(cache_path)
+            runtime_path = cache_path
+
+        pending_paths.extend(
+            sorted(
+                _custom_nodes_manifest_dependency_paths(volume_path, runtime_path)
+                - visited_paths
+            )
+        )
+
+    if hydrated_paths:
+        _emit_cloud_info(
+            "Hydrated %d missing committed volume file(s) through read-through storage for component=%s.",
+            len(hydrated_paths),
+            component_id,
+        )
+    return hydrated_paths
 
 
 def _log_payload_volume_reload_diagnostics(
@@ -5829,6 +5988,7 @@ def _prepare_warm_container_for_request(volume: Any, payload: dict[str, Any]) ->
     """Prime one RemoteEngine container for a request before the first real execution payload arrives."""
     component_id = str(payload.get("component_id") or "modal-warmup")
     reload_marker = _modal_volume_reload_marker(payload)
+    _hydrate_missing_payload_volume_paths(volume, payload)
     needs_volume_reload = _should_reload_modal_volume(payload)
     with _timed_phase("remote_engine_warmup", component=component_id):
         if needs_volume_reload:
@@ -6076,6 +6236,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                         component=component_id,
                         payload_kind=payload.get("payload_kind"),
                     ):
+                        _hydrate_missing_payload_volume_paths(vol, payload)
                         if _should_reload_modal_volume(payload):
                             _reload_modal_volume_for_request(
                                 vol,
@@ -6167,6 +6328,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                         component=component_id,
                         payload_kind=payload.get("payload_kind"),
                     ):
+                        _hydrate_missing_payload_volume_paths(vol, payload)
                         if _should_reload_modal_volume(payload):
                             _reload_modal_volume_for_request(
                                 vol,

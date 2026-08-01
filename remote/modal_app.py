@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import ModuleType
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager, nullcontext
@@ -2448,6 +2449,37 @@ def _load_modal_cloud_module() -> Any:
         sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
         raise
     return cloud_module
+
+
+def _install_modal_cloud_exception_compatibility_module() -> None:
+    """Expose cloud exception definitions without loading the deployable cloud app."""
+    if _MODAL_CLOUD_MODULE_NAME in sys.modules:
+        return
+
+    compatibility_module = ModuleType(_MODAL_CLOUD_MODULE_NAME)
+    setattr(
+        compatibility_module,
+        "RemoteSubgraphExecutionError",
+        RemoteSubgraphExecutionError,
+    )
+    exception_bases: dict[str, type[BaseException]] = {
+        "RemoteInvocationInProgressError": RuntimeError,
+        "RemoteInvocationAbandonedError": RuntimeError,
+        "RemoteCanaryInterruptedError": RuntimeError,
+        "RemoteCanaryBarrierTimeoutError": TimeoutError,
+        "ExistingModalAppError": RuntimeError,
+    }
+    for exception_name, exception_base in exception_bases.items():
+        setattr(
+            compatibility_module,
+            exception_name,
+            type(
+                exception_name,
+                (exception_base,),
+                {"__module__": _MODAL_CLOUD_MODULE_NAME},
+            ),
+        )
+    sys.modules[_MODAL_CLOUD_MODULE_NAME] = compatibility_module
 
 
 def _lookup_local_prompt_server() -> Any | None:
@@ -5717,6 +5749,7 @@ def _invoke_remote_engine_payload(
     cancellation_event: threading.Event | None,
 ) -> bytes:
     """Invoke one prepared remote engine instance with optional progress streaming."""
+    _install_modal_cloud_exception_compatibility_module()
     if cancellation_event is not None and cancellation_event.is_set():
         _request_remote_interrupt(payload)
         raise ModalRemoteInvocationError(

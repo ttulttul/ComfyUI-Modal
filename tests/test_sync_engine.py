@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import threading
 import time
+import types
 from typing import Any
 import zipfile
 
@@ -1313,8 +1314,11 @@ def test_modal_volume_backend_retries_rate_limited_calls(
         monotonic_time += seconds
 
     monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
-    monkeypatch.setattr(sync_engine_module.time, "sleep", fake_sleep)
-    monkeypatch.setattr(sync_engine_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(
+        sync_engine_module,
+        "time",
+        types.SimpleNamespace(sleep=fake_sleep, monotonic=fake_monotonic),
+    )
     backend = sync_engine_module.ModalVolumeBackend("volume")
 
     assert backend.exists("/hashes/present.done") is True
@@ -1371,8 +1375,11 @@ def test_modal_volume_backend_applies_shared_rate_limit_backoff_across_calls(
         monotonic_time += seconds
 
     monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
-    monkeypatch.setattr(sync_engine_module.time, "sleep", fake_sleep)
-    monkeypatch.setattr(sync_engine_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(
+        sync_engine_module,
+        "time",
+        types.SimpleNamespace(sleep=fake_sleep, monotonic=fake_monotonic),
+    )
     backend = sync_engine_module.ModalVolumeBackend("volume")
 
     assert backend._record_shared_rate_limit_backoff() == 0.25
