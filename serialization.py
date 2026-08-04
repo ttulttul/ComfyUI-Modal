@@ -19,7 +19,9 @@ _TENSOR_KIND = "tensor"
 _BYTES_KIND = "bytes"
 _TUPLE_KIND = "tuple"
 _MAPPED_OUTPUT_KIND = "mapped_output"
+_NESTED_TENSOR_KIND = "nested_tensor"
 _VIDEO_KIND = "video"
+_NESTED_TENSOR_PAYLOAD_VERSION = 1
 _VIDEO_PAYLOAD_VERSION = 1
 _BATCHABLE_TENSOR_IO_TYPES = frozenset({"IMAGE", "MASK", "NOISE", "SIGMAS"})
 _BINARY_ENVELOPE_MAGIC = b"CMODALB1"
@@ -112,6 +114,54 @@ def _deserialize_tensor_bytes(payload: bytes) -> Any:
     from safetensors.torch import load
 
     return load(payload)[_VALUE_KEY]
+
+
+def _load_nested_tensor_transport_type() -> type[Any] | None:
+    """Load ComfyUI's multimodal tensor wrapper when available."""
+    try:
+        from comfy.nested_tensor import NestedTensor
+    except (ImportError, AttributeError):
+        return None
+    return NestedTensor if isinstance(NestedTensor, type) else None
+
+
+def _is_comfy_nested_tensor(value: Any) -> bool:
+    """Return whether a value is ComfyUI's multimodal tensor wrapper."""
+    nested_tensor_type = _load_nested_tensor_transport_type()
+    return nested_tensor_type is not None and isinstance(value, nested_tensor_type)
+
+
+def _serialize_nested_tensor(
+    value: Any,
+    serialize_item: Callable[[Any], Any],
+) -> dict[str, Any]:
+    """Serialize a ComfyUI NestedTensor as its ordered tensor members."""
+    return {
+        _KIND_KEY: _NESTED_TENSOR_KIND,
+        "version": _NESTED_TENSOR_PAYLOAD_VERSION,
+        "tensors": serialize_item(value.tensors),
+    }
+
+
+def _deserialize_nested_tensor(
+    payload: Mapping[str, Any],
+    deserialize_item: Callable[[Any], Any],
+) -> Any:
+    """Reconstruct a ComfyUI NestedTensor from ordered tensor members."""
+    if payload.get("version") != _NESTED_TENSOR_PAYLOAD_VERSION:
+        raise ValueError(
+            "Unsupported serialized NestedTensor version "
+            f"{payload.get('version')!r}."
+        )
+    nested_tensor_type = _load_nested_tensor_transport_type()
+    if nested_tensor_type is None:
+        raise TypeError(
+            "Deserializing NestedTensor values requires a current ComfyUI runtime."
+        )
+    tensors = deserialize_item(payload.get("tensors"))
+    if not isinstance(tensors, list):
+        raise ValueError("Serialized NestedTensor members must decode to a list.")
+    return nested_tensor_type(tensors)
 
 
 def _load_video_transport_types() -> tuple[type[Any], type[Any], type[Any]] | None:
@@ -218,6 +268,9 @@ def serialize_value(value: Any) -> Any:
     if torch is not None and isinstance(value, torch.Tensor):
         return _serialize_tensor(value)
 
+    if _is_comfy_nested_tensor(value):
+        return _serialize_nested_tensor(value, serialize_value)
+
     if _is_comfy_video_input(value):
         return _serialize_video(value, serialize_value)
 
@@ -241,7 +294,8 @@ def serialize_value(value: Any) -> Any:
 
     raise TypeError(
         "ComfyUI-Modal can only serialize JSON-compatible values, bytes, "
-        "torch tensors, and ComfyUI VIDEO values. Unsupported value type: "
+        "torch tensors, and ComfyUI NestedTensor and VIDEO values. "
+        "Unsupported value type: "
         f"{type(value)!r}"
     )
 
@@ -276,6 +330,8 @@ def deserialize_value(payload: Any) -> Any:
             io_type=str(payload.get("io_type", "*")),
             is_list=bool(payload.get("is_list", False)),
         )
+    if kind == _NESTED_TENSOR_KIND:
+        return _deserialize_nested_tensor(payload, deserialize_value)
     if kind == _VIDEO_KIND:
         return _deserialize_video(payload, deserialize_value)
 
@@ -305,6 +361,12 @@ def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
         attachments.append(_serialize_tensor_bytes(value))
         return {_KIND_KEY: _TENSOR_KIND, "attachment": attachment_index}
 
+    if _is_comfy_nested_tensor(value):
+        return _serialize_nested_tensor(
+            value,
+            lambda item: _serialize_transport_value(item, attachments),
+        )
+
     if _is_comfy_video_input(value):
         return _serialize_video(
             value,
@@ -333,7 +395,8 @@ def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
 
     raise TypeError(
         "ComfyUI-Modal can only serialize JSON-compatible values, bytes, "
-        "torch tensors, and ComfyUI VIDEO values. Unsupported value type: "
+        "torch tensors, and ComfyUI NestedTensor and VIDEO values. "
+        "Unsupported value type: "
         f"{type(value)!r}"
     )
 
@@ -402,6 +465,11 @@ def _deserialize_transport_value(payload: Any, attachments: tuple[bytes, ...]) -
             ),
             io_type=str(payload.get("io_type", "*")),
             is_list=bool(payload.get("is_list", False)),
+        )
+    if kind == _NESTED_TENSOR_KIND:
+        return _deserialize_nested_tensor(
+            payload,
+            lambda item: _deserialize_transport_value(item, attachments),
         )
     if kind == _VIDEO_KIND:
         return _deserialize_video(

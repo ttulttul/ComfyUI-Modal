@@ -2385,23 +2385,24 @@ function setRemoteFlag(node, value) {
  * @returns {{ phase: string, promptId: string } | null}
  */
 function getRemoteVisualState(node) {
-  const state = modalNodeStates.get(nodeId(node)) ?? null;
+  const visualNodeId = workflowNodePath(node) || nodeId(node);
+  const state = modalNodeStates.get(visualNodeId) ?? null;
   if (!state?.promptId) {
     return state;
   }
   const promptState = modalPromptStates.get(state.promptId);
-  const progressState = nodeProgressState(nodeId(node), state.promptId);
-  const progressLanes = nodeProgressLanes(nodeId(node), state.promptId);
-  const cachedState = nodeCachedState(nodeId(node), state.promptId);
-  const batchProgressState = modalNodeBatchProgress.get(nodeId(node)) ?? null;
-  const hasLiveProgress = hasLiveNodeProgress(nodeId(node), state.promptId);
+  const progressState = nodeProgressState(visualNodeId, state.promptId);
+  const progressLanes = nodeProgressLanes(visualNodeId, state.promptId);
+  const cachedState = nodeCachedState(visualNodeId, state.promptId);
+  const batchProgressState = modalNodeBatchProgress.get(visualNodeId) ?? null;
+  const hasLiveProgress = hasLiveNodeProgress(visualNodeId, state.promptId);
   return {
     ...state,
     phase: deriveRemoteNodePhase(state.phase, hasLiveProgress),
-    isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === nodeId(node),
-    isActiveComponentMember: isNodeInActiveComponent(state.promptId, nodeId(node)),
+    isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === visualNodeId,
+    isActiveComponentMember: isNodeInActiveComponent(state.promptId, visualNodeId),
     isCachedRemoteNode: Boolean(cachedState),
-    componentLabel: promptState?.componentLabelByMember.get(nodeId(node)) ?? null,
+    componentLabel: promptState?.componentLabelByMember.get(visualNodeId) ?? null,
     cachedAt: cachedState?.cachedAt ?? null,
     progress: progressState,
     batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,

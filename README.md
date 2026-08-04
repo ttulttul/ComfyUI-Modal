@@ -142,6 +142,9 @@ Boundary-crossing values must be transportable. Supported evaluated values inclu
 - `BOOLEAN`
 - `STRING`
 
+`LATENT` transport includes both ordinary tensor samples and ComfyUI's multimodal
+`NestedTensor` wrapper used for paired video/audio latent samples.
+
 ComfyUI runtime objects such as `MODEL`, `CONDITIONING`, `CLIP`, `VAE`, `NOISE`, and `CONTROL_NET` cannot cross the local/remote boundary directly. Modal-Sync either expands the remote island so those values are produced remotely, keeps local preview/UI branches local, or fails queue-time validation with a boundary error.
 
 If a rewritten graph could create a local scheduler cycle, Modal-Sync logs compact diagnostics for the proxy graph: node classes, dependency edges, proxy payload summaries, planned stages, and detected cycle paths.

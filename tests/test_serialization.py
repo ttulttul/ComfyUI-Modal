@@ -40,6 +40,49 @@ def test_tensor_round_trip(serialization_module: Any) -> None:
     assert torch.equal(decoded[0], tensor)
 
 
+def test_nested_tensor_round_trip_preserves_multimodal_members(
+    serialization_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LATENT NestedTensor members should survive binary and legacy transport."""
+    torch = pytest.importorskip("torch")
+
+    class FakeNestedTensor:
+        """Minimal stand-in for ComfyUI's NestedTensor wrapper."""
+
+        def __init__(self, tensors: list[Any]) -> None:
+            """Store ordered tensor members."""
+            self.tensors = list(tensors)
+
+    monkeypatch.setattr(
+        serialization_module,
+        "_load_nested_tensor_transport_type",
+        lambda: FakeNestedTensor,
+    )
+    video_samples = torch.arange(24, dtype=torch.float32).reshape(1, 3, 2, 4)
+    audio_samples = torch.arange(12, dtype=torch.float32).reshape(1, 2, 6)
+    latent = {
+        "samples": FakeNestedTensor([video_samples, audio_samples]),
+        "batch_index": [0],
+    }
+
+    encoded = serialization_module.serialize_node_outputs((latent,))
+    decoded = serialization_module.deserialize_node_outputs(encoded)[0]
+
+    assert encoded.startswith(serialization_module._BINARY_ENVELOPE_MAGIC)
+    assert isinstance(decoded["samples"], FakeNestedTensor)
+    assert len(decoded["samples"].tensors) == 2
+    assert torch.equal(decoded["samples"].tensors[0], video_samples)
+    assert torch.equal(decoded["samples"].tensors[1], audio_samples)
+
+    legacy_decoded = serialization_module.deserialize_value(
+        serialization_module.serialize_value(latent)
+    )
+    assert isinstance(legacy_decoded["samples"], FakeNestedTensor)
+    assert torch.equal(legacy_decoded["samples"].tensors[0], video_samples)
+    assert torch.equal(legacy_decoded["samples"].tensors[1], audio_samples)
+
+
 def test_video_round_trip_preserves_tensor_backed_components(
     serialization_module: Any,
     monkeypatch: pytest.MonkeyPatch,
