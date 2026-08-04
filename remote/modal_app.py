@@ -75,6 +75,7 @@ _REMOTE_APP_PROTOCOL_VERSION = REMOTE_APP_PROTOCOL_VERSION
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
 _MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None, str]] = set()
+_MODAL_APP_STOP_TIMEOUT_SECONDS = 120.0
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
@@ -4889,6 +4890,24 @@ def _stop_modal_app_via_sdk(app_name: str) -> bool:
     """Try to stop a Modal app through the SDK if this SDK version exposes app stopping."""
     if modal is None:
         return False
+    try:
+        experimental_namespace = importlib.import_module("modal.experimental")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"modal", "modal.experimental"}:
+            raise
+    else:
+        stop_app = getattr(experimental_namespace, "stop_app", None)
+        if callable(stop_app):
+            try:
+                _call_modal_method(
+                    stop_app,
+                    app_name,
+                    environment_name=_modal_environment_name(),
+                )
+            except _modal_lookup_error_types():
+                return True
+            return True
+
     app_namespace = getattr(modal, "App", None)
     app_lookup = getattr(app_namespace, "lookup", None)
     if not callable(app_lookup):
@@ -4915,18 +4934,30 @@ def _stop_modal_app_via_sdk(app_name: str) -> bool:
 
 
 def _stop_modal_app_via_cli(app_name: str) -> bool:
-    """Try to stop a Modal app through the Modal CLI."""
+    """Try to stop a Modal app non-interactively through the Modal CLI."""
     modal_cli = shutil.which("modal")
     if modal_cli is None:
         return False
-    command = [modal_cli, "app", "stop", app_name]
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    command = [modal_cli, "app", "stop", app_name, "--yes"]
+    environment_name = _modal_environment_name()
+    if environment_name is not None:
+        command.extend(("--env", environment_name))
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_MODAL_APP_STOP_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Modal CLI app stop timed out for app=%s environment=%s after %.1fs.",
+            app_name,
+            environment_name or "<default>",
+            _MODAL_APP_STOP_TIMEOUT_SECONDS,
+        )
+        return False
     if completed.returncode != 0:
         logger.warning(
             "Modal CLI app stop failed for app=%s exit_code=%s stderr=%s",
