@@ -132,6 +132,8 @@ When a prompt is queued:
 Boundary-crossing values must be transportable. Supported evaluated values include:
 
 - `IMAGE`
+- `VIDEO`
+- `AUDIO`
 - `MASK`
 - `LATENT`
 - `SIGMAS`

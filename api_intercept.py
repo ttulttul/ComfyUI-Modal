@@ -43,6 +43,7 @@ _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_insta
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
+        "AUDIO",
         "BOOLEAN",
         "FLOAT",
         "IMAGE",
@@ -52,6 +53,7 @@ _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
         "NOISE",
         "SIGMAS",
         "STRING",
+        "VIDEO",
     }
 )
 _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
@@ -2542,8 +2544,8 @@ def _describe_output_boundary_error(
         f"to local node {local_consumer.node_id} ({local_consumer_class_type}) input "
         f"'{local_consumer.input_name}', which cannot cross the current local/remote boundary. "
         "Current ComfyUI-Modal transport only supports JSON-compatible values, bytes, "
-        "and tensor-like outputs such as IMAGE, MASK, LATENT, SIGMAS, NOISE, INT, "
-        "FLOAT, BOOLEAN, and STRING."
+        "and media or tensor-like outputs such as VIDEO, AUDIO, IMAGE, MASK, LATENT, "
+        "SIGMAS, NOISE, INT, FLOAT, BOOLEAN, and STRING."
     )
 
 
@@ -2562,8 +2564,8 @@ def _describe_input_boundary_error(
         f"depends on upstream node {source.node_id} ({source_class_type}) output index "
         f"{source.output_index} of type '{io_type}', which cannot cross the current "
         "local/remote boundary. Current ComfyUI-Modal transport only supports "
-        "JSON-compatible values, bytes, and tensor-like outputs such as IMAGE, MASK, "
-        "LATENT, SIGMAS, NOISE, INT, FLOAT, BOOLEAN, and STRING."
+        "JSON-compatible values, bytes, and media or tensor-like outputs such as VIDEO, "
+        "AUDIO, IMAGE, MASK, LATENT, SIGMAS, NOISE, INT, FLOAT, BOOLEAN, and STRING."
     )
 
 

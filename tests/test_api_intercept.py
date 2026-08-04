@@ -100,6 +100,14 @@ class _FakeRemoteImageNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeRemoteVideoNode:
+    """Fake remote node that produces a transportable VIDEO output."""
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    OUTPUT_IS_LIST = (False,)
+
+
 class _FakeRemoteImageConsumerNode:
     """Fake remote node that consumes IMAGE and produces IMAGE."""
 
@@ -3471,6 +3479,79 @@ def test_rewrite_rejects_non_transportable_remote_outputs(
 
     assert "exports node 1 (RemoteClip) output index 0 of type 'CLIP'" in message
     assert "cannot cross the current local/remote boundary" in message
+
+
+def test_rewrite_allows_video_and_audio_across_remote_boundaries(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Current ComfyUI VIDEO and AUDIO values should pass boundary validation."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_nodes_dir.mkdir()
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "CreateVideo": _FakeRemoteVideoNode,
+                "SaveVideo": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "CreateVideo",
+            "inputs": {},
+            "_meta": {"title": "Create Video"},
+        },
+        "2": {
+            "class_type": "SaveVideo",
+            "inputs": {"video": ["1", 0]},
+            "_meta": {"title": "Save Video"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["boundary_outputs"][0]["io_type"] == "VIDEO"
+    assert rewritten_prompt["2"]["inputs"]["video"] == ["1", 0]
+    assert summary.remote_node_ids == ["1"]
+    assert api_intercept_module._is_transportable_output_type("AUDIO") is True
 
 
 def test_extract_remote_node_ids_prefers_nested_prompt_id_over_colliding_root_id(
