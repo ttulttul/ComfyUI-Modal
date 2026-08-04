@@ -36,6 +36,14 @@ class _FakeRemoteSamplerNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeRemoteNoiseNode:
+    """Fake node that produces a non-transportable NOISE strategy object."""
+
+    RETURN_TYPES = ("NOISE",)
+    RETURN_NAMES = ("noise",)
+    OUTPUT_IS_LIST = (False,)
+
+
 class _FakeVAELoaderNode:
     """Fake VAE loader that produces a non-transportable VAE output."""
 
@@ -3552,6 +3560,82 @@ def test_rewrite_allows_video_and_audio_across_remote_boundaries(
     assert rewritten_prompt["2"]["inputs"]["video"] == ["1", 0]
     assert summary.remote_node_ids == ["1"]
     assert api_intercept_module._is_transportable_output_type("AUDIO") is True
+
+
+def test_rewrite_keeps_remote_noise_producer_with_remote_sampler(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """NOISE strategy objects should remain inside one remote component."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_nodes_dir.mkdir()
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RandomNoise": _FakeRemoteNoiseNode,
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "LocalSink": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}},
+        "2": {
+            "class_type": "RemoteSampler",
+            "inputs": {"noise": ["1", 0]},
+        },
+        "3": {
+            "class_type": "LocalSink",
+            "inputs": {"latent": ["2", 0]},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["component_node_ids"] == ["1", "2"]
+    assert set(payload["subgraph_prompt"]) == {"1", "2"}
+    assert payload["boundary_outputs"][0]["io_type"] == "LATENT"
+    assert rewritten_prompt["3"]["inputs"]["latent"] == ["1", 0]
+    assert summary.remote_component_ids == ["1"]
+    assert api_intercept_module._is_transportable_output_type("NOISE") is False
 
 
 def test_extract_remote_node_ids_prefers_nested_prompt_id_over_colliding_root_id(
