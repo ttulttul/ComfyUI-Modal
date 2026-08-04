@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from fractions import Fraction
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -36,6 +38,75 @@ def test_tensor_round_trip(serialization_module: Any) -> None:
 
     assert len(decoded) == 1
     assert torch.equal(decoded[0], tensor)
+
+
+def test_video_round_trip_preserves_tensor_backed_components(
+    serialization_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VIDEO transport should preserve frames, audio, alpha, rate, metadata, and depth."""
+    torch = pytest.importorskip("torch")
+
+    class FakeVideo:
+        """Minimal stand-in for ComfyUI's VideoInput protocol."""
+
+        def __init__(self, components: Any, bit_depth: int = 8) -> None:
+            """Store video components and encoding bit depth."""
+            self._components = components
+            self._bit_depth = bit_depth
+
+        def get_components(self) -> Any:
+            """Return the tensor-backed video components."""
+            return self._components
+
+        def get_bit_depth(self) -> int:
+            """Return the preferred encoded bit depth."""
+            return self._bit_depth
+
+    class FakeVideoFromComponents(FakeVideo):
+        """Stand in for ComfyUI's receiving-side VideoFromComponents implementation."""
+
+    class FakeVideoComponents(SimpleNamespace):
+        """Stand in for ComfyUI's VideoComponents dataclass."""
+
+    monkeypatch.setattr(
+        serialization_module,
+        "_load_video_transport_types",
+        lambda: (FakeVideo, FakeVideoFromComponents, FakeVideoComponents),
+    )
+    images = torch.arange(72, dtype=torch.float32).reshape(2, 3, 4, 3)
+    waveform = torch.arange(16, dtype=torch.float32).reshape(1, 2, 8)
+    alpha = torch.ones((2, 3, 4), dtype=torch.float32)
+    video = FakeVideo(
+        FakeVideoComponents(
+            images=images,
+            frame_rate=Fraction(30_000, 1_001),
+            audio={"waveform": waveform, "sample_rate": 48_000},
+            metadata={"source": "modal"},
+            alpha=alpha,
+        ),
+        bit_depth=10,
+    )
+
+    encoded = serialization_module.serialize_node_outputs((video,))
+    decoded = serialization_module.deserialize_node_outputs(encoded)[0]
+    decoded_components = decoded.get_components()
+
+    assert encoded.startswith(serialization_module._BINARY_ENVELOPE_MAGIC)
+    assert isinstance(decoded, FakeVideoFromComponents)
+    assert decoded.get_bit_depth() == 10
+    assert decoded_components.frame_rate == Fraction(30_000, 1_001)
+    assert decoded_components.audio["sample_rate"] == 48_000
+    assert decoded_components.metadata == {"source": "modal"}
+    assert torch.equal(decoded_components.images, images)
+    assert torch.equal(decoded_components.audio["waveform"], waveform)
+    assert torch.equal(decoded_components.alpha, alpha)
+
+    legacy_decoded = serialization_module.deserialize_value(
+        serialization_module.serialize_value(video)
+    )
+    assert legacy_decoded.get_components().frame_rate == Fraction(30_000, 1_001)
+    assert torch.equal(legacy_decoded.get_components().images, images)
 
 
 def test_tensor_transport_uses_raw_binary_attachments(serialization_module: Any) -> None:

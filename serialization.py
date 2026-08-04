@@ -8,7 +8,8 @@ import json
 import logging
 import struct
 from collections.abc import Mapping, Sequence
-from typing import Any
+from fractions import Fraction
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,8 @@ _TENSOR_KIND = "tensor"
 _BYTES_KIND = "bytes"
 _TUPLE_KIND = "tuple"
 _MAPPED_OUTPUT_KIND = "mapped_output"
+_VIDEO_KIND = "video"
+_VIDEO_PAYLOAD_VERSION = 1
 _BATCHABLE_TENSOR_IO_TYPES = frozenset({"IMAGE", "MASK", "NOISE", "SIGMAS"})
 _BINARY_ENVELOPE_MAGIC = b"CMODALB1"
 _BINARY_ENVELOPE_VERSION = 1
@@ -111,6 +114,89 @@ def _deserialize_tensor_bytes(payload: bytes) -> Any:
     return load(payload)[_VALUE_KEY]
 
 
+def _load_video_transport_types() -> tuple[type[Any], type[Any], type[Any]] | None:
+    """Load current ComfyUI video protocol and implementation types when available."""
+    try:
+        from comfy_api.latest import Input, InputImpl, Types
+    except (ImportError, AttributeError):
+        return None
+
+    video_input_type = getattr(Input, "Video", None)
+    video_impl_type = getattr(InputImpl, "VideoFromComponents", None)
+    video_components_type = getattr(Types, "VideoComponents", None)
+    if not all(
+        isinstance(candidate, type)
+        for candidate in (video_input_type, video_impl_type, video_components_type)
+    ):
+        return None
+    return video_input_type, video_impl_type, video_components_type
+
+
+def _is_comfy_video_input(value: Any) -> bool:
+    """Return whether a value implements the current ComfyUI VIDEO protocol."""
+    video_types = _load_video_transport_types()
+    return video_types is not None and isinstance(value, video_types[0])
+
+
+def _serialize_video(
+    value: Any,
+    serialize_item: Callable[[Any], Any],
+) -> dict[str, Any]:
+    """Serialize a ComfyUI VIDEO as transportable tensor-backed components."""
+    components = value.get_components()
+    frame_rate = Fraction(components.frame_rate).limit_denominator(1_000_000)
+    get_bit_depth = getattr(value, "get_bit_depth", None)
+    bit_depth = int(get_bit_depth()) if callable(get_bit_depth) else 8
+    return {
+        _KIND_KEY: _VIDEO_KIND,
+        "version": _VIDEO_PAYLOAD_VERSION,
+        "images": serialize_item(components.images),
+        "audio": serialize_item(getattr(components, "audio", None)),
+        "alpha": serialize_item(getattr(components, "alpha", None)),
+        "metadata": serialize_item(getattr(components, "metadata", None)),
+        "frame_rate_numerator": frame_rate.numerator,
+        "frame_rate_denominator": frame_rate.denominator,
+        "bit_depth": bit_depth,
+    }
+
+
+def _video_payload_integer(payload: Mapping[str, Any], key: str) -> int:
+    """Return one validated integer field from a serialized VIDEO payload."""
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Serialized VIDEO field '{key}' must be an integer.")
+    return value
+
+
+def _deserialize_video(
+    payload: Mapping[str, Any],
+    deserialize_item: Callable[[Any], Any],
+) -> Any:
+    """Reconstruct a current ComfyUI VIDEO from tensor-backed components."""
+    if payload.get("version") != _VIDEO_PAYLOAD_VERSION:
+        raise ValueError(f"Unsupported serialized VIDEO version {payload.get('version')!r}.")
+    video_types = _load_video_transport_types()
+    if video_types is None:
+        raise TypeError(
+            "Deserializing VIDEO values requires a ComfyUI runtime with the current video API."
+        )
+
+    _, video_impl_type, video_components_type = video_types
+    numerator = _video_payload_integer(payload, "frame_rate_numerator")
+    denominator = _video_payload_integer(payload, "frame_rate_denominator")
+    if denominator <= 0:
+        raise ValueError("Serialized VIDEO frame-rate denominator must be positive.")
+    bit_depth = _video_payload_integer(payload, "bit_depth")
+    components = video_components_type(
+        images=deserialize_item(payload.get("images")),
+        frame_rate=Fraction(numerator, denominator),
+        audio=deserialize_item(payload.get("audio")),
+        metadata=deserialize_item(payload.get("metadata")),
+        alpha=deserialize_item(payload.get("alpha")),
+    )
+    return video_impl_type(components, bit_depth=bit_depth)
+
+
 def serialize_value(value: Any) -> Any:
     """Convert a Python value into a JSON-safe execution payload."""
     if _is_scalar(value):
@@ -132,6 +218,9 @@ def serialize_value(value: Any) -> Any:
     if torch is not None and isinstance(value, torch.Tensor):
         return _serialize_tensor(value)
 
+    if _is_comfy_video_input(value):
+        return _serialize_video(value, serialize_value)
+
     if isinstance(value, bytes):
         return {
             _KIND_KEY: _BYTES_KIND,
@@ -152,7 +241,7 @@ def serialize_value(value: Any) -> Any:
 
     raise TypeError(
         "ComfyUI-Modal can only serialize JSON-compatible values, bytes, "
-        "and torch tensors. Unsupported value type: "
+        "torch tensors, and ComfyUI VIDEO values. Unsupported value type: "
         f"{type(value)!r}"
     )
 
@@ -187,6 +276,8 @@ def deserialize_value(payload: Any) -> Any:
             io_type=str(payload.get("io_type", "*")),
             is_list=bool(payload.get("is_list", False)),
         )
+    if kind == _VIDEO_KIND:
+        return _deserialize_video(payload, deserialize_value)
 
     return {str(key): deserialize_value(value) for key, value in payload.items()}
 
@@ -214,6 +305,12 @@ def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
         attachments.append(_serialize_tensor_bytes(value))
         return {_KIND_KEY: _TENSOR_KIND, "attachment": attachment_index}
 
+    if _is_comfy_video_input(value):
+        return _serialize_video(
+            value,
+            lambda item: _serialize_transport_value(item, attachments),
+        )
+
     if isinstance(value, bytes):
         attachment_index = len(attachments)
         attachments.append(value)
@@ -236,7 +333,7 @@ def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
 
     raise TypeError(
         "ComfyUI-Modal can only serialize JSON-compatible values, bytes, "
-        "and torch tensors. Unsupported value type: "
+        "torch tensors, and ComfyUI VIDEO values. Unsupported value type: "
         f"{type(value)!r}"
     )
 
@@ -305,6 +402,11 @@ def _deserialize_transport_value(payload: Any, attachments: tuple[bytes, ...]) -
             ),
             io_type=str(payload.get("io_type", "*")),
             is_list=bool(payload.get("is_list", False)),
+        )
+    if kind == _VIDEO_KIND:
+        return _deserialize_video(
+            payload,
+            lambda item: _deserialize_transport_value(item, attachments),
         )
     return {
         str(key): _deserialize_transport_value(value, attachments)
