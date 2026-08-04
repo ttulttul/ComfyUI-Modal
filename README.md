@@ -120,7 +120,7 @@ Mapped progress is summarized at the global status pill and representative node 
 When a prompt is queued:
 
 1. The frontend sends the prompt and `extra_pnginfo.workflow` metadata to `POST /modal/queue_prompt`.
-2. The backend resolves marked workflow nodes onto queued prompt node ids, including nested subgraph ids such as `195:27`.
+2. The backend resolves marked workflow nodes onto queued prompt node ids, including nested subgraph ids such as `195:27`. Reusable definitions under `workflow.definitions.subgraphs` are expanded through each matching subgraph instance before markers are mapped.
 3. Remote-marked nodes are partitioned into transport-aware components.
 4. Components expand upstream when required by non-transportable inputs such as `MODEL`, `CLIP`, `VAE`, or `CONDITIONING`.
 5. Each component is replaced with one or more generated `ModalUniversalExecutor_<hash>` proxy nodes.
