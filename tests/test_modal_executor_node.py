@@ -10762,6 +10762,72 @@ def test_modal_cloud_uses_current_comfy_explicit_ram_pressure_thresholds(
     assert cache_args == {"lru": 0, "ram": 3.0, "ram_inactive": 20.0}
 
 
+def test_modal_cloud_awaits_async_prompt_executor_api(
+    modal_cloud_module: Any,
+) -> None:
+    """An asynchronous PromptExecutor compatibility API should finish before cache reads."""
+    observed_calls: list[tuple[dict[str, Any], str, dict[str, Any], list[str]]] = []
+
+    class FakeExecutor:
+        """Minimal executor exposing a coroutine-based execute method."""
+
+        async def execute(
+            self,
+            *,
+            prompt: dict[str, Any],
+            prompt_id: str,
+            extra_data: dict[str, Any],
+            execute_outputs: list[str],
+        ) -> None:
+            """Record execution after yielding once."""
+            await asyncio.sleep(0)
+            observed_calls.append((prompt, prompt_id, extra_data, execute_outputs))
+
+    modal_cloud_module._execute_prompt_executor_compat(
+        FakeExecutor(),
+        prompt={"1": {"class_type": "Example", "inputs": {}}},
+        prompt_id="prompt-1",
+        extra_data={"client_id": "client-1"},
+        execute_outputs=["1"],
+    )
+
+    assert observed_calls == [
+        (
+            {"1": {"class_type": "Example", "inputs": {}}},
+            "prompt-1",
+            {"client_id": "client-1"},
+            ["1"],
+        )
+    ]
+
+
+def test_modal_cloud_sync_cache_reads_use_current_get_local_api(
+    modal_cloud_module: Any,
+) -> None:
+    """Synchronous progress paths should avoid creating current cache get coroutines."""
+    cache_entry = types.SimpleNamespace(outputs=[[512, 512]])
+
+    class FakeOutputsCache:
+        """Current cache double with async get and synchronous get_local."""
+
+        async def get(self, node_id: str) -> Any:
+            """Fail if the synchronous compatibility path calls async get."""
+            del node_id
+            raise AssertionError("async get should not be created")
+
+        def get_local(self, node_id: str) -> Any:
+            """Return the already materialized local cache entry."""
+            assert node_id == "115"
+            return cache_entry
+
+    resolved_entry = modal_cloud_module._prompt_executor_cache_get_sync(
+        FakeOutputsCache(),
+        "115",
+    )
+
+    assert resolved_entry is cache_entry
+
+
 def test_modal_cloud_class_options_do_not_use_deprecated_concurrency_flag(
     modal_cloud_module: Any,
 ) -> None:
@@ -11203,11 +11269,17 @@ def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instan
             cache_store=cache_store,
         )
     )
-    first_executor.caches.outputs.set("node_1", cache_entry)
-    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
-        first_executor,
-        prompt=copy.deepcopy(prompt),
-        cache_store=cache_store,
+    asyncio.run(
+        modal_cloud_module._await_maybe(
+            first_executor.caches.outputs.set("node_1", cache_entry)
+        )
+    )
+    persisted_nodes = asyncio.run(
+        modal_cloud_module._persist_node_output_cache_entries(
+            first_executor,
+            prompt=copy.deepcopy(prompt),
+            cache_store=cache_store,
+        )
     )
 
     second_executor = execution.PromptExecutor(
@@ -11226,7 +11298,9 @@ def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instan
             restored_cache_keys_by_node_id=restored_cache_keys_by_node_id,
         )
     )
-    restored_entry = second_executor.caches.outputs.get("node_1")
+    restored_entry = asyncio.run(
+        modal_cloud_module._await_maybe(second_executor.caches.outputs.get("node_1"))
+    )
 
     assert restored_first == []
     assert persisted_nodes == ["node_1"]
@@ -11331,7 +11405,7 @@ def test_modal_cloud_skips_rewriting_restored_distributed_cache_entries(
             """Populate one persistent cache entry."""
             self.cache_key_set = object()
 
-        def get(self, node_id: str) -> Any:
+        async def get(self, node_id: str) -> Any:
             """Return the prepared cache entry for the target node only."""
             if node_id == "node_1":
                 return cache_entry
@@ -11350,11 +11424,13 @@ def test_modal_cloud_skips_rewriting_restored_distributed_cache_entries(
         lambda message, *args: observed_logs.append((message, *args)),
     )
 
-    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
-        executor,
-        prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
-        cache_store=cache_store,
-        restored_cache_keys_by_node_id={"node_1": cache_key},
+    persisted_nodes = asyncio.run(
+        modal_cloud_module._persist_node_output_cache_entries(
+            executor,
+            prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
+            cache_store=cache_store,
+            restored_cache_keys_by_node_id={"node_1": cache_key},
+        )
     )
 
     assert persisted_nodes == []
@@ -11400,11 +11476,13 @@ def test_modal_cloud_skips_restored_hit_before_cache_entry_serialization(
         ),
     )
 
-    persisted_nodes = modal_cloud_module._persist_node_output_cache_entries(
-        executor,
-        prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
-        cache_store={},
-        restored_cache_keys_by_node_id={"node_1": "NC_existing"},
+    persisted_nodes = asyncio.run(
+        modal_cloud_module._persist_node_output_cache_entries(
+            executor,
+            prompt={"node_1": {"class_type": "PersistentCacheNode", "inputs": {"value": 4}}},
+            cache_store={},
+            restored_cache_keys_by_node_id={"node_1": "NC_existing"},
+        )
     )
 
     assert persisted_nodes == []
@@ -11426,11 +11504,11 @@ def test_modal_cloud_restores_persisted_node_cache_entries_in_parallel(
             """Expose the cache-key-set marker read by restore."""
             self.cache_key_set = object()
 
-        def get(self, node_id: str) -> Any:
+        async def get(self, node_id: str) -> Any:
             """Return any previously restored entry."""
             return restored_values.get(node_id)
 
-        def set(self, node_id: str, cache_entry: Any) -> None:
+        async def set(self, node_id: str, cache_entry: Any) -> None:
             """Record one restored cache entry."""
             restored_values[node_id] = cache_entry
 

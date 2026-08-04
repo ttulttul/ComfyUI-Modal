@@ -3156,6 +3156,25 @@ def _get_or_create_prompt_executor_state(
         return state
 
 
+def _execute_prompt_executor_compat(
+    executor: Any,
+    *,
+    prompt: dict[str, Any],
+    prompt_id: str,
+    extra_data: dict[str, Any],
+    execute_outputs: list[str],
+) -> None:
+    """Execute a ComfyUI prompt across synchronous and asynchronous executor APIs."""
+    execution_result = executor.execute(
+        prompt=prompt,
+        prompt_id=prompt_id,
+        extra_data=extra_data,
+        execute_outputs=execute_outputs,
+    )
+    if inspect.isawaitable(execution_result):
+        asyncio.run(execution_result)
+
+
 def _node_output_cache_store() -> Any | None:
     """Return the shared Modal Dict used for persisted transport-safe node outputs."""
     if modal is None:
@@ -3651,6 +3670,33 @@ def _deserialize_node_output_cache_entry(
     return execution.CacheEntry(ui=ui_value, outputs=outputs)
 
 
+async def _await_maybe(value: Any) -> Any:
+    """Await an asynchronous compatibility result or return a synchronous value."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _prompt_executor_cache_get_sync(outputs_cache: Any, node_id: str) -> Any | None:
+    """Read one prepared cache entry without leaking a coroutine into synchronous code."""
+    local_getter = getattr(outputs_cache, "get_local", None)
+    if callable(local_getter):
+        return local_getter(node_id)
+
+    cache_entry = outputs_cache.get(node_id)
+    if not inspect.isawaitable(cache_entry):
+        return cache_entry
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(cache_entry)
+    if inspect.iscoroutine(cache_entry):
+        cache_entry.close()
+    raise RuntimeError(
+        "ComfyUI exposed an asynchronous outputs cache without the synchronous get_local API."
+    )
+
+
 async def _restore_persisted_node_output_cache_entries(
     execution: Any,
     executor: Any,
@@ -3665,7 +3711,7 @@ async def _restore_persisted_node_output_cache_entries(
     outputs_cache = executor.caches.outputs
     dynamic_prompt = execution.DynamicPrompt(prompt)
     is_changed_cache = execution.IsChangedCache(prompt_id, dynamic_prompt, outputs_cache)
-    await outputs_cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
+    await _await_maybe(outputs_cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache))
     outputs_cache.clean_unused()
 
     return await _restore_persisted_node_output_cache_entries_into_prepared_cache(
@@ -3727,7 +3773,7 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
         )
 
     for node_id in prompt:
-        if outputs_cache.get(node_id) is not None:
+        if await _await_maybe(outputs_cache.get(node_id)) is not None:
             _emit_cloud_info(
                 "Node output cache lookup node=%s result=local-hit",
                 node_id,
@@ -3783,7 +3829,7 @@ async def _restore_persisted_node_output_cache_entries_into_prepared_cache(
                 missing_required_ancestors,
             )
             continue
-        outputs_cache.set(node_id, cache_entry)
+        await _await_maybe(outputs_cache.set(node_id, cache_entry))
         _emit_cloud_info(
             "Node output cache lookup node=%s key_prefix=%s result=hit",
             node_id,
@@ -3864,7 +3910,7 @@ def _boundary_output_node_ids(boundary_outputs: Iterable[Mapping[str, Any]]) -> 
     }
 
 
-def _persist_node_output_cache_entries(
+async def _persist_node_output_cache_entries(
     executor: Any,
     *,
     prompt: dict[str, Any],
@@ -3883,7 +3929,7 @@ def _persist_node_output_cache_entries(
 
     persisted_node_ids: list[str] = []
     for node_id in prompt:
-        cache_entry = outputs_cache.get(node_id)
+        cache_entry = await _await_maybe(outputs_cache.get(node_id))
         if cache_entry is None:
             _emit_cloud_info(
                 "Node output cache write node=%s result=skip reason=no-local-cache-entry",
@@ -4719,7 +4765,10 @@ def _execute_subgraph_prompt(
                 )
             prompt_server.configure_boundary_output_stream(
                 boundary_outputs=list(normalized_payload.get("boundary_outputs", [])),
-                lookup_cache_entry=lambda node_id: executor_state.executor.caches.outputs.get(node_id),
+                lookup_cache_entry=lambda node_id: _prompt_executor_cache_get_sync(
+                    executor_state.executor.caches.outputs,
+                    node_id,
+                ),
             )
             try:
                 with _timed_phase(
@@ -4727,7 +4776,8 @@ def _execute_subgraph_prompt(
                     component=component_id,
                     execute_nodes=list(normalized_payload.get("execute_node_ids", [])),
                 ):
-                    executor_state.executor.execute(
+                    _execute_prompt_executor_compat(
+                        executor_state.executor,
                         prompt=prompt,
                         prompt_id=str(
                             payload.get("prompt_id")
@@ -4760,14 +4810,16 @@ def _execute_subgraph_prompt(
 
         if cache_store is not None and get_settings().node_output_cache_max_bytes > 0:
             with _timed_phase("persist_node_cache", component=component_id):
-                persisted_node_ids = _persist_node_output_cache_entries(
-                    executor,
-                    prompt=prompt,
-                    cache_store=cache_store,
-                    restored_cache_keys_by_node_id=(
-                        restore_state.restored_cache_keys_by_node_id
-                        if restore_state is not None
-                        else None
+                persisted_node_ids = asyncio.run(
+                    _persist_node_output_cache_entries(
+                        executor,
+                        prompt=prompt,
+                        cache_store=cache_store,
+                        restored_cache_keys_by_node_id=(
+                            restore_state.restored_cache_keys_by_node_id
+                            if restore_state is not None
+                            else None
+                        ),
                     ),
                 )
             if persisted_node_ids:
@@ -4787,7 +4839,10 @@ def _execute_subgraph_prompt(
             for boundary_output in normalized_payload.get("boundary_outputs", []):
                 node_id = str(boundary_output["node_id"])
                 output_index = int(boundary_output["output_index"])
-                cache_entry = executor.caches.outputs.get(node_id)
+                cache_entry = _prompt_executor_cache_get_sync(
+                    executor.caches.outputs,
+                    node_id,
+                )
                 if cache_entry is None:
                     raise RemoteSubgraphExecutionError(
                         f"Remote subgraph did not produce cache entry for node {node_id}."
