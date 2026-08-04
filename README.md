@@ -42,12 +42,15 @@ export COMFY_MODAL_EXECUTION_MODE=local
 
 Local mode still exercises marker resolution, prompt rewrite, sync planning, serialization, and proxy execution, but the rewritten component runs in the local ComfyUI process instead of in Modal.
 
-Use remote mode when the ComfyUI environment has the supported Modal SDK and working credentials:
+Use remote mode with working Modal credentials:
 
 ```bash
-uv pip install "modal==1.4.2"
 export COMFY_MODAL_EXECUTION_MODE=remote
 ```
+
+When ComfyUI starts in remote mode, Modal-Sync checks whether the supported Modal SDK is importable. If it is missing, the extension installs the pinned `modal==1.4.2` package into the exact Python interpreter running ComfyUI. The installer prefers `uv pip` and falls back to `python -m pip`; startup logs report detection, the selected command, and the result. If neither installer is available or installation fails, startup continues with the existing local-mirror fallback and logs an actionable error.
+
+Modal authentication remains user-managed. Run `<comfyui-venv>/bin/python -m modal setup` when the current user does not already have working credentials. To install the SDK manually before startup, run `uv pip install --python <comfyui-venv>/bin/python "modal==1.4.2"`.
 
 For repository development, `uv sync --extra remote --group test` installs the same pinned SDK. Remote mode uses the stable cloud entrypoint in [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py). On first use, Modal-Sync can auto-deploy the configured Modal app if it does not exist.
 

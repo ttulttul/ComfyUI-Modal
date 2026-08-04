@@ -89,6 +89,12 @@ def extension_package() -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_sdk_module(extension_package: object) -> object:
+    """Return the Modal SDK startup bootstrap module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.modal_sdk")
+
+
+@pytest.fixture(scope="session")
 def api_intercept_module(extension_package: object) -> object:
     """Return the prompt interception module."""
     return importlib.import_module(f"{PACKAGE_NAME}.api_intercept")
