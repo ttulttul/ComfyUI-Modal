@@ -3578,6 +3578,7 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
     assert {
         "aiohttp",
         "alembic",
+        "comfy-aimdo",
         "comfy-kitchen",
         "kornia",
         "opencv-python-headless",

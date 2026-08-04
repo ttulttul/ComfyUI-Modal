@@ -64,6 +64,8 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert all("==" in requirement for requirement in runtime_packages)
     assert all("==" in requirement for requirement in torch_packages)
     assert len(runtime_packages) == len(set(runtime_packages))
+    assert "comfy-aimdo==0.4.11" in runtime_packages
+    assert "comfy-kitchen==0.2.26" in runtime_packages
 
 
 def test_runtime_identity_changes_with_source_and_runtime_options(
