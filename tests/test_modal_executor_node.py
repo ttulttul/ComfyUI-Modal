@@ -4761,6 +4761,112 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
     assert deploy_calls == [("comfy-modal-sync", "main")]
 
 
+def test_remote_modal_stops_app_through_experimental_sdk(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Modal 1.4 should use its non-interactive experimental stop API."""
+    stop_calls: list[tuple[str, str | None]] = []
+
+    def fake_stop_app(app_name: str, *, environment_name: str | None = None) -> None:
+        """Record one SDK stop request."""
+        stop_calls.append((app_name, environment_name))
+
+    fake_experimental_namespace = types.SimpleNamespace(stop_app=fake_stop_app)
+    original_import_module = remote_modal_app_module.importlib.import_module
+
+    def fake_import_module(module_name: str) -> Any:
+        """Return the Modal experimental namespace and delegate other imports."""
+        if module_name == "modal.experimental":
+            return fake_experimental_namespace
+        return original_import_module(module_name)
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "modal",
+        types.SimpleNamespace(exception=types.SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib,
+        "import_module",
+        fake_import_module,
+    )
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
+
+    stopped = remote_modal_app_module._stop_modal_app_via_sdk("comfy-modal-sync-instance")
+
+    assert stopped is True
+    assert stop_calls == [("comfy-modal-sync-instance", "main")]
+
+
+def test_remote_modal_cli_stop_is_noninteractive_and_environment_scoped(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The CLI fallback should never block waiting for confirmation."""
+    observed_calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> Any:
+        """Record the CLI command and return success."""
+        observed_calls.append((command, kwargs))
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda _: "/venv/bin/modal")
+    monkeypatch.setattr(remote_modal_app_module.subprocess, "run", fake_run)
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
+
+    stopped = remote_modal_app_module._stop_modal_app_via_cli("comfy-modal-sync-instance")
+
+    assert stopped is True
+    assert observed_calls == [
+        (
+            [
+                "/venv/bin/modal",
+                "app",
+                "stop",
+                "comfy-modal-sync-instance",
+                "--yes",
+                "--env",
+                "main",
+            ],
+            {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "timeout": remote_modal_app_module._MODAL_APP_STOP_TIMEOUT_SECONDS,
+            },
+        )
+    ]
+
+
+def test_remote_modal_cli_stop_timeout_returns_controlled_failure(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    """A genuine CLI timeout should not leak TimeoutExpired into prompt execution."""
+    command = ["/venv/bin/modal", "app", "stop", "comfy-modal-sync-instance", "--yes"]
+
+    def fake_run(*_: Any, **__: Any) -> Any:
+        """Simulate an unresponsive Modal CLI."""
+        raise subprocess.TimeoutExpired(
+            command,
+            remote_modal_app_module._MODAL_APP_STOP_TIMEOUT_SECONDS,
+        )
+
+    monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda _: "/venv/bin/modal")
+    monkeypatch.setattr(remote_modal_app_module.subprocess, "run", fake_run)
+    monkeypatch.delenv("MODAL_ENVIRONMENT", raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        stopped = remote_modal_app_module._stop_modal_app_via_cli(
+            "comfy-modal-sync-instance"
+        )
+
+    assert stopped is False
+    assert "Modal CLI app stop timed out" in caplog.text
+
+
 def test_remote_modal_rejects_fingerprint_mismatch_when_auto_deploy_is_disabled(
     remote_modal_app_module: Any,
     monkeypatch: Any,
