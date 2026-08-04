@@ -50,7 +50,6 @@ _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
         "INT",
         "LATENT",
         "MASK",
-        "NOISE",
         "SIGMAS",
         "STRING",
         "VIDEO",
@@ -2545,7 +2544,7 @@ def _describe_output_boundary_error(
         f"'{local_consumer.input_name}', which cannot cross the current local/remote boundary. "
         "Current ComfyUI-Modal transport only supports JSON-compatible values, bytes, "
         "and media or tensor-like outputs such as VIDEO, AUDIO, IMAGE, MASK, LATENT, "
-        "SIGMAS, NOISE, INT, FLOAT, BOOLEAN, and STRING."
+        "SIGMAS, INT, FLOAT, BOOLEAN, and STRING."
     )
 
 
@@ -2565,7 +2564,7 @@ def _describe_input_boundary_error(
         f"{source.output_index} of type '{io_type}', which cannot cross the current "
         "local/remote boundary. Current ComfyUI-Modal transport only supports "
         "JSON-compatible values, bytes, and media or tensor-like outputs such as VIDEO, "
-        "AUDIO, IMAGE, MASK, LATENT, SIGMAS, NOISE, INT, FLOAT, BOOLEAN, and STRING."
+        "AUDIO, IMAGE, MASK, LATENT, SIGMAS, INT, FLOAT, BOOLEAN, and STRING."
     )
 
 
