@@ -5838,6 +5838,95 @@ def test_remote_modal_log_stream_prefers_cli_before_sdk(
     assert backend_calls == ["cli:ta-123"]
 
 
+def test_remote_modal_log_stream_survives_short_container_reuse_gap(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A reused task id should keep one watcher and avoid replaying container history."""
+    created_threads: list[Any] = []
+    created_timers: list[Any] = []
+
+    class FakeThread:
+        """Record watcher lifecycle without starting a real thread."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """Store thread construction arguments."""
+            self.kwargs = kwargs
+            self.started = False
+            self.join_calls: list[float | None] = []
+            created_threads.append(self)
+
+        def start(self) -> None:
+            """Mark the watcher as alive."""
+            self.started = True
+
+        def is_alive(self) -> bool:
+            """Return whether the fake watcher has started."""
+            return self.started
+
+        def join(self, timeout: float | None = None) -> None:
+            """Record one bounded watcher join."""
+            self.join_calls.append(timeout)
+
+    class FakeTimer:
+        """Expose a manually fired daemon idle timer."""
+
+        def __init__(
+            self,
+            interval: float,
+            function: Any,
+            args: tuple[Any, ...],
+        ) -> None:
+            """Store the delayed callback without scheduling it."""
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            created_timers.append(self)
+
+        def start(self) -> None:
+            """Mark the timer as scheduled."""
+            self.started = True
+
+        def cancel(self) -> None:
+            """Mark the scheduled callback as cancelled."""
+            self.cancelled = True
+
+        def fire(self) -> None:
+            """Run the callback when it has not been cancelled."""
+            if not self.cancelled:
+                self.function(*self.args)
+
+    monkeypatch.setattr(remote_modal_app_module, "_REMOTE_CONTAINER_LOG_STREAMS", {})
+    monkeypatch.setattr(remote_modal_app_module.threading, "Thread", FakeThread)
+    monkeypatch.setattr(remote_modal_app_module.threading, "Timer", FakeTimer)
+
+    assert remote_modal_app_module._retain_remote_container_log_stream("ta-reused") == "ta-reused"
+    stream_state = remote_modal_app_module._REMOTE_CONTAINER_LOG_STREAMS["ta-reused"]
+    remote_modal_app_module._release_remote_container_log_stream("ta-reused")
+
+    assert len(created_threads) == 1
+    assert len(created_timers) == 1
+    assert created_timers[0].daemon is True
+    assert stream_state.stop_event.is_set() is False
+
+    remote_modal_app_module._retain_remote_container_log_stream("ta-reused")
+
+    assert len(created_threads) == 1
+    assert created_timers[0].cancelled is True
+    assert stream_state.refcount == 1
+
+    remote_modal_app_module._release_remote_container_log_stream("ta-reused")
+    assert len(created_timers) == 2
+    created_timers[1].fire()
+
+    assert stream_state.stop_event.is_set() is True
+    assert stream_state.thread.join_calls == [0.2]
+    assert "ta-reused" not in remote_modal_app_module._REMOTE_CONTAINER_LOG_STREAMS
+
+
 def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -8554,6 +8643,42 @@ def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
     assert serialization_module.deserialize_node_outputs(response) == (
         ["latent-a:10", "latent-b:11"],
     )
+
+
+def test_implicit_mapping_preserves_create_video_frame_sequence(
+    remote_modal_app_module: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CreateVideo should receive one complete IMAGE frame sequence."""
+    torch = pytest.importorskip("torch")
+    frame_sequence = torch.zeros((124, 8, 8, 3), dtype=torch.float32)
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "105:91",
+        "subgraph_prompt": {
+            "105:91": {
+                "class_type": "CreateVideo",
+                "inputs": {"images": ["105:10", 0]},
+            }
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "IMAGE",
+                "targets": [{"node_id": "105:91", "input_name": "images"}],
+            }
+        ],
+    }
+    caplog.set_level(logging.INFO)
+
+    split_inputs = remote_modal_app_module._split_batch_boundary_inputs(
+        payload,
+        {"remote_input_0": frame_sequence},
+    )
+
+    assert split_inputs is None
+    assert "target sockets consume the complete tensor batch" in caplog.text
+    assert "105:91.images" in caplog.text
 
 
 def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_run(
