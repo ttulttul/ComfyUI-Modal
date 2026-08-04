@@ -862,20 +862,48 @@ def _iter_workflow_nodes(
             yield from _iter_workflow_nodes(item, visited_object_ids)
 
 
+def _workflow_subgraph_definitions(
+    workflow_fragment: Any,
+) -> dict[str, dict[str, Any]]:
+    """Return reusable ComfyUI subgraph definitions keyed by their node type id."""
+    if not isinstance(workflow_fragment, dict):
+        return {}
+    definitions = workflow_fragment.get("definitions")
+    if not isinstance(definitions, dict):
+        return {}
+    subgraphs = definitions.get("subgraphs")
+    if not isinstance(subgraphs, list):
+        return {}
+
+    return {
+        str(subgraph["id"]): subgraph
+        for subgraph in subgraphs
+        if isinstance(subgraph, dict) and subgraph.get("id") is not None
+    }
+
+
 def _iter_workflow_nodes_with_ancestors(
     workflow_fragment: Any,
     ancestor_node_ids: tuple[str, ...] = (),
-    visited_object_ids: set[int] | None = None,
+    visited_fragments: set[tuple[int, tuple[str, ...], tuple[str, ...]]] | None = None,
+    subgraph_definitions: Mapping[str, dict[str, Any]] | None = None,
+    active_subgraph_definition_ids: tuple[str, ...] = (),
 ) -> Iterator[tuple[dict[str, Any], tuple[str, ...]]]:
-    """Yield workflow nodes together with their ancestor workflow-node ids."""
-    if visited_object_ids is None:
-        visited_object_ids = set()
+    """Yield workflow nodes with instance paths across embedded and defined subgraphs."""
+    if visited_fragments is None:
+        visited_fragments = set()
+    if subgraph_definitions is None:
+        subgraph_definitions = _workflow_subgraph_definitions(workflow_fragment)
 
     if isinstance(workflow_fragment, dict):
-        object_id = id(workflow_fragment)
-        if object_id in visited_object_ids:
+        fragment_identity = (
+            id(workflow_fragment),
+            ancestor_node_ids,
+            active_subgraph_definition_ids,
+        )
+        if fragment_identity in visited_fragments:
             return
-        visited_object_ids.add(object_id)
+        visited_fragments.add(fragment_identity)
 
         next_ancestor_node_ids = ancestor_node_ids
         if _looks_like_workflow_node(workflow_fragment):
@@ -883,25 +911,49 @@ def _iter_workflow_nodes_with_ancestors(
             yield workflow_fragment, ancestor_node_ids
             next_ancestor_node_ids = ancestor_node_ids + (node_id,)
 
-        for value in workflow_fragment.values():
+            subgraph_definition_id = str(workflow_fragment.get("type") or "")
+            subgraph_definition = subgraph_definitions.get(subgraph_definition_id)
+            if (
+                subgraph_definition is not None
+                and subgraph_definition_id not in active_subgraph_definition_ids
+            ):
+                yield from _iter_workflow_nodes_with_ancestors(
+                    subgraph_definition.get("nodes", []),
+                    next_ancestor_node_ids,
+                    visited_fragments,
+                    subgraph_definitions,
+                    active_subgraph_definition_ids + (subgraph_definition_id,),
+                )
+
+        for key, value in workflow_fragment.items():
+            if key == "definitions":
+                continue
             yield from _iter_workflow_nodes_with_ancestors(
                 value,
                 next_ancestor_node_ids,
-                visited_object_ids,
+                visited_fragments,
+                subgraph_definitions,
+                active_subgraph_definition_ids,
             )
         return
 
     if isinstance(workflow_fragment, list):
-        object_id = id(workflow_fragment)
-        if object_id in visited_object_ids:
+        fragment_identity = (
+            id(workflow_fragment),
+            ancestor_node_ids,
+            active_subgraph_definition_ids,
+        )
+        if fragment_identity in visited_fragments:
             return
-        visited_object_ids.add(object_id)
+        visited_fragments.add(fragment_identity)
 
         for item in workflow_fragment:
             yield from _iter_workflow_nodes_with_ancestors(
                 item,
                 ancestor_node_ids,
-                visited_object_ids,
+                visited_fragments,
+                subgraph_definitions,
+                active_subgraph_definition_ids,
             )
 
 

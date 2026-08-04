@@ -2790,6 +2790,126 @@ def test_extract_remote_node_ids_maps_subgraph_container_to_descendant_prompt_no
     ) == {"24:23", "24:25"}
 
 
+def test_extract_remote_node_ids_maps_defined_subgraph_nodes_through_instances(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """Markers in reusable subgraph definitions should map to every executable instance path."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+    subgraph_type = "4c314f31-ecda-4b08-ae98-faaba1bf613f"
+    workflow = {
+        "nodes": [
+            {"id": 105, "type": subgraph_type, "properties": {"is_modal_remote": False}},
+            {"id": 205, "type": subgraph_type, "properties": {"is_modal_remote": False}},
+        ],
+        "definitions": {
+            "subgraphs": [
+                {
+                    "id": subgraph_type,
+                    "nodes": [
+                        {"id": 11, "type": "VAELoader", "properties": {"is_modal_remote": True}},
+                        {
+                            "id": 14,
+                            "type": "SamplerCustomAdvanced",
+                            "properties": {"is_modal_remote": True},
+                        },
+                        {"id": 107, "type": "ComfyMathExpression", "properties": {}},
+                    ],
+                }
+            ]
+        },
+    }
+
+    prompt_node_ids = {
+        "105:11",
+        "105:14",
+        "105:107",
+        "205:11",
+        "205:14",
+        "205:107",
+        "300",
+    }
+
+    assert api_intercept_module.extract_remote_node_ids(
+        workflow,
+        settings,
+        prompt_node_ids=prompt_node_ids,
+    ) == {"105:11", "105:14", "205:11", "205:14"}
+    assert api_intercept_module._extract_marked_workflow_node_paths(
+        workflow,
+        settings,
+    ) == {"105:11", "105:14", "205:11", "205:14"}
+
+
+def test_extract_remote_node_ids_maps_nested_defined_subgraph_instances(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """Nested reusable definitions should retain every instance ancestor in prompt ids."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+    outer_type = "outer-subgraph"
+    inner_type = "inner-subgraph"
+    workflow = {
+        "nodes": [
+            {"id": 105, "type": outer_type, "properties": {"is_modal_remote": False}},
+        ],
+        "definitions": {
+            "subgraphs": [
+                {
+                    "id": outer_type,
+                    "nodes": [
+                        {"id": 7, "type": inner_type, "properties": {"is_modal_remote": False}},
+                    ],
+                },
+                {
+                    "id": inner_type,
+                    "nodes": [
+                        {"id": 11, "type": "VAELoader", "properties": {"is_modal_remote": True}},
+                    ],
+                },
+            ]
+        },
+    }
+
+    assert api_intercept_module.extract_remote_node_ids(
+        workflow,
+        settings,
+        prompt_node_ids={"105:7:11", "300"},
+    ) == {"105:7:11"}
+
+
 def test_rewrite_rejects_non_transportable_remote_inputs(
     api_intercept_module: Any,
     settings_module: Any,
