@@ -2793,21 +2793,17 @@ def _install_model_state_dict_compatibility_wrappers() -> None:
 
     def compatible_load_diffusion_model_state_dict(
         sd: dict[str, Any],
-        model_options: dict[str, Any] = {},
-        metadata: Any = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
-        """Load diffusion models after adding non-destructive state-dict aliases."""
+        """Load diffusion models after adding aliases while preserving ComfyUI's API."""
         alias_count = _alias_flux_rms_norm_weight_keys(sd)
         if alias_count:
             logger.info(
                 "Added %d Flux RMSNorm .scale aliases for a diffusion model state_dict saved with .weight keys.",
                 alias_count,
             )
-        return original_load_diffusion_model_state_dict(
-            sd,
-            model_options=model_options,
-            metadata=metadata,
-        )
+        return original_load_diffusion_model_state_dict(sd, *args, **kwargs)
 
     comfy.sd.load_diffusion_model_state_dict = compatible_load_diffusion_model_state_dict
     _MODEL_STATE_DICT_COMPAT_WRAPPED = True
