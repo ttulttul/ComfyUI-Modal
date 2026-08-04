@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import logging
 
+if __package__:
+    from .modal_sdk import ensure_modal_sdk_available
+else:  # pragma: no cover - pytest may collect this file as a top-level module.
+    from modal_sdk import ensure_modal_sdk_available
+
 logger = logging.getLogger(__name__)
 _EXTENSION_LOGGER_NAME = __name__.split(".")[0]
 _EXTENSION_HANDLER_NAME = "comfyui-modal-sync-timestamped"
@@ -33,6 +38,7 @@ def _configure_extension_logging() -> logging.Logger:
 
 
 _configure_extension_logging()
+ensure_modal_sdk_available()
 
 WEB_DIRECTORY = "./web"
 try:

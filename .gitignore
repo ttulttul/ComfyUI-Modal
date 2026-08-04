@@ -11,6 +11,7 @@
 !/comfyui_modal_sync_cloud.py
 !/durable_state.py
 !/modal_executor_node.py
+!/modal_sdk.py
 !/runtime_environment.py
 !/serialization.py
 !/settings.py
