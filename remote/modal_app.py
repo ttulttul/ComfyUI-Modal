@@ -99,6 +99,8 @@ _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()
 _REMOTE_CONTAINER_LOG_STREAMS: dict[str, "_RemoteContainerLogStreamState"] = {}
 _REMOTE_CONTAINER_LOG_STDERR_LOCK = threading.Lock()
+_REMOTE_CONTAINER_LOG_STREAM_IDLE_GRACE_SECONDS = 30.0
+_IMPLICIT_BATCH_PRESERVING_TARGETS = frozenset({("CreateVideo", "images")})
 _ACTIVE_REMOTE_INVOCATIONS_LOCK = threading.Lock()
 _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT: dict[str, dict[str, "_ActiveRemoteInvocation"]] = {}
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
@@ -149,6 +151,7 @@ class _RemoteContainerLogStreamState:
     stop_event: threading.Event
     thread: threading.Thread
     refcount: int = 0
+    idle_stop_timer: threading.Timer | None = None
 
 
 @dataclass
@@ -445,41 +448,84 @@ def _run_remote_container_log_stream(task_id: str, stop_event: threading.Event) 
     )
 
 
+def _new_remote_container_log_stream_state(
+    task_id: str,
+) -> _RemoteContainerLogStreamState:
+    """Create an unstarted container-log watcher state."""
+    stop_event = threading.Event()
+    return _RemoteContainerLogStreamState(
+        task_id=task_id,
+        stop_event=stop_event,
+        thread=threading.Thread(
+            target=_run_remote_container_log_stream,
+            args=(task_id, stop_event),
+            name=f"modal-log-stream-{task_id}",
+            daemon=True,
+        ),
+    )
+
+
+def _cancel_remote_container_log_idle_stop(
+    stream_state: _RemoteContainerLogStreamState,
+) -> None:
+    """Cancel one pending idle-stop timer before a container is reused."""
+    idle_stop_timer = stream_state.idle_stop_timer
+    if idle_stop_timer is None:
+        return
+    idle_stop_timer.cancel()
+    stream_state.idle_stop_timer = None
+
+
+def _stop_remote_container_log_stream_if_idle(
+    task_id: str,
+    expected_state: _RemoteContainerLogStreamState,
+) -> None:
+    """Stop one watcher after its grace period if no payload reused it."""
+    with _REMOTE_CONTAINER_LOG_STREAMS_LOCK:
+        stream_state = _REMOTE_CONTAINER_LOG_STREAMS.get(task_id)
+        if stream_state is not expected_state or stream_state.refcount != 0:
+            return
+        stream_state.idle_stop_timer = None
+        _REMOTE_CONTAINER_LOG_STREAMS.pop(task_id, None)
+
+    logger.info(
+        "Stopping idle remote Modal container log stream for task_id=%s.",
+        task_id,
+    )
+    stream_state.stop_event.set()
+    stream_state.thread.join(timeout=0.2)
+
+
+def _schedule_remote_container_log_idle_stop(
+    stream_state: _RemoteContainerLogStreamState,
+) -> None:
+    """Schedule one daemon timer to stop an unreferenced log watcher."""
+    idle_stop_timer = threading.Timer(
+        _REMOTE_CONTAINER_LOG_STREAM_IDLE_GRACE_SECONDS,
+        _stop_remote_container_log_stream_if_idle,
+        args=(stream_state.task_id, stream_state),
+    )
+    idle_stop_timer.daemon = True
+    stream_state.idle_stop_timer = idle_stop_timer
+    idle_stop_timer.start()
+
+
 def _retain_remote_container_log_stream(task_id: str) -> str:
     """Increment one shared Modal container log watcher and start it if needed."""
     with _REMOTE_CONTAINER_LOG_STREAMS_LOCK:
         stream_state = _REMOTE_CONTAINER_LOG_STREAMS.get(task_id)
+        if stream_state is not None and not stream_state.thread.is_alive():
+            _cancel_remote_container_log_idle_stop(stream_state)
+            _REMOTE_CONTAINER_LOG_STREAMS.pop(task_id, None)
+            stream_state = None
+
         if stream_state is None:
-            stop_event = threading.Event()
-            stream_state = _RemoteContainerLogStreamState(
-                task_id=task_id,
-                stop_event=stop_event,
-                thread=threading.Thread(
-                    target=_run_remote_container_log_stream,
-                    args=(task_id, stop_event),
-                    name=f"modal-log-stream-{task_id}",
-                    daemon=True,
-                ),
-            )
+            stream_state = _new_remote_container_log_stream_state(task_id)
             _REMOTE_CONTAINER_LOG_STREAMS[task_id] = stream_state
             logger.info("Creating remote Modal container log stream for task_id=%s.", task_id)
             stream_state.thread.start()
-        elif not stream_state.thread.is_alive() and stream_state.refcount == 0:
-            stop_event = threading.Event()
-            stream_state = _RemoteContainerLogStreamState(
-                task_id=task_id,
-                stop_event=stop_event,
-                thread=threading.Thread(
-                    target=_run_remote_container_log_stream,
-                    args=(task_id, stop_event),
-                    name=f"modal-log-stream-{task_id}",
-                    daemon=True,
-                ),
-            )
-            _REMOTE_CONTAINER_LOG_STREAMS[task_id] = stream_state
-            logger.info("Restarting remote Modal container log stream for task_id=%s.", task_id)
-            stream_state.thread.start()
         else:
+            _cancel_remote_container_log_idle_stop(stream_state)
             logger.info("Reusing remote Modal container log stream for task_id=%s.", task_id)
         stream_state.refcount += 1
         logger.info(
@@ -492,9 +538,7 @@ def _retain_remote_container_log_stream(task_id: str) -> str:
 
 
 def _release_remote_container_log_stream(task_id: str) -> None:
-    """Release one retained Modal container log watcher when a payload finishes."""
-    stream_state: _RemoteContainerLogStreamState | None = None
-    should_stop = False
+    """Release one watcher while allowing prompt-local container reuse."""
     with _REMOTE_CONTAINER_LOG_STREAMS_LOCK:
         stream_state = _REMOTE_CONTAINER_LOG_STREAMS.get(task_id)
         if stream_state is None:
@@ -505,14 +549,19 @@ def _release_remote_container_log_stream(task_id: str) -> None:
             task_id,
             stream_state.refcount,
         )
-        if stream_state.refcount == 0:
-            should_stop = True
+        if stream_state.refcount != 0:
+            return
+        if not stream_state.thread.is_alive():
             _REMOTE_CONTAINER_LOG_STREAMS.pop(task_id, None)
-
-    if should_stop and stream_state is not None:
-        logger.info("Stopping remote Modal container log stream for task_id=%s.", task_id)
-        stream_state.stop_event.set()
-        stream_state.thread.join(timeout=0.2)
+            return
+        if stream_state.idle_stop_timer is None:
+            logger.info(
+                "Keeping remote Modal container log stream alive for %.1fs "
+                "to allow task reuse without replaying history task_id=%s.",
+                _REMOTE_CONTAINER_LOG_STREAM_IDLE_GRACE_SECONDS,
+                task_id,
+            )
+            _schedule_remote_container_log_idle_stop(stream_state)
 
 
 def _close_remote_payload_stream(stream_events: Iterator[dict[str, Any]]) -> None:
@@ -4107,6 +4156,28 @@ def _emit_local_mapped_lane_progress_start(
     )
 
 
+def _implicit_batch_preserving_targets(
+    payload: dict[str, Any],
+    boundary_input: dict[str, Any],
+) -> list[str]:
+    """Return target sockets that must receive one complete tensor batch."""
+    prompt = payload.get("subgraph_prompt", {})
+    if not isinstance(prompt, dict):
+        return []
+
+    preserving_targets: list[str] = []
+    for target in boundary_input.get("targets", []):
+        node_id = str(target.get("node_id") or "")
+        input_name = str(target.get("input_name") or "")
+        prompt_node = prompt.get(node_id)
+        if not node_id or not input_name or not isinstance(prompt_node, dict):
+            continue
+        class_type = str(prompt_node.get("class_type") or "")
+        if (class_type, input_name) in _IMPLICIT_BATCH_PRESERVING_TARGETS:
+            preserving_targets.append(f"{node_id}.{input_name}")
+    return sorted(preserving_targets)
+
+
 def _split_batch_boundary_inputs(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
@@ -4144,6 +4215,19 @@ def _split_batch_boundary_inputs(
             boundary_input=boundary_input,
             input_value=input_value,
         )
+        preserving_targets = _implicit_batch_preserving_targets(
+            payload,
+            boundary_input,
+        )
+        if preserving_targets:
+            logger.info(
+                "Skipping implicit batch split for boundary input %s io_type=%s "
+                "because target sockets consume the complete tensor batch: %s.",
+                proxy_input_name,
+                io_type,
+                preserving_targets,
+            )
+            continue
         input_is_session_ref_list = is_session_ref_list(input_value)
         if (
             isinstance(input_value, list)
