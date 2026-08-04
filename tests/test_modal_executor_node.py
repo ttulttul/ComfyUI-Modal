@@ -11768,6 +11768,62 @@ def test_modal_cloud_aliases_flux_rms_norm_weight_keys_for_model_detection(
     assert modal_cloud_module._alias_flux_rms_norm_weight_keys(state_dict) == 0
 
 
+def test_modal_cloud_model_state_dict_wrapper_forwards_new_comfyui_arguments(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The compatibility wrapper should preserve evolving ComfyUI loader arguments."""
+    calls: list[tuple[dict[str, Any], tuple[Any, ...], dict[str, Any]]] = []
+
+    def original_loader(
+        state_dict: dict[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> str:
+        """Record the arguments forwarded by the compatibility wrapper."""
+        calls.append((state_dict, args, kwargs))
+        return "loaded"
+
+    fake_comfy_module = types.ModuleType("comfy")
+    fake_comfy_module.__path__ = []
+    fake_sd_module = types.ModuleType("comfy.sd")
+    fake_sd_module.load_diffusion_model_state_dict = original_loader
+    fake_comfy_module.sd = fake_sd_module
+    monkeypatch.setitem(sys.modules, "comfy", fake_comfy_module)
+    monkeypatch.setitem(sys.modules, "comfy.sd", fake_sd_module)
+    monkeypatch.setattr(modal_cloud_module, "_MODEL_STATE_DICT_COMPAT_WRAPPED", False)
+
+    modal_cloud_module._install_model_state_dict_compatibility_wrappers()
+    state_dict = {
+        "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight": object()
+    }
+
+    result = fake_sd_module.load_diffusion_model_state_dict(
+        state_dict,
+        {"dtype": "default"},
+        metadata={"source": "test"},
+        disable_dynamic=True,
+        future_option="preserved",
+    )
+
+    assert result == "loaded"
+    assert calls == [
+        (
+            state_dict,
+            ({"dtype": "default"},),
+            {
+                "metadata": {"source": "test"},
+                "disable_dynamic": True,
+                "future_option": "preserved",
+            },
+        )
+    ]
+    assert (
+        state_dict["model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale"]
+        is state_dict["model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight"]
+    )
+
+
 def test_modal_cloud_force_imports_comfyui_utils_package(
     modal_cloud_module: Any,
     monkeypatch: Any,
