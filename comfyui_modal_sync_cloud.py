@@ -3057,19 +3057,50 @@ def _load_nodes_module() -> Any:
     return nodes
 
 
+def _prompt_executor_ram_thresholds(cache_ram_values: list[float]) -> tuple[float, float]:
+    """Return current ComfyUI active and inactive RAM-cache thresholds in GiB."""
+    model_management = importlib.import_module("comfy.model_management")
+    active_threshold = min(10.0, max(2.0, model_management.total_ram * 0.10 / 1024.0))
+    inactive_threshold = min(128.0, model_management.total_ram / 1024.0)
+    if cache_ram_values:
+        active_threshold = cache_ram_values[0]
+    if len(cache_ram_values) > 1:
+        inactive_threshold = cache_ram_values[1]
+    return active_threshold, inactive_threshold
+
+
 def _prompt_executor_cache_config(execution: Any) -> tuple[Any, dict[str, float]]:
-    """Return the cache settings used by ComfyUI's normal prompt worker."""
+    """Return cache settings compatible with legacy and current ComfyUI CLI shapes."""
     from comfy.cli_args import args
+
+    cache_ram = args.cache_ram
+    if isinstance(cache_ram, list):
+        active_threshold = 0.0
+        inactive_threshold = 0.0
+        if not args.cache_classic and not args.cache_none and args.cache_lru <= 0:
+            active_threshold, inactive_threshold = _prompt_executor_ram_thresholds(cache_ram)
+
+        cache_type = execution.CacheType.RAM_PRESSURE
+        if args.cache_classic:
+            cache_type = execution.CacheType.CLASSIC
+        elif args.cache_lru > 0:
+            cache_type = execution.CacheType.LRU
+        elif args.cache_none:
+            cache_type = execution.CacheType.NONE
+        return cache_type, {
+            "lru": args.cache_lru,
+            "ram": active_threshold,
+            "ram_inactive": inactive_threshold,
+        }
 
     cache_type = execution.CacheType.CLASSIC
     if args.cache_lru > 0:
         cache_type = execution.CacheType.LRU
-    elif args.cache_ram > 0:
+    elif cache_ram > 0:
         cache_type = execution.CacheType.RAM_PRESSURE
     elif args.cache_none:
         cache_type = execution.CacheType.NONE
-
-    return cache_type, {"lru": args.cache_lru, "ram": args.cache_ram}
+    return cache_type, {"lru": args.cache_lru, "ram": cache_ram}
 
 
 def _serialize_prompt_executor_cache_scope(
