@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+
+if __package__:
+    from .instance_identity import (
+        INSTANCE_ID_FILENAME,
+        load_or_create_instance_id,
+        modal_app_name_for_instance,
+    )
+else:  # pragma: no cover - the stable cloud entrypoint imports this module top-level.
+    from instance_identity import (
+        INSTANCE_ID_FILENAME,
+        load_or_create_instance_id,
+        modal_app_name_for_instance,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +32,7 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_SYNC_CUSTOM_NODES",
     "COMFY_MODAL_LOCAL_STORAGE_ROOT",
     "COMFY_MODAL_APP_NAME",
+    "COMFY_MODAL_INSTANCE_ID_PATH",
     "COMFY_MODAL_AUTO_DEPLOY",
     "COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK",
     "COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT",
@@ -206,6 +221,51 @@ def _discover_custom_nodes_dir(repo_root: Path, comfyui_root: Path | None) -> Pa
     return None
 
 
+def _discover_comfyui_user_directory(comfyui_root: Path | None) -> Path | None:
+    """Return ComfyUI's effective user directory when it can be resolved."""
+    try:
+        folder_paths = importlib.import_module("folder_paths")
+    except ModuleNotFoundError as exc:
+        if exc.name != "folder_paths":
+            logger.debug("Unable to import folder_paths while resolving the user directory: %s", exc)
+    else:
+        get_user_directory = getattr(folder_paths, "get_user_directory", None)
+        if callable(get_user_directory):
+            return Path(get_user_directory()).expanduser().resolve()
+    if comfyui_root is None:
+        return None
+    return (comfyui_root / "user").resolve()
+
+
+def _resolve_modal_app_name(comfyui_root: Path | None, execution_mode: str) -> str:
+    """Return the explicit or persistent per-ComfyUI Modal app name."""
+    configured_name = os.getenv("COMFY_MODAL_APP_NAME")
+    if configured_name is not None:
+        resolved_name = configured_name.strip()
+        if not resolved_name:
+            raise ValueError("COMFY_MODAL_APP_NAME must not be empty.")
+        return resolved_name
+
+    identity_path = _read_path_env("COMFY_MODAL_INSTANCE_ID_PATH")
+    if identity_path is None:
+        user_directory = _discover_comfyui_user_directory(comfyui_root)
+        if user_directory is not None:
+            identity_path = user_directory / INSTANCE_ID_FILENAME
+    if identity_path is None:
+        if execution_mode == "remote":
+            raise RuntimeError(
+                "Remote execution requires a persistent ComfyUI instance identity, but the "
+                "ComfyUI user directory could not be resolved. Set COMFY_MODAL_COMFYUI_ROOT, "
+                "COMFY_MODAL_INSTANCE_ID_PATH, or COMFY_MODAL_APP_NAME explicitly."
+            )
+        logger.debug("Using the legacy local app name because no ComfyUI user directory was found.")
+        return "comfy-modal-sync"
+
+    app_name = modal_app_name_for_instance(load_or_create_instance_id(identity_path))
+    logger.info("Using per-ComfyUI Modal app %s from identity file %s.", app_name, identity_path)
+    return app_name
+
+
 def _settings_env_signature() -> tuple[tuple[str, str | None], ...]:
     """Return the environment values that affect resolved Modal-Sync settings."""
     return tuple((key, os.getenv(key)) for key in _SETTINGS_ENV_KEYS)
@@ -221,6 +281,7 @@ def _get_settings_cached(
     comfyui_root = _discover_comfyui_root(repo_root)
     custom_nodes_dir = _discover_custom_nodes_dir(repo_root, comfyui_root)
     execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local").strip().lower()
+    app_name = _resolve_modal_app_name(comfyui_root, execution_mode)
     sync_custom_nodes = _read_bool_env("COMFY_MODAL_SYNC_CUSTOM_NODES")
     if sync_custom_nodes is None:
         sync_custom_nodes = execution_mode != "local"
@@ -230,7 +291,7 @@ def _get_settings_cached(
     )
 
     settings = ModalSyncSettings(
-        app_name=(app_name := os.getenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync")),
+        app_name=app_name,
         auto_deploy=_read_bool_env("COMFY_MODAL_AUTO_DEPLOY") is not False,
         allow_ephemeral_fallback=_read_bool_env("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK") or False,
         enable_memory_snapshot=_read_bool_env("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT") is not False,

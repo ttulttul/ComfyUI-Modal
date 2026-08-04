@@ -10,6 +10,7 @@
 !/api_intercept.py
 !/comfyui_modal_sync_cloud.py
 !/durable_state.py
+!/instance_identity.py
 !/modal_executor_node.py
 !/modal_sdk.py
 !/runtime_environment.py

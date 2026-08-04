@@ -6104,6 +6104,21 @@ def _execute_loader_prewarm_plans(
         )
 
 
+def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[str, str]:
+    """Return environment values that keep the worker aligned with local settings."""
+    return {
+        "COMFY_MODAL_APP_NAME": settings.app_name,
+        "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_fingerprint,
+        "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE": str(settings.stream_event_queue_maxsize),
+        "COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES": str(settings.bridge_inline_max_bytes),
+        "COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES": str(
+            settings.invocation_result_inline_max_bytes
+        ),
+        "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS": str(settings.execution_timeout_seconds),
+        "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS": str(settings.startup_timeout_seconds),
+    }
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = get_settings()
     _guard_against_existing_modal_app(settings, modal)
@@ -6145,26 +6160,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     image = (
         modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
         .apt_install(*_comfyui_apt_packages())
-        .env(
-            {
-                "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_identity.fingerprint,
-                "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE": str(
-                    settings.stream_event_queue_maxsize
-                ),
-                "COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES": str(
-                    settings.bridge_inline_max_bytes
-                ),
-                "COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES": str(
-                    settings.invocation_result_inline_max_bytes
-                ),
-                "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS": str(
-                    settings.execution_timeout_seconds
-                ),
-                "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS": str(
-                    settings.startup_timeout_seconds
-                ),
-            }
-        )
+        .env(_modal_image_environment(settings, runtime_identity.fingerprint))
         .pip_install(*_comfyui_runtime_packages())
     )
     if custom_node_packages:
