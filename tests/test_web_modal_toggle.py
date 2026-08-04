@@ -178,7 +178,7 @@ def test_remote_modal_nodes_show_component_badges() -> None:
 
     assert "componentLabelByMember: new Map()," in source
     assert "promptState.componentLabelByMember.set(componentNodeId, componentLabel);" in source
-    assert "componentLabel: promptState?.componentLabelByMember.get(nodeId(node)) ?? null," in source
+    assert "componentLabel: promptState?.componentLabelByMember.get(visualNodeId) ?? null," in source
     assert "if (state?.componentLabel) {" in source
     assert "ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);" in source
     assert "ctx.fillText(String(state.componentLabel), badgeX, badgeY + 0.5 / scale);" in source
@@ -271,8 +271,8 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "clearNodeProgressLane(progressNodeId, promptId, String(detail.lane_id));" in source
     assert "setNodeProgressLane(" in source
     assert "function deriveRemoteNodePhase(phase, hasLiveProgress)" in source
-    assert "isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === nodeId(node)," in source
-    assert "isActiveComponentMember: isNodeInActiveComponent(state.promptId, nodeId(node))," in source
+    assert "isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === visualNodeId," in source
+    assert "isActiveComponentMember: isNodeInActiveComponent(state.promptId, visualNodeId)," in source
     assert "isCachedRemoteNode: Boolean(cachedState)," in source
     assert 'const panelY = node.size[1] + 6 / scale;' in source
     assert 'ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);' in source
@@ -502,6 +502,19 @@ def test_subgraph_descendant_states_percolate_to_visible_ancestor_nodes() -> Non
     assert "function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage)" in source
     assert "promptState.descendantNodeIdsByAncestor.get(ancestorNodeId)" in source
     assert "descendantStates.every((state) => state.phase === STATE_COMPLETE)" in source
+
+
+def test_subgraph_nodes_resolve_visual_state_by_composed_workflow_path() -> None:
+    """Inner subgraph nodes should read status stored under composed prompt ids."""
+    source = _modal_toggle_source()
+
+    assert "const visualNodeId = workflowNodePath(node) || nodeId(node);" in source
+    assert "const state = modalNodeStates.get(visualNodeId) ?? null;" in source
+    assert "const progressState = nodeProgressState(visualNodeId, state.promptId);" in source
+    assert "const progressLanes = nodeProgressLanes(visualNodeId, state.promptId);" in source
+    assert "const cachedState = nodeCachedState(visualNodeId, state.promptId);" in source
+    assert "const batchProgressState = modalNodeBatchProgress.get(visualNodeId) ?? null;" in source
+    assert "const hasLiveProgress = hasLiveNodeProgress(visualNodeId, state.promptId);" in source
 
 
 def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
