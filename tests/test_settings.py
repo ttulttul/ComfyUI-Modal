@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,49 @@ def test_settings_reads_modal_gpu_override(
         settings_module.get_settings.cache_clear()
 
     assert settings.modal_gpu == "L40S"
+
+
+def test_settings_generates_stable_per_comfyui_app_name(
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Default remote app names should be stable and namespaced by a persisted 64-bit identity."""
+    identity_path = tmp_path / "instance-id"
+    monkeypatch.delenv("COMFY_MODAL_APP_NAME", raising=False)
+    monkeypatch.setenv("COMFY_MODAL_INSTANCE_ID_PATH", str(identity_path))
+    settings_module.get_settings.cache_clear()
+    try:
+        first_settings = settings_module.get_settings()
+        settings_module.get_settings.cache_clear()
+        second_settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert first_settings.app_name == second_settings.app_name
+    assert re.fullmatch(r"comfy-modal-sync-[A-Za-z0-9_-]{11}", first_settings.app_name)
+    assert len(bytes.fromhex(identity_path.read_text(encoding="ascii").strip())) == 8
+    assert first_settings.interrupt_dict_name == f"{first_settings.app_name}-interrupts"
+    assert first_settings.invocation_dict_name == f"{first_settings.app_name}-invocations"
+
+
+def test_settings_app_name_override_bypasses_instance_identity(
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """An explicit app name should remain authoritative and require no identity file."""
+    identity_path = tmp_path / "instance-id"
+    monkeypatch.setenv("COMFY_MODAL_APP_NAME", "shared-explicit-app")
+    monkeypatch.setenv("COMFY_MODAL_INSTANCE_ID_PATH", str(identity_path))
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.app_name == "shared-explicit-app"
+    assert not identity_path.exists()
 
 
 def test_settings_cache_tracks_execution_mode_env_changes(

@@ -52,6 +52,8 @@ When ComfyUI starts in remote mode, Modal-Sync checks whether the supported Moda
 
 Modal authentication remains user-managed. Run `<comfyui-venv>/bin/python -m modal setup` when the current user does not already have working credentials. To install the SDK manually before startup, run `uv pip install --python <comfyui-venv>/bin/python "modal==1.4.2"`.
 
+Each ComfyUI environment receives its own Modal app name on first startup. Modal-Sync generates 64 random bits, persists them as lowercase hexadecimal in `<ComfyUI user directory>/.comfy-modal-sync-instance-id`, and uses an unpadded URL-safe Base64 encoding in names such as `comfy-modal-sync-R7uqpQZ6S1A`. The identity file is published atomically, so concurrent first startups converge on one name. It lives in ComfyUI's effective user directory and therefore follows `--user-directory`; keep the file when upgrading if the deployment and its state should remain associated with the same ComfyUI environment. `COMFY_MODAL_APP_NAME` remains an authoritative override for deliberately shared or externally managed deployments.
+
 For repository development, `uv sync --extra remote --group test` installs the same pinned SDK. Remote mode uses the stable cloud entrypoint in [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py). On first use, Modal-Sync can auto-deploy the configured Modal app if it does not exist.
 
 The deployed image uses Python 3.11 plus an exact ComfyUI support and CUDA package set. Its local build context is limited to the ComfyUI source packages, top-level Python modules, and runtime configuration needed by the headless worker; model directories, custom nodes, caches, tests, virtual environments, user data, and unknown top-level directories stay out of the image snapshot. Before every process's first remote invocation, Modal-Sync compares the deployed worker's runtime fingerprint with the local source, ComfyUI source, custom-node requirements, and runtime-shaping settings. A missing or mismatched fingerprint is treated as stale and replaced automatically when `COMFY_MODAL_AUTO_DEPLOY=true`.
@@ -218,7 +220,8 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `COMFY_MODAL_EXECUTION_MODE` | `local` | Set to `remote` for Modal-backed execution. |
-| `COMFY_MODAL_APP_NAME` | `comfy-modal-sync` | Modal app name. |
+| `COMFY_MODAL_APP_NAME` | `comfy-modal-sync-<instance_id>` | Explicit Modal app name override; otherwise derived from the persistent per-ComfyUI identity. |
+| `COMFY_MODAL_INSTANCE_ID_PATH` | `<ComfyUI user directory>/.comfy-modal-sync-instance-id` | Override the persistent 64-bit identity file location. |
 | `COMFY_MODAL_VOLUME_NAME` | `comfy-universal-storage` | Modal volume name for synced assets and bundles. |
 | `COMFY_MODAL_AUTO_DEPLOY` | `true` | Deploy or replace the configured app when lookup fails or its runtime fingerprint is stale. |
 | `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK` | `false` | Allow the older temporary `app.run()` fallback when deployed lookup fails. |

@@ -1321,6 +1321,25 @@ def test_stable_modal_cloud_entry_imports_without_modal_sdk(
     assert hasattr(modal_cloud_module, "RemoteEngine")
 
 
+def test_modal_cloud_image_environment_preserves_unique_app_name(
+    modal_cloud_module: Any,
+) -> None:
+    """Remote workers should receive the same per-ComfyUI app name resolved locally."""
+    settings = types.SimpleNamespace(
+        app_name="comfy-modal-sync-AAECAwQFBgc",
+        stream_event_queue_maxsize=256,
+        bridge_inline_max_bytes=1024,
+        invocation_result_inline_max_bytes=2048,
+        execution_timeout_seconds=3600,
+        startup_timeout_seconds=900,
+    )
+
+    image_environment = modal_cloud_module._modal_image_environment(settings, "fingerprint-1")
+
+    assert image_environment["COMFY_MODAL_APP_NAME"] == "comfy-modal-sync-AAECAwQFBgc"
+    assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
+
+
 def test_modal_cloud_installs_timestamped_logger_handler(
     modal_cloud_module: Any,
 ) -> None:

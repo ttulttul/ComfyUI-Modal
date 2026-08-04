@@ -14,6 +14,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "comfyui_modal_sync_under_test"
+os.environ["COMFY_MODAL_APP_NAME"] = "comfy-modal-sync"
 
 
 def _comfyui_root() -> Path:
@@ -95,6 +96,12 @@ def modal_sdk_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def instance_identity_module(extension_package: object) -> object:
+    """Return the persistent ComfyUI instance identity module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.instance_identity")
+
+
+@pytest.fixture(scope="session")
 def api_intercept_module(extension_package: object) -> object:
     """Return the prompt interception module."""
     return importlib.import_module(f"{PACKAGE_NAME}.api_intercept")
@@ -159,7 +166,9 @@ def modal_cloud_module() -> object:
 def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Isolate Modal-Sync environment variables between tests."""
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
+    monkeypatch.setenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync")
     monkeypatch.setenv("COMFY_MODAL_LOCAL_STORAGE_ROOT", str(tmp_path / "storage"))
+    monkeypatch.delenv("COMFY_MODAL_INSTANCE_ID_PATH", raising=False)
     monkeypatch.delenv("COMFY_MODAL_AUTO_DEPLOY", raising=False)
     monkeypatch.delenv("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK", raising=False)
     monkeypatch.delenv("COMFY_MODAL_CUSTOM_NODES_DIR", raising=False)
