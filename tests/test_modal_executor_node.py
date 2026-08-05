@@ -1640,11 +1640,25 @@ def test_modal_cloud_installs_headless_prompt_server_instance(
     assert instance.supports == ["custom_nodes_from_web"]
     assert instance.client_id is None
     assert instance.last_node_id is None
+    assert instance.number == 0
+    assert instance.prompt_queue.currently_running == {}
+    assert instance.prompt_queue.get_current_queue() == ([], [])
 
     instance.send_progress_text("width: 1024, height: 768", "104")
 
     instance.add_on_prompt_handler("handler")
     assert instance.on_prompt_handlers == ["handler"]
+
+    instance.prompt_queue.put((1, "prompt-id", {}, {}, []))
+    assert instance.prompt_queue.get_current_queue() == (
+        [],
+        [(1, "prompt-id", {}, {}, [])],
+    )
+    assert instance.prompt_queue.get_tasks_remaining() == 1
+
+    instance.prompt_queue.set_flag("free_memory", True)
+    assert instance.prompt_queue.get_flags() == {"free_memory": True}
+    assert instance.prompt_queue.get_flags() == {}
 
 
 def test_modal_cloud_streams_progress_and_result_events(

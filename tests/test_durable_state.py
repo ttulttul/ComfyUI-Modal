@@ -126,6 +126,37 @@ def test_content_addressed_store_reads_missing_object_from_committed_storage(
     assert not (tmp_path / object_ref.object_path).exists()
 
 
+def test_content_addressed_store_recovers_truncated_mount_from_committed_storage(
+    durable_state_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A stale partial mount should fall back to authoritative committed bytes."""
+    payload = b"complete-durable-object"
+    digest = hashlib.sha256(payload).hexdigest()
+    object_ref = durable_state_module.DurableObjectRef(
+        object_path=f"results/{digest[:2]}/{digest}.bin",
+        sha256=digest,
+        size_bytes=len(payload),
+    )
+    mounted_path = tmp_path / object_ref.object_path
+    mounted_path.parent.mkdir(parents=True)
+    mounted_path.write_bytes(payload[:-5])
+    requested_paths: list[str] = []
+
+    def read_committed_object(object_path: str) -> bytes:
+        """Return the complete object from a simulated committed-volume API."""
+        requested_paths.append(object_path)
+        return payload
+
+    store = durable_state_module.FileDurableObjectStore(
+        tmp_path,
+        committed_read_callback=read_committed_object,
+    )
+
+    assert store.get(object_ref) == payload
+    assert requested_paths == [object_ref.object_path]
+
+
 def test_content_addressed_store_reports_missing_committed_object(
     durable_state_module: Any,
     tmp_path: Path,
