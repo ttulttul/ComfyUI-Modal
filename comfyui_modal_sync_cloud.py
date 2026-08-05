@@ -47,6 +47,7 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
     REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
     REMOTE_PYTHON_VERSION,
+    RemoteTorchBuild as _RemoteTorchBuild,
     build_remote_runtime_identity,
     custom_node_runtime_packages as _custom_node_runtime_packages,
     remote_apt_packages as _comfyui_apt_packages,
@@ -6371,6 +6372,7 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
     """Return environment values that keep the worker aligned with local settings."""
     return {
         "COMFY_MODAL_APP_NAME": settings.app_name,
+        "COMFY_MODAL_GPU": settings.modal_gpu,
         "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_fingerprint,
         "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE": str(settings.stream_event_queue_maxsize),
         "COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES": str(settings.bridge_inline_max_bytes),
@@ -6380,6 +6382,24 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
         "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS": str(settings.execution_timeout_seconds),
         "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS": str(settings.startup_timeout_seconds),
     }
+
+
+def _install_remote_torch_build(image: Any, torch_build: _RemoteTorchBuild) -> Any:
+    """Install and validate the ordered package layers for one remote Torch build."""
+    for layer_number, install_layer in enumerate(torch_build.install_layers, start=1):
+        logger.info(
+            "Installing Modal PyTorch layer=%d index=%s packages=%s extra_options=%s.",
+            layer_number,
+            install_layer.index_url,
+            install_layer.packages,
+            install_layer.extra_options or "<none>",
+        )
+        image = image.pip_install(
+            *install_layer.packages,
+            index_url=install_layer.index_url,
+            extra_options=install_layer.extra_options,
+        )
+    return image.run_commands(torch_build.validation_command())
 
 
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
@@ -6422,12 +6442,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         REMOTE_PYTHON_VERSION,
     )
     logger.info(
-        "Selected Modal PyTorch build gpu=%s cuda=%s index=%s index_packages=%s pypi_packages=%s.",
+        "Selected Modal PyTorch build gpu=%s cuda=%s install_layers=%s.",
         settings.modal_gpu,
         torch_build.cuda_version,
-        torch_build.index_url,
-        torch_build.index_packages,
-        torch_build.pypi_packages,
+        torch_build.install_layers,
     )
     image = (
         modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
@@ -6437,9 +6455,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     )
     if custom_node_packages:
         image = image.pip_install(*custom_node_packages)
-    image = image.pip_install(*torch_build.index_packages, index_url=torch_build.index_url)
-    if torch_build.pypi_packages:
-        image = image.pip_install(*torch_build.pypi_packages)
+    image = _install_remote_torch_build(image, torch_build)
     image = image.add_local_dir(
         _REPO_ROOT,
         remote_path="/root/comfyui_modal_sync_repo",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -77,13 +78,16 @@ def test_default_modal_gpus_use_pinned_cuda_128_build(
     build = runtime_environment_module.select_remote_torch_build("A100:2")
 
     assert build.cuda_version == "12.8"
-    assert build.index_url == "https://download.pytorch.org/whl/cu128"
-    assert build.index_packages == (
-        "torch==2.10.0",
-        "torchvision==0.25.0",
-        "torchaudio==2.10.0",
+    assert build.install_layers == (
+        runtime_environment_module.RemoteTorchInstallLayer(
+            index_url="https://download.pytorch.org/whl/cu128",
+            packages=(
+                "torch==2.10.0",
+                "torchvision==0.25.0",
+                "torchaudio==2.10.0",
+            ),
+        ),
     )
-    assert build.pypi_packages == ()
 
 
 @pytest.mark.parametrize("modal_gpu", ("B300", "b300:2", "B200+", "B200+:8"))
@@ -95,17 +99,36 @@ def test_b300_capable_modal_gpus_use_cuda_132_build(
     build = runtime_environment_module.select_remote_torch_build(modal_gpu)
 
     assert build.cuda_version == "13.2"
-    assert build.index_url == "https://download.pytorch.org/whl/cu132"
-    assert build.index_packages == (
-        "torch==2.12.1",
-        "torchvision==0.27.1",
+    assert build.install_layers == (
+        runtime_environment_module.RemoteTorchInstallLayer(
+            index_url="https://download.pytorch.org/whl/cu132",
+            packages=("torch==2.12.1", "torchvision==0.27.1"),
+        ),
+        runtime_environment_module.RemoteTorchInstallLayer(
+            index_url="https://download.pytorch.org/whl/cpu",
+            packages=("torchaudio==2.11.0+cpu",),
+            extra_options="--no-deps",
+        ),
     )
-    assert build.pypi_packages == ("torchaudio==2.11.0",)
     assert runtime_environment_module.remote_torch_packages(modal_gpu) == (
         "torch==2.12.1",
         "torchvision==0.27.1",
-        "torchaudio==2.11.0",
+        "torchaudio==2.11.0+cpu",
     )
+
+
+def test_remote_torch_build_validation_imports_complete_stack(
+    runtime_environment_module: Any,
+) -> None:
+    """The image build should fail before deployment when Torch packages disagree."""
+    build = runtime_environment_module.select_remote_torch_build("B300")
+
+    validation_command = build.validation_command()
+    validation_script = shlex.split(validation_command)[2]
+
+    assert validation_command.startswith("python -c ")
+    assert "import torch, torchaudio, torchvision" in validation_script
+    assert "expected_cuda='13.2'" in validation_script
 
 
 def test_empty_modal_gpu_cannot_select_torch_build(runtime_environment_module: Any) -> None:
@@ -178,14 +201,23 @@ def test_runtime_identity_records_gpu_specific_torch_build(
 
     assert identity.manifest["torch_build"] == {
         "cuda_version": "13.2",
-        "index_url": "https://download.pytorch.org/whl/cu132",
-        "index_packages": ["torch==2.12.1", "torchvision==0.27.1"],
-        "pypi_packages": ["torchaudio==2.11.0"],
+        "install_layers": [
+            {
+                "index_url": "https://download.pytorch.org/whl/cu132",
+                "packages": ["torch==2.12.1", "torchvision==0.27.1"],
+                "extra_options": "",
+            },
+            {
+                "index_url": "https://download.pytorch.org/whl/cpu",
+                "packages": ["torchaudio==2.11.0+cpu"],
+                "extra_options": "--no-deps",
+            },
+        ],
     }
     assert identity.manifest["torch_packages"] == [
         "torch==2.12.1",
         "torchvision==0.27.1",
-        "torchaudio==2.11.0",
+        "torchaudio==2.11.0+cpu",
     ]
 
 

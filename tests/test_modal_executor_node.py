@@ -1327,6 +1327,7 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     """Remote workers should receive the same per-ComfyUI app name resolved locally."""
     settings = types.SimpleNamespace(
         app_name="comfy-modal-sync-AAECAwQFBgc",
+        modal_gpu="B300",
         stream_event_queue_maxsize=256,
         bridge_inline_max_bytes=1024,
         invocation_result_inline_max_bytes=2048,
@@ -1337,6 +1338,7 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     image_environment = modal_cloud_module._modal_image_environment(settings, "fingerprint-1")
 
     assert image_environment["COMFY_MODAL_APP_NAME"] == "comfy-modal-sync-AAECAwQFBgc"
+    assert image_environment["COMFY_MODAL_GPU"] == "B300"
     assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
 
 
@@ -3650,15 +3652,70 @@ def test_modal_cloud_selects_gpu_compatible_pytorch_stack(
     default_build = modal_cloud_module._select_remote_torch_build("A100")
     b300_build = modal_cloud_module._select_remote_torch_build("B300")
 
-    assert default_build.index_packages == (
+    assert default_build.install_layers[0].packages == (
         "torch==2.10.0",
         "torchvision==0.25.0",
         "torchaudio==2.10.0",
     )
-    assert default_build.index_url == "https://download.pytorch.org/whl/cu128"
-    assert b300_build.index_packages == ("torch==2.12.1", "torchvision==0.27.1")
-    assert b300_build.pypi_packages == ("torchaudio==2.11.0",)
-    assert b300_build.index_url == "https://download.pytorch.org/whl/cu132"
+    assert default_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu128"
+    assert b300_build.install_layers[0].packages == (
+        "torch==2.12.1",
+        "torchvision==0.27.1",
+    )
+    assert b300_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu132"
+    assert b300_build.install_layers[1].packages == ("torchaudio==2.11.0+cpu",)
+    assert b300_build.install_layers[1].index_url == "https://download.pytorch.org/whl/cpu"
+    assert b300_build.install_layers[1].extra_options == "--no-deps"
+
+
+def test_modal_cloud_installs_and_validates_torch_layers_in_order(
+    modal_cloud_module: Any,
+) -> None:
+    """The CPU TorchAudio layer must not replace the CUDA-enabled Torch package."""
+
+    class RecordingImage:
+        """Record Modal image package and command layers."""
+
+        def __init__(self) -> None:
+            """Initialize an empty call record."""
+            self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+        def pip_install(self, *packages: str, **options: Any) -> "RecordingImage":
+            """Record one package installation layer."""
+            self.calls.append(("pip_install", packages, options))
+            return self
+
+        def run_commands(self, *commands: str) -> "RecordingImage":
+            """Record one image validation command."""
+            self.calls.append(("run_commands", commands, {}))
+            return self
+
+    build = modal_cloud_module._select_remote_torch_build("B300")
+    image = RecordingImage()
+
+    result = modal_cloud_module._install_remote_torch_build(image, build)
+
+    assert result is image
+    assert image.calls[:2] == [
+        (
+            "pip_install",
+            ("torch==2.12.1", "torchvision==0.27.1"),
+            {
+                "index_url": "https://download.pytorch.org/whl/cu132",
+                "extra_options": "",
+            },
+        ),
+        (
+            "pip_install",
+            ("torchaudio==2.11.0+cpu",),
+            {
+                "index_url": "https://download.pytorch.org/whl/cpu",
+                "extra_options": "--no-deps",
+            },
+        ),
+    ]
+    assert image.calls[2][0] == "run_commands"
+    assert "import torch, torchaudio, torchvision" in image.calls[2][1][0]
 
 
 def test_modal_cloud_missing_prompt_node_class_raises_clear_error(

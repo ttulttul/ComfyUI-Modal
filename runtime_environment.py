@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -55,7 +56,7 @@ _CUDA_132_TORCH_PACKAGES = (
     "torch==2.12.1",
     "torchvision==0.27.1",
 )
-_CUDA_132_PYPI_PACKAGES = ("torchaudio==2.11.0",)
+_CUDA_132_CPU_AUDIO_PACKAGES = ("torchaudio==2.11.0+cpu",)
 _CUDA_132_MODAL_GPU_TYPES = frozenset({"B200+", "B300"})
 _IGNORED_DIRECTORY_NAMES = frozenset(
     {
@@ -131,18 +132,43 @@ class RemoteRuntimeIdentity:
 
 
 @dataclass(frozen=True)
+class RemoteTorchInstallLayer:
+    """Describe one ordered package layer in a remote PyTorch installation."""
+
+    index_url: str
+    packages: tuple[str, ...]
+    extra_options: str = ""
+
+
+@dataclass(frozen=True)
 class RemoteTorchBuild:
-    """Describe the pinned PyTorch packages for one Modal GPU type."""
+    """Describe an ordered, pinned PyTorch installation for one Modal GPU type."""
 
     cuda_version: str
-    index_url: str
-    index_packages: tuple[str, ...]
-    pypi_packages: tuple[str, ...] = ()
+    install_layers: tuple[RemoteTorchInstallLayer, ...]
 
     @property
     def packages(self) -> tuple[str, ...]:
         """Return every package pin installed for this PyTorch build."""
-        return self.index_packages + self.pypi_packages
+        return tuple(
+            package
+            for install_layer in self.install_layers
+            for package in install_layer.packages
+        )
+
+    def validation_command(self) -> str:
+        """Return a build-time import and CUDA compatibility check."""
+        validation_script = (
+            "import torch, torchaudio, torchvision; "
+            f"expected_cuda={self.cuda_version!r}; "
+            "actual_cuda=torch.version.cuda; "
+            "assert actual_cuda == expected_cuda, "
+            "f'Expected PyTorch CUDA {expected_cuda}, found {actual_cuda}'; "
+            "print('Validated Modal PyTorch stack:', "
+            "torch.__version__, torchvision.__version__, torchaudio.__version__, "
+            "'CUDA', actual_cuda)"
+        )
+        return f"python -c {shlex.quote(validation_script)}"
 
 
 def remote_runtime_packages() -> tuple[str, ...]:
@@ -169,14 +195,26 @@ def select_remote_torch_build(modal_gpu: str) -> RemoteTorchBuild:
     if gpu_type in _CUDA_132_MODAL_GPU_TYPES:
         return RemoteTorchBuild(
             cuda_version="13.2",
-            index_url="https://download.pytorch.org/whl/cu132",
-            index_packages=_CUDA_132_TORCH_PACKAGES,
-            pypi_packages=_CUDA_132_PYPI_PACKAGES,
+            install_layers=(
+                RemoteTorchInstallLayer(
+                    index_url="https://download.pytorch.org/whl/cu132",
+                    packages=_CUDA_132_TORCH_PACKAGES,
+                ),
+                RemoteTorchInstallLayer(
+                    index_url="https://download.pytorch.org/whl/cpu",
+                    packages=_CUDA_132_CPU_AUDIO_PACKAGES,
+                    extra_options="--no-deps",
+                ),
+            ),
         )
     return RemoteTorchBuild(
         cuda_version="12.8",
-        index_url="https://download.pytorch.org/whl/cu128",
-        index_packages=_CUDA_128_TORCH_PACKAGES,
+        install_layers=(
+            RemoteTorchInstallLayer(
+                index_url="https://download.pytorch.org/whl/cu128",
+                packages=_CUDA_128_TORCH_PACKAGES,
+            ),
+        ),
     )
 
 
@@ -356,9 +394,14 @@ def build_remote_runtime_identity(
         "torch_packages": list(torch_build.packages),
         "torch_build": {
             "cuda_version": torch_build.cuda_version,
-            "index_url": torch_build.index_url,
-            "index_packages": list(torch_build.index_packages),
-            "pypi_packages": list(torch_build.pypi_packages),
+            "install_layers": [
+                {
+                    "index_url": install_layer.index_url,
+                    "packages": list(install_layer.packages),
+                    "extra_options": install_layer.extra_options,
+                }
+                for install_layer in torch_build.install_layers
+            ],
         },
         "custom_node_packages": list(custom_node_runtime_packages(custom_nodes_dir)),
         "repo_source_digest": _tree_digest(
