@@ -72,6 +72,29 @@ class _FakeModelLoaderNode:
         return (_FakeModelValue(f"model::{ckpt_name}"),)
 
 
+class _PromptMetadataSerializationNode:
+    """Output node double that JSON-serializes ComfyUI's hidden PROMPT input."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("metadata",)
+    OUTPUT_IS_LIST = (False,)
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, Any]]:
+        """Declare one hydrated tensor input and the hidden prompt metadata input."""
+        return {
+            "required": {"image": ("IMAGE",)},
+            "hidden": {"prompt": "PROMPT"},
+        }
+
+    def run(self, image: Any, prompt: dict[str, Any]) -> tuple[str]:
+        """Serialize the prompt exactly as metadata-writing output nodes do."""
+        del image
+        return (json.dumps(prompt, sort_keys=True),)
+
+
 class _FakeClipLoaderNode:
     """Fake self-contained loader node that returns one CLIP-like object."""
 
@@ -1659,6 +1682,107 @@ def test_modal_cloud_installs_headless_prompt_server_instance(
     instance.prompt_queue.set_flag("free_memory", True)
     assert instance.prompt_queue.get_flags() == {"free_memory": True}
     assert instance.prompt_queue.get_flags() == {}
+
+
+def test_modal_cloud_dynamic_prompt_preserves_thread_local_metadata_graph(
+    modal_cloud_module: Any,
+) -> None:
+    """Hydrated execution graphs should not replace the JSON-safe hidden PROMPT graph."""
+
+    class FakeDynamicPrompt:
+        """Minimal ComfyUI DynamicPrompt stand-in."""
+
+        def __init__(self, original_prompt: dict[str, Any]) -> None:
+            """Retain the graph used for runtime dependency resolution."""
+            self.original_prompt = original_prompt
+
+        def get_original_prompt(self) -> dict[str, Any]:
+            """Return the runtime graph when no metadata override is active."""
+            return self.original_prompt
+
+    fake_execution = types.SimpleNamespace(DynamicPrompt=FakeDynamicPrompt)
+    hydrated_prompt = {"1": {"inputs": {"image": object()}}}
+    metadata_prompt = {"1": {"inputs": {"image": ["upstream", 0]}}}
+
+    modal_cloud_module._install_metadata_safe_dynamic_prompt_wrapper(fake_execution)
+    with modal_cloud_module._temporary_prompt_metadata(metadata_prompt):
+        dynamic_prompt = fake_execution.DynamicPrompt(hydrated_prompt)
+
+    ordinary_prompt = fake_execution.DynamicPrompt(hydrated_prompt)
+
+    assert dynamic_prompt.original_prompt is hydrated_prompt
+    assert dynamic_prompt.get_original_prompt() is metadata_prompt
+    assert ordinary_prompt.get_original_prompt() is hydrated_prompt
+
+
+def test_modal_cloud_hidden_prompt_stays_json_safe_after_tensor_boundary_hydration(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Metadata-writing output nodes should receive links, not hydrated tensors, in PROMPT."""
+    import torch
+
+    monkeypatch.setitem(sys.modules, "torchsde", types.ModuleType("torchsde"))
+    import comfy_execution.caching as comfy_caching
+
+    modal_cloud_module._ensure_comfy_runtime_initialized(None)
+    nodes_module = modal_cloud_module._load_nodes_module()
+    monkeypatch.setitem(
+        nodes_module.NODE_CLASS_MAPPINGS,
+        "PromptMetadataSerializationNode",
+        _PromptMetadataSerializationNode,
+    )
+    monkeypatch.setitem(
+        comfy_caching.nodes.NODE_CLASS_MAPPINGS,
+        "PromptMetadataSerializationNode",
+        _PromptMetadataSerializationNode,
+    )
+    monkeypatch.setitem(
+        nodes_module.NODE_DISPLAY_NAME_MAPPINGS,
+        "PromptMetadataSerializationNode",
+        "PromptMetadataSerializationNode",
+    )
+    monkeypatch.setattr(modal_cloud_module, "_node_output_cache_store", lambda: None)
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "metadata-output",
+        "prompt_id": "prompt-metadata-output",
+        "component_node_ids": ["output"],
+        "subgraph_prompt": {
+            "output": {
+                "class_type": "PromptMetadataSerializationNode",
+                "inputs": {"image": ["upstream", 0]},
+            }
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_image",
+                "io_type": "IMAGE",
+                "source_signature": "image-signature",
+                "targets": [{"node_id": "output", "input_name": "image"}],
+            }
+        ],
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "metadata",
+                "node_id": "output",
+                "output_index": 0,
+                "io_type": "STRING",
+                "is_list": False,
+            }
+        ],
+        "execute_node_ids": ["output"],
+        "extra_data": {},
+    }
+
+    outputs = modal_cloud_module._execute_subgraph_prompt(
+        payload,
+        {"remote_image": torch.zeros((1, 2, 2, 3), dtype=torch.float32)},
+        None,
+    )
+
+    assert len(outputs) == 1
+    assert json.loads(outputs[0]) == payload["subgraph_prompt"]
 
 
 def test_modal_cloud_streams_progress_and_result_events(

@@ -116,6 +116,8 @@ _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
+_DYNAMIC_PROMPT_WRAPPER_LOCK = threading.Lock()
+_PROMPT_METADATA_STATE = threading.local()
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
 _REMOTE_VOLUME_READTHROUGH_ROOT = Path(tempfile.gettempdir()) / "comfy-modal-volume-readthrough"
@@ -3405,6 +3407,70 @@ def _execute_prompt_executor_compat(
         asyncio.run(execution_result)
 
 
+def _install_metadata_safe_dynamic_prompt_wrapper(execution: Any) -> None:
+    """Let hidden PROMPT inputs see metadata-safe graphs instead of hydrated tensors."""
+    with _DYNAMIC_PROMPT_WRAPPER_LOCK:
+        dynamic_prompt_class = getattr(execution, "DynamicPrompt", None)
+        if dynamic_prompt_class is None:
+            raise RemoteSubgraphExecutionError(
+                "The ComfyUI execution module does not expose DynamicPrompt."
+            )
+        if bool(getattr(dynamic_prompt_class, "_comfy_modal_metadata_safe", False)):
+            return
+
+        class MetadataSafeDynamicPrompt(dynamic_prompt_class):
+            """DynamicPrompt variant with a separate hidden-input metadata graph."""
+
+            _comfy_modal_metadata_safe = True
+
+            def __init__(self, original_prompt: dict[str, Any]) -> None:
+                """Capture the calling thread's metadata prompt before execution starts."""
+                super().__init__(original_prompt)
+                self._comfy_modal_metadata_prompt = getattr(
+                    _PROMPT_METADATA_STATE,
+                    "prompt",
+                    None,
+                )
+
+            def get_original_prompt(self) -> dict[str, Any]:
+                """Return the JSON-safe graph exposed through ComfyUI's hidden PROMPT input."""
+                if self._comfy_modal_metadata_prompt is not None:
+                    return self._comfy_modal_metadata_prompt
+                return super().get_original_prompt()
+
+        execution.DynamicPrompt = MetadataSafeDynamicPrompt
+        logger.info(
+            "Installed metadata-safe DynamicPrompt wrapper for hydrated remote boundary inputs."
+        )
+
+
+@contextmanager
+def _temporary_prompt_metadata(prompt: dict[str, Any]) -> Iterator[None]:
+    """Expose one JSON-safe hidden PROMPT graph to this execution thread."""
+    had_previous_prompt = hasattr(_PROMPT_METADATA_STATE, "prompt")
+    previous_prompt = getattr(_PROMPT_METADATA_STATE, "prompt", None)
+    _PROMPT_METADATA_STATE.prompt = prompt
+    try:
+        yield
+    finally:
+        if had_previous_prompt:
+            _PROMPT_METADATA_STATE.prompt = previous_prompt
+        else:
+            delattr(_PROMPT_METADATA_STATE, "prompt")
+
+
+def _copy_json_safe_prompt_metadata(prompt: dict[str, Any]) -> dict[str, Any]:
+    """Copy and validate the graph exposed to metadata-writing custom nodes."""
+    metadata_prompt = copy.deepcopy(prompt)
+    try:
+        json.dumps(metadata_prompt)
+    except (TypeError, ValueError) as exc:
+        raise RemoteSubgraphExecutionError(
+            "Remote subgraph prompt metadata was not JSON-compatible before boundary hydration."
+        ) from exc
+    return metadata_prompt
+
+
 def _node_output_cache_store() -> Any | None:
     """Return the shared Modal Dict used for persisted transport-safe node outputs."""
     if modal is None:
@@ -4925,6 +4991,7 @@ def _execute_subgraph_prompt(
         )
     with _timed_phase("prepare_subgraph_prompt", component=component_id):
         prompt = _rewrite_modal_asset_references(copy.deepcopy(normalized_payload["subgraph_prompt"]))
+        metadata_prompt = _copy_json_safe_prompt_metadata(prompt)
         _apply_boundary_inputs(
             prompt=prompt,
             boundary_input_specs=list(normalized_payload.get("boundary_inputs", [])),
@@ -4933,6 +5000,7 @@ def _execute_subgraph_prompt(
         )
     with _timed_phase("load_execution_module", component=component_id):
         execution = _load_execution_module()
+        _install_metadata_safe_dynamic_prompt_wrapper(execution)
         cache_type, cache_args = _prompt_executor_cache_config(execution)
         custom_nodes_bundle_path = normalized_payload.get("custom_nodes_bundle")
         resolved_node_mapping = _ensure_prompt_node_classes_registered(
@@ -5006,16 +5074,17 @@ def _execute_subgraph_prompt(
                     component=component_id,
                     execute_nodes=list(normalized_payload.get("execute_node_ids", [])),
                 ):
-                    _execute_prompt_executor_compat(
-                        executor_state.executor,
-                        prompt=prompt,
-                        prompt_id=str(
-                            payload.get("prompt_id")
-                            or component_id
-                        ),
-                        extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
-                        execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
-                    )
+                    with _temporary_prompt_metadata(metadata_prompt):
+                        _execute_prompt_executor_compat(
+                            executor_state.executor,
+                            prompt=prompt,
+                            prompt_id=str(
+                                payload.get("prompt_id")
+                                or component_id
+                            ),
+                            extra_data=copy.deepcopy(normalized_payload.get("extra_data") or {}),
+                            execute_outputs=list(normalized_payload.get("execute_node_ids", [])),
+                        )
             finally:
                 if restore_state is not None:
                     restore_state.restore_original_method()
