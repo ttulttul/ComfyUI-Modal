@@ -138,6 +138,12 @@ def durable_state_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def output_artifacts_module(extension_package: object) -> object:
+    """Return the remote output artifact transfer helpers module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.output_artifacts")
+
+
+@pytest.fixture(scope="session")
 def settings_module(extension_package: object) -> object:
     """Return the settings module."""
     return importlib.import_module(f"{PACKAGE_NAME}.settings")

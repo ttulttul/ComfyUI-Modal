@@ -647,7 +647,9 @@ def test_local_client_attaches_stable_invocation_id(
 
     assert result == b"result"
     assert observed_payloads[0]["invocation_id"].startswith("RIV_")
+    assert observed_payloads[0]["capture_remote_outputs"] is True
     assert "invocation_id" not in payload
+    assert "capture_remote_outputs" not in payload
 
 
 def test_local_fallback_restores_object_backed_bridge_output(
