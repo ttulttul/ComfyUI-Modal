@@ -126,7 +126,21 @@ _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER: list[str] = []
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT = 32
-_DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset({"CONDITIONING", "LATENT"})
+_DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset(
+    {
+        "AUDIO",
+        "BOOLEAN",
+        "CONDITIONING",
+        "FLOAT",
+        "IMAGE",
+        "INT",
+        "LATENT",
+        "MASK",
+        "SIGMAS",
+        "STRING",
+        "VIDEO",
+    }
+)
 _DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset({"CLIP", "MODEL", "VAE"})
 
 try:
