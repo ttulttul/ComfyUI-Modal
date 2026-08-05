@@ -202,7 +202,11 @@ def test_cloud_payload_capture_bundles_new_remote_outputs(
         return b"serialized-outputs"
 
     packed = modal_cloud_module._execute_payload_with_output_capture(
-        {"capture_remote_outputs": True, "component_id": "component-1"},
+        {
+            "capture_remote_outputs": True,
+            "clear_remote_session": True,
+            "component_id": "component-1",
+        },
         execute_once,
     )
     result = output_artifacts_module.unpack_remote_execution_result(packed)

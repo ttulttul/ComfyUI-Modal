@@ -139,10 +139,22 @@ class FileDurableObjectStore:
                     f".{target_path.name}.{uuid.uuid4().hex}.tmp"
                 )
                 try:
-                    with temporary_path.open("xb") as output_file:
-                        output_file.write(payload)
+                    with temporary_path.open("xb", buffering=0) as output_file:
+                        remaining = memoryview(payload)
+                        while remaining:
+                            written = output_file.write(remaining)
+                            if written is None or written <= 0:
+                                raise DurableStateError(
+                                    f"Durable object write stalled for {temporary_path}."
+                                )
+                            remaining = remaining[written:]
                         output_file.flush()
                         os.fsync(output_file.fileno())
+                    self._validate_object_file(
+                        temporary_path,
+                        expected_size=len(payload),
+                        expected_sha256=sha256,
+                    )
                     os.replace(temporary_path, target_path)
                     wrote_object = True
                 finally:
@@ -186,21 +198,47 @@ class FileDurableObjectStore:
         try:
             payload = target_path.read_bytes()
         except FileNotFoundError as mounted_read_error:
-            if self._committed_read_callback is not None:
-                logger.info(
-                    "Durable object %s is absent from the mounted snapshot; reading committed bytes directly.",
-                    object_ref.object_path,
-                )
-                try:
-                    payload = self._committed_read_callback(object_ref.object_path)
-                except FileNotFoundError as committed_read_error:
-                    raise DurableStateError(
-                        f"Durable object {object_ref.object_path!r} was not found."
-                    ) from committed_read_error
-                return self._validate_loaded_object(object_ref, payload)
+            return self._read_committed_object(
+                object_ref,
+                reason="absent from the mounted snapshot",
+                mounted_error=mounted_read_error,
+            )
+        try:
+            return self._validate_loaded_object(object_ref, payload)
+        except DurableStateError as mounted_validation_error:
+            mounted_error_message = str(mounted_validation_error)
+        del payload
+        return self._read_committed_object(
+            object_ref,
+            reason=f"failed mounted-snapshot validation: {mounted_error_message}",
+            mounted_error=DurableStateError(mounted_error_message),
+        )
+
+    def _read_committed_object(
+        self,
+        object_ref: DurableObjectRef,
+        *,
+        reason: str,
+        mounted_error: OSError | DurableStateError,
+    ) -> bytes:
+        """Read and validate an object through the authoritative committed-store API."""
+        if self._committed_read_callback is None:
+            if isinstance(mounted_error, DurableStateError):
+                raise mounted_error
             raise DurableStateError(
                 f"Durable object {object_ref.object_path!r} was not found."
-            ) from mounted_read_error
+            ) from mounted_error
+        logger.warning(
+            "Durable object %s %s; reading committed bytes directly.",
+            object_ref.object_path,
+            reason,
+        )
+        try:
+            payload = self._committed_read_callback(object_ref.object_path)
+        except FileNotFoundError as committed_read_error:
+            raise DurableStateError(
+                f"Durable object {object_ref.object_path!r} was not found."
+            ) from committed_read_error
         return self._validate_loaded_object(object_ref, payload)
 
     def _validate_loaded_object(
@@ -245,12 +283,29 @@ class FileDurableObjectStore:
         expected_sha256: str,
     ) -> None:
         """Ensure a pre-existing content-addressed object is not corrupted."""
-        existing_payload = target_path.read_bytes()
-        if len(existing_payload) != len(payload):
+        self._validate_object_file(
+            target_path,
+            expected_size=len(payload),
+            expected_sha256=expected_sha256,
+        )
+
+    def _validate_object_file(
+        self,
+        target_path: Path,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> None:
+        """Validate one object file without loading a second full copy into memory."""
+        if target_path.stat().st_size != expected_size:
             raise DurableStateError(
                 f"Existing durable object {target_path} has an unexpected size."
             )
-        if hashlib.sha256(existing_payload).hexdigest() != expected_sha256:
+        digest = hashlib.sha256()
+        with target_path.open("rb") as input_file:
+            for chunk in iter(lambda: input_file.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
             raise DurableStateError(
                 f"Existing durable object {target_path} failed its content-address check."
             )

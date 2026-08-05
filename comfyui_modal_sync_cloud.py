@@ -584,9 +584,7 @@ def _remote_comfy_output_directory() -> Path:
 
 def _remote_output_snapshot(payload: Mapping[str, Any]) -> RemoteOutputSnapshot | None:
     """Snapshot remote outputs when the local client requested artifact collection."""
-    if not bool(payload.get("capture_remote_outputs")) or bool(
-        payload.get("clear_remote_session")
-    ):
+    if not bool(payload.get("capture_remote_outputs")):
         return None
     output_directory = _remote_comfy_output_directory()
     snapshot = snapshot_output_directory(output_directory)
@@ -1845,6 +1843,54 @@ class _NullPromptServer:
         logger.debug("Suppressed remote prompt event %s for client %s.", event, client_id)
 
 
+class _HeadlessPromptQueue:
+    """In-memory PromptQueue compatibility surface for remote custom-node hooks."""
+
+    def __init__(self) -> None:
+        """Initialize the queue collections exposed by ComfyUI's PromptQueue."""
+        self._lock = threading.RLock()
+        self.queue: list[Any] = []
+        self.currently_running: dict[int, Any] = {}
+        self.history: dict[str, Any] = {}
+        self.flags: dict[str, Any] = {}
+
+    def put(self, item: Any) -> None:
+        """Retain a custom-node requeue request for compatibility diagnostics."""
+        with self._lock:
+            self.queue.append(item)
+        logger.warning(
+            "A remote custom node queued headless follow-up work; the request is retained "
+            "for compatibility but has no background queue consumer."
+        )
+
+    def get_current_queue(self) -> tuple[list[Any], list[Any]]:
+        """Return snapshots of running and pending compatibility queue items."""
+        with self._lock:
+            return list(self.currently_running.values()), list(self.queue)
+
+    def get_current_queue_volatile(self) -> tuple[list[Any], list[Any]]:
+        """Return shallow running and pending queue snapshots."""
+        return self.get_current_queue()
+
+    def get_tasks_remaining(self) -> int:
+        """Return the number of running and pending compatibility tasks."""
+        with self._lock:
+            return len(self.currently_running) + len(self.queue)
+
+    def set_flag(self, name: str, data: Any) -> None:
+        """Store a queue flag for custom nodes that inspect PromptQueue state."""
+        with self._lock:
+            self.flags[name] = data
+
+    def get_flags(self, reset: bool = True) -> dict[str, Any]:
+        """Return queue flags and optionally clear them."""
+        with self._lock:
+            flags = dict(self.flags)
+            if reset:
+                self.flags.clear()
+            return flags
+
+
 class _HeadlessPromptServerInstance:
     """Minimal PromptServer.instance replacement for custom-node import side effects."""
 
@@ -1857,7 +1903,13 @@ class _HeadlessPromptServerInstance:
         self.supports = ["custom_nodes_from_web"]
         self.client_id: str | None = None
         self.last_node_id: str | None = None
+        self.number = 0
+        self.prompt_queue = _HeadlessPromptQueue()
         self.on_prompt_handlers: list[Any] = []
+
+    def queue_updated(self) -> None:
+        """Accept PromptQueue update notifications without a websocket client."""
+        logger.debug("Suppressed headless remote prompt queue update.")
 
     async def send(self, event: str, data: dict[str, Any], sid: str | None = None) -> None:
         """Discard async websocket sends from import-time custom-node helpers."""
