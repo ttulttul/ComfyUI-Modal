@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Mapping
 
 try:
@@ -25,6 +26,15 @@ _REMOTE_SESSION_BRIDGE_RECORD_MARKER = "__comfy_modal_remote_session_bridge_reco
 
 class RemoteSessionStateError(RuntimeError):
     """Raised when remote session metadata is invalid or missing."""
+
+
+class RemoteSessionBridgeRecoveryKind(str, Enum):
+    """Describe the durable mechanism used to restore one bridge output."""
+
+    SERIALIZED_OUTPUT = "serialized_output"
+    SINGLE_NODE_PLAN = "single_node_plan"
+    SUBGRAPH_PLAN = "subgraph_plan"
+    PRODUCER_REPLAY = "producer_replay"
 
 
 @dataclass(frozen=True)
@@ -146,6 +156,8 @@ class RemoteSessionBridgeRecord:
     output_index: int
     producer_payload: dict[str, Any]
     producer_inputs: dict[str, Any]
+    recovery_kind: RemoteSessionBridgeRecoveryKind | None = None
+    producer_inputs_retained: bool | None = None
     producer_inputs_object: DurableObjectRef | None = None
     serialized_output: Any | None = None
     serialized_output_object: DurableObjectRef | None = None
@@ -162,6 +174,10 @@ class RemoteSessionBridgeRecord:
             "output_index": self.output_index,
             "producer_payload": self.producer_payload,
             "producer_inputs": self.producer_inputs,
+            "recovery_kind": (
+                self.recovery_kind.value if self.recovery_kind is not None else None
+            ),
+            "producer_inputs_retained": self.producer_inputs_retained,
             "producer_inputs_object": (
                 self.producer_inputs_object.to_payload()
                 if self.producer_inputs_object is not None
@@ -199,6 +215,26 @@ class RemoteSessionBridgeRecord:
                 "Remote session bridge records must define mapping producer_payload and producer_inputs."
             )
         serialized_output_io_type = payload.get("serialized_output_io_type")
+        recovery_kind_payload = payload.get("recovery_kind")
+        try:
+            recovery_kind = (
+                RemoteSessionBridgeRecoveryKind(str(recovery_kind_payload))
+                if recovery_kind_payload is not None
+                and str(recovery_kind_payload).strip()
+                else None
+            )
+        except ValueError as exc:
+            raise RemoteSessionStateError(
+                f"Unsupported remote session bridge recovery kind {recovery_kind_payload!r}."
+            ) from exc
+        producer_inputs_retained = payload.get("producer_inputs_retained")
+        if producer_inputs_retained is not None and not isinstance(
+            producer_inputs_retained,
+            bool,
+        ):
+            raise RemoteSessionStateError(
+                "Remote session bridge producer_inputs_retained must be a boolean or null."
+            )
         producer_inputs_object_payload = payload.get("producer_inputs_object")
         serialized_output_object_payload = payload.get("serialized_output_object")
         rehydration_plan = payload.get("rehydration_plan")
@@ -209,6 +245,8 @@ class RemoteSessionBridgeRecord:
             output_index=int(output_index),
             producer_payload=dict(producer_payload),
             producer_inputs=dict(producer_inputs),
+            recovery_kind=recovery_kind,
+            producer_inputs_retained=producer_inputs_retained,
             producer_inputs_object=(
                 DurableObjectRef.from_payload(producer_inputs_object_payload)
                 if isinstance(producer_inputs_object_payload, Mapping)

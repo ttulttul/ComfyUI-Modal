@@ -505,12 +505,12 @@ def test_cloud_canary_barrier_coordinates_shared_store_members(
     assert "CANARY_BARRIER:barrier-1:member-a" in barrier_store
 
 
-def test_cloud_large_bridge_inputs_and_output_use_object_store(
+def test_cloud_direct_bridge_output_omits_large_producer_inputs(
     modal_cloud_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Oversized bridge state should keep only content-addressed refs in metadata."""
+    """A directly restorable output should not persist producer inputs."""
     import torch
 
     object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
@@ -539,21 +539,26 @@ def test_cloud_large_bridge_inputs_and_output_use_object_store(
                 target_session_handle=target_handle,
             )
         )
-        restored_inputs = (
+        with pytest.raises(
+            modal_cloud_module.RemoteSessionStateError,
+            match="intentionally omitted",
+        ):
             modal_cloud_module._deserialize_remote_session_bridge_producer_inputs(
                 record
             )
-        )
     finally:
         modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
         modal_cloud_module.get_settings.cache_clear()
 
     assert record.producer_inputs == {}
-    assert record.producer_inputs_object is not None
+    assert record.producer_inputs_object is None
+    assert record.producer_inputs_retained is False
+    assert record.recovery_kind is (
+        modal_cloud_module.RemoteSessionBridgeRecoveryKind.SERIALIZED_OUTPUT
+    )
     assert record.serialized_output is None
     assert record.serialized_output_object is not None
     assert torch.equal(restored_value["samples"], latent["samples"])
-    assert torch.equal(restored_inputs["latent"]["samples"], latent["samples"])
 
 
 def test_cloud_large_image_bridge_output_uses_object_store(
@@ -683,6 +688,146 @@ def test_local_fallback_restores_object_backed_bridge_output(
         remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
         remote_modal_app_module.get_settings.cache_clear()
 
-    assert record.producer_inputs_object is not None
+    assert record.producer_inputs_object is None
+    assert record.producer_inputs_retained is False
+    assert record.recovery_kind is (
+        remote_modal_app_module.RemoteSessionBridgeRecoveryKind.SERIALIZED_OUTPUT
+    )
     assert record.serialized_output_object is not None
     assert torch.equal(restored_value["samples"], latent["samples"])
+
+
+@pytest.mark.parametrize(
+    "module_fixture_name",
+    ["modal_cloud_module", "remote_modal_app_module"],
+)
+def test_direct_bridge_identity_includes_omitted_producer_inputs(
+    module_fixture_name: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Omitted producer inputs should still distinguish durable bridge identities."""
+    runtime_module = request.getfixturevalue(module_fixture_name)
+
+    first_record = runtime_module._build_remote_session_bridge_record(
+        payload={"component_id": "component-1"},
+        hydrated_inputs={"seed": 1},
+        node_id="node-1",
+        output_index=0,
+        io_type="INT",
+        output_value=7,
+    )
+    second_record = runtime_module._build_remote_session_bridge_record(
+        payload={"component_id": "component-1"},
+        hydrated_inputs={"seed": 2},
+        node_id="node-1",
+        output_index=0,
+        io_type="INT",
+        output_value=7,
+    )
+
+    assert first_record.bridge_key != second_record.bridge_key
+    assert first_record.producer_inputs == {}
+    assert second_record.producer_inputs == {}
+    assert first_record.producer_inputs_retained is False
+    assert second_record.producer_inputs_retained is False
+
+
+@pytest.mark.parametrize(
+    "module_fixture_name",
+    ["modal_cloud_module", "remote_modal_app_module"],
+)
+def test_literal_loader_plan_omits_producer_inputs(
+    module_fixture_name: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A self-contained loader plan should not persist producer component inputs."""
+    runtime_module = request.getfixturevalue(module_fixture_name)
+
+    record = runtime_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "loader-component",
+            "subgraph_prompt": {
+                "vae-loader": {
+                    "class_type": "VAELoader",
+                    "inputs": {"vae_name": "video-vae.safetensors"},
+                }
+            },
+        },
+        hydrated_inputs={"unrelated": "large-producer-value"},
+        node_id="vae-loader",
+        output_index=0,
+        io_type="VAE",
+        output_value=object(),
+    )
+
+    assert record.recovery_kind is (
+        runtime_module.RemoteSessionBridgeRecoveryKind.SINGLE_NODE_PLAN
+    )
+    assert record.rehydration_plan == {
+        "kind": "single_node_output",
+        "node_data": {"class_type": "VAELoader"},
+        "node_inputs": {"vae_name": "video-vae.safetensors"},
+    }
+    assert record.producer_inputs_retained is False
+    assert record.producer_inputs == {}
+    assert record.producer_inputs_object is None
+
+
+@pytest.mark.parametrize(
+    "module_fixture_name",
+    ["modal_cloud_module", "remote_modal_app_module"],
+)
+def test_linked_loader_plan_retains_only_required_boundary_inputs(
+    module_fixture_name: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A linked loader plan should persist only its reduced dependency inputs."""
+    runtime_module = request.getfixturevalue(module_fixture_name)
+    payload = {
+        "component_id": "loader-component",
+        "subgraph_prompt": {
+            "source": {"class_type": "BoundarySource", "inputs": {"value": 0}},
+            "loader": {
+                "class_type": "LinkedModelLoader",
+                "inputs": {"source": ["source", 0]},
+            },
+            "unrelated": {
+                "class_type": "BoundarySource",
+                "inputs": {"value": 0},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "needed",
+                "io_type": "STRING",
+                "targets": [{"node_id": "source", "input_name": "value"}],
+            },
+            {
+                "proxy_input_name": "unneeded",
+                "io_type": "STRING",
+                "targets": [{"node_id": "unrelated", "input_name": "value"}],
+            },
+        ],
+    }
+
+    record = runtime_module._build_remote_session_bridge_record(
+        payload=payload,
+        hydrated_inputs={"needed": "keep", "unneeded": "omit"},
+        node_id="loader",
+        output_index=0,
+        io_type="MODEL",
+        output_value=object(),
+    )
+
+    assert record.recovery_kind is (
+        runtime_module.RemoteSessionBridgeRecoveryKind.SUBGRAPH_PLAN
+    )
+    assert record.producer_inputs_retained is True
+    assert runtime_module._deserialize_remote_session_bridge_producer_inputs(record) == {
+        "needed": "keep"
+    }
+    assert record.rehydration_plan is not None
+    assert [
+        boundary_input["proxy_input_name"]
+        for boundary_input in record.rehydration_plan["payload"]["boundary_inputs"]
+    ] == ["needed"]
