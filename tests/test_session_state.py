@@ -150,6 +150,10 @@ def test_remote_session_bridge_record_round_trips_object_refs(
         output_index=0,
         producer_payload={"component_id": "component-1"},
         producer_inputs={},
+        recovery_kind=(
+            session_state_module.RemoteSessionBridgeRecoveryKind.PRODUCER_REPLAY
+        ),
+        producer_inputs_retained=True,
         producer_inputs_object=producer_inputs_object,
         serialized_output_object=serialized_output_object,
         serialized_output_io_type="LATENT",
@@ -160,6 +164,28 @@ def test_remote_session_bridge_record_round_trips_object_refs(
     )
 
     assert restored == record
+
+
+def test_remote_session_bridge_record_accepts_legacy_recovery_metadata(
+    session_state_module: Any,
+) -> None:
+    """Records created before recovery policies should remain readable."""
+    record = session_state_module.RemoteSessionBridgeRecord(
+        bridge_key="RSB_legacy",
+        node_id="node-1",
+        output_index=0,
+        producer_payload={"component_id": "component-1"},
+        producer_inputs={"value": 1},
+    )
+    payload = record.to_payload()
+    payload.pop("recovery_kind")
+    payload.pop("producer_inputs_retained")
+
+    restored = session_state_module.RemoteSessionBridgeRecord.from_payload(payload)
+
+    assert restored.recovery_kind is None
+    assert restored.producer_inputs_retained is None
+    assert restored.producer_inputs == {"value": 1}
 
 
 def test_remote_session_store_resolves_bridge_refs_via_replay_callback(

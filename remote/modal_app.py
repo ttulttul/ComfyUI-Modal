@@ -53,6 +53,7 @@ from ..session_state import (
     InMemoryRemoteSessionBridgeStore,
     InMemoryRemoteSessionStore,
     RemoteSessionBridgeRecord,
+    RemoteSessionBridgeRecoveryKind,
     RemoteSessionBridgeRef,
     RemoteSessionHandle,
     RemoteSessionStateError,
@@ -655,6 +656,71 @@ def _json_payload_size_bytes(payload: Any) -> int:
     )
 
 
+def _select_remote_session_bridge_recovery_kind(
+    *,
+    serialized_output: Any | None,
+    rehydration_plan: Mapping[str, Any] | None,
+) -> RemoteSessionBridgeRecoveryKind:
+    """Choose the least expensive complete recovery mechanism for one bridge."""
+    if serialized_output is not None:
+        return RemoteSessionBridgeRecoveryKind.SERIALIZED_OUTPUT
+    if isinstance(rehydration_plan, Mapping):
+        plan_kind = str(rehydration_plan.get("kind") or "")
+        if plan_kind == "single_node_output":
+            return RemoteSessionBridgeRecoveryKind.SINGLE_NODE_PLAN
+        if plan_kind == "subgraph_output":
+            return RemoteSessionBridgeRecoveryKind.SUBGRAPH_PLAN
+    return RemoteSessionBridgeRecoveryKind.PRODUCER_REPLAY
+
+
+def _remote_session_bridge_recovery_input_names(
+    *,
+    recovery_kind: RemoteSessionBridgeRecoveryKind,
+    rehydration_plan: Mapping[str, Any] | None,
+    hydrated_inputs: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return producer input names that the selected recovery mechanism needs."""
+    if recovery_kind in {
+        RemoteSessionBridgeRecoveryKind.SERIALIZED_OUTPUT,
+        RemoteSessionBridgeRecoveryKind.SINGLE_NODE_PLAN,
+    }:
+        return ()
+    if recovery_kind is RemoteSessionBridgeRecoveryKind.PRODUCER_REPLAY:
+        return tuple(str(input_name) for input_name in hydrated_inputs)
+
+    plan_payload = (
+        rehydration_plan.get("payload")
+        if isinstance(rehydration_plan, Mapping)
+        else None
+    )
+    boundary_inputs = (
+        plan_payload.get("boundary_inputs")
+        if isinstance(plan_payload, Mapping)
+        else None
+    )
+    if not isinstance(boundary_inputs, list):
+        raise RemoteSessionStateError(
+            "Durable bridge subgraph recovery plans must define boundary_inputs."
+        )
+    input_names = tuple(
+        dict.fromkeys(
+            str(boundary_input.get("proxy_input_name") or "").strip()
+            for boundary_input in boundary_inputs
+            if isinstance(boundary_input, Mapping)
+            and str(boundary_input.get("proxy_input_name") or "").strip()
+        )
+    )
+    missing_input_names = [
+        input_name for input_name in input_names if input_name not in hydrated_inputs
+    ]
+    if missing_input_names:
+        raise RemoteSessionStateError(
+            "Durable bridge subgraph recovery inputs are missing hydrated values: "
+            f"{missing_input_names}."
+        )
+    return input_names
+
+
 def _offload_large_bridge_payloads(
     *,
     hydrated_inputs: Mapping[str, Any],
@@ -671,7 +737,7 @@ def _offload_large_bridge_payloads(
     max_inline_bytes = get_settings().bridge_inline_max_bytes
     producer_inputs_object: DurableObjectRef | None = None
     serialized_output_object: DurableObjectRef | None = None
-    if _json_payload_size_bytes(producer_inputs) > max_inline_bytes:
+    if producer_inputs and _json_payload_size_bytes(producer_inputs) > max_inline_bytes:
         producer_inputs_object = _durable_object_store().put(
             "bridge_objects",
             serialize_node_inputs(hydrated_inputs),
@@ -702,6 +768,16 @@ def _deserialize_remote_session_bridge_producer_inputs(
         return deserialize_node_inputs(
             _durable_object_store().get(record.producer_inputs_object)
         )
+    if record.producer_inputs_retained is False:
+        recovery_kind = (
+            record.recovery_kind.value
+            if record.recovery_kind is not None
+            else "unspecified"
+        )
+        raise RemoteSessionStateError(
+            "Remote session bridge producer inputs were intentionally omitted for "
+            f"bridge_key={record.bridge_key!r} recovery_kind={recovery_kind!r}."
+        )
     return deserialize_node_inputs(record.producer_inputs)
 
 
@@ -716,11 +792,38 @@ def _build_remote_session_bridge_record(
 ) -> RemoteSessionBridgeRecord:
     """Build one durable bridge record for a session-backed boundary output."""
     producer_payload = _sanitize_payload_for_session_bridge_record(payload)
-    producer_inputs = serialize_mapping(hydrated_inputs)
+    producer_input_identity = serialize_mapping(hydrated_inputs)
     serialized_output = _serialize_durable_bridge_output(output_value, io_type)
+    rehydration_plan = _build_durable_bridge_rehydration_plan(
+        payload=producer_payload,
+        node_id=node_id,
+        output_index=output_index,
+        io_type=io_type,
+    )
+    recovery_kind = _select_remote_session_bridge_recovery_kind(
+        serialized_output=serialized_output,
+        rehydration_plan=rehydration_plan,
+    )
+    recovery_input_names = _remote_session_bridge_recovery_input_names(
+        recovery_kind=recovery_kind,
+        rehydration_plan=rehydration_plan,
+        hydrated_inputs=hydrated_inputs,
+    )
+    producer_inputs_retained = recovery_kind in {
+        RemoteSessionBridgeRecoveryKind.SUBGRAPH_PLAN,
+        RemoteSessionBridgeRecoveryKind.PRODUCER_REPLAY,
+    }
+    retained_hydrated_inputs = {
+        input_name: hydrated_inputs[input_name]
+        for input_name in recovery_input_names
+    }
+    producer_inputs = {
+        input_name: producer_input_identity[input_name]
+        for input_name in recovery_input_names
+    }
     bridge_key = stable_session_bridge_key(
         producer_payload=producer_payload,
-        producer_inputs=producer_inputs,
+        producer_inputs=producer_input_identity,
         node_id=node_id,
         output_index=output_index,
     )
@@ -730,16 +833,19 @@ def _build_remote_session_bridge_record(
         serialized_output,
         serialized_output_object,
     ) = _offload_large_bridge_payloads(
-        hydrated_inputs=hydrated_inputs,
+        hydrated_inputs=retained_hydrated_inputs,
         producer_inputs=producer_inputs,
         output_value=output_value,
         serialized_output=serialized_output,
     )
-    rehydration_plan = _build_durable_bridge_rehydration_plan(
-        payload=producer_payload,
-        node_id=node_id,
-        output_index=output_index,
-        io_type=io_type,
+    logger.info(
+        "Prepared remote session bridge bridge_key=%s recovery_kind=%s "
+        "producer_inputs_retained=%s retained_input_count=%d omitted_input_count=%d.",
+        bridge_key,
+        recovery_kind.value,
+        producer_inputs_retained,
+        len(recovery_input_names),
+        len(producer_input_identity) - len(recovery_input_names),
     )
     return RemoteSessionBridgeRecord(
         bridge_key=bridge_key,
@@ -747,6 +853,8 @@ def _build_remote_session_bridge_record(
         output_index=output_index,
         producer_payload=producer_payload,
         producer_inputs=producer_inputs,
+        recovery_kind=recovery_kind,
+        producer_inputs_retained=producer_inputs_retained,
         producer_inputs_object=producer_inputs_object,
         serialized_output=serialized_output,
         serialized_output_object=serialized_output_object,
