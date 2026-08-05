@@ -3643,18 +3643,22 @@ def test_modal_cloud_returns_no_custom_node_packages_without_requirements(
     assert modal_cloud_module._custom_node_runtime_packages(custom_nodes_dir) == ()
 
 
-def test_modal_cloud_pins_cu128_pytorch_stack(
+def test_modal_cloud_selects_gpu_compatible_pytorch_stack(
     modal_cloud_module: Any,
 ) -> None:
-    """The Modal cloud image should pin the PyTorch stack to the CUDA 12.8 wheel index."""
-    packages = modal_cloud_module._comfyui_torch_packages()
+    """The Modal cloud image should expose GPU-aware pinned PyTorch builds."""
+    default_build = modal_cloud_module._select_remote_torch_build("A100")
+    b300_build = modal_cloud_module._select_remote_torch_build("B300")
 
-    assert packages == (
+    assert default_build.index_packages == (
         "torch==2.10.0",
         "torchvision==0.25.0",
         "torchaudio==2.10.0",
     )
-    assert modal_cloud_module._PYTORCH_CUDA_INDEX_URL == "https://download.pytorch.org/whl/cu128"
+    assert default_build.index_url == "https://download.pytorch.org/whl/cu128"
+    assert b300_build.index_packages == ("torch==2.12.1", "torchvision==0.27.1")
+    assert b300_build.pypi_packages == ("torchaudio==2.11.0",)
+    assert b300_build.index_url == "https://download.pytorch.org/whl/cu132"
 
 
 def test_modal_cloud_missing_prompt_node_class_raises_clear_error(

@@ -45,14 +45,13 @@ for candidate in (_REPO_ROOT, _REMOTE_REPO_ROOT, _LOCAL_COMFYUI_ROOT, _REMOTE_CO
 from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     COMFYUI_RUNTIME_SOURCE_DIRECTORIES as _COMFYUI_IMAGE_RUNTIME_DIRECTORIES,
     COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
-    PYTORCH_CUDA_INDEX_URL as _PYTORCH_CUDA_INDEX_URL,
     REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
     REMOTE_PYTHON_VERSION,
     build_remote_runtime_identity,
     custom_node_runtime_packages as _custom_node_runtime_packages,
     remote_apt_packages as _comfyui_apt_packages,
     remote_runtime_packages as _comfyui_runtime_packages,
-    remote_torch_packages as _comfyui_torch_packages,
+    select_remote_torch_build as _select_remote_torch_build,
 )
 from durable_state import (  # noqa: E402 - paths are bootstrapped above.
     DurableObjectCommitBatch,
@@ -6349,6 +6348,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         create_if_missing=True,
     )
     custom_node_packages = _custom_node_runtime_packages(settings.custom_nodes_dir)
+    torch_build = _select_remote_torch_build(settings.modal_gpu)
     runtime_identity = build_remote_runtime_identity(
         repo_root=_REPO_ROOT,
         comfyui_root=settings.comfyui_root,
@@ -6361,6 +6361,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         _REMOTE_APP_PROTOCOL_VERSION,
         REMOTE_PYTHON_VERSION,
     )
+    logger.info(
+        "Selected Modal PyTorch build gpu=%s cuda=%s index=%s index_packages=%s pypi_packages=%s.",
+        settings.modal_gpu,
+        torch_build.cuda_version,
+        torch_build.index_url,
+        torch_build.index_packages,
+        torch_build.pypi_packages,
+    )
     image = (
         modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
         .apt_install(*_comfyui_apt_packages())
@@ -6369,13 +6377,13 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     )
     if custom_node_packages:
         image = image.pip_install(*custom_node_packages)
-    image = (
-        image.pip_install(*_comfyui_torch_packages(), index_url=_PYTORCH_CUDA_INDEX_URL)
-        .add_local_dir(
-            _REPO_ROOT,
-            remote_path="/root/comfyui_modal_sync_repo",
-            ignore=_should_ignore_repo_path,
-        )
+    image = image.pip_install(*torch_build.index_packages, index_url=torch_build.index_url)
+    if torch_build.pypi_packages:
+        image = image.pip_install(*torch_build.pypi_packages)
+    image = image.add_local_dir(
+        _REPO_ROOT,
+        remote_path="/root/comfyui_modal_sync_repo",
+        ignore=_should_ignore_repo_path,
     )
     if settings.comfyui_root is not None and settings.comfyui_root.exists():
         image = image.add_local_dir(

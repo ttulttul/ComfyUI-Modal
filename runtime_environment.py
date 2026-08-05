@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 REMOTE_APP_PROTOCOL_VERSION = 5
 REMOTE_PYTHON_VERSION = "3.11"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
-PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 
 _REMOTE_APT_PACKAGES = (
     "libgl1",
@@ -47,11 +46,17 @@ _REMOTE_RUNTIME_PACKAGES = (
     "tqdm==4.67.3",
     "transformers==5.1.0",
 )
-_REMOTE_TORCH_PACKAGES = (
+_CUDA_128_TORCH_PACKAGES = (
     "torch==2.10.0",
     "torchvision==0.25.0",
     "torchaudio==2.10.0",
 )
+_CUDA_132_TORCH_PACKAGES = (
+    "torch==2.12.1",
+    "torchvision==0.27.1",
+)
+_CUDA_132_PYPI_PACKAGES = ("torchaudio==2.11.0",)
+_CUDA_132_MODAL_GPU_TYPES = frozenset({"B200+", "B300"})
 _IGNORED_DIRECTORY_NAMES = frozenset(
     {
         ".cache",
@@ -125,6 +130,21 @@ class RemoteRuntimeIdentity:
     manifest: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class RemoteTorchBuild:
+    """Describe the pinned PyTorch packages for one Modal GPU type."""
+
+    cuda_version: str
+    index_url: str
+    index_packages: tuple[str, ...]
+    pypi_packages: tuple[str, ...] = ()
+
+    @property
+    def packages(self) -> tuple[str, ...]:
+        """Return every package pin installed for this PyTorch build."""
+        return self.index_packages + self.pypi_packages
+
+
 def remote_runtime_packages() -> tuple[str, ...]:
     """Return the exact ComfyUI support package set used by Modal images."""
     return _REMOTE_RUNTIME_PACKAGES
@@ -135,9 +155,34 @@ def remote_apt_packages() -> tuple[str, ...]:
     return _REMOTE_APT_PACKAGES
 
 
-def remote_torch_packages() -> tuple[str, ...]:
-    """Return the exact CUDA PyTorch package set used by Modal images."""
-    return _REMOTE_TORCH_PACKAGES
+def normalized_modal_gpu_type(modal_gpu: str) -> str:
+    """Return a canonical Modal GPU type without an optional count suffix."""
+    gpu_type = modal_gpu.strip().split(":", maxsplit=1)[0].upper()
+    if not gpu_type:
+        raise ValueError("Modal GPU type cannot be empty when selecting a PyTorch build.")
+    return gpu_type
+
+
+def select_remote_torch_build(modal_gpu: str) -> RemoteTorchBuild:
+    """Select a CUDA wheel set compatible with the requested Modal GPU."""
+    gpu_type = normalized_modal_gpu_type(modal_gpu)
+    if gpu_type in _CUDA_132_MODAL_GPU_TYPES:
+        return RemoteTorchBuild(
+            cuda_version="13.2",
+            index_url="https://download.pytorch.org/whl/cu132",
+            index_packages=_CUDA_132_TORCH_PACKAGES,
+            pypi_packages=_CUDA_132_PYPI_PACKAGES,
+        )
+    return RemoteTorchBuild(
+        cuda_version="12.8",
+        index_url="https://download.pytorch.org/whl/cu128",
+        index_packages=_CUDA_128_TORCH_PACKAGES,
+    )
+
+
+def remote_torch_packages(modal_gpu: str = "A100") -> tuple[str, ...]:
+    """Return the exact PyTorch package set for one Modal GPU specification."""
+    return select_remote_torch_build(modal_gpu).packages
 
 
 def _strip_requirement_comment(line: str) -> str:
@@ -301,13 +346,20 @@ def build_remote_runtime_identity(
     settings: RemoteRuntimeSettings,
 ) -> RemoteRuntimeIdentity:
     """Build the deterministic identity expected from one deployed Modal runtime."""
+    torch_build = select_remote_torch_build(settings.modal_gpu)
     manifest: dict[str, Any] = {
         "protocol_version": REMOTE_APP_PROTOCOL_VERSION,
         "python_version": REMOTE_PYTHON_VERSION,
         "modal_sdk_spec": REMOTE_MODAL_SDK_SPEC,
         "apt_packages": list(remote_apt_packages()),
         "runtime_packages": list(remote_runtime_packages()),
-        "torch_packages": list(remote_torch_packages()),
+        "torch_packages": list(torch_build.packages),
+        "torch_build": {
+            "cuda_version": torch_build.cuda_version,
+            "index_url": torch_build.index_url,
+            "index_packages": list(torch_build.index_packages),
+            "pypi_packages": list(torch_build.pypi_packages),
+        },
         "custom_node_packages": list(custom_node_runtime_packages(custom_nodes_dir)),
         "repo_source_digest": _tree_digest(
             repo_root,

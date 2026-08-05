@@ -159,6 +159,8 @@ Remote mode prefers a persistent deployed Modal app over ephemeral `app.run()` e
 
 Modal hardware is fixed at deploy time. If you change `COMFY_MODAL_GPU`, stop/delete the existing Modal app or redeploy it so the remote class is built with the new GPU type. If you upgrade this node pack and expect changed remote behavior, redeploy once so the Modal app picks up the new code and class options.
 
+The Modal image selects its pinned PyTorch wheel set from `COMFY_MODAL_GPU`. `B300` and `B200+` configurations use the CUDA 13.2 PyTorch wheels because Modal requires CUDA 13.1 or newer whenever a worker can be assigned a B300. Other supported GPU types retain the CUDA 12.8 wheel set. Count suffixes such as `B300:2` are normalized before selection, and the selected CUDA version, index, and package pins are logged during app construction and recorded in the runtime fingerprint.
+
 CPU memory snapshots are enabled by default. GPU memory snapshots are also enabled by default in current settings, but useful GPU snapshot work is limited to stable loader profiles derived from root literal model-loader nodes. Generic no-profile workers skip GPU snapshot prewarm because they do not provide the model-loaded cold-start win.
 
 Warm containers can reuse loaded model state, `PromptExecutor` state, remote session bridge values, and worker-local loader cache entries across compatible requests. The default Modal `scaledown_window` is `600` seconds with `min_containers=0`, so compute can scale down to zero between runs while still benefiting from warm reuse when capacity remains alive.
@@ -255,7 +257,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `COMFY_MODAL_GPU` | `A100` | Modal GPU type requested by the deployed remote class. |
+| `COMFY_MODAL_GPU` | `A100` | Modal GPU type requested by the deployed remote class; also selects its compatible pinned PyTorch CUDA wheel set. |
 | `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT` | `true` | Enable Modal CPU memory snapshots. |
 | `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT` | `true` | Enable Modal GPU memory snapshots for profiled loader states. |
 | `COMFY_MODAL_SCALEDOWN_WINDOW` | `600` | Seconds to keep idle Modal containers warm. |

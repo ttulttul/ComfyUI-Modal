@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 
 def _runtime_settings(**overrides: Any) -> SimpleNamespace:
     """Return minimal settings accepted by the runtime identity builder."""
@@ -68,6 +70,50 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "comfy-kitchen==0.2.26" in runtime_packages
 
 
+def test_default_modal_gpus_use_pinned_cuda_128_build(
+    runtime_environment_module: Any,
+) -> None:
+    """Established Modal GPU types should retain the tested CUDA 12.8 stack."""
+    build = runtime_environment_module.select_remote_torch_build("A100:2")
+
+    assert build.cuda_version == "12.8"
+    assert build.index_url == "https://download.pytorch.org/whl/cu128"
+    assert build.index_packages == (
+        "torch==2.10.0",
+        "torchvision==0.25.0",
+        "torchaudio==2.10.0",
+    )
+    assert build.pypi_packages == ()
+
+
+@pytest.mark.parametrize("modal_gpu", ("B300", "b300:2", "B200+", "B200+:8"))
+def test_b300_capable_modal_gpus_use_cuda_132_build(
+    runtime_environment_module: Any,
+    modal_gpu: str,
+) -> None:
+    """GPU specifications that may resolve to B300 should use CUDA 13.2 wheels."""
+    build = runtime_environment_module.select_remote_torch_build(modal_gpu)
+
+    assert build.cuda_version == "13.2"
+    assert build.index_url == "https://download.pytorch.org/whl/cu132"
+    assert build.index_packages == (
+        "torch==2.12.1",
+        "torchvision==0.27.1",
+    )
+    assert build.pypi_packages == ("torchaudio==2.11.0",)
+    assert runtime_environment_module.remote_torch_packages(modal_gpu) == (
+        "torch==2.12.1",
+        "torchvision==0.27.1",
+        "torchaudio==2.11.0",
+    )
+
+
+def test_empty_modal_gpu_cannot_select_torch_build(runtime_environment_module: Any) -> None:
+    """An empty GPU specification should fail before constructing a Modal image."""
+    with pytest.raises(ValueError, match="cannot be empty"):
+        runtime_environment_module.select_remote_torch_build("  ")
+
+
 def test_runtime_identity_changes_with_source_and_runtime_options(
     runtime_environment_module: Any,
     tmp_path: Path,
@@ -111,6 +157,36 @@ def test_runtime_identity_records_system_packages(
     identity = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
 
     assert identity.manifest["apt_packages"] == ["libgl1", "libglib2.0-0"]
+
+
+def test_runtime_identity_records_gpu_specific_torch_build(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The deployment manifest should describe the wheel set selected for its GPU."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    repo_root.mkdir()
+    comfyui_root.mkdir()
+
+    identity = _runtime_identity(
+        runtime_environment_module,
+        repo_root,
+        comfyui_root,
+        modal_gpu="B300",
+    )
+
+    assert identity.manifest["torch_build"] == {
+        "cuda_version": "13.2",
+        "index_url": "https://download.pytorch.org/whl/cu132",
+        "index_packages": ["torch==2.12.1", "torchvision==0.27.1"],
+        "pypi_packages": ["torchaudio==2.11.0"],
+    }
+    assert identity.manifest["torch_packages"] == [
+        "torch==2.12.1",
+        "torchvision==0.27.1",
+        "torchaudio==2.11.0",
+    ]
 
 
 def test_runtime_identity_tracks_custom_node_requirements_but_ignores_payload_source(
