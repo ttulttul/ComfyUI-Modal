@@ -556,6 +556,57 @@ def test_cloud_large_bridge_inputs_and_output_use_object_store(
     assert torch.equal(restored_inputs["latent"]["samples"], latent["samples"])
 
 
+def test_cloud_large_image_bridge_output_uses_object_store(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Remote IMAGE boundaries should restore from Volume bytes without replay."""
+    import torch
+
+    object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
+    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    monkeypatch.setenv("COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES", "1")
+    modal_cloud_module.get_settings.cache_clear()
+    image = torch.arange(48, dtype=torch.float32).reshape(1, 4, 4, 3)
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-image-object-backed",
+        prompt_id="prompt-1",
+        owner_component_id="component-2",
+    )
+
+    try:
+        record = modal_cloud_module._build_remote_session_bridge_record(
+            payload={"component_id": "component-1"},
+            hydrated_inputs={},
+            node_id="vae-decode-1",
+            output_index=0,
+            io_type="IMAGE",
+            output_value=image,
+        )
+        monkeypatch.setattr(
+            modal_cloud_module,
+            "_execute_subgraph_prompt",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("durable IMAGE restore should skip producer replay")
+            ),
+        )
+        restored_value = (
+            modal_cloud_module._restore_serialized_remote_session_bridge_value(
+                record,
+                target_session_handle=target_handle,
+            )
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        modal_cloud_module.get_settings.cache_clear()
+
+    assert record.serialized_output is None
+    assert record.serialized_output_object is not None
+    assert record.serialized_output_io_type == "IMAGE"
+    assert torch.equal(restored_value, image)
+
+
 def test_local_client_attaches_stable_invocation_id(
     remote_modal_app_module: Any,
     monkeypatch: pytest.MonkeyPatch,

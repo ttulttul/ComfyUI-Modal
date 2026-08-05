@@ -20,6 +20,8 @@ Repository = "https://github.com/ttulttul/ComfyUI-Modal"
 [dependency-groups]
 test = [
     "aiohttp",
+    "comfy-aimdo==0.4.11",
+    "comfy-kitchen==0.2.26",
     "einops",
     "numpy",
     "pillow",
@@ -29,6 +31,7 @@ test = [
     "safetensors",
     "scipy",
     "torch",
+    "torchaudio>=2.11.0",
     "torchvision",
     "tqdm",
     "transformers",

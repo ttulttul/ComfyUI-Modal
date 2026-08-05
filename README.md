@@ -127,7 +127,7 @@ When a prompt is queued:
 6. Referenced model assets and, when enabled, `custom_nodes/` packages are mirrored into storage.
 7. The rewritten prompt is submitted to ComfyUI's normal execution queue.
 8. Local nodes execute normally until a proxy node is reached.
-9. The proxy serializes boundary inputs, dispatches local or Modal execution, deserializes returned outputs, and exposes them as normal ComfyUI outputs.
+9. The proxy dispatches local or Modal execution. Values needed by local nodes are materialized as normal ComfyUI outputs, while values consumed only by later remote components travel through the local graph as small Modal-backed references.
 
 Boundary-crossing values must be transportable. Supported evaluated values include:
 
@@ -165,7 +165,9 @@ Warm containers can reuse loaded model state, `PromptExecutor` state, remote ses
 
 Independent Modal-backed components can overlap through ComfyUI's async proxy path and the local Modal call executor. Each Modal GPU container handles one active workflow execution at a time, so parallel ready components can scale out across containers instead of multiplexing several active executions onto one worker. `COMFY_MODAL_MAX_INFLIGHT_CALLS` bounds local dispatch independently from the local CPU count and the remote autoscaler.
 
-Split proxies and mapped phases use prompt-scoped remote sessions for live non-transportable values. Durable bridge metadata is stored in a Modal `Dict` so later phases can rehydrate selected values after container churn. Oversized serialized bridge inputs and outputs are stored as integrity-checked, content-addressed objects on the shared Modal Volume instead of being embedded in `Dict` records. Sampler-producing bridges are not replayed as a fallback; losing those values is surfaced as a session-state error.
+When a component output is consumed exclusively by other remote components, Modal-Sync keeps it remote. The producer returns a small durable bridge reference through the local ComfyUI proxy instead of returning the underlying `IMAGE`, `AUDIO`, `LATENT`, `MASK`, `SIGMAS`, `VIDEO`, or scalar value. A downstream remote component resolves that reference from the worker's warm bridge cache when possible, or restores it from shared Modal storage when Modal schedules the components on different containers. If any consumer is local, including an interim preview or final `SaveVideo`, the planner leaves that boundary materialized so the local node receives the ordinary ComfyUI value it expects.
+
+Split proxies, mapped phases, and remote-to-remote component edges use component-local remote sessions. Durable bridge metadata and small serialized values are stored in a Modal `Dict`. Serialized bridge values above `COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES` are stored as integrity-checked, content-addressed objects on the shared Modal Volume, with only the object reference retained in the Dict record. The producer commits new objects before publishing a completed invocation; a consumer whose mounted Volume snapshot is older reads committed bytes through `Volume.read_file()` without reloading the mount or disturbing memory-mapped models. `NOISE` remains deliberately excluded because ComfyUI represents it as a deferred strategy object rather than a realized tensor.
 
 Each remote payload also carries a stable invocation id. The worker records its lifecycle in a shared Modal `Dict` and replays a completed result when the local client or Modal retries the same call. An overlapping delivery waits briefly for the active attempt to publish a terminal state instead of failing immediately. If a streamed call loses its consumer, the worker cancels unfinished compute and marks that attempt failed before the retry proceeds; uncommitted Volume writes remain unpublished. Large completed results use the same content-addressed Volume store, while failed attempts remain retryable.
 

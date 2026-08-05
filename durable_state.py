@@ -154,6 +154,13 @@ class FileDurableObjectStore:
                     self._commit_callback()
             else:
                 active_batch.wrote_object = True
+        logger.info(
+            "Resolved durable object namespace=%s path=%s size_bytes=%d created=%s.",
+            normalized_namespace,
+            relative_path.as_posix(),
+            len(payload),
+            wrote_object,
+        )
         return DurableObjectRef(
             object_path=relative_path.as_posix(),
             sha256=sha256,

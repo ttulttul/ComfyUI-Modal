@@ -1073,11 +1073,12 @@ def test_rewrite_records_local_preview_targets_for_remote_boundary_images(
 
 def test_rewrite_splits_remote_chain_across_transportable_edges(
     api_intercept_module: Any,
+    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Transportable remote-to-remote edges should become ordered proxy boundaries."""
+    """Transportable remote-to-remote edges should use Modal-backed references."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -1160,6 +1161,7 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
             "io_type": "IMAGE",
             "is_list": False,
             "preview_target_node_ids": [],
+            "session_output": True,
         }
     ]
 
@@ -1183,6 +1185,25 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
     ]
     assert rewritten_prompt["2"]["inputs"]["remote_input_0"] == ["1", 0]
     assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
+
+    first_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        first_payload,
+        unique_id="1",
+    )
+    second_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        second_payload,
+        unique_id="2",
+    )
+    assert "remote_session" not in first_payload
+    assert "remote_session" not in second_payload
+    assert first_execution_payload["clear_remote_session"] is True
+    assert second_execution_payload["clear_remote_session"] is True
+    assert first_execution_payload["remote_session"]["owner_component_id"] == "1"
+    assert second_execution_payload["remote_session"]["owner_component_id"] == "2"
+    assert (
+        first_execution_payload["remote_session"]["session_id"]
+        != second_execution_payload["remote_session"]["session_id"]
+    )
 
 
 def test_rewrite_keeps_non_returning_local_preview_taps_local(
@@ -1278,6 +1299,18 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
     assert all("9" not in payload["component_node_ids"] for payload in remote_payloads)
     assert all("9" not in payload["subgraph_prompt"] for payload in remote_payloads)
     assert all("9" not in payload["execute_node_ids"] for payload in remote_payloads)
+    assert rewritten_prompt["1"]["inputs"]["original_node_data"][
+        "boundary_outputs"
+    ] == [
+        {
+            "proxy_output_name": "1_image",
+            "node_id": "1",
+            "output_index": 0,
+            "io_type": "IMAGE",
+            "is_list": False,
+            "preview_target_node_ids": ["9"],
+        }
+    ]
     assert rewritten_prompt["9"]["inputs"]["images"] == ["1", 0]
     assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 

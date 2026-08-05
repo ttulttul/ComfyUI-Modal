@@ -30,6 +30,7 @@ def _ensure_import_paths() -> None:
     if "av" not in sys.modules:
         av_module = types.ModuleType("av")
         av_module.__spec__ = importlib.machinery.ModuleSpec("av", loader=None)
+        av_module.__path__ = []
         av_module.open = lambda *args, **kwargs: (_ for _ in ()).throw(
             RuntimeError("The av stub should not be used in tests.")
         )
@@ -51,11 +52,16 @@ def _ensure_import_paths() -> None:
         av_subtitles_module = types.ModuleType("av.subtitles")
         av_subtitles_stream_module = types.ModuleType("av.subtitles.stream")
         av_subtitles_stream_module.SubtitleStream = type("SubtitleStream", (), {})
+        av_video_module = types.ModuleType("av.video")
+        av_video_reformatter_module = types.ModuleType("av.video.reformatter")
+        av_video_reformatter_module.ColorRange = type("ColorRange", (), {})
 
         sys.modules["av"] = av_module
         sys.modules["av.container"] = av_container_module
         sys.modules["av.subtitles"] = av_subtitles_module
         sys.modules["av.subtitles.stream"] = av_subtitles_stream_module
+        sys.modules["av.video"] = av_video_module
+        sys.modules["av.video.reformatter"] = av_video_reformatter_module
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     comfyui_root = _comfyui_root()

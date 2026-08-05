@@ -93,13 +93,14 @@ class BoundaryInputSpec:
 
 @dataclass
 class BoundaryOutputSpec:
-    """Describe one remote-to-local boundary value for a component."""
+    """Describe one value exported across a remote component boundary."""
 
     proxy_output_name: str
     source: LinkedOutputRef
     io_type: str
     is_list: bool
     preview_target_node_ids: list[str] = field(default_factory=list)
+    session_output: bool = False
 
 
 @dataclass
@@ -2497,6 +2498,89 @@ def _build_component_plans(
     ]
 
 
+def _mark_remote_to_remote_session_boundaries(
+    prompt: dict[str, Any],
+    components: list[RemoteComponentPlan],
+) -> set[str]:
+    """Mark exclusively remote component edges for reference-based transport."""
+    consumers = _build_consumer_map(prompt)
+    component_id_by_node_id = {
+        node_id: component.representative_node_id
+        for component in components
+        for node_id in component.node_ids
+    }
+    session_sources: set[LinkedOutputRef] = set()
+
+    for component in components:
+        for boundary_output in component.boundary_outputs:
+            output_consumers = consumers.get(boundary_output.source, [])
+            if not output_consumers:
+                continue
+            if not all(
+                consumer.node_id in component_id_by_node_id
+                for consumer in output_consumers
+            ):
+                continue
+            boundary_output.session_output = True
+            session_sources.add(boundary_output.source)
+            logger.info(
+                "Keeping remote boundary output in Modal storage source=%s:%d io_type=%s producer_component=%s consumer_components=%s.",
+                boundary_output.source.node_id,
+                boundary_output.source.output_index,
+                boundary_output.io_type,
+                component.representative_node_id,
+                sorted(
+                    {
+                        component_id_by_node_id[consumer.node_id]
+                        for consumer in output_consumers
+                    }
+                ),
+            )
+
+    return _remote_session_component_ids(
+        components=components,
+        session_sources=session_sources,
+    )
+
+
+def _remote_session_component_ids(
+    *,
+    components: list[RemoteComponentPlan],
+    session_sources: set[LinkedOutputRef],
+) -> set[str]:
+    """Return components that produce or consume Modal-backed boundary refs."""
+    return {
+        component.representative_node_id
+        for component in components
+        if any(output.session_output for output in component.boundary_outputs)
+        or any(
+            boundary_input.source in session_sources
+            for boundary_input in component.boundary_inputs
+        )
+    }
+
+
+def _boundary_output_payload(
+    boundary_output: BoundaryOutputSpec,
+    *,
+    mapped_output: bool | None = None,
+) -> dict[str, Any]:
+    """Serialize one component boundary output for a remote payload."""
+    payload = {
+        "proxy_output_name": boundary_output.proxy_output_name,
+        "node_id": boundary_output.source.node_id,
+        "output_index": boundary_output.source.output_index,
+        "io_type": boundary_output.io_type,
+        "is_list": boundary_output.is_list,
+        "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
+    }
+    if boundary_output.session_output:
+        payload["session_output"] = True
+    if mapped_output is not None:
+        payload["mapped_output"] = mapped_output
+    return payload
+
+
 def _mapped_boundary_origin_io_type(
     prompt: dict[str, Any],
     boundary_input: BoundaryInputSpec,
@@ -2695,6 +2779,7 @@ def _build_component_payload(
     uploaded_volume_paths: list[str],
     terminate_container_on_error: bool,
     nodes_module: Any,
+    remote_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the serialized execution payload for one remote component."""
     prompt_id = (extra_data or {}).get("prompt_id")
@@ -2850,16 +2935,7 @@ def _build_component_payload(
                 component.boundary_outputs,
                 phase_node_id_set,
             ):
-                phase_boundary_outputs.append(
-                    {
-                        "proxy_output_name": boundary_output.proxy_output_name,
-                        "node_id": boundary_output.source.node_id,
-                        "output_index": boundary_output.source.output_index,
-                        "io_type": boundary_output.io_type,
-                        "is_list": boundary_output.is_list,
-                        "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-                    }
-                )
+                phase_boundary_outputs.append(_boundary_output_payload(boundary_output))
                 phase_output_names_by_source[boundary_output.source] = boundary_output.proxy_output_name
 
             pending_node_ids = remaining_node_ids - phase_node_id_set
@@ -2912,7 +2988,7 @@ def _build_component_payload(
                                 "io_type": io_type,
                                 "is_list": is_list,
                                 "preview_target_node_ids": [],
-                                "session_output": not _is_transportable_output_type(io_type),
+                                "session_output": True,
                             }
                         )
                         phase_output_names_by_source[source] = proxy_output_name
@@ -2921,7 +2997,7 @@ def _build_component_payload(
                         source=source,
                         io_type=io_type,
                         is_list=is_list,
-                        session_output=not _is_transportable_output_type(io_type),
+                        session_output=True,
                     )
 
             phase_execute_node_ids = [
@@ -2950,14 +3026,16 @@ def _build_component_payload(
         )
         if not phase_payloads or len(phase_payloads) <= 1:
             return None
-        if has_session_bridges:
-            remote_session = RemoteSessionHandle(
+        active_remote_session = remote_session
+        if active_remote_session is None and has_session_bridges:
+            active_remote_session = RemoteSessionHandle(
                 session_id=uuid.uuid4().hex,
                 prompt_id=(str(prompt_id) if prompt_id is not None else None),
                 owner_component_id=component.representative_node_id,
             ).to_payload()
+        if active_remote_session is not None:
             for phase_index, phase_payload in enumerate(phase_payloads):
-                phase_payload["remote_session"] = copy.deepcopy(remote_session)
+                phase_payload["remote_session"] = copy.deepcopy(active_remote_session)
                 if phase_index == len(phase_payloads) - 1:
                     phase_payload["clear_remote_session"] = True
         logger.info(
@@ -2992,25 +3070,13 @@ def _build_component_payload(
             signature_prompt=signature_prompt,
         ),
         "boundary_outputs": [
-            (
-                {
-                    "proxy_output_name": boundary_output.proxy_output_name,
-                    "node_id": boundary_output.source.node_id,
-                    "output_index": boundary_output.source.output_index,
-                    "io_type": boundary_output.io_type,
-                    "is_list": boundary_output.is_list,
-                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-                    "mapped_output": bool(boundary_output.source.node_id in set(component.mapped_node_ids)),
-                }
-                if component.mapped_boundary_input_name
-                else {
-                    "proxy_output_name": boundary_output.proxy_output_name,
-                    "node_id": boundary_output.source.node_id,
-                    "output_index": boundary_output.source.output_index,
-                    "io_type": boundary_output.io_type,
-                    "is_list": boundary_output.is_list,
-                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-                }
+            _boundary_output_payload(
+                boundary_output,
+                mapped_output=(
+                    boundary_output.source.node_id in set(component.mapped_node_ids)
+                    if component.mapped_boundary_input_name
+                    else None
+                ),
             )
             for boundary_output in component.boundary_outputs
         ],
@@ -3032,6 +3098,9 @@ def _build_component_payload(
             else None
         ),
     }
+    if remote_session is not None:
+        payload["remote_session"] = copy.deepcopy(remote_session)
+        payload["clear_remote_session"] = True
     logger.info(
         "Built remote payload for component %s: boundary_inputs=%d boundary_outputs=%d execute_nodes=%s custom_nodes_bundle=%s",
         component.representative_node_id,
@@ -3099,14 +3168,7 @@ def _build_component_payload(
                 signature_prompt=signature_prompt,
             ),
             "boundary_outputs": [
-                {
-                    "proxy_output_name": boundary_output.proxy_output_name,
-                    "node_id": boundary_output.source.node_id,
-                    "output_index": boundary_output.source.output_index,
-                    "io_type": boundary_output.io_type,
-                    "is_list": boundary_output.is_list,
-                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-                }
+                _boundary_output_payload(boundary_output)
                 for boundary_output in static_boundary_outputs
             ]
             + static_bridge_outputs,
@@ -3129,26 +3191,19 @@ def _build_component_payload(
                 signature_prompt=signature_prompt,
             ),
             "boundary_outputs": [
-                {
-                    "proxy_output_name": boundary_output.proxy_output_name,
-                    "node_id": boundary_output.source.node_id,
-                    "output_index": boundary_output.source.output_index,
-                    "io_type": boundary_output.io_type,
-                    "is_list": boundary_output.is_list,
-                    "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-                    "mapped_output": True,
-                }
+                _boundary_output_payload(boundary_output, mapped_output=True)
                 for boundary_output in mapped_boundary_outputs
             ],
             "execute_node_ids": list(component.mapped_execute_node_ids),
         }
         if not component.static_node_ids:
             return _attach_snapshot_profile_key(payload, settings)
-        remote_session = RemoteSessionHandle(
-            session_id=uuid.uuid4().hex,
-            prompt_id=(str(prompt_id) if prompt_id is not None else None),
-            owner_component_id=component.representative_node_id,
-        ).to_payload()
+        if remote_session is None:
+            remote_session = RemoteSessionHandle(
+                session_id=uuid.uuid4().hex,
+                prompt_id=(str(prompt_id) if prompt_id is not None else None),
+                owner_component_id=component.representative_node_id,
+            ).to_payload()
         logger.info(
             "Split hybrid component %s into static nodes=%s and mapped nodes=%s using remote_session session_id=%s with %d static bridge outputs.",
             component.representative_node_id,
@@ -3164,14 +3219,7 @@ def _build_component_payload(
                     component_node_ids=list(component.static_node_ids),
                     boundary_inputs=static_boundary_inputs,
                     boundary_outputs=[
-                        {
-                            "proxy_output_name": boundary_output.proxy_output_name,
-                            "node_id": boundary_output.source.node_id,
-                            "output_index": boundary_output.source.output_index,
-                            "io_type": boundary_output.io_type,
-                            "is_list": boundary_output.is_list,
-                            "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-                        }
+                        _boundary_output_payload(boundary_output)
                         for boundary_output in static_boundary_outputs
                     ]
                     + static_bridge_outputs,
@@ -3192,14 +3240,7 @@ def _build_component_payload(
                         for boundary_spec in component.static_to_mapped_boundaries
                     ],
                     boundary_outputs=[
-                        {
-                            "proxy_output_name": boundary_output.proxy_output_name,
-                            "node_id": boundary_output.source.node_id,
-                            "output_index": boundary_output.source.output_index,
-                            "io_type": boundary_output.io_type,
-                            "is_list": boundary_output.is_list,
-                            "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
-                        }
+                        _boundary_output_payload(boundary_output)
                         for boundary_output in mapped_boundary_outputs
                     ],
                     execute_node_ids=list(component.mapped_execute_node_ids),
@@ -3602,6 +3643,25 @@ def rewrite_prompt_for_modal(
         expanded_remote_node_ids,
         resolved_nodes_module,
     )
+    session_component_ids = _mark_remote_to_remote_session_boundaries(
+        rewritten_prompt,
+        components,
+    )
+    prompt_id = (extra_data or {}).get("prompt_id")
+    remote_sessions_by_component_id = {
+        component.representative_node_id: RemoteSessionHandle(
+            session_id=uuid.uuid4().hex,
+            prompt_id=(str(prompt_id) if prompt_id is not None else None),
+            owner_component_id=component.representative_node_id,
+        ).to_payload()
+        for component in components
+        if component.representative_node_id in session_component_ids
+    }
+    if remote_sessions_by_component_id:
+        logger.info(
+            "Enabled Modal-backed remote references for components=%s.",
+            sorted(remote_sessions_by_component_id),
+        )
     validate_remote_component_transport_compatibility(
         prompt=rewritten_prompt,
         components=components,
@@ -3682,6 +3742,9 @@ def rewrite_prompt_for_modal(
             uploaded_volume_paths=uploaded_volume_paths,
             terminate_container_on_error=resolved_settings.terminate_container_on_error,
             nodes_module=resolved_nodes_module,
+            remote_session=remote_sessions_by_component_id.get(
+                component.representative_node_id
+            ),
         )
         proxy_node_ids = _rewrite_component_into_proxy(
             component=component,
