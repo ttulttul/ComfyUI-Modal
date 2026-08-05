@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
-REMOTE_APP_PROTOCOL_VERSION = 5
+REMOTE_APP_PROTOCOL_VERSION = 6
 REMOTE_PYTHON_VERSION = "3.11"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 

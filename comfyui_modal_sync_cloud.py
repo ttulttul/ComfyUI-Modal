@@ -63,6 +63,11 @@ from durable_state import (  # noqa: E402 - paths are bootstrapped above.
     new_running_invocation_record,
     read_modal_volume_file,
 )
+from output_artifacts import (  # noqa: E402 - paths are bootstrapped above.
+    RemoteOutputSnapshot,
+    capture_execution_result,
+    snapshot_output_directory,
+)
 
 from serialization import (  # noqa: E402 - paths are bootstrapped above.
     coerce_serialized_node_outputs,
@@ -544,7 +549,7 @@ def _execute_with_durable_invocation(
     pending_batch: DurableObjectCommitBatch | None = None
     try:
         with object_store.batch_commits(commit_on_exit=False) as pending_batch:
-            serialized_outputs = coerce_serialized_node_outputs(execute_once())
+            serialized_outputs = _execute_payload_with_output_capture(payload, execute_once)
     except Exception as exc:
         if pending_batch is not None:
             object_store.commit_batch(pending_batch)
@@ -560,6 +565,61 @@ def _execute_with_durable_invocation(
     elif pending_batch is not None:
         object_store.commit_batch(pending_batch)
     return serialized_outputs
+
+
+def _remote_comfy_output_directory() -> Path:
+    """Return the effective output directory inside the remote ComfyUI runtime."""
+    try:
+        import folder_paths
+    except ModuleNotFoundError as exc:
+        if exc.name != "folder_paths":
+            raise
+        return _REMOTE_COMFYUI_ROOT / "output"
+    get_output_directory = getattr(folder_paths, "get_output_directory", None)
+    if callable(get_output_directory):
+        return Path(get_output_directory()).expanduser().resolve()
+    return _REMOTE_COMFYUI_ROOT / "output"
+
+
+def _remote_output_snapshot(payload: Mapping[str, Any]) -> RemoteOutputSnapshot | None:
+    """Snapshot remote outputs when the local client requested artifact collection."""
+    if not bool(payload.get("capture_remote_outputs")) or bool(
+        payload.get("clear_remote_session")
+    ):
+        return None
+    output_directory = _remote_comfy_output_directory()
+    snapshot = snapshot_output_directory(output_directory)
+    logger.info(
+        "Snapshot remote ComfyUI output directory %s before component=%s with %d existing file(s).",
+        output_directory,
+        payload.get("component_id"),
+        len(snapshot.files),
+    )
+    return snapshot
+
+
+def _execute_payload_with_output_capture(
+    payload: Mapping[str, Any],
+    execute_once: Callable[[], bytes | bytearray | str | Sequence[Any] | Any],
+) -> bytes:
+    """Execute one payload and attach files it created beneath remote output."""
+    snapshot = _remote_output_snapshot(payload)
+    serialized_outputs = coerce_serialized_node_outputs(execute_once())
+    if snapshot is None:
+        return serialized_outputs
+    result = capture_execution_result(serialized_outputs, snapshot)
+    if result is serialized_outputs or result == serialized_outputs:
+        logger.info(
+            "Remote component=%s created no new ComfyUI output files.",
+            payload.get("component_id"),
+        )
+        return serialized_outputs
+    logger.info(
+        "Bundled remote ComfyUI output files for component=%s result_bytes=%d.",
+        payload.get("component_id"),
+        len(result),
+    )
+    return result
 
 
 def _canary_interrupt_requested(
@@ -5566,7 +5626,7 @@ def _stream_remote_payload_events(
         pending_batch: DurableObjectCommitBatch | None = None
         try:
             with object_store.batch_commits(commit_on_exit=False) as pending_batch:
-                outputs = coerce_serialized_node_outputs(execute_once())
+                outputs = _execute_payload_with_output_capture(payload, execute_once)
         except Exception as exc:  # pragma: no cover - exercised through generator consumer tests.
             event_buffer.publish_terminal("error", (exc, pending_batch))
         else:

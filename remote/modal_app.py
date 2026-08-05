@@ -49,6 +49,11 @@ from ..durable_state import (
     read_modal_volume_file,
     stable_remote_invocation_id,
 )
+from ..output_artifacts import (
+    RemoteExecutionResult,
+    materialize_remote_output_artifacts,
+    unpack_remote_execution_result,
+)
 from ..session_state import (
     InMemoryRemoteSessionBridgeStore,
     InMemoryRemoteSessionStore,
@@ -6031,6 +6036,7 @@ def _invoke_remote_engine_payload_with_recovery(
 ) -> bytes:
     """Retry one payload call after auto-deploy when a stale deployed handle vanishes."""
     payload = dict(payload)
+    payload.setdefault("capture_remote_outputs", True)
     payload.setdefault(
         "invocation_id",
         stable_remote_invocation_id(payload, kwargs_payload),
@@ -6038,7 +6044,7 @@ def _invoke_remote_engine_payload_with_recovery(
     lookup_error_types = _modal_lookup_error_types()
     settings = get_settings()
     try:
-        return _invoke_remote_engine_payload(
+        response = _invoke_remote_engine_payload(
             remote_engine,
             payload,
             kwargs_payload,
@@ -6053,12 +6059,61 @@ def _invoke_remote_engine_payload_with_recovery(
             exc,
         )
         recovered_remote_engine = _auto_deploy_modal_app(payload, exc)
-        return _invoke_remote_engine_payload(
+        response = _invoke_remote_engine_payload(
             recovered_remote_engine,
             payload,
             kwargs_payload,
             cancellation_event,
         )
+    return _materialize_remote_execution_result(response, settings=settings)
+
+
+def _local_comfy_output_directory(settings: ModalSyncSettings) -> Path:
+    """Return the effective output directory of the local ComfyUI process."""
+    try:
+        import folder_paths
+    except ModuleNotFoundError as exc:
+        if exc.name != "folder_paths":
+            raise
+    else:
+        get_output_directory = getattr(folder_paths, "get_output_directory", None)
+        if callable(get_output_directory):
+            return Path(get_output_directory()).expanduser().resolve()
+    if settings.comfyui_root is None:
+        raise ModalRemoteInvocationError(
+            "Modal returned ComfyUI output files, but the local ComfyUI output directory "
+            "could not be resolved. Set COMFY_MODAL_COMFYUI_ROOT."
+        )
+    return (settings.comfyui_root / "output").resolve()
+
+
+def _materialize_remote_execution_result(
+    response: bytes | bytearray,
+    *,
+    settings: ModalSyncSettings | None = None,
+) -> bytes:
+    """Download bundled remote files and return the ordinary serialized node outputs."""
+    result: RemoteExecutionResult = unpack_remote_execution_result(response)
+    if not result.artifacts:
+        return result.outputs
+    resolved_settings = settings or get_settings()
+    output_directory = _local_comfy_output_directory(resolved_settings)
+    logger.info(
+        "Materializing %d remote ComfyUI output file(s) into %s.",
+        len(result.artifacts),
+        output_directory,
+    )
+    materialized_paths = materialize_remote_output_artifacts(
+        result,
+        output_directory=output_directory,
+        app_name=resolved_settings.app_name,
+    )
+    logger.info(
+        "Finished downloading %d remote ComfyUI output file(s): %s.",
+        len(materialized_paths),
+        [str(path) for path in materialized_paths],
+    )
+    return result.outputs
 
 
 def _invoke_modal_payload_blocking(

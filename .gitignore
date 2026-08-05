@@ -13,6 +13,7 @@
 !/instance_identity.py
 !/modal_executor_node.py
 !/modal_sdk.py
+!/output_artifacts.py
 !/runtime_environment.py
 !/serialization.py
 !/settings.py
