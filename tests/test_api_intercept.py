@@ -116,6 +116,14 @@ class _FakeRemoteVideoNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeRemoteAudioNode:
+    """Fake remote node that produces a transportable AUDIO output."""
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    OUTPUT_IS_LIST = (False,)
+
+
 class _FakeRemoteImageConsumerNode:
     """Fake remote node that consumes IMAGE and produces IMAGE."""
 
@@ -1071,14 +1079,13 @@ def test_rewrite_records_local_preview_targets_for_remote_boundary_images(
     ]
 
 
-def test_rewrite_splits_remote_chain_across_transportable_edges(
+def test_rewrite_colocates_remote_chain_across_large_transportable_edges(
     api_intercept_module: Any,
-    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Transportable remote-to-remote edges should use Modal-backed references."""
+    """Large transportable remote-to-remote values should remain inside one component."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -1143,37 +1150,16 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "2", "3"}
-    assert summary.remote_component_ids == ["1", "2"]
-    assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
-    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
+    assert set(rewritten_prompt) == {"1", "3"}
+    assert summary.remote_component_ids == ["1"]
+    assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
 
-    first_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
-    second_payload = rewritten_prompt["2"]["inputs"]["original_node_data"]
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
 
-    assert first_payload["component_node_ids"] == ["1"]
-    assert first_payload["boundary_inputs"] == []
-    assert first_payload["boundary_outputs"] == [
-        {
-            "proxy_output_name": "1_image",
-            "node_id": "1",
-            "output_index": 0,
-            "io_type": "IMAGE",
-            "is_list": False,
-            "preview_target_node_ids": [],
-            "session_output": True,
-        }
-    ]
-
-    assert second_payload["component_node_ids"] == ["2"]
-    assert second_payload["boundary_inputs"] == [
-        {
-            "proxy_input_name": "remote_input_0",
-            "io_type": "IMAGE",
-            "targets": [{"node_id": "2", "input_name": "image"}],
-        }
-    ]
-    assert second_payload["boundary_outputs"] == [
+    assert payload["component_node_ids"] == ["1", "2"]
+    assert payload["boundary_inputs"] == []
+    assert payload["boundary_outputs"] == [
         {
             "proxy_output_name": "2_image",
             "node_id": "2",
@@ -1183,27 +1169,112 @@ def test_rewrite_splits_remote_chain_across_transportable_edges(
             "preview_target_node_ids": [],
         }
     ]
-    assert rewritten_prompt["2"]["inputs"]["remote_input_0"] == ["1", 0]
-    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
+    assert payload["execute_node_ids"] == ["2"]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 0]
+    assert api_intercept_module._is_inexpensive_remote_boundary_type("IMAGE") is False
+    assert api_intercept_module._is_inexpensive_remote_boundary_type("STRING") is True
 
-    first_execution_payload = modal_executor_module._rehydrate_proxy_payload(
-        first_payload,
-        unique_id="1",
+
+def test_rewrite_colocates_sampler_decoders_and_video_assembly(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Sampler media branches should stay together through final video assembly."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
     )
-    second_execution_payload = modal_executor_module._rehydrate_proxy_payload(
-        second_payload,
-        unique_id="2",
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteModel": _FakeRemoteModelNode,
+                "RemoteSampler": _FakeRemoteSamplerNode,
+                "VAELoader": _FakeVAELoaderNode,
+                "VAEDecode": _FakeVAEDecodeNode,
+                "VAEDecodeAudio": _FakeRemoteAudioNode,
+                "CreateVideo": _FakeRemoteVideoNode,
+                "SaveVideo": _FakeLocalSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": node_id, "properties": {"is_modal_remote": node_id != 8}}
+            for node_id in range(1, 9)
+        ]
+    }
+    prompt = {
+        "1": {"class_type": "RemoteModel", "inputs": {}},
+        "2": {"class_type": "RemoteSampler", "inputs": {"model": ["1", 0]}},
+        "3": {"class_type": "VAELoader", "inputs": {}},
+        "4": {
+            "class_type": "VAEDecode",
+            "inputs": {"samples": ["2", 0], "vae": ["3", 0]},
+        },
+        "5": {"class_type": "VAELoader", "inputs": {}},
+        "6": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {"samples": ["2", 0], "vae": ["5", 0]},
+        },
+        "7": {
+            "class_type": "CreateVideo",
+            "inputs": {"images": ["4", 0], "audio": ["6", 0]},
+        },
+        "8": {"class_type": "SaveVideo", "inputs": {"video": ["7", 0]}},
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
     )
-    assert "remote_session" not in first_payload
-    assert "remote_session" not in second_payload
-    assert first_execution_payload["clear_remote_session"] is True
-    assert second_execution_payload["clear_remote_session"] is True
-    assert first_execution_payload["remote_session"]["owner_component_id"] == "1"
-    assert second_execution_payload["remote_session"]["owner_component_id"] == "2"
-    assert (
-        first_execution_payload["remote_session"]["session_id"]
-        != second_execution_payload["remote_session"]["session_id"]
-    )
+
+    assert set(rewritten_prompt) == {"1", "8"}
+    assert summary.remote_component_ids == ["1"]
+    assert summary.component_node_ids_by_representative == {
+        "1": ["1", "2", "3", "4", "5", "6", "7"],
+    }
+    assert summary.rewritten_node_id_map == {
+        str(node_id): "1"
+        for node_id in range(1, 8)
+    }
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["component_node_ids"] == ["1", "2", "3", "4", "5", "6", "7"]
+    assert payload["execute_node_ids"] == ["7"]
+    assert payload["boundary_inputs"] == []
+    assert payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "7_video",
+            "node_id": "7",
+            "output_index": 0,
+            "io_type": "VIDEO",
+            "is_list": False,
+            "preview_target_node_ids": [],
+        }
+    ]
+    assert rewritten_prompt["8"]["inputs"]["video"] == ["1", 0]
 
 
 def test_rewrite_keeps_non_returning_local_preview_taps_local(
@@ -1284,10 +1355,10 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "2", "3", "9"}
-    assert summary.remote_component_ids == ["1", "2"]
-    assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
-    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
+    assert set(rewritten_prompt) == {"1", "3", "9"}
+    assert summary.remote_component_ids == ["1"]
+    assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
 
     remote_payloads = [
         rewritten_node["inputs"]["original_node_data"]
@@ -1299,9 +1370,8 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
     assert all("9" not in payload["component_node_ids"] for payload in remote_payloads)
     assert all("9" not in payload["subgraph_prompt"] for payload in remote_payloads)
     assert all("9" not in payload["execute_node_ids"] for payload in remote_payloads)
-    assert rewritten_prompt["1"]["inputs"]["original_node_data"][
-        "boundary_outputs"
-    ] == [
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["boundary_outputs"] == [
         {
             "proxy_output_name": "1_image",
             "node_id": "1",
@@ -1309,10 +1379,18 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
             "io_type": "IMAGE",
             "is_list": False,
             "preview_target_node_ids": ["9"],
-        }
+        },
+        {
+            "proxy_output_name": "2_image",
+            "node_id": "2",
+            "output_index": 0,
+            "io_type": "IMAGE",
+            "is_list": False,
+            "preview_target_node_ids": [],
+        },
     ]
     assert rewritten_prompt["9"]["inputs"]["images"] == ["1", 0]
-    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 1]
 
 
 def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
@@ -1425,10 +1503,10 @@ def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "2", "3", "7", "8", "9", "11", "90", "192"}
-    assert summary.remote_component_ids == ["1", "2"]
-    assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
-    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
+    assert set(rewritten_prompt) == {"1", "3", "7", "8", "9", "11", "90", "192"}
+    assert summary.remote_component_ids == ["1"]
+    assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
 
     remote_payloads = [
         rewritten_node["inputs"]["original_node_data"]
@@ -1437,13 +1515,13 @@ def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
         and "original_node_data" in rewritten_node["inputs"]
     ]
     local_node_ids = {"7", "8", "9", "11", "90", "192"}
-    assert len(remote_payloads) == 2
+    assert len(remote_payloads) == 1
     for payload in remote_payloads:
         assert not (local_node_ids & set(payload["component_node_ids"]))
         assert not (local_node_ids & set(payload["subgraph_prompt"]))
         assert not (local_node_ids & set(payload["execute_node_ids"]))
     assert rewritten_prompt["90"]["inputs"]["images"] == ["192", 0]
-    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 1]
 
 
 def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
@@ -1758,9 +1836,9 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
         (),
         {
             "NODE_CLASS_MAPPINGS": {
-                "RemoteImage": _FakeRemoteImageNode,
-                "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
-                "LocalSink": _FakeLocalSinkNode,
+                "RemoteString": _FakeRemoteStringEchoNode,
+                "RemoteStringConsumer": _FakeRemoteStringEchoNode,
+                "LocalSink": _FakeLocalStringSinkNode,
             },
             "NODE_DISPLAY_NAME_MAPPINGS": {},
         },
@@ -1775,18 +1853,18 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
     }
     prompt = {
         "1": {
-            "class_type": "RemoteImage",
+            "class_type": "RemoteString",
             "inputs": {},
-            "_meta": {"title": "Remote Image"},
+            "_meta": {"title": "Remote String"},
         },
         "2": {
-            "class_type": "RemoteImageConsumer",
-            "inputs": {"image": ["1", 0]},
-            "_meta": {"title": "Remote Image Consumer"},
+            "class_type": "RemoteStringConsumer",
+            "inputs": {"text": ["1", 0]},
+            "_meta": {"title": "Remote String Consumer"},
         },
         "3": {
             "class_type": "LocalSink",
-            "inputs": {"image": ["2", 0]},
+            "inputs": {"text": ["2", 0]},
             "_meta": {"title": "Local Sink"},
         },
     }
@@ -1812,7 +1890,7 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
         return {
             "2": {
                 "class_type": rewritten_prompt["2"]["class_type"],
-                "inputs": {"image_path": uploaded_asset.remote_path},
+                "inputs": {"text_path": uploaded_asset.remote_path},
                 "_meta": rewritten_prompt["2"]["_meta"],
             }
         }, [uploaded_asset]
@@ -2521,14 +2599,13 @@ def test_rewrite_stamps_snapshot_profile_on_split_static_and_mapped_payloads(
     assert mapped_payload["snapshot_profile_key"] == static_payload["snapshot_profile_key"]
 
 
-def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_upstream(
+def test_rewrite_keeps_unmapped_remote_siblings_without_local_reentry_together(
     api_intercept_module: Any,
-    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Unmapped remote execute siblings should become ordered proxies when they only share remote-only upstream state."""
+    """Ordinary remote execute siblings should remain one proxy without local re-entry."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -2618,76 +2695,42 @@ def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_up
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"2", "3", "4", "5", "6", "7"}
-    assert summary.remote_component_ids == ["3", "6"]
+    assert set(rewritten_prompt) == {"1", "2", "4", "5", "7"}
+    assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {
-        "3": ["1", "3"],
-        "6": ["6"],
+        "1": ["1", "3", "6"],
     }
     assert summary.component_dependency_ids_by_representative == {
-        "3": [],
-        "6": ["3"],
+        "1": [],
     }
-    assert summary.component_execution_stages == [["3"], ["6"]]
-    assert summary.rewritten_node_id_map["1"] == "3"
-    assert summary.rewritten_node_id_map["3"] == "3"
-    assert summary.rewritten_node_id_map["6"] == "6"
+    assert summary.component_execution_stages == [["1"]]
+    assert summary.rewritten_node_id_map == {"1": "1", "3": "1", "6": "1"}
 
-    first_payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
-    second_payload = rewritten_prompt["6"]["inputs"]["original_node_data"]
-    first_execution_payload = modal_executor_module._rehydrate_proxy_payload(
-        first_payload,
-        unique_id="3",
-    )
-    second_execution_payload = modal_executor_module._rehydrate_proxy_payload(
-        second_payload,
-        unique_id="6",
-    )
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
 
-    assert first_payload["payload_kind"] == "subgraph"
-    assert first_payload["component_node_ids"] == ["1", "3"]
-    assert first_payload["boundary_inputs"] == [
+    assert payload["payload_kind"] == "subgraph"
+    assert payload["component_node_ids"] == ["1", "3", "6"]
+    assert payload["boundary_inputs"] == [
         {
             "proxy_input_name": "remote_input_0",
             "io_type": "LATENT",
             "targets": [{"node_id": "3", "input_name": "latent"}],
-        }
-    ]
-    assert first_payload["boundary_outputs"][0] == {
-        "proxy_output_name": "3_latent",
-        "node_id": "3",
-        "output_index": 0,
-        "io_type": "LATENT",
-        "is_list": False,
-        "preview_target_node_ids": [],
-    }
-    assert first_payload["boundary_outputs"][1]["node_id"] == "1"
-    assert first_payload["boundary_outputs"][1]["output_index"] == 0
-    assert first_payload["boundary_outputs"][1]["io_type"] == "MODEL"
-    assert first_payload["boundary_outputs"][1]["session_output"] is True
-    assert first_payload["execute_node_ids"] == ["3"]
-    assert "remote_session" not in first_payload
-    assert first_execution_payload["remote_session"]["owner_component_id"] == "1"
-
-    assert second_payload["payload_kind"] == "subgraph"
-    assert second_payload["component_node_ids"] == ["6"]
-    assert second_payload["boundary_inputs"] == [
+        },
         {
             "proxy_input_name": "remote_input_1",
             "io_type": "LATENT",
             "targets": [{"node_id": "6", "input_name": "latent"}],
         },
-        {
-            "proxy_input_name": first_payload["boundary_outputs"][1]["proxy_output_name"],
-            "io_type": "MODEL",
-            "targets": [{"node_id": "6", "input_name": "model"}],
-            "source_signature": api_intercept_module._boundary_source_signature(
-                prompt,
-                api_intercept_module.LinkedOutputRef(node_id="1", output_index=0),
-            ),
-        },
     ]
-    assert second_payload["boundary_outputs"] == [
+    assert payload["boundary_outputs"] == [
+        {
+            "proxy_output_name": "3_latent",
+            "node_id": "3",
+            "output_index": 0,
+            "io_type": "LATENT",
+            "is_list": False,
+            "preview_target_node_ids": [],
+        },
         {
             "proxy_output_name": "6_latent",
             "node_id": "6",
@@ -2695,18 +2738,12 @@ def test_rewrite_splits_unmapped_remote_siblings_that_share_non_transportable_up
             "io_type": "LATENT",
             "is_list": False,
             "preview_target_node_ids": [],
-        }
+        },
     ]
-    assert second_payload["execute_node_ids"] == ["6"]
-    assert "clear_remote_session" not in second_payload
-    assert second_execution_payload["clear_remote_session"] is True
-    assert (
-        second_execution_payload["remote_session"]["session_id"]
-        == first_execution_payload["remote_session"]["session_id"]
-    )
-    assert rewritten_prompt["6"]["inputs"][first_payload["boundary_outputs"][1]["proxy_output_name"]] == ["3", 1]
-    assert rewritten_prompt["4"]["inputs"]["image"] == ["3", 0]
-    assert rewritten_prompt["7"]["inputs"]["image"] == ["6", 0]
+    assert payload["execute_node_ids"] == ["3", "6"]
+    assert "remote_session" not in payload
+    assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
+    assert rewritten_prompt["7"]["inputs"]["image"] == ["1", 1]
 
 
 def test_boundary_source_signature_changes_with_upstream_prompt_structure(

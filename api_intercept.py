@@ -55,6 +55,14 @@ _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
         "VIDEO",
     }
 )
+_INEXPENSIVE_REMOTE_BOUNDARY_TYPES = frozenset(
+    {
+        "BOOLEAN",
+        "FLOAT",
+        "INT",
+        "STRING",
+    }
+)
 _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
     {
         "CheckpointLoaderSimple",
@@ -1168,6 +1176,14 @@ def _is_transportable_output_type(io_type: str) -> bool:
     return bool(normalized_parts) and all(part in _TRANSPORTABLE_OUTPUT_TYPES for part in normalized_parts)
 
 
+def _is_inexpensive_remote_boundary_type(io_type: str) -> bool:
+    """Return whether a remote edge is cheap enough to remain a component boundary."""
+    normalized_parts = [part.strip() for part in io_type.split(",") if part.strip()]
+    return bool(normalized_parts) and all(
+        part in _INEXPENSIVE_REMOTE_BOUNDARY_TYPES for part in normalized_parts
+    )
+
+
 def _build_consumer_map(prompt: dict[str, Any]) -> dict[LinkedOutputRef, list[InputTarget]]:
     """Build a reverse map from node outputs to downstream prompt inputs."""
     consumers: dict[LinkedOutputRef, list[InputTarget]] = defaultdict(list)
@@ -1410,7 +1426,7 @@ def _remote_component_partition_groups(
     consumers: dict[LinkedOutputRef, list[InputTarget]],
     nodes_module: Any,
 ) -> dict[str, set[str]]:
-    """Return component groups after merging remote nodes across non-transportable edges."""
+    """Return component groups after merging remote nodes across costly boundaries."""
     parent: dict[str, str] = {node_id: node_id for node_id in remote_node_ids}
     downstream_remote_node_ids_by_node_id: dict[str, set[str]] = defaultdict(set)
 
@@ -1475,8 +1491,17 @@ def _remote_component_partition_groups(
                 output_index=source.output_index,
                 nodes_module=nodes_module,
             )
-            if io_type is None or _is_transportable_output_type(io_type):
+            if io_type is not None and _is_inexpensive_remote_boundary_type(io_type):
                 continue
+            if io_type is not None and _is_transportable_output_type(io_type):
+                logger.info(
+                    "Co-locating remote nodes %s -> %s because %s output %d is "
+                    "transportable but expensive.",
+                    upstream_node_id,
+                    node_id,
+                    io_type,
+                    source.output_index,
+                )
             union(node_id, upstream_node_id)
 
     for remote_node_id in sorted(remote_node_ids):
@@ -2830,22 +2855,19 @@ def _build_component_payload(
         """Return ordered split-proxy phase payloads for components with local feedback."""
         if len(component.execute_node_ids) <= 1:
             return None
-        if component.mapped_boundary_input_name is not None and not _component_has_local_reentry_dependency(
+        has_local_reentry_dependency = _component_has_local_reentry_dependency(
             prompt=signature_prompt,
             component=component,
-        ):
+        )
+        if not has_local_reentry_dependency:
+            logger.info(
+                "Keeping remote component %s as one proxy because execute targets %s "
+                "have no local re-entry dependency.",
+                component.representative_node_id,
+                component.execute_node_ids,
+            )
             return None
         if component.local_tap_node_ids:
-            if not _component_has_local_reentry_dependency(
-                prompt=signature_prompt,
-                component=component,
-            ):
-                logger.info(
-                    "Keeping remote component %s as one proxy because it contains non-returning local tap nodes %s.",
-                    component.representative_node_id,
-                    component.local_tap_node_ids,
-                )
-                return None
             logger.info(
                 "Allowing remote component %s with local tap nodes %s to split because it has a local re-entry dependency.",
                 component.representative_node_id,

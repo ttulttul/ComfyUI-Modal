@@ -121,8 +121,8 @@ When a prompt is queued:
 
 1. The frontend sends the prompt and `extra_pnginfo.workflow` metadata to `POST /modal/queue_prompt`.
 2. The backend resolves marked workflow nodes onto queued prompt node ids, including nested subgraph ids such as `195:27`. Reusable definitions under `workflow.definitions.subgraphs` are expanded through each matching subgraph instance before markers are mapped.
-3. Remote-marked nodes are partitioned into transport-aware components.
-4. Components expand upstream when required by non-transportable inputs such as `MODEL`, `CLIP`, `VAE`, or `CONDITIONING`.
+3. Remote-marked nodes are partitioned into cost-aware components. Direct remote edges carrying large tensor or media values such as `LATENT`, `IMAGE`, `MASK`, `SIGMAS`, `AUDIO`, or `VIDEO` stay inside one component; inexpensive scalar edges may remain component boundaries.
+4. Components also expand across non-transportable inputs such as `MODEL`, `CLIP`, `VAE`, or `CONDITIONING`.
 5. Each component is replaced with one or more generated `ModalUniversalExecutor_<hash>` proxy nodes.
 6. Referenced model assets and, when enabled, `custom_nodes/` packages are mirrored into storage.
 7. The rewritten prompt is submitted to ComfyUI's normal execution queue.
@@ -165,7 +165,7 @@ CPU memory snapshots are enabled by default. GPU memory snapshots are also enabl
 
 Warm containers can reuse loaded model state, `PromptExecutor` state, remote session bridge values, and worker-local loader cache entries across compatible requests. The default Modal `scaledown_window` is `600` seconds with `min_containers=0`, so compute can scale down to zero between runs while still benefiting from warm reuse when capacity remains alive.
 
-Independent Modal-backed components can overlap through ComfyUI's async proxy path and the local Modal call executor. Each Modal GPU container handles one active workflow execution at a time, so parallel ready components can scale out across containers instead of multiplexing several active executions onto one worker. `COMFY_MODAL_MAX_INFLIGHT_CALLS` bounds local dispatch independently from the local CPU count and the remote autoscaler.
+Independent Modal-backed components can overlap through ComfyUI's async proxy path and the local Modal call executor. Large tensor and media edges are deliberately co-located first, so this parallelism is reserved for genuinely independent branches, inexpensive scalar boundaries, mapped execution, and graph shapes that require a split for correctness. Ordinary components with several remote execution targets remain one proxy unless a local re-entry dependency would create a scheduler cycle. Each Modal GPU container handles one active workflow execution at a time, so parallel ready components can scale out across containers instead of multiplexing several active executions onto one worker. `COMFY_MODAL_MAX_INFLIGHT_CALLS` bounds local dispatch independently from the local CPU count and the remote autoscaler.
 
 When a component output is consumed exclusively by other remote components, Modal-Sync keeps it remote. The producer returns a small durable bridge reference through the local ComfyUI proxy instead of returning the underlying `IMAGE`, `AUDIO`, `LATENT`, `MASK`, `SIGMAS`, `VIDEO`, or scalar value. A downstream remote component resolves that reference from the worker's warm bridge cache when possible, or restores it from shared Modal storage when Modal schedules the components on different containers. If any consumer is local, including an interim preview or final `SaveVideo`, the planner leaves that boundary materialized so the local node receives the ordinary ComfyUI value it expects.
 
