@@ -58,6 +58,8 @@ let modalLastAnimationRedrawAt = 0;
 let modalGlobalStatusElement = null;
 let modalVisibilityRefreshInFlight = null;
 let modalReplayedEventUpdatedAtMs = null;
+let vueNodeObserver = null;
+let vueNodeSyncScheduled = false;
 
 /**
  * Return whether a node should show the Modal toggle.
@@ -981,7 +983,7 @@ function refreshModalUiAfterVisibilityChange() {
   if (Array.from(modalNodeStates.values()).length > 0) {
     ensureAnimationLoop();
   }
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
   if (modalVisibilityRefreshInFlight) {
     return;
   }
@@ -996,7 +998,7 @@ function refreshModalUiAfterVisibilityChange() {
       if (Array.from(modalNodeStates.values()).length > 0) {
         ensureAnimationLoop();
       }
-      app.graph?.setDirtyCanvas(true, true);
+      refreshNodeDecorations();
     });
 }
 
@@ -1169,7 +1171,7 @@ function refreshCanvasAnimation(timestamp = performance.now()) {
     return;
   }
   if (timestamp - modalLastAnimationRedrawAt >= MODAL_ANIMATION_FRAME_INTERVAL_MS) {
-    app.graph?.setDirtyCanvas(true, true);
+    refreshNodeDecorations();
     modalLastAnimationRedrawAt = timestamp;
   }
   animationFrameHandle = requestAnimationFrame(refreshCanvasAnimation);
@@ -1218,7 +1220,7 @@ function scheduleNodeClear(nodeIdValue, promptId, delayMs) {
     modalNodeClearTimers.delete(nodeIdValue);
     stopAnimationLoopIfIdle();
     reconcilePromptGlobalStatus(promptId);
-    app.graph?.setDirtyCanvas(true, true);
+    refreshNodeDecorations();
   }, delayMs);
   modalNodeClearTimers.set(nodeIdValue, timerId);
 }
@@ -1278,7 +1280,7 @@ function setNodesPhase(nodeIds, phase, promptId, errorMessage) {
   if ([STATE_COMPLETE, STATE_FINALIZING, STATE_ERROR].includes(phase)) {
     reconcilePromptGlobalStatus(promptId);
   }
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -1644,7 +1646,7 @@ function clearFadedNodeProgress(progressNodeId, promptId, fadingStartedAt) {
 
   stopAnimationLoopIfIdle();
   reconcilePromptGlobalStatus(promptId);
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -1695,7 +1697,7 @@ function fadeNodeProgress(nodeIdValue, promptId) {
 
   if (fadedAnyProgress) {
     ensureAnimationLoop();
-    app.graph?.setDirtyCanvas(true, true);
+    refreshNodeDecorations();
   }
 }
 
@@ -1727,7 +1729,7 @@ function markNodeCached(nodeIdValue, promptId) {
     });
   }
   ensureAnimationLoop();
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -1771,7 +1773,7 @@ function setNodeBatchProgress(nodeIdValue, promptId, value, maxValue) {
     updatedAt: nowMs(),
   });
   ensureAnimationLoop();
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -1799,7 +1801,7 @@ function setNodeProgress(nodeIdValue, promptId, value, maxValue) {
   }
 
   ensureAnimationLoop();
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -1856,7 +1858,7 @@ function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, ite
   }
 
   ensureAnimationLoop();
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -1879,7 +1881,7 @@ function clearNodeProgressLane(nodeIdValue, promptId, laneId) {
   deleteNodeProgressLane(safeNodeIdValue, promptId, safeLaneId);
 
   stopAnimationLoopIfIdle();
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -2190,7 +2192,7 @@ function setAllEligibleWorkflowNodesRemote(value) {
     setRemoteFlag(node, value);
     appliedCount += 1;
   }
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
   const actionLabel = value ? "Enabled" : "Disabled";
   notifyModal(
     appliedCount > 0
@@ -2227,7 +2229,7 @@ async function analyzeAndSetUpstreamRemoteNodes(node, value) {
   const resolvedWorkflowNodePaths = result.resolved_workflow_node_paths ?? [];
   const addedWorkflowNodePaths = result.added_workflow_node_paths ?? [];
   const appliedCount = setWorkflowNodePathsRemote(resolvedWorkflowNodePaths, value);
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 
   if (!value) {
     notifyModal(
@@ -2376,7 +2378,7 @@ function setRemoteFlag(node, value) {
   if (node.__modalToggleWidget) {
     node.__modalToggleWidget.value = enabled;
   }
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -2478,6 +2480,259 @@ function isNodeInActiveComponent(promptId, nodeIdValue) {
 }
 
 /**
+ * Return preparation-phase colors for one remote visual state.
+ * @param {Record<string, any> | null} state
+ * @param {number} elapsed
+ * @returns {{ borderColor: string, shadowColor: string, fillColor: string | null } | null}
+ */
+function remotePreparationPalette(state, elapsed) {
+  let borderColor;
+  let shadowColor;
+  let fillColor = null;
+
+  if (state?.phase === STATE_SETUP) {
+    const pulse = (Math.sin(elapsed * 5) + 1) / 2;
+    borderColor = `${SETUP_BORDER_COLOR}${Math.round((0.65 + pulse * 0.35) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(245, 158, 11, ${0.25 + pulse * 0.35})`;
+  } else if (state?.phase === STATE_STARTING) {
+    const pulse = (Math.sin(elapsed * 8) + 1) / 2;
+    borderColor = `${STARTING_BORDER_COLOR}${Math.round((0.58 + pulse * 0.42) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(234, 179, 8, ${0.2 + pulse * 0.42})`;
+    fillColor = `rgba(250, 204, 21, ${0.08 + pulse * 0.08})`;
+  } else if (state?.phase === STATE_READY) {
+    const pulseRate = state?.isCachedRemoteNode ? 2 : 6;
+    const pulse = (Math.sin(elapsed * pulseRate) + 1) / 2;
+    borderColor = state?.isActiveComponentMember
+      ? READY_ACTIVE_COMPONENT_BORDER_COLOR
+      : READY_INACTIVE_COMPONENT_BORDER_COLOR;
+    shadowColor = state?.isActiveComponentMember
+      ? `rgba(34, 197, 94, ${0.24 + pulse * 0.18})`
+      : `rgba(22, 101, 52, ${0.18 + pulse * 0.12})`;
+    fillColor = state?.isActiveComponentMember
+      ? `rgba(134, 239, 172, ${0.1 + pulse * 0.07})`
+      : `rgba(74, 222, 128, ${0.06 + pulse * 0.04})`;
+  } else {
+    return null;
+  }
+
+  return { borderColor, shadowColor, fillColor };
+}
+
+/**
+ * Return execution-phase colors for one remote visual state.
+ * @param {Record<string, any> | null} state
+ * @param {number} elapsed
+ * @returns {{ borderColor: string, shadowColor: string, fillColor: string | null } | null}
+ */
+function remoteExecutionPalette(state, elapsed) {
+  let borderColor;
+  let shadowColor;
+  let fillColor = null;
+
+  if (state?.phase === STATE_ACTIVE) {
+    const pulse = (Math.sin(elapsed * 7) + 1) / 2;
+    borderColor = `${ACTIVE_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(168, 85, 247, ${0.28 + pulse * 0.32})`;
+    fillColor = `rgba(216, 180, 254, ${0.16 + pulse * 0.1})`;
+  } else if (state?.phase === STATE_COMPLETE) {
+    borderColor = COMPLETE_BORDER_COLOR;
+    shadowColor = "rgba(0, 79, 164, 0.28)";
+    fillColor = `${COMPLETE_FILL_COLOR}33`;
+  } else if (state?.phase === STATE_FINALIZING) {
+    const pulse = (Math.sin(elapsed * 5) + 1) / 2;
+    borderColor = FINALIZING_NODE_BORDER_COLOR;
+    shadowColor = `rgba(0, 53, 138, ${0.2 + pulse * 0.26})`;
+    fillColor = `${COMPLETE_FILL_COLOR}${Math.round((0.16 + pulse * 0.1) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+  } else if (state?.phase === STATE_CANCELLING) {
+    const pulse = (Math.sin(elapsed * 9) + 1) / 2;
+    borderColor = `${CANCELLING_BORDER_COLOR}${Math.round((0.64 + pulse * 0.36) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(251, 113, 133, ${0.24 + pulse * 0.36})`;
+    fillColor = `rgba(251, 113, 133, ${0.1 + pulse * 0.08})`;
+  } else if (state?.phase === STATE_ERROR) {
+    const pulse = (Math.sin(elapsed * 6) + 1) / 2;
+    borderColor = `${ERROR_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
+      .toString(16)
+      .padStart(2, "0")}`;
+    shadowColor = `rgba(239, 68, 68, ${0.22 + pulse * 0.28})`;
+  } else {
+    return null;
+  }
+
+  return { borderColor, shadowColor, fillColor };
+}
+
+/**
+ * Return the border, glow, and fill colors for one remote visual state.
+ * @param {Record<string, any> | null} state
+ * @param {number} elapsed
+ * @returns {{ borderColor: string, shadowColor: string, fillColor: string | null }}
+ */
+function remoteDecorationPalette(state, elapsed) {
+  return (
+    remotePreparationPalette(state, elapsed) ??
+    remoteExecutionPalette(state, elapsed) ?? {
+      borderColor: IDLE_BORDER_COLOR,
+      shadowColor: "rgba(29, 155, 240, 0.35)",
+      fillColor: null,
+    }
+  );
+}
+
+/**
+ * Return the visible LiteGraph node matching a Nodes 2.0 DOM element.
+ * @param {HTMLElement} nodeElement
+ * @returns {LGraphNode | null}
+ */
+function vueNodeForElement(nodeElement) {
+  const graph = app.canvas?.graph;
+  const graphNodes = graph?.nodes ?? graph?._nodes ?? [];
+  const elementNodeId = String(nodeElement.dataset.nodeId ?? "");
+  return graphNodes.find((node) => nodeId(node) === elementNodeId) ?? null;
+}
+
+/**
+ * Remove Modal's Nodes 2.0 decoration from one DOM node.
+ * @param {HTMLElement} nodeElement
+ */
+function clearVueNodeDecoration(nodeElement) {
+  nodeElement.classList.remove("comfy-modal-vue-node");
+  delete nodeElement.dataset.modalPhase;
+  nodeElement.querySelector(":scope > .comfy-modal-vue-node-decoration")?.remove();
+}
+
+/**
+ * Return the decoration element for one Nodes 2.0 node, creating it when needed.
+ * @param {HTMLElement} nodeElement
+ * @returns {HTMLDivElement}
+ */
+function ensureVueNodeDecoration(nodeElement) {
+  let decoration = nodeElement.querySelector(":scope > .comfy-modal-vue-node-decoration");
+  if (decoration) {
+    return decoration;
+  }
+  decoration = document.createElement("div");
+  decoration.className = "comfy-modal-vue-node-decoration";
+  decoration.setAttribute("aria-hidden", "true");
+  const badge = document.createElement("span");
+  badge.className = "comfy-modal-vue-node-badge";
+  decoration.appendChild(badge);
+  nodeElement.appendChild(decoration);
+  return decoration;
+}
+
+/**
+ * Apply Modal's current visual state to one Nodes 2.0 DOM node.
+ * @param {HTMLElement} nodeElement
+ * @param {LGraphNode} node
+ * @param {number} timestamp
+ */
+function updateVueNodeDecoration(nodeElement, node, timestamp) {
+  if (!isRemoteNode(node)) {
+    clearVueNodeDecoration(nodeElement);
+    return;
+  }
+  const state = getRemoteVisualState(node);
+  const palette = remoteDecorationPalette(state, timestamp / 1000);
+  const decoration = ensureVueNodeDecoration(nodeElement);
+  const innerWrapper = nodeElement.querySelector(':scope > [data-testid="node-inner-wrapper"]');
+  const borderRadius =
+    innerWrapper && typeof getComputedStyle === "function"
+      ? getComputedStyle(innerWrapper).borderRadius
+      : "12px";
+  decoration.style.borderColor = palette.borderColor;
+  decoration.style.backgroundColor = palette.fillColor ?? "transparent";
+  decoration.style.borderRadius = borderRadius || "12px";
+  decoration.style.boxShadow = `0 0 8px ${palette.shadowColor}`;
+  const phase = state?.phase ?? "idle";
+  nodeElement.classList.add("comfy-modal-vue-node");
+  nodeElement.dataset.modalPhase = phase;
+  const badge = decoration.querySelector(".comfy-modal-vue-node-badge");
+  badge.textContent = String(state?.componentLabel ?? "");
+  badge.hidden = !state?.componentLabel;
+  badge.style.borderColor = palette.borderColor;
+  badge.style.boxShadow = `0 0 8px ${palette.shadowColor}`;
+}
+
+/**
+ * Synchronize Modal decorations onto all currently rendered Nodes 2.0 nodes.
+ * @param {number | undefined} timestamp
+ */
+function syncVueNodeDecorations(timestamp = performance.now()) {
+  if (typeof document === "undefined") {
+    return;
+  }
+  for (const nodeElement of document.querySelectorAll(".lg-node[data-node-id]")) {
+    const node = vueNodeForElement(nodeElement);
+    if (node) {
+      updateVueNodeDecoration(nodeElement, node, timestamp);
+    } else {
+      clearVueNodeDecoration(nodeElement);
+    }
+  }
+}
+
+/**
+ * Schedule one Nodes 2.0 DOM synchronization after Vue has rendered.
+ */
+function queueVueNodeDecorationSync() {
+  if (typeof document === "undefined" || vueNodeSyncScheduled) {
+    return;
+  }
+  vueNodeSyncScheduled = true;
+  const callback = (timestamp) => {
+    vueNodeSyncScheduled = false;
+    syncVueNodeDecorations(timestamp);
+  };
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(callback);
+  } else {
+    setTimeout(() => callback(performance.now()), 0);
+  }
+}
+
+/**
+ * Redraw both the legacy canvas and the Nodes 2.0 DOM layer.
+ */
+function refreshNodeDecorations() {
+  app.graph?.setDirtyCanvas(true, true);
+  queueVueNodeDecorationSync();
+}
+
+/**
+ * Watch for Vue nodes mounted after workflow loads or renderer switches.
+ */
+function installVueNodeDecorationObserver() {
+  if (vueNodeObserver || typeof MutationObserver === "undefined" || !document.body) {
+    return;
+  }
+  vueNodeObserver = new MutationObserver((records) => {
+    const addedVueNode = records.some((record) =>
+      Array.from(record.addedNodes).some(
+        (addedNode) =>
+          addedNode.nodeType === 1 &&
+          (addedNode.matches?.(".lg-node[data-node-id]") ||
+            addedNode.querySelector?.(".lg-node[data-node-id]")),
+      ),
+    );
+    if (addedVueNode) {
+      queueVueNodeDecorationSync();
+    }
+  });
+  vueNodeObserver.observe(document.body, { childList: true, subtree: true });
+  queueVueNodeDecorationSync();
+}
+
+/**
  * Trace one rounded-rectangle path, using the native canvas helper when available.
  * @param {CanvasRenderingContext2D} ctx
  * @param {number} x
@@ -2521,68 +2776,7 @@ function drawRemoteNodeDecoration(node, ctx) {
   const borderWidth = 3 / scale;
   const cornerRadius = 12 / scale;
   const elapsed = performance.now() / 1000;
-
-  let borderColor = IDLE_BORDER_COLOR;
-  let shadowColor = "rgba(29, 155, 240, 0.35)";
-  let fillColor = null;
-
-  if (state?.phase === STATE_SETUP) {
-    const pulse = (Math.sin(elapsed * 5) + 1) / 2;
-    borderColor = `${SETUP_BORDER_COLOR}${Math.round((0.65 + pulse * 0.35) * 255)
-      .toString(16)
-      .padStart(2, "0")}`;
-    shadowColor = `rgba(245, 158, 11, ${0.25 + pulse * 0.35})`;
-  } else if (state?.phase === STATE_STARTING) {
-    const pulse = (Math.sin(elapsed * 8) + 1) / 2;
-    borderColor = `${STARTING_BORDER_COLOR}${Math.round((0.58 + pulse * 0.42) * 255)
-      .toString(16)
-      .padStart(2, "0")}`;
-    shadowColor = `rgba(234, 179, 8, ${0.2 + pulse * 0.42})`;
-    fillColor = `rgba(250, 204, 21, ${0.08 + pulse * 0.08})`;
-  } else if (state?.phase === STATE_READY) {
-    const pulseRate = state?.isCachedRemoteNode ? 2 : 6;
-    const pulse = (Math.sin(elapsed * pulseRate) + 1) / 2;
-    borderColor = state?.isActiveComponentMember
-      ? READY_ACTIVE_COMPONENT_BORDER_COLOR
-      : READY_INACTIVE_COMPONENT_BORDER_COLOR;
-    shadowColor = state?.isActiveComponentMember
-      ? `rgba(34, 197, 94, ${0.24 + pulse * 0.18})`
-      : `rgba(22, 101, 52, ${0.18 + pulse * 0.12})`;
-    fillColor = state?.isActiveComponentMember
-      ? `rgba(134, 239, 172, ${0.1 + pulse * 0.07})`
-      : `rgba(74, 222, 128, ${0.06 + pulse * 0.04})`;
-  } else if (state?.phase === STATE_ACTIVE) {
-    const pulse = (Math.sin(elapsed * 7) + 1) / 2;
-    borderColor = `${ACTIVE_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
-      .toString(16)
-      .padStart(2, "0")}`;
-    shadowColor = `rgba(168, 85, 247, ${0.28 + pulse * 0.32})`;
-    fillColor = `rgba(216, 180, 254, ${0.16 + pulse * 0.1})`;
-  } else if (state?.phase === STATE_COMPLETE) {
-    borderColor = COMPLETE_BORDER_COLOR;
-    shadowColor = "rgba(0, 79, 164, 0.28)";
-    fillColor = `${COMPLETE_FILL_COLOR}33`;
-  } else if (state?.phase === STATE_FINALIZING) {
-    const pulse = (Math.sin(elapsed * 5) + 1) / 2;
-    borderColor = FINALIZING_NODE_BORDER_COLOR;
-    shadowColor = `rgba(0, 53, 138, ${0.2 + pulse * 0.26})`;
-    fillColor = `${COMPLETE_FILL_COLOR}${Math.round((0.16 + pulse * 0.1) * 255)
-      .toString(16)
-      .padStart(2, "0")}`;
-  } else if (state?.phase === STATE_CANCELLING) {
-    const pulse = (Math.sin(elapsed * 9) + 1) / 2;
-    borderColor = `${CANCELLING_BORDER_COLOR}${Math.round((0.64 + pulse * 0.36) * 255)
-      .toString(16)
-      .padStart(2, "0")}`;
-    shadowColor = `rgba(251, 113, 133, ${0.24 + pulse * 0.36})`;
-    fillColor = `rgba(251, 113, 133, ${0.1 + pulse * 0.08})`;
-  } else if (state?.phase === STATE_ERROR) {
-    const pulse = (Math.sin(elapsed * 6) + 1) / 2;
-    borderColor = `${ERROR_BORDER_COLOR}${Math.round((0.7 + pulse * 0.3) * 255)
-      .toString(16)
-      .padStart(2, "0")}`;
-    shadowColor = `rgba(239, 68, 68, ${0.22 + pulse * 0.28})`;
-  }
+  const { borderColor, shadowColor, fillColor } = remoteDecorationPalette(state, elapsed);
 
   ctx.save();
   if (fillColor) {
@@ -2808,6 +3002,7 @@ function decorateNode(node) {
     originalDrawForeground?.apply(this, arguments);
     drawRemoteNodeDecoration(this, ctx);
   };
+  queueVueNodeDecorationSync();
 }
 
 /**
@@ -3161,7 +3356,7 @@ function clearPromptRemoteStates(promptId) {
     pruneGlobalStatusStates();
     refreshGlobalStatusElement();
     stopAnimationLoopIfIdle();
-    app.graph?.setDirtyCanvas(true, true);
+    refreshNodeDecorations();
     return;
   }
   clearPromptProgressStates(promptId);
@@ -3188,7 +3383,7 @@ function clearPromptRemoteStates(promptId) {
   pruneGlobalStatusStates();
   refreshGlobalStatusElement();
   stopAnimationLoopIfIdle();
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -3222,7 +3417,7 @@ function clearPromptRemoteNodeVisuals(promptId) {
   }
   setPromptActiveNode(promptId, null);
   stopAnimationLoopIfIdle();
-  app.graph?.setDirtyCanvas(true, true);
+  refreshNodeDecorations();
 }
 
 /**
@@ -3485,6 +3680,35 @@ function installGlobalStatusStyles() {
       50% { transform: scale(1.08); opacity: 1; }
       100% { transform: scale(0.9); opacity: 0.7; }
     }
+
+    .comfy-modal-vue-node-decoration {
+      position: absolute;
+      inset: -3px;
+      z-index: 30;
+      box-sizing: border-box;
+      border: 3px solid transparent;
+      pointer-events: none;
+    }
+
+    .comfy-modal-vue-node-badge {
+      position: absolute;
+      top: 7px;
+      left: 7px;
+      display: grid;
+      width: 20px;
+      height: 20px;
+      place-items: center;
+      box-sizing: border-box;
+      border: 1.5px solid transparent;
+      border-radius: 9999px;
+      background: rgba(15, 23, 42, 0.92);
+      color: #f8fafc;
+      font: 10px/1 ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .comfy-modal-vue-node-badge[hidden] {
+      display: none;
+    }
   `;
   document.head.appendChild(style);
 }
@@ -3494,6 +3718,7 @@ app.registerExtension({
 
   async init() {
     installGlobalStatusStyles();
+    installVueNodeDecorationObserver();
     patchInterruptFeedback();
     patchQueuePrompt();
     registerExecutionListeners();
