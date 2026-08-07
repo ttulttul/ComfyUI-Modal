@@ -139,6 +139,41 @@ def test_remote_modal_uses_distinct_ready_active_and_complete_colors() -> None:
     assert "setNodesPhase(nodeIds, STATE_FINALIZING, promptId);" in source
 
 
+def test_nodes_2_0_dom_nodes_receive_remote_state_decorations() -> None:
+    """Nodes 2.0 should receive the same Modal palette as legacy nodes."""
+    source = _modal_toggle_source()
+
+    assert "function remoteDecorationPalette(state, elapsed)" in source
+    assert "function syncVueNodeDecorations(timestamp = performance.now())" in source
+    assert 'document.querySelectorAll(".lg-node[data-node-id]")' in source
+    assert 'nodeElement.dataset.modalPhase = phase;' in source
+    assert 'decoration.style.borderColor = palette.borderColor;' in source
+    assert (
+        'decoration.style.backgroundColor = palette.fillColor ?? "transparent";'
+        in source
+    )
+    assert 'decoration.style.boxShadow = `0 0 8px ${palette.shadowColor}`;' in source
+    assert 'decoration.className = "comfy-modal-vue-node-decoration";' in source
+    assert 'badge.className = "comfy-modal-vue-node-badge";' in source
+
+
+def test_nodes_2_0_decorations_follow_vue_mounts_and_visual_refreshes() -> None:
+    """Late Vue mounts and visual refreshes should resynchronize DOM nodes."""
+    source = _modal_toggle_source()
+
+    assert "function installVueNodeDecorationObserver()" in source
+    assert "vueNodeObserver = new MutationObserver((records) => {" in source
+    assert 'addedNode.matches?.(".lg-node[data-node-id]")' in source
+    assert (
+        "vueNodeObserver.observe(document.body, { childList: true, subtree: true });"
+        in source
+    )
+    assert "function refreshNodeDecorations()" in source
+    assert "queueVueNodeDecorationSync();" in source
+    assert "installVueNodeDecorationObserver();" in source
+    assert source.count("app.graph?.setDirtyCanvas(true, true);") == 1
+
+
 def test_cancel_click_shows_immediate_modal_cancelling_feedback() -> None:
     """Cancel should paint Modal prompts as cancelling before backend cleanup finishes."""
     source = _modal_toggle_source()
