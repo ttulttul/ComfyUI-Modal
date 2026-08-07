@@ -9,7 +9,7 @@ ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts
 
 Modal-Sync provides:
 
-- a ComfyUI frontend extension with a `Run on Modal` toggle and remote execution overlays
+- a ComfyUI frontend extension with a `Run on Modal` toggle, workflow-level GPU selection, and remote execution overlays
 - a queue route at `/modal/queue_prompt` that intercepts normal prompt submission
 - queue-time graph partitioning and proxy-node rewrite for selected remote regions
 - local in-process execution mode for development and tests
@@ -76,7 +76,7 @@ To mark a remote region:
 
 The toggle stores `properties.is_modal_remote = true` in workflow metadata. The editor graph is not rewritten when you toggle a node; rewrite happens only when the prompt is queued.
 
-The node context menu includes a `Modal` submenu for bulk changes. `Enable on Upstream Nodes` asks the backend which extra upstream nodes must join the selected remote island when a boundary would otherwise contain local-only runtime objects. `Disable on Upstream Nodes`, `Enable All Nodes`, and `Disable All Nodes` apply the corresponding marker changes to the current graph or selection.
+The node context menu includes a `Modal` submenu for bulk changes. Its `GPU` submenu lists Modal's supported single-GPU targets and marks the current workflow selection. The choice is saved as `workflow.extra.comfy_modal.gpu`, so it follows the graph when the workflow is saved, shared, and loaded again. `Enable on Upstream Nodes` asks the backend which extra upstream nodes must join the selected remote island when a boundary would otherwise contain local-only runtime objects. `Disable on Upstream Nodes`, `Enable All Nodes`, and `Disable All Nodes` apply the corresponding marker changes to the current graph or selection.
 
 ### Canvas State
 
@@ -159,9 +159,9 @@ If a rewritten graph could create a local scheduler cycle, Modal-Sync logs compa
 
 Remote mode prefers a persistent deployed Modal app over ephemeral `app.run()` execution. First-run auto-deploy is enabled by default and can replace missing, stale, unversioned, or protocol-incompatible deployed apps. The extension does not create a persistent web endpoint.
 
-Modal hardware is fixed at deploy time. If you change `COMFY_MODAL_GPU`, stop/delete the existing Modal app or redeploy it so the remote class is built with the new GPU type. If you upgrade this node pack and expect changed remote behavior, redeploy once so the Modal app picks up the new code and class options.
+Modal hardware is fixed at deploy time. Choose the target from `Modal` → `GPU`; the next remote run compares that workflow selection with the deployed runtime fingerprint and automatically rebuilds the configured Modal app when the GPU differs. Because one configured app name is reused, switching between workflows with different GPU selections rebuilds that app for the newly requested target. If you upgrade this node pack and expect changed remote behavior, redeploy once so the Modal app picks up the new code and class options.
 
-The Modal image selects its pinned PyTorch wheel set from `COMFY_MODAL_GPU`. `B300` and `B200+` configurations use the CUDA 13.2 PyTorch and TorchVision wheels because Modal requires CUDA 13.1 or newer whenever a worker can be assigned a B300. Their TorchAudio layer uses the official CPU-only wheel with `--no-deps`; installing the ordinary PyPI wheel would add a CUDA 13.0 TorchAudio extension beside CUDA 13.2 PyTorch and make every GPU-snapshot container fail during import. ComfyUI's TorchAudio transforms continue to operate on Torch tensors, including CUDA tensors, without a TorchAudio CUDA extension. Other supported GPU types retain the complete CUDA 12.8 wheel set. Count suffixes such as `B300:2` are normalized before selection, and every ordered package layer is logged and recorded in the runtime fingerprint. The image build imports Torch, TorchVision, and TorchAudio and verifies `torch.version.cuda` before Modal deploys the app, so incompatible layers fail once during image construction instead of crash-looping snapshot workers.
+The Modal image selects its pinned PyTorch wheel set from the workflow GPU target (or the `COMFY_MODAL_GPU` compatibility fallback). `B300` and `B200+` configurations use the CUDA 13.2 PyTorch and TorchVision wheels because Modal requires CUDA 13.1 or newer whenever a worker can be assigned a B300. Their TorchAudio layer uses the official CPU-only wheel with `--no-deps`; installing the ordinary PyPI wheel would add a CUDA 13.0 TorchAudio extension beside CUDA 13.2 PyTorch and make every GPU-snapshot container fail during import. ComfyUI's TorchAudio transforms continue to operate on Torch tensors, including CUDA tensors, without a TorchAudio CUDA extension. Other supported GPU types retain the complete CUDA 12.8 wheel set. Count suffixes such as `B300:2` remain supported through the environment fallback and are normalized before build selection; the workflow menu intentionally targets one GPU. Every ordered package layer is logged and recorded in the runtime fingerprint. The image build imports Torch, TorchVision, and TorchAudio and verifies `torch.version.cuda` before Modal deploys the app, so incompatible layers fail once during image construction instead of crash-looping snapshot workers.
 
 CPU memory snapshots are enabled by default. GPU memory snapshots are also enabled by default in current settings, but useful GPU snapshot work is limited to stable loader profiles derived from root literal model-loader nodes. Generic no-profile workers skip GPU snapshot prewarm because they do not provide the model-loaded cold-start win.
 
@@ -263,7 +263,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `COMFY_MODAL_GPU` | `A100` | Modal GPU type requested by the deployed remote class; also selects its compatible pinned PyTorch CUDA wheel set. |
+| `COMFY_MODAL_GPU` | `A100` | Compatibility fallback for workflows or API clients without `workflow.extra.comfy_modal.gpu`. The context-menu workflow selection is authoritative for normal UI runs and also selects the compatible pinned PyTorch CUDA wheel set. |
 | `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT` | `true` | Enable Modal CPU memory snapshots. |
 | `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT` | `true` | Enable Modal GPU memory snapshots for profiled loader states. |
 | `COMFY_MODAL_SCALEDOWN_WINDOW` | `600` | Seconds to keep idle Modal containers warm. |
@@ -290,7 +290,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 ## Troubleshooting
 
 - App not found or deleted: leave `COMFY_MODAL_AUTO_DEPLOY=true` so the next lookup can deploy the stable cloud entrypoint again.
-- Changed `COMFY_MODAL_GPU`: delete or stop the old Modal app before redeploying; hardware is fixed at deploy time.
+- Changed the workflow GPU: queue the next remote run and Modal-Sync will rebuild the configured app if its deployed runtime targets a different GPU.
 - Remote mode still uses local mirror storage: restart ComfyUI with `COMFY_MODAL_EXECUTION_MODE=remote` and the Modal SDK available so sync and invocation resolve the same mode.
 - Missing custom node class in Modal: ensure custom-node sync is enabled, check the worker logs for import failures, and confirm the package's Python dependencies are present in its `requirements.txt`.
 - `UNETLoader` reports `Could not detect model type` for a synced Flux-style model: Modal-Sync aliases saved RMSNorm `.weight` keys to ComfyUI's `.scale` key form in memory before remote model detection, but the model still has to be supported by the ComfyUI checkout packaged into the Modal app.

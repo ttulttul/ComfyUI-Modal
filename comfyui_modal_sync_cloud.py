@@ -304,7 +304,8 @@ def _existing_modal_app_error_message(app_name: str) -> str:
     """Return the user-facing error for refusing to overwrite a Modal app."""
     return (
         f"Modal app {app_name!r} already exists. Delete the existing app before launching "
-        "ComfyUI-Modal with this configuration, especially after changing COMFY_MODAL_GPU, "
+        "ComfyUI-Modal with this configuration, especially after changing the workflow GPU "
+        "target or the COMFY_MODAL_GPU compatibility fallback, "
         f"for example: modal app stop {app_name!r}."
     )
 
@@ -6524,7 +6525,8 @@ def _install_remote_torch_build(image: Any, torch_build: _RemoteTorchBuild) -> A
 
 
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
-    settings = get_settings()
+    settings = globals().get("__comfy_modal_settings_override__") or get_settings()
+    __comfy_modal_gpu__ = settings.modal_gpu
     _guard_against_existing_modal_app(settings, modal)
     app = modal.App(settings.app_name)
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)

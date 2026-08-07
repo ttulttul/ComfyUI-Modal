@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -23,6 +23,25 @@ else:  # pragma: no cover - the stable cloud entrypoint imports this module top-
     )
 
 logger = logging.getLogger(__name__)
+
+MODAL_GPU_TYPES = (
+    "T4",
+    "L4",
+    "A10",
+    "L40S",
+    "A100",
+    "A100-40GB",
+    "A100-80GB",
+    "RTX-PRO-6000",
+    "H100",
+    "H100!",
+    "H200",
+    "B200",
+    "B200+",
+    "B300",
+)
+WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal"
+WORKFLOW_MODAL_GPU_KEY = "gpu"
 
 _SETTINGS_ENV_KEYS = (
     "COMFYUI_ROOT",
@@ -115,6 +134,44 @@ class ModalSyncSettings:
     remote_cancel_restart_seconds: float = 1.0
     stream_event_queue_maxsize: int = 256
     stream_remote_container_logs: bool = False
+
+
+def normalize_modal_gpu_selection(value: object) -> str:
+    """Return one supported workflow-level Modal GPU selection."""
+    if not isinstance(value, str):
+        raise ValueError("The workflow Modal GPU selection must be a string.")
+    normalized = value.strip().upper()
+    if normalized not in MODAL_GPU_TYPES:
+        supported_values = ", ".join(MODAL_GPU_TYPES)
+        raise ValueError(
+            f"Unsupported workflow Modal GPU selection {value!r}. "
+            f"Choose one of: {supported_values}."
+        )
+    return normalized
+
+
+def modal_gpu_from_workflow(
+    workflow: object,
+    default_gpu: str,
+) -> str:
+    """Resolve the saved workflow GPU selection or return the configured fallback."""
+    if not isinstance(workflow, dict):
+        return default_gpu
+    extra = workflow.get("extra")
+    if not isinstance(extra, dict):
+        return default_gpu
+    modal_config = extra.get(WORKFLOW_MODAL_CONFIG_KEY)
+    if not isinstance(modal_config, dict) or WORKFLOW_MODAL_GPU_KEY not in modal_config:
+        return default_gpu
+    return normalize_modal_gpu_selection(modal_config[WORKFLOW_MODAL_GPU_KEY])
+
+
+def settings_for_modal_gpu(
+    settings: ModalSyncSettings,
+    modal_gpu: object,
+) -> ModalSyncSettings:
+    """Return settings with one validated workflow-level GPU override."""
+    return replace(settings, modal_gpu=normalize_modal_gpu_selection(modal_gpu))
 
 
 def _read_path_env(name: str) -> Path | None:

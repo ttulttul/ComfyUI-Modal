@@ -1190,6 +1190,7 @@ def test_build_prompt_warmup_request_includes_root_loader_prewarm_plans(
             {
                 "prompt_id": "prompt-1",
                 "component_id": "component-1",
+                "modal_gpu": "B300",
                 "subgraph_prompt": {
                     "1": {
                         "class_type": "UNETLoader",
@@ -1218,6 +1219,7 @@ def test_build_prompt_warmup_request_includes_root_loader_prewarm_plans(
         remote_modal_app_module.get_settings.cache_clear()
 
     loader_plans = warmup_request["loader_prewarm_plans"]
+    assert warmup_request["modal_gpu"] == "B300"
     assert [plan["node_id"] for plan in loader_plans] == ["1", "2", "3"]
     assert [plan["class_type"] for plan in loader_plans] == ["UNETLoader", "CLIPLoader", "DualCLIPLoader"]
     assert all(plan["execute_node_ids"] == [plan["node_id"]] for plan in loader_plans)
@@ -5093,6 +5095,23 @@ def test_remote_modal_rejects_fingerprint_mismatch_when_auto_deploy_is_disabled(
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
 
+def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
+    remote_modal_app_module: Any,
+) -> None:
+    """Each workflow GPU target should select a distinct deploy-time runtime identity."""
+    a100_fingerprint = remote_modal_app_module._expected_remote_runtime_fingerprint(
+        {"modal_gpu": "A100"}
+    )
+    b300_fingerprint = remote_modal_app_module._expected_remote_runtime_fingerprint(
+        {"modal_gpu": "B300"}
+    )
+
+    assert a100_fingerprint != b300_fingerprint
+    assert remote_modal_app_module._settings_for_payload(
+        {"modal_gpu": "L40S"}
+    ).modal_gpu == "L40S"
+
+
 def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -5597,6 +5616,55 @@ def test_load_modal_cloud_module_reloads_stale_partial_module(
 
     assert reloaded_module is not stale_module
     assert getattr(reloaded_module, "app", None) == "fresh-app"
+
+
+def test_load_modal_cloud_module_reloads_for_workflow_gpu_change(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Cloud app construction should receive the workflow-selected GPU settings."""
+    module_name = remote_modal_app_module._MODAL_CLOUD_MODULE_NAME
+    original_module = sys.modules.get(module_name)
+    sys.modules[module_name] = types.SimpleNamespace(
+        app="a100-app",
+        __comfy_modal_gpu__="A100",
+    )
+    observed_gpu_values: list[str] = []
+
+    class FakeLoader:
+        """Populate a replacement cloud module from its injected settings."""
+
+        def create_module(self, spec: Any) -> None:
+            """Use the default module creation path."""
+            del spec
+            return None
+
+        def exec_module(self, module: Any) -> None:
+            """Capture the settings override and expose a deployable app."""
+            settings_override = module.__comfy_modal_settings_override__
+            observed_gpu_values.append(settings_override.modal_gpu)
+            module.app = "b300-app"
+
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: importlib.util.spec_from_loader(module_name, FakeLoader()),
+    )
+    settings = remote_modal_app_module.settings_for_modal_gpu(
+        remote_modal_app_module.get_settings(),
+        "B300",
+    )
+    try:
+        with remote_modal_app_module._modal_cloud_settings_override(settings):
+            reloaded_module = remote_modal_app_module._load_modal_cloud_module()
+    finally:
+        sys.modules.pop(module_name, None)
+        if original_module is not None:
+            sys.modules[module_name] = original_module
+
+    assert observed_gpu_values == ["B300"]
+    assert reloaded_module.app == "b300-app"
+    assert reloaded_module.__comfy_modal_gpu__ == "B300"
 
 
 def test_remote_modal_installs_cloud_exception_compatibility_module(

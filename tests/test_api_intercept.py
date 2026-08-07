@@ -568,6 +568,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
                 "extra_data": {
                     "extra_pnginfo": {
                         "workflow": {
+                            "extra": {"comfy_modal": {"gpu": "B300"}},
                             "nodes": [
                                 {
                                     "id": 1,
@@ -624,6 +625,13 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
         estimated_max_parallel_requests=1,
         max_parallel_requests_upper_bound=1,
     )
+    observed_rewrite_settings: list[Any] = []
+
+    def capture_rewrite_settings(**kwargs: Any) -> tuple[dict[str, Any], Any]:
+        """Capture the workflow-derived settings passed into prompt rewriting."""
+        observed_rewrite_settings.append(kwargs["settings"])
+        return kwargs["prompt"], summary
+
     monkeypatch.setattr(api_intercept_module, "_ROUTE_REGISTERED", False)
     monkeypatch.setattr(
         api_intercept_module,
@@ -635,7 +643,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     monkeypatch.setattr(
         api_intercept_module,
         "rewrite_prompt_for_modal",
-        lambda **kwargs: (kwargs["prompt"], summary),
+        capture_rewrite_settings,
     )
     monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", fail_queue_time_warmup)
 
@@ -649,6 +657,9 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     response_payload = json.loads(response.text)
     assert response_payload["prompt_id"] == "prompt-queue-warmup"
     assert response_payload["modal_remote_node_ids"] == ["1"]
+    assert observed_rewrite_settings[0].modal_gpu == "B300"
+    queued_extra_data = prompt_server.prompt_queue.items[0][3]
+    assert queued_extra_data["modal"]["gpu"] == "B300"
     assert len(prompt_server.prompt_queue.items) == 1
 
 
@@ -2512,6 +2523,7 @@ def test_rewrite_stamps_snapshot_profile_on_split_static_and_mapped_payloads(
         custom_nodes_archive_name="custom_nodes_bundle.zip",
         comfyui_root=None,
         custom_nodes_dir=tmp_path / "custom_nodes",
+        modal_gpu="L40S",
     )
     sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
     fake_nodes_module = type(
@@ -2597,6 +2609,8 @@ def test_rewrite_stamps_snapshot_profile_on_split_static_and_mapped_payloads(
 
     assert static_payload["snapshot_profile_key"].startswith("loader-profile:")
     assert mapped_payload["snapshot_profile_key"] == static_payload["snapshot_profile_key"]
+    assert static_payload["modal_gpu"] == "L40S"
+    assert mapped_payload["modal_gpu"] == "L40S"
 
 
 def test_rewrite_keeps_unmapped_remote_siblings_without_local_reentry_together(

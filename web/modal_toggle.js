@@ -10,6 +10,25 @@ const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delet
 const COMFY_QUEUE_ROUTE = "/queue";
 const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
+const WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal";
+const WORKFLOW_MODAL_GPU_KEY = "gpu";
+const DEFAULT_MODAL_GPU = "A100";
+const MODAL_GPU_TYPES = [
+  "T4",
+  "L4",
+  "A10",
+  "L40S",
+  "A100",
+  "A100-40GB",
+  "A100-80GB",
+  "RTX-PRO-6000",
+  "H100",
+  "H100!",
+  "H200",
+  "B200",
+  "B200+",
+  "B300",
+];
 
 const IDLE_BORDER_COLOR = "#1d9bf0";
 const SETUP_BORDER_COLOR = "#f59e0b";
@@ -1955,6 +1974,61 @@ function rootGraph() {
 }
 
 /**
+ * Return the workflow-level Modal GPU selection, installing the default when absent.
+ * @param {object | null | undefined} workflow
+ * @returns {string}
+ */
+function selectedModalGpu(workflow = null) {
+  const workflowContainer = workflow ?? rootGraph();
+  const savedGpu = workflowContainer?.extra?.[WORKFLOW_MODAL_CONFIG_KEY]?.[WORKFLOW_MODAL_GPU_KEY];
+  if (MODAL_GPU_TYPES.includes(savedGpu)) {
+    return savedGpu;
+  }
+  if (workflowContainer) {
+    workflowContainer.extra ||= {};
+    workflowContainer.extra[WORKFLOW_MODAL_CONFIG_KEY] ||= {};
+    workflowContainer.extra[WORKFLOW_MODAL_CONFIG_KEY][WORKFLOW_MODAL_GPU_KEY] = DEFAULT_MODAL_GPU;
+  }
+  return DEFAULT_MODAL_GPU;
+}
+
+/**
+ * Save one Modal GPU selection on the root graph so normal workflow serialization preserves it.
+ * @param {string} modalGpu
+ */
+function setSelectedModalGpu(modalGpu) {
+  if (!MODAL_GPU_TYPES.includes(modalGpu)) {
+    throw new Error(`Unsupported Modal GPU selection: ${String(modalGpu)}`);
+  }
+  const graph = rootGraph();
+  if (!graph) {
+    throw new Error("The workflow graph is unavailable.");
+  }
+  const previousGpu = selectedModalGpu(graph);
+  graph.extra[WORKFLOW_MODAL_CONFIG_KEY][WORKFLOW_MODAL_GPU_KEY] = modalGpu;
+  if (previousGpu !== modalGpu) {
+    graph.change?.();
+    app.graph?.setDirtyCanvas?.(true, true);
+  }
+  notifyModal(
+    `Modal GPU set to ${modalGpu}. The next remote run will rebuild the Modal app if needed.`,
+  );
+}
+
+/**
+ * Copy the live graph GPU selection onto one serialized workflow snapshot.
+ * @param {object | null | undefined} workflow
+ */
+function stampModalGpuOnWorkflow(workflow) {
+  if (!workflow || typeof workflow !== "object") {
+    return;
+  }
+  workflow.extra ||= {};
+  workflow.extra[WORKFLOW_MODAL_CONFIG_KEY] ||= {};
+  workflow.extra[WORKFLOW_MODAL_CONFIG_KEY][WORKFLOW_MODAL_GPU_KEY] = selectedModalGpu();
+}
+
+/**
  * Look up a graph-local node id without assuming whether ids are numeric or strings.
  * @param {LGraph | null | undefined} graph
  * @param {string} id
@@ -2290,11 +2364,24 @@ function installModalContextMenu(nodeType, nodeData) {
         ? "Disable on Upstream Nodes for Selection"
         : "Disable on Upstream Nodes";
     if (!targetOptions.some((option) => option?.content === "Modal")) {
+      const currentModalGpu = selectedModalGpu();
       targetOptions.push(null, {
         content: "Modal",
         has_submenu: true,
         submenu: {
           options: [
+            {
+              content: "GPU",
+              has_submenu: true,
+              submenu: {
+                options: MODAL_GPU_TYPES.map((modalGpu) => ({
+                  content: modalGpu,
+                  checked: modalGpu === currentModalGpu,
+                  callback: () => setSelectedModalGpu(modalGpu),
+                })),
+              },
+            },
+            null,
             {
               content: enableUpstreamMenuItemLabel,
               callback: () => {
@@ -3582,6 +3669,7 @@ function patchQueuePrompt() {
 
   api.queuePrompt = async function modalQueuePrompt(number, data, options) {
     const { output: prompt, workflow } = data;
+    stampModalGpuOnWorkflow(workflow);
     const promptId = createPromptId();
     clearPromptTerminal(promptId);
     clearSupersededCancellingPrompts(promptId);
@@ -3730,5 +3818,9 @@ app.registerExtension({
 
   async nodeCreated(node) {
     decorateNode(node);
+  },
+
+  async afterConfigureGraph() {
+    selectedModalGpu();
   },
 });

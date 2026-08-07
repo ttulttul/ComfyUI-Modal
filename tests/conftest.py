@@ -190,6 +190,7 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.delenv("COMFY_MODAL_INVOCATION_DICT_NAME", raising=False)
     monkeypatch.delenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", raising=False)
     monkeypatch.delenv("COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_GPU", raising=False)
     monkeypatch.delenv("COMFY_MODAL_MAX_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_BUFFER_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFY_MODAL_MAX_INFLIGHT_CALLS", raising=False)
