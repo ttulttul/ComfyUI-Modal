@@ -23,7 +23,12 @@ from .modal_executor_node import (
     register_modal_map_input_warmup_context,
 )
 from .session_state import RemoteSessionHandle
-from .settings import ModalSyncSettings, get_settings
+from .settings import (
+    ModalSyncSettings,
+    get_settings,
+    modal_gpu_from_workflow,
+    settings_for_modal_gpu,
+)
 from .sync_engine import (
     AssetSyncRequestCache,
     ModalAssetSyncEngine,
@@ -2828,6 +2833,7 @@ def _build_component_payload(
             "payload_kind": "subgraph",
             "component_id": component_id,
             "prompt_id": prompt_id,
+            "modal_gpu": settings.modal_gpu,
             "component_node_ids": list(component_node_ids),
             "subgraph_prompt": _subset_component_prompt(component_prompt, component_node_ids),
             "boundary_inputs": _serialize_boundary_input_specs(
@@ -3085,6 +3091,7 @@ def _build_component_payload(
         "payload_kind": "mapped_subgraph" if component.mapped_boundary_input_name else "subgraph",
         "component_id": component.representative_node_id,
         "prompt_id": prompt_id,
+        "modal_gpu": settings.modal_gpu,
         "component_node_ids": list(component.node_ids),
         "subgraph_prompt": component_prompt,
         "boundary_inputs": _serialize_boundary_input_specs(
@@ -4274,6 +4281,19 @@ def setup_modal_queue_route(
                 )
                 return response
 
+            try:
+                request_settings = settings_for_modal_gpu(
+                    resolved_settings,
+                    modal_gpu_from_workflow(workflow, resolved_settings.modal_gpu),
+                )
+            except ValueError as exc:
+                raise ModalPromptValidationError(str(exc)) from exc
+            logger.info(
+                "Resolved workflow Modal GPU selection gpu=%s prompt_id=%s.",
+                request_settings.modal_gpu,
+                prompt_id,
+            )
+
             def emit_setup_status(
                 message: str,
                 current: int | None = None,
@@ -4301,7 +4321,7 @@ def setup_modal_queue_route(
                     prompt=json_data["prompt"],
                     workflow=workflow,
                     sync_engine=resolved_sync_engine,
-                    settings=resolved_settings,
+                    settings=request_settings,
                     extra_data=json_data.get("extra_data"),
                     status_callback=emit_setup_status,
                 )
@@ -4320,6 +4340,7 @@ def setup_modal_queue_route(
                     }
                     json_data["partial_execution_targets"] = sorted(rewritten_targets)
                 json_data.setdefault("extra_data", {}).setdefault("modal", {})
+                json_data["extra_data"]["modal"]["gpu"] = request_settings.modal_gpu
                 json_data["extra_data"]["modal"]["remote_node_ids"] = summary.remote_node_ids
                 json_data["extra_data"]["modal"]["remote_component_ids"] = summary.remote_component_ids
                 json_data["extra_data"]["modal"]["component_dependency_ids_by_representative"] = (

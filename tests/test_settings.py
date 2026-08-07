@@ -60,6 +60,43 @@ def test_settings_reads_modal_gpu_override(
     assert settings.modal_gpu == "L40S"
 
 
+def test_modal_gpu_from_workflow_prefers_saved_selection(settings_module: Any) -> None:
+    """A saved workflow GPU should override the process-level fallback."""
+    workflow = {"extra": {"comfy_modal": {"gpu": "B300"}}}
+
+    selected_gpu = settings_module.modal_gpu_from_workflow(workflow, "L40S")
+
+    assert selected_gpu == "B300"
+
+
+def test_modal_gpu_from_workflow_uses_fallback_when_unsaved(settings_module: Any) -> None:
+    """Older workflows without Modal metadata should retain the configured fallback."""
+    assert settings_module.modal_gpu_from_workflow({"nodes": []}, "L40S") == "L40S"
+
+
+def test_modal_gpu_from_workflow_rejects_unknown_selection(settings_module: Any) -> None:
+    """Queue handling should reject edited workflow GPU values outside Modal's supported list."""
+    workflow = {"extra": {"comfy_modal": {"gpu": "V100"}}}
+
+    try:
+        settings_module.modal_gpu_from_workflow(workflow, "A100")
+    except ValueError as exc:
+        assert "V100" in str(exc)
+    else:
+        raise AssertionError("Expected an unsupported workflow GPU to be rejected.")
+
+
+def test_settings_for_modal_gpu_preserves_other_runtime_settings(settings_module: Any) -> None:
+    """A workflow GPU override should change only the deploy-time GPU target."""
+    base_settings = settings_module.get_settings()
+
+    overridden_settings = settings_module.settings_for_modal_gpu(base_settings, "h200")
+
+    assert overridden_settings.modal_gpu == "H200"
+    assert overridden_settings.app_name == base_settings.app_name
+    assert overridden_settings.volume_name == base_settings.volume_name
+
+
 def test_settings_generates_stable_per_comfyui_app_name(
     settings_module: Any,
     monkeypatch: Any,

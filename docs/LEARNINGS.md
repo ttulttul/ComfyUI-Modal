@@ -1,5 +1,11 @@
 # Learnings
 
+## 2026-08-07
+
+- A workflow-level GPU choice has to survive beyond the queue request. ComfyUI executes rewritten proxies asynchronously after the HTTP handler returns, so the selected GPU must be stamped into every ordinary, mapped, split-phase, and proactive-warmup payload; consulting process settings later can silently deploy or invoke the wrong target.
+- GPU choice is part of the immutable Modal runtime identity. Request-specific fingerprint checks and cloud-module construction must use the payload-selected settings together, otherwise a newly selected GPU can reuse a locally cached deployment decision or rebuild the image with the startup environment's GPU.
+- ComfyUI's root graph `extra` mapping is the right persistence boundary for workflow-wide extension settings. Values stored there are included by normal graph serialization without adding a synthetic node or a prompt widget.
+
 ## 2026-06-26
 
 - Frontend canvas animation should be driven by visuals that actually change over time, not by the mere presence of progress or cache state. Static Modal progress can redraw on websocket updates; only pulsing phases, setup placeholder lanes, and fade-outs need a throttled rAF loop, and prompt cleanup should cancel that loop once the last animated state is gone.

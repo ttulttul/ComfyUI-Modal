@@ -48,6 +48,11 @@ const transformedSource = `${[
   "  handlePromptInterruption,",
   "  setRemoteFlag,",
   "  setAllEligibleWorkflowNodesRemote,",
+  "  selectedModalGpu,",
+  "  setSelectedModalGpu,",
+  "  stampModalGpuOnWorkflow,",
+  "  installModalContextMenu,",
+  "  MODAL_GPU_TYPES,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  currentGlobalStatus,",
@@ -512,3 +517,50 @@ modalToggle.handleExecutionPhase(
 assert.equal(modalToggle.isPromptQueuedBehindActiveModal("prompt-queued"), false);
 assert.equal(modalToggle.modalNodeStates.get("60")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeStates.get("61")?.phase, modalToggle.STATE_READY);
+
+const workflowGraph = {
+  extra: {},
+  nodes: [],
+  changeCount: 0,
+  change() {
+    this.changeCount += 1;
+  },
+  getNodeById(id) {
+    return this.nodes.find((node) => String(node.id) === String(id)) ?? null;
+  },
+};
+globalThis.__modalAppStub.rootGraph = workflowGraph;
+globalThis.__modalAppStub.graph.rootGraph = workflowGraph;
+assert.equal(modalToggle.selectedModalGpu(), "A100");
+assert.equal(workflowGraph.extra.comfy_modal.gpu, "A100");
+
+modalToggle.setSelectedModalGpu("B300");
+assert.equal(modalToggle.selectedModalGpu(), "B300");
+assert.equal(workflowGraph.extra.comfy_modal.gpu, "B300");
+assert.equal(workflowGraph.changeCount, 1);
+
+const serializedWorkflow = { nodes: [] };
+modalToggle.stampModalGpuOnWorkflow(serializedWorkflow);
+assert.equal(serializedWorkflow.extra.comfy_modal.gpu, "B300");
+
+class MenuNode {}
+const menuNode = new MenuNode();
+menuNode.id = 101;
+menuNode.graph = workflowGraph;
+workflowGraph.nodes.push(menuNode);
+modalToggle.installModalContextMenu(MenuNode, { name: "KSampler" });
+const menuOptions = [];
+menuNode.getExtraMenuOptions(null, menuOptions);
+const modalMenu = menuOptions.find((option) => option?.content === "Modal");
+const gpuMenu = modalMenu.submenu.options.find((option) => option?.content === "GPU");
+assert.deepEqual(
+  gpuMenu.submenu.options.map((option) => option.content),
+  modalToggle.MODAL_GPU_TYPES,
+);
+assert.equal(
+  gpuMenu.submenu.options.find((option) => option.content === "B300")?.checked,
+  true,
+);
+gpuMenu.submenu.options.find((option) => option.content === "L40S").callback();
+assert.equal(workflowGraph.extra.comfy_modal.gpu, "L40S");
+assert.equal(workflowGraph.changeCount, 2);

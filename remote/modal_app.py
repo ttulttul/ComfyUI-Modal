@@ -73,11 +73,13 @@ from ..runtime_environment import (
     RemoteRuntimeIdentity,
     build_remote_runtime_identity,
 )
-from ..settings import ModalSyncSettings, get_settings
+from ..settings import ModalSyncSettings, get_settings, settings_for_modal_gpu
 
 logger = logging.getLogger(__name__)
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
 _REMOTE_APP_PROTOCOL_VERSION = REMOTE_APP_PROTOCOL_VERSION
+_MODAL_CLOUD_MODULE_LOCK = threading.Lock()
+_MODAL_CLOUD_SETTINGS_STATE = threading.local()
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
 _MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None, str]] = set()
@@ -118,6 +120,34 @@ _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER: list[str] = []
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT = 32
+
+
+def _settings_for_payload(payload: Mapping[str, Any]) -> ModalSyncSettings:
+    """Resolve settings with the workflow-selected GPU carried by one payload."""
+    settings = get_settings()
+    modal_gpu = payload.get("modal_gpu")
+    if modal_gpu is None:
+        return settings
+    return settings_for_modal_gpu(settings, modal_gpu)
+
+
+@contextmanager
+def _modal_cloud_settings_override(settings: ModalSyncSettings) -> Iterator[None]:
+    """Expose request-specific settings while constructing the deployable cloud module."""
+    previous_settings = getattr(_MODAL_CLOUD_SETTINGS_STATE, "settings", None)
+    _MODAL_CLOUD_SETTINGS_STATE.settings = settings
+    try:
+        yield
+    finally:
+        if previous_settings is None:
+            try:
+                delattr(_MODAL_CLOUD_SETTINGS_STATE, "settings")
+            except AttributeError:
+                pass
+        else:
+            _MODAL_CLOUD_SETTINGS_STATE.settings = previous_settings
+
+
 _DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset(
     {
         "AUDIO",
@@ -2598,34 +2628,45 @@ def _is_missing_modal_deployment_error(exc: BaseException) -> bool:
 
 def _load_modal_cloud_module() -> Any:
     """Load the stable Modal cloud entry module under a valid Python name."""
-    existing_module = sys.modules.get(_MODAL_CLOUD_MODULE_NAME)
-    if existing_module is not None and getattr(existing_module, "app", None) is not None:
-        return existing_module
-    if existing_module is not None:
-        logger.warning(
-            "Discarding partially initialized Modal cloud module %s before reload.",
+    settings = getattr(_MODAL_CLOUD_SETTINGS_STATE, "settings", None) or get_settings()
+    with _MODAL_CLOUD_MODULE_LOCK:
+        existing_module = sys.modules.get(_MODAL_CLOUD_MODULE_NAME)
+        existing_gpu = getattr(existing_module, "__comfy_modal_gpu__", settings.modal_gpu)
+        if (
+            existing_module is not None
+            and getattr(existing_module, "app", None) is not None
+            and existing_gpu == settings.modal_gpu
+        ):
+            return existing_module
+        if existing_module is not None:
+            logger.warning(
+                "Discarding Modal cloud module %s before reload for gpu=%s (previous_gpu=%s).",
+                _MODAL_CLOUD_MODULE_NAME,
+                settings.modal_gpu,
+                existing_gpu,
+            )
+            sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
+
+        cloud_module_path = Path(__file__).resolve().parents[1] / f"{_MODAL_CLOUD_MODULE_NAME}.py"
+        module_spec = importlib.util.spec_from_file_location(
             _MODAL_CLOUD_MODULE_NAME,
+            cloud_module_path,
         )
-        sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
+        if module_spec is None or module_spec.loader is None:
+            raise ModalRemoteInvocationError(
+                f"Unable to create module spec for Modal cloud entrypoint at {cloud_module_path}."
+            )
 
-    cloud_module_path = Path(__file__).resolve().parents[1] / f"{_MODAL_CLOUD_MODULE_NAME}.py"
-    module_spec = importlib.util.spec_from_file_location(
-        _MODAL_CLOUD_MODULE_NAME,
-        cloud_module_path,
-    )
-    if module_spec is None or module_spec.loader is None:
-        raise ModalRemoteInvocationError(
-            f"Unable to create module spec for Modal cloud entrypoint at {cloud_module_path}."
-        )
-
-    cloud_module = importlib.util.module_from_spec(module_spec)
-    sys.modules[_MODAL_CLOUD_MODULE_NAME] = cloud_module
-    try:
-        module_spec.loader.exec_module(cloud_module)
-    except BaseException:
-        sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
-        raise
-    return cloud_module
+        cloud_module = importlib.util.module_from_spec(module_spec)
+        setattr(cloud_module, "__comfy_modal_settings_override__", settings)
+        setattr(cloud_module, "__comfy_modal_gpu__", settings.modal_gpu)
+        sys.modules[_MODAL_CLOUD_MODULE_NAME] = cloud_module
+        try:
+            module_spec.loader.exec_module(cloud_module)
+        except BaseException:
+            sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
+            raise
+        return cloud_module
 
 
 def _install_modal_cloud_exception_compatibility_module() -> None:
@@ -4906,7 +4947,7 @@ def _lookup_deployed_remote_engine(
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
-    settings = get_settings()
+    settings = _settings_for_payload(payload)
     loader_prewarm_plans: list[dict[str, Any]] = _build_loader_prewarm_plans(payload)
     snapshot_profile_key = ""
     payload_snapshot_profile_key = payload.get("snapshot_profile_key")
@@ -5014,9 +5055,11 @@ def _modal_environment_name() -> str | None:
     return normalized or None
 
 
-def _modal_deploy_cache_key() -> tuple[str, str | None]:
+def _modal_deploy_cache_key(
+    payload: Mapping[str, Any] | None = None,
+) -> tuple[str, str | None]:
     """Return the cache key for auto-deployed Modal apps."""
-    settings = get_settings()
+    settings = _settings_for_payload(payload) if payload is not None else get_settings()
     return (settings.app_name, _modal_environment_name())
 
 
@@ -5033,18 +5076,21 @@ def _remote_runtime_identity_for_settings(
     )
 
 
-def _expected_remote_runtime_fingerprint() -> str:
+def _expected_remote_runtime_fingerprint(payload: Mapping[str, Any] | None = None) -> str:
     """Return the exact deployment fingerprint required by this local client."""
-    return _remote_runtime_identity_for_settings(get_settings()).fingerprint
+    settings = _settings_for_payload(payload) if payload is not None else get_settings()
+    return _remote_runtime_identity_for_settings(settings).fingerprint
 
 
-def _modal_runtime_cache_key() -> tuple[str, str | None, str]:
+def _modal_runtime_cache_key(
+    payload: Mapping[str, Any] | None = None,
+) -> tuple[str, str | None, str]:
     """Return the version cache key for the current app, environment, and runtime."""
-    settings = get_settings()
+    settings = _settings_for_payload(payload) if payload is not None else get_settings()
     return (
         settings.app_name,
         _modal_environment_name(),
-        _expected_remote_runtime_fingerprint(),
+        _expected_remote_runtime_fingerprint(payload),
     )
 
 
@@ -5078,7 +5124,10 @@ def _runtime_fingerprint_from_payload(version_payload: dict[str, Any] | None) ->
     return normalized or None
 
 
-def _is_runtime_version_payload_current(version_payload: dict[str, Any] | None) -> bool:
+def _is_runtime_version_payload_current(
+    version_payload: dict[str, Any] | None,
+    payload: Mapping[str, Any] | None = None,
+) -> bool:
     """Return whether remote version metadata exactly matches this local runtime."""
     if version_payload is None:
         return False
@@ -5088,13 +5137,19 @@ def _is_runtime_version_payload_current(version_payload: dict[str, Any] | None) 
     return (
         protocol_version == _REMOTE_APP_PROTOCOL_VERSION
         and _runtime_fingerprint_from_payload(version_payload)
-        == _expected_remote_runtime_fingerprint()
+        == _expected_remote_runtime_fingerprint(payload)
     )
 
 
-def _is_remote_engine_runtime_current(remote_engine: Any) -> bool:
+def _is_remote_engine_runtime_current(
+    remote_engine: Any,
+    payload: Mapping[str, Any] | None = None,
+) -> bool:
     """Return whether a deployed engine exactly matches this local runtime."""
-    return _is_runtime_version_payload_current(_remote_engine_runtime_version(remote_engine))
+    return _is_runtime_version_payload_current(
+        _remote_engine_runtime_version(remote_engine),
+        payload,
+    )
 
 
 def _stop_modal_app_via_sdk(app_name: str) -> bool:
@@ -5213,9 +5268,9 @@ def _replace_outdated_modal_app(
     version_payload: dict[str, Any] | None = None,
 ) -> Any:
     """Stop and auto-deploy a replacement for an incompatible deployed app."""
-    settings = get_settings()
-    deploy_key = _modal_deploy_cache_key()
-    runtime_cache_key = _modal_runtime_cache_key()
+    settings = _settings_for_payload(payload)
+    deploy_key = _modal_deploy_cache_key(payload)
+    runtime_cache_key = _modal_runtime_cache_key(payload)
     if version_payload is None:
         version_payload = _remote_engine_runtime_version(remote_engine)
     protocol_version = (
@@ -5224,7 +5279,7 @@ def _replace_outdated_modal_app(
         else None
     )
     remote_fingerprint = _runtime_fingerprint_from_payload(version_payload)
-    local_fingerprint = _expected_remote_runtime_fingerprint()
+    local_fingerprint = _expected_remote_runtime_fingerprint(payload)
     logger.warning(
         "Deployed Modal app %s is out of date for component=%s remote_protocol=%s local_protocol=%s remote_fingerprint=%s local_fingerprint=%s; stopping and replacing it.",
         settings.app_name,
@@ -5251,16 +5306,17 @@ def _replace_outdated_modal_app(
 
 def _ensure_remote_engine_protocol_current(remote_engine: Any, payload: dict[str, Any]) -> Any:
     """Return a compatible remote engine, replacing the deployed app when allowed."""
-    runtime_cache_key = _modal_runtime_cache_key()
+    settings = _settings_for_payload(payload)
+    runtime_cache_key = _modal_runtime_cache_key(payload)
     with _MODAL_AUTO_DEPLOY_LOCK:
         if runtime_cache_key in _MODAL_REMOTE_APP_VERSION_OK:
             return remote_engine
     version_payload = _remote_engine_runtime_version(remote_engine)
-    if _is_runtime_version_payload_current(version_payload):
+    if _is_runtime_version_payload_current(version_payload, payload):
         with _MODAL_AUTO_DEPLOY_LOCK:
             _MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
         return remote_engine
-    if not get_settings().auto_deploy:
+    if not settings.auto_deploy:
         raise ModalRemoteInvocationError(
             "Deployed Modal app runtime fingerprint is out of date and "
             "COMFY_MODAL_AUTO_DEPLOY=false prevents automatic replacement."
@@ -5490,7 +5546,7 @@ def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]
 
 def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Extract the prompt-scoped warmup-relevant fields from one payload."""
-    settings = get_settings()
+    settings = _settings_for_payload(payload)
     loader_prewarm_plans = _build_loader_prewarm_plans(payload)
     snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
     if settings.enable_gpu_memory_snapshot and not snapshot_profile_key:
@@ -5508,6 +5564,7 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | No
         "component_id": str(
             payload.get("mapped_progress_display_node_id", payload.get("component_id", "modal-warmup"))
         ),
+        "modal_gpu": settings.modal_gpu,
         "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
         "volume_reload_marker": payload.get("volume_reload_marker"),
         "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
@@ -5614,7 +5671,7 @@ def _invoke_remote_engine_warmup_with_recovery(
 ) -> Any:
     """Retry one warmup call after auto-deploy when a stale deployed handle vanishes."""
     lookup_error_types = _modal_lookup_error_types()
-    settings = get_settings()
+    settings = _settings_for_payload(warmup_request)
     try:
         return _invoke_remote_engine_warmup(remote_engine, warmup_request)
     except lookup_error_types as exc:
@@ -5635,7 +5692,7 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
         return None
 
     lookup_error_types = _modal_lookup_error_types()
-    settings = get_settings()
+    settings = _settings_for_payload(warmup_request)
     if lookup_error_types:
         try:
             remote_engine = _ensure_remote_engine_protocol_current(
@@ -5665,7 +5722,8 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
         )
         return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
 
-    cloud_module = _load_modal_cloud_module()
+    with _modal_cloud_settings_override(settings):
+        cloud_module = _load_modal_cloud_module()
     cloud_app = getattr(cloud_module, "app", None)
     cloud_remote_engine = getattr(cloud_module, "RemoteEngine", None)
     if cloud_app is None or cloud_remote_engine is None:
@@ -5865,10 +5923,11 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
-    settings = get_settings()
-    deploy_key = _modal_deploy_cache_key()
+    settings = _settings_for_payload(payload)
+    deploy_key = _modal_deploy_cache_key(payload)
     deploy_state = _modal_auto_deploy_state(deploy_key)
-    cloud_module = _load_modal_cloud_module()
+    with _modal_cloud_settings_override(settings):
+        cloud_module = _load_modal_cloud_module()
     cloud_app = getattr(cloud_module, "app", None)
     if cloud_app is None:
         raise ModalRemoteInvocationError(
@@ -5947,11 +6006,11 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
             time.perf_counter() - deploy_started_at,
         )
         remote_engine = _lookup_deployed_remote_engine_with_retry(payload)
-        if not _is_remote_engine_runtime_current(remote_engine):
+        if not _is_remote_engine_runtime_current(remote_engine, payload):
             raise ModalRemoteInvocationError(
                 f"Auto-deployed Modal app {settings.app_name!r} did not report expected protocol "
                 f"{_REMOTE_APP_PROTOCOL_VERSION} and fingerprint "
-                f"{_expected_remote_runtime_fingerprint()!r}."
+                f"{_expected_remote_runtime_fingerprint(payload)!r}."
             )
     except BaseException as exc:
         with deploy_state.condition:
@@ -5966,7 +6025,7 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
         deploy_state.last_error = None
         deploy_state.condition.notify_all()
     with _MODAL_AUTO_DEPLOY_LOCK:
-        _MODAL_REMOTE_APP_VERSION_OK.add(_modal_runtime_cache_key())
+        _MODAL_REMOTE_APP_VERSION_OK.add(_modal_runtime_cache_key(payload))
     logger.info(
         "Deployed Modal app %s for env=%s is now lookup-ready.",
         settings.app_name,
@@ -6042,7 +6101,7 @@ def _invoke_remote_engine_payload_with_recovery(
         stable_remote_invocation_id(payload, kwargs_payload),
     )
     lookup_error_types = _modal_lookup_error_types()
-    settings = get_settings()
+    settings = _settings_for_payload(payload)
     try:
         response = _invoke_remote_engine_payload(
             remote_engine,
@@ -6126,7 +6185,7 @@ def _invoke_modal_payload_blocking(
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
     lookup_error_types = _modal_lookup_error_types()
-    settings = get_settings()
+    settings = _settings_for_payload(payload)
     if lookup_error_types:
         try:
             remote_engine = _ensure_remote_engine_protocol_current(
@@ -6198,7 +6257,8 @@ def _invoke_modal_payload_blocking(
     if "app" not in globals() or "RemoteEngine" not in globals():
         logger.debug("Local module Modal runtime objects are unavailable; loading stable cloud entry module.")
 
-    cloud_module = _load_modal_cloud_module()
+    with _modal_cloud_settings_override(settings):
+        cloud_module = _load_modal_cloud_module()
     cloud_app = getattr(cloud_module, "app", None)
     cloud_remote_engine = getattr(cloud_module, "RemoteEngine", None)
     if cloud_app is None or cloud_remote_engine is None:
@@ -6391,7 +6451,7 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     image = modal.Image.debian_slim().pip_install("torch", "safetensors", "pillow", "numpy")
 
     @app.cls(
-        gpu="A100",
+        gpu=settings.modal_gpu,
         volumes={settings.remote_storage_root: vol},
         scaledown_window=60,
         image=image,
