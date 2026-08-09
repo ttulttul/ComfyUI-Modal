@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import logging
 import os
+import re
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +44,9 @@ MODAL_GPU_TYPES = (
 )
 WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal"
 WORKFLOW_MODAL_GPU_KEY = "gpu"
+_DEFAULT_MODAL_GPU = "A100"
+_MODAL_APP_NAME_MAX_LENGTH = 64
+_MODAL_GPU_SLUG_MAX_LENGTH = 28
 
 _SETTINGS_ENV_KEYS = (
     "COMFYUI_ROOT",
@@ -172,6 +177,43 @@ def settings_for_modal_gpu(
 ) -> ModalSyncSettings:
     """Return settings with one validated workflow-level GPU override."""
     return replace(settings, modal_gpu=normalize_modal_gpu_selection(modal_gpu))
+
+
+def _modal_gpu_app_slug(modal_gpu: str) -> str:
+    """Return a readable, collision-resistant app-name suffix for one GPU target."""
+    expanded = (
+        modal_gpu.strip()
+        .lower()
+        .replace("!", "-priority")
+        .replace("+", "-plus")
+        .replace(":", "-x")
+        .replace(",", "-or-")
+    )
+    slug = "-".join(re.findall(r"[a-z0-9]+", expanded))
+    if not slug:
+        slug = f"target-{hashlib.sha256(modal_gpu.encode('utf-8')).hexdigest()[:8]}"
+    if len(slug) <= _MODAL_GPU_SLUG_MAX_LENGTH:
+        return slug
+    digest = hashlib.sha256(modal_gpu.encode("utf-8")).hexdigest()[:8]
+    prefix_length = _MODAL_GPU_SLUG_MAX_LENGTH - len(digest) - 1
+    return f"{slug[:prefix_length].rstrip('-')}-{digest}"
+
+
+def modal_deployment_app_name(settings: ModalSyncSettings) -> str:
+    """Return the persistent Modal app name dedicated to the configured GPU target."""
+    modal_gpu = str(getattr(settings, "modal_gpu", _DEFAULT_MODAL_GPU)).strip()
+    if modal_gpu.upper() == _DEFAULT_MODAL_GPU:
+        return settings.app_name
+
+    suffix = f"-gpu-{_modal_gpu_app_slug(modal_gpu)}"
+    candidate = f"{settings.app_name}{suffix}"
+    if len(candidate) <= _MODAL_APP_NAME_MAX_LENGTH:
+        return candidate
+
+    digest = hashlib.sha256(settings.app_name.encode("utf-8")).hexdigest()[:8]
+    prefix_length = _MODAL_APP_NAME_MAX_LENGTH - len(suffix) - len(digest) - 1
+    prefix = settings.app_name[:prefix_length].rstrip("-_.") or "app"
+    return f"{prefix}-{digest}{suffix}"
 
 
 def _read_path_env(name: str) -> Path | None:

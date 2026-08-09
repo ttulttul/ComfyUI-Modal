@@ -5110,6 +5110,12 @@ def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
     assert remote_modal_app_module._settings_for_payload(
         {"modal_gpu": "L40S"}
     ).modal_gpu == "L40S"
+    assert remote_modal_app_module._modal_deploy_cache_key(
+        {"modal_gpu": "A100"}
+    )[0] == "comfy-modal-sync"
+    assert remote_modal_app_module._modal_deploy_cache_key(
+        {"modal_gpu": "B300"}
+    )[0] == "comfy-modal-sync-gpu-b300"
 
 
 def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
@@ -5303,6 +5309,35 @@ def test_lookup_deployed_remote_engine_excludes_affinity_from_modal_class_parame
             "gpu_snapshot_enabled": True,
         }
     ]
+
+
+def test_lookup_deployed_remote_engine_uses_workflow_gpu_app_identity(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A B300 workflow must miss or reuse its own app without contacting the A100 class."""
+    observed_lookups: list[tuple[str, str]] = []
+
+    class FakeModal:
+        """Minimal Modal SDK double that captures deployed class identity."""
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> Any:
+                """Return a no-op class factory for the requested deployment."""
+                observed_lookups.append((app_name, class_name))
+                return lambda **kwargs: kwargs
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+
+    result = remote_modal_app_module._lookup_deployed_remote_engine(
+        {"component_id": "component-1", "modal_gpu": "B300"}
+    )
+
+    assert result == {"gpu_snapshot_enabled": True}
+    assert observed_lookups == [("comfy-modal-sync-gpu-b300", "RemoteEngine")]
 
 
 def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu_snapshots(
@@ -5665,6 +5700,7 @@ def test_load_modal_cloud_module_reloads_for_workflow_gpu_change(
     assert observed_gpu_values == ["B300"]
     assert reloaded_module.app == "b300-app"
     assert reloaded_module.__comfy_modal_gpu__ == "B300"
+    assert reloaded_module.__comfy_modal_app_name__ == "comfy-modal-sync-gpu-b300"
 
 
 def test_remote_modal_installs_cloud_exception_compatibility_module(

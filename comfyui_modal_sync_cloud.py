@@ -94,7 +94,10 @@ from session_state import (  # noqa: E402 - paths are bootstrapped above.
     is_remote_session_value_ref_payload,
     stable_session_bridge_key,
 )
-from settings import get_settings  # noqa: E402 - paths are bootstrapped above.
+from settings import (  # noqa: E402 - paths are bootstrapped above.
+    get_settings,
+    modal_deployment_app_name,
+)
 
 logger = logging.getLogger(__name__)
 _CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
@@ -315,7 +318,7 @@ def _guard_against_existing_modal_app(settings: Any, modal_module: Any) -> None:
     if _running_inside_modal_container(modal_module):
         return
 
-    app_name = str(settings.app_name)
+    app_name = modal_deployment_app_name(settings)
     app_exists = _modal_app_exists_via_sdk(modal_module, app_name)
     if app_exists is None:
         app_exists = _modal_app_exists_via_cli(app_name)
@@ -6527,8 +6530,9 @@ def _install_remote_torch_build(image: Any, torch_build: _RemoteTorchBuild) -> A
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = globals().get("__comfy_modal_settings_override__") or get_settings()
     __comfy_modal_gpu__ = settings.modal_gpu
+    __comfy_modal_app_name__ = modal_deployment_app_name(settings)
     _guard_against_existing_modal_app(settings, modal)
-    app = modal.App(settings.app_name)
+    app = modal.App(__comfy_modal_app_name__)
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)
     interrupt_flags = modal.Dict.from_name(
         settings.interrupt_dict_name,
@@ -6711,7 +6715,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             """Return the deployed runtime identity expected by the local client."""
             return {
                 "protocol_version": _REMOTE_APP_PROTOCOL_VERSION,
-                "app_name": settings.app_name,
+                "app_name": __comfy_modal_app_name__,
                 "runtime_fingerprint": os.environ.get(
                     "COMFY_MODAL_RUNTIME_FINGERPRINT",
                     "",
