@@ -5800,6 +5800,7 @@ def test_remote_modal_consumes_streamed_progress_and_result(
         "prompt_id": "prompt-1",
         "component_id": "component-1",
         "component_node_ids": ["7", "8"],
+        "modal_gpu": "B300",
         "extra_data": {"client_id": "client-1"},
     }
     result = remote_modal_app_module._consume_remote_payload_stream(
@@ -5841,6 +5842,7 @@ def test_remote_modal_consumes_streamed_progress_and_result(
                 "phase": "executing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["7", "8"],
+                "modal_gpu": "B300",
                 "active_node_id": "7",
                 "active_node_class_type": "UNETLoader",
                 "active_node_role": "model_load",
@@ -5864,6 +5866,7 @@ def test_remote_modal_consumes_streamed_progress_and_result(
                 "phase": "finalizing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["7", "8"],
+                "modal_gpu": "B300",
                 "status_message": "Receiving Modal outputs",
             },
             "client-1",
@@ -5896,6 +5899,7 @@ def test_emit_local_remote_dispatch_status_marks_component_starting(
             "prompt_id": "prompt-1",
             "component_id": "component-1",
             "component_node_ids": ["7", "8"],
+            "modal_gpu": "B300",
             "extra_data": {"client_id": "client-1"},
         }
     )
@@ -5907,6 +5911,7 @@ def test_emit_local_remote_dispatch_status_marks_component_starting(
                 "phase": "starting",
                 "prompt_id": "prompt-1",
                 "node_ids": ["7", "8"],
+                "modal_gpu": "B300",
                 "status_message": "Starting Modal component",
             },
             "client-1",

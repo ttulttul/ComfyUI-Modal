@@ -656,6 +656,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
 
     response_payload = json.loads(response.text)
     assert response_payload["prompt_id"] == "prompt-queue-warmup"
+    assert response_payload["modal_gpu"] == "B300"
     assert response_payload["modal_remote_node_ids"] == ["1"]
     assert observed_rewrite_settings[0].modal_gpu == "B300"
     queued_extra_data = prompt_server.prompt_queue.items[0][3]
@@ -3885,6 +3886,7 @@ def test_emit_modal_status_targets_prompt_client(
         client_id="client-1",
         prompt_id="prompt-1",
         node_ids=["4", "5"],
+        modal_gpu="B300",
         component_node_ids_by_representative={"4": ["4", "5"]},
         active_node_id="5",
         active_node_class_type="KSampler",
@@ -3898,6 +3900,7 @@ def test_emit_modal_status_targets_prompt_client(
                 "phase": "executing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["4", "5"],
+                "modal_gpu": "B300",
                 "active_node_id": "5",
                 "active_node_class_type": "KSampler",
                 "active_node_role": "sampling",
@@ -3919,6 +3922,7 @@ def test_emit_modal_status_targets_prompt_client(
                 "phase": "executing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["4", "5"],
+                "modal_gpu": "B300",
                 "active_node_id": "5",
                 "active_node_class_type": "KSampler",
                 "active_node_role": "sampling",

@@ -247,6 +247,7 @@ def _emit_modal_status(
     client_id: str | None,
     prompt_id: str | None,
     node_ids: list[str],
+    modal_gpu: str | None = None,
     component_node_ids_by_representative: dict[str, list[str]] | None = None,
     active_node_id: str | None = None,
     active_node_class_type: str | None = None,
@@ -266,6 +267,8 @@ def _emit_modal_status(
         "prompt_id": prompt_id,
         "node_ids": list(node_ids),
     }
+    if modal_gpu is not None:
+        payload["modal_gpu"] = modal_gpu
     if component_node_ids_by_representative:
         payload["components"] = [
             {
@@ -4249,6 +4252,7 @@ def setup_modal_queue_route(
         json_data: dict[str, Any] | None = None
         workflow: dict[str, Any] | None = None
         remote_node_ids: list[str] = []
+        request_modal_gpu: str | None = None
         summary = RewriteSummary()
         try:
             request_started_at = time.perf_counter()
@@ -4293,6 +4297,7 @@ def setup_modal_queue_route(
                 request_settings.modal_gpu,
                 prompt_id,
             )
+            request_modal_gpu = request_settings.modal_gpu
 
             def emit_setup_status(
                 message: str,
@@ -4306,6 +4311,7 @@ def setup_modal_queue_route(
                     client_id=client_id,
                     prompt_id=prompt_id,
                     node_ids=remote_node_ids,
+                    modal_gpu=request_settings.modal_gpu,
                     component_node_ids_by_representative=(
                         summary.component_node_ids_by_representative or None
                     ),
@@ -4369,6 +4375,7 @@ def setup_modal_queue_route(
                     client_id=client_id,
                     prompt_id=prompt_id,
                     node_ids=remote_node_ids,
+                    modal_gpu=request_settings.modal_gpu,
                     component_node_ids_by_representative=summary.component_node_ids_by_representative,
                     status_message="Submitting Modal workflow",
                 )
@@ -4377,6 +4384,7 @@ def setup_modal_queue_route(
                 json_data,
                 modal_response_payload=(
                     {
+                        "modal_gpu": request_settings.modal_gpu,
                         "modal_remote_node_ids": list(summary.remote_node_ids),
                         "modal_components": [
                             {
@@ -4406,6 +4414,7 @@ def setup_modal_queue_route(
                     client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
                     prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
                     node_ids=remote_node_ids,
+                    modal_gpu=request_modal_gpu,
                     error_message=str(exc),
                 )
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
@@ -4418,6 +4427,7 @@ def setup_modal_queue_route(
                     client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
                     prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
                     node_ids=remote_node_ids,
+                    modal_gpu=request_modal_gpu,
                     error_message=str(exc),
                 )
             return web.json_response({"error": str(exc), "node_errors": []}, status=400)
@@ -4430,6 +4440,7 @@ def setup_modal_queue_route(
                     client_id=str(json_data.get("client_id")) if json_data.get("client_id") else None,
                     prompt_id=str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None,
                     node_ids=remote_node_ids,
+                    modal_gpu=request_modal_gpu,
                     error_message=str(exc),
                 )
             return web.json_response({"error": str(exc), "node_errors": []}, status=500)

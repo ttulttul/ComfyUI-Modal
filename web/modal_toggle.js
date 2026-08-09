@@ -230,7 +230,7 @@ function ensureGlobalStatusElement() {
   element.style.fontWeight = "600";
   element.style.pointerEvents = "none";
   element.innerHTML =
-    '<span class="modal-status-dot"></span><span class="modal-status-text"></span>';
+    '<span class="modal-status-dot"></span><span class="modal-status-copy"><span class="modal-status-text"></span><span class="modal-status-gpu" hidden></span></span>';
   document.body.appendChild(element);
   modalGlobalStatusElement = element;
   return element;
@@ -442,7 +442,7 @@ function reconcilePromptGlobalStatus(promptId) {
 
 /**
  * Return the most important active global Modal state.
- * @returns {{ phase: string, promptId: string, nodeCount: number } | null}
+ * @returns {{ phase: string, promptId: string, nodeCount: number, modalGpu: string | null } | null}
  */
 function currentGlobalStatus() {
   pruneGlobalStatusStates();
@@ -459,6 +459,7 @@ function currentGlobalStatus() {
     statusMessage: state.statusMessage ?? null,
     statusCurrent: state.statusCurrent ?? null,
     statusTotal: state.statusTotal ?? null,
+    modalGpu: state.modalGpu ?? null,
     updatedAt: state.updatedAt,
   }));
   phases.sort((left, right) => right.updatedAt - left.updatedAt);
@@ -488,11 +489,13 @@ function refreshGlobalStatusElement() {
   if (!activeState) {
     element.style.display = "none";
     element.dataset.phase = "";
+    element.dataset.modalGpu = "";
     return;
   }
 
   const dot = element.querySelector(".modal-status-dot");
   const text = element.querySelector(".modal-status-text");
+  const gpuText = element.querySelector(".modal-status-gpu");
   const nodeLabel = activeState.nodeCount === 1 ? "node" : "nodes";
   const hasBatchProgress =
     activeState.phase === EXECUTION_PHASE &&
@@ -514,6 +517,9 @@ function refreshGlobalStatusElement() {
 
   element.style.display = "inline-flex";
   element.dataset.phase = activeState.phase;
+  element.dataset.modalGpu = activeState.modalGpu ?? "";
+  gpuText.textContent = activeState.modalGpu ?? "";
+  gpuText.hidden = !activeState.modalGpu;
 
   if (activeState.phase === STATE_SETUP) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
@@ -594,7 +600,7 @@ function refreshGlobalStatusElement() {
  * @param {string} promptId
  * @param {string} phase
  * @param {number} nodeCount
- * @param {{ message?: string | null, current?: number | null, total?: number | null } | null} details
+ * @param {{ message?: string | null, current?: number | null, total?: number | null, modalGpu?: string | null } | null} details
  */
 function setGlobalStatusPhase(promptId, phase, nodeCount, details = null) {
   if (!promptId) {
@@ -604,6 +610,11 @@ function setGlobalStatusPhase(promptId, phase, nodeCount, details = null) {
     return;
   }
   const existingState = modalGlobalStatusStates.get(promptId);
+  const promptState = ensurePromptState(promptId);
+  const detailModalGpu = MODAL_GPU_TYPES.includes(details?.modalGpu) ? details.modalGpu : null;
+  if (promptState && detailModalGpu) {
+    promptState.modalGpu = detailModalGpu;
+  }
   modalGlobalStatusStates.set(promptId, {
     phase: effectiveGlobalStatusPhase(promptId, phase),
     nodeCount: promptRemoteNodeCount(promptId, nodeCount),
@@ -612,6 +623,7 @@ function setGlobalStatusPhase(promptId, phase, nodeCount, details = null) {
     statusMessage: details?.message ?? existingState?.statusMessage ?? null,
     statusCurrent: details?.current ?? existingState?.statusCurrent ?? null,
     statusTotal: details?.total ?? existingState?.statusTotal ?? null,
+    modalGpu: detailModalGpu ?? existingState?.modalGpu ?? promptState?.modalGpu ?? null,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -641,6 +653,8 @@ function setGlobalStatusBatchProgress(promptId, value, maxValue) {
     statusMessage: existingState?.statusMessage ?? null,
     statusCurrent: existingState?.statusCurrent ?? null,
     statusTotal: existingState?.statusTotal ?? null,
+    modalGpu:
+      existingState?.modalGpu ?? modalPromptStates.get(promptId)?.modalGpu ?? null,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -1024,7 +1038,7 @@ function refreshModalUiAfterVisibilityChange() {
 /**
  * Return the prompt metadata bucket, creating it if needed.
  * @param {string} promptId
- * @returns {{ startedAt: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, componentLabelByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
+ * @returns {{ startedAt: number, modalGpu: string | null, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, componentLabelByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
  */
 function ensurePromptState(promptId) {
   if (isPromptTerminal(promptId)) {
@@ -1034,6 +1048,7 @@ function ensurePromptState(promptId) {
     const startedAt = modalReplayedEventUpdatedAtMs ?? nowMs();
     modalPromptStates.set(promptId, {
       startedAt,
+      modalGpu: null,
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
       componentNodeIdsByMember: new Map(),
@@ -3120,16 +3135,21 @@ function handleModalStatus(event) {
   if (!promptState) {
     return;
   }
+  const modalGpu = MODAL_GPU_TYPES.includes(detail.modal_gpu) ? detail.modal_gpu : null;
+  if (modalGpu) {
+    promptState.modalGpu = modalGpu;
+  }
 
   if (detail.phase === STATE_SETUP) {
     if (isPromptQueuedBehindActiveModal(promptId)) {
       return;
     }
-    beginSyntheticExecutionUi(promptId, nodeIds);
+    beginSyntheticExecutionUi(promptId, nodeIds, modalGpu);
     setGlobalStatusPhase(promptId, STATE_SETUP, nodeIds.length, {
       message: detail.status_message ?? null,
       current: detail.status_current ?? null,
       total: detail.status_total ?? null,
+      modalGpu,
     });
     setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_SETUP, promptId);
@@ -3144,6 +3164,7 @@ function handleModalStatus(event) {
       message: detail.status_message ?? null,
       current: detail.status_current ?? null,
       total: detail.status_total ?? null,
+      modalGpu,
     });
     setPromptActiveNode(promptId, null);
     return;
@@ -3157,6 +3178,7 @@ function handleModalStatus(event) {
       message: detail.status_message ?? "Starting Modal component",
       current: detail.status_current ?? null,
       total: detail.status_total ?? null,
+      modalGpu,
     });
     setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_STARTING, promptId);
@@ -3169,6 +3191,7 @@ function handleModalStatus(event) {
       message: detail.status_message ?? null,
       current: detail.status_current ?? null,
       total: detail.status_total ?? null,
+      modalGpu,
     });
     setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_FINALIZING, promptId);
@@ -3178,7 +3201,7 @@ function handleModalStatus(event) {
   if (detail.phase === STATE_ERROR) {
     clearPromptQueued(promptId);
     endSyntheticExecutionUi(promptId, true);
-    setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length);
+    setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length, { modalGpu });
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
     clearPromptRemoteNodeVisuals(promptId);
     markPromptTerminal(promptId, STATE_ERROR);
@@ -3202,10 +3225,11 @@ function handleModalStatus(event) {
     promptState.hasStreamedProgress = true;
     if (nextActiveNodeId) {
       promptState.hasRemoteExecutionStarted = true;
-      setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length);
+      setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length, { modalGpu });
     } else {
       setGlobalStatusPhase(promptId, STATE_WAITING, nodeIds.length, {
         message: detail.status_message ?? "Waiting for Modal container",
+        modalGpu,
       });
     }
     setNodesPhase(nodeIds, STATE_READY, promptId);
@@ -3549,8 +3573,9 @@ function statusPayload(queueRemaining) {
  * Start a synthetic running state so ComfyUI shows active execution while the Modal route is still preparing.
  * @param {string} promptId
  * @param {string[]} remoteNodeIds
+ * @param {string | null} modalGpu
  */
-function beginSyntheticExecutionUi(promptId, remoteNodeIds) {
+function beginSyntheticExecutionUi(promptId, remoteNodeIds, modalGpu = null) {
   if (remoteNodeIds.length === 0 || syntheticPromptUiStates.has(promptId)) {
     return;
   }
@@ -3558,7 +3583,7 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds) {
 
   const displayNode = remoteNodeIds[0];
   syntheticPromptUiStates.set(promptId, { displayNode });
-  setGlobalStatusPhase(promptId, STATE_SETUP, remoteNodeIds.length);
+  setGlobalStatusPhase(promptId, STATE_SETUP, remoteNodeIds.length, { modalGpu });
   dispatchSyntheticApiEvent("status", statusPayload(1));
   dispatchSyntheticApiEvent("notification", {
     id: promptId,
@@ -3670,6 +3695,7 @@ function patchQueuePrompt() {
   api.queuePrompt = async function modalQueuePrompt(number, data, options) {
     const { output: prompt, workflow } = data;
     stampModalGpuOnWorkflow(workflow);
+    const modalGpu = selectedModalGpu(workflow);
     const promptId = createPromptId();
     clearPromptTerminal(promptId);
     clearSupersededCancellingPrompts(promptId);
@@ -3680,7 +3706,7 @@ function patchQueuePrompt() {
     if (remoteNodeIds.length > 0) {
       if (!queuedBehindActiveModal) {
         setNodesPhase(remoteNodeIds, STATE_SETUP, promptId);
-        beginSyntheticExecutionUi(promptId, remoteNodeIds);
+        beginSyntheticExecutionUi(promptId, remoteNodeIds, modalGpu);
       }
     }
 
@@ -3719,6 +3745,9 @@ function patchQueuePrompt() {
 
       const responsePayload = await response.json();
       if (remoteNodeIds.length > 0) {
+        const acceptedModalGpu = MODAL_GPU_TYPES.includes(responsePayload.modal_gpu)
+          ? responsePayload.modal_gpu
+          : modalGpu;
         const resolvedRemoteNodeIds = (responsePayload.modal_remote_node_ids ?? []).map((nodeIdValue) =>
           String(nodeIdValue),
         );
@@ -3735,6 +3764,7 @@ function patchQueuePrompt() {
           endSyntheticExecutionUi(promptId);
           setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
             message: "Waiting for Modal startup",
+            modalGpu: acceptedModalGpu,
           });
           setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);
         }
@@ -3767,6 +3797,27 @@ function installGlobalStatusStyles() {
       0% { transform: scale(0.9); opacity: 0.7; }
       50% { transform: scale(1.08); opacity: 1; }
       100% { transform: scale(0.9); opacity: 0.7; }
+    }
+
+    #comfy-modal-global-status .modal-status-copy {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      align-items: flex-start;
+      line-height: 1.15;
+    }
+
+    #comfy-modal-global-status .modal-status-gpu {
+      margin-top: 3px;
+      color: rgba(226, 232, 240, 0.76);
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      line-height: 1;
+    }
+
+    #comfy-modal-global-status .modal-status-gpu[hidden] {
+      display: none;
     }
 
     .comfy-modal-vue-node-decoration {

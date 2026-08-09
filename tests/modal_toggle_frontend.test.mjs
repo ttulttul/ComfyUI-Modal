@@ -85,6 +85,7 @@ function resetFrontendState() {
   modalToggle.modalPromptStates.clear();
   modalToggle.modalTerminalPromptStates.clear();
   modalToggle.modalQueuedPromptIds.clear();
+  modalToggle.modalGlobalStatusStates.clear();
 }
 
 resetFrontendState();
@@ -542,6 +543,30 @@ assert.equal(workflowGraph.changeCount, 1);
 const serializedWorkflow = { nodes: [] };
 modalToggle.stampModalGpuOnWorkflow(serializedWorkflow);
 assert.equal(serializedWorkflow.extra.comfy_modal.gpu, "B300");
+
+resetFrontendState();
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-gpu-status",
+    phase: "setup",
+    node_ids: ["70"],
+    modal_gpu: "B300",
+    status_message: "Rebuilding Modal app",
+  },
+});
+assert.equal(modalToggle.currentGlobalStatus()?.statusMessage, "Rebuilding Modal app");
+assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, "B300");
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-gpu-status",
+    node_id: "70",
+    display_node_id: "70",
+    real_node_id: "70",
+    value: 1,
+    max: 4,
+  },
+});
+assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, "B300");
 
 class MenuNode {}
 const menuNode = new MenuNode();

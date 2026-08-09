@@ -34,6 +34,9 @@ def test_global_modal_status_badge_is_installed() -> None:
     source = _modal_toggle_source()
 
     assert 'element.id = "comfy-modal-global-status";' in source
+    assert 'class="modal-status-gpu" hidden' in source
+    assert "gpuText.textContent = activeState.modalGpu ?? \"\";" in source
+    assert "font-size: 10px;" in source
     assert "Syncing graph with Modal" in source
     assert "Waiting for Modal startup" in source
     assert "Receiving Modal outputs" in source
@@ -44,6 +47,7 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "statusMessage: state.statusMessage ?? null," in source
     assert "statusCurrent: state.statusCurrent ?? null," in source
     assert "statusTotal: state.statusTotal ?? null," in source
+    assert "modalGpu: state.modalGpu ?? null," in source
     assert "linear-gradient(90deg" in source
     assert "installGlobalStatusStyles()" in source
     assert "function pruneGlobalStatusStates()" in source
