@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,45 @@ def test_settings_for_modal_gpu_preserves_other_runtime_settings(settings_module
     assert overridden_settings.modal_gpu == "H200"
     assert overridden_settings.app_name == base_settings.app_name
     assert overridden_settings.volume_name == base_settings.volume_name
+
+
+def test_modal_deployment_app_name_isolates_non_default_gpu_targets(
+    settings_module: Any,
+) -> None:
+    """Each non-default GPU should use a persistent app that cannot probe an A100 app."""
+    base_settings = settings_module.get_settings()
+
+    a100_settings = settings_module.settings_for_modal_gpu(base_settings, "A100")
+    b300_settings = settings_module.settings_for_modal_gpu(base_settings, "B300")
+    h100_settings = settings_module.settings_for_modal_gpu(base_settings, "H100")
+    priority_h100_settings = settings_module.settings_for_modal_gpu(base_settings, "H100!")
+
+    assert settings_module.modal_deployment_app_name(a100_settings) == base_settings.app_name
+    assert settings_module.modal_deployment_app_name(b300_settings) == (
+        f"{base_settings.app_name}-gpu-b300"
+    )
+    assert settings_module.modal_deployment_app_name(h100_settings).endswith("-gpu-h100")
+    assert settings_module.modal_deployment_app_name(priority_h100_settings).endswith(
+        "-gpu-h100-priority"
+    )
+
+
+def test_modal_deployment_app_name_stays_within_modal_object_name_limit(
+    settings_module: Any,
+) -> None:
+    """GPU-specific app identities should remain valid for a 64-character base app name."""
+    base_settings = settings_module.get_settings()
+    long_name_settings = replace(
+        base_settings,
+        app_name="a" * 64,
+        modal_gpu="RTX-PRO-6000",
+    )
+
+    deployment_app_name = settings_module.modal_deployment_app_name(long_name_settings)
+
+    assert len(deployment_app_name) <= 64
+    assert deployment_app_name.endswith("-gpu-rtx-pro-6000")
+    assert re.fullmatch(r"[a-zA-Z0-9-_.]+", deployment_app_name)
 
 
 def test_settings_generates_stable_per_comfyui_app_name(
