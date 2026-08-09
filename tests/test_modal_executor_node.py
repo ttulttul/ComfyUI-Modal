@@ -21,6 +21,8 @@ from typing import Any, Iterator
 
 import pytest
 
+DEFAULT_TEST_DEPLOYMENT_APP_NAME = "comfy-modal-sync-gpu-rtx-pro-6000"
+
 
 class _FakeOriginalNode:
     """Simple fake legacy node for proxy signature mirroring."""
@@ -3983,7 +3985,7 @@ def test_modal_cloud_existing_app_guard_uses_non_creating_sdk_lookup(
     with pytest.raises(modal_cloud_module.ExistingModalAppError) as exc_info:
         modal_cloud_module._guard_against_existing_modal_app(settings, fake_modal)
 
-    assert lookup_calls == [("comfy-modal-sync", False)]
+    assert lookup_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, False)]
     assert "Delete the existing app" in str(exc_info.value)
     assert "COMFY_MODAL_GPU" in str(exc_info.value)
 
@@ -4034,7 +4036,7 @@ def test_modal_cloud_existing_app_guard_falls_back_to_cli_json(
     completed = subprocess.CompletedProcess(
         args=["modal", "app", "list", "--json"],
         returncode=0,
-        stdout=json.dumps([{"name": "other"}, {"name": "comfy-modal-sync"}]),
+        stdout=json.dumps([{"name": "other"}, {"name": DEFAULT_TEST_DEPLOYMENT_APP_NAME}]),
         stderr="",
     )
     observed_commands: list[list[str]] = []
@@ -4471,7 +4473,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
-    assert deploy_calls == [("comfy-modal-sync", None)]
+    assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, None)]
     assert [
         (event["phase"], event["status_message"])
         for event in status_events
@@ -4645,7 +4647,9 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
     remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES[("comfy-modal-sync", "main")] = (
+    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES[
+        (DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")
+    ] = (
         remote_modal_app_module._ModalAutoDeployState(ready=True)
     )
     try:
@@ -4659,7 +4663,7 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
-    assert deploy_calls == [("comfy-modal-sync", "main")]
+    assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
 
 
 def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_invoke(
@@ -4755,7 +4759,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
-    assert deploy_calls == [("comfy-modal-sync", "main")]
+    assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
 
 
 def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
@@ -4849,7 +4853,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == {"component_id": "component-1::warmup:0"}
-    assert deploy_calls == [("comfy-modal-sync", "main")]
+    assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
 
 
 def test_remote_modal_replaces_out_of_date_deployed_app(
@@ -4958,8 +4962,8 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
-    assert stop_calls == ["comfy-modal-sync"]
-    assert deploy_calls == [("comfy-modal-sync", "main")]
+    assert stop_calls == [DEFAULT_TEST_DEPLOYMENT_APP_NAME]
+    assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
 
 
 def test_remote_modal_stops_app_through_experimental_sdk(
@@ -5259,7 +5263,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     assert thread_errors == []
     assert payload_response == [b"remote-response"]
     assert warmup_response == [{"component_id": "component-1"}]
-    assert deploy_calls == [("comfy-modal-sync", "main")]
+    assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
 
 
 def test_lookup_deployed_remote_engine_excludes_affinity_from_modal_class_parameters(
@@ -5278,7 +5282,7 @@ def test_lookup_deployed_remote_engine_excludes_affinity_from_modal_class_parame
             @staticmethod
             def from_name(app_name: str, class_name: str) -> Any:
                 """Return a factory that records the provided class parameters."""
-                assert app_name == "comfy-modal-sync"
+                assert app_name == DEFAULT_TEST_DEPLOYMENT_APP_NAME
                 assert class_name == "RemoteEngine"
 
                 def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
@@ -5367,7 +5371,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
             @staticmethod
             def from_name(app_name: str, class_name: str) -> Any:
                 """Return a factory that records the provided class parameters."""
-                assert app_name == "comfy-modal-sync"
+                assert app_name == DEFAULT_TEST_DEPLOYMENT_APP_NAME
                 assert class_name == "RemoteEngine"
 
                 def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
@@ -5430,7 +5434,7 @@ def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_w
             @staticmethod
             def from_name(app_name: str, class_name: str) -> Any:
                 """Return a factory that records the provided class parameters."""
-                assert app_name == "comfy-modal-sync"
+                assert app_name == DEFAULT_TEST_DEPLOYMENT_APP_NAME
                 assert class_name == "RemoteEngine"
 
                 def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
@@ -5491,7 +5495,7 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
             @staticmethod
             def from_name(app_name: str, class_name: str) -> Any:
                 """Return a factory that records the provided class parameters."""
-                assert app_name == "comfy-modal-sync"
+                assert app_name == DEFAULT_TEST_DEPLOYMENT_APP_NAME
                 assert class_name == "RemoteEngine"
 
                 def build_remote_engine(**kwargs: Any) -> dict[str, Any]:
@@ -5569,7 +5573,7 @@ def test_lookup_deployed_remote_engine_shares_profiled_identity_across_lane_over
             @staticmethod
             def from_name(app_name: str, class_name: str) -> Any:
                 """Return a factory that records the provided class parameters."""
-                assert app_name == "comfy-modal-sync"
+                assert app_name == DEFAULT_TEST_DEPLOYMENT_APP_NAME
                 assert class_name == "RemoteEngine"
 
                 def build_remote_engine(**kwargs: Any) -> dict[str, Any]:

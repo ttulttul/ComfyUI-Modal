@@ -44,7 +44,8 @@ MODAL_GPU_TYPES = (
 )
 WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal"
 WORKFLOW_MODAL_GPU_KEY = "gpu"
-_DEFAULT_MODAL_GPU = "A100"
+DEFAULT_MODAL_GPU = "RTX-PRO-6000"
+_LEGACY_BASE_APP_GPU = "A100"
 _MODAL_APP_NAME_MAX_LENGTH = 64
 _MODAL_GPU_SLUG_MAX_LENGTH = 28
 
@@ -124,7 +125,7 @@ class ModalSyncSettings:
     bridge_inline_max_bytes: int = 4 * 1024 * 1024
     invocation_result_inline_max_bytes: int = 4 * 1024 * 1024
     terminate_container_on_error: bool = True
-    modal_gpu: str = "A100"
+    modal_gpu: str = DEFAULT_MODAL_GPU
     scaledown_window_seconds: int = 600
     min_containers: int = 0
     max_containers: int | None = None
@@ -201,8 +202,8 @@ def _modal_gpu_app_slug(modal_gpu: str) -> str:
 
 def modal_deployment_app_name(settings: ModalSyncSettings) -> str:
     """Return the persistent Modal app name dedicated to the configured GPU target."""
-    modal_gpu = str(getattr(settings, "modal_gpu", _DEFAULT_MODAL_GPU)).strip()
-    if modal_gpu.upper() == _DEFAULT_MODAL_GPU:
+    modal_gpu = str(getattr(settings, "modal_gpu", DEFAULT_MODAL_GPU)).strip()
+    if modal_gpu.upper() == _LEGACY_BASE_APP_GPU:
         return settings.app_name
 
     suffix = f"-gpu-{_modal_gpu_app_slug(modal_gpu)}"
@@ -450,7 +451,7 @@ def _get_settings_cached(
         ),
         terminate_container_on_error=_read_bool_env("COMFY_MODAL_TERMINATE_CONTAINER_ON_ERROR")
         is not False,
-        modal_gpu=os.getenv("COMFY_MODAL_GPU", "A100").strip() or "A100",
+        modal_gpu=os.getenv("COMFY_MODAL_GPU", DEFAULT_MODAL_GPU).strip() or DEFAULT_MODAL_GPU,
         scaledown_window_seconds=_read_int_env("COMFY_MODAL_SCALEDOWN_WINDOW", 600),
         min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),
         max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),

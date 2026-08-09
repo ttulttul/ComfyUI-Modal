@@ -61,6 +61,20 @@ def test_settings_reads_modal_gpu_override(
     assert settings.modal_gpu == "L40S"
 
 
+def test_settings_defaults_modal_gpu_to_rtx_pro_6000(
+    settings_module: Any,
+) -> None:
+    """Backend settings should use the same RTX default as the workflow UI."""
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings_module.DEFAULT_MODAL_GPU == "RTX-PRO-6000"
+    assert settings.modal_gpu == "RTX-PRO-6000"
+
+
 def test_modal_gpu_from_workflow_prefers_saved_selection(settings_module: Any) -> None:
     """A saved workflow GPU should override the process-level fallback."""
     workflow = {"extra": {"comfy_modal": {"gpu": "B300"}}}
@@ -98,18 +112,22 @@ def test_settings_for_modal_gpu_preserves_other_runtime_settings(settings_module
     assert overridden_settings.volume_name == base_settings.volume_name
 
 
-def test_modal_deployment_app_name_isolates_non_default_gpu_targets(
+def test_modal_deployment_app_name_isolates_gpu_targets_from_legacy_a100_app(
     settings_module: Any,
 ) -> None:
-    """Each non-default GPU should use a persistent app that cannot probe an A100 app."""
+    """The RTX default should not probe the legacy A100 app retained at the base name."""
     base_settings = settings_module.get_settings()
 
+    rtx_settings = settings_module.settings_for_modal_gpu(base_settings, "RTX-PRO-6000")
     a100_settings = settings_module.settings_for_modal_gpu(base_settings, "A100")
     b300_settings = settings_module.settings_for_modal_gpu(base_settings, "B300")
     h100_settings = settings_module.settings_for_modal_gpu(base_settings, "H100")
     priority_h100_settings = settings_module.settings_for_modal_gpu(base_settings, "H100!")
 
     assert settings_module.modal_deployment_app_name(a100_settings) == base_settings.app_name
+    assert settings_module.modal_deployment_app_name(rtx_settings) == (
+        f"{base_settings.app_name}-gpu-rtx-pro-6000"
+    )
     assert settings_module.modal_deployment_app_name(b300_settings) == (
         f"{base_settings.app_name}-gpu-b300"
     )

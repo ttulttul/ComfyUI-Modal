@@ -61,6 +61,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     runtime_packages = runtime_environment_module.remote_runtime_packages()
     torch_packages = runtime_environment_module.remote_torch_packages()
 
+    assert runtime_environment_module.DEFAULT_MODAL_GPU == "RTX-PRO-6000"
     assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION >= 5
     assert runtime_environment_module.REMOTE_PYTHON_VERSION == "3.11"
     assert apt_packages == ("libgl1", "libglib2.0-0")

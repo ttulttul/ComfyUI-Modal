@@ -532,8 +532,8 @@ const workflowGraph = {
 };
 globalThis.__modalAppStub.rootGraph = workflowGraph;
 globalThis.__modalAppStub.graph.rootGraph = workflowGraph;
-assert.equal(modalToggle.selectedModalGpu(), "A100");
-assert.equal(workflowGraph.extra.comfy_modal.gpu, "A100");
+assert.equal(modalToggle.selectedModalGpu(), "RTX-PRO-6000");
+assert.equal(workflowGraph.extra.comfy_modal.gpu, "RTX-PRO-6000");
 
 modalToggle.setSelectedModalGpu("B300");
 assert.equal(modalToggle.selectedModalGpu(), "B300");

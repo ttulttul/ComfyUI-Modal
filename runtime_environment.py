@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+if __package__:
+    from .settings import DEFAULT_MODAL_GPU
+else:  # pragma: no cover - the stable cloud entrypoint imports this module top-level.
+    from settings import DEFAULT_MODAL_GPU
+
 logger = logging.getLogger(__name__)
 
 REMOTE_APP_PROTOCOL_VERSION = 6
@@ -218,7 +223,7 @@ def select_remote_torch_build(modal_gpu: str) -> RemoteTorchBuild:
     )
 
 
-def remote_torch_packages(modal_gpu: str = "A100") -> tuple[str, ...]:
+def remote_torch_packages(modal_gpu: str = DEFAULT_MODAL_GPU) -> tuple[str, ...]:
     """Return the exact PyTorch package set for one Modal GPU specification."""
     return select_remote_torch_build(modal_gpu).packages
 

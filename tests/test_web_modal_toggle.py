@@ -63,6 +63,13 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "function promptActiveNodeIsLive(promptId)" in source
 
 
+def test_frontend_defaults_modal_gpu_to_rtx_pro_6000() -> None:
+    """Unsaved workflows should receive the requested RTX GPU default."""
+    source = _modal_toggle_source()
+
+    assert 'const DEFAULT_MODAL_GPU = "RTX-PRO-6000";' in source
+
+
 def test_empty_modal_status_events_do_not_show_global_pill() -> None:
     """Queue requests without Modal-enabled nodes should not create global Modal UI state."""
     source = _modal_toggle_source()

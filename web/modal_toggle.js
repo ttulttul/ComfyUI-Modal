@@ -12,7 +12,7 @@ const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 const WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal";
 const WORKFLOW_MODAL_GPU_KEY = "gpu";
-const DEFAULT_MODAL_GPU = "A100";
+const DEFAULT_MODAL_GPU = "RTX-PRO-6000";
 const MODAL_GPU_TYPES = [
   "T4",
   "L4",
