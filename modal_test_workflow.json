@@ -464,6 +464,9 @@
   "groups": [],
   "config": {},
   "extra": {
+    "comfy_modal": {
+      "gpu": "RTX-PRO-6000"
+    },
     "workflowRendererVersion": "LG",
     "ds": {
       "scale": 0.8779288479164423,

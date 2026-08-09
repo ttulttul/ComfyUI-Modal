@@ -62,6 +62,7 @@ def test_modal_test_workflow_captures_known_working_remote_component() -> None:
 
     assert workflow_path.exists()
     assert workflow["version"] == 0.4
+    assert workflow["extra"]["comfy_modal"]["gpu"] == "RTX-PRO-6000"
     assert node_types_by_id[2] == "KSampler"
     assert node_types_by_id[7] == "UNETLoader"
     assert node_types_by_id[11] == "CLIPLoader"

@@ -302,5 +302,6 @@ def test_local_remote_result_materializer_returns_node_outputs(
 
     assert outputs == b"serialized-outputs"
     assert (
-        output_directory / "remote-ez7utL15S7Y-786123456-render.mp4"
+        output_directory
+        / "remote-ez7utL15S7Y-gpu-rtx-pro-6000-786123456-render.mp4"
     ).read_bytes() == b"encoded-video"
