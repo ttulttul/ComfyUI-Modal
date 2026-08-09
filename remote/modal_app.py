@@ -2740,6 +2740,7 @@ def _emit_local_modal_status(
     client_id: str | None,
     phase: str,
     node_ids: list[str],
+    modal_gpu: str | None = None,
     active_node_id: str | None = None,
     active_node_class_type: str | None = None,
     active_node_role: str | None = None,
@@ -2762,6 +2763,8 @@ def _emit_local_modal_status(
         "prompt_id": prompt_id,
         "node_ids": list(node_ids),
     }
+    if modal_gpu is not None:
+        payload["modal_gpu"] = modal_gpu
     if active_node_id is not None:
         payload["active_node_id"] = active_node_id
     if active_node_class_type is not None:
@@ -2811,6 +2814,11 @@ def _emit_local_remote_startup_status(
         client_id=client_id,
         phase=phase,
         node_ids=node_ids,
+        modal_gpu=(
+            str(payload["modal_gpu"])
+            if payload.get("modal_gpu") is not None
+            else None
+        ),
         status_message=status_message,
     )
 
@@ -3520,6 +3528,7 @@ def _consume_remote_payload_stream(
     extra_data = payload.get("extra_data") or {}
     client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
     node_ids = [str(node_id) for node_id in payload.get("component_node_ids", [])]
+    modal_gpu = str(payload["modal_gpu"]) if payload.get("modal_gpu") is not None else None
     suppress_status_stream = bool(payload.get("suppress_status_stream"))
     result_payload: bytes | bytearray | None = None
     suppressed_progress_node_metadata: dict[str, dict[str, str | None]] = {}
@@ -3794,6 +3803,7 @@ def _consume_remote_payload_stream(
                         client_id=client_id,
                         phase="finalizing",
                         node_ids=node_ids,
+                        modal_gpu=modal_gpu,
                         status_message="Receiving Modal outputs",
                     )
                     continue
@@ -3802,6 +3812,7 @@ def _consume_remote_payload_stream(
                     client_id=client_id,
                     phase=remote_phase,
                     node_ids=node_ids,
+                    modal_gpu=modal_gpu,
                     active_node_id=(
                         str(stream_event["active_node_id"])
                         if stream_event.get("active_node_id") is not None

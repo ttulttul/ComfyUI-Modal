@@ -115,7 +115,7 @@ Ordinary remote components without `Modal Map Input` still preserve ComfyUI's zi
 
 Mapped components can contain both one-time execute targets and per-item execute targets. For example, two remote samplers may share one upstream model loader while only one sampler fans out over latents. Modal-Sync keeps the invariant upstream work separate from the per-item work so the sibling branch still runs once.
 
-Mapped progress is summarized at the global status pill and representative node with counts such as `3/16`. Node-local bars remain reserved for real streamed node progress from executing remote nodes.
+Mapped progress is summarized at the global status pill and representative node with counts such as `3/16`. The global pill shows the workflow's selected GPU on a smaller second line throughout setup, app rebuilding, execution, and finalization. Node-local bars remain reserved for real streamed node progress from executing remote nodes.
 
 ## How Modal-Sync Works
 
