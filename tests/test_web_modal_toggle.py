@@ -311,6 +311,11 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "function clearNodeProgressLane(nodeIdValue, promptId, laneId)" in source
     assert "function clearNodeProgress(nodeIdValue, promptId)" in source
     assert "fadeNodeProgress(nodeIdValue, promptId);" in source
+    assert "function progressIterationRate(previousState, value, maxValue, updatedAt)" in source
+    assert "function formatIterationRate(iterationRate)" in source
+    assert "iterationRate: progressIterationRate(" in source
+    assert "formatIterationRate(laneProgress.iterationRate)" in source
+    assert "formatIterationRate(state.progress.iterationRate)" in source
     assert "state?.progress" in source
     assert "state?.progressLanes" in source
     assert "detail.lane_id != null" in source
