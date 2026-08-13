@@ -56,6 +56,7 @@ const transformedSource = `${[
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  currentGlobalStatus,",
+  "  formatIterationRate,",
   "  fadeNodeProgress,",
   "  markPromptQueuedBehindActiveModal,",
   "  isPromptQueuedBehindActiveModal,",
@@ -153,6 +154,84 @@ assert.equal(modalToggle.modalNodeStates.get("12")?.phase, modalToggle.STATE_REA
 assert.equal(modalToggle.modalNodeProgressLanes.has("11"), false);
 assert.equal(modalToggle.modalNodeProgressLanes.get("12")?.lanes.get("0")?.value, 3);
 assert.equal(modalToggle.getRemoteVisualState({ id: "12" })?.phase, modalToggle.STATE_ACTIVE);
+
+const originalDateNow = Date.now;
+let progressClockMs = 1_000;
+Date.now = () => progressClockMs;
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-rate", ["20"], [
+  {
+    representative_node_id: "20",
+    node_ids: ["20"],
+  },
+]);
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-rate",
+    node_id: "20",
+    value: 1,
+    max: 10,
+  },
+});
+assert.equal(modalToggle.modalNodeProgress.get("20")?.iterationRate, null);
+progressClockMs = 2_000;
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-rate",
+    node_id: "20",
+    value: 3,
+    max: 10,
+  },
+});
+assert.equal(modalToggle.modalNodeProgress.get("20")?.iterationRate, 2);
+progressClockMs = 3_000;
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-rate",
+    node_id: "20",
+    value: 7,
+    max: 10,
+  },
+});
+assert.equal(modalToggle.modalNodeProgress.get("20")?.iterationRate, 2.7);
+assert.equal(modalToggle.formatIterationRate(2.7), "2.70 it/s");
+assert.equal(modalToggle.formatIterationRate(42.34), "42.3 it/s");
+assert.equal(modalToggle.formatIterationRate(null), "— it/s");
+
+progressClockMs = 4_000;
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-lane-rate", ["21"], [
+  {
+    representative_node_id: "21",
+    node_ids: ["21"],
+  },
+]);
+for (const [laneId, value] of [["0", 1], ["1", 2]]) {
+  modalToggle.handleModalProgress({
+    detail: {
+      prompt_id: "prompt-lane-rate",
+      node_id: "21",
+      value,
+      max: 10,
+      lane_id: laneId,
+    },
+  });
+}
+progressClockMs = 5_000;
+for (const [laneId, value] of [["0", 3], ["1", 6]]) {
+  modalToggle.handleModalProgress({
+    detail: {
+      prompt_id: "prompt-lane-rate",
+      node_id: "21",
+      value,
+      max: 10,
+      lane_id: laneId,
+    },
+  });
+}
+assert.equal(modalToggle.modalNodeProgressLanes.get("21")?.lanes.get("0")?.iterationRate, 2);
+assert.equal(modalToggle.modalNodeProgressLanes.get("21")?.lanes.get("1")?.iterationRate, 4);
+Date.now = originalDateNow;
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-d", ["10", "11"], [

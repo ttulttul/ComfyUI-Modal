@@ -1,5 +1,9 @@
 # Learnings
 
+## 2026-08-13
+
+- Iteration-rate labels can be derived entirely from successive streamed `value`/`max` samples in the frontend, but refocus replay must use the backend event timestamps rather than replay arrival time or buffered events will produce artificially high `it/s` values. Track and smooth rates independently for ordinary node progress and every mapped worker lane.
+
 ## 2026-08-07
 
 - A workflow-level GPU choice has to survive beyond the queue request. ComfyUI executes rewritten proxies asynchronously after the HTTP handler returns, so the selected GPU must be stamped into every ordinary, mapped, split-phase, and proactive-warmup payload; consulting process settings later can silently deploy or invoke the wrong target.
