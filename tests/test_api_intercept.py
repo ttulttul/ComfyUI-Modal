@@ -1032,7 +1032,7 @@ def test_rewrite_anchors_terminal_artifact_only_remote_node(
 
     assert rewritten_prompt[finalizer_node_id] == {
         "class_type": modal_executor_module.MODAL_ARTIFACT_FINALIZER_NODE_ID,
-        "inputs": {"component_0": ["1", 0]},
+        "inputs": {"components.component_0": ["1", 0]},
         "_meta": {"title": "Modal Artifact Finalizer"},
     }
     finalizer_class = fake_nodes_module.NODE_CLASS_MAPPINGS[
@@ -1040,6 +1040,13 @@ def test_rewrite_anchors_terminal_artifact_only_remote_node(
     ]
     assert finalizer_class.GET_SCHEMA().is_output_node is True
     assert finalizer_class.OUTPUT_NODE is True
+    finalized_inputs, _hidden_inputs, _v3_data = (
+        modal_executor_module.io.get_finalized_class_inputs(
+            finalizer_class.INPUT_TYPES(),
+            rewritten_prompt[finalizer_node_id]["inputs"],
+        )
+    )
+    assert "components.component_0" in finalized_inputs["required"]
 
 
 def test_rewrite_strips_prompt_id_from_cache_safe_proxy_payload(
