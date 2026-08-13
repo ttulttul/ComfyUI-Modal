@@ -141,6 +141,23 @@ class _FakePreviewImageNode:
     OUTPUT_NODE = True
 
 
+class _FakeRemoteArtifactWriterNode:
+    """Fake terminal remote node that saves artifacts without ComfyUI outputs."""
+
+    RETURN_TYPES = ()
+    RETURN_NAMES = ()
+    OUTPUT_IS_LIST = ()
+    OUTPUT_NODE = False
+
+
+def _artifact_finalizer_node_id(summary: Any) -> str:
+    """Return the finalizer id after asserting that prompt rewrite attached it."""
+    finalizer_node_id = summary.artifact_finalizer_node_id
+    assert isinstance(finalizer_node_id, str)
+    assert finalizer_node_id
+    return finalizer_node_id
+
+
 def test_rewrite_remote_mode_rejects_local_sync_backend(
     api_intercept_module: Any,
     settings_module: Any,
@@ -907,7 +924,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
         extra_data={"extra_pnginfo": {"workflow": workflow}},
     )
 
-    assert set(rewritten_prompt) == {"1", "3"}
+    assert set(rewritten_prompt) == {"1", "3", _artifact_finalizer_node_id(summary)}
     rewritten_node = rewritten_prompt["1"]
     payload = rewritten_node["inputs"]["original_node_data"]
     assert rewritten_node["class_type"].startswith("ModalUniversalExecutor_")
@@ -938,6 +955,91 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
     assert len(summary.synced_assets) == 1
     assert summary.synced_assets[0].uploaded is True
+
+
+def test_rewrite_anchors_terminal_artifact_only_remote_node(
+    api_intercept_module: Any,
+    modal_executor_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A terminal remote side-effect node should remain executable through the finalizer."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_nodes_dir.mkdir()
+    (custom_nodes_dir / "__init__.py").write_text(
+        "NODE_CLASS_MAPPINGS = {}\n",
+        encoding="utf-8",
+    )
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteArtifactWriter": _FakeRemoteArtifactWriterNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {"nodes": [{"id": 1, "properties": {"is_modal_remote": True}}]}
+    prompt = {
+        "1": {
+            "class_type": "RemoteArtifactWriter",
+            "inputs": {},
+            "_meta": {"title": "Remote Artifact Writer"},
+        }
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    finalizer_node_id = _artifact_finalizer_node_id(summary)
+    assert set(rewritten_prompt) == {"1", finalizer_node_id}
+    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert payload["execute_node_ids"] == ["1"]
+    assert payload["boundary_outputs"] == []
+
+    proxy_class_type = rewritten_prompt["1"]["class_type"]
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_class_type]
+    proxy_schema = proxy_class.GET_SCHEMA()
+    assert [output.io_type for output in proxy_schema.outputs] == ["BOOLEAN"]
+    assert [output.display_name for output in proxy_schema.outputs] == [
+        modal_executor_module.MODAL_COMPONENT_COMPLETION_OUTPUT_NAME
+    ]
+
+    assert rewritten_prompt[finalizer_node_id] == {
+        "class_type": modal_executor_module.MODAL_ARTIFACT_FINALIZER_NODE_ID,
+        "inputs": {"component_0": ["1", 0]},
+        "_meta": {"title": "Modal Artifact Finalizer"},
+    }
+    finalizer_class = fake_nodes_module.NODE_CLASS_MAPPINGS[
+        modal_executor_module.MODAL_ARTIFACT_FINALIZER_NODE_ID
+    ]
+    assert finalizer_class.GET_SCHEMA().is_output_node is True
+    assert finalizer_class.OUTPUT_NODE is True
 
 
 def test_rewrite_strips_prompt_id_from_cache_safe_proxy_payload(
@@ -1162,7 +1264,7 @@ def test_rewrite_colocates_remote_chain_across_large_transportable_edges(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "3"}
+    assert set(rewritten_prompt) == {"1", "3", _artifact_finalizer_node_id(summary)}
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
@@ -1263,7 +1365,7 @@ def test_rewrite_colocates_sampler_decoders_and_video_assembly(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "8"}
+    assert set(rewritten_prompt) == {"1", "8", _artifact_finalizer_node_id(summary)}
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {
         "1": ["1", "2", "3", "4", "5", "6", "7"],
@@ -1367,7 +1469,12 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "3", "9"}
+    assert set(rewritten_prompt) == {
+        "1",
+        "3",
+        "9",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
@@ -1515,7 +1622,17 @@ def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "3", "7", "8", "9", "11", "90", "192"}
+    assert set(rewritten_prompt) == {
+        "1",
+        "3",
+        "7",
+        "8",
+        "9",
+        "11",
+        "90",
+        "192",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
     assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
@@ -1613,7 +1730,13 @@ def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "2", "3", "4"}
+    assert set(rewritten_prompt) == {
+        "1",
+        "2",
+        "3",
+        "4",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_component_ids == ["1", "2"]
     assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
     assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
@@ -2015,7 +2138,7 @@ def test_rewrite_merges_cyclic_coarse_components_back_into_single_proxy(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "4"}
+    assert set(rewritten_prompt) == {"1", "4", _artifact_finalizer_node_id(summary)}
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {"1": ["1", "2", "3"]}
     payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
@@ -2118,7 +2241,12 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "2", "4"}
+    assert set(rewritten_prompt) == {
+        "1",
+        "2",
+        "4",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_component_ids == ["2"]
     payload = rewritten_prompt["2"]["inputs"]["original_node_data"]
     assert payload["payload_kind"] == "mapped_subgraph"
@@ -2251,7 +2379,13 @@ def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "2", "3", "4"}
+    assert set(rewritten_prompt) == {
+        "1",
+        "2",
+        "3",
+        "4",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_component_ids == ["3"]
     payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
     assert payload["payload_kind"] == "mapped_subgraph"
@@ -2403,7 +2537,15 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "1__mapped", "2", "4", "5", "8"}
+    assert set(rewritten_prompt) == {
+        "1",
+        "1__mapped",
+        "2",
+        "4",
+        "5",
+        "8",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_component_ids == ["1", "1__mapped"]
     assert summary.component_node_ids_by_representative == {
         "1": ["1", "3"],
@@ -2710,7 +2852,14 @@ def test_rewrite_keeps_unmapped_remote_siblings_without_local_reentry_together(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "2", "4", "5", "7"}
+    assert set(rewritten_prompt) == {
+        "1",
+        "2",
+        "4",
+        "5",
+        "7",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {
         "1": ["1", "3", "6"],
@@ -3079,7 +3228,7 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
         nodes_module=fake_nodes_module,
     )
 
-    assert list(rewritten_prompt) == ["1"]
+    assert list(rewritten_prompt) == ["1", _artifact_finalizer_node_id(summary)]
     assert summary.remote_node_ids == ["1", "2"]
     assert summary.remote_component_ids == ["1"]
 
@@ -3161,7 +3310,7 @@ def test_rewrite_detects_remote_marker_inside_nested_subgraph_workflow(
         nodes_module=fake_nodes_module,
     )
 
-    assert list(rewritten_prompt) == ["99", "4"]
+    assert list(rewritten_prompt) == ["99", "4", _artifact_finalizer_node_id(summary)]
     assert rewritten_prompt["4"]["inputs"]["latent"] == ["99", 0]
     assert summary.remote_node_ids == ["99"]
     assert summary.remote_component_ids == ["99"]
@@ -3243,7 +3392,7 @@ def test_rewrite_detects_marked_inner_subgraph_prompt_node_ids(
         nodes_module=fake_nodes_module,
     )
 
-    assert list(rewritten_prompt) == ["24:23"]
+    assert list(rewritten_prompt) == ["24:23", _artifact_finalizer_node_id(summary)]
     assert summary.remote_node_ids == ["24:23", "30"]
     assert summary.remote_component_ids == ["24:23"]
 
@@ -3333,7 +3482,7 @@ def test_rewrite_auto_expands_upstream_non_transportable_dependencies(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "4"}
+    assert set(rewritten_prompt) == {"1", "4", _artifact_finalizer_node_id(summary)}
     assert summary.remote_node_ids == ["1", "2", "3"]
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {"1": ["1", "2", "3"]}
@@ -3857,7 +4006,12 @@ def test_rewrite_keeps_nested_remote_nodes_remote_when_root_ids_collide(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"27", "195:27", "223"}
+    assert set(rewritten_prompt) == {
+        "27",
+        "195:27",
+        "223",
+        _artifact_finalizer_node_id(summary),
+    }
     assert summary.remote_node_ids == ["195:27", "222"]
     assert summary.remote_component_ids == ["195:27"]
 

@@ -601,6 +601,78 @@ def test_dynamic_proxy_node_preserves_output_signature(
     assert proxy_class.INPUT_IS_LIST is True
 
 
+def test_component_proxy_emits_completion_token_after_remote_execution(
+    modal_executor_module: Any,
+) -> None:
+    """Artifact-only component proxies should expose completion after remote work returns."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    proxy_node_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=(),
+        output_names=(),
+        output_is_list=(),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+        include_completion_output=True,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    schema = proxy_class.GET_SCHEMA()
+
+    assert [output.io_type for output in schema.outputs] == ["BOOLEAN"]
+    assert [output.display_name for output in schema.outputs] == [
+        modal_executor_module.MODAL_COMPONENT_COMPLETION_OUTPUT_NAME
+    ]
+
+    class FakeClient:
+        """Return no remote boundary values for an artifact-only component."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[()]:
+            """Confirm the remote component ran before returning no boundary outputs."""
+            assert payload["component_id"] == "artifact-component"
+            assert kwargs == {}
+            return ()
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        result = asyncio.run(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "artifact-prompt",
+                    "component_id": "artifact-component",
+                },
+                unique_id="artifact-component",
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert result.result == (True,)
+
+
+def test_modal_artifact_finalizer_requires_completed_components(
+    modal_executor_module: Any,
+) -> None:
+    """The internal output sink should reject any missing completion signal."""
+    schema = modal_executor_module.ModalArtifactFinalizer.GET_SCHEMA()
+
+    assert schema.is_output_node is True
+    assert schema.outputs == []
+    assert modal_executor_module.ModalArtifactFinalizer.execute(
+        {"component_0": True, "component_1": True}
+    ).result is None
+    with pytest.raises(RuntimeError, match="component_1"):
+        modal_executor_module.ModalArtifactFinalizer.execute(
+            {"component_0": True, "component_1": False}
+        )
+
+
 def test_proxy_execution_uses_injected_remote_client(
     modal_executor_module: Any,
 ) -> None:
@@ -8755,7 +8827,8 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
 
     assert static_outputs[0] == "static-latent"
     assert session_state_module.is_remote_session_bridge_ref_payload(static_outputs[1])
-    assert mapped_outputs == ("mapped-latent",)
+    assert static_outputs[2] is True
+    assert mapped_outputs == ("mapped-latent", True)
     assert observed_order == [
         "static_proxy_finish",
         "mapped_proxy_start",

@@ -17,7 +17,11 @@ from typing import Any, Iterator, Mapping
 from aiohttp import web
 
 from .modal_executor_node import (
+    MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
+    MODAL_ARTIFACT_FINALIZER_NODE_ID,
+    MODAL_COMPONENT_COMPLETION_OUTPUT_NAME,
     MODAL_MAP_INPUT_NODE_ID,
+    ensure_modal_artifact_finalizer_registered,
     ensure_modal_component_proxy_node_registered,
     register_cache_friendly_proxy_payload,
     register_modal_map_input_warmup_context,
@@ -178,6 +182,7 @@ class RewriteSummary:
     rewritten_node_id_map: dict[str, str] = field(default_factory=dict)
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
+    artifact_finalizer_node_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2003,10 +2008,16 @@ def _build_component_plan(
                 boundary_inputs_by_source[source] = spec
             spec.targets.append(InputTarget(node_id=node_id, input_name=str(input_name)))
 
+        has_downstream_consumer = False
         for output_index, io_type in enumerate(output_types):
             source = LinkedOutputRef(node_id=node_id, output_index=output_index)
+            output_consumers = consumers.get(source, [])
+            if output_consumers:
+                has_downstream_consumer = True
             local_consumers = [
-                consumer for consumer in consumers.get(source, []) if consumer.node_id not in component_node_id_set
+                consumer
+                for consumer in output_consumers
+                if consumer.node_id not in component_node_id_set
             ]
             if not local_consumers:
                 continue
@@ -2024,6 +2035,9 @@ def _build_component_plan(
                     local_consumers=local_consumers,
                 ),
             )
+
+        if not has_downstream_consumer:
+            output_execution_targets.add(node_id)
 
     mapped_boundary_spec: BoundaryInputSpec | None = None
     mapped_boundary_input_io_type: str | None = None
@@ -3398,6 +3412,7 @@ def _rewrite_component_into_proxy(
             output_is_list=tuple(bool(output.get("is_list", False)) for output in boundary_outputs),
             nodes_module=nodes_module,
             is_output_node=is_output_node,
+            include_completion_output=True,
         )
         proxy_inputs["original_node_data"] = register_cache_friendly_proxy_payload(
             prompt_node_id,
@@ -3599,6 +3614,7 @@ def _rewrite_component_into_proxy(
         output_is_list=tuple(spec.is_list for spec in component.boundary_outputs),
         nodes_module=nodes_module,
         is_output_node=component.contains_output_node,
+        include_completion_output=True,
     )
     representative_node_id = component.representative_node_id
     proxy_inputs = proxy_inputs_for_boundary_inputs(list(payload.get("boundary_inputs", [])))
@@ -3640,6 +3656,79 @@ def _rewrite_component_into_proxy(
         proxy_node_id,
     )
     return [representative_node_id]
+
+
+def _modal_component_completion_output_index(
+    *,
+    proxy_node_id: str,
+    rewritten_prompt: dict[str, Any],
+    nodes_module: Any,
+) -> int:
+    """Return the synthetic completion-token output index for one Modal proxy."""
+    prompt_node = rewritten_prompt.get(proxy_node_id)
+    if prompt_node is None:
+        raise ModalPromptValidationError(
+            f"Modal proxy node {proxy_node_id!r} is missing before artifact finalization."
+        )
+    class_type = str(prompt_node.get("class_type"))
+    node_class = nodes_module.NODE_CLASS_MAPPINGS.get(class_type)
+    if node_class is None:
+        raise ModalPromptValidationError(
+            f"Modal proxy class {class_type!r} is not registered before artifact finalization."
+        )
+    _output_types, output_names, _output_is_list = _normalize_output_metadata(node_class)
+    try:
+        return output_names.index(MODAL_COMPONENT_COMPLETION_OUTPUT_NAME)
+    except ValueError as exc:
+        raise ModalPromptValidationError(
+            f"Modal proxy {proxy_node_id!r} does not expose its completion token."
+        ) from exc
+
+
+def _attach_modal_artifact_finalizer(
+    *,
+    rewritten_prompt: dict[str, Any],
+    remote_component_ids: list[str],
+    nodes_module: Any,
+) -> str:
+    """Attach one internal output sink to every rewritten Modal component."""
+    if not remote_component_ids:
+        raise ModalPromptValidationError(
+            "Modal artifact finalization requires at least one remote component."
+        )
+    if len(remote_component_ids) > MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS:
+        raise ModalPromptValidationError(
+            "Modal artifact finalization supports at most "
+            f"{MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS} remote components per prompt."
+        )
+
+    ensure_modal_artifact_finalizer_registered(nodes_module)
+    finalizer_node_id = f"__{MODAL_ARTIFACT_FINALIZER_NODE_ID}__"
+    while finalizer_node_id in rewritten_prompt:
+        finalizer_node_id = f"{finalizer_node_id}_proxy"
+
+    finalizer_inputs = {
+        f"component_{component_index}": [
+            proxy_node_id,
+            _modal_component_completion_output_index(
+                proxy_node_id=proxy_node_id,
+                rewritten_prompt=rewritten_prompt,
+                nodes_module=nodes_module,
+            ),
+        ]
+        for component_index, proxy_node_id in enumerate(remote_component_ids)
+    }
+    rewritten_prompt[finalizer_node_id] = {
+        "class_type": MODAL_ARTIFACT_FINALIZER_NODE_ID,
+        "inputs": finalizer_inputs,
+        "_meta": {"title": "Modal Artifact Finalizer"},
+    }
+    logger.info(
+        "Attached Modal artifact finalizer %s to remote components %s.",
+        finalizer_node_id,
+        remote_component_ids,
+    )
+    return finalizer_node_id
 
 
 def rewrite_prompt_for_modal(
@@ -3819,6 +3908,12 @@ def rewrite_prompt_for_modal(
             summary.rewritten_node_id_map[node_id] = proxy_node_ids[0]
         if component.mapped_boundary_input_name:
             mapped_proxy_component_ids.add(proxy_node_ids[0])
+
+    summary.artifact_finalizer_node_id = _attach_modal_artifact_finalizer(
+        rewritten_prompt=rewritten_prompt,
+        remote_component_ids=summary.remote_component_ids,
+        nodes_module=resolved_nodes_module,
+    )
 
     proxy_component_groups = {
         component_id: {component_id}
