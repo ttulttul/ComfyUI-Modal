@@ -19,6 +19,9 @@ from .serialization import deserialize_node_outputs, serialize_node_inputs, spli
 
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
+MODAL_ARTIFACT_FINALIZER_NODE_ID = "ModalArtifactFinalizer"
+MODAL_COMPONENT_COMPLETION_OUTPUT_NAME = "modal_component_complete"
+MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS = 100
 _PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
 _VOLATILE_PROXY_CACHE_KEYS = frozenset(
     {
@@ -497,6 +500,7 @@ def _build_proxy_node_class(
     output_is_list: tuple[bool, ...],
     *,
     is_output_node: bool,
+    include_completion_output: bool = False,
 ) -> type[io.ComfyNode]:
     """Create a v3 proxy node that mirrors an original node output signature."""
 
@@ -512,6 +516,12 @@ def _build_proxy_node_class(
                 _output_spec(io_type, name, is_list)
                 for io_type, name, is_list in zip(output_types, output_names, output_is_list, strict=False)
             ]
+            if include_completion_output:
+                outputs.append(
+                    io.Boolean.Output(
+                        display_name=MODAL_COMPONENT_COMPLETION_OUTPUT_NAME,
+                    )
+                )
             return io.Schema(
                 node_id=node_id,
                 display_name=proxy_display_name,
@@ -553,6 +563,8 @@ def _build_proxy_node_class(
                 payload.get("payload_kind"),
                 len(outputs),
             )
+            if include_completion_output:
+                return io.NodeOutput(*outputs, True)
             return io.NodeOutput(*outputs)
 
     _DynamicModalExecutor.__name__ = f"DynamicModalExecutor_{node_id}"
@@ -596,6 +608,7 @@ def ensure_modal_component_proxy_node_registered(
     nodes_module: Any,
     *,
     is_output_node: bool,
+    include_completion_output: bool = False,
 ) -> str:
     """Register and return a proxy node id for a remote component signature."""
     normalized_output_types = tuple(output_types)
@@ -603,7 +616,8 @@ def ensure_modal_component_proxy_node_registered(
     normalized_output_is_list = tuple(output_is_list)
     proxy_node_id = _proxy_node_id(
         "ModalRemoteComponent",
-        normalized_output_types + (str(is_output_node),),
+        normalized_output_types
+        + (str(is_output_node), str(include_completion_output)),
     )
 
     if proxy_node_id in _PROXY_NODE_CACHE:
@@ -619,12 +633,23 @@ def ensure_modal_component_proxy_node_registered(
         output_names=normalized_output_names,
         output_is_list=normalized_output_is_list,
         is_output_node=is_output_node,
+        include_completion_output=include_completion_output,
     )
     nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = proxy_class
     nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Remote Component"
     _PROXY_NODE_CACHE[proxy_node_id] = proxy_class
     logger.info("Registered Modal component proxy node %s", proxy_node_id)
     return proxy_node_id
+
+
+def ensure_modal_artifact_finalizer_registered(nodes_module: Any) -> None:
+    """Register the internal artifact-finalization sink in a ComfyUI node mapping."""
+    nodes_module.NODE_CLASS_MAPPINGS[MODAL_ARTIFACT_FINALIZER_NODE_ID] = (
+        ModalArtifactFinalizer
+    )
+    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[MODAL_ARTIFACT_FINALIZER_NODE_ID] = (
+        "Modal Artifact Finalizer"
+    )
 
 
 class ModalUniversalExecutor(io.ComfyNode):
@@ -686,3 +711,55 @@ class ModalMapInput(io.ComfyNode):
             value,
         )
         return io.NodeOutput(value)
+
+
+class ModalArtifactFinalizer(io.ComfyNode):
+    """Internal output sink that anchors remote execution and artifact materialization."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        """Accept one completion token from every rewritten terminal Modal component."""
+        completion_template = io.Autogrow.TemplatePrefix(
+            input=io.Boolean.Input("completion", force_input=True),
+            prefix="component_",
+            min=1,
+            max=MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
+        )
+        return io.Schema(
+            node_id=MODAL_ARTIFACT_FINALIZER_NODE_ID,
+            display_name="Modal Artifact Finalizer",
+            category="Modal",
+            description=(
+                "Internal output sink inserted into rewritten prompts so Modal components "
+                "run and materialize their remote output artifacts locally."
+            ),
+            inputs=[
+                io.Autogrow.Input(
+                    "components",
+                    template=completion_template,
+                )
+            ],
+            outputs=[],
+            is_output_node=True,
+            is_dev_only=True,
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, components: io.Autogrow.Type) -> io.NodeOutput:
+        """Confirm every upstream Modal component completed before the prompt finishes."""
+        incomplete_component_names = [
+            str(component_name)
+            for component_name, completed in components.items()
+            if completed is not True
+        ]
+        if incomplete_component_names:
+            raise RuntimeError(
+                "Modal artifact finalization received incomplete component tokens: "
+                f"{incomplete_component_names}."
+            )
+        logger.info(
+            "Modal artifact finalization completed after %d remote component(s).",
+            len(components),
+        )
+        return io.NodeOutput()
