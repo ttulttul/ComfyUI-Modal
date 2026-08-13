@@ -3708,7 +3708,7 @@ def _attach_modal_artifact_finalizer(
         finalizer_node_id = f"{finalizer_node_id}_proxy"
 
     finalizer_inputs = {
-        f"component_{component_index}": [
+        f"components.component_{component_index}": [
             proxy_node_id,
             _modal_component_completion_output_index(
                 proxy_node_id=proxy_node_id,
