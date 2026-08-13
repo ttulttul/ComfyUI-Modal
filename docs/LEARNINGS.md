@@ -3,6 +3,7 @@
 ## 2026-08-13
 
 - Iteration-rate labels can be derived entirely from successive streamed `value`/`max` samples in the frontend, but refocus replay must use the backend event timestamps rather than replay arrival time or buffered events will produce artificially high `it/s` values. Track and smooth rates independently for ordinary node progress and every mapped worker lane.
+- A fast prompt can emit `execution_success` and clear its frontend state before the queue route's successful HTTP response is processed. Queue-response UI reconciliation must treat a `null` prompt state as an already-terminal success and avoid recreating ready/waiting visuals or converting completion into a frontend `TypeError`.
 
 ## 2026-08-07
 

@@ -46,6 +46,8 @@ const transformedSource = `${[
   "  handleModalStatus,",
   "  handleExecutionPhase,",
   "  handlePromptInterruption,",
+  "  markPromptTerminal,",
+  "  patchQueuePrompt,",
   "  setRemoteFlag,",
   "  setAllEligibleWorkflowNodesRemote,",
   "  selectedModalGpu,",
@@ -646,6 +648,36 @@ modalToggle.handleModalProgress({
   },
 });
 assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, "B300");
+
+resetFrontendState();
+globalThis.__modalApiStub.__modalQueuePromptPatched = false;
+globalThis.__modalApiStub.clientId = "client-fast";
+globalThis.__modalApiStub.fetchApi = async (_route, options) => {
+  const requestBody = JSON.parse(options.body);
+  modalToggle.markPromptTerminal(requestBody.prompt_id, "execution_success");
+  modalToggle.clearPromptRemoteStates(requestBody.prompt_id);
+  return {
+    status: 200,
+    async json() {
+      return {
+        prompt_id: requestBody.prompt_id,
+        modal_remote_node_ids: ["80"],
+        modal_components: [],
+        modal_gpu: "B300",
+      };
+    },
+  };
+};
+modalToggle.patchQueuePrompt();
+const fastPromptResponse = await globalThis.__modalApiStub.queuePrompt(0, {
+  output: {},
+  workflow: {
+    extra: { comfy_modal: { gpu: "B300" } },
+    nodes: [{ id: 80, properties: { is_modal_remote: true } }],
+  },
+});
+assert.equal(fastPromptResponse.modal_gpu, "B300");
+assert.equal(modalToggle.modalNodeStates.has("80"), false);
 
 class MenuNode {}
 const menuNode = new MenuNode();
