@@ -257,6 +257,7 @@ def test_queue_success_marks_all_remote_nodes_ready_before_component_execution()
     assert "const resolvedRemoteNodeIds = (responsePayload.modal_remote_node_ids ?? []).map((nodeIdValue) =>" in source
     assert "const resolvedComponents = Array.isArray(responsePayload.modal_components)" in source
     assert "registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);" in source
+    assert "if (!promptState) {\n          return responsePayload;\n        }" in source
     assert "endSyntheticExecutionUi(promptId);" in source
     assert 'setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {' in source
     assert 'message: "Waiting for Modal startup",' in source

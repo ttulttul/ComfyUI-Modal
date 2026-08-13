@@ -3865,6 +3865,9 @@ function patchQueuePrompt() {
           registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);
         }
         const promptState = ensurePromptState(promptId);
+        if (!promptState) {
+          return responsePayload;
+        }
         const acceptedRemoteNodeIds =
           promptState.remoteNodeIds.length > 0 ? promptState.remoteNodeIds : remoteNodeIds;
         if (!isPromptQueuedBehindActiveModal(promptId)) {
