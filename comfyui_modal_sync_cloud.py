@@ -4540,8 +4540,11 @@ def _summarize_suspicious_prompt_inputs(prompt: dict[str, Any]) -> list[str]:
     return findings
 
 
-def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
-    """Return one node class's declared V1 input types keyed by input name."""
+def _node_input_types(
+    node_class: type[Any],
+    live_inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return one node class's input schema finalized for the live prompt inputs."""
     input_types_callable = getattr(node_class, "INPUT_TYPES", None)
     if not callable(input_types_callable):
         return {}
@@ -4550,9 +4553,46 @@ def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
     if not isinstance(raw_input_types, dict):
         return {}
 
+    has_v3_dynamic_inputs = any(
+        isinstance(input_config, tuple)
+        and bool(input_config)
+        and isinstance(input_config[0], str)
+        and input_config[0].startswith("COMFY_")
+        and input_config[0].endswith("_V3")
+        for section_name in ("required", "optional")
+        for input_config in (
+            raw_input_types.get(section_name, {}).values()
+            if isinstance(raw_input_types.get(section_name), dict)
+            else ()
+        )
+    )
+    if not has_v3_dynamic_inputs:
+        return raw_input_types
+
+    from comfy_api.latest import _io
+
+    finalized_input_types, _, _ = _io.get_finalized_class_inputs(
+        raw_input_types,
+        live_inputs or {},
+    )
+    logger.debug(
+        "Finalized V3 input schema for %s against prompt inputs %s.",
+        node_class.__name__,
+        sorted(str(input_name) for input_name in (live_inputs or {})),
+    )
+    return finalized_input_types
+
+
+def _node_input_type_map(
+    node_class: type[Any],
+    live_inputs: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Return one node class's finalized input types keyed by prompt input name."""
+    input_types = _node_input_types(node_class, live_inputs)
+
     input_type_map: dict[str, str] = {}
     for section_name in ("required", "optional", "hidden"):
-        section = raw_input_types.get(section_name)
+        section = input_types.get(section_name)
         if not isinstance(section, dict):
             continue
         for input_name, input_config in section.items():
@@ -4564,17 +4604,12 @@ def _node_input_type_map(node_class: type[Any]) -> dict[str, str]:
     return input_type_map
 
 
-def _node_required_input_names(node_class: type[Any]) -> set[str]:
-    """Return the declared required input names for one node class."""
-    input_types_callable = getattr(node_class, "INPUT_TYPES", None)
-    if not callable(input_types_callable):
-        return set()
-
-    raw_input_types = input_types_callable()
-    if not isinstance(raw_input_types, dict):
-        return set()
-
-    required_inputs = raw_input_types.get("required")
+def _node_required_input_names(
+    node_class: type[Any],
+    live_inputs: dict[str, Any] | None = None,
+) -> set[str]:
+    """Return required input names after expanding V3 dynamic prompt inputs."""
+    required_inputs = _node_input_types(node_class, live_inputs).get("required")
     if not isinstance(required_inputs, dict):
         return set()
     return {str(input_name) for input_name in required_inputs}
@@ -4627,10 +4662,10 @@ def _coerce_prompt_primitive_input_values(
         node_class = node_mapping.get(class_type)
         if node_class is None:
             continue
-        input_type_map = _node_input_type_map(node_class)
+        inputs = prompt_node.get("inputs") or {}
+        input_type_map = _node_input_type_map(node_class, inputs)
         if not input_type_map:
             continue
-        inputs = prompt_node.get("inputs") or {}
         for input_name, input_value in list(inputs.items()):
             declared_type = input_type_map.get(str(input_name))
             if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
@@ -4677,10 +4712,11 @@ def _validate_prompt_input_shapes(
         node_class = node_mapping.get(class_type)
         if node_class is None:
             continue
-        input_type_map = _node_input_type_map(node_class)
+        inputs = prompt_node.get("inputs") or {}
+        input_type_map = _node_input_type_map(node_class, inputs)
         if not input_type_map:
             continue
-        for input_name, input_value in (prompt_node.get("inputs") or {}).items():
+        for input_name, input_value in inputs.items():
             declared_type = input_type_map.get(str(input_name))
             if declared_type not in _PRIMITIVE_WIDGET_INPUT_TYPES:
                 continue
@@ -4717,7 +4753,9 @@ def _validate_required_prompt_inputs(
         if node_class is None:
             continue
         inputs = prompt_node.get("inputs") or {}
-        missing_inputs = sorted(_node_required_input_names(node_class) - set(inputs.keys()))
+        missing_inputs = sorted(
+            _node_required_input_names(node_class, inputs) - set(inputs.keys())
+        )
         if not missing_inputs:
             continue
         raise RemoteSubgraphExecutionError(
