@@ -601,6 +601,56 @@ def test_dynamic_proxy_node_preserves_output_signature(
     assert proxy_class.INPUT_IS_LIST is True
 
 
+def test_component_proxy_cache_distinguishes_scheduler_list_outputs(
+    modal_executor_module: Any,
+) -> None:
+    """Mapped list proxies must not reuse a cached scalar-output proxy class."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+
+    scalar_proxy_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=("LATENT",),
+        output_names=("samples",),
+        output_is_list=(False,),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+    )
+    list_proxy_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=("LATENT",),
+        output_names=("samples",),
+        output_is_list=(True,),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+    )
+
+    assert scalar_proxy_id != list_proxy_id
+    assert fake_nodes_module.NODE_CLASS_MAPPINGS[scalar_proxy_id].OUTPUT_IS_LIST == [False]
+    assert fake_nodes_module.NODE_CLASS_MAPPINGS[list_proxy_id].OUTPUT_IS_LIST == [True]
+
+
+def test_mapped_boundary_payload_requests_scheduler_list_output(
+    api_intercept_module: Any,
+) -> None:
+    """Explicit mapped outputs should tell the local proxy to expose ComfyUI list semantics."""
+    boundary_output = api_intercept_module.BoundaryOutputSpec(
+        proxy_output_name="sampler_samples",
+        source=api_intercept_module.LinkedOutputRef(node_id="12", output_index=0),
+        io_type="LATENT",
+        is_list=False,
+    )
+
+    payload = api_intercept_module._boundary_output_payload(
+        boundary_output,
+        mapped_output=True,
+    )
+
+    assert payload["mapped_output"] is True
+    assert payload["scheduler_is_list"] is True
+    assert api_intercept_module._proxy_boundary_output_is_list(payload) is True
+
+
 def test_component_proxy_emits_completion_token_after_remote_execution(
     modal_executor_module: Any,
 ) -> None:
@@ -7467,6 +7517,43 @@ def test_invoke_mapped_remote_engine_async_runs_explicit_mapped_phase_items(
     assert progress_updates[0]["value"] == 0.0
     assert progress_updates[0].get("lane_id") is None
     assert progress_updates[-1]["value"] == 4.0
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name", "aggregate_function_name"),
+    [
+        ("remote_modal_app_module", "_aggregate_mapped_outputs"),
+        ("modal_cloud_module", "_aggregate_mapped_phase_outputs"),
+    ],
+)
+def test_mapped_latent_aggregation_preserves_scheduler_items_when_shapes_differ(
+    request: Any,
+    module_fixture_name: str,
+    aggregate_function_name: str,
+) -> None:
+    """Both execution paths should return heterogeneous LATENT values as scheduler items."""
+    torch = pytest.importorskip("torch")
+    target_module = request.getfixturevalue(module_fixture_name)
+    aggregate_outputs = getattr(target_module, aggregate_function_name)
+    first_latent = {"samples": torch.zeros((1, 4, 32, 32), dtype=torch.float32)}
+    second_latent = {"samples": torch.zeros((1, 4, 35, 35), dtype=torch.float32)}
+    payload = {
+        "boundary_outputs": [
+            {
+                "io_type": "LATENT",
+                "is_list": False,
+                "mapped_output": True,
+                "scheduler_is_list": True,
+            }
+        ]
+    }
+
+    result = aggregate_outputs([(first_latent,), (second_latent,)], payload)
+
+    assert len(result) == 1
+    assert len(result[0]) == 2
+    assert result[0][0] is first_latent
+    assert result[0][1] is second_latent
 
 
 def test_invoke_mapped_remote_engine_async_splits_int_inputs_for_direct_targets(

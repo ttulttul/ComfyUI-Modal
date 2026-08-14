@@ -34,7 +34,7 @@ from ..serialization import (
     deserialize_node_inputs,
     deserialize_node_outputs,
     is_mapped_output_value,
-    join_mapped_values,
+    join_mapped_values_for_scheduler,
     serialize_mapping,
     serialize_node_inputs,
     serialize_node_outputs,
@@ -4326,10 +4326,11 @@ def _aggregate_mapped_outputs(
     for output_index in range(output_count):
         boundary_output = boundary_outputs[output_index] if output_index < len(boundary_outputs) else {}
         aggregated_outputs.append(
-            join_mapped_values(
+            join_mapped_values_for_scheduler(
                 [item_outputs[output_index] for item_outputs in per_item_outputs],
                 io_type=str(boundary_output.get("io_type", "*")),
                 is_list=bool(boundary_output.get("is_list", False)),
+                scheduler_is_list=bool(boundary_output.get("scheduler_is_list", False)),
             )
         )
     return tuple(aggregated_outputs)

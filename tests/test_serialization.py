@@ -336,3 +336,37 @@ def test_join_mapped_latents_falls_back_to_list_when_shapes_differ(
     assert len(rejoined) == 2
     assert rejoined[0]["samples"].shape == (1, 4, 32, 32)
     assert rejoined[1]["samples"].shape == (1, 4, 35, 35)
+
+
+def test_join_mapped_latents_adapts_batches_to_scheduler_list_contract(
+    serialization_module: Any,
+) -> None:
+    """Mapped LATENT proxies should expose one batch item or several heterogeneous items."""
+    torch = pytest.importorskip("torch")
+    compatible_latents = [
+        {"samples": torch.zeros((1, 4, 32, 32), dtype=torch.float32)},
+        {"samples": torch.ones((1, 4, 32, 32), dtype=torch.float32)},
+    ]
+    heterogeneous_latents = [
+        compatible_latents[0],
+        {"samples": torch.ones((1, 4, 35, 35), dtype=torch.float32)},
+    ]
+
+    compatible_result = serialization_module.join_mapped_values_for_scheduler(
+        compatible_latents,
+        "LATENT",
+        is_list=False,
+        scheduler_is_list=True,
+    )
+    heterogeneous_result = serialization_module.join_mapped_values_for_scheduler(
+        heterogeneous_latents,
+        "LATENT",
+        is_list=False,
+        scheduler_is_list=True,
+    )
+
+    assert len(compatible_result) == 1
+    assert compatible_result[0]["samples"].shape == (2, 4, 32, 32)
+    assert len(heterogeneous_result) == 2
+    assert heterogeneous_result[0]["samples"].shape == (1, 4, 32, 32)
+    assert heterogeneous_result[1]["samples"].shape == (1, 4, 35, 35)

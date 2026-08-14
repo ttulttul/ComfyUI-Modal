@@ -617,6 +617,8 @@ def ensure_modal_component_proxy_node_registered(
     proxy_node_id = _proxy_node_id(
         "ModalRemoteComponent",
         normalized_output_types
+        + tuple(f"name:{name}" for name in normalized_output_names)
+        + tuple(f"list:{is_list}" for is_list in normalized_output_is_list)
         + (str(is_output_node), str(include_completion_output)),
     )
 
