@@ -350,22 +350,6 @@ def _flush_remote_container_log_chunk(
     line_buffer.buffered_text = ""
 
 
-async def _close_modal_client(client: Any) -> None:
-    """Close one Modal SDK client if the concrete client exposes a close hook."""
-    close_callable = getattr(client, "aclose", None)
-    if callable(close_callable):
-        close_result = close_callable()
-        if asyncio.iscoroutine(close_result):
-            await close_result
-        return
-
-    close_callable = getattr(client, "close", None)
-    if callable(close_callable):
-        close_result = close_callable()
-        if asyncio.iscoroutine(close_result):
-            await close_result
-
-
 def _managed_modal_app_gpus(settings: ModalSyncSettings) -> dict[str, str]:
     """Map every GPU-specific app name owned by this ComfyUI instance to its GPU."""
     return {
@@ -378,6 +362,37 @@ def _optional_modal_timestamp(value: Any) -> float | None:
     """Normalize an unset Modal protobuf timestamp to ``None``."""
     timestamp = float(value or 0.0)
     return timestamp if timestamp > 0 else None
+
+
+@lru_cache(maxsize=None)
+def _synchronized_modal_callable(
+    async_callable: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Wrap one async Modal SDK operation on Modal's managed event loop."""
+    async_utils_module = importlib.import_module("modal._utils.async_utils")
+    return async_utils_module.synchronize_api(async_callable)
+
+
+async def _list_modal_tasks_on_sdk_loop(
+    client_module: Any,
+    api_pb2: Any,
+    environment_name: str,
+) -> Any:
+    """List Modal tasks while running on Modal's managed event loop."""
+    client = await client_module._Client.from_env()
+    return await client.stub.TaskList(
+        api_pb2.TaskListRequest(environment_name=environment_name)
+    )
+
+
+def _list_modal_tasks_synchronously(
+    client_module: Any,
+    api_pb2: Any,
+    environment_name: str,
+) -> Any:
+    """Run one Modal task-list query through the synchronized SDK bridge."""
+    blocking_callable = _synchronized_modal_callable(_list_modal_tasks_on_sdk_loop)
+    return blocking_callable(client_module, api_pb2, environment_name)
 
 
 async def list_active_modal_containers(
@@ -401,19 +416,17 @@ async def list_active_modal_containers(
         ) from exc
 
     modal_error_type = getattr(exception_module, "Error", RuntimeError)
-    client = None
     try:
         environment = environments_module.ensure_env(_modal_environment_name())
         environment_name = object_module._get_environment_name(environment)
-        client = await client_module._Client.from_env()
-        response = await client.stub.TaskList(
-            api_pb2.TaskListRequest(environment_name=environment_name)
+        response = await asyncio.to_thread(
+            _list_modal_tasks_synchronously,
+            client_module,
+            api_pb2,
+            environment_name,
         )
-    except (modal_error_type, OSError, AttributeError) as exc:
+    except (modal_error_type, OSError, AttributeError, RuntimeError) as exc:
         raise ModalContainerStatusError(f"Unable to list Modal containers: {exc}") from exc
-    finally:
-        if client is not None:
-            await _close_modal_client(client)
 
     containers: list[ModalContainerStatus] = []
     for task in response.tasks:
@@ -508,7 +521,6 @@ async def _stream_remote_container_logs_via_modal_sdk_async(
                 raise
     finally:
         _flush_remote_container_log_chunk(line_buffer)
-        await _close_modal_client(client)
 
 
 def _stream_remote_container_logs_via_modal_sdk(
@@ -518,7 +530,10 @@ def _stream_remote_container_logs_via_modal_sdk(
     """Try to mirror one Modal container log stream through the installed SDK."""
     if modal is None:
         return False
-    asyncio.run(_stream_remote_container_logs_via_modal_sdk_async(task_id, stop_event))
+    blocking_callable = _synchronized_modal_callable(
+        _stream_remote_container_logs_via_modal_sdk_async
+    )
+    blocking_callable(task_id, stop_event)
     return True
 
 

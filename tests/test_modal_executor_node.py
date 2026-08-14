@@ -6084,7 +6084,10 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
         remote_modal_app_module.settings_for_modal_gpu(settings, "B300")
     )
     request_environment_names: list[str] = []
-    client_closed: list[bool] = []
+    request_thread_ids: list[int] = []
+    request_event_loops: list[Any] = []
+    caller_thread_id = threading.get_ident()
+    sdk_event_loop = asyncio.new_event_loop()
 
     class FakeStub:
         """Return a mixed active-container list."""
@@ -6092,6 +6095,8 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
         async def TaskList(self, request: Any) -> Any:
             """Capture the environment and return managed plus unrelated tasks."""
             request_environment_names.append(request.environment_name)
+            request_thread_ids.append(threading.get_ident())
+            request_event_loops.append(asyncio.get_running_loop())
             return types.SimpleNamespace(
                 tasks=[
                     types.SimpleNamespace(
@@ -6119,23 +6124,28 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
             )
 
     class FakeClient:
-        """Expose the Modal TaskList stub and close lifecycle."""
+        """Expose the synchronized Modal TaskList stub."""
 
         def __init__(self) -> None:
             """Create the fake TaskList stub."""
             self.stub = FakeStub()
 
-        async def aclose(self) -> None:
-            """Record client cleanup."""
-            client_closed.append(True)
-
     class FakeClientFactory:
-        """Create the fake Modal client."""
+        """Create the fake synchronized Modal client."""
 
         @staticmethod
         async def from_env() -> FakeClient:
             """Return one fake authenticated client."""
             return FakeClient()
+
+    def synchronize_api(async_callable: Any) -> Any:
+        """Run the fake SDK operation on one persistent event loop."""
+
+        def blocking_callable(*args: Any) -> Any:
+            """Synchronously marshal one call onto the fake SDK loop."""
+            return sdk_event_loop.run_until_complete(async_callable(*args))
+
+        return blocking_callable
 
     original_import_module = remote_modal_app_module.importlib.import_module
 
@@ -6147,6 +6157,8 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
             return types.SimpleNamespace(ensure_env=lambda environment: environment or "test-env")
         if name == "modal.client":
             return types.SimpleNamespace(_Client=FakeClientFactory)
+        if name == "modal._utils.async_utils":
+            return types.SimpleNamespace(synchronize_api=synchronize_api)
         if name == "modal.exception":
             return types.SimpleNamespace(Error=RuntimeError)
         if name == "modal_proto.api_pb2":
@@ -6158,14 +6170,21 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module.importlib, "import_module", fake_import_module)
 
+    first_containers = asyncio.run(
+        remote_modal_app_module.list_active_modal_containers(settings)
+    )
     containers = asyncio.run(remote_modal_app_module.list_active_modal_containers(settings))
 
+    assert first_containers == containers
     assert [container.container_id for container in containers] == ["ta-running", "ta-starting"]
     assert [container.state for container in containers] == ["running", "starting"]
     assert all(container.modal_gpu == "B300" for container in containers)
     assert containers[0].as_dict()["started_at"] == 101.0
-    assert request_environment_names == ["test-env"]
-    assert client_closed == [True]
+    assert request_environment_names == ["test-env", "test-env"]
+    assert request_thread_ids
+    assert all(thread_id != caller_thread_id for thread_id in request_thread_ids)
+    assert request_event_loops == [sdk_event_loop, sdk_event_loop]
+    sdk_event_loop.close()
 
 
 def test_remote_modal_stops_consuming_stream_after_terminal_result(
