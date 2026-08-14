@@ -6180,11 +6180,25 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
     assert [container.state for container in containers] == ["running", "starting"]
     assert all(container.modal_gpu == "B300" for container in containers)
     assert containers[0].as_dict()["started_at"] == 101.0
+    assert containers[0].as_dict()["estimated_gpu_cost_per_second"] == 0.001972
     assert request_environment_names == ["test-env", "test-env"]
     assert request_thread_ids
     assert all(thread_id != caller_thread_id for thread_id in request_thread_ids)
     assert request_event_loops == [sdk_event_loop, sdk_event_loop]
     sdk_event_loop.close()
+
+
+def test_modal_gpu_estimated_rates_cover_supported_aliases(
+    remote_modal_app_module: Any,
+) -> None:
+    """Published GPU estimates should cover every selectable billed GPU identity."""
+    rates = remote_modal_app_module.MODAL_GPU_ESTIMATED_USD_PER_SECOND
+
+    assert set(rates) == set(remote_modal_app_module.MODAL_GPU_TYPES)
+    assert rates["A100"] == rates["A100-40GB"]
+    assert rates["H100!"] == rates["H100"]
+    assert rates["B200+"] == rates["B200"]
+    assert remote_modal_app_module.MODAL_GPU_PRICING_EFFECTIVE_DATE == "2026-08-13"
 
 
 def test_remote_modal_stops_consuming_stream_after_terminal_result(

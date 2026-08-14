@@ -126,6 +126,23 @@ _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER: list[str] = []
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT = 32
+MODAL_GPU_PRICING_EFFECTIVE_DATE = "2026-08-13"
+MODAL_GPU_ESTIMATED_USD_PER_SECOND: dict[str, float] = {
+    "T4": 0.000164,
+    "L4": 0.000222,
+    "A10": 0.000306,
+    "L40S": 0.000542,
+    "A100": 0.000583,
+    "A100-40GB": 0.000583,
+    "A100-80GB": 0.000694,
+    "RTX-PRO-6000": 0.000842,
+    "H100": 0.001097,
+    "H100!": 0.001097,
+    "H200": 0.001261,
+    "B200": 0.001736,
+    "B200+": 0.001736,
+    "B300": 0.001972,
+}
 
 
 def _settings_for_payload(payload: Mapping[str, Any]) -> ModalSyncSettings:
@@ -274,6 +291,7 @@ class ModalContainerStatus:
     app_id: str
     app_name: str
     modal_gpu: str
+    estimated_gpu_cost_per_second: float
     state: str
     enqueued_at: float | None
     started_at: float | None
@@ -285,6 +303,7 @@ class ModalContainerStatus:
             "app_id": self.app_id,
             "app_name": self.app_name,
             "modal_gpu": self.modal_gpu,
+            "estimated_gpu_cost_per_second": self.estimated_gpu_cost_per_second,
             "state": self.state,
             "enqueued_at": self.enqueued_at,
             "started_at": self.started_at,
@@ -441,6 +460,9 @@ async def list_active_modal_containers(
                 app_id=str(task.app_id),
                 app_name=app_name,
                 modal_gpu=modal_gpu,
+                estimated_gpu_cost_per_second=MODAL_GPU_ESTIMATED_USD_PER_SECOND[
+                    modal_gpu
+                ],
                 state="running" if started_at is not None else "starting",
                 enqueued_at=_optional_modal_timestamp(task.enqueued_at),
                 started_at=started_at,
