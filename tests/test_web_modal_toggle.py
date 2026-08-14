@@ -355,9 +355,13 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "fadeNodeProgress(nodeIdValue, promptId);" in source
     assert "function progressIterationRate(previousState, value, maxValue, updatedAt)" in source
     assert "function formatIterationRate(iterationRate)" in source
+    assert "function drawIterationRateOverlay(" in source
+    assert 'ctx.fillStyle = "rgba(0, 0, 0, 0.9)";' in source
+    assert "const progressBarWidth = barWidth;" in source
+    assert "iterationRateColumnWidth" not in source
     assert "iterationRate: progressIterationRate(" in source
-    assert "formatIterationRate(laneProgress.iterationRate)" in source
-    assert "formatIterationRate(state.progress.iterationRate)" in source
+    assert "laneProgress.iterationRate," in source
+    assert "state.progress.iterationRate," in source
     assert "state?.progress" in source
     assert "state?.progressLanes" in source
     assert "detail.lane_id != null" in source
