@@ -93,6 +93,8 @@ let modalContainerStatusTimer = null;
 let modalContainerStatusPollInFlight = false;
 let modalContainerStatusUnchangedPolls = 0;
 let modalContainerStatusFailureCount = 0;
+let modalContainerEstimatedCostUsd = 0;
+let modalContainerCostUpdatedAtSeconds = null;
 
 /**
  * Return whether a node should show the Modal toggle.
@@ -309,7 +311,7 @@ function ensureGlobalStatusElement() {
   element.style.fontWeight = "600";
   element.style.pointerEvents = "none";
   element.innerHTML =
-    '<span class="modal-status-dot"></span><span class="modal-status-copy"><span class="modal-status-text"></span><span class="modal-status-gpu" hidden></span><span class="modal-status-containers" hidden></span></span>';
+    '<span class="modal-status-dot"></span><span class="modal-status-copy"><span class="modal-status-text"></span><span class="modal-status-gpu" hidden></span><span class="modal-status-cost" hidden></span><span class="modal-status-containers" hidden></span></span>';
   document.body.appendChild(element);
   modalGlobalStatusElement = element;
   return element;
@@ -577,6 +579,8 @@ function normalizedModalContainerStatuses(payload) {
       containerId: String(container.container_id),
       appName: String(container.app_name ?? ""),
       modalGpu: String(container.modal_gpu ?? ""),
+      estimatedGpuCostPerSecond:
+        Math.max(0, Number(container.estimated_gpu_cost_per_second)) || 0,
       state: container.state === "running" ? "running" : "starting",
       enqueuedAt: Number(container.enqueued_at) || null,
       startedAt: Number(container.started_at) || null,
@@ -594,8 +598,124 @@ function normalizedModalContainerStatuses(payload) {
  */
 function modalContainerStatusSignature(containers) {
   return containers
-    .map((container) => `${container.containerId}:${container.state}:${container.startedAt ?? ""}`)
+    .map(
+      (container) =>
+        `${container.containerId}:${container.state}:${container.startedAt ?? ""}:${container.estimatedGpuCostPerSecond}`,
+    )
     .join("|");
+}
+
+/**
+ * Return containers whose billed GPU identity matches the active prompt.
+ * @param {string | null} promptId
+ * @param {Array<Record<string, any>>} containers
+ * @returns {Array<Record<string, any>>}
+ */
+function modalPromptCostContainers(promptId, containers) {
+  const selectedModalGpu = modalPromptStates.get(String(promptId ?? ""))?.modalGpu;
+  if (!selectedModalGpu) {
+    return containers;
+  }
+  return containers.filter((container) => container.modalGpu === selectedModalGpu);
+}
+
+/**
+ * Return the estimated GPU burn rate for active running containers.
+ * @param {Array<Record<string, any>>} containers
+ * @param {string | null} promptId
+ * @returns {number}
+ */
+function modalContainerGpuBurnRate(
+  containers = modalContainerStatuses,
+  promptId = modalContainerStatusPromptId,
+) {
+  return modalPromptCostContainers(promptId, containers)
+    .filter((container) => container.state === "running" && container.startedAt)
+    .reduce(
+      (total, container) => total + Math.max(0, container.estimatedGpuCostPerSecond),
+      0,
+    );
+}
+
+/**
+ * Add one successful status interval to the prompt-scoped GPU cost estimate.
+ * @param {string} promptId
+ * @param {Array<Record<string, any>>} nextStatuses
+ * @param {number} polledAtSeconds
+ */
+function updateModalContainerCostEstimate(promptId, nextStatuses, polledAtSeconds) {
+  if (!promptId || !Number.isFinite(polledAtSeconds)) {
+    return;
+  }
+  const promptStartedAtSeconds = Math.max(
+    0,
+    Number(modalPromptStates.get(promptId)?.startedAt ?? nowMs()) / 1000,
+  );
+  const promptStatuses = modalPromptCostContainers(promptId, nextStatuses);
+  const previousPromptStatuses = modalPromptCostContainers(
+    promptId,
+    modalContainerStatuses,
+  );
+  let intervalCostUsd = 0;
+
+  if (modalContainerCostUpdatedAtSeconds == null) {
+    for (const container of promptStatuses) {
+      if (container.state !== "running" || !container.startedAt) {
+        continue;
+      }
+      const intervalStartedAt = Math.max(promptStartedAtSeconds, container.startedAt);
+      intervalCostUsd +=
+        Math.max(0, polledAtSeconds - intervalStartedAt) *
+        container.estimatedGpuCostPerSecond;
+    }
+  } else {
+    const previousIntervalSeconds = Math.max(
+      0,
+      polledAtSeconds - modalContainerCostUpdatedAtSeconds,
+    );
+    intervalCostUsd +=
+      previousIntervalSeconds *
+      modalContainerGpuBurnRate(previousPromptStatuses, promptId);
+
+    const previousRunningContainerIds = new Set(
+      previousPromptStatuses
+        .filter((container) => container.state === "running" && container.startedAt)
+        .map((container) => container.containerId),
+    );
+    for (const container of promptStatuses) {
+      if (
+        container.state !== "running" ||
+        !container.startedAt ||
+        previousRunningContainerIds.has(container.containerId)
+      ) {
+        continue;
+      }
+      const intervalStartedAt = Math.max(
+        promptStartedAtSeconds,
+        modalContainerCostUpdatedAtSeconds,
+        container.startedAt,
+      );
+      intervalCostUsd +=
+        Math.max(0, polledAtSeconds - intervalStartedAt) *
+        container.estimatedGpuCostPerSecond;
+    }
+  }
+
+  modalContainerEstimatedCostUsd += Math.max(0, intervalCostUsd);
+  modalContainerCostUpdatedAtSeconds = polledAtSeconds;
+}
+
+/**
+ * Return the accumulated estimate plus the active interval since the last poll.
+ * @returns {number}
+ */
+function liveModalContainerCostEstimate() {
+  if (modalContainerCostUpdatedAtSeconds == null) {
+    return modalContainerEstimatedCostUsd;
+  }
+  const unpolledSeconds = Math.max(0, nowMs() / 1000 - modalContainerCostUpdatedAtSeconds);
+  return modalContainerEstimatedCostUsd +
+    unpolledSeconds * modalContainerGpuBurnRate(modalContainerStatuses);
 }
 
 /**
@@ -631,6 +751,8 @@ function stopModalContainerStatusPolling() {
   modalContainerStatusError = null;
   modalContainerStatusUnchangedPolls = 0;
   modalContainerStatusFailureCount = 0;
+  modalContainerEstimatedCostUsd = 0;
+  modalContainerCostUpdatedAtSeconds = null;
 }
 
 /**
@@ -664,6 +786,7 @@ async function pollModalContainerStatus() {
     return;
   }
 
+  const requestedPromptId = String(activeState.promptId ?? "");
   modalContainerStatusPollInFlight = true;
   try {
     const response = await api.fetchApi(MODAL_CONTAINER_STATUS_ROUTE, { method: "GET" });
@@ -671,7 +794,12 @@ async function pollModalContainerStatus() {
       throw new Error(`Modal container status returned HTTP ${response.status}.`);
     }
     const payload = await response.json();
+    if (modalContainerStatusPromptId !== requestedPromptId) {
+      return;
+    }
     const nextStatuses = normalizedModalContainerStatuses(payload);
+    const polledAtSeconds = Number(payload?.polled_at) || nowMs() / 1000;
+    updateModalContainerCostEstimate(requestedPromptId, nextStatuses, polledAtSeconds);
     const changed =
       modalContainerStatusSignature(nextStatuses) !==
       modalContainerStatusSignature(modalContainerStatuses);
@@ -742,6 +870,45 @@ function formatModalContainerAge(startedAtSeconds) {
 }
 
 /**
+ * Format a compact estimated US-dollar amount.
+ * @param {number} amountUsd
+ * @returns {string}
+ */
+function formatEstimatedModalUsd(amountUsd) {
+  const safeAmount = Math.max(0, Number(amountUsd) || 0);
+  if (safeAmount < 0.01) {
+    return `$${safeAmount.toFixed(4)}`;
+  }
+  if (safeAmount < 1) {
+    return `$${safeAmount.toFixed(3)}`;
+  }
+  return `$${safeAmount.toFixed(2)}`;
+}
+
+/**
+ * Render the prompt-scoped estimated GPU cost and current burn rate.
+ * @param {HTMLElement | null} costElement
+ */
+function renderModalCostEstimate(costElement) {
+  if (!costElement) {
+    return;
+  }
+  const estimatedCostUsd = liveModalContainerCostEstimate();
+  const burnRatePerMinuteUsd = modalContainerGpuBurnRate() * 60;
+  if (estimatedCostUsd <= 0 && burnRatePerMinuteUsd <= 0) {
+    costElement.textContent = "";
+    costElement.hidden = true;
+    return;
+  }
+  costElement.textContent =
+    `Estimated GPU cost ${formatEstimatedModalUsd(estimatedCostUsd)}` +
+    (burnRatePerMinuteUsd > 0
+      ? ` · ${formatEstimatedModalUsd(burnRatePerMinuteUsd)}/min`
+      : "");
+  costElement.hidden = false;
+}
+
+/**
  * Render all active Modal containers beneath the GPU line.
  * @param {HTMLElement | null} containerElement
  */
@@ -806,6 +973,7 @@ function refreshGlobalStatusElement() {
   const dot = element.querySelector(".modal-status-dot");
   const text = element.querySelector(".modal-status-text");
   const gpuText = element.querySelector(".modal-status-gpu");
+  const costText = element.querySelector(".modal-status-cost");
   const containerText = element.querySelector(".modal-status-containers");
   const nodeLabel = activeState.nodeCount === 1 ? "node" : "nodes";
   const hasBatchProgress =
@@ -831,8 +999,9 @@ function refreshGlobalStatusElement() {
   element.dataset.modalGpu = activeState.modalGpu ?? "";
   gpuText.textContent = activeState.modalGpu ?? "";
   gpuText.hidden = !activeState.modalGpu;
-  renderModalContainerStatuses(containerText);
   syncModalContainerStatusPolling(activeState);
+  renderModalCostEstimate(costText);
+  renderModalContainerStatuses(containerText);
 
   if (activeState.phase === STATE_SETUP) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
@@ -4176,6 +4345,20 @@ function installGlobalStatusStyles() {
     }
 
     #comfy-modal-global-status .modal-status-gpu[hidden] {
+      display: none;
+    }
+
+    #comfy-modal-global-status .modal-status-cost {
+      margin-top: 4px;
+      color: rgba(191, 219, 254, 0.9);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      line-height: 1.1;
+      white-space: nowrap;
+    }
+
+    #comfy-modal-global-status .modal-status-cost[hidden] {
       display: none;
     }
 

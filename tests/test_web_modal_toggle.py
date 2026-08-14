@@ -267,6 +267,25 @@ def test_global_modal_status_badge_polls_and_renders_active_containers() -> None
     assert "requestImmediateModalContainerStatusPoll();" in source
 
 
+def test_global_modal_status_badge_estimates_prompt_gpu_cost() -> None:
+    """The global pill should integrate active GPU-container seconds per prompt."""
+    source = _modal_toggle_source()
+
+    assert 'class="modal-status-cost" hidden' in source
+    assert "estimatedGpuCostPerSecond:" in source
+    assert "function modalPromptCostContainers(promptId, containers)" in source
+    assert "container.modalGpu === selectedModalGpu" in source
+    assert "function modalContainerGpuBurnRate(" in source
+    assert "function updateModalContainerCostEstimate(" in source
+    assert "function liveModalContainerCostEstimate()" in source
+    assert "previousIntervalSeconds *" in source
+    assert "modalContainerGpuBurnRate(previousPromptStatuses, promptId)" in source
+    assert "modalContainerCostUpdatedAtSeconds" in source
+    assert "Estimated GPU cost ${formatEstimatedModalUsd(estimatedCostUsd)}" in source
+    assert "formatEstimatedModalUsd(burnRatePerMinuteUsd)}/min" in source
+    assert "modalContainerStatusPromptId !== requestedPromptId" in source
+
+
 def test_queue_success_marks_all_remote_nodes_ready_before_component_execution() -> None:
     """Once the Modal route accepts the prompt, all remote nodes should flip from setup to ready."""
     source = _modal_toggle_source()
