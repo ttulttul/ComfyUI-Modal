@@ -12540,6 +12540,66 @@ class _PrimitiveEchoNode:
         return (steps, cfg, enabled, label)
 
 
+def _v3_batch_images_node_class() -> type[Any]:
+    """Return a dependency-light V3 Batch Images node with Autogrow inputs."""
+    class _V3BatchImagesNode:
+        """Minimal V3 node matching ComfyUI's Batch Images input schema."""
+
+        @classmethod
+        def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[Any, ...]]]:
+            """Return the raw V3 Autogrow schema emitted by ComfyUI."""
+            return {
+                "required": {
+                    "images": (
+                        "COMFY_AUTOGROW_V3",
+                        {
+                            "template": {
+                                "input": {"required": {"image": ("IMAGE", {})}},
+                                "prefix": "image",
+                                "min": 1,
+                                "max": 50,
+                            }
+                        },
+                    )
+                }
+            }
+
+    return _V3BatchImagesNode
+
+
+def _install_fake_v3_input_finalizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install a narrow ComfyUI V3 finalizer double for Autogrow unit tests."""
+    comfy_api_module = types.ModuleType("comfy_api")
+    comfy_api_module.__path__ = []
+    comfy_api_latest_module = types.ModuleType("comfy_api.latest")
+
+    def get_finalized_class_inputs(
+        raw_input_types: dict[str, Any],
+        live_inputs: dict[str, Any],
+    ) -> tuple[dict[str, Any], None, dict[str, Any]]:
+        """Expand the test Autogrow schema using ComfyUI's public prompt shape."""
+        _, config = raw_input_types["required"]["images"]
+        template = config["template"]
+        template_input = template["input"]["required"]["image"]
+        names = [f"{template['prefix']}{index}" for index in range(template["max"])]
+        finalized: dict[str, dict[str, Any]] = {"required": {}, "optional": {}}
+        dynamic_paths: dict[str, str] = {}
+        for index, name in enumerate(names):
+            expanded_name = f"images.{name}"
+            section_name = "required" if index < template["min"] else "optional"
+            finalized[section_name][expanded_name] = template_input
+            if expanded_name in live_inputs:
+                dynamic_paths[expanded_name] = expanded_name
+        return finalized, None, {"dynamic_paths": dynamic_paths}
+
+    comfy_api_latest_module._io = types.SimpleNamespace(
+        get_finalized_class_inputs=get_finalized_class_inputs
+    )
+    comfy_api_module.latest = comfy_api_latest_module
+    monkeypatch.setitem(sys.modules, "comfy_api", comfy_api_module)
+    monkeypatch.setitem(sys.modules, "comfy_api.latest", comfy_api_latest_module)
+
+
 class _ImplicitBatchListSourceNode:
     """Fake node that consumes a whole list once and emits scalar and list outputs."""
 
@@ -12814,6 +12874,48 @@ def test_validate_required_prompt_inputs_reports_missing_latent_image(
     assert "missing required node inputs" in message
     assert "latent_image" in message
     assert "available_inputs=['positive', 'seed', 'steps']" in message
+
+
+@pytest.mark.parametrize(
+    ("module_fixture_name",),
+    [
+        ("remote_modal_app_module",),
+        ("modal_cloud_module",),
+    ],
+)
+def test_validate_required_prompt_inputs_expands_v3_autogrow_inputs(
+    request: Any,
+    module_fixture_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V3 Autogrow prompts should validate their expanded `group.name` sockets."""
+    target_module = request.getfixturevalue(module_fixture_name)
+    _install_fake_v3_input_finalizer(monkeypatch)
+    batch_images_node = _v3_batch_images_node_class()
+    live_inputs = {
+        "images.image0": ["101", 0],
+        "images.image1": ["102", 0],
+    }
+    prompt = {
+        "153": {
+            "class_type": "ModalTestV3BatchImagesNode",
+            "inputs": live_inputs,
+        }
+    }
+
+    target_module._validate_required_prompt_inputs(
+        prompt,
+        {"ModalTestV3BatchImagesNode": batch_images_node},
+    )
+
+    assert target_module._node_required_input_names(
+        batch_images_node,
+        live_inputs,
+    ) == {"images.image0"}
+    input_type_map = target_module._node_input_type_map(batch_images_node, live_inputs)
+    assert input_type_map["images.image0"] == "IMAGE"
+    assert input_type_map["images.image1"] == "IMAGE"
+    assert "images" not in input_type_map
 
 
 @pytest.mark.parametrize(
