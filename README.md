@@ -154,6 +154,8 @@ instead of being split into one remote invocation per frame.
 When mapped outputs cannot be concatenated because their shapes differ, Modal-Sync
 publishes them as ordered ComfyUI list outputs so ordinary downstream nodes execute
 once per item instead of receiving an invalid Python list as one tensor-like value.
+That scheduler-list contract propagates through later remote components whose outputs
+depend on the mapped input, including components that become mapped only at runtime.
 
 ComfyUI runtime objects such as `MODEL`, `CONDITIONING`, `CLIP`, `VAE`, `NOISE`, and `CONTROL_NET` cannot cross the local/remote boundary directly. Modal-Sync either expands the remote island so those values are produced remotely, keeps local preview/UI branches local, or fails queue-time validation with a boundary error.
 
