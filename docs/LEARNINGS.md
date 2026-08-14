@@ -2,6 +2,7 @@
 
 ## 2026-08-13
 
+- A ComfyUI requirements-file change affects the remote runtime fingerprint but does not install the new dependency by itself when the Modal image uses an explicit pinned support set. Reconcile new import-time core requirements with that pinned set: otherwise a built-in extra such as `nodes_math.py` can fail on `simpleeval`, then be misreported later as an unsynced custom node because its V3 class never registered.
 - Iteration-rate labels can be derived entirely from successive streamed `value`/`max` samples in the frontend, but refocus replay must use the backend event timestamps rather than replay arrival time or buffered events will produce artificially high `it/s` values. Track and smooth rates independently for ordinary node progress and every mapped worker lane.
 - A fast prompt can emit `execution_success` and clear its frontend state before the queue route's successful HTTP response is processed. Queue-response UI reconciliation must treat a `null` prompt state as an already-terminal success and avoid recreating ready/waiting visuals or converting completion into a frontend `TypeError`.
 - Artifact-only remote workflows need two execution anchors: the remote component planner must keep a terminal side-effect node in `execute_node_ids` even when it has no outputs, and the rewritten local prompt must expose a real ComfyUI output path. A synthetic completion token emitted after artifact materialization and consumed by an internal V3 output sink satisfies both requirements without adding a user-visible workflow output.
