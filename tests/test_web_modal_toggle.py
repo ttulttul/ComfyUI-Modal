@@ -245,6 +245,28 @@ def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> No
     assert 'text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";' in source
 
 
+def test_global_modal_status_badge_polls_and_renders_active_containers() -> None:
+    """The global pill should adaptively poll and show every active Modal container."""
+    source = _modal_toggle_source()
+
+    assert 'const MODAL_CONTAINER_STATUS_ROUTE = MODAL_ROUTE.replace(' in source
+    assert '"/container_status"' in source
+    assert "function pollModalContainerStatus()" in source
+    assert "function modalContainerStatusPollDelay()" in source
+    assert "CONTAINER_STATUS_FAST_POLL_MS = 1500" in source
+    assert "CONTAINER_STATUS_STABLE_POLL_MS = 5000" in source
+    assert "CONTAINER_STATUS_HIDDEN_POLL_MS = 15000" in source
+    assert "CONTAINER_STATUS_MAX_BACKOFF_MS = 30000" in source
+    assert "document.visibilityState !== \"visible\"" in source
+    assert "modalContainerStatusUnchangedPolls >= 2" in source
+    assert "modalContainerStatusFailureCount > 0" in source
+    assert "function renderModalContainerStatuses(containerElement)" in source
+    assert "modalContainerStatuses.forEach((container, index) =>" in source
+    assert "Container ${index + 1} · ${state}" in source
+    assert 'class="modal-status-containers" hidden' in source
+    assert "requestImmediateModalContainerStatusPoll();" in source
+
+
 def test_queue_success_marks_all_remote_nodes_ready_before_component_execution() -> None:
     """Once the Modal route accepts the prompt, all remote nodes should flip from setup to ready."""
     source = _modal_toggle_source()
