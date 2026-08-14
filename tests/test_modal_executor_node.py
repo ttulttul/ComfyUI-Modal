@@ -6074,6 +6074,100 @@ def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
     assert log_stream_calls == [("retain", "ta-123"), ("release", "ta-123")]
 
 
+def test_list_active_modal_containers_filters_and_classifies_managed_apps(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Container status should include every active GPU app for this ComfyUI instance."""
+    settings = remote_modal_app_module.get_settings()
+    b300_app_name = remote_modal_app_module.modal_deployment_app_name(
+        remote_modal_app_module.settings_for_modal_gpu(settings, "B300")
+    )
+    request_environment_names: list[str] = []
+    client_closed: list[bool] = []
+
+    class FakeStub:
+        """Return a mixed active-container list."""
+
+        async def TaskList(self, request: Any) -> Any:
+            """Capture the environment and return managed plus unrelated tasks."""
+            request_environment_names.append(request.environment_name)
+            return types.SimpleNamespace(
+                tasks=[
+                    types.SimpleNamespace(
+                        task_id="ta-starting",
+                        app_id="ap-managed",
+                        app_description=b300_app_name,
+                        started_at=0.0,
+                        enqueued_at=100.0,
+                    ),
+                    types.SimpleNamespace(
+                        task_id="ta-running",
+                        app_id="ap-managed",
+                        app_description=b300_app_name,
+                        started_at=101.0,
+                        enqueued_at=99.0,
+                    ),
+                    types.SimpleNamespace(
+                        task_id="ta-unrelated",
+                        app_id="ap-other",
+                        app_description="another-modal-app",
+                        started_at=102.0,
+                        enqueued_at=98.0,
+                    ),
+                ]
+            )
+
+    class FakeClient:
+        """Expose the Modal TaskList stub and close lifecycle."""
+
+        def __init__(self) -> None:
+            """Create the fake TaskList stub."""
+            self.stub = FakeStub()
+
+        async def aclose(self) -> None:
+            """Record client cleanup."""
+            client_closed.append(True)
+
+    class FakeClientFactory:
+        """Create the fake Modal client."""
+
+        @staticmethod
+        async def from_env() -> FakeClient:
+            """Return one fake authenticated client."""
+            return FakeClient()
+
+    original_import_module = remote_modal_app_module.importlib.import_module
+
+    def fake_import_module(name: str) -> Any:
+        """Supply the Modal SDK modules used by the container status query."""
+        if name == "modal._object":
+            return types.SimpleNamespace(_get_environment_name=lambda _environment: "test-env")
+        if name == "modal.environments":
+            return types.SimpleNamespace(ensure_env=lambda environment: environment or "test-env")
+        if name == "modal.client":
+            return types.SimpleNamespace(_Client=FakeClientFactory)
+        if name == "modal.exception":
+            return types.SimpleNamespace(Error=RuntimeError)
+        if name == "modal_proto.api_pb2":
+            return types.SimpleNamespace(
+                TaskListRequest=lambda **kwargs: types.SimpleNamespace(**kwargs)
+            )
+        return original_import_module(name)
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module.importlib, "import_module", fake_import_module)
+
+    containers = asyncio.run(remote_modal_app_module.list_active_modal_containers(settings))
+
+    assert [container.container_id for container in containers] == ["ta-running", "ta-starting"]
+    assert [container.state for container in containers] == ["running", "starting"]
+    assert all(container.modal_gpu == "B300" for container in containers)
+    assert containers[0].as_dict()["started_at"] == 101.0
+    assert request_environment_names == ["test-env"]
+    assert client_closed == [True]
+
+
 def test_remote_modal_stops_consuming_stream_after_terminal_result(
     remote_modal_app_module: Any,
 ) -> None:

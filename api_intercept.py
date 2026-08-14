@@ -4078,6 +4078,13 @@ def _progress_state_route_path(route_path: str) -> str:
     return f"{route_path.rstrip('/')}/progress_state"
 
 
+def _container_status_route_path(route_path: str) -> str:
+    """Return the sibling HTTP route used for active Modal container status."""
+    if route_path.endswith("/queue_prompt"):
+        return f"{route_path.removesuffix('/queue_prompt')}/container_status"
+    return f"{route_path.rstrip('/')}/container_status"
+
+
 def _delete_modal_caches_route_path(route_path: str) -> str:
     """Return the sibling HTTP route used to delete persistent Modal cache Dicts."""
     if route_path.endswith("/queue_prompt"):
@@ -4249,6 +4256,7 @@ def setup_modal_queue_route(
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
     analysis_route_path = _analysis_route_path(resolved_settings.route_path)
     progress_state_route_path = _progress_state_route_path(resolved_settings.route_path)
+    container_status_route_path = _container_status_route_path(resolved_settings.route_path)
     delete_caches_route_path = _delete_modal_caches_route_path(resolved_settings.route_path)
     delete_volume_route_path = _delete_modal_volume_route_path(resolved_settings.route_path)
     _install_modal_interrupt_queue_bridge(prompt_server)
@@ -4260,6 +4268,29 @@ def setup_modal_queue_route(
             """Return recent Modal UI events for the requesting ComfyUI client."""
             client_id = request.query.get("client_id")
             return web.json_response({"events": modal_ui_events_for_client(client_id)})
+
+        @prompt_server.routes.get(container_status_route_path)
+        async def modal_container_status(_request: web.Request) -> web.Response:
+            """Return active Modal containers owned by this ComfyUI instance."""
+            from .remote.modal_app import (
+                ModalContainerStatusError,
+                list_active_modal_containers,
+            )
+
+            try:
+                containers = await list_active_modal_containers(resolved_settings)
+            except ModalContainerStatusError as exc:
+                logger.warning("Unable to refresh Modal container status: %s", exc)
+                return web.json_response(
+                    {"containers": [], "error": str(exc), "polled_at": time.time()},
+                    status=502,
+                )
+            return web.json_response(
+                {
+                    "containers": [container.as_dict() for container in containers],
+                    "polled_at": time.time(),
+                }
+            )
 
     @prompt_server.routes.post(analysis_route_path)
     async def modal_analyze_remote_nodes(request: web.Request) -> web.Response:
@@ -4542,10 +4573,11 @@ def setup_modal_queue_route(
 
     _ROUTE_REGISTERED = True
     logger.info(
-        "Registered Modal queue route at %s, analysis route at %s, progress state route at %s, cache deletion route at %s, and volume deletion route at %s",
+        "Registered Modal queue route at %s, analysis route at %s, progress state route at %s, container status route at %s, cache deletion route at %s, and volume deletion route at %s",
         resolved_settings.route_path,
         analysis_route_path,
         progress_state_route_path,
+        container_status_route_path,
         delete_caches_route_path,
         delete_volume_route_path,
     )

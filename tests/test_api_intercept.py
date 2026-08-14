@@ -4137,6 +4137,16 @@ def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) 
     )
 
 
+def test_container_status_route_is_queue_route_sibling(api_intercept_module: Any) -> None:
+    """The frontend should have a stable sibling route for active Modal containers."""
+    assert api_intercept_module._container_status_route_path("/modal/queue_prompt") == (
+        "/modal/container_status"
+    )
+    assert api_intercept_module._container_status_route_path("/custom/modal") == (
+        "/custom/modal/container_status"
+    )
+
+
 def test_modal_reset_route_paths_are_queue_route_siblings(api_intercept_module: Any) -> None:
     """The frontend should have stable sibling routes for Modal maintenance actions."""
     assert api_intercept_module._delete_modal_caches_route_path("/modal/queue_prompt") == (

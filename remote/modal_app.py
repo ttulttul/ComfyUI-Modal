@@ -74,6 +74,7 @@ from ..runtime_environment import (
     build_remote_runtime_identity,
 )
 from ..settings import (
+    MODAL_GPU_TYPES,
     ModalSyncSettings,
     get_settings,
     modal_deployment_app_name,
@@ -261,6 +262,35 @@ class ModalRemoteAppOutOfDateError(ModalRemoteInvocationError):
     """Raised when a deployed Modal app is incompatible with the local client."""
 
 
+class ModalContainerStatusError(RuntimeError):
+    """Raised when active Modal container status cannot be queried."""
+
+
+@dataclass(frozen=True)
+class ModalContainerStatus:
+    """Describe one active Modal container owned by this ComfyUI instance."""
+
+    container_id: str
+    app_id: str
+    app_name: str
+    modal_gpu: str
+    state: str
+    enqueued_at: float | None
+    started_at: float | None
+
+    def as_dict(self) -> dict[str, str | float | None]:
+        """Return a JSON-serializable representation for the frontend."""
+        return {
+            "container_id": self.container_id,
+            "app_id": self.app_id,
+            "app_name": self.app_name,
+            "modal_gpu": self.modal_gpu,
+            "state": self.state,
+            "enqueued_at": self.enqueued_at,
+            "started_at": self.started_at,
+        }
+
+
 def _is_remote_container_log_stream_enabled() -> bool:
     """Return whether remote Modal container logs should be mirrored locally."""
     return bool(get_settings().stream_remote_container_logs)
@@ -334,6 +364,84 @@ async def _close_modal_client(client: Any) -> None:
         close_result = close_callable()
         if asyncio.iscoroutine(close_result):
             await close_result
+
+
+def _managed_modal_app_gpus(settings: ModalSyncSettings) -> dict[str, str]:
+    """Map every GPU-specific app name owned by this ComfyUI instance to its GPU."""
+    return {
+        modal_deployment_app_name(settings_for_modal_gpu(settings, modal_gpu)): modal_gpu
+        for modal_gpu in MODAL_GPU_TYPES
+    }
+
+
+def _optional_modal_timestamp(value: Any) -> float | None:
+    """Normalize an unset Modal protobuf timestamp to ``None``."""
+    timestamp = float(value or 0.0)
+    return timestamp if timestamp > 0 else None
+
+
+async def list_active_modal_containers(
+    settings: ModalSyncSettings | None = None,
+) -> list[ModalContainerStatus]:
+    """List active Modal containers belonging to this ComfyUI instance."""
+    if modal is None:
+        raise ModalContainerStatusError("The Modal SDK is unavailable.")
+
+    resolved_settings = settings or get_settings()
+    managed_app_gpus = _managed_modal_app_gpus(resolved_settings)
+    try:
+        object_module = importlib.import_module("modal._object")
+        environments_module = importlib.import_module("modal.environments")
+        client_module = importlib.import_module("modal.client")
+        exception_module = importlib.import_module("modal.exception")
+        api_pb2 = importlib.import_module("modal_proto.api_pb2")
+    except ModuleNotFoundError as exc:
+        raise ModalContainerStatusError(
+            "The installed Modal SDK does not expose the container list API."
+        ) from exc
+
+    modal_error_type = getattr(exception_module, "Error", RuntimeError)
+    client = None
+    try:
+        environment = environments_module.ensure_env(_modal_environment_name())
+        environment_name = object_module._get_environment_name(environment)
+        client = await client_module._Client.from_env()
+        response = await client.stub.TaskList(
+            api_pb2.TaskListRequest(environment_name=environment_name)
+        )
+    except (modal_error_type, OSError, AttributeError) as exc:
+        raise ModalContainerStatusError(f"Unable to list Modal containers: {exc}") from exc
+    finally:
+        if client is not None:
+            await _close_modal_client(client)
+
+    containers: list[ModalContainerStatus] = []
+    for task in response.tasks:
+        app_name = str(task.app_description)
+        modal_gpu = managed_app_gpus.get(app_name)
+        if modal_gpu is None:
+            continue
+        started_at = _optional_modal_timestamp(task.started_at)
+        containers.append(
+            ModalContainerStatus(
+                container_id=str(task.task_id),
+                app_id=str(task.app_id),
+                app_name=app_name,
+                modal_gpu=modal_gpu,
+                state="running" if started_at is not None else "starting",
+                enqueued_at=_optional_modal_timestamp(task.enqueued_at),
+                started_at=started_at,
+            )
+        )
+
+    containers.sort(
+        key=lambda container: (
+            container.enqueued_at or container.started_at or 0.0,
+            container.container_id,
+        )
+    )
+    logger.debug("Listed %d active Modal container(s) for the status UI.", len(containers))
+    return containers
 
 
 async def _stream_remote_container_logs_via_modal_sdk_async(

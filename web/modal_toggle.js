@@ -5,6 +5,7 @@ const REMOTE_PROPERTY = "is_modal_remote";
 const MODAL_ROUTE = "/modal/queue_prompt";
 const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
 const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/progress_state");
+const MODAL_CONTAINER_STATUS_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/container_status");
 const MODAL_DELETE_CACHES_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_caches");
 const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_volume");
 const COMFY_QUEUE_ROUTE = "/queue";
@@ -59,6 +60,10 @@ const PROGRESS_FADE_MS = 900;
 const REFOCUS_STALE_PROMPT_GRACE_MS = 30000;
 const MODAL_ANIMATION_FRAME_INTERVAL_MS = 100;
 const ITERATION_RATE_SMOOTHING_FACTOR = 0.35;
+const CONTAINER_STATUS_FAST_POLL_MS = 1500;
+const CONTAINER_STATUS_STABLE_POLL_MS = 5000;
+const CONTAINER_STATUS_HIDDEN_POLL_MS = 15000;
+const CONTAINER_STATUS_MAX_BACKOFF_MS = 30000;
 
 const modalNodeStates = new Map();
 const modalNodeProgress = new Map();
@@ -80,6 +85,14 @@ let modalVisibilityRefreshInFlight = null;
 let modalReplayedEventUpdatedAtMs = null;
 let vueNodeObserver = null;
 let vueNodeSyncScheduled = false;
+let modalContainerStatuses = [];
+let modalContainerStatusPromptId = null;
+let modalContainerStatusLoaded = false;
+let modalContainerStatusError = null;
+let modalContainerStatusTimer = null;
+let modalContainerStatusPollInFlight = false;
+let modalContainerStatusUnchangedPolls = 0;
+let modalContainerStatusFailureCount = 0;
 
 /**
  * Return whether a node should show the Modal toggle.
@@ -283,10 +296,10 @@ function ensureGlobalStatusElement() {
   element.style.right = "18px";
   element.style.zIndex = "9999";
   element.style.display = "none";
-  element.style.alignItems = "center";
+  element.style.alignItems = "flex-start";
   element.style.gap = "10px";
   element.style.padding = "10px 14px";
-  element.style.borderRadius = "999px";
+  element.style.borderRadius = "16px";
   element.style.border = "1px solid rgba(255, 255, 255, 0.16)";
   element.style.background = "rgba(15, 23, 42, 0.94)";
   element.style.boxShadow = "0 10px 30px rgba(0, 0, 0, 0.28)";
@@ -296,7 +309,7 @@ function ensureGlobalStatusElement() {
   element.style.fontWeight = "600";
   element.style.pointerEvents = "none";
   element.innerHTML =
-    '<span class="modal-status-dot"></span><span class="modal-status-copy"><span class="modal-status-text"></span><span class="modal-status-gpu" hidden></span></span>';
+    '<span class="modal-status-dot"></span><span class="modal-status-copy"><span class="modal-status-text"></span><span class="modal-status-gpu" hidden></span><span class="modal-status-containers" hidden></span></span>';
   document.body.appendChild(element);
   modalGlobalStatusElement = element;
   return element;
@@ -543,6 +556,236 @@ function currentGlobalStatus() {
 }
 
 /**
+ * Return whether active workflow state should poll Modal for container status.
+ * @param {{ phase?: string } | null} activeState
+ * @returns {boolean}
+ */
+function shouldPollModalContainerStatus(activeState) {
+  return Boolean(activeState && activeState.phase !== STATE_ERROR);
+}
+
+/**
+ * Normalize one container-list payload for stable rendering and comparison.
+ * @param {any} payload
+ * @returns {Array<Record<string, any>>}
+ */
+function normalizedModalContainerStatuses(payload) {
+  const containers = Array.isArray(payload?.containers) ? payload.containers : [];
+  return containers
+    .filter((container) => container?.container_id)
+    .map((container) => ({
+      containerId: String(container.container_id),
+      appName: String(container.app_name ?? ""),
+      modalGpu: String(container.modal_gpu ?? ""),
+      state: container.state === "running" ? "running" : "starting",
+      enqueuedAt: Number(container.enqueued_at) || null,
+      startedAt: Number(container.started_at) || null,
+    }))
+    .sort((left, right) =>
+      (left.enqueuedAt ?? left.startedAt ?? 0) - (right.enqueuedAt ?? right.startedAt ?? 0) ||
+      left.containerId.localeCompare(right.containerId),
+    );
+}
+
+/**
+ * Return a stable signature for one container status response.
+ * @param {Array<Record<string, any>>} containers
+ * @returns {string}
+ */
+function modalContainerStatusSignature(containers) {
+  return containers
+    .map((container) => `${container.containerId}:${container.state}:${container.startedAt ?? ""}`)
+    .join("|");
+}
+
+/**
+ * Return the next adaptive container status poll delay.
+ * @returns {number}
+ */
+function modalContainerStatusPollDelay() {
+  if (modalContainerStatusFailureCount > 0) {
+    return Math.min(
+      CONTAINER_STATUS_MAX_BACKOFF_MS,
+      CONTAINER_STATUS_STABLE_POLL_MS * 2 ** (modalContainerStatusFailureCount - 1),
+    );
+  }
+  if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+    return CONTAINER_STATUS_HIDDEN_POLL_MS;
+  }
+  return modalContainerStatusUnchangedPolls >= 2
+    ? CONTAINER_STATUS_STABLE_POLL_MS
+    : CONTAINER_STATUS_FAST_POLL_MS;
+}
+
+/**
+ * Clear scheduled polling and prompt-scoped container UI state.
+ */
+function stopModalContainerStatusPolling() {
+  if (modalContainerStatusTimer != null) {
+    clearTimeout(modalContainerStatusTimer);
+    modalContainerStatusTimer = null;
+  }
+  modalContainerStatuses = [];
+  modalContainerStatusPromptId = null;
+  modalContainerStatusLoaded = false;
+  modalContainerStatusError = null;
+  modalContainerStatusUnchangedPolls = 0;
+  modalContainerStatusFailureCount = 0;
+}
+
+/**
+ * Schedule the next container status query while Modal work remains active.
+ * @param {number | null} requestedDelayMs
+ */
+function scheduleModalContainerStatusPoll(requestedDelayMs = null) {
+  const activeState = currentGlobalStatus();
+  if (!shouldPollModalContainerStatus(activeState)) {
+    stopModalContainerStatusPolling();
+    return;
+  }
+  if (modalContainerStatusPollInFlight || modalContainerStatusTimer != null) {
+    return;
+  }
+  const delayMs = requestedDelayMs ?? modalContainerStatusPollDelay();
+  modalContainerStatusTimer = setTimeout(() => {
+    modalContainerStatusTimer = null;
+    pollModalContainerStatus();
+  }, Math.max(0, delayMs));
+}
+
+/**
+ * Poll active containers through the local ComfyUI route.
+ * @returns {Promise<void>}
+ */
+async function pollModalContainerStatus() {
+  const activeState = currentGlobalStatus();
+  if (!shouldPollModalContainerStatus(activeState) || typeof api.fetchApi !== "function") {
+    stopModalContainerStatusPolling();
+    return;
+  }
+
+  modalContainerStatusPollInFlight = true;
+  try {
+    const response = await api.fetchApi(MODAL_CONTAINER_STATUS_ROUTE, { method: "GET" });
+    if (response.status !== 200) {
+      throw new Error(`Modal container status returned HTTP ${response.status}.`);
+    }
+    const payload = await response.json();
+    const nextStatuses = normalizedModalContainerStatuses(payload);
+    const changed =
+      modalContainerStatusSignature(nextStatuses) !==
+      modalContainerStatusSignature(modalContainerStatuses);
+    modalContainerStatuses = nextStatuses;
+    modalContainerStatusLoaded = true;
+    modalContainerStatusError = null;
+    modalContainerStatusFailureCount = 0;
+    modalContainerStatusUnchangedPolls = changed
+      ? 0
+      : modalContainerStatusUnchangedPolls + 1;
+  } catch (error) {
+    modalContainerStatusLoaded = true;
+    modalContainerStatusError = String(error?.message ?? error);
+    modalContainerStatusFailureCount += 1;
+    console.debug("Unable to poll Modal container status.", error);
+  } finally {
+    modalContainerStatusPollInFlight = false;
+    refreshGlobalStatusElement();
+    scheduleModalContainerStatusPoll();
+  }
+}
+
+/**
+ * Ensure polling follows the prompt currently shown by the global status pill.
+ * @param {{ promptId?: string, phase?: string } | null} activeState
+ */
+function syncModalContainerStatusPolling(activeState) {
+  if (!shouldPollModalContainerStatus(activeState)) {
+    stopModalContainerStatusPolling();
+    return;
+  }
+  if (modalContainerStatusPromptId !== activeState.promptId) {
+    stopModalContainerStatusPolling();
+    modalContainerStatusPromptId = activeState.promptId;
+    scheduleModalContainerStatusPoll(0);
+    return;
+  }
+  scheduleModalContainerStatusPoll();
+}
+
+/**
+ * Force an immediate status refresh after the browser returns to the foreground.
+ */
+function requestImmediateModalContainerStatusPoll() {
+  if (modalContainerStatusTimer != null) {
+    clearTimeout(modalContainerStatusTimer);
+    modalContainerStatusTimer = null;
+  }
+  scheduleModalContainerStatusPoll(0);
+}
+
+/**
+ * Format a compact elapsed time for one running container.
+ * @param {number | null} startedAtSeconds
+ * @returns {string}
+ */
+function formatModalContainerAge(startedAtSeconds) {
+  if (!startedAtSeconds) {
+    return "";
+  }
+  const elapsedSeconds = Math.max(0, Math.floor(nowMs() / 1000 - startedAtSeconds));
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds}s`;
+  }
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+/**
+ * Render all active Modal containers beneath the GPU line.
+ * @param {HTMLElement | null} containerElement
+ */
+function renderModalContainerStatuses(containerElement) {
+  if (!containerElement) {
+    return;
+  }
+  containerElement.replaceChildren();
+  containerElement.hidden = false;
+
+  if (modalContainerStatusError) {
+    const line = document.createElement("span");
+    line.textContent = "Container status temporarily unavailable";
+    line.className = "modal-status-container modal-status-container-error";
+    containerElement.appendChild(line);
+    return;
+  }
+  if (!modalContainerStatusLoaded) {
+    const line = document.createElement("span");
+    line.textContent = "Checking Modal containers…";
+    line.className = "modal-status-container";
+    containerElement.appendChild(line);
+    return;
+  }
+  if (modalContainerStatuses.length === 0) {
+    const line = document.createElement("span");
+    line.textContent = "Waiting for container assignment";
+    line.className = "modal-status-container";
+    containerElement.appendChild(line);
+    return;
+  }
+
+  modalContainerStatuses.forEach((container, index) => {
+    const line = document.createElement("span");
+    const shortId = container.containerId.slice(-8);
+    const age = formatModalContainerAge(container.startedAt);
+    const state = container.state === "running" ? "Running" : "Starting";
+    line.textContent = `Container ${index + 1} · ${state}${age ? ` ${age}` : ""} · ${shortId}`;
+    line.className = `modal-status-container modal-status-container-${container.state}`;
+    containerElement.appendChild(line);
+  });
+}
+
+/**
  * Redraw the global Modal execution badge.
  */
 function refreshGlobalStatusElement() {
@@ -556,12 +799,14 @@ function refreshGlobalStatusElement() {
     element.style.display = "none";
     element.dataset.phase = "";
     element.dataset.modalGpu = "";
+    stopModalContainerStatusPolling();
     return;
   }
 
   const dot = element.querySelector(".modal-status-dot");
   const text = element.querySelector(".modal-status-text");
   const gpuText = element.querySelector(".modal-status-gpu");
+  const containerText = element.querySelector(".modal-status-containers");
   const nodeLabel = activeState.nodeCount === 1 ? "node" : "nodes";
   const hasBatchProgress =
     activeState.phase === EXECUTION_PHASE &&
@@ -586,6 +831,8 @@ function refreshGlobalStatusElement() {
   element.dataset.modalGpu = activeState.modalGpu ?? "";
   gpuText.textContent = activeState.modalGpu ?? "";
   gpuText.hidden = !activeState.modalGpu;
+  renderModalContainerStatuses(containerText);
+  syncModalContainerStatusPolling(activeState);
 
   if (activeState.phase === STATE_SETUP) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
@@ -659,6 +906,7 @@ function refreshGlobalStatusElement() {
   dot.style.height = "10px";
   dot.style.borderRadius = "999px";
   dot.style.display = "inline-block";
+  dot.style.marginTop = "2px";
 }
 
 /**
@@ -1078,6 +1326,7 @@ async function reconcileModalUiAfterVisibilityChange() {
  * Refresh the badge and canvas when the tab regains visibility.
  */
 function refreshModalUiAfterVisibilityChange() {
+  requestImmediateModalContainerStatusPoll();
   refreshGlobalStatusElement();
   if (Array.from(modalNodeStates.values()).length > 0) {
     ensureAnimationLoop();
@@ -3928,6 +4177,41 @@ function installGlobalStatusStyles() {
 
     #comfy-modal-global-status .modal-status-gpu[hidden] {
       display: none;
+    }
+
+    #comfy-modal-global-status .modal-status-containers {
+      display: flex;
+      min-width: 210px;
+      margin-top: 7px;
+      padding-top: 6px;
+      flex-direction: column;
+      gap: 4px;
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+    }
+
+    #comfy-modal-global-status .modal-status-containers[hidden] {
+      display: none;
+    }
+
+    #comfy-modal-global-status .modal-status-container {
+      color: rgba(226, 232, 240, 0.82);
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.01em;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+
+    #comfy-modal-global-status .modal-status-container-running {
+      color: rgba(187, 247, 208, 0.92);
+    }
+
+    #comfy-modal-global-status .modal-status-container-starting {
+      color: rgba(254, 240, 138, 0.92);
+    }
+
+    #comfy-modal-global-status .modal-status-container-error {
+      color: rgba(254, 202, 202, 0.88);
     }
 
     .comfy-modal-vue-node-decoration {
