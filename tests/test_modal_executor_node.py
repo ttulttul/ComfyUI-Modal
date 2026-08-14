@@ -7556,6 +7556,197 @@ def test_mapped_latent_aggregation_preserves_scheduler_items_when_shapes_differ(
     assert result[0][1] is second_latent
 
 
+def test_implicit_mapping_propagates_scheduler_list_through_downstream_component(
+    api_intercept_module: Any,
+    modal_executor_module: Any,
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Heterogeneous implicit LATENT outputs should map into an ordinary local consumer."""
+    torch = pytest.importorskip("torch")
+
+    class PromptSeedList:
+        """Expose integer seeds as one scheduler list output."""
+
+        RETURN_TYPES = ("INT",)
+        RETURN_NAMES = ("seeds",)
+        OUTPUT_IS_LIST = (True,)
+
+    class ModalMapInput:
+        """Represent the explicit queue-time mapped input marker."""
+
+        RETURN_TYPES = ("*",)
+        RETURN_NAMES = ("value",)
+        OUTPUT_IS_LIST = (False,)
+
+    class RemoteSeed:
+        """Publish an inexpensive mapped integer across a remote component boundary."""
+
+        RETURN_TYPES = ("INT",)
+        RETURN_NAMES = ("seed",)
+        OUTPUT_IS_LIST = (False,)
+
+    class RemoteLatent:
+        """Publish one latent whose shape depends on its mapped seed."""
+
+        RETURN_TYPES = ("LATENT",)
+        RETURN_NAMES = ("samples",)
+        OUTPUT_IS_LIST = (False,)
+
+    class LocalVAEDecode:
+        """Model the ordinary mapping contract used by ComfyUI's VAE decoder."""
+
+        RETURN_TYPES = ("IMAGE",)
+        RETURN_NAMES = ("image",)
+        OUTPUT_IS_LIST = (False,)
+
+        @staticmethod
+        def decode(samples: dict[str, Any]) -> int:
+            """Require a LATENT mapping and return its width."""
+            return int(samples["samples"].shape[-1])
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "PromptSeedList": PromptSeedList,
+                "ModalMapInput": ModalMapInput,
+                "RemoteSeed": RemoteSeed,
+                "RemoteLatent": RemoteLatent,
+                "VAEDecode": LocalVAEDecode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 49, "properties": {"is_modal_remote": False}},
+            {"id": 50, "properties": {"is_modal_remote": False}},
+            {"id": 51, "properties": {"is_modal_remote": True}},
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 11, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "49": {"class_type": "PromptSeedList", "inputs": {}},
+        "50": {"class_type": "ModalMapInput", "inputs": {"value": ["49", 0]}},
+        "51": {"class_type": "RemoteSeed", "inputs": {"seed": ["50", 0]}},
+        "1": {"class_type": "RemoteLatent", "inputs": {"seed": ["51", 0]}},
+        "11": {"class_type": "VAEDecode", "inputs": {"samples": ["1", 0]}},
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+        extra_data={"prompt_id": "implicit-list-regression"},
+    )
+
+    downstream_proxy_id = rewritten_prompt["1"]["class_type"]
+    downstream_proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[downstream_proxy_id]
+    downstream_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    downstream_execution_payload = modal_executor_module._rehydrate_proxy_payload(
+        downstream_payload,
+        unique_id="1",
+    )
+
+    assert summary.remote_component_ids == ["51", "1"]
+    assert summary.mapped_component_ids == ["1", "51"]
+    assert (
+        downstream_execution_payload["boundary_outputs"][0]["scheduler_is_list"]
+        is True
+    )
+    assert downstream_proxy_class.OUTPUT_IS_LIST == [True, False]
+    assert rewritten_prompt["11"]["inputs"]["samples"] == ["1", 0]
+
+    async def fake_invoke_remote_engine_async(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+    ) -> bytes:
+        """Return distinct latent shapes for the downstream mapped items."""
+        if not payload.get("execute_node_ids"):
+            return serialization_module.serialize_node_outputs(())
+        hydrated_inputs = serialization_module.deserialize_node_inputs(
+            kwargs_payload
+        )
+        seed = int(hydrated_inputs["remote_input_0"])
+        latent_size = 32 if seed == 10 else 35
+        latent = {
+            "samples": torch.zeros(
+                (1, 4, latent_size, latent_size),
+                dtype=torch.float32,
+            )
+        }
+        return serialization_module.serialize_node_outputs((latent,))
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        fake_invoke_remote_engine_async,
+    )
+
+    class ImplicitMappingClient:
+        """Run the downstream payload through implicit mapped aggregation."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[Any, ...]:
+            """Return deserialized outputs from the implicit mapped subgraph runner."""
+            invoke_implicitly_mapped = (
+                remote_modal_app_module._invoke_implicitly_mapped_subgraph_async
+            )
+            response = await invoke_implicitly_mapped(
+                payload,
+                serialization_module.serialize_node_inputs(kwargs),
+            )
+            return serialization_module.deserialize_node_outputs(response)
+
+    modal_executor_module.set_remote_executor_client_factory(
+        lambda: ImplicitMappingClient()
+    )
+    try:
+        proxy_result = asyncio.run(
+            downstream_proxy_class.execute(
+                original_node_data=downstream_payload,
+                remote_input_0=[10, 11],
+                unique_id="1",
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    latent_items = proxy_result.result[0]
+    assert isinstance(latent_items, list)
+    assert [LocalVAEDecode.decode(latent) for latent in latent_items] == [32, 35]
+
+
 def test_invoke_mapped_remote_engine_async_splits_int_inputs_for_direct_targets(
     remote_modal_app_module: Any,
     serialization_module: Any,

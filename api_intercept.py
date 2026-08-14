@@ -2638,6 +2638,113 @@ def _proxy_boundary_output_is_list(boundary_output: Mapping[str, Any]) -> bool:
     )
 
 
+def _implicitly_mapped_boundary_output_sources(
+    *,
+    component: RemoteComponentPlan,
+    original_prompt: dict[str, Any],
+    rewritten_prompt: dict[str, Any],
+    nodes_module: Any,
+) -> set[LinkedOutputRef]:
+    """Return component outputs transitively driven by scheduler-list proxy inputs."""
+    mapped_target_node_ids: set[str] = set()
+    list_boundary_input_names: set[str] = set()
+
+    for boundary_input in component.boundary_inputs:
+        input_is_scheduler_list = False
+        for target in boundary_input.targets:
+            target_prompt_node = rewritten_prompt.get(target.node_id)
+            if target_prompt_node is None:
+                continue
+            current_input_value = (target_prompt_node.get("inputs") or {}).get(
+                target.input_name
+            )
+            if not _is_link(current_input_value):
+                continue
+            if not _remote_output_is_list(
+                prompt=rewritten_prompt,
+                node_id=str(current_input_value[0]),
+                output_index=int(current_input_value[1]),
+                nodes_module=nodes_module,
+            ):
+                continue
+            input_is_scheduler_list = True
+            mapped_target_node_ids.add(target.node_id)
+
+        if input_is_scheduler_list:
+            list_boundary_input_names.add(boundary_input.proxy_input_name)
+
+    if not mapped_target_node_ids:
+        return set()
+
+    consumers = _build_consumer_map(original_prompt)
+    mapped_node_ids = _component_downstream_closure(
+        seed_node_ids=mapped_target_node_ids,
+        component_node_id_set=set(component.node_ids),
+        consumers=consumers,
+    )
+    mapped_output_sources = {
+        boundary_output.source
+        for boundary_output in component.boundary_outputs
+        if boundary_output.source.node_id in mapped_node_ids
+    }
+    logger.info(
+        "Propagating scheduler-list metadata through remote component %s from "
+        "boundary inputs=%s to outputs=%s.",
+        component.representative_node_id,
+        sorted(list_boundary_input_names),
+        sorted(
+            f"{source.node_id}:{source.output_index}"
+            for source in mapped_output_sources
+        ),
+    )
+    return mapped_output_sources
+
+
+def _mark_payload_scheduler_list_outputs(
+    payload: dict[str, Any],
+    scheduler_list_output_sources: set[LinkedOutputRef],
+) -> None:
+    """Mark matching outputs across a component payload and any split phase payloads."""
+    if not scheduler_list_output_sources:
+        return
+
+    boundary_outputs = payload.get("boundary_outputs")
+    if isinstance(boundary_outputs, list):
+        for boundary_output in boundary_outputs:
+            if not isinstance(boundary_output, dict):
+                continue
+            source = LinkedOutputRef(
+                node_id=str(boundary_output.get("node_id")),
+                output_index=int(boundary_output.get("output_index", -1)),
+            )
+            if source in scheduler_list_output_sources:
+                boundary_output["scheduler_is_list"] = True
+
+    for phase_name in ("static_phase", "mapped_phase"):
+        phase_payload = payload.get(phase_name)
+        if isinstance(phase_payload, dict):
+            _mark_payload_scheduler_list_outputs(
+                phase_payload,
+                scheduler_list_output_sources,
+            )
+
+    split_proxy_payloads = payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, dict):
+        for split_payload in split_proxy_payloads.values():
+            if isinstance(split_payload, dict):
+                _mark_payload_scheduler_list_outputs(
+                    split_payload,
+                    scheduler_list_output_sources,
+                )
+    elif isinstance(split_proxy_payloads, list):
+        for split_payload in split_proxy_payloads:
+            if isinstance(split_payload, dict):
+                _mark_payload_scheduler_list_outputs(
+                    split_payload,
+                    scheduler_list_output_sources,
+                )
+
+
 def _mapped_boundary_origin_io_type(
     prompt: dict[str, Any],
     boundary_input: BoundaryInputSpec,
@@ -3882,6 +3989,16 @@ def rewrite_prompt_for_modal(
                 component.representative_node_id
             ),
         )
+        implicitly_mapped_output_sources = _implicitly_mapped_boundary_output_sources(
+            component=component,
+            original_prompt=prompt,
+            rewritten_prompt=rewritten_prompt,
+            nodes_module=resolved_nodes_module,
+        )
+        _mark_payload_scheduler_list_outputs(
+            payload,
+            implicitly_mapped_output_sources,
+        )
         proxy_node_ids = _rewrite_component_into_proxy(
             component=component,
             rewritten_prompt=rewritten_prompt,
@@ -3921,7 +4038,7 @@ def rewrite_prompt_for_modal(
         summary.component_node_ids_by_representative[proxy_node_ids[0]] = list(component.node_ids)
         for node_id in component.node_ids:
             summary.rewritten_node_id_map[node_id] = proxy_node_ids[0]
-        if component.mapped_boundary_input_name:
+        if component.mapped_boundary_input_name or implicitly_mapped_output_sources:
             mapped_proxy_component_ids.add(proxy_node_ids[0])
 
     summary.artifact_finalizer_node_id = _attach_modal_artifact_finalizer(
