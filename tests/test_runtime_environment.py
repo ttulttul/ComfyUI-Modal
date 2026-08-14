@@ -68,8 +68,12 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert all("==" in requirement for requirement in runtime_packages)
     assert all("==" in requirement for requirement in torch_packages)
     assert len(runtime_packages) == len(set(runtime_packages))
+    assert "blake3==1.0.9" in runtime_packages
+    assert "comfy-angle==0.1.0" in runtime_packages
     assert "comfy-aimdo==0.4.11" in runtime_packages
     assert "comfy-kitchen==0.2.26" in runtime_packages
+    assert "pyopengl==3.1.10" in runtime_packages
+    assert "simpleeval==1.0.7" in runtime_packages
 
 
 def test_default_modal_gpus_use_pinned_cuda_128_build(
