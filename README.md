@@ -151,6 +151,9 @@ Boundary-crossing values must be transportable. Supported evaluated values inclu
 Automatic mapped execution preserves semantic tensor batches for aggregate consumers.
 For example, the `IMAGE` input to `CreateVideo` remains one ordered frame sequence
 instead of being split into one remote invocation per frame.
+When mapped outputs cannot be concatenated because their shapes differ, Modal-Sync
+publishes them as ordered ComfyUI list outputs so ordinary downstream nodes execute
+once per item instead of receiving an invalid Python list as one tensor-like value.
 
 ComfyUI runtime objects such as `MODEL`, `CONDITIONING`, `CLIP`, `VAE`, `NOISE`, and `CONTROL_NET` cannot cross the local/remote boundary directly. Modal-Sync either expands the remote island so those values are produced remotely, keeps local preview/UI branches local, or fails queue-time validation with a boundary error.
 

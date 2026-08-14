@@ -2625,7 +2625,17 @@ def _boundary_output_payload(
         payload["session_output"] = True
     if mapped_output is not None:
         payload["mapped_output"] = mapped_output
+        if mapped_output:
+            payload["scheduler_is_list"] = True
     return payload
+
+
+def _proxy_boundary_output_is_list(boundary_output: Mapping[str, Any]) -> bool:
+    """Return whether ComfyUI should expose one proxy boundary as a list output."""
+    return bool(
+        boundary_output.get("is_list", False)
+        or boundary_output.get("scheduler_is_list", False)
+    )
 
 
 def _mapped_boundary_origin_io_type(
@@ -3409,7 +3419,9 @@ def _rewrite_component_into_proxy(
         proxy_node_id = ensure_modal_component_proxy_node_registered(
             output_types=tuple(str(output["io_type"]) for output in boundary_outputs),
             output_names=tuple(str(output["proxy_output_name"]) for output in boundary_outputs),
-            output_is_list=tuple(bool(output.get("is_list", False)) for output in boundary_outputs),
+            output_is_list=tuple(
+                _proxy_boundary_output_is_list(output) for output in boundary_outputs
+            ),
             nodes_module=nodes_module,
             is_output_node=is_output_node,
             include_completion_output=True,
@@ -3608,10 +3620,13 @@ def _rewrite_component_into_proxy(
         )
         return [static_proxy_node_id, mapped_proxy_node_id]
 
+    boundary_outputs = list(payload.get("boundary_outputs", []))
     proxy_node_id = ensure_modal_component_proxy_node_registered(
-        output_types=tuple(spec.io_type for spec in component.boundary_outputs),
-        output_names=tuple(spec.proxy_output_name for spec in component.boundary_outputs),
-        output_is_list=tuple(spec.is_list for spec in component.boundary_outputs),
+        output_types=tuple(str(output["io_type"]) for output in boundary_outputs),
+        output_names=tuple(str(output["proxy_output_name"]) for output in boundary_outputs),
+        output_is_list=tuple(
+            _proxy_boundary_output_is_list(output) for output in boundary_outputs
+        ),
         nodes_module=nodes_module,
         is_output_node=component.contains_output_node,
         include_completion_output=True,

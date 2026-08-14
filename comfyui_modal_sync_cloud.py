@@ -5434,6 +5434,7 @@ def _aggregate_mapped_phase_outputs(
                 [item_outputs[output_index] for item_outputs in per_item_outputs],
                 io_type=str(boundary_output.get("io_type", "*")),
                 is_list=bool(boundary_output.get("is_list", False)),
+                scheduler_is_list=bool(boundary_output.get("scheduler_is_list", False)),
             )
         )
     return tuple(aggregated_outputs)
@@ -5444,11 +5445,17 @@ def _merge_static_or_mapped_values(
     *,
     io_type: str,
     is_list: bool,
+    scheduler_is_list: bool,
 ) -> Any:
     """Join mapped per-item outputs using the shared transport serializer rules."""
-    from serialization import join_mapped_values
+    from serialization import join_mapped_values_for_scheduler
 
-    return join_mapped_values(values, io_type=io_type, is_list=is_list)
+    return join_mapped_values_for_scheduler(
+        values,
+        io_type=io_type,
+        is_list=is_list,
+        scheduler_is_list=scheduler_is_list,
+    )
 
 
 def _merge_static_and_mapped_outputs(

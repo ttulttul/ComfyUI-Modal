@@ -746,3 +746,16 @@ def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> An
             return _join_mapped_values_as_list(values)
 
     return _join_mapped_values_as_list(values)
+
+
+def join_mapped_values_for_scheduler(
+    values: Sequence[Any],
+    io_type: str,
+    is_list: bool,
+    scheduler_is_list: bool,
+) -> Any:
+    """Join mapped values and adapt them to the proxy's ComfyUI list-output contract."""
+    joined_value = join_mapped_values(values, io_type=io_type, is_list=is_list)
+    if scheduler_is_list and not isinstance(joined_value, list):
+        return [joined_value]
+    return joined_value

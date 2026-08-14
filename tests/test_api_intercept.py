@@ -2300,6 +2300,7 @@ def test_rewrite_marks_modal_map_boundary_as_mapped_subgraph(
                 "is_list": False,
                 "preview_target_node_ids": [],
                 "mapped_output": True,
+                "scheduler_is_list": True,
             }
         ],
         "execute_node_ids": ["5"],
@@ -2429,6 +2430,7 @@ def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
                 "is_list": False,
                 "preview_target_node_ids": [],
                 "mapped_output": True,
+                "scheduler_is_list": True,
             }
         ],
         "execute_node_ids": ["3"],
