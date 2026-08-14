@@ -194,7 +194,7 @@ function progressIterationRate(previousState, value, maxValue, updatedAt) {
 }
 
 /**
- * Format a progress rate for the compact label beside a node progress bar.
+ * Format a progress rate for the compact label over a node progress bar.
  * @param {number | null | undefined} iterationRate
  * @returns {string}
  */
@@ -205,6 +205,45 @@ function formatIterationRate(iterationRate) {
   }
   const fractionDigits = safeRate < 10 ? 2 : safeRate < 100 ? 1 : 0;
   return `${safeRate.toFixed(fractionDigits)} it/s`;
+}
+
+/**
+ * Draw an iteration-rate label over a progress bar with a tight opaque backing.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {number | null | undefined} iterationRate
+ * @param {number} rightX
+ * @param {number} centerY
+ * @param {number} barHeight
+ * @param {number} scale
+ */
+function drawIterationRateOverlay(
+  ctx,
+  iterationRate,
+  rightX,
+  centerY,
+  barHeight,
+  scale,
+) {
+  const label = formatIterationRate(iterationRate);
+  const metrics = ctx.measureText(label);
+  const paddingX = 3 / scale;
+  const paddingY = 1 / scale;
+  const measuredHeight =
+    Number(metrics.actualBoundingBoxAscent ?? 0) +
+    Number(metrics.actualBoundingBoxDescent ?? 0);
+  const boxWidth = metrics.width + paddingX * 2;
+  const boxHeight = Math.min(barHeight, Math.max(7 / scale, measuredHeight) + paddingY * 2);
+  const boxX = rightX - boxWidth;
+  const boxY = centerY - boxHeight / 2;
+
+  ctx.fillStyle = "rgba(0, 0, 0, 0.9)";
+  ctx.beginPath();
+  ctx.roundRect(boxX, boxY, boxWidth, boxHeight, Math.min(2 / scale, boxHeight / 2));
+  ctx.fill();
+  ctx.fillStyle = "#e2e8f0";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, rightX - paddingX, centerY);
 }
 
 /**
@@ -3479,8 +3518,7 @@ function drawRemoteNodeDecoration(node, ctx) {
   const visibleLaneProgress = hasLaneProgress ? visibleActiveProgressLanes : setupProgressLanes;
   const hasVisibleLaneProgress = visibleLaneProgress.length > 0;
   const hasIterationRateLabels = hasAggregateProgress || hasLaneProgress;
-  const iterationRateColumnWidth = hasIterationRateLabels ? 68 / scale : 0;
-  const progressBarWidth = Math.max(0, barWidth - iterationRateColumnWidth);
+  const progressBarWidth = barWidth;
   const laneBlockHeight = hasVisibleLaneProgress
     ? visibleLaneProgress.length * laneHeight + (visibleLaneProgress.length - 1) * laneGap
     : 0;
@@ -3567,11 +3605,13 @@ function drawRemoteNodeDecoration(node, ctx) {
       }
       ctx.fillRect(-borderWidth, laneY, laneWidth, laneHeight);
       if (!laneProgress.setupOnly) {
-        ctx.fillStyle = "#e2e8f0";
-        ctx.fillText(
-          formatIterationRate(laneProgress.iterationRate),
-          node.size[0] + borderWidth - panelPaddingX,
+        drawIterationRateOverlay(
+          ctx,
+          laneProgress.iterationRate,
+          node.size[0] + borderWidth,
           laneY + laneHeight / 2,
+          laneHeight,
+          scale,
         );
       }
       laneY += laneHeight + laneGap;
@@ -3586,11 +3626,13 @@ function drawRemoteNodeDecoration(node, ctx) {
     ctx.fillRect(-borderWidth, aggregateY, progressBarWidth, aggregateHeight);
     ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
     ctx.fillRect(-borderWidth, aggregateY, progressWidth, aggregateHeight);
-    ctx.fillStyle = "#e2e8f0";
-    ctx.fillText(
-      formatIterationRate(state.progress.iterationRate),
-      node.size[0] + borderWidth - panelPaddingX,
+    drawIterationRateOverlay(
+      ctx,
+      state.progress.iterationRate,
+      node.size[0] + borderWidth,
       aggregateY + aggregateHeight / 2,
+      aggregateHeight,
+      scale,
     );
   }
   ctx.restore();
