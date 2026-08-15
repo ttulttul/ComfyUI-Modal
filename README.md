@@ -112,7 +112,7 @@ Mapped execution currently supports:
 
 One `Modal Map Input` boundary is supported per remote component. Non-mapped boundary inputs are broadcast unchanged to every item. Mapped outputs are reassembled in item order, concatenating batchable tensors when possible and otherwise preserving an ordered list.
 
-Ordinary remote components without `Modal Map Input` still preserve ComfyUI's zipped batch behavior at the remote boundary. If a compatible batch reaches a primitive socket such as `seed: INT`, Modal-Sync itemizes it instead of injecting the whole list into the primitive widget input. If the target node declares `INPUT_IS_LIST`, Modal-Sync runs the component once as an ordinary subgraph.
+Ordinary remote components without `Modal Map Input` still preserve ComfyUI's zipped batch behavior at the remote boundary. If a compatible batch reaches a primitive socket such as `seed: INT`, Modal-Sync itemizes it instead of injecting the whole list into the primitive widget input. If the target node declares `INPUT_IS_LIST`, Modal-Sync runs the component once as an ordinary subgraph. Scheduler-list output contracts remain stable for singleton runs: an ordinary one-item `IMAGE` result stays wrapped as one `[B,H,W,C]` value instead of losing its batch dimension when it returns to ComfyUI.
 
 Mapped components can contain both one-time execute targets and per-item execute targets. For example, two remote samplers may share one upstream model loader while only one sampler fans out over latents. Modal-Sync keeps the invariant upstream work separate from the per-item work so the sibling branch still runs once.
 

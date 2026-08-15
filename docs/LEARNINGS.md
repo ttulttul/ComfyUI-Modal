@@ -1,5 +1,10 @@
 # Learnings
 
+## 2026-08-15
+
+- ComfyUI `OUTPUT_IS_LIST` is a strict runtime container contract, not only planning metadata. If a proxy advertises a scheduler-list `IMAGE` but returns a raw `[1,H,W,C]` tensor, ComfyUI extends that tensor as the output list and passes `[H,W,C]` downstream; `PreviewImage` then treats height as batch size and saves `H` arrays shaped `[W,C]`. Normalize every scheduler-list proxy result to a Python list even when singleton execution skipped mapped aggregation.
+- Multi-item mapped tests do not cover the singleton contract. Their aggregation path already wraps a joined tensor, so regression coverage also needs an ordinary remote result with one `IMAGE` and must verify that ComfyUI list merging preserves the complete `[1,H,W,C]` tensor as one scheduler item.
+
 ## 2026-08-14
 
 - A costly local re-entry is a graph property, not just a single-edge pattern. The planner can identify every affected local node by intersecting two local-only closures: nodes reachable downstream from any remote node and nodes that can reach any remote node upstream. This catches both one-node and multi-node remote-to-local-to-remote paths while excluding local preview branches that never re-enter remote execution.

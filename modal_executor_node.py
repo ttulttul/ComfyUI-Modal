@@ -303,6 +303,38 @@ def _normalize_proxy_payload(payload: Any) -> Mapping[str, Any]:
     return payload
 
 
+def _normalize_scheduler_list_outputs(
+    payload: Mapping[str, Any],
+    outputs: Sequence[Any],
+) -> tuple[Any, ...]:
+    """Make remote output containers match the proxy's scheduler-list declarations."""
+    normalized_outputs = list(outputs)
+    boundary_outputs = payload.get("boundary_outputs")
+    if not isinstance(boundary_outputs, Sequence) or isinstance(
+        boundary_outputs,
+        str | bytes | bytearray,
+    ):
+        return tuple(normalized_outputs)
+
+    for output_index, boundary_output in enumerate(boundary_outputs):
+        if output_index >= len(normalized_outputs):
+            break
+        if not isinstance(boundary_output, Mapping):
+            continue
+        if not bool(boundary_output.get("scheduler_is_list", False)):
+            continue
+        if isinstance(normalized_outputs[output_index], list):
+            continue
+        normalized_outputs[output_index] = [normalized_outputs[output_index]]
+        logger.debug(
+            "Wrapped singleton remote output %d for component=%s to satisfy its scheduler-list contract.",
+            output_index,
+            payload.get("component_id"),
+        )
+
+    return tuple(normalized_outputs)
+
+
 def _normalize_prompt_id(value: Any) -> str | None:
     """Return one non-empty prompt id string when available."""
     if value is None:
@@ -551,12 +583,13 @@ def _build_proxy_node_class(
             )
 
             async with _modal_workflow_execution_slot(payload):
-                outputs = tuple(
+                outputs = _normalize_scheduler_list_outputs(
+                    payload,
                     await _execute_payload_async(
                         get_remote_executor_client(),
                         payload,
                         _normalize_proxy_kwargs(kwargs),
-                    )
+                    ),
                 )
             logger.debug(
                 "Remote execution completed for payload kind=%s with %d outputs.",
