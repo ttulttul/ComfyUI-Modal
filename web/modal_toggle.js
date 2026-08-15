@@ -43,6 +43,9 @@ const COMPLETE_BORDER_COLOR = "#004FA4";
 const COMPLETE_FILL_COLOR = "#001C71";
 const FINALIZING_NODE_BORDER_COLOR = "#00358A";
 const ERROR_BORDER_COLOR = "#ef4444";
+const LOCAL_BOTTLENECK_BORDER_COLOR = "#ef4444";
+const LOCAL_BOTTLENECK_FILL_COLOR = "rgba(239, 68, 68, 0.14)";
+const LOCAL_BOTTLENECK_SHADOW_COLOR = "rgba(239, 68, 68, 0.55)";
 
 const STATE_SETUP = "setup";
 const STATE_STARTING = "starting";
@@ -75,6 +78,7 @@ const modalPromptStates = new Map();
 const modalTerminalPromptStates = new Map();
 const modalCancellingPromptIds = new Set();
 const modalQueuedPromptIds = new Set();
+const modalSandwichedLocalNodeIds = new Set();
 const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 
@@ -112,6 +116,42 @@ function isEligibleNode(node) {
  */
 function isRemoteNode(node) {
   return Boolean(node?.properties?.[REMOTE_PROPERTY]);
+}
+
+/**
+ * Return whether the latest planner result identified a local re-entry bottleneck.
+ * @param {LGraphNode} node
+ * @returns {boolean}
+ */
+function isSandwichedLocalNode(node) {
+  if (isRemoteNode(node)) {
+    return false;
+  }
+  const workflowPath = workflowNodePath(node) || nodeId(node);
+  return modalSandwichedLocalNodeIds.has(workflowPath);
+}
+
+/**
+ * Replace the local re-entry warnings with one planner result.
+ * @param {Array<string | number>} nodeIds
+ */
+function setSandwichedLocalNodeIds(nodeIds) {
+  modalSandwichedLocalNodeIds.clear();
+  for (const nodeIdValue of nodeIds ?? []) {
+    modalSandwichedLocalNodeIds.add(String(nodeIdValue));
+  }
+  refreshNodeDecorations();
+}
+
+/**
+ * Clear planner warnings after the user changes remote selection.
+ */
+function clearSandwichedLocalNodeWarnings() {
+  if (modalSandwichedLocalNodeIds.size === 0) {
+    return;
+  }
+  modalSandwichedLocalNodeIds.clear();
+  refreshNodeDecorations();
 }
 
 /**
@@ -2859,6 +2899,7 @@ async function analyzeAndSetUpstreamRemoteNodes(node, value) {
   const resolvedWorkflowNodePaths = result.resolved_workflow_node_paths ?? [];
   const addedWorkflowNodePaths = result.added_workflow_node_paths ?? [];
   const appliedCount = setWorkflowNodePathsRemote(resolvedWorkflowNodePaths, value);
+  setSandwichedLocalNodeIds(value ? (result.sandwiched_local_node_ids ?? []) : []);
   refreshNodeDecorations();
 
   if (!value) {
@@ -3021,6 +3062,7 @@ function setRemoteFlag(node, value) {
   if (node.__modalToggleWidget) {
     node.__modalToggleWidget.value = enabled;
   }
+  clearSandwichedLocalNodeWarnings();
   refreshNodeDecorations();
 }
 
@@ -3232,6 +3274,18 @@ function remoteDecorationPalette(state, elapsed) {
 }
 
 /**
+ * Return the static warning palette for a local node between remote graph regions.
+ * @returns {{ borderColor: string, shadowColor: string, fillColor: string }}
+ */
+function localBottleneckDecorationPalette() {
+  return {
+    borderColor: LOCAL_BOTTLENECK_BORDER_COLOR,
+    shadowColor: LOCAL_BOTTLENECK_SHADOW_COLOR,
+    fillColor: LOCAL_BOTTLENECK_FILL_COLOR,
+  };
+}
+
+/**
  * Return the visible LiteGraph node matching a Nodes 2.0 DOM element.
  * @param {HTMLElement} nodeElement
  * @returns {LGraphNode | null}
@@ -3280,12 +3334,15 @@ function ensureVueNodeDecoration(nodeElement) {
  * @param {number} timestamp
  */
 function updateVueNodeDecoration(nodeElement, node, timestamp) {
-  if (!isRemoteNode(node)) {
+  const localBottleneck = isSandwichedLocalNode(node);
+  if (!isRemoteNode(node) && !localBottleneck) {
     clearVueNodeDecoration(nodeElement);
     return;
   }
   const state = getRemoteVisualState(node);
-  const palette = remoteDecorationPalette(state, timestamp / 1000);
+  const palette = localBottleneck
+    ? localBottleneckDecorationPalette()
+    : remoteDecorationPalette(state, timestamp / 1000);
   const decoration = ensureVueNodeDecoration(nodeElement);
   const innerWrapper = nodeElement.querySelector(':scope > [data-testid="node-inner-wrapper"]');
   const borderRadius =
@@ -3296,12 +3353,13 @@ function updateVueNodeDecoration(nodeElement, node, timestamp) {
   decoration.style.backgroundColor = palette.fillColor ?? "transparent";
   decoration.style.borderRadius = borderRadius || "12px";
   decoration.style.boxShadow = `0 0 8px ${palette.shadowColor}`;
-  const phase = state?.phase ?? "idle";
+  const phase = localBottleneck ? "local-bottleneck" : (state?.phase ?? "idle");
   nodeElement.classList.add("comfy-modal-vue-node");
   nodeElement.dataset.modalPhase = phase;
   const badge = decoration.querySelector(".comfy-modal-vue-node-badge");
-  badge.textContent = String(state?.componentLabel ?? "");
-  badge.hidden = !state?.componentLabel;
+  const badgeText = localBottleneck ? "!" : String(state?.componentLabel ?? "");
+  badge.textContent = badgeText;
+  badge.hidden = !badgeText;
   badge.style.borderColor = palette.borderColor;
   badge.style.boxShadow = `0 0 8px ${palette.shadowColor}`;
 }
@@ -3404,12 +3462,13 @@ function traceRoundedRectPath(ctx, x, y, width, height, radius) {
 }
 
 /**
- * Draw the remote execution border and shading for a node.
+ * Draw the Modal execution or local-bottleneck border and shading for a node.
  * @param {LGraphNode} node
  * @param {CanvasRenderingContext2D} ctx
  */
-function drawRemoteNodeDecoration(node, ctx) {
-  if (!isRemoteNode(node)) {
+function drawModalNodeDecoration(node, ctx) {
+  const localBottleneck = isSandwichedLocalNode(node);
+  if (!isRemoteNode(node) && !localBottleneck) {
     return;
   }
 
@@ -3419,7 +3478,9 @@ function drawRemoteNodeDecoration(node, ctx) {
   const borderWidth = 3 / scale;
   const cornerRadius = 12 / scale;
   const elapsed = performance.now() / 1000;
-  const { borderColor, shadowColor, fillColor } = remoteDecorationPalette(state, elapsed);
+  const { borderColor, shadowColor, fillColor } = localBottleneck
+    ? localBottleneckDecorationPalette()
+    : remoteDecorationPalette(state, elapsed);
 
   ctx.save();
   if (fillColor) {
@@ -3449,7 +3510,8 @@ function drawRemoteNodeDecoration(node, ctx) {
   ctx.stroke();
   ctx.restore();
 
-  if (state?.componentLabel) {
+  const nodeBadgeText = localBottleneck ? "!" : state?.componentLabel;
+  if (nodeBadgeText) {
     ctx.save();
     const badgeRadius = 10 / scale;
     const badgeX = 10 / scale;
@@ -3468,7 +3530,7 @@ function drawRemoteNodeDecoration(node, ctx) {
     ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(String(state.componentLabel), badgeX, badgeY + 0.5 / scale);
+    ctx.fillText(String(nodeBadgeText), badgeX, badgeY + 0.5 / scale);
     ctx.restore();
   }
 
@@ -3669,7 +3731,7 @@ function decorateNode(node) {
   const originalDrawForeground = node.onDrawForeground;
   node.onDrawForeground = function onDrawForeground(ctx) {
     originalDrawForeground?.apply(this, arguments);
-    drawRemoteNodeDecoration(this, ctx);
+    drawModalNodeDecoration(this, ctx);
   };
   queueVueNodeDecorationSync();
 }
@@ -4311,6 +4373,12 @@ function patchQueuePrompt() {
       }
 
       const responsePayload = await response.json();
+      const sandwichedLocalNodeIds = Array.isArray(
+        responsePayload.modal_sandwiched_local_node_ids,
+      )
+        ? responsePayload.modal_sandwiched_local_node_ids
+        : [];
+      setSandwichedLocalNodeIds(sandwichedLocalNodeIds);
       if (remoteNodeIds.length > 0) {
         const acceptedModalGpu = MODAL_GPU_TYPES.includes(responsePayload.modal_gpu)
           ? responsePayload.modal_gpu

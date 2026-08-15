@@ -88,10 +88,11 @@ The frontend shows remote state directly on the canvas:
 - pulsing green border: ready and waiting
 - pulsing purple border: executing remotely
 - steady green border: finished for the current run
-- red border: queue-time or execution failure
+- red border on a remote node: queue-time or execution failure
+- red border with a `!` badge on a local node: the planner found a remote-to-local-to-remote path through that node, so the local re-entry may force extra component splits and data transfers
 - numbered badge: remote component assignment for the current prompt
 
-These state colours work with both the legacy LiteGraph renderer and ComfyUI's experimental Nodes 2.0 renderer. The legacy renderer uses its canvas foreground hook; Nodes 2.0 receives an equivalent DOM border, glow, fill, and component badge on each `.lg-node`, driven by the same palette and throttled animation state.
+These state colours work with both the legacy LiteGraph renderer and ComfyUI's experimental Nodes 2.0 renderer. The legacy renderer uses its canvas foreground hook; Nodes 2.0 receives an equivalent DOM border, glow, fill, and component badge on each `.lg-node`, driven by the same palette and throttled animation state. Local re-entry warnings cover every local node in a path between remote regions, including multi-node local chains. They refresh when the planner analyzes a changed remote selection or queues a prompt, and clear immediately when you change a `Run on Modal` flag so stale advice is not left on the canvas.
 
 Remote sampler-style progress is rendered in a small temporary panel near the node. Each active progress bar includes a smoothed iterations-per-second (`it/s`) rate derived from successive streamed progress samples; parallel mapped lanes report their rates independently. Static progress redraws happen only when progress events arrive, while pulsing node phases, setup lane placeholders, and short fade-outs use a throttled canvas animation loop. Preview images and ComfyUI UI payloads emitted by remote nodes are streamed back into the local PromptServer while the remote component is still running. When the browser regains focus, Modal-Sync replays recent UI events and reconciles them against ComfyUI queue/history state so cancelled or completed prompts do not leave stale progress bars behind.
 

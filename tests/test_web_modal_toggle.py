@@ -225,9 +225,23 @@ def test_remote_modal_nodes_show_component_badges() -> None:
     assert "componentLabelByMember: new Map()," in source
     assert "promptState.componentLabelByMember.set(componentNodeId, componentLabel);" in source
     assert "componentLabel: promptState?.componentLabelByMember.get(visualNodeId) ?? null," in source
-    assert "if (state?.componentLabel) {" in source
+    assert 'const nodeBadgeText = localBottleneck ? "!" : state?.componentLabel;' in source
+    assert "if (nodeBadgeText) {" in source
     assert "ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);" in source
-    assert "ctx.fillText(String(state.componentLabel), badgeX, badgeY + 0.5 / scale);" in source
+    assert "ctx.fillText(String(nodeBadgeText), badgeX, badgeY + 0.5 / scale);" in source
+
+
+def test_planner_highlights_sandwiched_local_nodes() -> None:
+    """Queue-time local re-entry warnings should render in both node frontends."""
+    source = _modal_toggle_source()
+
+    assert "const modalSandwichedLocalNodeIds = new Set();" in source
+    assert "function isSandwichedLocalNode(node)" in source
+    assert "function localBottleneckDecorationPalette()" in source
+    assert 'const phase = localBottleneck ? "local-bottleneck"' in source
+    assert 'const nodeBadgeText = localBottleneck ? "!"' in source
+    assert "responsePayload.modal_sandwiched_local_node_ids" in source
+    assert "setSandwichedLocalNodeIds(sandwichedLocalNodeIds);" in source
 
 
 def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> None:
