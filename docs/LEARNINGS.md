@@ -1,5 +1,10 @@
 # Learnings
 
+## 2026-08-14
+
+- A costly local re-entry is a graph property, not just a single-edge pattern. The planner can identify every affected local node by intersecting two local-only closures: nodes reachable downstream from any remote node and nodes that can reach any remote node upstream. This catches both one-node and multi-node remote-to-local-to-remote paths while excluding local preview branches that never re-enter remote execution.
+- Planner advice should remain visually distinct from execution failure even when both use red. A static red border and `!` badge on local nodes communicates a potential component-splitting bottleneck, while remote failure keeps its existing red execution-state styling and remote nodes always take precedence if a warning becomes stale.
+
 ## 2026-08-13
 
 - A ComfyUI requirements-file change affects the remote runtime fingerprint but does not install the new dependency by itself when the Modal image uses an explicit pinned support set. Reconcile new import-time core requirements with that pinned set: otherwise a built-in extra such as `nodes_math.py` can fail on `simpleeval`, then be misreported later as an unsynced custom node because its V3 class never registered.

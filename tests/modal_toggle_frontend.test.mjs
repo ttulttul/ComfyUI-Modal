@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { Buffer } from "node:buffer";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runInThisContext } from "node:vm";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -49,6 +49,8 @@ const transformedSource = `${[
   "  markPromptTerminal,",
   "  patchQueuePrompt,",
   "  setRemoteFlag,",
+  "  setSandwichedLocalNodeIds,",
+  "  isSandwichedLocalNode,",
   "  setAllEligibleWorkflowNodesRemote,",
   "  selectedModalGpu,",
   "  setSelectedModalGpu,",
@@ -70,13 +72,14 @@ const transformedSource = `${[
   "  modalPromptStates,",
   "  modalTerminalPromptStates,",
   "  modalQueuedPromptIds,",
+  "  modalSandwichedLocalNodeIds,",
   "  STATE_READY,",
   "  STATE_ACTIVE,",
   "  STATE_COMPLETE,",
   "  EXECUTION_PHASE,",
   "};",
 ].join("\n")}`;
-await import(`data:text/javascript;base64,${Buffer.from(transformedSource).toString("base64")}`);
+runInThisContext(transformedSource, { filename: sourcePath });
 
 const modalToggle = globalThis.__modalToggleExports;
 
@@ -88,8 +91,18 @@ function resetFrontendState() {
   modalToggle.modalPromptStates.clear();
   modalToggle.modalTerminalPromptStates.clear();
   modalToggle.modalQueuedPromptIds.clear();
+  modalToggle.modalSandwichedLocalNodeIds.clear();
   modalToggle.modalGlobalStatusStates.clear();
 }
+
+resetFrontendState();
+const localBottleneckNode = { id: 174, properties: {} };
+modalToggle.setSandwichedLocalNodeIds([174]);
+assert.equal(modalToggle.isSandwichedLocalNode(localBottleneckNode), true);
+localBottleneckNode.properties.is_modal_remote = true;
+assert.equal(modalToggle.isSandwichedLocalNode(localBottleneckNode), false);
+modalToggle.setRemoteFlag(localBottleneckNode, false);
+assert.equal(modalToggle.modalSandwichedLocalNodeIds.size, 0);
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-a", ["10", "11", "12"], [
@@ -662,6 +675,7 @@ globalThis.__modalApiStub.fetchApi = async (_route, options) => {
       return {
         prompt_id: requestBody.prompt_id,
         modal_remote_node_ids: ["80"],
+        modal_sandwiched_local_node_ids: ["174"],
         modal_components: [],
         modal_gpu: "B300",
       };
@@ -678,6 +692,7 @@ const fastPromptResponse = await globalThis.__modalApiStub.queuePrompt(0, {
 });
 assert.equal(fastPromptResponse.modal_gpu, "B300");
 assert.equal(modalToggle.modalNodeStates.has("80"), false);
+assert.deepEqual(Array.from(modalToggle.modalSandwichedLocalNodeIds), ["174"]);
 
 class MenuNode {}
 const menuNode = new MenuNode();

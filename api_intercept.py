@@ -180,6 +180,7 @@ class RewriteSummary:
     volume_reload_marker: str | None = None
     uploaded_volume_paths: list[str] = field(default_factory=list)
     rewritten_node_id_map: dict[str, str] = field(default_factory=dict)
+    sandwiched_local_node_ids: list[str] = field(default_factory=list)
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
     artifact_finalizer_node_id: str | None = None
@@ -209,6 +210,7 @@ class RemoteNodeAnalysis:
     resolved_workflow_node_paths: list[str] = field(default_factory=list)
     added_node_ids: list[str] = field(default_factory=list)
     added_workflow_node_paths: list[str] = field(default_factory=list)
+    sandwiched_local_node_ids: list[str] = field(default_factory=list)
     reasons: list[RemoteExpansionReason] = field(default_factory=list)
 
 
@@ -1209,6 +1211,46 @@ def _build_consumer_map(prompt: dict[str, Any]) -> dict[LinkedOutputRef, list[In
     return consumers
 
 
+def _sandwiched_local_node_ids(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+) -> set[str]:
+    """Return local nodes on paths that leave and then re-enter remote execution."""
+    downstream_node_ids: dict[str, set[str]] = defaultdict(set)
+    upstream_node_ids: dict[str, set[str]] = defaultdict(set)
+    for target_node_id, prompt_node in prompt.items():
+        for input_value in (prompt_node.get("inputs") or {}).values():
+            if not _is_link(input_value):
+                continue
+            source_node_id = str(input_value[0])
+            safe_target_node_id = str(target_node_id)
+            downstream_node_ids[source_node_id].add(safe_target_node_id)
+            upstream_node_ids[safe_target_node_id].add(source_node_id)
+
+    def local_closure(adjacency: Mapping[str, set[str]]) -> set[str]:
+        """Return local nodes reachable from the remote seed set in one direction."""
+        reachable_local_node_ids: set[str] = set()
+        pending_node_ids = list(sorted(remote_node_ids))
+        visited_node_ids = set(remote_node_ids)
+        while pending_node_ids:
+            current_node_id = pending_node_ids.pop()
+            for adjacent_node_id in adjacency.get(current_node_id, set()):
+                if adjacent_node_id in visited_node_ids:
+                    continue
+                visited_node_ids.add(adjacent_node_id)
+                if adjacent_node_id in remote_node_ids:
+                    continue
+                if adjacent_node_id not in prompt:
+                    continue
+                reachable_local_node_ids.add(adjacent_node_id)
+                pending_node_ids.append(adjacent_node_id)
+        return reachable_local_node_ids
+
+    downstream_local_node_ids = local_closure(downstream_node_ids)
+    upstream_local_node_ids = local_closure(upstream_node_ids)
+    return downstream_local_node_ids & upstream_local_node_ids
+
+
 def _node_output_refs(prompt: dict[str, Any], node_id: str, nodes_module: Any) -> list[LinkedOutputRef]:
     """Return declared output refs for one prompt node."""
     prompt_node = prompt.get(node_id)
@@ -1898,6 +1940,10 @@ def analyze_remote_node_selection(
         remote_node_ids=initial_remote_node_ids,
         nodes_module=resolved_nodes_module,
     )
+    sandwiched_local_node_ids = _sandwiched_local_node_ids(
+        prompt,
+        resolved_remote_node_ids,
+    )
     resolved_workflow_node_paths = (
         _resolve_workflow_node_paths_for_prompt_nodes(
             resolved_remote_node_ids,
@@ -1917,6 +1963,7 @@ def analyze_remote_node_selection(
         resolved_workflow_node_paths=sorted(resolved_workflow_node_paths),
         added_node_ids=sorted(added_node_ids),
         added_workflow_node_paths=sorted(added_workflow_node_paths),
+        sandwiched_local_node_ids=sorted(sandwiched_local_node_ids),
         reasons=reasons,
     )
 
@@ -3881,6 +3928,14 @@ def rewrite_prompt_for_modal(
         nodes_module=resolved_nodes_module,
     )
     summary.remote_node_ids = sorted(expanded_remote_node_ids)
+    summary.sandwiched_local_node_ids = sorted(
+        _sandwiched_local_node_ids(rewritten_prompt, expanded_remote_node_ids)
+    )
+    if summary.sandwiched_local_node_ids:
+        logger.warning(
+            "Detected local nodes sandwiched between remote graph regions; these nodes may force additional Modal phases: %s",
+            summary.sandwiched_local_node_ids,
+        )
     components = _build_component_plans(
         rewritten_prompt,
         expanded_remote_node_ids,
@@ -4464,6 +4519,7 @@ def setup_modal_queue_route(
                     "resolved_workflow_node_paths": analysis.resolved_workflow_node_paths,
                     "added_node_ids": analysis.added_node_ids,
                     "added_workflow_node_paths": analysis.added_workflow_node_paths,
+                    "sandwiched_local_node_ids": analysis.sandwiched_local_node_ids,
                     "reasons": [
                         {
                             "node_id": reason.node_id,
@@ -4644,6 +4700,9 @@ def setup_modal_queue_route(
                     {
                         "modal_gpu": request_settings.modal_gpu,
                         "modal_remote_node_ids": list(summary.remote_node_ids),
+                        "modal_sandwiched_local_node_ids": list(
+                            summary.sandwiched_local_node_ids
+                        ),
                         "modal_components": [
                             {
                                 "representative_node_id": representative_node_id,

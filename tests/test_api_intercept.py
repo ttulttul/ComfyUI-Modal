@@ -638,6 +638,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
         remote_node_ids=["1"],
         remote_component_ids=["1"],
         component_node_ids_by_representative={"1": ["1"]},
+        sandwiched_local_node_ids=["4"],
         component_execution_stages=[["1"]],
         estimated_max_parallel_requests=1,
         max_parallel_requests_upper_bound=1,
@@ -675,6 +676,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     assert response_payload["prompt_id"] == "prompt-queue-warmup"
     assert response_payload["modal_gpu"] == "B300"
     assert response_payload["modal_remote_node_ids"] == ["1"]
+    assert response_payload["modal_sandwiched_local_node_ids"] == ["4"]
     assert observed_rewrite_settings[0].modal_gpu == "B300"
     queued_extra_data = prompt_server.prompt_queue.items[0][3]
     assert queued_extra_data["modal"]["gpu"] == "B300"
@@ -1747,6 +1749,7 @@ def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
     assert summary.remote_component_ids == ["1", "2"]
     assert summary.component_node_ids_by_representative == {"1": ["1"], "2": ["2"]}
     assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
+    assert summary.sandwiched_local_node_ids == ["4"]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["1", 0]
     assert rewritten_prompt["2"]["inputs"]["remote_input_0"] == ["4", 0]
     assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
@@ -1809,6 +1812,31 @@ def test_component_local_reentry_dependency_detection(
         prompt=prompt,
         component=component,
     )
+
+
+def test_sandwiched_local_nodes_include_only_remote_reentry_paths(
+    api_intercept_module: Any,
+) -> None:
+    """Planner warnings should cover local chains that leave and re-enter remote work."""
+    prompt = {
+        "1": {"class_type": "RemoteSource", "inputs": {}},
+        "2": {"class_type": "LocalTransform", "inputs": {"value": ["1", 0]}},
+        "3": {
+            "class_type": "LocalTransform",
+            "inputs": {"value": ["2", 0], "local_only": ["7", 0]},
+        },
+        "4": {"class_type": "RemoteSink", "inputs": {"value": ["3", 0]}},
+        "5": {"class_type": "LocalPreview", "inputs": {"value": ["1", 0]}},
+        "6": {"class_type": "RemoteSink", "inputs": {"value": ["8", 0]}},
+        "7": {"class_type": "LocalSource", "inputs": {}},
+        "8": {"class_type": "LocalSource", "inputs": {}},
+        "9": {"class_type": "RemoteSink", "inputs": {"value": ["1", 1]}},
+    }
+
+    assert api_intercept_module._sandwiched_local_node_ids(
+        prompt,
+        {"1", "4", "6", "9"},
+    ) == {"2", "3"}
 
 
 def test_rewrite_reports_parallel_component_stages(
@@ -3577,6 +3605,64 @@ def test_analyze_remote_node_selection_returns_nodes_to_mark_and_reasons(
         ("1", "3"),
         ("2", "3"),
     ]
+
+
+def test_analyze_remote_node_selection_reports_local_reentry(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """Dry-run analysis should report local nodes between existing remote regions."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteString": _FakeRemoteStringEchoNode,
+                "LocalString": _FakeLocalStringSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+        ]
+    }
+    prompt = {
+        "1": {"class_type": "RemoteString", "inputs": {}},
+        "2": {"class_type": "LocalString", "inputs": {"text": ["1", 0]}},
+        "3": {"class_type": "RemoteString", "inputs": {"text": ["2", 0]}},
+    }
+
+    analysis = api_intercept_module.analyze_remote_node_selection(
+        prompt=prompt,
+        workflow=workflow,
+        seed_workflow_node_paths=[],
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert analysis.resolved_remote_node_ids == ["1", "3"]
+    assert analysis.sandwiched_local_node_ids == ["2"]
 
 
 def test_analyze_remote_node_selection_prefers_nested_workflow_paths(
