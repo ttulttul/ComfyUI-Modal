@@ -651,6 +651,74 @@ def test_mapped_boundary_payload_requests_scheduler_list_output(
     assert api_intercept_module._proxy_boundary_output_is_list(payload) is True
 
 
+def test_scheduler_list_proxy_wraps_singleton_image_tensor(
+    modal_executor_module: Any,
+) -> None:
+    """A singleton mapped IMAGE must retain its batch dimension in ComfyUI."""
+    torch = pytest.importorskip("torch")
+
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    proxy_node_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=("IMAGE",),
+        output_names=("image",),
+        output_is_list=(True,),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    image = torch.zeros((1, 8, 6, 3), dtype=torch.float32)
+
+    class FakeClient:
+        """Return one ordinary IMAGE tensor from a singleton remote execution."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[Any, ...]:
+            """Return the unwrapped tensor produced by the ordinary subgraph path."""
+            assert payload["boundary_outputs"][0]["scheduler_is_list"] is True
+            assert kwargs == {}
+            return (image,)
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        result = asyncio.run(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": "singleton-image-prompt",
+                    "component_id": "singleton-image-component",
+                    "boundary_outputs": [
+                        {
+                            "proxy_output_name": "image",
+                            "node_id": "11",
+                            "output_index": 0,
+                            "io_type": "IMAGE",
+                            "is_list": False,
+                            "scheduler_is_list": True,
+                        }
+                    ],
+                },
+                unique_id="singleton-image-component",
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert isinstance(result.result[0], list)
+    assert len(result.result[0]) == 1
+    assert result.result[0][0] is image
+    scheduler_items: list[Any] = []
+    scheduler_items.extend(result.result[0])
+    assert len(scheduler_items) == 1
+    assert scheduler_items[0] is image
+    assert tuple(scheduler_items[0].shape) == (1, 8, 6, 3)
+
+
 def test_component_proxy_emits_completion_token_after_remote_execution(
     modal_executor_module: Any,
 ) -> None:
