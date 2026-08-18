@@ -1900,12 +1900,13 @@ class _HeadlessPromptQueue:
 class _HeadlessPromptServerInstance:
     """Minimal PromptServer.instance replacement for custom-node import side effects."""
 
-    def __init__(self) -> None:
+    def __init__(self, node_replace_manager: Any | None) -> None:
         """Initialize route registration and no-op websocket state."""
         from aiohttp import web
 
         self.routes = web.RouteTableDef()
         self.app = web.Application()
+        self.node_replace_manager = node_replace_manager
         self.supports = ["custom_nodes_from_web"]
         self.client_id: str | None = None
         self.last_node_id: str | None = None
@@ -2647,7 +2648,13 @@ def _ensure_headless_prompt_server_instance() -> None:
     if getattr(prompt_server_class, "instance", None) is not None:
         return
 
-    prompt_server_class.instance = _HeadlessPromptServerInstance()
+    node_replace_manager_class = getattr(server, "NodeReplaceManager", None)
+    node_replace_manager = (
+        node_replace_manager_class()
+        if callable(node_replace_manager_class)
+        else None
+    )
+    prompt_server_class.instance = _HeadlessPromptServerInstance(node_replace_manager)
     logger.info("Installed headless PromptServer.instance for remote custom-node initialization.")
 
 
