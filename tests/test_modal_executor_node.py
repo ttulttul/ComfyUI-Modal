@@ -1844,8 +1844,22 @@ def test_modal_cloud_installs_headless_prompt_server_instance(
     monkeypatch: Any,
 ) -> None:
     """Remote custom-node init should get a minimal PromptServer.instance shim."""
+    class FakeNodeReplaceManager:
+        """Record replacement registrations made through the headless server."""
+
+        def __init__(self) -> None:
+            """Initialize an empty replacement registry."""
+            self.registrations: list[Any] = []
+
+        def register(self, replacement: Any) -> None:
+            """Record one replacement registered by a ComfyUI extension."""
+            self.registrations.append(replacement)
+
     fake_prompt_server_class = type("PromptServer", (), {})
-    fake_server_module = types.SimpleNamespace(PromptServer=fake_prompt_server_class)
+    fake_server_module = types.SimpleNamespace(
+        NodeReplaceManager=FakeNodeReplaceManager,
+        PromptServer=fake_prompt_server_class,
+    )
 
     monkeypatch.setitem(sys.modules, "server", fake_server_module)
     modal_cloud_module._ensure_headless_prompt_server_instance()
@@ -1854,6 +1868,7 @@ def test_modal_cloud_installs_headless_prompt_server_instance(
     assert instance is not None
     assert hasattr(instance, "routes")
     assert hasattr(instance, "app")
+    assert isinstance(instance.node_replace_manager, FakeNodeReplaceManager)
     assert instance.supports == ["custom_nodes_from_web"]
     assert instance.client_id is None
     assert instance.last_node_id is None
@@ -1865,6 +1880,9 @@ def test_modal_cloud_installs_headless_prompt_server_instance(
 
     instance.add_on_prompt_handler("handler")
     assert instance.on_prompt_handlers == ["handler"]
+
+    instance.node_replace_manager.register("replacement")
+    assert instance.node_replace_manager.registrations == ["replacement"]
 
     instance.prompt_queue.put((1, "prompt-id", {}, {}, []))
     assert instance.prompt_queue.get_current_queue() == (
