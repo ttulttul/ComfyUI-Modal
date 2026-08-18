@@ -24,6 +24,7 @@ def _runtime_settings(**overrides: Any) -> SimpleNamespace:
         "max_containers": None,
         "min_containers": 0,
         "modal_gpu": "A100",
+        "modal_secret_name": "comfy",
         "node_output_cache_dict_name": "comfy-modal-sync-node-cache",
         "remote_storage_root": "/storage",
         "scaledown_window_seconds": 600,
@@ -167,9 +168,19 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
         comfyui_root,
         modal_gpu="L40S",
     )
+    secret_changed = _runtime_identity(
+        runtime_environment_module,
+        repo_root,
+        comfyui_root,
+        modal_secret_name="workflow-credentials",
+    )
 
     assert source_changed.fingerprint != baseline.fingerprint
     assert option_changed.fingerprint != source_changed.fingerprint
+    assert secret_changed.fingerprint != source_changed.fingerprint
+    assert secret_changed.manifest["runtime_options"]["modal_secret_name"] == (
+        "workflow-credentials"
+    )
 
 
 def test_runtime_identity_records_system_packages(

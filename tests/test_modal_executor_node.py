@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from concurrent.futures import Future
+from dataclasses import replace
 import importlib.util
 import json
 import pickle
@@ -1545,6 +1546,7 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     settings = types.SimpleNamespace(
         app_name="comfy-modal-sync-AAECAwQFBgc",
         modal_gpu="B300",
+        modal_secret_name="workflow-credentials",
         stream_event_queue_maxsize=256,
         bridge_inline_max_bytes=1024,
         invocation_result_inline_max_bytes=2048,
@@ -1556,7 +1558,29 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
 
     assert image_environment["COMFY_MODAL_APP_NAME"] == "comfy-modal-sync-AAECAwQFBgc"
     assert image_environment["COMFY_MODAL_GPU"] == "B300"
+    assert image_environment["COMFY_MODAL_SECRET_NAME"] == "workflow-credentials"
     assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
+
+
+def test_modal_cloud_resolves_configured_named_secret(
+    modal_cloud_module: Any,
+) -> None:
+    """Cloud app construction should reference the configured collection without reading .env."""
+    observed_names: list[str] = []
+    expected_secret = object()
+    fake_modal = types.SimpleNamespace(
+        Secret=types.SimpleNamespace(
+            from_name=lambda name: observed_names.append(name) or expected_secret,
+        )
+    )
+
+    resolved_secret = modal_cloud_module._modal_secret_from_settings(
+        types.SimpleNamespace(modal_secret_name="workflow-credentials"),
+        fake_modal,
+    )
+
+    assert resolved_secret is expected_secret
+    assert observed_names == ["workflow-credentials"]
 
 
 def test_modal_cloud_installs_timestamped_logger_handler(
@@ -4309,7 +4333,13 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
         min_containers=0,
     )
 
-    options = modal_cloud_module._remote_engine_cls_options(base_settings, "volume", "image")
+    modal_secret = object()
+    options = modal_cloud_module._remote_engine_cls_options(
+        base_settings,
+        "volume",
+        "image",
+        modal_secret,
+    )
 
     assert options["enable_memory_snapshot"] is True
     assert "experimental_options" not in options
@@ -4319,6 +4349,7 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
     assert options["min_containers"] == 0
     assert options["timeout"] == 3600
     assert options["startup_timeout"] == 900
+    assert options["secrets"] == [modal_secret]
 
     gpu_snapshot_settings = types.SimpleNamespace(
         remote_storage_root="/storage",
@@ -5917,6 +5948,57 @@ def test_load_modal_cloud_module_reloads_for_workflow_gpu_change(
     assert reloaded_module.app == "b300-app"
     assert reloaded_module.__comfy_modal_gpu__ == "B300"
     assert reloaded_module.__comfy_modal_app_name__ == "comfy-modal-sync-gpu-b300"
+
+
+def test_load_modal_cloud_module_reloads_for_secret_name_change(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Changing only the secret name should rebuild the cloud module with new settings."""
+    module_name = remote_modal_app_module._MODAL_CLOUD_MODULE_NAME
+    original_module = sys.modules.get(module_name)
+    base_settings = remote_modal_app_module.get_settings()
+    sys.modules[module_name] = types.SimpleNamespace(
+        app="old-secret-app",
+        __comfy_modal_gpu__=base_settings.modal_gpu,
+        __comfy_modal_app_name__=remote_modal_app_module.modal_deployment_app_name(
+            base_settings
+        ),
+        __comfy_modal_secret_name__="comfy",
+    )
+    observed_secret_names: list[str] = []
+
+    class FakeLoader:
+        """Populate a replacement cloud module from its injected settings."""
+
+        def create_module(self, spec: Any) -> None:
+            """Use the default module creation path."""
+            del spec
+            return None
+
+        def exec_module(self, module: Any) -> None:
+            """Capture the secret setting and expose a deployable app."""
+            settings_override = module.__comfy_modal_settings_override__
+            observed_secret_names.append(settings_override.modal_secret_name)
+            module.app = "new-secret-app"
+
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: importlib.util.spec_from_loader(module_name, FakeLoader()),
+    )
+    new_settings = replace(base_settings, modal_secret_name="workflow-credentials")
+    try:
+        with remote_modal_app_module._modal_cloud_settings_override(new_settings):
+            reloaded_module = remote_modal_app_module._load_modal_cloud_module()
+    finally:
+        sys.modules.pop(module_name, None)
+        if original_module is not None:
+            sys.modules[module_name] = original_module
+
+    assert observed_secret_names == ["workflow-credentials"]
+    assert reloaded_module.app == "new-secret-app"
+    assert reloaded_module.__comfy_modal_secret_name__ == "workflow-credentials"
 
 
 def test_remote_modal_installs_cloud_exception_compatibility_module(

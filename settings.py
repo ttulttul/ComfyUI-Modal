@@ -45,6 +45,7 @@ MODAL_GPU_TYPES = (
 WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal"
 WORKFLOW_MODAL_GPU_KEY = "gpu"
 DEFAULT_MODAL_GPU = "RTX-PRO-6000"
+DEFAULT_MODAL_SECRET_NAME = "comfy"
 _LEGACY_BASE_APP_GPU = "A100"
 _MODAL_APP_NAME_MAX_LENGTH = 64
 _MODAL_GPU_SLUG_MAX_LENGTH = 28
@@ -54,6 +55,7 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_COMFYUI_ROOT",
     "COMFY_MODAL_CUSTOM_NODES_DIR",
     "COMFY_MODAL_EXECUTION_MODE",
+    "COMFY_MODAL_SECRET_NAME",
     "COMFY_MODAL_SYNC_CUSTOM_NODES",
     "COMFY_MODAL_LOCAL_STORAGE_ROOT",
     "COMFY_MODAL_APP_NAME",
@@ -115,6 +117,7 @@ class ModalSyncSettings:
     custom_nodes_archive_name: str
     comfyui_root: Path | None
     custom_nodes_dir: Path | None
+    modal_secret_name: str = DEFAULT_MODAL_SECRET_NAME
     interrupt_dict_name: str = "comfy-modal-sync-interrupts"
     node_output_cache_dict_name: str = "comfy-modal-sync-node-cache"
     session_bridge_dict_name: str = "comfy-modal-sync-session-bridges"
@@ -410,6 +413,10 @@ def _get_settings_cached(
         ),
         comfyui_root=comfyui_root,
         custom_nodes_dir=custom_nodes_dir,
+        modal_secret_name=(
+            os.getenv("COMFY_MODAL_SECRET_NAME", DEFAULT_MODAL_SECRET_NAME).strip()
+            or DEFAULT_MODAL_SECRET_NAME
+        ),
         interrupt_dict_name=os.getenv(
             "COMFY_MODAL_INTERRUPT_DICT_NAME",
             f"{app_name}-interrupts",

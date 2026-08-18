@@ -1,5 +1,9 @@
 # Learnings
 
+## 2026-08-18
+
+- A local ComfyUI `.env` file should remain outside the Modal image and synced custom-node bundle. Attach an existing named Modal `Secret` to the deployed `RemoteEngine` class so all contained key-value pairs become worker environment variables, and include only the collection name in the runtime fingerprint so changing `COMFY_MODAL_SECRET_NAME` replaces a deployment that references the old collection.
+
 ## 2026-08-15
 
 - ComfyUI `OUTPUT_IS_LIST` is a strict runtime container contract, not only planning metadata. If a proxy advertises a scheduler-list `IMAGE` but returns a raw `[1,H,W,C]` tensor, ComfyUI extends that tensor as the output list and passes `[H,W,C]` downstream; `PreviewImage` then treats height as batch size and saves `H` arrays shaped `[W,C]`. Normalize every scheduler-list proxy result to a Python list even when singleton execution skipped mapped aggregation.

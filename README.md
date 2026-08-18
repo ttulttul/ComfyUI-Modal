@@ -48,6 +48,25 @@ Use remote mode with working Modal credentials:
 export COMFY_MODAL_EXECUTION_MODE=remote
 ```
 
+Remote workers receive workflow API keys through a named Modal secret collection. Create the
+default `comfy` collection from ComfyUI's local `.env` file once; the file itself is not copied
+into the image or container:
+
+```bash
+<comfyui-venv>/bin/python -m modal secret create comfy \
+  --from-dotenv /path/to/ComfyUI/.env
+```
+
+To use a different collection, set its name before starting ComfyUI:
+
+```bash
+export COMFY_MODAL_SECRET_NAME=my-comfy-secrets
+export COMFY_MODAL_EXECUTION_MODE=remote
+```
+
+Every key in that Modal collection is available to remote custom nodes through `os.environ`.
+The selected collection must already exist in the active Modal environment before deployment.
+
 When ComfyUI starts in remote mode, Modal-Sync checks whether the supported Modal SDK is importable. If it is missing, the extension installs the pinned `modal==1.4.2` package into the exact Python interpreter running ComfyUI. The installer prefers `uv pip` and falls back to `python -m pip`; startup logs report detection, the selected command, and the result. If neither installer is available or installation fails, startup continues with the existing local-mirror fallback and logs an actionable error.
 
 Modal authentication remains user-managed. Run `<comfyui-venv>/bin/python -m modal setup` when the current user does not already have working credentials. To install the SDK manually before startup, run `uv pip install --python <comfyui-venv>/bin/python "modal==1.4.2"`.
@@ -249,6 +268,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_EXECUTION_MODE` | `local` | Set to `remote` for Modal-backed execution. |
 | `COMFY_MODAL_APP_NAME` | `comfy-modal-sync-<instance_id>` | Explicit Modal app name override; otherwise derived from the persistent per-ComfyUI identity. |
 | `COMFY_MODAL_INSTANCE_ID_PATH` | `<ComfyUI user directory>/.comfy-modal-sync-instance-id` | Override the persistent 64-bit identity file location. |
+| `COMFY_MODAL_SECRET_NAME` | `comfy` | Existing Modal secret collection injected into every remote worker as environment variables. |
 | `COMFY_MODAL_VOLUME_NAME` | `comfy-universal-storage` | Modal volume name for synced assets and bundles. |
 | `COMFY_MODAL_AUTO_DEPLOY` | `true` | Deploy or replace the configured app when lookup fails or its runtime fingerprint is stale. |
 | `COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK` | `false` | Allow the older temporary `app.run()` fallback when deployed lookup fails. |
