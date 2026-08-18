@@ -70,8 +70,8 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert len(runtime_packages) == len(set(runtime_packages))
     assert "blake3==1.0.9" in runtime_packages
     assert "comfy-angle==0.1.0" in runtime_packages
-    assert "comfy-aimdo==0.4.11" in runtime_packages
-    assert "comfy-kitchen==0.2.26" in runtime_packages
+    assert "comfy-aimdo==0.4.13" in runtime_packages
+    assert "comfy-kitchen==0.2.31" in runtime_packages
     assert "pyopengl==3.1.10" in runtime_packages
     assert "simpleeval==1.0.7" in runtime_packages
 

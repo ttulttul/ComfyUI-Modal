@@ -5941,7 +5941,10 @@ def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
     monkeypatch: Any,
 ) -> None:
     """Failed cloud-module imports should not leave a poisoned cache entry behind."""
-    original_module = sys.modules.get(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME)
+    original_module = sys.modules.pop(
+        remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+        None,
+    )
 
     class FakeLoader:
         """Raise during module execution to simulate a partial import failure."""
