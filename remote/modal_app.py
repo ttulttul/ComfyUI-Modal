@@ -2822,21 +2822,25 @@ def _load_modal_cloud_module() -> Any:
         existing_module = sys.modules.get(_MODAL_CLOUD_MODULE_NAME)
         existing_gpu = getattr(existing_module, "__comfy_modal_gpu__", settings.modal_gpu)
         existing_app_name = getattr(existing_module, "__comfy_modal_app_name__", None)
+        existing_secret_name = getattr(existing_module, "__comfy_modal_secret_name__", None)
         if (
             existing_module is not None
             and getattr(existing_module, "app", None) is not None
             and existing_gpu == settings.modal_gpu
             and existing_app_name == deployment_app_name
+            and existing_secret_name == settings.modal_secret_name
         ):
             return existing_module
         if existing_module is not None:
             logger.warning(
-                "Discarding Modal cloud module %s before reload for app=%s gpu=%s (previous_app=%s previous_gpu=%s).",
+                "Discarding Modal cloud module %s before reload for app=%s gpu=%s secret=%s (previous_app=%s previous_gpu=%s previous_secret=%s).",
                 _MODAL_CLOUD_MODULE_NAME,
                 deployment_app_name,
                 settings.modal_gpu,
+                settings.modal_secret_name,
                 existing_app_name,
                 existing_gpu,
+                existing_secret_name,
             )
             sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
 
@@ -2854,6 +2858,7 @@ def _load_modal_cloud_module() -> Any:
         setattr(cloud_module, "__comfy_modal_settings_override__", settings)
         setattr(cloud_module, "__comfy_modal_gpu__", settings.modal_gpu)
         setattr(cloud_module, "__comfy_modal_app_name__", deployment_app_name)
+        setattr(cloud_module, "__comfy_modal_secret_name__", settings.modal_secret_name)
         sys.modules[_MODAL_CLOUD_MODULE_NAME] = cloud_module
         try:
             module_spec.loader.exec_module(cloud_module)

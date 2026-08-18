@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 if __package__:
-    from .settings import DEFAULT_MODAL_GPU
+    from .settings import DEFAULT_MODAL_GPU, DEFAULT_MODAL_SECRET_NAME
 else:  # pragma: no cover - the stable cloud entrypoint imports this module top-level.
-    from settings import DEFAULT_MODAL_GPU
+    from settings import DEFAULT_MODAL_GPU, DEFAULT_MODAL_SECRET_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,7 @@ class RemoteRuntimeSettings(Protocol):
     max_containers: int | None
     min_containers: int
     modal_gpu: str
+    modal_secret_name: str
     node_output_cache_dict_name: str
     remote_storage_root: str
     scaledown_window_seconds: int
@@ -372,6 +373,11 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "max_containers": settings.max_containers,
         "min_containers": settings.min_containers,
         "modal_gpu": settings.modal_gpu,
+        "modal_secret_name": getattr(
+            settings,
+            "modal_secret_name",
+            DEFAULT_MODAL_SECRET_NAME,
+        ),
         "node_output_cache_dict_name": settings.node_output_cache_dict_name,
         "remote_storage_root": settings.remote_storage_root,
         "scaledown_window_seconds": settings.scaledown_window_seconds,

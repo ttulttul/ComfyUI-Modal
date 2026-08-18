@@ -95,6 +95,7 @@ from session_state import (  # noqa: E402 - paths are bootstrapped above.
     stable_session_bridge_key,
 )
 from settings import (  # noqa: E402 - paths are bootstrapped above.
+    DEFAULT_MODAL_SECRET_NAME,
     get_settings,
     modal_deployment_app_name,
 )
@@ -5987,7 +5988,12 @@ def _prewarm_restored_runtime() -> None:
         _load_execution_module()
 
 
-def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str, Any]:
+def _remote_engine_cls_options(
+    settings: Any,
+    vol: Any,
+    image: Any,
+    modal_secret: Any | None = None,
+) -> dict[str, Any]:
     """Build the Modal class options for the deployed remote execution runtime."""
     options: dict[str, Any] = {
         "gpu": settings.modal_gpu,
@@ -5999,6 +6005,8 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
         "timeout": int(getattr(settings, "execution_timeout_seconds", 3600)),
         "startup_timeout": int(getattr(settings, "startup_timeout_seconds", 900)),
     }
+    if modal_secret is not None:
+        options["secrets"] = [modal_secret]
     max_containers = getattr(settings, "max_containers", None)
     buffer_containers = getattr(settings, "buffer_containers", None)
     if max_containers is not None:
@@ -6008,6 +6016,17 @@ def _remote_engine_cls_options(settings: Any, vol: Any, image: Any) -> dict[str,
     if settings.enable_gpu_memory_snapshot:
         options["experimental_options"] = {"enable_gpu_snapshot": True}
     return options
+
+
+def _modal_secret_from_settings(settings: Any, modal_module: Any) -> Any:
+    """Return the existing named Modal secret configured for remote workers."""
+    secret_name = str(
+        getattr(settings, "modal_secret_name", DEFAULT_MODAL_SECRET_NAME)
+    ).strip()
+    if not secret_name:
+        raise ValueError("The Modal secret collection name must not be empty.")
+    logger.info("Attaching Modal secret collection %s to the remote worker.", secret_name)
+    return modal_module.Secret.from_name(secret_name)
 
 
 def _should_reload_modal_volume(payload: dict[str, Any]) -> bool:
@@ -6550,6 +6569,11 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
     return {
         "COMFY_MODAL_APP_NAME": settings.app_name,
         "COMFY_MODAL_GPU": settings.modal_gpu,
+        "COMFY_MODAL_SECRET_NAME": getattr(
+            settings,
+            "modal_secret_name",
+            DEFAULT_MODAL_SECRET_NAME,
+        ),
         "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_fingerprint,
         "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE": str(settings.stream_event_queue_maxsize),
         "COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES": str(settings.bridge_inline_max_bytes),
@@ -6583,8 +6607,12 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = globals().get("__comfy_modal_settings_override__") or get_settings()
     __comfy_modal_gpu__ = settings.modal_gpu
     __comfy_modal_app_name__ = modal_deployment_app_name(settings)
+    __comfy_modal_secret_name__ = str(
+        getattr(settings, "modal_secret_name", DEFAULT_MODAL_SECRET_NAME)
+    ).strip()
     _guard_against_existing_modal_app(settings, modal)
     app = modal.App(__comfy_modal_app_name__)
+    modal_secret = _modal_secret_from_settings(settings, modal)
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)
     interrupt_flags = modal.Dict.from_name(
         settings.interrupt_dict_name,
@@ -6656,7 +6684,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             "No local ComfyUI checkout was discovered; remote Modal execution may fail to import ComfyUI core modules."
         )
 
-    @app.cls(**_remote_engine_cls_options(settings, vol, image))
+    @app.cls(**_remote_engine_cls_options(settings, vol, image, modal_secret))
     @modal.concurrent(max_inputs=1)
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""

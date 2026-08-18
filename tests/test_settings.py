@@ -75,6 +75,37 @@ def test_settings_defaults_modal_gpu_to_rtx_pro_6000(
     assert settings.modal_gpu == "RTX-PRO-6000"
 
 
+def test_settings_reads_modal_secret_name_override(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The named Modal secret collection should be configurable at local startup."""
+    monkeypatch.setenv("COMFY_MODAL_SECRET_NAME", "  workflow-credentials  ")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.modal_secret_name == "workflow-credentials"
+
+
+def test_settings_defaults_modal_secret_name_to_comfy(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Remote workers should use the conventional comfy secret collection by default."""
+    monkeypatch.delenv("COMFY_MODAL_SECRET_NAME", raising=False)
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings_module.DEFAULT_MODAL_SECRET_NAME == "comfy"
+    assert settings.modal_secret_name == "comfy"
+
+
 def test_modal_gpu_from_workflow_prefers_saved_selection(settings_module: Any) -> None:
     """A saved workflow GPU should override the process-level fallback."""
     workflow = {"extra": {"comfy_modal": {"gpu": "B300"}}}

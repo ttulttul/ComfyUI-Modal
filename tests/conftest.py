@@ -186,6 +186,7 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.delenv("COMFY_MODAL_CUSTOM_NODES_DIR", raising=False)
     monkeypatch.delenv("COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT", raising=False)
     monkeypatch.delenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_SECRET_NAME", raising=False)
     monkeypatch.delenv("COMFY_MODAL_INTERRUPT_DICT_NAME", raising=False)
     monkeypatch.delenv("COMFY_MODAL_INVOCATION_DICT_NAME", raising=False)
     monkeypatch.delenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", raising=False)
