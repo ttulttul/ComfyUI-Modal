@@ -46,6 +46,7 @@ try:
 
     from .api_intercept import setup_modal_queue_route
     from .modal_endpoint_node import ModalEndpointChat
+    from .modal_llm_node import ModalLLM
     from .modal_executor_node import (
         ModalArtifactFinalizer,
         ModalMapInput,
@@ -57,6 +58,7 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     ModalMapInput = None  # type: ignore[assignment]
     ModalArtifactFinalizer = None  # type: ignore[assignment]
     ModalEndpointChat = None  # type: ignore[assignment]
+    ModalLLM = None  # type: ignore[assignment]
     ModalUniversalExecutor = None  # type: ignore[assignment]
 
     class ComfyModalSyncExtension:  # type: ignore[no-redef]
@@ -81,6 +83,7 @@ else:
                 ModalMapInput,
                 ModalArtifactFinalizer,
                 ModalEndpointChat,
+                ModalLLM,
             ]
 
     async def comfy_entrypoint() -> ComfyExtension:
@@ -93,6 +96,7 @@ __all__ = [
     "ComfyModalSyncExtension",
     "ModalArtifactFinalizer",
     "ModalEndpointChat",
+    "ModalLLM",
     "ModalMapInput",
     "ModalUniversalExecutor",
     "WEB_DIRECTORY",

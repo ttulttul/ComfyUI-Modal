@@ -11,8 +11,13 @@
 !/comfyui_modal_sync_cloud.py
 !/durable_state.py
 !/instance_identity.py
+!/llm_profiles.json
+!/llm_profiles.py
+!/llm_staging.py
 !/modal_executor_node.py
 !/modal_endpoint_node.py
+!/modal_llm_node.py
+!/modal_llm_runtime.py
 !/modal_sdk.py
 !/output_artifacts.py
 !/runtime_environment.py
@@ -20,6 +25,11 @@
 !/settings.py
 !/session_state.py
 !/sync_engine.py
+
+!/docs/
+/docs/*
+!/docs/LEARNINGS.md
+!/docs/MODAL_LLM.md
 
 !/remote/
 /remote/*

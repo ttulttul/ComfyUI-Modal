@@ -1,6 +1,6 @@
 [project]
 name = "modal-sync"
-version = "0.1.24"
+version = "0.2.0"
 description = "ComfyUI nodes for Modal-backed workflow execution and hosted model endpoints."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,7 @@ test = [
     "numpy",
     "pillow",
     "psutil",
+    "pypdf",
     "pytest",
     "pyyaml",
     "safetensors",

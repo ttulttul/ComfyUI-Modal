@@ -18,9 +18,10 @@ else:  # pragma: no cover - the stable cloud entrypoint imports this module top-
 
 logger = logging.getLogger(__name__)
 
-REMOTE_APP_PROTOCOL_VERSION = 6
+REMOTE_APP_PROTOCOL_VERSION = 7
 REMOTE_PYTHON_VERSION = "3.11"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
+REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
 
 _REMOTE_APT_PACKAGES = (
     "libgl1",
@@ -41,6 +42,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "packaging==26.0",
     "pillow==12.1.0",
     "psutil==7.2.2",
+    "pypdf==6.16.1",
     "pydantic==2.12.5",
     "pydantic-settings==2.13.0",
     "pyopengl==3.1.10",
@@ -55,6 +57,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "torchsde==0.2.6",
     "tqdm==4.67.3",
     "transformers==5.1.0",
+    REMOTE_HUGGINGFACE_HUB_SPEC,
 )
 _CUDA_128_TORCH_PACKAGES = (
     "torch==2.10.0",
@@ -131,6 +134,8 @@ class RemoteRuntimeSettings(Protocol):
     stream_event_queue_maxsize: int
     sync_index_dict_name: str
     volume_name: str
+    llm_max_resident_models: int
+    llm_reserve_free_vram_gb: float
 
 
 @dataclass(frozen=True)
@@ -388,6 +393,8 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "stream_event_queue_maxsize": settings.stream_event_queue_maxsize,
         "sync_index_dict_name": settings.sync_index_dict_name,
         "volume_name": settings.volume_name,
+        "llm_max_resident_models": getattr(settings, "llm_max_resident_models", 2),
+        "llm_reserve_free_vram_gb": getattr(settings, "llm_reserve_free_vram_gb", 24.0),
     }
 
 
@@ -422,6 +429,7 @@ def build_remote_runtime_identity(
         "repo_source_digest": _tree_digest(
             repo_root,
             included_suffixes=frozenset({".py"}),
+            included_names=frozenset({"llm_profiles.json"}),
             ignored_top_level_directories=frozenset({"tests"}),
         ),
         "comfyui_source_digest": _tree_digest(

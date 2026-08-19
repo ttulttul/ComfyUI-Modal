@@ -63,7 +63,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     torch_packages = runtime_environment_module.remote_torch_packages()
 
     assert runtime_environment_module.DEFAULT_MODAL_GPU == "RTX-PRO-6000"
-    assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION >= 5
+    assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION == 7
     assert runtime_environment_module.REMOTE_PYTHON_VERSION == "3.11"
     assert apt_packages == ("libgl1", "libglib2.0-0")
     assert all("==" in requirement for requirement in runtime_packages)
@@ -74,6 +74,8 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "comfy-aimdo==0.4.13" in runtime_packages
     assert "comfy-kitchen==0.2.31" in runtime_packages
     assert "pyopengl==3.1.10" in runtime_packages
+    assert "pypdf==6.16.1" in runtime_packages
+    assert "huggingface-hub==1.28.0" in runtime_packages
     assert "simpleeval==1.0.7" in runtime_packages
 
 
@@ -181,6 +183,26 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
     assert secret_changed.manifest["runtime_options"]["modal_secret_name"] == (
         "workflow-credentials"
     )
+
+
+def test_runtime_identity_tracks_curated_llm_profile_registry(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Changing a pinned model profile should force a remote deployment rebuild."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    repo_root.mkdir()
+    comfyui_root.mkdir()
+    (repo_root / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+    profile_path = repo_root / "llm_profiles.json"
+    profile_path.write_text('{"profiles":[{"id":"one"}]}\n', encoding="utf-8")
+    baseline = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+
+    profile_path.write_text('{"profiles":[{"id":"two"}]}\n', encoding="utf-8")
+    changed = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+
+    assert changed.fingerprint != baseline.fingerprint
 
 
 def test_runtime_identity_records_system_packages(

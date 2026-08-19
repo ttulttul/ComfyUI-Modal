@@ -305,6 +305,23 @@ def test_settings_reads_remote_invocation_runtime_controls(
     assert settings.stream_event_queue_maxsize == 32
 
 
+def test_settings_reads_resident_llm_memory_controls(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Resident model count and ComfyUI VRAM reserve should be configurable."""
+    monkeypatch.setenv("COMFY_MODAL_LLM_MAX_RESIDENT_MODELS", "3")
+    monkeypatch.setenv("COMFY_MODAL_LLM_RESERVE_FREE_GB", "48.5")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.llm_max_resident_models == 3
+    assert settings.llm_reserve_free_vram_gb == 48.5
+
+
 def test_settings_reads_proactive_warmup_override(
     settings_module: Any,
     monkeypatch: Any,

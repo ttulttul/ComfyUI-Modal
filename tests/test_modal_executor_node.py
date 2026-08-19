@@ -1558,6 +1558,10 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
 
     assert image_environment["COMFY_MODAL_APP_NAME"] == "comfy-modal-sync-AAECAwQFBgc"
     assert image_environment["COMFY_MODAL_GPU"] == "B300"
+    assert image_environment["COMFY_MODAL_REMOTE_STORAGE_ROOT"] == "/storage"
+    assert image_environment["COMFY_MODAL_REMOTE_WORKER"] == "1"
+    assert image_environment["COMFY_MODAL_LLM_MAX_RESIDENT_MODELS"] == "2"
+    assert image_environment["COMFY_MODAL_LLM_RESERVE_FREE_GB"] == "24.0"
     assert image_environment["COMFY_MODAL_SECRET_NAME"] == "workflow-credentials"
     assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
 

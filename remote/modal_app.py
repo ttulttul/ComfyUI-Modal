@@ -73,6 +73,7 @@ from ..runtime_environment import (
     RemoteRuntimeIdentity,
     build_remote_runtime_identity,
 )
+from ..llm_profiles import get_llm_profile, llm_profile_ids_from_payload
 from ..settings import (
     MODAL_GPU_TYPES,
     ModalSyncSettings,
@@ -89,6 +90,8 @@ _MODAL_CLOUD_SETTINGS_STATE = threading.local()
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
 _MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None, str]] = set()
+_STAGED_LLM_PROFILES_LOCK = threading.Lock()
+_STAGED_LLM_PROFILES: set[tuple[str, str, str]] = set()
 _MODAL_APP_STOP_TIMEOUT_SECONDS = 120.0
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
@@ -5190,7 +5193,77 @@ def _lookup_deployed_remote_engine(
     }
     if snapshot_profile_key:
         remote_engine_kwargs["snapshot_profile_key"] = snapshot_profile_key
-    return remote_cls(**remote_engine_kwargs)
+    remote_engine = remote_cls(**remote_engine_kwargs)
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        runtime_is_known_current = _modal_runtime_cache_key(payload) in _MODAL_REMOTE_APP_VERSION_OK
+    if runtime_is_known_current:
+        _ensure_llm_profiles_staged(payload, deployment_app_name)
+    return remote_engine
+
+
+def _ensure_llm_profiles_staged(
+    payload: dict[str, Any],
+    deployment_app_name: str,
+) -> None:
+    """Stage every LLM profile in a payload on a CPU worker before GPU dispatch."""
+    if modal is None:
+        raise ModalRemoteInvocationError("Modal SDK is unavailable.")
+    profile_ids = llm_profile_ids_from_payload(payload)
+    if not profile_ids:
+        return
+    profile_keys = {
+        (
+            deployment_app_name,
+            profile_id,
+            get_llm_profile(profile_id).revision,
+        )
+        for profile_id in profile_ids
+    }
+    with _STAGED_LLM_PROFILES_LOCK:
+        missing_profile_ids = [
+            profile_id
+            for profile_id in profile_ids
+            if (
+                deployment_app_name,
+                profile_id,
+                get_llm_profile(profile_id).revision,
+            )
+            not in _STAGED_LLM_PROFILES
+        ]
+        if missing_profile_ids:
+            logger.info(
+                "Dispatching CPU model staging app=%s profiles=%s before GPU component=%s.",
+                deployment_app_name,
+                missing_profile_ids,
+                payload.get("component_id"),
+            )
+            stager_cls = modal.Cls.from_name(deployment_app_name, "ModelStager")
+            stage_results = stager_cls().stage_profiles.remote(missing_profile_ids)
+            staged_ids = {
+                str(result.get("profile_id"))
+                for result in stage_results
+                if isinstance(result, Mapping)
+            }
+            missing_results = set(missing_profile_ids) - staged_ids
+            if missing_results:
+                raise ModalRemoteInvocationError(
+                    f"Modal ModelStager did not confirm profiles {sorted(missing_results)}."
+                )
+            _STAGED_LLM_PROFILES.update(profile_keys)
+    revisions = ",".join(
+        f"{profile_id}:{get_llm_profile(profile_id).revision}"
+        for profile_id in profile_ids
+    )
+    payload["requires_volume_reload"] = True
+    payload["volume_reload_marker"] = hashlib.sha256(
+        f"llm-profiles:{revisions}".encode("utf-8")
+    ).hexdigest()
+    logger.info(
+        "Modal LLM profiles are staged for component=%s profiles=%s reload_marker=%s.",
+        payload.get("component_id"),
+        profile_ids,
+        payload["volume_reload_marker"],
+    )
 
 
 async def _invoke_bound_remote_engine_async(
@@ -5897,6 +5970,10 @@ def _invoke_remote_engine_warmup_with_recovery(
             exc,
         )
         recovered_remote_engine = _auto_deploy_modal_app(warmup_request, exc)
+        _ensure_llm_profiles_staged(
+            warmup_request,
+            modal_deployment_app_name(settings),
+        )
         return _invoke_remote_engine_warmup(recovered_remote_engine, warmup_request)
 
 
@@ -5914,11 +5991,13 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
                 _lookup_deployed_remote_engine(warmup_request),
                 warmup_request,
             )
+            _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
             return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
         except lookup_error_types as exc:
             if settings.auto_deploy:
                 remote_engine = _auto_deploy_modal_app(warmup_request, exc)
                 try:
+                    _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
                     return _invoke_remote_engine_warmup_with_recovery(
                         remote_engine,
                         warmup_request,
@@ -5935,6 +6014,7 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
             _lookup_deployed_remote_engine(warmup_request),
             warmup_request,
         )
+        _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
         return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
 
     with _modal_cloud_settings_override(settings):
@@ -6334,6 +6414,10 @@ def _invoke_remote_engine_payload_with_recovery(
             exc,
         )
         recovered_remote_engine = _auto_deploy_modal_app(payload, exc)
+        _ensure_llm_profiles_staged(
+            payload,
+            modal_deployment_app_name(settings),
+        )
         response = _invoke_remote_engine_payload(
             recovered_remote_engine,
             payload,
@@ -6409,6 +6493,7 @@ def _invoke_modal_payload_blocking(
                 _lookup_deployed_remote_engine(payload),
                 payload,
             )
+            _ensure_llm_profiles_staged(payload, deployment_app_name)
             logger.info(
                 "Using deployed Modal app %s for component %s.",
                 deployment_app_name,
@@ -6425,6 +6510,7 @@ def _invoke_modal_payload_blocking(
             if settings.auto_deploy and missing_deployment:
                 remote_engine = _auto_deploy_modal_app(payload, exc)
                 try:
+                    _ensure_llm_profiles_staged(payload, deployment_app_name)
                     logger.info(
                         "Using auto-deployed Modal app %s for component %s.",
                         deployment_app_name,
@@ -6459,6 +6545,7 @@ def _invoke_modal_payload_blocking(
             _lookup_deployed_remote_engine(payload),
             payload,
         )
+        _ensure_llm_profiles_staged(payload, deployment_app_name)
         logger.info(
             "Using deployed Modal app %s for component %s.",
             deployment_app_name,

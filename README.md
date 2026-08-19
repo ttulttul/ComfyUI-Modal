@@ -10,6 +10,7 @@ ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts
 Modal-Sync provides:
 
 - a ComfyUI frontend extension with a `Run on Modal` toggle, workflow-level GPU selection, and remote execution overlays
+- a resident `Modal LLM` node for text, image, video, and bounded file understanding on the same GPU worker as ComfyUI
 - a `Modal Endpoint Chat` node for prompt, image, and file inference through Modal hosted-model endpoints
 - a queue route at `/modal/queue_prompt` that intercepts normal prompt submission
 - queue-time graph partitioning and proxy-node rewrite for selected remote regions
@@ -34,6 +35,7 @@ Restart ComfyUI. On startup it should load:
 - [`web/modal_toggle.js`](web/modal_toggle.js), the frontend toggle and overlay extension
 - [`api_intercept.py`](api_intercept.py), the queue rewrite route
 - [`modal_executor_node.py`](modal_executor_node.py), the internal proxy node registry
+- [`modal_llm_node.py`](modal_llm_node.py), the resident multimodal LLM node
 
 Start with local mode while building or debugging workflows:
 
@@ -107,6 +109,37 @@ modal workspace proxy-tokens allow wk-... main
 ```
 
 For credential safety, the node accepts only HTTPS `modal.direct` origins, refuses redirects, and never exposes its own `Run on Modal` toggle.
+
+### Running A Resident LLM Beside ComfyUI
+
+`Modal LLM` is a V3 node modelled on ComfyUI's built-in OpenAI chat node, but inference happens inside the same Modal GPU worker that executes the surrounding remote ComfyUI component. Enable `Run on Modal` for the node. It deliberately refuses local execution so a missed toggle cannot download or load a multi-gigabyte model into the desktop ComfyUI process.
+
+The node accepts:
+
+- a text prompt and optional system prompt
+- an `IMAGE` batch
+- one native ComfyUI `VIDEO`, uniformly sampled into timestamped frames
+- UTF-8 text or text-based PDF values from `OpenAI ChatGPT Input Files`
+- bounded generation, sampling, seed, video-frame, VRAM-reserve, and residency controls
+
+It returns the response plus compact JSON telemetry containing token counts, tokens per second, cold/warm model status, media counts, GPU memory, the resident LLM profiles, and ComfyUI-managed models still resident after generation. Token generation uses ComfyUI's ordinary progress and interruption hooks, so the remote progress bar and prompt cancellation work without a separate inference server.
+
+Models come only from [`llm_profiles.json`](llm_profiles.json). Each profile fixes the Hugging Face repository, exact commit, dtype, supported modalities, context/media limits, expected VRAM, and remote-code policy. The initial `smolvlm2-2.2b-instruct` profile supports text, images, video, and files with stock Transformers and `trust_remote_code=false`. It accepts images or video in one request, not both.
+
+Before any GPU call, the local dispatcher finds fixed LLM profiles in the remote prompt and calls the deployed CPU-only `ModelStager`. The stager downloads a missing immutable snapshot into `<volume>/llm_models/<profile>/<revision>`, writes a completion marker, commits the shared Modal Volume, and only then allows the B300 worker to start or reload that volume revision. A linked/dynamic `model_profile` is rejected because it cannot be staged before GPU allocation.
+
+The warm worker holds a process-global, serialized LRU of Transformers models. A cache hit reuses both processor and weights across node and workflow executions. Before a cold load, it asks ComfyUI to release idle managed models, evicts older resident LLMs if necessary, and enforces the requested free-VRAM reserve. This makes co-residency intentional while allowing ComfyUI's image/video loaders to use the rest of a large GPU. The first implementation uses BF16 plus PyTorch SDPA; it does not require vLLM, bitsandbytes, FlashAttention extensions, arbitrary model IDs, chat-session persistence, tool calls, or GPU snapshots for LLM weights.
+
+For a single-user B300 session, start conservatively with one container and one active component:
+
+```bash
+export COMFY_MODAL_MAX_CONTAINERS=1
+export COMFY_MODAL_MAX_INFLIGHT_CALLS=1
+export COMFY_MODAL_LLM_MAX_RESIDENT_MODELS=2
+export COMFY_MODAL_LLM_RESERVE_FREE_GB=24
+```
+
+The Modal secret collection may include `HF_TOKEN` for gated profiles. Public profiles do not require it. Model staging can take several minutes the first time, but it consumes CPU and network resources rather than billed B300 time; later requests reuse the committed Volume snapshot.
 
 ## Using It In ComfyUI
 
@@ -333,6 +366,8 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_MAX_INFLIGHT_CALLS` | `4` | Maximum local Modal calls dispatched at once; mapped fan-out is clamped to this budget. |
 | `COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS` | `3600` | Maximum runtime for one Modal workflow call. |
 | `COMFY_MODAL_STARTUP_TIMEOUT_SECONDS` | `900` | Maximum Modal container startup and snapshot-restore time. |
+| `COMFY_MODAL_LLM_MAX_RESIDENT_MODELS` | `2` | Maximum Transformers LLM profiles retained per warm GPU worker before LRU eviction. |
+| `COMFY_MODAL_LLM_RESERVE_FREE_GB` | `24.0` | Default minimum free VRAM retained for ComfyUI-managed image and video models. The node can override this per request. |
 | `COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE` | `256` | Maximum buffered remote progress/result envelopes; stale progress is coalesced when full. |
 | `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP` | `true` | Start background warmup from runtime parallelism signals such as mapped fan-out. |
 | `COMFY_MODAL_ENABLE_LOADER_PREWARM` | `true` | During warmup, execute synthetic loader prompts for root literal model-loader nodes. |

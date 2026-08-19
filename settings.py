@@ -95,6 +95,8 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS",
     "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE",
     "COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS",
+    "COMFY_MODAL_LLM_MAX_RESIDENT_MODELS",
+    "COMFY_MODAL_LLM_RESERVE_FREE_GB",
 )
 
 
@@ -143,6 +145,8 @@ class ModalSyncSettings:
     remote_cancel_restart_seconds: float = 1.0
     stream_event_queue_maxsize: int = 256
     stream_remote_container_logs: bool = False
+    llm_max_resident_models: int = 2
+    llm_reserve_free_vram_gb: float = 24.0
 
 
 def normalize_modal_gpu_selection(value: object) -> str:
@@ -495,6 +499,14 @@ def _get_settings_cached(
         ),
         stream_remote_container_logs=_read_bool_env("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS")
         or False,
+        llm_max_resident_models=max(
+            1,
+            _read_int_env("COMFY_MODAL_LLM_MAX_RESIDENT_MODELS", 2),
+        ),
+        llm_reserve_free_vram_gb=max(
+            0.0,
+            _read_float_env("COMFY_MODAL_LLM_RESERVE_FREE_GB", 24.0),
+        ),
     )
     logger.debug("Resolved Modal-Sync settings: %s", settings)
     return settings

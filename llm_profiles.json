@@ -1,0 +1,20 @@
+{
+  "profiles": [
+    {
+      "id": "smolvlm2-2.2b-instruct",
+      "display_name": "SmolVLM2 2.2B Instruct",
+      "repository": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+      "revision": "482adb537c021c86670beed01cd58990d01e72e4",
+      "dtype": "bfloat16",
+      "modalities": ["text", "image", "video", "file"],
+      "estimated_vram_gb": 6.0,
+      "max_context_tokens": 16384,
+      "max_images": 8,
+      "max_video_frames": 32,
+      "max_file_bytes": 33554432,
+      "max_file_characters": 200000,
+      "allow_mixed_image_video": false,
+      "trust_remote_code": false
+    }
+  ]
+}
