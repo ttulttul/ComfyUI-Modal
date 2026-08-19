@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-from typing import Any, Literal, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ TRANSFORMERS_RUNTIME_VERSION = "5.15.0"
 VLLM_RUNTIME_VERSION = "0.27.1"
 VLLM_TORCH_VERSION = "2.13.0"
 LOCAL_MLX_VLM_VERSION = "0.6.15"
+LOCAL_MLX_DSPARK_VERSION = "0.13.1"
 LLMExecutionTarget = Literal["modal", "local_apple"]
 
 
@@ -121,9 +123,7 @@ def resolve_compatibility(
     quantization_method = _quantization_method(config)
 
     if execution_target == "local_apple":
-        if quantization_method != "none" and not quantization_method.startswith(
-            "mlx_"
-        ):
+        if quantization_method != "none" and not quantization_method.startswith("mlx_"):
             raise ValueError(
                 f"Quantization {quantization_method!r} is not an MLX checkpoint "
                 "format supported by the Apple-local LLM policy. Choose an "
@@ -224,11 +224,12 @@ def resolve_compatibility(
 __all__ = [
     "LLM_COMPATIBILITY_POLICY_VERSION",
     "LLM_PROFILE_SCHEMA_VERSION",
-    "LLMCompatibilityDecision",
-    "LLMExecutionTarget",
+    "LOCAL_MLX_DSPARK_VERSION",
     "LOCAL_MLX_VLM_VERSION",
     "TRANSFORMERS_RUNTIME_VERSION",
     "VLLM_RUNTIME_VERSION",
     "VLLM_TORCH_VERSION",
+    "LLMCompatibilityDecision",
+    "LLMExecutionTarget",
     "resolve_compatibility",
 ]

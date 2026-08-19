@@ -1375,6 +1375,9 @@ class ResidentLLMManager:
                 "comfy_loaded_model_count": len(comfy_loaded_model_names),
                 "comfy_loaded_model_names": comfy_loaded_model_names,
             }
+            runtime_metadata = getattr(resident.backend, "runtime_metadata", None)
+            if callable(runtime_metadata):
+                metadata.update(runtime_metadata())
             if self.execution_target == "modal":
                 metadata.update(
                     {
