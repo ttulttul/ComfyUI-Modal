@@ -32,6 +32,7 @@ _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SUPPORTED_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 _SUPPORTED_MODALITIES = frozenset({"text", "image", "video", "file"})
 _SUPPORTED_BACKENDS = frozenset({"transformers", "vllm"})
+_SUPPORTED_REASONING_PARSERS = frozenset({"", "none", "qwen3"})
 _PROFILE_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -62,6 +63,7 @@ class LLMModelProfile:
     quantization_method: str = "none"
     artifact_bytes: int = 0
     advertised_context_tokens: int = 0
+    reasoning_parser: str = ""
     backend_options: tuple[tuple[str, str | int | float | bool], ...] = ()
     runtime_requirements: tuple[str, ...] = ()
 
@@ -126,6 +128,7 @@ class LLMModelProfile:
                     "advertised_context_tokens", value.get("max_context_tokens", 0)
                 )
             ),
+            reasoning_parser=str(value.get("reasoning_parser", "")).strip().lower(),
             backend_options=tuple(
                 sorted(
                     (str(key), option)
@@ -156,6 +159,11 @@ class LLMModelProfile:
             raise ValueError(
                 f"Modal LLM profile {self.profile_id!r} has unsupported backend "
                 f"{self.backend!r}."
+            )
+        if self.reasoning_parser not in _SUPPORTED_REASONING_PARSERS:
+            raise ValueError(
+                f"Modal LLM profile {self.profile_id!r} has unsupported reasoning "
+                f"parser {self.reasoning_parser!r}."
             )
         if self.source not in {"curated", "generated"}:
             raise ValueError(
@@ -234,6 +242,7 @@ class LLMModelProfile:
             "quantization_method": self.quantization_method,
             "artifact_bytes": self.artifact_bytes,
             "advertised_context_tokens": self.advertised_context_tokens,
+            "reasoning_parser": self.reasoning_parser,
             "backend_options": dict(self.backend_options),
             "runtime_requirements": list(self.runtime_requirements),
         }

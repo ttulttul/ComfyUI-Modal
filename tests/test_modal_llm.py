@@ -121,6 +121,87 @@ def test_compatibility_policy_selects_requested_model_backends(
     assert decision.quantization_method == quantization_method
     assert decision.default_context_tokens == 32768
     assert decision.advertised_context_tokens == 262144
+    assert decision.reasoning_parser == ("qwen3" if backend == "vllm" else "none")
+
+
+class _FakeReasoningTokenizer:
+    """Decode deterministic IDs while modelling Qwen's special think tokens."""
+
+    _vocabulary = {"<think>": 10, "</think>": 11}
+    _text = {1: "consider", 2: " carefully", 3: "final answer", 10: "", 11: ""}
+
+    def get_vocab(self) -> dict[str, int]:
+        """Return exact reasoning boundary token IDs."""
+        return dict(self._vocabulary)
+
+    def decode(self, token_ids: Any, **kwargs: Any) -> str:
+        """Decode content while respecting special-token cleanup."""
+        del kwargs
+        return "".join(self._text[token_id] for token_id in token_ids)
+
+
+def test_qwen_reasoning_parser_separates_token_channels(
+    llm_reasoning_module: Any,
+) -> None:
+    """Qwen reasoning must never remain in the primary response string."""
+    parser = llm_reasoning_module.Qwen3ReasoningParser(_FakeReasoningTokenizer())
+
+    result = parser.extract(
+        "<think>consider carefully</think>final answer",
+        [10, 1, 2, 11, 11, 3],
+    )
+
+    assert result.response == "final answer"
+    assert result.reasoning == "consider carefully"
+    assert result.reasoning_tokens == 2
+    assert result.parser == "qwen3"
+
+
+def test_reasoning_parser_uses_architecture_fallback_for_existing_profile(
+    llm_reasoning_module: Any,
+) -> None:
+    """Profiles generated before the parser field existed should remain usable."""
+    profile = SimpleNamespace(
+        architecture="Qwen3_5ForConditionalGeneration",
+        reasoning_parser="",
+    )
+
+    parser = llm_reasoning_module.create_reasoning_parser(
+        profile,
+        _FakeReasoningTokenizer(),
+    )
+
+    assert parser.parser_name == "qwen3"
+
+
+def test_qwen_reasoning_parser_keeps_truncated_thinking_out_of_response(
+    llm_reasoning_module: Any,
+) -> None:
+    """A token-limit stop before </think> is reasoning-only, not a final answer."""
+    parser = llm_reasoning_module.Qwen3ReasoningParser(_FakeReasoningTokenizer())
+
+    result = parser.extract("consider carefully", [1, 2])
+
+    assert result.response == ""
+    assert result.reasoning == "consider carefully"
+    assert result.reasoning_tokens == 2
+
+
+def test_reasoning_parser_prefers_engine_native_channel(
+    llm_reasoning_module: Any,
+) -> None:
+    """A future backend-native split should bypass delimiter parsing."""
+    parser = llm_reasoning_module.Qwen3ReasoningParser(_FakeReasoningTokenizer())
+
+    result = parser.extract(
+        "final answer",
+        [3],
+        native_reasoning="engine reasoning",
+    )
+
+    assert result.response == "final answer"
+    assert result.reasoning == "engine reasoning"
+    assert result.parser == "native"
 
 
 def test_generated_profile_requires_matching_content_digest(
@@ -216,6 +297,7 @@ def test_cpu_resolver_pins_and_persists_generated_profile(
     assert first.profile.profile_id == second.profile.profile_id
     assert first.profile.revision == revision
     assert first.profile.backend == "vllm"
+    assert first.profile.reasoning_parser == "qwen3"
     assert first.profile.quantization_method == "modelopt_fp4"
     assert first.profile.artifact_bytes == 30 * 1024**3
     assert first.manifest_created is True
@@ -502,6 +584,7 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
         profile_id="qwen-vllm-test",
         backend="vllm",
         architecture="Qwen3_5ForConditionalGeneration",
+        reasoning_parser="qwen3",
         quantization_method="fp8",
         backend_options=(
             ("enforce_eager", True),
@@ -514,6 +597,8 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
 
     class FakeProcessor:
         """Render a deterministic prompt from processor-native messages."""
+
+        tokenizer = _FakeReasoningTokenizer()
 
         def apply_chat_template(self, messages: Any, **kwargs: Any) -> str:
             """Record that tokenization stays inside vLLM."""
@@ -535,7 +620,12 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
             return [
                 SimpleNamespace(
                     prompt_token_ids=[1, 2, 3],
-                    outputs=[SimpleNamespace(text="answer", token_ids=[4, 5])],
+                    outputs=[
+                        SimpleNamespace(
+                            text="<think>consider carefully</think>final answer",
+                            token_ids=[10, 1, 2, 11, 3],
+                        )
+                    ],
                 )
             ]
 
@@ -599,9 +689,14 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     }
     assert observed["prompts"] == [{"prompt": "rendered prompt"}]
     assert observed["chat_kwargs"]["tokenize"] is False
-    assert progress == [0, 2]
-    assert result.text == "answer"
+    assert progress == [0, 5]
+    assert result.text == "final answer"
+    assert result.reasoning == "consider carefully"
+    assert result.reasoning_tokens == 2
     assert result.input_tokens == 3
+    assert observed["generate_kwargs"]["sampling_params"].kwargs[
+        "skip_special_tokens"
+    ] is False
     assert observed["shutdown"] is True
 
 
@@ -651,9 +746,15 @@ def test_vllm_backend_translates_private_runtime_errors(
     )
 
     backend = object.__new__(modal_llm_runtime_module.VLLMMultimodalBackend)
-    backend.profile = SimpleNamespace(profile_id="generated-profile")
+    backend.profile = SimpleNamespace(
+        profile_id="generated-profile",
+        architecture="",
+        reasoning_parser="",
+        backend_option=lambda name, default=None: default,
+    )
     backend.processor = FakeProcessor()
     backend.llm = FailingLLM()
+    backend.reasoning_parser = SimpleNamespace(requires_boundary_tokens=False)
     prepared = modal_llm_runtime_module.PreparedLLMInputs(
         prompt="hello",
         system_prompt="",
@@ -698,6 +799,9 @@ class _FakeBackend:
             text=f"response:{self.profile_id}:{settings.seed}",
             input_tokens=7,
             output_tokens=1,
+            reasoning="",
+            reasoning_tokens=0,
+            reasoning_parser="none",
         )
 
     def unload(self) -> None:
@@ -793,6 +897,7 @@ def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
     assert [output.display_name for output in schema.outputs] == [
         "response",
         "metadata_json",
+        "reasoning",
     ]
 
     monkeypatch.delenv("COMFY_MODAL_REMOTE_WORKER", raising=False)
@@ -809,6 +914,7 @@ def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
         lambda **kwargs: modal_llm_runtime_module.LLMInferenceResult(
             text="done",
             metadata={"output_tokens": 1, "cache_hit": True},
+            reasoning="working",
         ),
     )
     node_output = modal_llm_node_module.ModalLLM.execute(
@@ -819,6 +925,7 @@ def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
 
     assert node_output.result[0] == "done"
     assert json.loads(node_output.result[1])["cache_hit"] is True
+    assert node_output.result[2] == "working"
 
 
 def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
