@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 MODAL_ENDPOINT_CHAT_NODE_ID = "ModalEndpointChat"
 MODAL_KEY_ENV = "MODAL_KEY"
 MODAL_SECRET_ENV = "MODAL_SECRET"
+_DEFAULT_MODAL_ENVIRONMENT = "main"
 _KEYRING_SERVICE = "ComfyUI Modal-Sync"
 _KEYRING_WRITE_TEST_USER = "__credential_store_write_test__"
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -311,13 +312,13 @@ class ModalCredentialResolver:
         store: CredentialStore,
         creator: ProxyTokenCreator,
         authorizer: ProxyTokenAuthorizer | None = None,
-        environment: str = "main",
+        environment: str = _DEFAULT_MODAL_ENVIRONMENT,
     ) -> None:
         """Configure secure storage and token creation implementations."""
         self._store = store
         self._creator = creator
         self._authorizer = authorizer
-        self._environment = environment
+        self._environment = environment.strip() or _DEFAULT_MODAL_ENVIRONMENT
 
     def resolve(self) -> ModalProxyCredentials:
         """Return credentials, creating and storing a pair only when none exists."""
@@ -768,7 +769,7 @@ def _modal_endpoint_advanced_inputs() -> list[io.Input]:
     return [
         io.String.Input(
             "environment",
-            default="main",
+            default=_DEFAULT_MODAL_ENVIRONMENT,
             optional=True,
             advanced=True,
             tooltip=(
@@ -847,7 +848,7 @@ class ModalEndpointChat(io.ComfyNode):
         images: torch.Tensor | None = None,
         files: Sequence[Any] | None = None,
         system_prompt: str = "",
-        environment: str = "main",
+        environment: str = _DEFAULT_MODAL_ENVIRONMENT,
         max_tokens: int = 4096,
         temperature: float = 0.7,
         timeout_seconds: int = 600,
