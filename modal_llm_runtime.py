@@ -27,6 +27,7 @@ if __package__:
         ReasoningOutputParser,
         create_reasoning_parser,
         reasoning_chat_template_kwargs,
+        reasoning_parser_for_request,
     )
     from .llm_staging import is_model_snapshot_staged, model_snapshot_path
 else:  # pragma: no cover - remote node bundles may import top-level modules.
@@ -35,6 +36,7 @@ else:  # pragma: no cover - remote node bundles may import top-level modules.
         ReasoningOutputParser,
         create_reasoning_parser,
         reasoning_chat_template_kwargs,
+        reasoning_parser_for_request,
     )
     from llm_staging import is_model_snapshot_staged, model_snapshot_path
 
@@ -74,6 +76,7 @@ class LLMGenerationSettings:
     temperature: float
     top_p: float
     seed: int
+    enable_reasoning: bool = True
 
 
 @dataclass(frozen=True)
@@ -594,11 +597,18 @@ class TransformersMultimodalBackend:
         """Tokenize multimodal messages and generate only the assistant continuation."""
         import torch
 
+        reasoning_parser = reasoning_parser_for_request(
+            self.reasoning_parser,
+            settings.enable_reasoning,
+        )
         inputs = _apply_multimodal_chat_template(
             self.processor,
             self._messages(prepared_inputs),
             has_predecoded_video=prepared_inputs.video is not None,
-            chat_template_kwargs=reasoning_chat_template_kwargs(self.profile),
+            chat_template_kwargs=reasoning_chat_template_kwargs(
+                self.profile,
+                settings.enable_reasoning,
+            ),
         )
         inputs = _move_batch_to_device(inputs, "cuda")
         input_ids = inputs.get("input_ids")
@@ -630,10 +640,10 @@ class TransformersMultimodalBackend:
         continuation_ids = generated_ids[:, input_tokens:]
         raw_text = self.processor.batch_decode(
             continuation_ids,
-            skip_special_tokens=not self.reasoning_parser.requires_boundary_tokens,
+            skip_special_tokens=not reasoning_parser.requires_boundary_tokens,
             clean_up_tokenization_spaces=False,
         )[0].strip()
-        reasoning_output = self.reasoning_parser.extract(
+        reasoning_output = reasoning_parser.extract(
             raw_text,
             continuation_ids[0].tolist(),
         )
@@ -832,13 +842,20 @@ class VLLMMultimodalBackend:
         """Construct AsyncLLM while its long-lived event loop is current."""
         return engine_class.from_engine_args(engine_args)
 
-    def _request(self, prepared_inputs: PreparedLLMInputs) -> dict[str, Any]:
+    def _request(
+        self,
+        prepared_inputs: PreparedLLMInputs,
+        settings: LLMGenerationSettings,
+    ) -> dict[str, Any]:
         """Build one vLLM prompt with direct in-process multimodal data."""
         prompt = self.processor.apply_chat_template(
             _multimodal_messages(prepared_inputs),
             add_generation_prompt=True,
             tokenize=False,
-            **reasoning_chat_template_kwargs(self.profile),
+            **reasoning_chat_template_kwargs(
+                self.profile,
+                settings.enable_reasoning,
+            ),
         )
         if not isinstance(prompt, str):
             raise RuntimeError("The multimodal processor did not return a text prompt.")
@@ -902,7 +919,7 @@ class VLLMMultimodalBackend:
         finally:
             if not finished:
                 await self._abort_request(request_id, EngineDeadError)
-        return self._generation_result(stream_state)
+        return self._generation_result(stream_state, settings)
 
     @staticmethod
     def _report_prefill(
@@ -927,12 +944,16 @@ class VLLMMultimodalBackend:
         settings: LLMGenerationSettings,
     ) -> Any:
         """Translate backend-neutral settings into vLLM sampling parameters."""
+        reasoning_parser = reasoning_parser_for_request(
+            self.reasoning_parser,
+            settings.enable_reasoning,
+        )
         return parameter_class(
             max_tokens=settings.max_new_tokens,
             temperature=settings.temperature,
             top_p=settings.top_p,
             seed=settings.seed,
-            skip_special_tokens=not self.reasoning_parser.requires_boundary_tokens,
+            skip_special_tokens=not reasoning_parser.requires_boundary_tokens,
         )
 
     async def _consume_stream(
@@ -948,7 +969,7 @@ class VLLMMultimodalBackend:
         first_token_at: float | None = None
         request_output: Any | None = None
         output_stream = self.llm.generate(
-            self._request(prepared_inputs),
+            self._request(prepared_inputs, settings),
             sampling_params=sampling_params,
             request_id=request_id,
         )
@@ -1022,6 +1043,7 @@ class VLLMMultimodalBackend:
     def _generation_result(
         self,
         stream_state: _VLLMStreamState,
+        settings: LLMGenerationSettings,
     ) -> BackendGenerationResult:
         """Convert the final cumulative vLLM output into the backend contract."""
         request_output = stream_state.request_output
@@ -1040,7 +1062,11 @@ class VLLMMultimodalBackend:
         native_reasoning = getattr(candidate, "reasoning", None)
         if native_reasoning is None:
             native_reasoning = getattr(candidate, "reasoning_content", None)
-        reasoning_output = self.reasoning_parser.extract(
+        reasoning_parser = reasoning_parser_for_request(
+            self.reasoning_parser,
+            settings.enable_reasoning,
+        )
+        reasoning_output = reasoning_parser.extract(
             str(candidate.text),
             candidate.token_ids,
             native_reasoning=(
@@ -1308,6 +1334,7 @@ class ResidentLLMManager:
                 "output_tokens": generation_result.output_tokens,
                 "reasoning_tokens": generation_result.reasoning_tokens,
                 "reasoning_parser": generation_result.reasoning_parser,
+                "reasoning_enabled": generation_settings.enable_reasoning,
                 "time_to_first_token_seconds": (
                     generation_result.time_to_first_token_seconds
                 ),
@@ -1400,6 +1427,7 @@ def run_modal_llm_inference(
     video: Any | None,
     files: Sequence[Any] | None,
     system_prompt: str,
+    enable_reasoning: bool,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
@@ -1424,6 +1452,7 @@ def run_modal_llm_inference(
         temperature=float(temperature),
         top_p=float(top_p),
         seed=int(seed),
+        enable_reasoning=bool(enable_reasoning),
     )
     if not 0.0 <= generation_settings.temperature <= 2.0:
         raise ValueError("temperature must be between 0.0 and 2.0.")

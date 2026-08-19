@@ -69,10 +69,13 @@ def reasoning_parser_name(profile: ReasoningProfile) -> str:
     )
 
 
-def reasoning_chat_template_kwargs(profile: ReasoningProfile) -> dict[str, bool]:
-    """Return chat-template settings that agree with the selected parser state."""
+def reasoning_chat_template_kwargs(
+    profile: ReasoningProfile,
+    enable_reasoning: bool = True,
+) -> dict[str, bool]:
+    """Return chat-template settings that agree with the requested reasoning state."""
     if reasoning_parser_name(profile) == _QWEN3_REASONING_PARSER:
-        return {"enable_thinking": True}
+        return {"enable_thinking": enable_reasoning}
     return {}
 
 
@@ -96,6 +99,29 @@ class PassthroughReasoningParser:
             reasoning=(native_reasoning or "").strip(),
             reasoning_tokens=0,
             parser="native" if native_reasoning is not None else self.parser_name,
+        )
+
+
+class DisabledReasoningParser:
+    """Treat generated text as a direct response when reasoning is disabled."""
+
+    parser_name = "disabled"
+    requires_boundary_tokens = False
+
+    def extract(
+        self,
+        text: str,
+        token_ids: Sequence[int],
+        *,
+        native_reasoning: str | None = None,
+    ) -> ReasoningOutput:
+        """Return only the direct response and discard unexpected reasoning metadata."""
+        del token_ids, native_reasoning
+        return ReasoningOutput(
+            response=text.strip(),
+            reasoning="",
+            reasoning_tokens=0,
+            parser=self.parser_name,
         )
 
 
@@ -207,12 +233,24 @@ def create_reasoning_parser(
     raise ValueError(f"Unsupported Modal LLM reasoning parser {parser_name!r}.")
 
 
+def reasoning_parser_for_request(
+    configured_parser: ReasoningOutputParser,
+    enable_reasoning: bool,
+) -> ReasoningOutputParser:
+    """Return the configured parser or a direct-response parser for this request."""
+    if enable_reasoning:
+        return configured_parser
+    return DisabledReasoningParser()
+
+
 __all__ = [
+    "DisabledReasoningParser",
     "PassthroughReasoningParser",
     "Qwen3ReasoningParser",
     "ReasoningOutput",
     "ReasoningOutputParser",
     "create_reasoning_parser",
     "reasoning_chat_template_kwargs",
+    "reasoning_parser_for_request",
     "reasoning_parser_name",
 ]
