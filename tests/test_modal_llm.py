@@ -595,8 +595,7 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert "gpu_memory_utilization" not in observed["llm_kwargs"]
     assert observed["llm_kwargs"]["quantization"] == "fp8"
     assert observed["llm_kwargs"]["attention_config"] == {
-        "backend": "FLASH_ATTN",
-        "flash_attn_version": 3,
+        "backend": "TRITON_ATTN",
     }
     assert observed["prompts"] == [{"prompt": "rendered prompt"}]
     assert observed["chat_kwargs"]["tokenize"] is False
