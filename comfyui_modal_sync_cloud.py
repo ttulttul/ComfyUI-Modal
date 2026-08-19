@@ -171,7 +171,9 @@ _DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset(
         "VIDEO",
     }
 )
-_DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset({"CLIP", "MODEL", "VAE"})
+_DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset(
+    {"CLIP", "MODEL", "NOISE", "SAMPLER", "VAE"}
+)
 
 try:
     import modal  # type: ignore
@@ -1434,18 +1436,22 @@ def _remote_session_bridge_replay_stack() -> set[str]:
 
 
 def _bridge_record_replays_sampling_node(record: RemoteSessionBridgeRecord) -> bool:
-    """Return whether replaying one bridge record would rerun a sampler-like execute node."""
-    execute_node_ids = {
+    """Return whether replaying one bridge record would rerun sampler work."""
+    execute_node_ids = [
         str(node_id)
         for node_id in record.producer_payload.get("execute_node_ids", [])
         if str(node_id)
-    }
+    ]
     if not execute_node_ids:
         return False
     subgraph_prompt = record.producer_payload.get("subgraph_prompt")
-    if not isinstance(subgraph_prompt, Mapping):
+    if not isinstance(subgraph_prompt, dict):
         return False
-    return _subgraph_contains_sampling_node(subgraph_prompt, execute_node_ids)
+    required_node_ids = _resolve_required_subgraph_nodes(
+        prompt=subgraph_prompt,
+        execute_node_ids=execute_node_ids,
+    )
+    return _subgraph_contains_sampling_node(subgraph_prompt, required_node_ids)
 
 
 def _subgraph_contains_sampling_node(
