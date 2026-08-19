@@ -30,11 +30,13 @@ def _modal_llm_primary_inputs() -> list[io.Input]:
             multiline=True,
             tooltip="Text instructions or content for the resident Modal language model.",
         ),
-        io.Combo.Input(
+        io.String.Input(
             "model_profile",
-            options=llm_profile_options(),
             default=llm_profile_options()[0],
-            tooltip="A reviewed, revision-pinned model profile staged on the Modal Volume.",
+            tooltip=(
+                "A curated profile or Hugging Face ID such as owner/model. The first run "
+                "inspects, pins, and stages a compatible model on the Modal Volume."
+            ),
         ),
         io.Image.Input(
             "images",
