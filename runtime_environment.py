@@ -28,6 +28,8 @@ REMOTE_VLLM_WHEEL_URL = (
     "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac/"
     "vllm-0.27.1-cp38-abi3-manylinux_2_28_x86_64.whl"
 )
+REMOTE_NUMPY_SPEC = "numpy==2.3.5"
+REMOTE_OPENCV_SPEC = "opencv-python-headless==4.13.0.92"
 
 _REMOTE_APT_PACKAGES = (
     "libgl1",
@@ -44,9 +46,9 @@ _REMOTE_RUNTIME_PACKAGES = (
     "comfy-kitchen==0.2.31",
     "einops==0.8.2",
     "kornia==0.8.2",
-    "numpy==2.3.5",
+    REMOTE_NUMPY_SPEC,
     "num2words==0.5.14",
-    "opencv-python-headless==4.13.0.92",
+    REMOTE_OPENCV_SPEC,
     "packaging==26.0",
     "pillow==12.1.0",
     "psutil==7.2.2",
@@ -200,14 +202,23 @@ def remote_accelerator_validation_command(modal_gpu: str) -> str:
     """Return a build-time import and version check for the GPU inference stack."""
     normalized_modal_gpu_type(modal_gpu)
     validation_script = (
-        "from importlib import metadata; import torch, vllm; "
+        "from importlib import metadata; import cv2, numpy, torch, vllm; "
         f"expected_vllm={REMOTE_VLLM_SPEC.split('==', maxsplit=1)[1]!r}; "
+        f"expected_numpy={REMOTE_NUMPY_SPEC.split('==', maxsplit=1)[1]!r}; "
+        f"expected_opencv={REMOTE_OPENCV_SPEC.split('==', maxsplit=1)[1]!r}; "
         "actual_vllm=metadata.version('vllm'); "
+        "actual_numpy=metadata.version('numpy'); "
+        "actual_opencv=metadata.version('opencv-python-headless'); "
         "assert actual_vllm == expected_vllm, "
         "f'Expected vLLM {expected_vllm}, found {actual_vllm}'; "
+        "assert actual_numpy == expected_numpy, "
+        "f'Expected NumPy {expected_numpy}, found {actual_numpy}'; "
+        "assert actual_opencv == expected_opencv, "
+        "f'Expected OpenCV {expected_opencv}, found {actual_opencv}'; "
         "print('Validated Modal accelerator stack:', "
         "'vLLM', actual_vllm, 'Torch', torch.__version__, "
-        "'CUDA', torch.version.cuda)"
+        "'CUDA', torch.version.cuda, 'NumPy', numpy.__version__, "
+        "'OpenCV', cv2.__version__)"
     )
     return f"python -c {shlex.quote(validation_script)}"
 

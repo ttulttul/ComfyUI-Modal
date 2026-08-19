@@ -7015,6 +7015,14 @@ def _install_remote_accelerator_packages(image: Any, modal_gpu: str) -> Any:
     return image.run_commands(_remote_accelerator_validation_command(modal_gpu))
 
 
+def _install_custom_node_packages(image: Any, packages: tuple[str, ...]) -> Any:
+    """Install custom requirements and then restore deployment-owned package pins."""
+    if not packages:
+        return image
+    image = image.pip_install(*packages)
+    return image.pip_install(*_comfyui_runtime_packages())
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = globals().get("__comfy_modal_settings_override__") or get_settings()
     __comfy_modal_gpu__ = settings.modal_gpu
@@ -7071,8 +7079,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         .apt_install(*_comfyui_apt_packages())
         .pip_install(*_comfyui_runtime_packages())
     )
-    if custom_node_packages:
-        image = image.pip_install(*custom_node_packages)
+    image = _install_custom_node_packages(image, custom_node_packages)
     image = _install_remote_torch_build(image, torch_build)
     image = _install_remote_accelerator_packages(image, settings.modal_gpu)
     image = image.env(

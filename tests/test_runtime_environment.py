@@ -147,8 +147,10 @@ def test_remote_build_validation_imports_complete_torch_and_vllm_stacks(
     assert validation_command.startswith("python -c ")
     assert "import torch, torchaudio, torchvision" in validation_script
     assert "expected_cuda='13.0'" in validation_script
-    assert "import torch, vllm" in accelerator_script
+    assert "import cv2, numpy, torch, vllm" in accelerator_script
     assert "expected_vllm='0.27.1'" in accelerator_script
+    assert "expected_numpy='2.3.5'" in accelerator_script
+    assert "expected_opencv='4.13.0.92'" in accelerator_script
 
 
 def test_empty_modal_gpu_cannot_select_torch_build(runtime_environment_module: Any) -> None:

@@ -4137,7 +4137,40 @@ def test_modal_cloud_installs_and_validates_vllm_for_non_b300_gpu(
         {},
     )
     assert image.calls[1][0] == "run_commands"
-    assert "import torch, vllm" in image.calls[1][1][0]
+    assert "import cv2, numpy, torch, vllm" in image.calls[1][1][0]
+
+
+def test_modal_cloud_restores_runtime_pins_after_custom_node_packages(
+    modal_cloud_module: Any,
+) -> None:
+    """Custom requirements must not remain authoritative for shared runtime packages."""
+
+    class RecordingImage:
+        """Record Modal image package layers."""
+
+        def __init__(self) -> None:
+            """Initialize an empty call record."""
+            self.calls: list[tuple[str, ...]] = []
+
+        def pip_install(self, *packages: str, **_options: Any) -> "RecordingImage":
+            """Record one package installation layer."""
+            self.calls.append(packages)
+            return self
+
+    image = RecordingImage()
+
+    result = modal_cloud_module._install_custom_node_packages(
+        image,
+        ("numpy==1.26.4", "opencv-python-headless==4.11.0.86"),
+    )
+
+    assert result is image
+    assert image.calls[0] == (
+        "numpy==1.26.4",
+        "opencv-python-headless==4.11.0.86",
+    )
+    assert "numpy==2.3.5" in image.calls[1]
+    assert "opencv-python-headless==4.13.0.92" in image.calls[1]
 
 
 def test_modal_cloud_missing_prompt_node_class_raises_clear_error(
