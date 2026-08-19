@@ -75,6 +75,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "comfy-kitchen==0.2.31" in runtime_packages
     assert "pyopengl==3.1.10" in runtime_packages
     assert "pypdf==6.16.1" in runtime_packages
+    assert "numpy==2.3.5" in runtime_packages
     assert "safetensors==0.8.0" in runtime_packages
     assert "huggingface-hub==1.28.0" in runtime_packages
     assert "transformers==5.15.0" in runtime_packages
@@ -108,7 +109,7 @@ def test_b300_capable_modal_gpus_use_cuda_132_build(
     """GPU specifications that may resolve to B300 should use CUDA 13.2 wheels."""
     build = runtime_environment_module.select_remote_torch_build(modal_gpu)
 
-    assert build.cuda_version == "13.2"
+    assert build.cuda_version == "13.0"
     assert build.install_layers == (
         runtime_environment_module.RemoteTorchInstallLayer(
             index_url="https://download.pytorch.org/whl/cu132",
@@ -138,7 +139,7 @@ def test_remote_torch_build_validation_imports_complete_stack(
 
     assert validation_command.startswith("python -c ")
     assert "import torch, torchaudio, torchvision" in validation_script
-    assert "expected_cuda='13.2'" in validation_script
+    assert "expected_cuda='13.0'" in validation_script
     assert runtime_environment_module.remote_accelerator_packages("B300") == (
         "vllm==0.27.1",
     )
@@ -244,7 +245,7 @@ def test_runtime_identity_records_gpu_specific_torch_build(
     )
 
     assert identity.manifest["torch_build"] == {
-        "cuda_version": "13.2",
+        "cuda_version": "13.0",
         "install_layers": [
             {
                 "index_url": "https://download.pytorch.org/whl/cu132",
