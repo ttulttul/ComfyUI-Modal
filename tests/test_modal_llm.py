@@ -149,6 +149,125 @@ def test_generated_profile_requires_matching_content_digest(
         )
 
 
+def test_cpu_resolver_pins_and_persists_generated_profile(
+    llm_resolver_module: Any,
+    llm_profiles_module: Any,
+    tmp_path: Path,
+) -> None:
+    """One model ID should become a stable manifest without downloading weights."""
+    revision = "9" * 40
+    config_path = tmp_path / "downloaded-config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "dtype": "bfloat16",
+                "text_config": {"max_position_embeddings": 262144},
+                "quantization_config": {
+                    "quant_method": "modelopt",
+                    "quant_algo": "NVFP4",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_info = {
+        "id": "owner/model",
+        "sha": revision,
+        "siblings": [
+            {"rfilename": "config.json", "size": 1000},
+            {"rfilename": "model-00001.safetensors", "size": 20 * 1024**3},
+            {"rfilename": "model-00002.safetensors", "size": 10 * 1024**3},
+        ],
+        "securityStatus": {"scansDone": True, "filesWithIssues": []},
+    }
+
+    class FakeApi:
+        """Return immutable test metadata from model_info."""
+
+        def model_info(self, repo_id: str, **kwargs: Any) -> dict[str, Any]:
+            """Validate the metadata-only resolver request."""
+            assert repo_id == "owner/model"
+            assert kwargs["revision"] == "release"
+            assert kwargs["files_metadata"] is True
+            return model_info
+
+    download_calls: list[dict[str, Any]] = []
+
+    def fake_hf_hub_download(**kwargs: Any) -> str:
+        """Return only the config file during resolution."""
+        download_calls.append(kwargs)
+        return str(config_path)
+
+    first = llm_resolver_module.resolve_model_profile(
+        "owner/model@release",
+        tmp_path,
+        api=FakeApi(),
+        hf_hub_download=fake_hf_hub_download,
+    )
+    second = llm_resolver_module.resolve_model_profile(
+        "owner/model@release",
+        tmp_path,
+        api=FakeApi(),
+        hf_hub_download=fake_hf_hub_download,
+    )
+
+    assert first.profile.profile_id == second.profile.profile_id
+    assert first.profile.revision == revision
+    assert first.profile.backend == "vllm"
+    assert first.profile.quantization_method == "modelopt_fp4"
+    assert first.profile.artifact_bytes == 30 * 1024**3
+    assert first.manifest_created is True
+    assert second.manifest_created is False
+    assert len(download_calls) == 2
+    loaded = llm_profiles_module.get_llm_profile(
+        first.profile.profile_id,
+        storage_root=tmp_path,
+    )
+    assert loaded == first.profile
+
+
+def test_cpu_resolver_rejects_unknown_architecture_before_weights(
+    llm_resolver_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Compatibility errors should happen after config-only inspection."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["UnreviewedForConditionalGeneration"],
+                "max_position_embeddings": 4096,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeApi:
+        """Return a safe but unsupported test repository."""
+
+        def model_info(self, repo_id: str, **kwargs: Any) -> dict[str, Any]:
+            """Return metadata without performing network access."""
+            del repo_id, kwargs
+            return {
+                "sha": "8" * 40,
+                "siblings": [
+                    {"rfilename": "config.json", "size": 1},
+                    {"rfilename": "model.safetensors", "size": 1024},
+                ],
+                "securityStatus": {"scansDone": True},
+            }
+
+    with pytest.raises(ValueError, match="not supported"):
+        llm_resolver_module.resolve_model_profile(
+            "owner/unknown",
+            tmp_path,
+            api=FakeApi(),
+            hf_hub_download=lambda **kwargs: str(config_path),
+        )
+    assert not (tmp_path / "llm_models").exists()
+
+
 def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     llm_staging_module: Any,
     tmp_path: Path,
@@ -179,6 +298,8 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     assert second.downloaded is False
     assert len(calls) == 1
     assert calls[0]["revision"] == "482adb537c021c86670beed01cd58990d01e72e4"
+    assert "*.safetensors" in calls[0]["allow_patterns"]
+    assert "*.bin" not in calls[0]["allow_patterns"]
     assert llm_staging_module.is_model_snapshot_staged(
         tmp_path,
         llm_staging_module.get_llm_profile("smolvlm2-2.2b-instruct"),

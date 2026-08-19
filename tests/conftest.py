@@ -143,6 +143,13 @@ def llm_compatibility_module(extension_package: object) -> object:
     return importlib.import_module(f"{PACKAGE_NAME}.llm_compatibility")
 
 
+@pytest.fixture
+def llm_resolver_module(extension_package: object) -> object:
+    """Import the CPU-side LLM profile resolver under the synthetic package."""
+    del extension_package
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_resolver")
+
+
 @pytest.fixture(scope="session")
 def llm_staging_module(extension_package: object) -> object:
     """Return the CPU-side Modal LLM staging module."""
