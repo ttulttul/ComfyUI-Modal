@@ -12825,6 +12825,42 @@ def test_modal_cloud_serializes_only_small_transport_safe_node_outputs(
     assert large_record is None
 
 
+def test_modal_cloud_awaits_async_node_output_cache_writes(
+    modal_cloud_module: Any,
+) -> None:
+    """Persisted cache writes should use Modal's non-blocking Dict interface."""
+    observed_writes: list[tuple[str, dict[str, Any]]] = []
+
+    class AsyncPut:
+        """Expose the callable shape used by Modal's synchronized methods."""
+
+        async def aio(self, cache_key: str, record: dict[str, Any]) -> None:
+            """Record one asynchronous cache write."""
+            observed_writes.append((cache_key, record))
+
+    class AsyncCacheStore:
+        """Reject synchronous assignment while exposing an asynchronous put method."""
+
+        put = AsyncPut()
+
+        def __setitem__(self, cache_key: str, record: dict[str, Any]) -> None:
+            """Fail if persistence regresses to Modal's blocking operator interface."""
+            del cache_key, record
+            raise AssertionError("cache write must use put.aio")
+
+    record = {"version": 1, "outputs_zlib": b"payload"}
+
+    asyncio.run(
+        modal_cloud_module._node_output_cache_store_put(
+            AsyncCacheStore(),
+            "NC_example",
+            record,
+        )
+    )
+
+    assert observed_writes == [("NC_example", record)]
+
+
 def test_modal_cloud_restores_persisted_node_cache_across_prompt_executor_instances(
     modal_cloud_module: Any,
     monkeypatch: Any,

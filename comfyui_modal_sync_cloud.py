@@ -3821,6 +3821,19 @@ async def _node_output_cache_store_get(cache_store: Any, cache_key: str) -> Any:
     return cache_store.get(cache_key)
 
 
+async def _node_output_cache_store_put(
+    cache_store: Any,
+    cache_key: str,
+    record: dict[str, Any],
+) -> None:
+    """Persist one node-cache record without blocking an active event loop."""
+    aio_put = getattr(getattr(cache_store, "put", None), "aio", None)
+    if callable(aio_put):
+        await aio_put(cache_key, record)
+        return
+    cache_store[cache_key] = record
+
+
 def _is_input_signature_cache_key_set(cache_key_set: Any) -> bool:
     """Return whether one cache-key set uses ComfyUI input-signature semantics."""
     return all(
@@ -4594,7 +4607,7 @@ async def _persist_node_output_cache_entries(
                 _node_output_cache_key_preview(cache_key),
             )
             continue
-        cache_store[cache_key] = record
+        await _node_output_cache_store_put(cache_store, cache_key, record)
         _emit_cloud_info(
             "Node output cache write node=%s key_prefix=%s result=write outputs_size_bytes=%s",
             node_id,
