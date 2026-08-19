@@ -2,6 +2,7 @@ import { app } from "../../scripts/app.js";
 import { PromptExecutionError, api } from "../../scripts/api.js";
 
 const REMOTE_PROPERTY = "is_modal_remote";
+const REMOTE_WIDGET_NAME = "Run on Modal";
 const MODAL_ROUTE = "/modal/queue_prompt";
 const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
 const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/progress_state");
@@ -2692,11 +2693,24 @@ function laneOwnerKey(promptId, nodeIdValue, laneId) {
 function extractRemoteNodeIds(workflow) {
   const remoteNodeIds = [];
   for (const node of workflow?.nodes ?? []) {
-    if (node?.properties?.[REMOTE_PROPERTY]) {
+    if (serializedRemoteFlag(node)) {
       remoteNodeIds.push(String(node.id));
     }
   }
   return remoteNodeIds;
+}
+
+/**
+ * Return the user-visible Modal toggle value from a serialized workflow node.
+ * @param {object | undefined} node
+ * @returns {boolean}
+ */
+function serializedRemoteFlag(node) {
+  const namedWidgetValue = node?.widgets_values_named?.[REMOTE_WIDGET_NAME];
+  if (typeof namedWidgetValue === "boolean") {
+    return namedWidgetValue;
+  }
+  return Boolean(node?.properties?.[REMOTE_PROPERTY]);
 }
 
 /**
@@ -3204,6 +3218,24 @@ function setRemoteFlag(node, value) {
   if (node.__modalToggleWidget) {
     node.__modalToggleWidget.value = enabled;
   }
+  clearSandwichedLocalNodeWarnings();
+  refreshNodeDecorations();
+}
+
+/**
+ * Reconcile a restored node property with the toggle value displayed to the user.
+ * @param {LGraphNode} node
+ */
+function synchronizeRemoteFlagFromWidget(node) {
+  if (!isEligibleNode(node) || !node.__modalToggleWidget) {
+    return;
+  }
+  const enabled = Boolean(node.__modalToggleWidget.value);
+  node.properties ||= {};
+  if (node.properties[REMOTE_PROPERTY] === enabled) {
+    return;
+  }
+  node.properties[REMOTE_PROPERTY] = enabled;
   clearSandwichedLocalNodeWarnings();
   refreshNodeDecorations();
 }
@@ -3896,7 +3928,7 @@ function decorateNode(node) {
 
   const widget = node.addWidget(
     "toggle",
-    "Run on Modal",
+    REMOTE_WIDGET_NAME,
     node.properties[REMOTE_PROPERTY],
     (value) => setRemoteFlag(node, value),
     {
@@ -4787,7 +4819,14 @@ app.registerExtension({
     decorateNode(node);
   },
 
+  async loadedGraphNode(node) {
+    synchronizeRemoteFlagFromWidget(node);
+  },
+
   async afterConfigureGraph() {
+    for (const node of allWorkflowNodes()) {
+      synchronizeRemoteFlagFromWidget(node);
+    }
     selectedModalGpu();
   },
 });
