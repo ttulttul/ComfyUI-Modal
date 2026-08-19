@@ -748,15 +748,6 @@ async def get_hourly_modal_app_billing(
         raise ModalBillingStatusError(
             f"Unable to fetch Modal hourly billing: {exc}"
         ) from exc
-    logger.info(
-        "Fetched Modal hourly billing app=%s gpu=%s environment=%s interval=%s..%s cost=%s.",
-        app_name,
-        resolved_settings.modal_gpu,
-        status.environment_name,
-        interval_start.isoformat(),
-        interval_end.isoformat(),
-        status.app_cost_usd_before_credits,
-    )
     return status
 
 
