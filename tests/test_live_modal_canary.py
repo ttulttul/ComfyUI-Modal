@@ -292,7 +292,7 @@ def test_live_generated_profile_model_inference(
             "model_profile": model_id,
             "images": image,
             "system_prompt": "Answer plainly.",
-            "max_new_tokens": 24,
+            "max_new_tokens": 128,
             "temperature": 0.0,
             "top_p": 1.0,
             "seed": 0,
@@ -310,6 +310,9 @@ def test_live_generated_profile_model_inference(
     assert metadata["profile"].startswith("hf-")
     assert metadata["image_count"] == 1
     assert metadata["output_tokens"] > 0
+    if expected_backend == "vllm":
+        assert metadata["time_to_first_token_seconds"] > 0
+        assert metadata["tokens_per_second"] > 0
 
 
 def test_live_modal_llm_and_comfy_vae_are_co_resident(
