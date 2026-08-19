@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
 import json
 import logging
 import os
-from pathlib import Path
 import time
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterator
 
 if __package__:
@@ -51,6 +51,62 @@ class StagedModelSnapshot:
     path: str
     downloaded: bool
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class LLMStagingProgress:
+    """Describe one numeric Hugging Face snapshot-staging update."""
+
+    stage: str
+    message: str
+    value: float | None = None
+    maximum: float | None = None
+    unit: str | None = None
+    indeterminate: bool = False
+
+
+StagingProgressCallback = Callable[[LLMStagingProgress], None]
+
+
+def _snapshot_tqdm_class(
+    progress_callback: StagingProgressCallback,
+) -> type[Any]:
+    """Build a tqdm subclass that forwards Hugging Face file progress."""
+    from tqdm.auto import tqdm
+
+    class SnapshotProgressTqdm(tqdm):
+        """Mirror snapshot_download's aggregate file bar to the caller."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Initialize the Hugging Face bar and report its initial state."""
+            super().__init__(*args, **kwargs)
+            self._report_progress()
+
+        def update(self, n: float | None = 1) -> bool | None:
+            """Forward every aggregate file-count update."""
+            updated = super().update(n)
+            self._report_progress()
+            return updated
+
+        def _report_progress(self) -> None:
+            """Publish the current tqdm count with compact user-facing copy."""
+            maximum = float(self.total) if self.total is not None else None
+            value = float(self.n)
+            description = str(
+                getattr(self, "desc", None) or "Downloading model snapshot"
+            ).strip()
+            progress_callback(
+                LLMStagingProgress(
+                    stage="download",
+                    message=description,
+                    value=value,
+                    maximum=maximum,
+                    unit=str(getattr(self, "unit", None) or "files"),
+                    indeterminate=maximum is None,
+                )
+            )
+
+    return SnapshotProgressTqdm
 
 
 def model_snapshot_path(storage_root: str | Path, profile: LLMModelProfile) -> Path:
@@ -161,6 +217,7 @@ def stage_model_profile(
     *,
     profile: LLMModelProfile | None = None,
     snapshot_download: Callable[..., str] | None = None,
+    progress_callback: StagingProgressCallback | None = None,
 ) -> StagedModelSnapshot:
     """Download one pinned curated or generated snapshot on a CPU worker."""
     profile = profile or get_llm_profile(profile_id, storage_root=storage_root)
@@ -178,6 +235,16 @@ def stage_model_profile(
             profile.revision,
             snapshot_path,
         )
+        if progress_callback is not None:
+            progress_callback(
+                LLMStagingProgress(
+                    stage="cached",
+                    message="Model snapshot already staged",
+                    value=1,
+                    maximum=1,
+                    unit="model",
+                )
+            )
         return StagedModelSnapshot(
             profile_id=profile.profile_id,
             repository=profile.repository,
@@ -211,15 +278,19 @@ def stage_model_profile(
             profile.revision,
             snapshot_path,
         )
-        resolved_path = Path(
-            snapshot_download(
-                repo_id=profile.repository,
-                revision=profile.revision,
-                local_dir=str(snapshot_path),
-                token=os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"),
-                allow_patterns=_SNAPSHOT_ALLOW_PATTERNS,
+        download_options: dict[str, Any] = {
+            "repo_id": profile.repository,
+            "revision": profile.revision,
+            "local_dir": str(snapshot_path),
+            "token": os.getenv("HF_TOKEN")
+            or os.getenv("HUGGING_FACE_HUB_TOKEN"),
+            "allow_patterns": _SNAPSHOT_ALLOW_PATTERNS,
+        }
+        if progress_callback is not None:
+            download_options["tqdm_class"] = _snapshot_tqdm_class(
+                progress_callback
             )
-        ).resolve()
+        resolved_path = Path(snapshot_download(**download_options)).resolve()
         if resolved_path != snapshot_path.resolve():
             raise RuntimeError(
                 f"Hugging Face staged {profile.profile_id!r} at unexpected path "
@@ -245,6 +316,7 @@ def stage_model_profile(
 
 __all__ = [
     "StagedModelSnapshot",
+    "LLMStagingProgress",
     "is_model_snapshot_staged",
     "model_snapshot_path",
     "stage_model_profile",

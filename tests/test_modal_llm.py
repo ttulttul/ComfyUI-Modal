@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
+import sys
 from dataclasses import dataclass, replace
 from fractions import Fraction
-import json
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -395,6 +396,7 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
 ) -> None:
     """A completed immutable snapshot should not download twice."""
     calls: list[dict[str, Any]] = []
+    progress: list[Any] = []
 
     def fake_snapshot_download(**kwargs: Any) -> str:
         """Materialize the minimum expected Hugging Face snapshot."""
@@ -402,12 +404,21 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
         snapshot_path = Path(kwargs["local_dir"])
         snapshot_path.mkdir(parents=True, exist_ok=True)
         (snapshot_path / "config.json").write_text("{}", encoding="utf-8")
+        progress_bar = kwargs["tqdm_class"](
+            total=2,
+            unit="files",
+            file=StringIO(),
+        )
+        progress_bar.update(1)
+        progress_bar.update(1)
+        progress_bar.close()
         return str(snapshot_path)
 
     first = llm_staging_module.stage_model_profile(
         "smolvlm2-2.2b-instruct",
         tmp_path,
         snapshot_download=fake_snapshot_download,
+        progress_callback=progress.append,
     )
     second = llm_staging_module.stage_model_profile(
         "smolvlm2-2.2b-instruct",
@@ -421,6 +432,12 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     assert calls[0]["revision"] == "482adb537c021c86670beed01cd58990d01e72e4"
     assert "*.safetensors" in calls[0]["allow_patterns"]
     assert "*.bin" not in calls[0]["allow_patterns"]
+    assert calls[0]["tqdm_class"].__name__ == "SnapshotProgressTqdm"
+    assert [event.value for event in progress if event.stage == "download"] == [
+        0.0,
+        1.0,
+        2.0,
+    ]
     assert llm_staging_module.is_model_snapshot_staged(
         tmp_path,
         llm_staging_module.get_llm_profile("smolvlm2-2.2b-instruct"),
@@ -525,10 +542,10 @@ def test_transformers_stopping_criteria_propagates_cancellation(
     """Per-token criteria should surface the same interruption raised by ComfyUI."""
     calls: list[int] = []
 
-    def cancel_on_second_token(token_count: int) -> None:
+    def cancel_on_second_token(progress: Any) -> None:
         """Raise a cancellation marker on the second generation step."""
-        calls.append(token_count)
-        if token_count == 2:
+        calls.append(int(progress.value))
+        if progress.value == 2:
             raise InterruptedError("cancelled")
 
     criterion = modal_llm_runtime_module._stopping_criteria(cancel_on_second_token)[0]
@@ -606,28 +623,45 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
             observed["chat_kwargs"] = kwargs
             return "rendered prompt"
 
-    class FakeLLM:
-        """Record constructor and generation arguments."""
+    class FakeAsyncEngineArgs:
+        """Capture explicit asynchronous engine construction arguments."""
 
         def __init__(self, **kwargs: Any) -> None:
-            """Capture the explicit engine memory policy."""
-            observed["llm_kwargs"] = kwargs
+            """Retain the co-residency policy for assertions."""
+            self.kwargs = kwargs
 
-        def generate(self, prompts: Any, **kwargs: Any) -> list[Any]:
-            """Return one deterministic vLLM-shaped result."""
-            observed["prompts"] = prompts
+    class FakeAsyncLLM:
+        """Stream deterministic cumulative vLLM request outputs."""
+
+        @classmethod
+        def from_engine_args(cls, engine_args: FakeAsyncEngineArgs) -> Any:
+            """Capture engine arguments and return one resident engine."""
+            observed["llm_kwargs"] = engine_args.kwargs
+            return cls()
+
+        async def generate(self, prompt: Any, **kwargs: Any) -> Any:
+            """Yield two cumulative token updates from one request."""
+            observed["prompts"] = prompt
             observed["generate_kwargs"] = kwargs
-            return [
-                SimpleNamespace(
-                    prompt_token_ids=[1, 2, 3],
-                    outputs=[
-                        SimpleNamespace(
-                            text="<think>consider carefully</think>final answer",
-                            token_ids=[10, 1, 2, 11, 3],
-                        )
-                    ],
-                )
-            ]
+            yield SimpleNamespace(
+                prompt_token_ids=[1, 2, 3],
+                outputs=[
+                    SimpleNamespace(text="<think>consider", token_ids=[10, 1])
+                ],
+            )
+            yield SimpleNamespace(
+                prompt_token_ids=[1, 2, 3],
+                outputs=[
+                    SimpleNamespace(
+                        text="<think>consider carefully</think>final answer",
+                        token_ids=[10, 1, 2, 11, 3],
+                    )
+                ],
+            )
+
+        async def abort(self, request_id: str) -> None:
+            """Record unexpected request cancellation."""
+            observed["aborted"] = request_id
 
         def shutdown(self) -> None:
             """Record deterministic engine cleanup."""
@@ -651,7 +685,12 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     monkeypatch.setitem(
         sys.modules,
         "vllm",
-        SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams, __path__=[]),
+        SimpleNamespace(
+            AsyncEngineArgs=FakeAsyncEngineArgs,
+            AsyncLLMEngine=FakeAsyncLLM,
+            SamplingParams=FakeSamplingParams,
+            __path__=[],
+        ),
     )
     monkeypatch.setitem(sys.modules, "vllm.v1", SimpleNamespace(__path__=[]))
     monkeypatch.setitem(sys.modules, "vllm.v1.engine", SimpleNamespace(__path__=[]))
@@ -660,8 +699,12 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
         "vllm.v1.engine.exceptions",
         SimpleNamespace(EngineDeadError=FakeEngineDeadError),
     )
-    backend = modal_llm_runtime_module._default_backend_factory(profile, tmp_path)
-    progress: list[int] = []
+    progress: list[Any] = []
+    backend = modal_llm_runtime_module._default_backend_factory(
+        profile,
+        tmp_path,
+        progress.append,
+    )
     result = backend.generate(
         modal_llm_runtime_module.PreparedLLMInputs(
             prompt="hello",
@@ -687,9 +730,10 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert observed["llm_kwargs"]["attention_config"] == {
         "backend": "TRITON_ATTN",
     }
-    assert observed["prompts"] == [{"prompt": "rendered prompt"}]
+    assert observed["prompts"] == {"prompt": "rendered prompt"}
     assert observed["chat_kwargs"]["tokenize"] is False
-    assert progress == [0, 5]
+    assert [event.value for event in progress if event.stage == "generating"] == [2, 5]
+    assert progress[-1].tokens_per_second is not None
     assert result.text == "final answer"
     assert result.reasoning == "consider carefully"
     assert result.reasoning_tokens == 2
@@ -697,6 +741,7 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert observed["generate_kwargs"]["sampling_params"].kwargs[
         "skip_special_tokens"
     ] is False
+    assert observed["generate_kwargs"]["request_id"].startswith("modal-llm-")
     assert observed["shutdown"] is True
 
 
@@ -720,10 +765,15 @@ def test_vllm_backend_translates_private_runtime_errors(
     class FailingLLM:
         """Raise the RuntimeError shape used by vLLM engine failures."""
 
-        def generate(self, prompts: Any, **kwargs: Any) -> list[Any]:
+        async def generate(self, prompts: Any, **kwargs: Any) -> Any:
             """Fail after accepting a well-formed generation request."""
             del prompts, kwargs
             raise FakeEngineDeadError("engine subprocess stopped")
+            yield
+
+        async def abort(self, request_id: str) -> None:
+            """Accept cleanup after the failed request."""
+            del request_id
 
     class FakeSamplingParams:
         """Accept backend-neutral generation options without vLLM installed."""
@@ -774,7 +824,91 @@ def test_vllm_backend_translates_private_runtime_errors(
         RuntimeError,
         match="vLLM generation failed for profile 'generated-profile'",
     ):
-        backend.generate(prepared, settings, lambda value: None)
+        asyncio.run(
+            backend._generate_async(prepared, settings, lambda progress: None)
+        )
+
+
+def test_vllm_backend_aborts_when_progress_callback_cancels(
+    modal_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ComfyUI cancellation during streaming should abort the vLLM request."""
+    aborted_requests: list[str] = []
+
+    class FakeSamplingParams:
+        """Accept generation options for the cancellation path."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """Discard validated generation options."""
+            del kwargs
+
+    class FakeEngineDeadError(Exception):
+        """Stand in for vLLM's private engine exception."""
+
+    class StreamingLLM:
+        """Yield one token update and record its subsequent abort."""
+
+        async def generate(self, prompt: Any, **kwargs: Any) -> Any:
+            """Yield one cumulative request output."""
+            del prompt, kwargs
+            yield SimpleNamespace(
+                prompt_token_ids=[1],
+                outputs=[SimpleNamespace(text="partial", token_ids=[2])],
+            )
+
+        async def abort(self, request_id: str) -> None:
+            """Record the interrupted request id."""
+            aborted_requests.append(request_id)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm",
+        SimpleNamespace(SamplingParams=FakeSamplingParams, __path__=[]),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.v1", SimpleNamespace(__path__=[]))
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine", SimpleNamespace(__path__=[]))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.engine.exceptions",
+        SimpleNamespace(EngineDeadError=FakeEngineDeadError),
+    )
+    backend = object.__new__(modal_llm_runtime_module.VLLMMultimodalBackend)
+    backend.profile = SimpleNamespace(
+        profile_id="generated-profile",
+        reasoning_parser="",
+        architecture="",
+    )
+    backend.processor = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: "rendered prompt"
+    )
+    backend.llm = StreamingLLM()
+    backend.reasoning_parser = SimpleNamespace(requires_boundary_tokens=False)
+    prepared = modal_llm_runtime_module.PreparedLLMInputs(
+        prompt="hello",
+        system_prompt="",
+        images=(),
+        video=None,
+        file_characters=0,
+        file_count=0,
+    )
+    settings = modal_llm_runtime_module.LLMGenerationSettings(
+        max_new_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        seed=0,
+    )
+
+    def cancel_on_token(progress: Any) -> None:
+        """Raise the same interruption shape used by the node callback."""
+        if progress.stage == "generating":
+            raise InterruptedError("cancelled")
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        asyncio.run(backend._generate_async(prepared, settings, cancel_on_token))
+
+    assert len(aborted_requests) == 1
+    assert aborted_requests[0].startswith("modal-llm-")
 
 
 @dataclass
@@ -789,12 +923,12 @@ class _FakeBackend:
         self,
         prepared_inputs: Any,
         settings: Any,
-        progress_callback: Callable[[int], None],
+        progress_callback: Callable[[Any], None],
     ) -> Any:
         """Return deterministic token counts while exercising progress."""
         del prepared_inputs
         self.generate_calls += 1
-        progress_callback(1)
+        progress_callback(SimpleNamespace(stage="generating", value=1))
         return SimpleNamespace(
             text=f"response:{self.profile_id}:{settings.seed}",
             input_tokens=7,
@@ -802,6 +936,8 @@ class _FakeBackend:
             reasoning="",
             reasoning_tokens=0,
             reasoning_parser="none",
+            time_to_first_token_seconds=0.25,
+            tokens_per_second=4.0,
         )
 
     def unload(self) -> None:
@@ -823,9 +959,13 @@ def test_resident_manager_reuses_and_lru_evicts_models(
     )
     backends: dict[str, _FakeBackend] = {}
 
-    def backend_factory(profile: Any, snapshot_path: Path) -> _FakeBackend:
+    def backend_factory(
+        profile: Any,
+        snapshot_path: Path,
+        progress_callback: Callable[[Any], None],
+    ) -> _FakeBackend:
         """Create one fake backend per load."""
-        del snapshot_path
+        del snapshot_path, progress_callback
         backend = _FakeBackend(profile.profile_id)
         backends[profile.profile_id] = backend
         return backend
@@ -1062,6 +1202,87 @@ def test_remote_dispatch_rewrites_hugging_face_id_to_generated_profile(
         "prompt": "hello",
     }
     assert payload["requires_volume_reload"] is True
+
+
+def test_remote_dispatch_streams_cpu_llm_staging_progress(
+    remote_modal_app_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-run Hugging Face progress should render before GPU allocation."""
+    observed_progress: list[dict[str, Any]] = []
+
+    class FakeStageStream:
+        """Yield one download update followed by the immutable profile result."""
+
+        def remote_gen(self, model_references: list[str]) -> Any:
+            """Stream deterministic CPU staging envelopes."""
+            assert model_references == ["owner/model"]
+            yield {
+                "kind": "progress",
+                "stage": "download",
+                "message": "Fetching 8 files",
+                "value": 3,
+                "max": 8,
+                "unit": "files",
+            }
+            yield {
+                "kind": "result",
+                "results": [
+                    {
+                        "requested_reference": "owner/model",
+                        "profile_id": "hf-" + "b" * 64,
+                        "revision": "8" * 40,
+                    }
+                ],
+            }
+
+    class FakeCls:
+        """Resolve the streaming CPU ModelStager."""
+
+        @staticmethod
+        def from_name(app_name: str, class_name: str) -> Callable[[], Any]:
+            """Return a deterministic streaming stager instance."""
+            assert app_name == "test-app"
+            assert class_name == "ModelStager"
+            return lambda: SimpleNamespace(stage_profiles_stream=FakeStageStream())
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", SimpleNamespace(Cls=FakeCls))
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_llm_staging_progress",
+        lambda payload, event: observed_progress.append(dict(event)),
+    )
+    with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
+        remote_modal_app_module._STAGED_LLM_PROFILES.clear()
+        remote_modal_app_module._STAGED_LLM_PROFILE_RESULTS.clear()
+    payload = {
+        "prompt_id": "prompt-1",
+        "component_id": "llm-node",
+        "extra_data": {"client_id": "client-1"},
+        "subgraph_prompt": {
+            "llm-node": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "owner/model"},
+            }
+        },
+    }
+
+    remote_modal_app_module._ensure_llm_profiles_staged(payload, "test-app")
+
+    assert observed_progress == [
+        {
+            "kind": "progress",
+            "stage": "download",
+            "message": "Fetching 8 files",
+            "value": 3,
+            "max": 8,
+            "unit": "files",
+        }
+    ]
+    assert (
+        payload["subgraph_prompt"]["llm-node"]["inputs"]["model_profile"]
+        == "hf-" + "b" * 64
+    )
 
 
 def test_remote_runtime_registers_deployment_owned_llm_node(

@@ -2219,6 +2219,34 @@ class _TracingPromptServer(_NullPromptServer):
         self, event: str, data: dict[str, Any], client_id: str | None
     ) -> None:
         """Track per-node timing transitions from PromptExecutor progress events."""
+        if event == "modal_llm_progress":
+            if self._status_callback is None:
+                return
+            node_id = str(data.get("node_id") or self._active_node_id or "")
+            if not node_id:
+                return
+            progress_event = {
+                "event_type": "node_progress",
+                "node_id": node_id,
+                "display_node_id": node_id,
+                "real_node_id": node_id,
+                "value": float(data.get("value", 0.0)),
+                "max": float(data.get("max", 1.0)),
+                "stage": str(data.get("stage") or ""),
+                "message": str(data.get("message") or ""),
+                "indeterminate": bool(data.get("indeterminate", False)),
+            }
+            for field_name in (
+                "unit",
+                "elapsed_seconds",
+                "time_to_first_token_seconds",
+                "tokens_per_second",
+            ):
+                if data.get(field_name) is not None:
+                    progress_event[field_name] = data[field_name]
+            self._status_callback(progress_event)
+            return
+
         if event == "executing":
             next_node_id = data.get("node")
             if next_node_id != self._active_node_id:
@@ -7136,12 +7164,25 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     class ModelStager:
         """Resolve and stage pinned Hugging Face snapshots without consuming GPU time."""
 
-        @modal.method()
-        def stage_profiles(self, model_references: list[str]) -> list[dict[str, Any]]:
-            """Resolve model references, stage snapshots, and return progress metadata."""
+        def _stage_profiles(
+            self,
+            model_references: list[str],
+            progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        ) -> list[dict[str, Any]]:
+            """Resolve and stage profiles while optionally publishing progress."""
             results: list[dict[str, Any]] = []
             curated_profiles = load_llm_profiles()
             for model_reference in model_references:
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "resolve",
+                            "message": f"Inspecting {model_reference}",
+                            "value": 0.0,
+                            "max": 1.0,
+                            "indeterminate": True,
+                        }
+                    )
                 resolve_started_at = time.perf_counter()
                 if model_reference in curated_profiles:
                     profile = curated_profiles[model_reference]
@@ -7170,6 +7211,20 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     profile.profile_id,
                     settings.remote_storage_root,
                     profile=profile,
+                    progress_callback=(
+                        lambda progress: progress_callback(
+                            {
+                                "stage": progress.stage,
+                                "message": progress.message,
+                                "value": progress.value,
+                                "max": progress.maximum,
+                                "unit": progress.unit,
+                                "indeterminate": progress.indeterminate,
+                            }
+                        )
+                        if progress_callback is not None
+                        else None
+                    ),
                 )
                 results.append(
                     {
@@ -7196,6 +7251,50 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 model_references,
             )
             return results
+
+        @modal.method()
+        def stage_profiles(self, model_references: list[str]) -> list[dict[str, Any]]:
+            """Resolve model references, stage snapshots, and return metadata."""
+            return self._stage_profiles(model_references)
+
+        @modal.method()
+        def stage_profiles_stream(
+            self,
+            model_references: list[str],
+        ) -> Iterator[dict[str, Any]]:
+            """Stream CPU staging progress and finish with resolved profile data."""
+            progress_events: queue.Queue[dict[str, Any]] = queue.Queue()
+            results: list[list[dict[str, Any]]] = []
+            errors: list[Exception] = []
+
+            def run_staging() -> None:
+                """Run blocking Hugging Face work while the generator yields events."""
+                try:
+                    results.append(
+                        self._stage_profiles(
+                            model_references,
+                            progress_events.put,
+                        )
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            staging_thread = threading.Thread(
+                target=run_staging,
+                name="modal-llm-model-stager",
+                daemon=True,
+            )
+            staging_thread.start()
+            while staging_thread.is_alive() or not progress_events.empty():
+                try:
+                    progress = progress_events.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                yield {"kind": "progress", **progress}
+            staging_thread.join()
+            if errors:
+                raise errors[0]
+            yield {"kind": "result", "results": results[0] if results else []}
 
     @app.cls(**_remote_engine_cls_options(settings, vol, image, modal_secret))
     @modal.concurrent(max_inputs=1)

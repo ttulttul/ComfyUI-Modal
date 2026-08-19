@@ -387,18 +387,26 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "function handleModalProgress(event)" in source
     assert "if (detail.aggregate_only) {" in source
     assert "setNodeBatchProgress(" in source
-    assert "function setNodeProgress(nodeIdValue, promptId, value, maxValue)" in source
+    assert (
+        "function setNodeProgress(nodeIdValue, promptId, value, maxValue, metadata = {})"
+        in source
+    )
+    assert 'unit === "tokens" ? "tok/s" : "it/s"' in source
+    assert "timeToFirstTokenSeconds" in source
+    assert "if (state.progress.indeterminate) {" in source
+    assert "preGpu: Boolean(metadata.pre_gpu)" in source
+    assert "state.phase === STATE_STARTING && state.progress.preGpu" in source
     assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false)" in source
     assert "function clearNodeProgressLane(nodeIdValue, promptId, laneId)" in source
     assert "function clearNodeProgress(nodeIdValue, promptId)" in source
     assert "fadeNodeProgress(nodeIdValue, promptId);" in source
     assert "function progressIterationRate(previousState, value, maxValue, updatedAt)" in source
-    assert "function formatIterationRate(iterationRate)" in source
+    assert "function formatIterationRate(iterationRate, unit = null)" in source
     assert "function drawIterationRateOverlay(" in source
     assert 'ctx.fillStyle = "rgba(0, 0, 0, 0.9)";' in source
     assert "const progressBarWidth = barWidth;" in source
     assert "iterationRateColumnWidth" not in source
-    assert "iterationRate: progressIterationRate(" in source
+    assert ": progressIterationRate(" in source
     assert "laneProgress.iterationRate," in source
     assert "state.progress.iterationRate," in source
     assert "state?.progress" in source
@@ -412,7 +420,7 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "isCachedRemoteNode: Boolean(cachedState)," in source
     assert 'const panelY = node.size[1] + 6 / scale;' in source
     assert 'ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);' in source
-    assert 'const headerText = hasAggregateProgress' in source
+    assert "const llmTimingLabel = aggregateProgress?.timeToFirstTokenSeconds" in source
 
 
 def test_modal_canvas_animation_loop_is_selective_and_throttled() -> None:

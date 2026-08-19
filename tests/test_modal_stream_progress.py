@@ -112,10 +112,16 @@ def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None
         }
     ]
     with modal_app._MAPPED_PROGRESS_NODE_IDS_LOCK:
-        assert modal_app._MAPPED_PROGRESS_NODE_IDS[("prompt-1", "component-1", "7")] == "node-b"
+        assert modal_app._MAPPED_PROGRESS_NODE_IDS[
+            ("prompt-1", "component-1", "7")
+        ] == "node-b"
 
     emitted_progress.clear()
-    modal_app._clear_local_mapped_lane_progress(payload, lane_index=7, item_index=3)
+    modal_app._clear_local_mapped_lane_progress(
+        payload,
+        lane_index=7,
+        item_index=3,
+    )
     assert emitted_progress == [
         {
             "prompt_id": "prompt-1",
@@ -127,5 +133,66 @@ def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None
             "lane_id": "7",
             "clear": True,
             "item_index": 3,
+        }
+    ]
+
+
+def test_llm_stream_progress_preserves_stage_and_token_metrics(
+    monkeypatch: Any,
+) -> None:
+    """LLM labels, TTFT, and token rate should reach the local websocket."""
+    modal_app = _load_modal_app_module()
+    emitted_progress: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        modal_app,
+        "_emit_local_modal_progress",
+        lambda **kwargs: emitted_progress.append(kwargs),
+    )
+    payload = {
+        "prompt_id": "prompt-llm",
+        "component_id": "llm-node",
+        "component_node_ids": ["llm-node"],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    modal_app._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {
+                    "kind": "progress",
+                    "event_type": "node_progress",
+                    "node_id": "llm-node",
+                    "value": 12,
+                    "max": 64,
+                    "stage": "generating",
+                    "message": "Generating",
+                    "unit": "tokens",
+                    "time_to_first_token_seconds": 2.5,
+                    "tokens_per_second": 9.75,
+                },
+                {"kind": "result", "outputs": ["done"]},
+            ]
+        ),
+    )
+
+    assert emitted_progress == [
+        {
+            "prompt_id": "prompt-llm",
+            "client_id": "client-1",
+            "node_id": "llm-node",
+            "value": 12.0,
+            "max_value": 64.0,
+            "display_node_id": "llm-node",
+            "real_node_id": None,
+            "lane_id": None,
+            "clear": False,
+            "item_index": None,
+            "aggregate_only": False,
+            "stage": "generating",
+            "message": "Generating",
+            "unit": "tokens",
+            "time_to_first_token_seconds": 2.5,
+            "tokens_per_second": 9.75,
         }
     ]
