@@ -124,6 +124,14 @@ class _FakeRemoteAudioNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeTextNode:
+    """Fake text node used for local LLM boundary planning."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+
+
 class _FakeRemoteImageConsumerNode:
     """Fake remote node that consumes IMAGE and produces IMAGE."""
 
@@ -148,6 +156,50 @@ class _FakeRemoteArtifactWriterNode:
     RETURN_NAMES = ()
     OUTPUT_IS_LIST = ()
     OUTPUT_NODE = False
+
+
+def test_planner_keeps_unmarked_llm_local_between_remote_text_nodes(
+    api_intercept_module: Any,
+) -> None:
+    """Transportable text boundaries must not absorb a local LLM into Modal."""
+    prompt = {
+        "1": {"class_type": "RemoteTextSource", "inputs": {}},
+        "2": {
+            "class_type": "ModalLLM",
+            "inputs": {"prompt": ["1", 0], "model_profile": "owner/model"},
+        },
+        "3": {
+            "class_type": "RemoteTextConsumer",
+            "inputs": {"prompt": ["2", 0]},
+        },
+    }
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": False}},
+            {"id": 3, "properties": {"is_modal_remote": True}},
+        ]
+    }
+    fake_nodes_module = SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "RemoteTextSource": _FakeTextNode,
+            "ModalLLM": _FakeTextNode,
+            "RemoteTextConsumer": _FakeTextNode,
+        },
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+
+    analysis = api_intercept_module.analyze_remote_node_selection(
+        prompt,
+        workflow,
+        [],
+        settings=SimpleNamespace(marker_property="is_modal_remote"),
+        nodes_module=fake_nodes_module,
+    )
+
+    assert analysis.resolved_remote_node_ids == ["1", "3"]
+    assert analysis.sandwiched_local_node_ids == ["2"]
+    assert analysis.added_node_ids == []
 
 
 def _artifact_finalizer_node_id(summary: Any) -> str:

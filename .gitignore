@@ -17,6 +17,7 @@
 !/llm_compatibility.py
 !/llm_resolver.py
 !/llm_staging.py
+!/local_llm_runtime.py
 !/modal_executor_node.py
 !/modal_endpoint_node.py
 !/modal_llm_node.py

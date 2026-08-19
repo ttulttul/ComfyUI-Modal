@@ -24,6 +24,21 @@ def test_bootstrap_pin_matches_declared_remote_extra(modal_sdk_module: Any) -> N
     ]
 
 
+def test_local_apple_extra_matches_validated_mlx_runtime(
+    local_llm_runtime_module: Any,
+) -> None:
+    """The opt-in Apple backend should pin the adapter validated by the runtime."""
+    project_metadata = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    marker = "sys_platform == 'darwin' and platform_machine == 'arm64'"
+    assert project_metadata["project"]["optional-dependencies"]["local-apple"] == [
+        f"{local_llm_runtime_module.LOCAL_MLX_VLM_SPEC}; {marker}",
+        f"psutil>=7,<8; {marker}",
+    ]
+
+
 def test_remote_mode_installs_and_reimports_missing_modal_sdk(
     modal_sdk_module: Any,
     monkeypatch: pytest.MonkeyPatch,

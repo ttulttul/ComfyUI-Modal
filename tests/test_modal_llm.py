@@ -125,6 +125,79 @@ def test_compatibility_policy_selects_requested_model_backends(
     assert decision.reasoning_parser == ("qwen3" if backend == "vllm" else "none")
 
 
+@pytest.mark.parametrize(
+    ("architecture", "quantization", "reasoning_parser"),
+    [
+        ("SmolVLMForConditionalGeneration", {}, "none"),
+        ("MuseGlimmerForConditionalGeneration", {}, "none"),
+        (
+            "Qwen3_5ForConditionalGeneration",
+            {"bits": 4, "group_size": 64, "mode": "affine"},
+            "qwen3",
+        ),
+    ],
+)
+def test_apple_local_compatibility_selects_mlx_vlm(
+    llm_compatibility_module: Any,
+    architecture: str,
+    quantization: dict[str, Any],
+    reasoning_parser: str,
+) -> None:
+    """Reviewed Apple-local architectures should resolve to the MLX adapter."""
+    decision = llm_compatibility_module.resolve_compatibility(
+        {
+            "architectures": [architecture],
+            "dtype": "bfloat16",
+            "text_config": {"max_position_embeddings": 65536},
+            "quantization": quantization,
+        },
+        artifact_bytes=2 * 1024**3,
+        execution_target="local_apple",
+    )
+
+    assert decision.backend == "mlx_vlm"
+    assert decision.reasoning_parser == reasoning_parser
+    assert decision.runtime_requirements == ("mlx-vlm==0.6.15",)
+    assert decision.estimated_vram_gb < 5
+
+
+def test_apple_local_compatibility_rejects_cuda_quantization(
+    llm_compatibility_module: Any,
+) -> None:
+    """Apple resolution should fail before downloading CUDA-specific weights."""
+    with pytest.raises(ValueError, match="not an MLX checkpoint format"):
+        llm_compatibility_module.resolve_compatibility(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "text_config": {"max_position_embeddings": 32768},
+                "quantization_config": {"quant_method": "fp8"},
+            },
+            artifact_bytes=1024,
+            execution_target="local_apple",
+        )
+
+
+def test_curated_profile_adapts_to_apple_without_mutating_modal_profile(
+    llm_profiles_module: Any,
+) -> None:
+    """One saved curated id should resolve independently for both targets."""
+    modal_profile = llm_profiles_module.get_llm_profile(
+        "smolvlm2-2.2b-instruct"
+    )
+
+    local_profile = llm_profiles_module.profile_for_execution_target(
+        modal_profile,
+        "local_apple",
+    )
+
+    assert modal_profile.backend == "transformers"
+    assert modal_profile.execution_target == "modal"
+    assert local_profile.profile_id == modal_profile.profile_id
+    assert local_profile.repository == modal_profile.repository
+    assert local_profile.backend == "mlx_vlm"
+    assert local_profile.execution_target == "local_apple"
+
+
 class _FakeReasoningTokenizer:
     """Decode deterministic IDs while modelling Qwen's special think tokens."""
 
@@ -311,6 +384,57 @@ def test_cpu_resolver_pins_and_persists_generated_profile(
     assert loaded == first.profile
 
 
+def test_local_resolver_creates_target_specific_mlx_profile(
+    llm_resolver_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The same user-facing model reference should get an Apple-local manifest."""
+    config_path = tmp_path / "mlx-config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "dtype": "bfloat16",
+                "text_config": {"max_position_embeddings": 65536},
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeApi:
+        """Return one immutable MLX-format repository."""
+
+        def model_info(self, repo_id: str, **kwargs: Any) -> dict[str, Any]:
+            """Return compatible metadata without downloading model weights."""
+            del repo_id, kwargs
+            return {
+                "sha": "7" * 40,
+                "siblings": [
+                    {"rfilename": "config.json", "size": 1000},
+                    {"rfilename": "model.safetensors", "size": 2 * 1024**3},
+                ],
+                "securityStatus": {"scansDone": True, "filesWithIssues": []},
+            }
+
+    result = llm_resolver_module.resolve_model_profile(
+        "mlx-community/Qwen3.5-2B-4bit",
+        tmp_path,
+        api=FakeApi(),
+        hf_hub_download=lambda **kwargs: str(config_path),
+        execution_target="local_apple",
+    )
+
+    assert result.profile.backend == "mlx_vlm"
+    assert result.profile.execution_target == "local_apple"
+    assert result.profile.quantization_method == "mlx_affine_4bit"
+    assert result.profile.runtime_requirements == ("mlx-vlm==0.6.15",)
+
+
 def test_cpu_resolver_rejects_unknown_architecture_before_weights(
     llm_resolver_module: Any,
     tmp_path: Path,
@@ -387,6 +511,30 @@ def test_cpu_resolver_wraps_gated_config_download_error(
             tmp_path,
             api=FakeApi(),
             hf_hub_download=denied_download,
+        )
+
+
+def test_local_resolver_reports_local_hugging_face_token_location(
+    llm_resolver_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Gated local models should not direct users to a Modal secret."""
+
+    class DeniedApi:
+        """Reject model metadata as a gated repository would."""
+
+        def model_info(self, repo_id: str, **kwargs: Any) -> Any:
+            """Raise a deterministic authorization error."""
+            del repo_id, kwargs
+            raise OSError("401 Unauthorized")
+
+    with pytest.raises(ValueError, match="set HF_TOKEN in the local ComfyUI"):
+        llm_resolver_module.resolve_model_profile(
+            "owner/gated",
+            tmp_path,
+            api=DeniedApi(),
+            hf_hub_download=lambda **kwargs: "unused",
+            execution_target="local_apple",
         )
 
 
@@ -911,6 +1059,234 @@ def test_vllm_backend_aborts_when_progress_callback_cancels(
     assert aborted_requests[0].startswith("modal-llm-")
 
 
+def test_local_storage_uses_comfyui_model_directory(
+    local_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Local snapshots should follow ComfyUI's configured model root."""
+    paths: list[str] = []
+    fake_folder_paths = SimpleNamespace(
+        models_dir=str(tmp_path / "models"),
+        add_model_folder_path=lambda name, path, is_default=False: paths.append(
+            f"{name}:{path}:{is_default}"
+        ),
+        get_folder_paths=lambda name: [str(tmp_path / "models" / name)],
+    )
+    monkeypatch.delenv("COMFY_MODAL_LOCAL_LLM_STORAGE_ROOT", raising=False)
+    monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths)
+
+    storage_root = local_llm_runtime_module.local_llm_storage_root()
+
+    assert storage_root == (tmp_path / "models" / "modal_llm").resolve()
+    assert paths == [
+        f"modal_llm:{(tmp_path / 'models' / 'modal_llm').resolve()}:True"
+    ]
+
+
+def test_local_runtime_rejects_non_apple_hardware_actionably(
+    local_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unsupported local hardware should direct the workflow to Modal."""
+    monkeypatch.setattr(local_llm_runtime_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(local_llm_runtime_module.platform, "machine", lambda: "x86_64")
+
+    with pytest.raises(RuntimeError, match="Enable 'Run on Modal'"):
+        local_llm_runtime_module.ensure_local_apple_runtime_available()
+
+
+def test_local_runtime_requires_the_pinned_mlx_version(
+    local_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drifted MLX adapter should fail with an exact repair command."""
+    monkeypatch.setattr(local_llm_runtime_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(local_llm_runtime_module.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(
+        local_llm_runtime_module.metadata,
+        "version",
+        lambda distribution: "0.1.0",
+    )
+
+    with pytest.raises(RuntimeError, match="mlx-vlm==0.6.15"):
+        local_llm_runtime_module.ensure_local_apple_runtime_available()
+
+
+def test_local_curated_profile_is_staged_with_mlx_backend(
+    local_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A saved curated id should stage locally without changing the workflow."""
+    staged: list[tuple[str, Any, Any]] = []
+    monkeypatch.setattr(
+        local_llm_runtime_module,
+        "stage_model_profile",
+        lambda profile_id, storage_root, **kwargs: staged.append(
+            (profile_id, Path(storage_root), kwargs["profile"])
+        ),
+    )
+
+    profile = local_llm_runtime_module.resolve_and_stage_local_profile(
+        "smolvlm2-2.2b-instruct",
+        tmp_path,
+        progress_callback=lambda progress: None,
+    )
+
+    assert profile.backend == "mlx_vlm"
+    assert profile.execution_target == "local_apple"
+    assert staged == [(profile.profile_id, tmp_path, profile)]
+
+
+def test_mlx_backend_streams_multimodal_reasoning_and_progress(
+    local_llm_runtime_module: Any,
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """MLX streaming should retain the shared outputs and reasoning contract."""
+    import types
+
+    observed: dict[str, Any] = {}
+
+    class FakeMX:
+        """Expose only the MLX lifecycle methods used by the adapter."""
+
+        @staticmethod
+        def reset_peak_memory() -> None:
+            """Record peak-memory reset."""
+            observed["reset_peak_memory"] = True
+
+        @staticmethod
+        def clear_cache() -> None:
+            """Record cache release."""
+            observed["clear_cache"] = True
+
+    processor = SimpleNamespace(tokenizer=_FakeReasoningTokenizer())
+    model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"))
+
+    def fake_load(path: str, **kwargs: Any) -> tuple[Any, Any]:
+        """Return a deterministic resident MLX model and processor."""
+        observed["load"] = (path, kwargs)
+        return model, processor
+
+    def fake_apply_chat_template(
+        selected_processor: Any,
+        config: Any,
+        messages: Any,
+        **kwargs: Any,
+    ) -> str:
+        """Capture the structured prompt passed to MLX-VLM."""
+        observed["chat"] = (selected_processor, config, messages, kwargs)
+        return "rendered prompt"
+
+    def fake_stream_generate(*args: Any, **kwargs: Any) -> Any:
+        """Yield exact reasoning boundary and response tokens."""
+        observed["generate"] = (args, kwargs)
+        segments = [
+            ("<think>", 10),
+            ("consider", 1),
+            ("</think>", 11),
+            ("final answer", 3),
+        ]
+        for index, (text, token) in enumerate(segments, start=1):
+            yield SimpleNamespace(
+                text=text,
+                token=token,
+                prompt_tokens=5,
+                generation_tokens=index,
+                generation_tps=10.0 + index,
+            )
+
+    mlx_module = types.ModuleType("mlx")
+    mlx_module.__path__ = []
+    mlx_core_module = types.ModuleType("mlx.core")
+    mlx_core_module.reset_peak_memory = FakeMX.reset_peak_memory
+    mlx_core_module.clear_cache = FakeMX.clear_cache
+    mlx_vlm_module = types.ModuleType("mlx_vlm")
+    mlx_vlm_module.__path__ = []
+    mlx_vlm_module.load = fake_load
+    mlx_generate_module = types.ModuleType("mlx_vlm.generate")
+    mlx_generate_module.stream_generate = fake_stream_generate
+    mlx_prompt_module = types.ModuleType("mlx_vlm.prompt_utils")
+    mlx_prompt_module.apply_chat_template = fake_apply_chat_template
+    monkeypatch.setitem(sys.modules, "mlx", mlx_module)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core_module)
+    monkeypatch.setitem(sys.modules, "mlx_vlm", mlx_vlm_module)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", mlx_generate_module)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.prompt_utils", mlx_prompt_module)
+    monkeypatch.setattr(
+        local_llm_runtime_module,
+        "ensure_local_apple_runtime_available",
+        lambda: None,
+    )
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        backend="mlx_vlm",
+        architecture="Qwen3_5ForConditionalGeneration",
+        reasoning_parser="qwen3",
+        execution_target="local_apple",
+        max_context_tokens=128,
+    )
+    progress: list[Any] = []
+    backend = local_llm_runtime_module.MLXVLMBackend(
+        profile,
+        tmp_path,
+        progress.append,
+    )
+    prepared = modal_llm_runtime_module.PreparedLLMInputs(
+        prompt="describe",
+        system_prompt="be concise",
+        images=("image-a",),
+        video=modal_llm_runtime_module.PreparedVideo(
+            frames=("frame-a", "frame-b"),
+            timestamps_seconds=(0.0, 1.0),
+        ),
+        file_characters=0,
+        file_count=0,
+    )
+
+    result = backend.generate(
+        prepared,
+        modal_llm_runtime_module.LLMGenerationSettings(
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=0.95,
+            seed=7,
+        ),
+        progress.append,
+    )
+    backend.unload()
+
+    assert result.text == "final answer"
+    assert result.reasoning == "consider"
+    assert result.reasoning_tokens == 1
+    assert result.input_tokens == 5
+    assert result.output_tokens == 4
+    assert observed["chat"][2] == [
+        {"role": "system", "content": "be concise"},
+        {"role": "user", "content": "describe"},
+    ]
+    assert observed["chat"][3]["num_images"] == 3
+    assert observed["generate"][1]["image"] == [
+        "image-a",
+        "frame-a",
+        "frame-b",
+    ]
+    assert observed["generate"][1]["seed"] == 7
+    assert observed["generate"][1]["enable_thinking"] is True
+    assert observed["generate"][1]["thinking_budget"] == 4
+    assert [event.value for event in progress if event.stage == "generating"] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert observed["clear_cache"] is True
+
+
 @dataclass
 class _FakeBackend:
     """Record resident backend inference and unload behavior."""
@@ -1020,18 +1396,73 @@ def test_resident_manager_reuses_and_lru_evicts_models(
     )
 
     assert first.metadata["cache_hit"] is False
+    assert first.metadata["execution_target"] == "modal"
+    assert first.metadata["device"] == "cuda"
+    assert first.metadata["memory_total_gib"] == 256
+    assert first.metadata["gpu_total_gib"] == 256
     assert second.metadata["cache_hit"] is True
     assert backends[base_profile.profile_id].generate_calls == 2
     assert backends[base_profile.profile_id].unloaded is True
     assert manager.resident_profiles() == (second_profile.profile_id,)
 
 
-def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
+def test_resident_manager_reports_apple_unified_memory_metadata(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Local inference telemetry should not mislabel unified memory as VRAM."""
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        backend="mlx_vlm",
+        execution_target="local_apple",
+    )
+    manager = modal_llm_runtime_module.ResidentLLMManager(
+        storage_root=tmp_path,
+        backend_factory=lambda *args: _FakeBackend(profile.profile_id),
+        memory_info=lambda: (48 * 1024**3, 64 * 1024**3),
+        empty_cache=lambda: None,
+        snapshot_ready=lambda storage_root, selected_profile: True,
+        comfy_memory_release=lambda required_bytes: None,
+        execution_target="local_apple",
+        device_name="metal",
+        memory_label="unified memory",
+    )
+
+    result = manager.infer(
+        profile=profile,
+        prepared_inputs=modal_llm_runtime_module.PreparedLLMInputs(
+            prompt="hello",
+            system_prompt="",
+            images=(),
+            video=None,
+            file_characters=0,
+            file_count=0,
+        ),
+        generation_settings=modal_llm_runtime_module.LLMGenerationSettings(
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            seed=0,
+        ),
+        reserve_free_vram_gb=1,
+        keep_model_loaded=False,
+        progress_callback=lambda progress: None,
+    )
+
+    assert result.metadata["execution_target"] == "local_apple"
+    assert result.metadata["device"] == "metal"
+    assert result.metadata["memory_total_gib"] == 64
+    assert result.metadata["memory_available_before_gib"] == 48
+    assert "gpu_total_gib" not in result.metadata
+
+
+def test_modal_llm_node_routes_between_local_and_remote_runtimes(
     modal_llm_node_module: Any,
     modal_llm_runtime_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The V3 node should refuse accidental local model loading."""
+    """The V3 node toggle state should select local or remote execution."""
     schema = modal_llm_node_module.ModalLLM.define_schema()
     assert schema.node_id == "ModalLLM"
     assert [output.display_name for output in schema.outputs] == [
@@ -1040,32 +1471,52 @@ def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
         "reasoning",
     ]
 
-    monkeypatch.delenv("COMFY_MODAL_REMOTE_WORKER", raising=False)
-    with pytest.raises(RuntimeError, match="Enable 'Run on Modal'"):
-        modal_llm_node_module.ModalLLM.execute(
-            prompt="hello",
-            model_profile="smolvlm2-2.2b-instruct",
+    calls: list[tuple[str, float]] = []
+
+    def fake_result(target: str, **kwargs: Any) -> Any:
+        """Return deterministic output while recording the selected runtime."""
+        calls.append((target, kwargs["reserve_free_vram_gb"]))
+        return modal_llm_runtime_module.LLMInferenceResult(
+            text=f"{target}-done",
+            metadata={
+                "output_tokens": 1,
+                "cache_hit": True,
+                "execution_target": target,
+            },
+            reasoning="working",
         )
 
+    monkeypatch.delenv("COMFY_MODAL_REMOTE_WORKER", raising=False)
+    monkeypatch.setattr(
+        modal_llm_node_module,
+        "run_local_llm_inference",
+        lambda **kwargs: fake_result("local_apple", **kwargs),
+    )
+    local_output = modal_llm_node_module.ModalLLM.execute(
+        prompt="hello",
+        model_profile="smolvlm2-2.2b-instruct",
+        max_new_tokens=4,
+        local_reserve_free_memory_gb=3.0,
+    )
     monkeypatch.setenv("COMFY_MODAL_REMOTE_WORKER", "1")
     monkeypatch.setattr(
         modal_llm_node_module,
         "run_modal_llm_inference",
-        lambda **kwargs: modal_llm_runtime_module.LLMInferenceResult(
-            text="done",
-            metadata={"output_tokens": 1, "cache_hit": True},
-            reasoning="working",
-        ),
+        lambda **kwargs: fake_result("modal", **kwargs),
     )
-    node_output = modal_llm_node_module.ModalLLM.execute(
+    remote_output = modal_llm_node_module.ModalLLM.execute(
         prompt="hello",
         model_profile="smolvlm2-2.2b-instruct",
         max_new_tokens=4,
+        reserve_free_vram_gb=17.0,
     )
 
-    assert node_output.result[0] == "done"
-    assert json.loads(node_output.result[1])["cache_hit"] is True
-    assert node_output.result[2] == "working"
+    assert local_output.result[0] == "local_apple-done"
+    assert json.loads(local_output.result[1])["execution_target"] == "local_apple"
+    assert remote_output.result[0] == "modal-done"
+    assert json.loads(remote_output.result[1])["execution_target"] == "modal"
+    assert remote_output.result[2] == "working"
+    assert calls == [("local_apple", 3.0), ("modal", 17.0)]
 
 
 def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(

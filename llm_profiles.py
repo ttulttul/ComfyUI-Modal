@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import json
 import logging
@@ -14,11 +14,15 @@ if __package__:
     from .llm_compatibility import (
         LLM_COMPATIBILITY_POLICY_VERSION,
         LLM_PROFILE_SCHEMA_VERSION,
+        LOCAL_MLX_VLM_VERSION,
+        LLMExecutionTarget,
     )
 else:  # pragma: no cover - stable cloud entrypoint imports top-level modules.
     from llm_compatibility import (
         LLM_COMPATIBILITY_POLICY_VERSION,
         LLM_PROFILE_SCHEMA_VERSION,
+        LOCAL_MLX_VLM_VERSION,
+        LLMExecutionTarget,
     )
 
 logger = logging.getLogger(__name__)
@@ -31,7 +35,8 @@ _PROFILE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SUPPORTED_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 _SUPPORTED_MODALITIES = frozenset({"text", "image", "video", "file"})
-_SUPPORTED_BACKENDS = frozenset({"transformers", "vllm"})
+_SUPPORTED_BACKENDS = frozenset({"transformers", "vllm", "mlx_vlm"})
+_SUPPORTED_EXECUTION_TARGETS = frozenset({"modal", "local_apple"})
 _SUPPORTED_REASONING_PARSERS = frozenset({"", "none", "qwen3"})
 _PROFILE_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -66,6 +71,7 @@ class LLMModelProfile:
     reasoning_parser: str = ""
     backend_options: tuple[tuple[str, str | int | float | bool], ...] = ()
     runtime_requirements: tuple[str, ...] = ()
+    execution_target: str = "modal"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "LLMModelProfile":
@@ -139,6 +145,9 @@ class LLMModelProfile:
                 str(requirement)
                 for requirement in value.get("runtime_requirements", [])
             ),
+            execution_target=str(value.get("execution_target", "modal"))
+            .strip()
+            .lower(),
         )
         profile.validate()
         return profile
@@ -159,6 +168,11 @@ class LLMModelProfile:
             raise ValueError(
                 f"Modal LLM profile {self.profile_id!r} has unsupported backend "
                 f"{self.backend!r}."
+            )
+        if self.execution_target not in _SUPPORTED_EXECUTION_TARGETS:
+            raise ValueError(
+                f"Modal LLM profile {self.profile_id!r} has unsupported execution "
+                f"target {self.execution_target!r}."
             )
         if self.reasoning_parser not in _SUPPORTED_REASONING_PARSERS:
             raise ValueError(
@@ -218,7 +232,7 @@ class LLMModelProfile:
 
     def to_mapping(self) -> dict[str, Any]:
         """Return the stable JSON representation used by generated manifests."""
-        return {
+        mapping = {
             "id": self.profile_id,
             "display_name": self.display_name,
             "repository": self.repository,
@@ -246,6 +260,34 @@ class LLMModelProfile:
             "backend_options": dict(self.backend_options),
             "runtime_requirements": list(self.runtime_requirements),
         }
+        if self.execution_target != "modal":
+            mapping["execution_target"] = self.execution_target
+        return mapping
+
+
+def profile_for_execution_target(
+    profile: LLMModelProfile,
+    execution_target: LLMExecutionTarget,
+) -> LLMModelProfile:
+    """Return a curated profile adapted to one execution target."""
+    if profile.source == "generated":
+        if profile.execution_target != execution_target:
+            raise ValueError(
+                f"Generated LLM profile {profile.profile_id!r} targets "
+                f"{profile.execution_target!r}, not {execution_target!r}. Resolve the "
+                "original Hugging Face model reference for this execution target."
+            )
+        return profile
+    if execution_target == "modal":
+        return profile
+    adapted = replace(
+        profile,
+        backend="mlx_vlm",
+        execution_target="local_apple",
+        runtime_requirements=(f"mlx-vlm=={LOCAL_MLX_VLM_VERSION}",),
+    )
+    adapted.validate()
+    return adapted
 
 
 def _mapping_value(value: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -449,5 +491,6 @@ __all__ = [
     "llm_profile_ids_from_payload",
     "llm_profile_options",
     "load_llm_profiles",
+    "profile_for_execution_target",
     "rewrite_llm_model_references",
 ]

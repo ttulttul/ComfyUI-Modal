@@ -1,79 +1,75 @@
-# Resident Modal LLM Architecture
+# Local And Modal Resident LLM Architecture
 
-Modal LLM runs multimodal language-model inference inside the persistent RemoteEngine process. It is not an HTTP client and does not create an independently scaling inference service.
+The `Modal LLM` V3 node runs multimodal language-model inference in the current ComfyUI execution process. An unmarked node runs locally on Apple Silicon through MLX-VLM. A node marked `Run on Modal` runs in the persistent RemoteEngine process on the workflow's selected Modal GPU. Neither target creates a separate HTTP inference service.
 
-## Request Path
+## Target Selection And Request Path
 
-1. The V3 node exposes text, IMAGE, native VIDEO, and OPENAI_INPUT_FILES inputs.
-2. Queue rewriting places the marked node in a normal remote component.
-3. The local dispatcher scans the complete payload, including split phases, for curated profiles or Hugging Face model IDs.
-4. For a model ID, the CPU resolver inspects Hub metadata and `config.json`, validates architecture, quantization, safetensors inventory, security status, and download budget, then pins the exact commit in a content-addressed schema-v2 manifest.
-5. The CPU ModelStager downloads only the approved revision-pinned safetensors, processor, and tokenizer assets to the shared Modal Volume.
-6. The stager writes a completion marker and commits the Volume.
-7. The dispatcher rewrites the model ID to the immutable generated profile ID, and the GPU worker reloads that exact Volume revision before executing the component.
-8. The node converts ComfyUI tensors directly to processor inputs, samples video frames uniformly, and extracts bounded text from supported files.
-9. ResidentLLMManager reuses or loads the profile under a process lock. Structured progress covers processor setup, known checkpoint shard totals, vLLM engine warmup, prefill, and generation.
-10. A model-aware output parser separates generated reasoning from final content using exact token boundaries, with a native engine field taking precedence when available.
-11. The clean response, JSON telemetry, and separate reasoning string return through the normal Modal-Sync node-output transport.
+1. The node exposes text, IMAGE, native VIDEO, and `OPENAI_INPUT_FILES` inputs plus the existing `Run on Modal` toggle.
+2. Queue rewriting leaves an unmarked node in the local graph. Marking it places the node in a normal remote component.
+3. Both targets inspect a Hugging Face repository and `config.json` before weight download, validate the target-specific architecture and quantization policy, and pin the exact commit in a content-addressed schema-v2 profile.
+4. Local execution downloads the approved snapshot beneath `<ComfyUI models>/modal_llm` and loads it through pinned MLX-VLM. Modal execution uses the CPU-only ModelStager and shared Modal Volume before allocating a GPU worker.
+5. The node converts ComfyUI tensors directly to processor inputs, samples video uniformly into timestamped frames, and extracts bounded text from supported files. The local adapter supplies sampled video frames as an ordered image sequence because the shared input layer has already done the sampling and timestamp annotation.
+6. A target-specific process-global `ResidentLLMManager` reuses or loads the immutable profile under a process lock.
+7. A shared model-aware parser separates generated reasoning from final content using exact token boundaries, with a native engine field taking precedence when available.
+8. The clean response, JSON telemetry, and separate reasoning string return through normal ComfyUI node outputs.
+
+An unmarked LLM may sit between remote regions. The planner keeps it local and creates the same transport boundaries it would for any other local node; only the values cross those boundaries.
+
+## Apple-Local Runtime
+
+Local execution currently requires Apple Silicon macOS and exactly `mlx-vlm==0.6.15`. Install it into the interpreter that launches ComfyUI:
+
+```bash
+uv pip install --python <comfyui-venv>/bin/python "mlx-vlm==0.6.15" "psutil>=7,<8"
+```
+
+The default snapshot root follows ComfyUI's model directory and registers the `modal_llm` model folder. `COMFY_MODAL_LOCAL_LLM_STORAGE_ROOT` overrides it. The compatibility registry currently permits unquantized or native MLX checkpoints for SmolVLM, Muse-Glimmer, and Qwen3.5 architectures. CUDA-oriented FP8, ModelOpt FP4, and unknown formats are rejected before download; users should choose an unquantized repository or an `mlx-community` conversion.
+
+For Qwen3.5, MLX-VLM receives an explicit thinking budget equal to half of `max_new_tokens`. This preserves the existing separate reasoning output while ensuring that a verbose small model cannot consume the entire allowance before emitting a final answer.
 
 ## Residency And Memory
 
-The manager is module-global in the warm RemoteEngine process. Its LRU is keyed by immutable profile ID and retains up to COMFY_MODAL_LLM_MAX_RESIDENT_MODELS.
+The shared manager implements a serialized, immutable-profile LRU for both targets. Before a cold load it asks ComfyUI to release idle managed models, evicts older resident LLMs as needed, and rejects the load when the model estimate plus configured reserve does not fit.
 
-Before loading a new LLM, the manager:
+Apple-local admission uses `psutil.virtual_memory().available` and total system unified memory. The node's `local_reserve_free_memory_gb` defaults to 4 GiB, the local LRU defaults to one model, and evictions clear MLX caches. `COMFY_MODAL_LOCAL_LLM_MAX_RESIDENT_MODELS` changes the LRU limit. `COMFY_MODAL_LOCAL_LLM_RESERVE_FREE_GB` supplies the default to programmatic calls that omit a reserve.
 
-1. asks ComfyUI's memory manager to release idle managed models if needed;
-2. checks torch.cuda.mem_get_info();
-3. evicts least-recently used LLMs until the profile estimate plus reserve fits;
-4. fails with measured free/total VRAM rather than attempting an unsafe load.
+Modal admission keeps the existing `torch.cuda.mem_get_info()` path, `reserve_free_vram_gb` control, and `COMFY_MODAL_LLM_MAX_RESIDENT_MODELS` setting. Executions are serialized within each process; retaining more than one model does not promise simultaneous kernels.
 
-ComfyUI sees the LLM's real CUDA allocation when calculating free memory, even though it does not own the Transformers object. The configurable reserve gives subsequent image/video nodes headroom. Executions are serialized within a worker; co-residency does not promise simultaneous CUDA kernels.
+Telemetry exposes `execution_target`, `device`, generic available/total-memory fields, cache status, resident profiles, and ComfyUI-managed model names. Existing Modal GPU memory keys remain present for backward compatibility.
 
 ## Security And Reproducibility
 
-- Repository IDs are metadata-inspected on CPU before any weight download or GPU allocation.
-- Every profile pins a 40-character repository commit.
-- Generated profile IDs include the SHA-256 digest of all runtime-defining fields.
-- `trust_remote_code` must remain false.
-- The remote model loader uses `local_files_only=true`.
-- The CPU stager is the only network download path.
+- Repository IDs are metadata-inspected before weight download or accelerator allocation.
+- Every generated profile pins a 40-character repository commit and includes the execution target in its content identity.
+- Existing Modal generated-profile identities remain unchanged for compatibility; `execution_target=modal` is intentionally omitted from their historical digest shape.
+- `trust_remote_code` remains false.
 - Snapshot allow-patterns omit Python source and pickle weight formats.
-- Text and PDF input sizes are bounded before prompt construction.
-- The compatibility policy participates in the remote runtime fingerprint.
+- Both loaders consume only the completed local snapshot path.
+- Text and PDF sizes are bounded before prompt construction.
+- Public models need no token. Local gated access reads `HF_TOKEN` from ComfyUI's environment; remote gated access reads it from the selected Modal secret collection.
 
-Compatibility-policy changes remain deployment changes. New repositories using a reviewed architecture and quantization can generate immutable profiles without changing the image.
+Changing target requires resolving the original Hugging Face reference again. A generated profile created for Modal cannot be silently loaded through MLX, and vice versa.
 
-## Current Backend Boundary
+## Backend Boundary
 
-The compatibility registry selects Transformers for Muse-Glimmer and vLLM for Qwen3.5. Qwen block-FP8 and NVIDIA ModelOpt NVFP4 checkpoints share the vLLM adapter. Generated vLLM profiles set an explicit KV-cache byte budget and a conservative 32K default context instead of allowing the serving engine to reserve nearly all available GPU memory.
+The Modal compatibility registry selects Transformers for Muse-Glimmer and vLLM for Qwen3.5, including reviewed block-FP8 and NVIDIA ModelOpt NVFP4 checkpoints. The Apple registry selects MLX-VLM for reviewed unquantized or MLX-format SmolVLM, Muse-Glimmer, and Qwen3.5 checkpoints.
 
-Reasoning extraction is deliberately model-aware and backend-neutral:
+Reasoning extraction remains backend-neutral:
 
-- A profile selects a top-level immutable `reasoning_parser`; known architectures provide a compatibility fallback for previously generated profiles.
+- A profile selects an immutable `reasoning_parser`; known architectures provide a compatibility fallback for older profiles.
 - Each backend supplies raw generated token IDs and any native separated reasoning field to the same parser contract.
-- A native field wins when an engine supplies one. This supports future engine APIs without changing the node contract.
-- Transformers generation has no standard separated reasoning result, so reasoning models retain boundary tokens until the parser splits the token sequence and decodes each channel with special tokens removed.
-- Resident vLLM uses one persistent `AsyncLLM` event loop per loaded backend. Its cumulative async generation stream exposes token IDs and text but not the OpenAI server's parsed reasoning response, so the same token-aware fallback applies.
-- Qwen3.5 chat templating explicitly enables thinking, and its parser treats tokens before `</think>` as reasoning. If generation stops before that terminator, the entire partial output is reasoning and `response` remains empty.
+- Transformers and MLX retain reasoning boundary tokens until parsing; resident vLLM uses its cumulative async token stream.
+- The node appends `reasoning` after the pre-existing `response` and `metadata_json` outputs, preserving saved workflow link indices.
+- `output_tokens` counts all generated tokens and `reasoning_tokens` counts reasoning content without boundary markers.
 
-The node appends `reasoning` after the pre-existing `response` and `metadata_json` outputs to preserve saved workflow link indices. `output_tokens` remains the total generated count; `reasoning_tokens` counts reasoning content tokens excluding boundary markers.
+## Progress And Cancellation
 
-## Progress And Streaming
+Both staging paths pass a custom progress adapter into Hugging Face snapshot download. Local and remote execution emit the same typed stages for profile inspection, input preparation, memory admission, processor/model loading, and token generation. The standard ComfyUI progress bar therefore works locally, while the existing streamed remote event path continues to feed Modal overlays. Work without a real completion fraction remains indeterminate.
 
-The CPU ModelStager passes a custom `tqdm_class` into Hugging Face `snapshot_download` and streams aggregate file progress before GPU allocation. GPU execution emits the same typed progress contract for profile resolution, multimodal input preparation, GPU-memory admission, processor load, known safetensor shard totals, engine initialization, prefill, and decoding. Work without an upstream completion fraction uses an indeterminate pulse instead of a fabricated percentage.
+Each generated token checks ComfyUI's interruption hook through the node progress callback. Remote vLLM also aborts its active async request before propagating cancellation. Final time-to-first-token and throughput are retained in `metadata_json`.
 
-The vLLM backend keeps `AsyncLLM` and its output task attached to a persistent event-loop thread for the lifetime of the resident model. Each cumulative request output updates generated token count, time to first token, elapsed time, and live tokens per second. Cancellation raised by ComfyUI aborts the active vLLM request before propagating. Final TTFT and throughput are retained in `metadata_json`.
+## Live Validation
 
-Every selectable NVIDIA GPU runtime uses Python 3.13 and pins Torch 2.13.0, torchvision 0.28.0, Transformers 5.15.0, and the CUDA 13.0 vLLM 0.27.1 wheel. This covers Modal's T4-through-Blackwell choices and ensures a workflow's GPU price/capacity selection never removes its LLM backend. Python 3.13 is necessary because a FlashInfer communications module imported by vLLM's kernel warmup evaluates `array.array[int]` at runtime. The initial vLLM policy uses a 12 GiB BF16 KV cache, one request at a time, and eager execution to keep graph-capture allocations predictable beside ComfyUI. The worker sets `VLLM_USE_FLASHINFER_SAMPLER=0` and selects Triton full attention so optional FlashInfer sampling and Blackwell TRT-LLM attention kernels do not require an `nvcc` JIT compiler, while avoiding FlashAttention 4's unsupported Qwen3.5 used-sequence prefill at head dimension 256. Qwen's separate GDN kernel remains available. Torch and vLLM imports are validated while building every image; model-specific capacity remains enforced separately from backend availability.
+On 2026-08-19, Apple-local validation on a 64 GiB Mac loaded the exact `mlx-community/Qwen3.5-2B-4bit` revision `674aaa7240b91e8012fcad5d791b7dfe5ba90207`, produced the requested text response, accepted a real `[1,32,32,3]` ComfyUI IMAGE tensor and identified its dominant red colour, then reported a resident cache hit on the second request. The text pass generated at approximately 193 tokens per second. This validates one representative 4-bit MLX model, not every model that fits in unified memory.
 
-## Live GPU Validation
-
-On 2026-08-19, the generated-profile canary resolved exact Hub revisions, staged immutable snapshots, loaded each model, accepted a real ComfyUI IMAGE input, and generated non-empty output for:
-
-- `orcarouter/Qwen3.8-27B-Uncensored-FP8` at `9228df5c6c9c509e1019f83b4e085cf643118bac` through vLLM FP8;
-- `meta-models/Muse-Glimmer-30B` at `a4e59da52a7bc87ae7251dd5545c0dd437c44b68` through Transformers;
-- `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4` at `faf7945020c138c8ef864ab1644273f3158f85fa` through vLLM ModelOpt FP4.
-
-The live co-residency canary can select a curated profile or Hub ID through `COMFY_MODAL_LLM_CANARY_PROFILE`. It retains that LLM, executes a real ComfyUI VAE encode on the same single B300 worker, and then requires the second LLM call to report a resident cache hit. The 2026-08-19 run passed with the generated Orcarouter FP8 profile retained across a real Flux VAE encode on one B300 worker.
-
-The same date's isolated RTX PRO 6000 canary rebuilt the universal image from its custom-node requirements, validated the final pinned dependency versions, and passed both the remote runtime handshake and real generated-profile inference for `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4`. This specifically covers the non-B300 path that previously omitted vLLM. It does not imply that every model fits or supports every selectable GPU; profile compatibility and measured-VRAM admission remain independent checks.
+The same date's Modal canaries validated generated vLLM FP8, Transformers, and vLLM ModelOpt FP4 profiles on B300 and RTX PRO 6000 workers. Model-specific capacity and compatibility remain separate from backend availability on both targets.
