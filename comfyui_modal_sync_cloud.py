@@ -56,6 +56,7 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     RemoteTorchBuild as _RemoteTorchBuild,
     build_remote_runtime_identity,
     custom_node_runtime_packages as _custom_node_runtime_packages,
+    remote_accelerator_packages as _remote_accelerator_packages,
     remote_apt_packages as _comfyui_apt_packages,
     remote_runtime_packages as _comfyui_runtime_packages,
     select_remote_torch_build as _select_remote_torch_build,
@@ -7056,6 +7057,9 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         .env(_modal_image_environment(settings, runtime_identity.fingerprint))
         .pip_install(*_comfyui_runtime_packages())
     )
+    accelerator_packages = _remote_accelerator_packages(settings.modal_gpu)
+    if accelerator_packages:
+        image = image.pip_install(*accelerator_packages)
     if custom_node_packages:
         image = image.pip_install(*custom_node_packages)
     image = _install_remote_torch_build(image, torch_build)

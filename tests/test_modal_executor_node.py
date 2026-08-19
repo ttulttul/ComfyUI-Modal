@@ -4041,8 +4041,8 @@ def test_modal_cloud_selects_gpu_compatible_pytorch_stack(
     )
     assert default_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu128"
     assert b300_build.install_layers[0].packages == (
-        "torch==2.12.1",
-        "torchvision==0.27.1",
+        "torch==2.13.0",
+        "torchvision==0.28.0",
     )
     assert b300_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu132"
     assert b300_build.install_layers[1].packages == ("torchaudio==2.11.0+cpu",)
@@ -4081,7 +4081,7 @@ def test_modal_cloud_installs_and_validates_torch_layers_in_order(
     assert image.calls[:2] == [
         (
             "pip_install",
-            ("torch==2.12.1", "torchvision==0.27.1"),
+            ("torch==2.13.0", "torchvision==0.28.0"),
             {
                 "index_url": "https://download.pytorch.org/whl/cu132",
                 "extra_options": "",
@@ -4746,10 +4746,18 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     assert [
         (event["phase"], event["status_message"])
         for event in status_events
-    ] == [
-        ("setup", "Rebuilding Modal app"),
-        ("starting", "Starting Modal component"),
-    ]
+        ] == [
+            ("setup", "Rebuilding Modal app"),
+            (
+                "llm_staging",
+                "Inspecting and staging LLM on CPU; no GPU is allocated yet",
+            ),
+            (
+                "llm_staged",
+                "LLM staging complete (0.0 GiB downloaded); starting GPU worker",
+            ),
+            ("starting", "Starting Modal component"),
+        ]
 
 
 def test_remote_modal_does_not_classify_remote_execution_error_as_missing_app(

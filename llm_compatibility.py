@@ -130,6 +130,7 @@ def resolve_compatibility(
         backend = "vllm"
         modalities = frozenset({"text", "image", "video", "file"})
         backend_options = (
+            ("enforce_eager", True),
             ("kv_cache_memory_bytes", 12 * 1024**3),
             ("max_model_len", default_context_tokens),
             (

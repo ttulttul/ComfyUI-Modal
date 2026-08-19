@@ -5592,6 +5592,13 @@ def _ensure_llm_profiles_staged(
             if (deployment_app_name, reference) not in _STAGED_LLM_PROFILE_RESULTS
         ]
         if missing_model_references:
+            _emit_local_remote_startup_status(
+                payload,
+                phase="llm_staging",
+                status_message=(
+                    "Inspecting and staging LLM on CPU; no GPU is allocated yet"
+                ),
+            )
             logger.info(
                 "Dispatching CPU model resolution/staging app=%s models=%s "
                 "before GPU component=%s.",
@@ -5636,6 +5643,19 @@ def _ensure_llm_profiles_staged(
                 raise ModalRemoteInvocationError(
                     f"Modal ModelStager did not confirm models {sorted(missing_results)}."
                 )
+            downloaded_gib = sum(
+                float(result.get("artifact_bytes") or 0) / 1024**3
+                for result in stage_results
+                if isinstance(result, Mapping) and result.get("downloaded")
+            )
+            _emit_local_remote_startup_status(
+                payload,
+                phase="llm_staged",
+                status_message=(
+                    f"LLM staging complete ({downloaded_gib:.1f} GiB downloaded); "
+                    "starting GPU worker"
+                ),
+            )
         resolved_results = {
             reference: _STAGED_LLM_PROFILE_RESULTS[(deployment_app_name, reference)]
             for reference in model_references

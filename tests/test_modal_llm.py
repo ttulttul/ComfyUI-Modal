@@ -8,6 +8,7 @@ from fractions import Fraction
 import json
 from io import BytesIO
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -447,6 +448,110 @@ def test_transformers_processor_does_not_resample_predecoded_video(
     assert result == "tokenized"
     assert calls[0][1]["do_sample_frames"] is False
     assert "processor_kwargs" not in calls[0][1]
+
+
+def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The vLLM adapter should not reserve memory from a whole-GPU fraction."""
+    import transformers
+
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        profile_id="qwen-vllm-test",
+        backend="vllm",
+        architecture="Qwen3_5ForConditionalGeneration",
+        quantization_method="fp8",
+        backend_options=(
+            ("enforce_eager", True),
+            ("kv_cache_memory_bytes", 12 * 1024**3),
+            ("max_model_len", 32768),
+            ("quantization", "fp8"),
+        ),
+    )
+    observed: dict[str, Any] = {}
+
+    class FakeProcessor:
+        """Render a deterministic prompt from processor-native messages."""
+
+        def apply_chat_template(self, messages: Any, **kwargs: Any) -> str:
+            """Record that tokenization stays inside vLLM."""
+            observed["messages"] = messages
+            observed["chat_kwargs"] = kwargs
+            return "rendered prompt"
+
+    class FakeLLM:
+        """Record constructor and generation arguments."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """Capture the explicit engine memory policy."""
+            observed["llm_kwargs"] = kwargs
+
+        def generate(self, prompts: Any, **kwargs: Any) -> list[Any]:
+            """Return one deterministic vLLM-shaped result."""
+            observed["prompts"] = prompts
+            observed["generate_kwargs"] = kwargs
+            return [
+                SimpleNamespace(
+                    prompt_token_ids=[1, 2, 3],
+                    outputs=[SimpleNamespace(text="answer", token_ids=[4, 5])],
+                )
+            ]
+
+        def shutdown(self) -> None:
+            """Record deterministic engine cleanup."""
+            observed["shutdown"] = True
+
+    class FakeSamplingParams:
+        """Capture backend-neutral sampling settings."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """Retain settings for assertions."""
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        lambda *args, **kwargs: FakeProcessor(),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm",
+        SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams),
+    )
+    backend = modal_llm_runtime_module._default_backend_factory(profile, tmp_path)
+    progress: list[int] = []
+    result = backend.generate(
+        modal_llm_runtime_module.PreparedLLMInputs(
+            prompt="hello",
+            system_prompt="",
+            images=(),
+            video=None,
+            file_characters=0,
+            file_count=0,
+        ),
+        modal_llm_runtime_module.LLMGenerationSettings(
+            max_new_tokens=16,
+            temperature=0.0,
+            top_p=1.0,
+            seed=4,
+        ),
+        progress.append,
+    )
+    backend.unload()
+
+    assert observed["llm_kwargs"]["kv_cache_memory_bytes"] == 12 * 1024**3
+    assert "gpu_memory_utilization" not in observed["llm_kwargs"]
+    assert observed["llm_kwargs"]["quantization"] == "fp8"
+    assert observed["prompts"] == [{"prompt": "rendered prompt"}]
+    assert observed["chat_kwargs"]["tokenize"] is False
+    assert progress == [0, 2]
+    assert result.text == "answer"
+    assert result.input_tokens == 3
+    assert observed["shutdown"] is True
 
 
 @dataclass
