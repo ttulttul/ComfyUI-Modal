@@ -6593,8 +6593,9 @@ def test_completed_modal_billing_interval_uses_hourly_resolution_and_buffer(
 def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
     remote_modal_app_module: Any,
     monkeypatch: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Hourly billing should select one GPU app/environment and query once per interval."""
+    """Hourly billing should quietly select and cache one GPU app/environment."""
     settings = remote_modal_app_module.get_settings()
     selected_settings = remote_modal_app_module.settings_for_modal_gpu(
         settings,
@@ -6655,6 +6656,7 @@ def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
     )
     remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
     remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+    caplog.set_level(logging.INFO, logger=remote_modal_app_module.__name__)
     now = datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc)
 
     first_status = asyncio.run(
@@ -6702,6 +6704,7 @@ def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
             "resolution": "h",
         }
     ]
+    assert "Fetched Modal hourly billing" not in caplog.text
 
 
 def test_get_hourly_modal_app_billing_sums_historical_ids_in_default_environment(
