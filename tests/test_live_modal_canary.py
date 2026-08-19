@@ -314,7 +314,7 @@ def test_live_modal_llm_and_comfy_vae_are_co_resident(
     live_modal_canary: _LiveModalCanaryContext,
     sync_engine_module: Any,
 ) -> None:
-    """A real ComfyUI image VAE and the Transformers LLM should share one B300 worker."""
+    """A real ComfyUI image VAE and the selected LLM should share one B300 worker."""
     import json
     from pathlib import Path
 
@@ -328,6 +328,10 @@ def test_live_modal_llm_and_comfy_vae_are_co_resident(
         pytest.skip(f"resident LLM co-residency canary VAE is missing: {vae_path}")
     if live_modal_canary.settings.max_containers != 1:
         pytest.skip("co-residency canary requires COMFY_MODAL_MAX_CONTAINERS=1")
+    model_profile = os.getenv(
+        "COMFY_MODAL_LLM_CANARY_PROFILE",
+        "smolvlm2-2.2b-instruct",
+    )
 
     sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(
         live_modal_canary.settings
@@ -339,7 +343,7 @@ def test_live_modal_llm_and_comfy_vae_are_co_resident(
         "ModalLLM",
         {
             "prompt": "Reply with the word ready.",
-            "model_profile": "smolvlm2-2.2b-instruct",
+            "model_profile": model_profile,
             "max_new_tokens": 8,
             "temperature": 0.0,
             "top_p": 1.0,
@@ -349,9 +353,9 @@ def test_live_modal_llm_and_comfy_vae_are_co_resident(
             "keep_model_loaded": True,
         },
     )
-    assert json.loads(initial_outputs[1])["resident_profiles"] == [
-        "smolvlm2-2.2b-instruct"
-    ]
+    initial_metadata = json.loads(initial_outputs[1])
+    resident_profile = initial_metadata["profile"]
+    assert initial_metadata["resident_profiles"] == [resident_profile]
 
     vae_payload = live_modal_canary.payload("comfy-vae")
     vae_payload.update(
@@ -412,7 +416,7 @@ def test_live_modal_llm_and_comfy_vae_are_co_resident(
         "ModalLLM",
         {
             "prompt": "Reply with the word resident.",
-            "model_profile": "smolvlm2-2.2b-instruct",
+            "model_profile": model_profile,
             "max_new_tokens": 8,
             "temperature": 0.0,
             "top_p": 1.0,
@@ -425,7 +429,8 @@ def test_live_modal_llm_and_comfy_vae_are_co_resident(
     final_metadata = json.loads(final_outputs[1])
 
     assert final_metadata["cache_hit"] is True
-    assert final_metadata["resident_profiles"] == ["smolvlm2-2.2b-instruct"]
+    assert final_metadata["profile"] == resident_profile
+    assert final_metadata["resident_profiles"] == [resident_profile]
     assert final_metadata["gpu_total_gib"] > 200
 
 
