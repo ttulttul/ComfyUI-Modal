@@ -12,6 +12,7 @@
 !/durable_state.py
 !/instance_identity.py
 !/modal_executor_node.py
+!/modal_endpoint_node.py
 !/modal_sdk.py
 !/output_artifacts.py
 !/runtime_environment.py
