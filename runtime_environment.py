@@ -39,7 +39,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "comfy-kitchen==0.2.31",
     "einops==0.8.2",
     "kornia==0.8.2",
-    "numpy==2.4.2",
+    "numpy==2.3.5",
     "num2words==0.5.14",
     "opencv-python-headless==4.13.0.92",
     "packaging==26.0",
@@ -216,7 +216,7 @@ def select_remote_torch_build(modal_gpu: str) -> RemoteTorchBuild:
     gpu_type = normalized_modal_gpu_type(modal_gpu)
     if gpu_type in _CUDA_132_MODAL_GPU_TYPES:
         return RemoteTorchBuild(
-            cuda_version="13.2",
+            cuda_version="13.0",
             install_layers=(
                 RemoteTorchInstallLayer(
                     index_url="https://download.pytorch.org/whl/cu132",
