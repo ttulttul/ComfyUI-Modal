@@ -4284,9 +4284,25 @@ def _consume_remote_payload_stream(
     suppressed_progress_node_metadata: dict[str, dict[str, str | None]] = {}
     active_remote_log_task_id: str | None = None
     should_close_stream = False
+    component_id = str(payload.get("component_id") or "payload")
+    invocation_id = str(payload.get("invocation_id") or "none")
+    stream_started_at = time.monotonic()
+    previous_event_at = stream_started_at
+    event_count = 0
+    progress_event_count = 0
+    logger.info(
+        "Starting local Modal stream consumption component=%s prompt_id=%s invocation_id=%s.",
+        component_id,
+        prompt_id or "none",
+        invocation_id,
+    )
 
     try:
         for stream_event in stream_events:
+            event_received_at = time.monotonic()
+            seconds_since_previous_event = event_received_at - previous_event_at
+            previous_event_at = event_received_at
+            event_count += 1
             event_kind = str(stream_event.get("kind", ""))
             if event_kind == "remote_logs":
                 task_id = _coerce_modal_task_id(stream_event.get("task_id"))
@@ -4300,6 +4316,7 @@ def _consume_remote_payload_stream(
                     )
                 continue
             if event_kind == "progress":
+                progress_event_count += 1
                 event_type = str(stream_event.get("event_type", ""))
                 if event_type == "node_progress":
                     progress_metadata = _progress_stream_event_metadata(stream_event)
@@ -4645,6 +4662,24 @@ def _consume_remote_payload_stream(
                 continue
             if event_kind == "result":
                 candidate_outputs = stream_event.get("outputs")
+                candidate_bytes = (
+                    len(candidate_outputs)
+                    if isinstance(candidate_outputs, bytes | bytearray)
+                    else -1
+                )
+                logger.info(
+                    "Received streamed Modal result component=%s prompt_id=%s invocation_id=%s "
+                    "result_bytes=%d stream_elapsed_seconds=%.3f seconds_since_previous_event=%.3f "
+                    "event_count=%d progress_event_count=%d.",
+                    component_id,
+                    prompt_id or "none",
+                    invocation_id,
+                    candidate_bytes,
+                    event_received_at - stream_started_at,
+                    seconds_since_previous_event,
+                    event_count,
+                    progress_event_count,
+                )
                 try:
                     result_payload = coerce_serialized_node_outputs(candidate_outputs)
                 except TypeError as exc:
@@ -4660,7 +4695,22 @@ def _consume_remote_payload_stream(
             )
     finally:
         if should_close_stream:
+            close_started_at = time.monotonic()
+            logger.info(
+                "Starting local Modal result stream close component=%s prompt_id=%s invocation_id=%s.",
+                component_id,
+                prompt_id or "none",
+                invocation_id,
+            )
             _close_remote_payload_stream(stream_events)
+            logger.info(
+                "Finished local Modal result stream close in %.3fs component=%s prompt_id=%s "
+                "invocation_id=%s.",
+                time.monotonic() - close_started_at,
+                component_id,
+                prompt_id or "none",
+                invocation_id,
+            )
         if active_remote_log_task_id is not None:
             _release_remote_container_log_stream(active_remote_log_task_id)
 
@@ -4668,6 +4718,17 @@ def _consume_remote_payload_stream(
         raise ModalRemoteInvocationError(
             f"Modal streamed payload for component={payload.get('component_id')!r} did not yield a final result."
         )
+    logger.info(
+        "Finished local Modal stream consumption in %.3fs component=%s prompt_id=%s invocation_id=%s "
+        "result_bytes=%d event_count=%d progress_event_count=%d.",
+        time.monotonic() - stream_started_at,
+        component_id,
+        prompt_id or "none",
+        invocation_id,
+        len(result_payload),
+        event_count,
+        progress_event_count,
+    )
     return bytes(result_payload)
 
 

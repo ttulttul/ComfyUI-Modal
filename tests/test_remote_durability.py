@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 import threading
 import time
@@ -152,6 +153,7 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
     modal_cloud_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Streaming execution should batch worker writes into one consumer commit."""
     invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
@@ -175,6 +177,7 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
     monkeypatch.setenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", "1")
     modal_cloud_module.get_settings.cache_clear()
     consumer_thread_id = threading.current_thread().ident
+    caplog.set_level(logging.INFO)
 
     try:
         events = list(
@@ -192,6 +195,48 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
     assert completed_record.result_object is not None
     assert object_store.get(completed_record.result_object) == serialized_outputs
     assert commit_thread_ids == [consumer_thread_id]
+    assert "Starting durable object batch commit" in caplog.text
+    assert "Finished durable object batch commit" in caplog.text
+
+
+def test_cloud_stream_logs_result_persistence_and_transport_boundaries(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Terminal-result diagnostics should distinguish buffering, persistence, and yield time."""
+    invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
+    object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
+    serialized_outputs = modal_cloud_module.serialize_node_outputs(("inline-result",))
+    payload = {
+        "invocation_id": "RIV_timing",
+        "component_id": "component-timing",
+    }
+
+    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
+    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "execute_node_locally",
+        lambda payload, kwargs_payload: serialized_outputs,
+    )
+    caplog.set_level(logging.INFO, logger=modal_cloud_module.__name__)
+
+    events = list(
+        modal_cloud_module._stream_remote_payload_events(payload, b"inputs")
+    )
+
+    assert events == [{"kind": "result", "outputs": serialized_outputs}]
+    assert "Remote stream worker produced result component=component-timing" in caplog.text
+    assert "Finished publishing remote stream result to event buffer" in caplog.text
+    assert "Remote stream consumer received buffered result" in caplog.text
+    assert "result_storage=inline" in caplog.text
+    assert "state=completed" in caplog.text
+    assert f"inline_result_bytes={len(serialized_outputs)}" in caplog.text
+    assert "Yielding remote stream result to Modal transport" in caplog.text
+    assert "Remote stream result yield released after" in caplog.text
 
 
 def test_cloud_invocation_waits_for_active_attempt_and_replays_result(

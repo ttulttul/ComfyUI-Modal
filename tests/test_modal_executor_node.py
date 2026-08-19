@@ -6347,6 +6347,7 @@ def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
 def test_remote_modal_consumes_streamed_progress_and_result(
     remote_modal_app_module: Any,
     monkeypatch: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The local Modal client should forward streamed progress events into the UI websocket."""
 
@@ -6367,10 +6368,12 @@ def test_remote_modal_consumes_streamed_progress_and_result(
     payload = {
         "prompt_id": "prompt-1",
         "component_id": "component-1",
+        "invocation_id": "RIV_stream_timing",
         "component_node_ids": ["7", "8"],
         "modal_gpu": "B300",
         "extra_data": {"client_id": "client-1"},
     }
+    caplog.set_level(logging.INFO, logger=remote_modal_app_module.__name__)
     result = remote_modal_app_module._consume_remote_payload_stream(
         payload,
         iter(
@@ -6403,6 +6406,12 @@ def test_remote_modal_consumes_streamed_progress_and_result(
     )
 
     assert result == b"serialized-outputs"
+    assert "Starting local Modal stream consumption component=component-1" in caplog.text
+    assert "Received streamed Modal result component=component-1" in caplog.text
+    assert "result_bytes=18" in caplog.text
+    assert "event_count=4 progress_event_count=3" in caplog.text
+    assert "Finished local Modal result stream close" in caplog.text
+    assert "Finished local Modal stream consumption" in caplog.text
     assert prompt_server.messages == [
         (
             "modal_status",
