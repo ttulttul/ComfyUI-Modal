@@ -88,6 +88,8 @@ https://your-workspace--your-endpoint.us-west.modal.direct
 
 The node calls the endpoint's OpenAI-compatible `/v1/chat/completions` API. Enter the base or custom Hugging Face model ID in `model`, or leave it blank to select the first ID advertised by `/v1/models`. Image and file content is sent using the OpenAI Chat Completions multimodal format; the hosted model and serving recipe must support the supplied content types.
 
+Modal endpoints scale to zero. While the first replica is starting, Modal Server returns an empty HTTP 503 response rather than queueing the request. The node treats that response as a cold-start signal and retries model discovery or completion with bounded backoff until the advanced `timeout_seconds` deadline. Other empty or non-JSON responses retain their HTTP status in the ComfyUI error instead of being reported only as a JSON decoding failure.
+
 Authentication is resolved in this order:
 
 1. `MODAL_KEY` and `MODAL_SECRET` from the ComfyUI process environment. These must be proxy-token values with `wk-` and `ws-` prefixes, not Modal API credentials with `ak-` and `as-` prefixes.

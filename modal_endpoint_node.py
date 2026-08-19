@@ -31,6 +31,8 @@ MODAL_SECRET_ENV = "MODAL_SECRET"
 _KEYRING_SERVICE = "ComfyUI Modal-Sync"
 _KEYRING_WRITE_TEST_USER = "__credential_store_write_test__"
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_COLD_START_INITIAL_DELAY_SECONDS = 1.0
+_COLD_START_MAX_DELAY_SECONDS = 5.0
 _TOKEN_CREATION_TIMEOUT_SECONDS = 120
 _TOKEN_CREATION_LOCK = threading.Lock()
 _AUTHORIZED_PROXY_TOKENS: set[tuple[str, str]] = set()
@@ -469,8 +471,8 @@ def _user_content(
     ]
 
 
-async def _read_json_response(response: aiohttp.ClientResponse) -> Mapping[str, Any]:
-    """Read one bounded JSON response body."""
+async def _read_response_body(response: aiohttp.ClientResponse) -> bytes:
+    """Read one bounded endpoint response body."""
     chunks: list[bytes] = []
     byte_count = 0
     async for chunk in response.content.iter_chunked(64 * 1024):
@@ -480,12 +482,30 @@ async def _read_json_response(response: aiohttp.ClientResponse) -> Mapping[str, 
                 "Modal endpoint response exceeded the 8 MiB safety limit."
             )
         chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_json_response(body: bytes, status: int) -> Mapping[str, Any]:
+    """Decode one response object with status-aware empty-body diagnostics."""
+    if not body:
+        raise RuntimeError(
+            f"Modal endpoint returned HTTP {status} with an empty response body."
+        )
     try:
-        payload = json.loads(b"".join(chunks))
+        payload = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Modal endpoint returned a non-JSON response.") from exc
+        preview = body.decode("utf-8", "replace").strip()[:500]
+        preview = re.sub(
+            r"\b(?:wk|ws)-[A-Za-z0-9_-]+\b", "[redacted]", preview
+        )
+        detail = f": {preview}" if preview else "."
+        raise RuntimeError(
+            f"Modal endpoint returned HTTP {status} with a non-JSON response{detail}"
+        ) from exc
     if not isinstance(payload, Mapping):
-        raise TypeError("Modal endpoint returned a JSON value instead of an object.")
+        raise TypeError(
+            f"Modal endpoint returned HTTP {status} with a JSON value instead of an object."
+        )
     return payload
 
 
@@ -544,6 +564,7 @@ class ModalEndpointClient:
         self._origin = _normalize_endpoint_url(endpoint_url)
         credentials.validate()
         self._credentials = credentials
+        self._timeout_seconds = timeout_seconds
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
     @property
@@ -562,9 +583,15 @@ class ModalEndpointClient:
             "Modal-Secret": self._credentials.secret,
         }
 
-    async def discover_model(self, session: aiohttp.ClientSession) -> str:
+    async def discover_model(
+        self,
+        session: aiohttp.ClientSession,
+        deadline: float | None = None,
+    ) -> str:
         """Select the first model advertised by the endpoint's OpenAI-compatible API."""
-        payload = await self._request_json(session, "GET", "/v1/models")
+        payload = await self._request_json(
+            session, "GET", "/v1/models", deadline=deadline
+        )
         models = payload.get("data")
         if (
             isinstance(models, Sequence)
@@ -591,8 +618,11 @@ class ModalEndpointClient:
         temperature: float,
     ) -> str:
         """Submit one non-streaming multimodal Chat Completions request."""
+        deadline = asyncio.get_running_loop().time() + self._timeout_seconds
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
-            resolved_model = model.strip() or await self.discover_model(session)
+            resolved_model = model.strip() or await self.discover_model(
+                session, deadline
+            )
             payload = self._request_payload(
                 prompt,
                 resolved_model,
@@ -603,7 +633,11 @@ class ModalEndpointClient:
                 temperature,
             )
             response = await self._request_json(
-                session, "POST", "/v1/chat/completions", payload
+                session,
+                "POST",
+                "/v1/chat/completions",
+                payload,
+                deadline=deadline,
             )
         return _chat_response_text(response)
 
@@ -638,8 +672,52 @@ class ModalEndpointClient:
         method: str,
         path: str,
         payload: Mapping[str, Any] | None = None,
+        deadline: float | None = None,
     ) -> Mapping[str, Any]:
-        """Make one credential-bearing request without following redirects."""
+        """Make one request, retrying Modal's empty cold-start 503 responses."""
+        loop = asyncio.get_running_loop()
+        effective_deadline = deadline or loop.time() + self._timeout_seconds
+        delay = _COLD_START_INITIAL_DELAY_SECONDS
+        saw_unavailable = False
+        try:
+            async with asyncio.timeout_at(effective_deadline):
+                while True:
+                    status, body = await self._request_once(
+                        session, method, path, payload
+                    )
+                    if status != 503 or body:
+                        response_payload = _decode_json_response(body, status)
+                        if 200 <= status < 300:
+                            return response_payload
+                        detail = _response_error_message(response_payload)
+                        raise RuntimeError(
+                            f"Modal endpoint returned HTTP {status}: {detail}"
+                        )
+                    if not saw_unavailable:
+                        logger.info(
+                            "Modal endpoint has no ready replica; waiting for cold start."
+                        )
+                    saw_unavailable = True
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2.0, _COLD_START_MAX_DELAY_SECONDS)
+        except TimeoutError as exc:
+            if saw_unavailable:
+                raise TimeoutError(
+                    "Modal endpoint stayed unavailable with HTTP 503 while its model "
+                    f"server started; timeout was {self._timeout_seconds}s."
+                ) from exc
+            raise TimeoutError(
+                f"Modal endpoint request timed out after {self._timeout_seconds}s."
+            ) from exc
+
+    async def _request_once(
+        self,
+        session: aiohttp.ClientSession,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None,
+    ) -> tuple[int, bytes]:
+        """Return the status and bounded body for one credential-bearing request."""
         async with session.request(
             method,
             f"{self._origin}{path}",
@@ -647,13 +725,7 @@ class ModalEndpointClient:
             json=payload,
             allow_redirects=False,
         ) as response:
-            response_payload = await _read_json_response(response)
-            if 200 <= response.status < 300:
-                return response_payload
-            detail = _response_error_message(response_payload)
-            raise RuntimeError(
-                f"Modal endpoint returned HTTP {response.status}: {detail}"
-            )
+            return response.status, await _read_response_body(response)
 
 
 def _modal_endpoint_primary_inputs() -> list[io.Input]:
