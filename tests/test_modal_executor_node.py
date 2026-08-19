@@ -6,6 +6,8 @@ import asyncio
 import copy
 from concurrent.futures import Future
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import importlib.util
 import json
 import pickle
@@ -6531,6 +6533,285 @@ def test_modal_gpu_estimated_rates_cover_supported_aliases(
     assert rates["H100!"] == rates["H100"]
     assert rates["B200+"] == rates["B200"]
     assert remote_modal_app_module.MODAL_GPU_PRICING_EFFECTIVE_DATE == "2026-08-13"
+
+
+def test_completed_modal_billing_interval_uses_hourly_resolution_and_buffer(
+    remote_modal_app_module: Any,
+) -> None:
+    """Billing should use the latest full UTC hour after a collection buffer."""
+    interval_start, interval_end, next_refresh_at = (
+        remote_modal_app_module._completed_modal_billing_interval(
+            datetime(2026, 8, 19, 8, 5, tzinfo=timezone.utc)
+        )
+    )
+
+    assert interval_start == datetime(2026, 8, 19, 6, 0, tzinfo=timezone.utc)
+    assert interval_end == datetime(2026, 8, 19, 7, 0, tzinfo=timezone.utc)
+    assert next_refresh_at == datetime(2026, 8, 19, 8, 10, tzinfo=timezone.utc)
+
+
+def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Hourly billing should select one GPU app/environment and query once per interval."""
+    settings = remote_modal_app_module.get_settings()
+    selected_settings = remote_modal_app_module.settings_for_modal_gpu(
+        settings,
+        "B300",
+    )
+    app_name = remote_modal_app_module.modal_deployment_app_name(selected_settings)
+    interval_start = datetime(2026, 8, 19, 7, 0, tzinfo=timezone.utc)
+    report_calls: list[dict[str, Any]] = []
+
+    def workspace_billing_report(**kwargs: Any) -> list[dict[str, Any]]:
+        """Return matching and unrelated hourly billing rows."""
+        report_calls.append(kwargs)
+        return [
+            {
+                "object_id": "ap-selected",
+                "description": app_name,
+                "environment_name": "main",
+                "interval_start": interval_start,
+                "cost": Decimal("0.11799566"),
+            },
+            {
+                "object_id": "ap-other-env",
+                "description": app_name,
+                "environment_name": "dev",
+                "interval_start": interval_start,
+                "cost": Decimal("9.99"),
+            },
+            {
+                "object_id": "ap-other-app",
+                "description": "unrelated",
+                "environment_name": "main",
+                "interval_start": interval_start,
+                "cost": Decimal("8.88"),
+            },
+        ]
+
+    original_import_module = remote_modal_app_module.importlib.import_module
+
+    def fake_import_module(name: str) -> Any:
+        """Supply the public Modal billing and environment SDK surfaces."""
+        if name == "modal._object":
+            return types.SimpleNamespace(_get_environment_name=lambda _environment: "main")
+        if name == "modal.environments":
+            return types.SimpleNamespace(ensure_env=lambda environment: environment or "main")
+        if name == "modal.billing":
+            return types.SimpleNamespace(
+                workspace_billing_report=workspace_billing_report
+            )
+        if name == "modal.exception":
+            return types.SimpleNamespace(Error=RuntimeError)
+        return original_import_module(name)
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib,
+        "import_module",
+        fake_import_module,
+    )
+    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+    now = datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc)
+
+    first_status = asyncio.run(
+        remote_modal_app_module.get_hourly_modal_app_billing(
+            "B300",
+            settings,
+            now=now,
+        )
+    )
+    cached_status = asyncio.run(
+        remote_modal_app_module.get_hourly_modal_app_billing(
+            "B300",
+            settings,
+            now=now + timedelta(minutes=30),
+        )
+    )
+
+    assert first_status is cached_status
+    assert first_status.app_id == "ap-selected"
+    assert first_status.app_name == app_name
+    assert first_status.modal_gpu == "B300"
+    assert first_status.environment_name == "main"
+    assert first_status.app_cost_usd_before_credits == Decimal("0.11799566")
+    assert first_status.has_usage is True
+    assert first_status.interval_start == interval_start
+    assert first_status.interval_end == datetime(
+        2026,
+        8,
+        19,
+        8,
+        tzinfo=timezone.utc,
+    )
+    assert first_status.next_refresh_at == datetime(
+        2026,
+        8,
+        19,
+        9,
+        10,
+        tzinfo=timezone.utc,
+    )
+    assert report_calls == [
+        {
+            "start": interval_start,
+            "end": datetime(2026, 8, 19, 8, 0, tzinfo=timezone.utc),
+            "resolution": "h",
+        }
+    ]
+
+
+def test_get_hourly_modal_app_billing_resolves_workspace_default_from_row(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """An implicit workspace environment should use the app identity in the report."""
+    settings = remote_modal_app_module.get_settings()
+    selected_settings = remote_modal_app_module.settings_for_modal_gpu(settings, "L4")
+    app_name = remote_modal_app_module.modal_deployment_app_name(selected_settings)
+    interval_start = datetime(2026, 8, 19, 7, 0, tzinfo=timezone.utc)
+    original_import_module = remote_modal_app_module.importlib.import_module
+
+    def fake_import_module(name: str) -> Any:
+        """Supply an implicit environment and one unambiguous billing row."""
+        if name == "modal._object":
+            return types.SimpleNamespace(_get_environment_name=lambda _environment: None)
+        if name == "modal.environments":
+            return types.SimpleNamespace(ensure_env=lambda _environment: None)
+        if name == "modal.billing":
+            return types.SimpleNamespace(
+                workspace_billing_report=lambda **_kwargs: [
+                    {
+                        "object_id": "ap-workspace-default",
+                        "description": app_name,
+                        "environment_name": "main",
+                        "interval_start": interval_start,
+                        "cost": Decimal("0.42"),
+                    }
+                ]
+            )
+        if name == "modal.exception":
+            return types.SimpleNamespace(Error=RuntimeError)
+        return original_import_module(name)
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib,
+        "import_module",
+        fake_import_module,
+    )
+    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+
+    status = asyncio.run(
+        remote_modal_app_module.get_hourly_modal_app_billing(
+            "L4",
+            settings,
+            now=datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc),
+        )
+    )
+
+    assert status.app_id == "ap-workspace-default"
+    assert status.environment_name == "main"
+    assert status.app_cost_usd_before_credits == Decimal("0.42")
+
+
+def test_get_hourly_modal_app_billing_reports_zero_for_no_usage(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """An absent app row should render as zero cost for that completed hour."""
+    original_import_module = remote_modal_app_module.importlib.import_module
+
+    def fake_import_module(name: str) -> Any:
+        """Supply an empty public Modal billing report."""
+        if name == "modal._object":
+            return types.SimpleNamespace(_get_environment_name=lambda _environment: "main")
+        if name == "modal.environments":
+            return types.SimpleNamespace(ensure_env=lambda environment: environment or "main")
+        if name == "modal.billing":
+            return types.SimpleNamespace(workspace_billing_report=lambda **_kwargs: [])
+        if name == "modal.exception":
+            return types.SimpleNamespace(Error=RuntimeError)
+        return original_import_module(name)
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib,
+        "import_module",
+        fake_import_module,
+    )
+    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+
+    status = asyncio.run(
+        remote_modal_app_module.get_hourly_modal_app_billing(
+            "L4",
+            now=datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc),
+        )
+    )
+
+    assert status.app_cost_usd_before_credits == Decimal("0")
+    assert status.has_usage is False
+    assert status.as_dict()["resolution"] == "hour"
+    assert status.as_dict()["collection_buffer_seconds"] == 600
+
+
+def test_get_hourly_modal_app_billing_caches_report_failures(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Fast status polling should attempt a failed billing interval only once."""
+    report_calls = 0
+
+    def workspace_billing_report(**_kwargs: Any) -> list[dict[str, Any]]:
+        """Simulate a workspace that cannot expose billing reports."""
+        nonlocal report_calls
+        report_calls += 1
+        raise RuntimeError("billing access denied")
+
+    original_import_module = remote_modal_app_module.importlib.import_module
+
+    def fake_import_module(name: str) -> Any:
+        """Supply a failing public Modal billing report."""
+        if name == "modal._object":
+            return types.SimpleNamespace(_get_environment_name=lambda _environment: "main")
+        if name == "modal.environments":
+            return types.SimpleNamespace(ensure_env=lambda environment: environment or "main")
+        if name == "modal.billing":
+            return types.SimpleNamespace(
+                workspace_billing_report=workspace_billing_report
+            )
+        if name == "modal.exception":
+            return types.SimpleNamespace(Error=RuntimeError)
+        return original_import_module(name)
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(
+        remote_modal_app_module.importlib,
+        "import_module",
+        fake_import_module,
+    )
+    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+    now = datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc)
+
+    for _attempt in range(2):
+        with pytest.raises(
+            remote_modal_app_module.ModalBillingStatusError,
+            match="billing access denied",
+        ):
+            asyncio.run(
+                remote_modal_app_module.get_hourly_modal_app_billing(
+                    "L4",
+                    now=now,
+                )
+            )
+
+    assert report_calls == 1
 
 
 def test_remote_modal_stops_consuming_stream_after_terminal_result(

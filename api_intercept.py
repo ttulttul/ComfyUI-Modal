@@ -4457,24 +4457,61 @@ def setup_modal_queue_route(
             return web.json_response({"events": modal_ui_events_for_client(client_id)})
 
         @prompt_server.routes.get(container_status_route_path)
-        async def modal_container_status(_request: web.Request) -> web.Response:
-            """Return active Modal containers owned by this ComfyUI instance."""
+        async def modal_container_status(request: web.Request) -> web.Response:
+            """Return active containers and hourly billing for one selected GPU app."""
             from .remote.modal_app import (
+                ModalBillingStatusError,
                 ModalContainerStatusError,
+                get_hourly_modal_app_billing,
                 list_active_modal_containers,
             )
 
+            requested_modal_gpu = request.query.get(
+                "modal_gpu",
+                resolved_settings.modal_gpu,
+            )
             try:
-                containers = await list_active_modal_containers(resolved_settings)
+                selected_settings = settings_for_modal_gpu(
+                    resolved_settings,
+                    requested_modal_gpu,
+                )
+            except ValueError as exc:
+                return web.json_response(
+                    {"containers": [], "error": str(exc), "polled_at": time.time()},
+                    status=400,
+                )
+
+            containers_task = asyncio.create_task(
+                list_active_modal_containers(resolved_settings)
+            )
+            billing_task = asyncio.create_task(
+                get_hourly_modal_app_billing(
+                    selected_settings.modal_gpu,
+                    resolved_settings,
+                )
+            )
+            try:
+                containers = await containers_task
             except ModalContainerStatusError as exc:
+                billing_task.cancel()
+                await asyncio.gather(billing_task, return_exceptions=True)
                 logger.warning("Unable to refresh Modal container status: %s", exc)
                 return web.json_response(
                     {"containers": [], "error": str(exc), "polled_at": time.time()},
                     status=502,
                 )
+            billing = None
+            billing_error = None
+            try:
+                billing = await billing_task
+            except ModalBillingStatusError as exc:
+                billing_error = str(exc)
+                logger.warning("Unable to refresh Modal hourly billing: %s", exc)
             return web.json_response(
                 {
                     "containers": [container.as_dict() for container in containers],
+                    "billing": billing.as_dict() if billing is not None else None,
+                    "billing_error": billing_error,
                     "polled_at": time.time(),
                 }
             )
