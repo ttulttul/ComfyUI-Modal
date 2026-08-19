@@ -100,6 +100,8 @@ let modalContainerStatusUnchangedPolls = 0;
 let modalContainerStatusFailureCount = 0;
 let modalContainerEstimatedCostUsd = 0;
 let modalContainerCostUpdatedAtSeconds = null;
+let modalHourlyBillingStatus = null;
+let modalHourlyBillingError = null;
 
 /**
  * Return whether a node should show the Modal toggle.
@@ -395,7 +397,7 @@ function ensureGlobalStatusElement() {
   element.style.fontWeight = "600";
   element.style.pointerEvents = "none";
   element.innerHTML =
-    '<span class="modal-status-dot"></span><span class="modal-status-copy"><span class="modal-status-text"></span><span class="modal-status-gpu" hidden></span><span class="modal-status-cost" hidden></span><span class="modal-status-containers" hidden></span></span>';
+    '<span class="modal-status-dot"></span><span class="modal-status-copy"><span class="modal-status-text"></span><span class="modal-status-gpu" hidden></span><span class="modal-status-cost" hidden></span><span class="modal-status-billing" hidden></span><span class="modal-status-containers" hidden></span></span>';
   document.body.appendChild(element);
   modalGlobalStatusElement = element;
   return element;
@@ -676,6 +678,30 @@ function normalizedModalContainerStatuses(payload) {
 }
 
 /**
+ * Normalize one completed Modal hourly billing record.
+ * @param {any} payload
+ * @returns {Record<string, any> | null}
+ */
+function normalizedModalHourlyBillingStatus(payload) {
+  const billing = payload?.billing;
+  if (!billing?.app_name || !billing?.interval_end) {
+    return null;
+  }
+  return {
+    appName: String(billing.app_name),
+    environmentName: String(billing.environment_name ?? ""),
+    modalGpu: String(billing.modal_gpu ?? ""),
+    intervalStart: String(billing.interval_start ?? ""),
+    intervalEnd: String(billing.interval_end),
+    appCostUsdBeforeCredits:
+      Math.max(0, Number(billing.app_cost_usd_before_credits)) || 0,
+    hasUsage: Boolean(billing.has_usage),
+    fetchedAt: String(billing.fetched_at ?? ""),
+    nextRefreshAt: String(billing.next_refresh_at ?? ""),
+  };
+}
+
+/**
  * Return a stable signature for one container status response.
  * @param {Array<Record<string, any>>} containers
  * @returns {string}
@@ -837,6 +863,8 @@ function stopModalContainerStatusPolling() {
   modalContainerStatusFailureCount = 0;
   modalContainerEstimatedCostUsd = 0;
   modalContainerCostUpdatedAtSeconds = null;
+  modalHourlyBillingStatus = null;
+  modalHourlyBillingError = null;
 }
 
 /**
@@ -871,9 +899,12 @@ async function pollModalContainerStatus() {
   }
 
   const requestedPromptId = String(activeState.promptId ?? "");
+  const requestedModalGpu = String(activeState.modalGpu ?? DEFAULT_MODAL_GPU);
   modalContainerStatusPollInFlight = true;
   try {
-    const response = await api.fetchApi(MODAL_CONTAINER_STATUS_ROUTE, { method: "GET" });
+    const statusUrl =
+      `${MODAL_CONTAINER_STATUS_ROUTE}?modal_gpu=${encodeURIComponent(requestedModalGpu)}`;
+    const response = await api.fetchApi(statusUrl, { method: "GET" });
     if (response.status !== 200) {
       throw new Error(`Modal container status returned HTTP ${response.status}.`);
     }
@@ -882,6 +913,10 @@ async function pollModalContainerStatus() {
       return;
     }
     const nextStatuses = normalizedModalContainerStatuses(payload);
+    modalHourlyBillingStatus = normalizedModalHourlyBillingStatus(payload);
+    modalHourlyBillingError = payload?.billing_error
+      ? String(payload.billing_error)
+      : null;
     const polledAtSeconds = Number(payload?.polled_at) || nowMs() / 1000;
     updateModalContainerCostEstimate(requestedPromptId, nextStatuses, polledAtSeconds);
     const changed =
@@ -897,6 +932,7 @@ async function pollModalContainerStatus() {
   } catch (error) {
     modalContainerStatusLoaded = true;
     modalContainerStatusError = String(error?.message ?? error);
+    modalHourlyBillingError = modalContainerStatusError;
     modalContainerStatusFailureCount += 1;
     console.debug("Unable to poll Modal container status.", error);
   } finally {
@@ -993,6 +1029,63 @@ function renderModalCostEstimate(costElement) {
 }
 
 /**
+ * Format the end of one completed hourly Modal billing interval.
+ * @param {string} intervalEnd
+ * @returns {string}
+ */
+function formatModalBillingIntervalEnd(intervalEnd) {
+  const intervalEndDate = new Date(intervalEnd);
+  if (!Number.isFinite(intervalEndDate.getTime())) {
+    return "unknown time";
+  }
+  return intervalEndDate.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
+/**
+ * Render actual app billing for Modal's latest buffered completed hour.
+ * @param {HTMLElement | null} billingElement
+ * @param {{ modalGpu?: string | null } | null} activeState
+ */
+function renderModalHourlyBilling(billingElement, activeState) {
+  if (!billingElement) {
+    return;
+  }
+  if (modalHourlyBillingError) {
+    billingElement.textContent = "Hourly billing temporarily unavailable";
+    billingElement.title = modalHourlyBillingError;
+    billingElement.hidden = false;
+    return;
+  }
+  if (
+    !modalHourlyBillingStatus ||
+    modalHourlyBillingStatus.modalGpu !== String(activeState?.modalGpu ?? DEFAULT_MODAL_GPU)
+  ) {
+    billingElement.textContent = "Checking hourly Modal billing…";
+    billingElement.title = "Modal billing reports use completed hourly intervals.";
+    billingElement.hidden = false;
+    return;
+  }
+
+  const reportedCost = formatEstimatedModalUsd(
+    modalHourlyBillingStatus.appCostUsdBeforeCredits,
+  );
+  const intervalEnd = formatModalBillingIntervalEnd(
+    modalHourlyBillingStatus.intervalEnd,
+  );
+  billingElement.textContent =
+    `Reported app cost ${reportedCost} · hour ending ${intervalEnd}`;
+  billingElement.title =
+    `${modalHourlyBillingStatus.appName} in ${modalHourlyBillingStatus.environmentName}; ` +
+    "actual Modal metered cost before credits and reservations. " +
+    "Hourly reports exclude the partial current hour and use a 10-minute collection buffer.";
+  billingElement.hidden = false;
+}
+
+/**
  * Render all active Modal containers beneath the GPU line.
  * @param {HTMLElement | null} containerElement
  */
@@ -1058,6 +1151,7 @@ function refreshGlobalStatusElement() {
   const text = element.querySelector(".modal-status-text");
   const gpuText = element.querySelector(".modal-status-gpu");
   const costText = element.querySelector(".modal-status-cost");
+  const billingText = element.querySelector(".modal-status-billing");
   const containerText = element.querySelector(".modal-status-containers");
   const nodeLabel = activeState.nodeCount === 1 ? "node" : "nodes";
   const hasBatchProgress =
@@ -1085,6 +1179,7 @@ function refreshGlobalStatusElement() {
   gpuText.hidden = !activeState.modalGpu;
   syncModalContainerStatusPolling(activeState);
   renderModalCostEstimate(costText);
+  renderModalHourlyBilling(billingText, activeState);
   renderModalContainerStatuses(containerText);
 
   if (activeState.phase === STATE_SETUP) {
@@ -4478,6 +4573,20 @@ function installGlobalStatusStyles() {
     }
 
     #comfy-modal-global-status .modal-status-cost[hidden] {
+      display: none;
+    }
+
+    #comfy-modal-global-status .modal-status-billing {
+      margin-top: 3px;
+      color: rgba(196, 181, 253, 0.92);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      line-height: 1.1;
+      white-space: nowrap;
+    }
+
+    #comfy-modal-global-status .modal-status-billing[hidden] {
       display: none;
     }
 

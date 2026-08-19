@@ -288,6 +288,7 @@ def test_global_modal_status_badge_polls_and_renders_active_containers() -> None
     assert "Container ${index + 1} · ${state}" in source
     assert 'class="modal-status-containers" hidden' in source
     assert "requestImmediateModalContainerStatusPoll();" in source
+    assert "?modal_gpu=${encodeURIComponent(requestedModalGpu)}" in source
 
 
 def test_global_modal_status_badge_estimates_prompt_gpu_cost() -> None:
@@ -307,6 +308,21 @@ def test_global_modal_status_badge_estimates_prompt_gpu_cost() -> None:
     assert "Estimated GPU cost ${formatEstimatedModalUsd(estimatedCostUsd)}" in source
     assert "formatEstimatedModalUsd(burnRatePerMinuteUsd)}/min" in source
     assert "modalContainerStatusPromptId !== requestedPromptId" in source
+
+
+def test_global_modal_status_badge_renders_hourly_app_billing() -> None:
+    """The global pill should show cached actual billing for the selected GPU app."""
+    source = _modal_toggle_source()
+
+    assert 'class="modal-status-billing" hidden' in source
+    assert "function normalizedModalHourlyBillingStatus(payload)" in source
+    assert "appCostUsdBeforeCredits:" in source
+    assert "function renderModalHourlyBilling(billingElement, activeState)" in source
+    assert "Reported app cost ${reportedCost} · hour ending ${intervalEnd}" in source
+    assert "actual Modal metered cost before credits and reservations" in source
+    assert "Hourly reports exclude the partial current hour" in source
+    assert 'element.querySelector(".modal-status-billing")' in source
+    assert "renderModalHourlyBilling(billingText, activeState);" in source
 
 
 def test_queue_success_marks_all_remote_nodes_ready_before_component_execution() -> None:
