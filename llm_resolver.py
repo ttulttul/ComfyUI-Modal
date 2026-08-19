@@ -18,6 +18,7 @@ if __package__:
     from .llm_compatibility import (
         LLM_COMPATIBILITY_POLICY_VERSION,
         LLM_PROFILE_SCHEMA_VERSION,
+        LLMExecutionTarget,
         resolve_compatibility,
     )
     from .llm_profiles import (
@@ -29,6 +30,7 @@ else:  # pragma: no cover - stable cloud entrypoint imports top-level modules.
     from llm_compatibility import (
         LLM_COMPATIBILITY_POLICY_VERSION,
         LLM_PROFILE_SCHEMA_VERSION,
+        LLMExecutionTarget,
         resolve_compatibility,
     )
     from llm_profiles import (
@@ -104,6 +106,13 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 def _token() -> str | None:
     """Return the first supported Hugging Face access-token environment value."""
     return os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+
+
+def _hugging_face_token_guidance(execution_target: LLMExecutionTarget) -> str:
+    """Describe where to configure a Hugging Face token for one target."""
+    if execution_target == "local_apple":
+        return "set HF_TOKEN in the local ComfyUI environment"
+    return "add HF_TOKEN to the Modal Secret"
 
 
 def _repository_files(model_info: Any) -> tuple[tuple[str, int], ...]:
@@ -206,9 +215,14 @@ def _generated_profile(
     revision: str,
     config: Mapping[str, Any],
     artifact_bytes: int,
+    execution_target: LLMExecutionTarget,
 ) -> LLMModelProfile:
     """Build a content-addressed profile from reviewed compatibility metadata."""
-    decision = resolve_compatibility(config, artifact_bytes=artifact_bytes)
+    decision = resolve_compatibility(
+        config,
+        artifact_bytes=artifact_bytes,
+        execution_target=execution_target,
+    )
     identity: dict[str, Any] = {
         "schema_version": LLM_PROFILE_SCHEMA_VERSION,
         "compatibility_policy_version": LLM_COMPATIBILITY_POLICY_VERSION,
@@ -227,6 +241,8 @@ def _generated_profile(
         "backend_options": dict(decision.backend_options),
         "runtime_requirements": list(decision.runtime_requirements),
     }
+    if execution_target != "modal":
+        identity["execution_target"] = execution_target
     digest = hashlib.sha256(_canonical_profile_identity(identity)).hexdigest()
     profile_id = generated_profile_id(digest)
     return LLMModelProfile.from_mapping(
@@ -291,6 +307,7 @@ def resolve_model_profile(
     api: HuggingFaceApi | None = None,
     hf_hub_download: Callable[..., str] | None = None,
     max_download_bytes: int | None = None,
+    execution_target: LLMExecutionTarget = "modal",
 ) -> ResolvedModelProfile:
     """Inspect one Hugging Face ID and persist its immutable generated profile."""
     reference = HuggingFaceModelReference.parse(model_reference)
@@ -309,10 +326,10 @@ def resolve_model_profile(
             token=token,
         )
     except (HfHubHTTPError, OSError, ValueError) as exc:
+        token_guidance = _hugging_face_token_guidance(execution_target)
         raise ValueError(
             f"Unable to access Hugging Face model {reference.display()!r}. For "
-            "gated or "
-            "private models, add HF_TOKEN to the Modal Secret: "
+            f"gated or private models, {token_guidance}: "
             f"{exc}"
         ) from exc
     revision = str(_field(model_info, "sha", "")).lower()
@@ -337,16 +354,18 @@ def resolve_model_profile(
             hf_hub_download=hf_hub_download,
         )
     except (HfHubHTTPError, OSError, ValueError) as exc:
+        token_guidance = _hugging_face_token_guidance(execution_target)
         raise ValueError(
             f"Unable to download config.json for Hugging Face model "
-            f"{reference.display()!r}. For gated or private models, add "
-            f"HF_TOKEN to the Modal Secret: {exc}"
+            f"{reference.display()!r}. For gated or private models, "
+            f"{token_guidance}: {exc}"
         ) from exc
     profile = _generated_profile(
         reference=reference,
         revision=revision,
         config=config,
         artifact_bytes=artifact_bytes,
+        execution_target=execution_target,
     )
     manifest_path, manifest_created = _write_generated_manifest(
         storage_root,
@@ -355,11 +374,12 @@ def resolve_model_profile(
         security_scan_complete=scan_complete,
     )
     logger.info(
-        "Resolved Modal LLM model=%s revision=%s profile=%s backend=%s "
+        "Resolved LLM model=%s revision=%s profile=%s target=%s backend=%s "
         "weights_gib=%.2f manifest_created=%s.",
         reference.display(),
         revision,
         profile.profile_id,
+        execution_target,
         profile.backend,
         artifact_bytes / 1024**3,
         manifest_created,

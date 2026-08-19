@@ -163,6 +163,12 @@ def modal_llm_runtime_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def local_llm_runtime_module(extension_package: object) -> object:
+    """Return the Apple-local resident LLM runtime module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.local_llm_runtime")
+
+
+@pytest.fixture(scope="session")
 def llm_reasoning_module(extension_package: object) -> object:
     """Return the backend-neutral LLM reasoning-output module."""
     return importlib.import_module(f"{PACKAGE_NAME}.llm_reasoning")

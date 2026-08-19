@@ -1127,6 +1127,9 @@ class ResidentLLMManager:
         empty_cache: Callable[[], None] | None = None,
         snapshot_ready: Callable[[str | Path, LLMModelProfile], bool] = is_model_snapshot_staged,
         comfy_memory_release: Callable[[int], None] | None = None,
+        execution_target: str = "modal",
+        device_name: str = "cuda",
+        memory_label: str = "GPU memory",
     ) -> None:
         """Configure the shared model cache and injectable hardware operations."""
         if max_resident_models <= 0:
@@ -1138,6 +1141,9 @@ class ResidentLLMManager:
         self._empty_cache = empty_cache or self._cuda_empty_cache
         self._snapshot_ready = snapshot_ready
         self._comfy_memory_release = comfy_memory_release or self._release_comfy_memory
+        self.execution_target = execution_target
+        self.device_name = device_name
+        self.memory_label = memory_label
         self._models: OrderedDict[str, ResidentModel] = OrderedDict()
         self._lock = threading.RLock()
 
@@ -1176,7 +1182,8 @@ class ResidentLLMManager:
         """Unload one resident backend and release cached CUDA allocations."""
         resident = self._models.pop(profile_id)
         logger.info(
-            "Evicting resident Modal LLM profile=%s allocated_gib=%.3f.",
+            "Evicting resident LLM target=%s profile=%s allocated_gib=%.3f.",
+            self.execution_target,
             profile_id,
             resident.allocated_bytes / _BYTES_PER_GIB,
         )
@@ -1194,10 +1201,11 @@ class ResidentLLMManager:
             free_bytes, total_bytes = self._memory_info()
         if free_bytes < required_bytes:
             raise RuntimeError(
-                f"Modal LLM profile {profile.profile_id!r} needs approximately "
+                f"LLM profile {profile.profile_id!r} needs approximately "
                 f"{profile.estimated_vram_gb:.1f} GiB plus {reserve_free_vram_gb:.1f} GiB reserve, "
                 f"but only {free_bytes / _BYTES_PER_GIB:.1f} of "
-                f"{total_bytes / _BYTES_PER_GIB:.1f} GiB is free."
+                f"{total_bytes / _BYTES_PER_GIB:.1f} GiB of {self.memory_label} is "
+                "available."
             )
 
     def _load(
@@ -1223,16 +1231,16 @@ class ResidentLLMManager:
             return cached, True
         if not self._snapshot_ready(self.storage_root, profile):
             raise RuntimeError(
-                f"Modal LLM profile {profile.profile_id!r} is not staged at "
-                f"{model_snapshot_path(self.storage_root, profile)}. The CPU ModelStager must "
-                "complete before GPU inference starts."
+                f"LLM profile {profile.profile_id!r} is not staged at "
+                f"{model_snapshot_path(self.storage_root, profile)}. Model staging must "
+                f"complete before {self.execution_target} inference starts."
             )
         while len(self._models) >= self.max_resident_models:
             self._evict(next(iter(self._models)))
         progress_callback(
             LLMProgressEvent(
                 stage="memory",
-                message="Preparing GPU memory",
+                message=f"Preparing {self.memory_label}",
                 indeterminate=True,
             )
         )
@@ -1254,7 +1262,9 @@ class ResidentLLMManager:
         )
         self._models[profile.profile_id] = resident
         logger.info(
-            "Loaded resident Modal LLM profile=%s measured_allocation_gib=%.3f residents=%s.",
+            "Loaded resident LLM target=%s profile=%s measured_allocation_gib=%.3f "
+            "residents=%s.",
+            self.execution_target,
             profile.profile_id,
             resident.allocated_bytes / _BYTES_PER_GIB,
             list(self._models),
@@ -1300,6 +1310,8 @@ class ResidentLLMManager:
             comfy_loaded_model_names = _comfy_loaded_model_names()
             metadata = {
                 "backend": profile.backend,
+                "execution_target": self.execution_target,
+                "device": self.device_name,
                 "profile": profile.profile_id,
                 "repository": profile.repository,
                 "revision": profile.revision,
@@ -1329,14 +1341,22 @@ class ResidentLLMManager:
                 "video_frame_count": (
                     len(prepared_inputs.video.frames) if prepared_inputs.video is not None else 0
                 ),
-                "gpu_total_gib": total_bytes / _BYTES_PER_GIB,
-                "gpu_free_before_gib": before_free / _BYTES_PER_GIB,
-                "gpu_free_after_gib": after_free / _BYTES_PER_GIB,
+                "memory_total_gib": total_bytes / _BYTES_PER_GIB,
+                "memory_available_before_gib": before_free / _BYTES_PER_GIB,
+                "memory_available_after_gib": after_free / _BYTES_PER_GIB,
                 "resident_profiles": resident_ids,
                 "comfy_loaded_model_count": len(comfy_loaded_model_names),
                 "comfy_loaded_model_names": comfy_loaded_model_names,
             }
-            logger.info("Completed Modal LLM inference: %s", metadata)
+            if self.execution_target == "modal":
+                metadata.update(
+                    {
+                        "gpu_total_gib": total_bytes / _BYTES_PER_GIB,
+                        "gpu_free_before_gib": before_free / _BYTES_PER_GIB,
+                        "gpu_free_after_gib": after_free / _BYTES_PER_GIB,
+                    }
+                )
+            logger.info("Completed LLM inference: %s", metadata)
             return LLMInferenceResult(
                 text=generation_result.text,
                 metadata=metadata,
