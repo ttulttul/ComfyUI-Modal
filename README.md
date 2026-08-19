@@ -417,6 +417,8 @@ uv run --extra remote pytest -q tests/test_live_modal_canary.py
 
 The canaries use the normal `COMFY_MODAL_APP_NAME`, environment, GPU, timeout, and container-limit settings. The parallel canary skips when either the local in-flight limit or the configured Modal container limit is below two. All ordinary tests remain local-only and do not require Modal credentials.
 
+The 2026-08-19 non-B300 regression canary passed on RTX PRO 6000 with the final reconciled Torch 2.13.0/CUDA 13.0/vLLM 0.27.1 image and real inference using the generated profile for `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4`. Model capacity and quantization compatibility are still checked per GPU; the universal image guarantees backend availability, not that every checkpoint can execute on every card.
+
 To run tests against a temporary checkout:
 
 ```bash
