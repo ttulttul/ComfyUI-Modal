@@ -2438,6 +2438,18 @@ def _remote_execution_key(payload: dict[str, Any]) -> tuple[str, str]:
     return prompt_id, component_id
 
 
+def _observe_remote_workflow_for_llm_mode(payload: dict[str, Any]) -> None:
+    """Record real workflow arrivals for container-local vLLM auto promotion."""
+    if payload.get("payload_kind") == "canary":
+        return
+    from modal_llm_runtime import observe_modal_workflow_execution
+
+    prompt_id = payload.get("prompt_id")
+    observe_modal_workflow_execution(
+        str(prompt_id).strip() if prompt_id is not None else None
+    )
+
+
 def _remote_interrupt_flag_key(prompt_id: str, component_id: str) -> str:
     """Return the shared Modal interrupt-store key for one payload execution."""
     return f"{prompt_id}:{component_id}"
@@ -7008,7 +7020,7 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
         ),
         "COMFY_MODAL_REMOTE_WORKER": "1",
         "COMFY_MODAL_LLM_VLLM_EXECUTION_MODE": str(
-            getattr(settings, "llm_vllm_execution_mode", "eager")
+            getattr(settings, "llm_vllm_execution_mode", "auto")
         ),
         "VLLM_CACHE_ROOT": str(compile_cache_root / "vllm"),
         "TORCHINDUCTOR_CACHE_DIR": str(compile_cache_root / "torchinductor"),
@@ -7387,6 +7399,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             self, payload: dict[str, Any], kwargs_payload: bytes
         ) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
+            _observe_remote_workflow_for_llm_mode(payload)
             component_id = payload.get("component_id", "single-node")
             reload_marker = _modal_volume_reload_marker(payload)
             try:
@@ -7482,6 +7495,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             kwargs_payload: bytes,
         ) -> Iterator[dict[str, Any]]:
             """Stream progress envelopes and a final serialized result for one payload."""
+            _observe_remote_workflow_for_llm_mode(payload)
             component_id = payload.get("component_id", "single-node")
             reload_marker = _modal_volume_reload_marker(payload)
             try:

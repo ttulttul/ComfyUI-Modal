@@ -1027,23 +1027,170 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert observed["shutdown"] is True
 
 
-def test_vllm_throughput_mode_enables_cuda_graph_execution(
+@pytest.mark.parametrize(
+    ("configured_mode", "expected_mode", "expected_enforce_eager"),
+    [
+        ("auto", "eager", True),
+        ("eager", "eager", True),
+        ("throughput", "throughput", False),
+    ],
+)
+def test_vllm_execution_setting_selects_initial_engine_policy(
     modal_llm_runtime_module: Any,
     llm_profiles_module: Any,
     monkeypatch: pytest.MonkeyPatch,
+    configured_mode: str,
+    expected_mode: str,
+    expected_enforce_eager: bool,
 ) -> None:
-    """The throughput deployment profile should override legacy eager metadata."""
+    """Pinned settings should win while auto starts with a low-latency eager engine."""
     profile = replace(
         llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
         backend="vllm",
         backend_options=(("enforce_eager", True),),
     )
-    monkeypatch.setenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", "throughput")
+    monkeypatch.setenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", configured_mode)
 
     mode, enforce_eager = modal_llm_runtime_module._vllm_execution_policy(profile)
 
-    assert mode == "throughput"
-    assert enforce_eager is False
+    assert mode == expected_mode
+    assert enforce_eager is expected_enforce_eager
+
+
+@pytest.mark.parametrize("setting", ["eager", "throughput"])
+def test_vllm_pinned_mode_never_auto_promotes(
+    modal_llm_runtime_module: Any,
+    setting: str,
+) -> None:
+    """Pinned controllers must ignore container workflow-count changes."""
+    controller = modal_llm_runtime_module.VLLMExecutionModeController(setting)
+
+    assert controller.observe("workflow-1") is False
+    assert controller.observe("workflow-2") is False
+    assert controller.effective_mode() == setting
+    assert controller.promoted is False
+    assert controller.observed_workflow_count == 0
+
+
+def test_vllm_auto_mode_can_promote_before_first_llm_load(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+) -> None:
+    """An image-only first workflow should still make a later LLM use throughput."""
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        backend="vllm",
+    )
+    controller = modal_llm_runtime_module.VLLMExecutionModeController("auto")
+
+    controller.observe("image-workflow")
+    controller.observe("llm-workflow")
+    runtime_profile = modal_llm_runtime_module._profile_for_vllm_execution(
+        profile,
+        controller,
+    )
+
+    assert runtime_profile.backend_option(
+        modal_llm_runtime_module._VLLM_RUNTIME_MODE_OPTION
+    ) == "throughput"
+
+
+def test_vllm_auto_mode_promotes_on_second_distinct_workflow(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Repeat components stay eager, then the next workflow rebuilds for throughput."""
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        backend="vllm",
+    )
+    controller = modal_llm_runtime_module.VLLMExecutionModeController("auto")
+    loaded_backends: list[Any] = []
+
+    class ModeBackend(_FakeBackend):
+        """Expose the ephemeral vLLM mode attached by the resident manager."""
+
+        def __init__(self, runtime_profile: Any) -> None:
+            """Record the mode selected for this fake engine construction."""
+            super().__init__(runtime_profile.profile_id)
+            self.mode = runtime_profile.backend_option(
+                modal_llm_runtime_module._VLLM_RUNTIME_MODE_OPTION
+            )
+
+        def runtime_metadata(self) -> dict[str, Any]:
+            """Mirror the real vLLM backend's effective-mode telemetry."""
+            return {"vllm_execution_mode": self.mode}
+
+    def backend_factory(
+        runtime_profile: Any,
+        snapshot_path: Path,
+        progress_callback: Callable[[Any], None],
+    ) -> ModeBackend:
+        """Create a mode-aware fake backend for each engine rebuild."""
+        del snapshot_path, progress_callback
+        backend = ModeBackend(runtime_profile)
+        loaded_backends.append(backend)
+        return backend
+
+    manager = modal_llm_runtime_module.ResidentLLMManager(
+        storage_root=tmp_path,
+        backend_factory=backend_factory,
+        memory_info=lambda: (200 * 1024**3, 256 * 1024**3),
+        empty_cache=lambda: None,
+        snapshot_ready=lambda storage_root, selected_profile: True,
+        comfy_memory_release=lambda required_bytes: None,
+        vllm_mode_controller=controller,
+    )
+    prepared = modal_llm_runtime_module.PreparedLLMInputs(
+        prompt="hello",
+        system_prompt="",
+        images=(),
+        video=None,
+        file_characters=0,
+        file_count=0,
+    )
+    generation = modal_llm_runtime_module.LLMGenerationSettings(
+        max_new_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        seed=0,
+    )
+    progress: list[Any] = []
+
+    def infer(workflow_execution_id: str) -> Any:
+        """Run one fake workflow through the shared resident manager."""
+        return manager.infer(
+            profile=profile,
+            prepared_inputs=prepared,
+            generation_settings=generation,
+            reserve_free_vram_gb=0,
+            keep_model_loaded=True,
+            progress_callback=progress.append,
+            workflow_execution_id=workflow_execution_id,
+        )
+
+    first = infer("workflow-1")
+    same_workflow = infer("workflow-1")
+    promoted = infer("workflow-2")
+    warm_throughput = infer("workflow-3")
+
+    assert first.metadata["vllm_execution_mode"] == "eager"
+    assert first.metadata["cache_hit"] is False
+    assert same_workflow.metadata["cache_hit"] is True
+    assert promoted.metadata["vllm_execution_mode"] == "throughput"
+    assert promoted.metadata["vllm_execution_setting"] == "auto"
+    assert promoted.metadata["vllm_auto_promoted"] is True
+    assert promoted.metadata["vllm_observed_workflow_count"] == 2
+    assert promoted.metadata["cache_hit"] is False
+    assert warm_throughput.metadata["cache_hit"] is True
+    assert [backend.mode for backend in loaded_backends] == ["eager", "throughput"]
+    assert loaded_backends[0].unloaded is True
+    assert any(
+        event.stage == "engine"
+        and event.message == "Optimizing vLLM for repeat workflows"
+        for event in progress
+    )
 
 
 def test_vllm_backend_translates_private_runtime_errors(

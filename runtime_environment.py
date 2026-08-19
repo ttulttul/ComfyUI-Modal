@@ -450,7 +450,7 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "llm_vllm_execution_mode": getattr(
             settings,
             "llm_vllm_execution_mode",
-            "eager",
+            "auto",
         ),
     }
 

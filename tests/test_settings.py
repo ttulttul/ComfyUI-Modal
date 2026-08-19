@@ -329,6 +329,21 @@ def test_settings_reads_resident_llm_memory_controls(
     assert settings.llm_compile_cache_volume_name == "benchmark-vllm-cache"
 
 
+def test_settings_defaults_vllm_execution_mode_to_auto(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Unconfigured deployments should promote only after repeat container use."""
+    monkeypatch.delenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", raising=False)
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.llm_vllm_execution_mode == "auto"
+
+
 def test_settings_reads_proactive_warmup_override(
     settings_module: Any,
     monkeypatch: Any,
