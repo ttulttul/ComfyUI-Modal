@@ -584,12 +584,74 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert observed["llm_kwargs"]["kv_cache_memory_bytes"] == 12 * 1024**3
     assert "gpu_memory_utilization" not in observed["llm_kwargs"]
     assert observed["llm_kwargs"]["quantization"] == "fp8"
+    assert observed["llm_kwargs"]["attention_backend"] == "FLASH_ATTN"
     assert observed["prompts"] == [{"prompt": "rendered prompt"}]
     assert observed["chat_kwargs"]["tokenize"] is False
     assert progress == [0, 2]
     assert result.text == "answer"
     assert result.input_tokens == 3
     assert observed["shutdown"] is True
+
+
+def test_vllm_backend_translates_private_runtime_errors(
+    modal_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote failures should not require vLLM exception classes on the client."""
+
+    class FakeProcessor:
+        """Return a deterministic prompt without importing Transformers."""
+
+        def apply_chat_template(self, messages: Any, **kwargs: Any) -> str:
+            """Ignore the request structure and return a prompt sentinel."""
+            del messages, kwargs
+            return "rendered prompt"
+
+    class FailingLLM:
+        """Raise the RuntimeError shape used by vLLM engine failures."""
+
+        def generate(self, prompts: Any, **kwargs: Any) -> list[Any]:
+            """Fail after accepting a well-formed generation request."""
+            del prompts, kwargs
+            raise RuntimeError("engine subprocess stopped")
+
+    class FakeSamplingParams:
+        """Accept backend-neutral generation options without vLLM installed."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """Discard values after proving the adapter constructed them."""
+            del kwargs
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm",
+        SimpleNamespace(SamplingParams=FakeSamplingParams),
+    )
+
+    backend = object.__new__(modal_llm_runtime_module.VLLMMultimodalBackend)
+    backend.profile = SimpleNamespace(profile_id="generated-profile")
+    backend.processor = FakeProcessor()
+    backend.llm = FailingLLM()
+    prepared = modal_llm_runtime_module.PreparedLLMInputs(
+        prompt="hello",
+        system_prompt="",
+        images=(),
+        video=None,
+        file_characters=0,
+        file_count=0,
+    )
+    settings = modal_llm_runtime_module.LLMGenerationSettings(
+        max_new_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        seed=0,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="vLLM generation failed for profile 'generated-profile'",
+    ):
+        backend.generate(prepared, settings, lambda value: None)
 
 
 @dataclass
