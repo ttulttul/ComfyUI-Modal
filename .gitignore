@@ -13,6 +13,7 @@
 !/instance_identity.py
 !/llm_profiles.json
 !/llm_profiles.py
+!/llm_compatibility.py
 !/llm_staging.py
 !/modal_executor_node.py
 !/modal_endpoint_node.py

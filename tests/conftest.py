@@ -46,7 +46,9 @@ def _ensure_import_paths() -> None:
             set_level=lambda *args, **kwargs: None,
         )
         av_module.video = types.SimpleNamespace(
-            frame=types.SimpleNamespace(VideoFrame=type("VideoFrame", (), {"pict_type": None}))
+            frame=types.SimpleNamespace(
+                VideoFrame=type("VideoFrame", (), {"pict_type": None})
+            )
         )
 
         av_container_module = types.ModuleType("av.container")
@@ -132,6 +134,13 @@ def modal_endpoint_module(extension_package: object) -> object:
 def llm_profiles_module(extension_package: object) -> object:
     """Return the curated Modal LLM profile registry module."""
     return importlib.import_module(f"{PACKAGE_NAME}.llm_profiles")
+
+
+@pytest.fixture
+def llm_compatibility_module(extension_package: object) -> object:
+    """Import the LLM compatibility module under the synthetic package."""
+    del extension_package
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_compatibility")
 
 
 @pytest.fixture(scope="session")
