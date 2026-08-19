@@ -38,6 +38,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "einops==0.8.2",
     "kornia==0.8.2",
     "numpy==2.4.2",
+    "num2words==0.5.14",
     "opencv-python-headless==4.13.0.92",
     "packaging==26.0",
     "pillow==12.1.0",
