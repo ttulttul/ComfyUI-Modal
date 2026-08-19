@@ -119,9 +119,21 @@ class FileDurableObjectStore:
         """Commit pending object writes from a completed logical operation once."""
         if not batch.wrote_object:
             return
+        started_at = time.monotonic()
+        logger.info(
+            "Starting durable object batch commit root=%s callback_configured=%s.",
+            self.root,
+            self._commit_callback is not None,
+        )
         if self._commit_callback is not None:
             self._commit_callback()
         batch.wrote_object = False
+        logger.info(
+            "Finished durable object batch commit in %.3fs root=%s callback_configured=%s.",
+            time.monotonic() - started_at,
+            self.root,
+            self._commit_callback is not None,
+        )
 
     def put(self, namespace: str, payload: bytes) -> DurableObjectRef:
         """Persist bytes under a content-addressed namespace and return their ref."""

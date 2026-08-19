@@ -424,11 +424,38 @@ def _load_remote_invocation_record(
 def _store_remote_invocation_record(record: RemoteInvocationRecord) -> None:
     """Persist one invocation lifecycle update to the configured shared store."""
     store = _invocation_record_store()
+    inline_result_bytes = len(record.result_inline or b"")
+    result_object_bytes = (
+        record.result_object.size_bytes if record.result_object is not None else 0
+    )
+    store_type = f"{type(store).__module__}.{type(store).__qualname__}"
+    started_at = time.monotonic()
+    logger.info(
+        "Starting remote invocation record write invocation_id=%s state=%s attempt=%d "
+        "store_type=%s inline_result_bytes=%d result_object_bytes=%d.",
+        record.invocation_id,
+        record.state,
+        record.attempt,
+        store_type,
+        inline_result_bytes,
+        result_object_bytes,
+    )
     put_record = getattr(store, "put_record", None)
     if callable(put_record):
         put_record(record)
-        return
-    store[record.invocation_id] = record.to_payload()
+    else:
+        store[record.invocation_id] = record.to_payload()
+    logger.info(
+        "Finished remote invocation record write in %.3fs invocation_id=%s state=%s "
+        "attempt=%d store_type=%s inline_result_bytes=%d result_object_bytes=%d.",
+        time.monotonic() - started_at,
+        record.invocation_id,
+        record.state,
+        record.attempt,
+        store_type,
+        inline_result_bytes,
+        result_object_bytes,
+    )
 
 
 def _load_completed_remote_invocation_result(record: RemoteInvocationRecord) -> bytes:
@@ -524,18 +551,46 @@ def _complete_remote_invocation(
 ) -> None:
     """Commit successful object writes before publishing completed metadata."""
     settings = get_settings()
+    completion_started_at = time.monotonic()
+    result_bytes = len(serialized_outputs)
+    inline_threshold_bytes = settings.invocation_result_inline_max_bytes
+    result_storage = (
+        "durable_object" if result_bytes > inline_threshold_bytes else "inline"
+    )
+    pending_object_write = bool(pending_batch and pending_batch.wrote_object)
+    logger.info(
+        "Starting remote invocation completion invocation_id=%s attempt=%d result_bytes=%d "
+        "inline_threshold_bytes=%d result_storage=%s pending_object_write=%s.",
+        running_record.invocation_id,
+        running_record.attempt,
+        result_bytes,
+        inline_threshold_bytes,
+        result_storage,
+        pending_object_write,
+    )
     result_inline: bytes | None = serialized_outputs
     result_object = None
     object_store = _durable_object_store()
+    durable_started_at = time.monotonic()
     with object_store.batch_commits() as completion_batch:
         if pending_batch is not None:
             completion_batch.absorb(pending_batch)
-        if len(serialized_outputs) > settings.invocation_result_inline_max_bytes:
+        if result_storage == "durable_object":
             result_object = object_store.put(
                 "invocation_results",
                 serialized_outputs,
             )
             result_inline = None
+    logger.info(
+        "Finished remote invocation durable result preparation in %.3fs invocation_id=%s "
+        "attempt=%d result_bytes=%d result_storage=%s pending_object_write=%s.",
+        time.monotonic() - durable_started_at,
+        running_record.invocation_id,
+        running_record.attempt,
+        result_bytes,
+        result_storage,
+        pending_object_write,
+    )
     _store_remote_invocation_record(
         RemoteInvocationRecord(
             invocation_id=running_record.invocation_id,
@@ -546,6 +601,15 @@ def _complete_remote_invocation(
             result_inline=result_inline,
             result_object=result_object,
         )
+    )
+    logger.info(
+        "Finished remote invocation completion in %.3fs invocation_id=%s attempt=%d "
+        "result_bytes=%d result_storage=%s.",
+        time.monotonic() - completion_started_at,
+        running_record.invocation_id,
+        running_record.attempt,
+        result_bytes,
+        result_storage,
     )
 
 
@@ -6063,6 +6127,11 @@ class _BoundedStreamEventBuffer:
         with self._dropped_lock:
             return self._dropped_progress_events
 
+    @property
+    def queue_size(self) -> int:
+        """Return the approximate number of currently buffered events."""
+        return self._queue.qsize()
+
     def publish_progress(self, payload: Any) -> None:
         """Publish the newest progress event without exceeding the queue bound."""
         event = ("progress", payload)
@@ -6137,6 +6206,8 @@ def _stream_remote_payload_events(
     """Yield progress and result events for one remote payload execution."""
     event_buffer = _BoundedStreamEventBuffer(get_settings().stream_event_queue_maxsize)
     task_id = os.getenv("MODAL_TASK_ID")
+    component_id = str(payload.get("component_id") or "payload")
+    invocation_id = str(payload.get("invocation_id") or "none")
 
     def publish_status(progress_state: dict[str, Any]) -> None:
         """Queue a progress envelope for the remote caller."""
@@ -6215,7 +6286,31 @@ def _stream_remote_payload_events(
         ) as exc:  # pragma: no cover - exercised through generator consumer tests.
             event_buffer.publish_terminal("error", (exc, pending_batch))
         else:
-            event_buffer.publish_terminal("result", (outputs, pending_batch))
+            result_bytes = len(outputs)
+            pending_object_write = bool(pending_batch and pending_batch.wrote_object)
+            logger.info(
+                "Remote stream worker produced result component=%s invocation_id=%s task_id=%s "
+                "result_bytes=%d pending_object_write=%s buffer_queue_size=%d.",
+                component_id,
+                invocation_id,
+                task_id or "none",
+                result_bytes,
+                pending_object_write,
+                event_buffer.queue_size,
+            )
+            publish_started_at = time.monotonic()
+            published = event_buffer.publish_terminal("result", (outputs, pending_batch))
+            logger.info(
+                "Finished publishing remote stream result to event buffer in %.3fs component=%s "
+                "invocation_id=%s task_id=%s published=%s result_bytes=%d buffer_queue_size=%d.",
+                time.monotonic() - publish_started_at,
+                component_id,
+                invocation_id,
+                task_id or "none",
+                published,
+                result_bytes,
+                event_buffer.queue_size,
+            )
         finally:
             event_buffer.publish_terminal("done", None)
 
@@ -6241,6 +6336,16 @@ def _stream_remote_payload_events(
             if event_kind == "result":
                 outputs, pending_batch = event_payload
                 serialized_outputs = coerce_serialized_node_outputs(outputs)
+                logger.info(
+                    "Remote stream consumer received buffered result component=%s invocation_id=%s "
+                    "task_id=%s result_bytes=%d pending_object_write=%s buffer_queue_size=%d.",
+                    component_id,
+                    invocation_id,
+                    task_id or "none",
+                    len(serialized_outputs),
+                    bool(pending_batch and pending_batch.wrote_object),
+                    event_buffer.queue_size,
+                )
                 if running_record is not None:
                     _complete_remote_invocation(
                         running_record,
@@ -6250,7 +6355,29 @@ def _stream_remote_payload_events(
                 elif pending_batch is not None:
                     object_store.commit_batch(pending_batch)
                 invocation_finalized = True
-                yield {"kind": "result", "outputs": serialized_outputs}
+                yield_started_at = time.monotonic()
+                logger.info(
+                    "Yielding remote stream result to Modal transport component=%s invocation_id=%s "
+                    "task_id=%s result_bytes=%d buffer_queue_size=%d.",
+                    component_id,
+                    invocation_id,
+                    task_id or "none",
+                    len(serialized_outputs),
+                    event_buffer.queue_size,
+                )
+                try:
+                    yield {"kind": "result", "outputs": serialized_outputs}
+                finally:
+                    logger.info(
+                        "Remote stream result yield released after %.3fs component=%s invocation_id=%s "
+                        "task_id=%s result_bytes=%d buffer_queue_size=%d.",
+                        time.monotonic() - yield_started_at,
+                        component_id,
+                        invocation_id,
+                        task_id or "none",
+                        len(serialized_outputs),
+                        event_buffer.queue_size,
+                    )
                 continue
             if event_kind == "error":
                 error, pending_batch = event_payload
