@@ -550,6 +550,9 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
             """Retain settings for assertions."""
             self.kwargs = kwargs
 
+    class FakeEngineDeadError(Exception):
+        """Stand in for vLLM's package-private engine exception."""
+
     monkeypatch.setattr(
         transformers.AutoProcessor,
         "from_pretrained",
@@ -558,7 +561,14 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     monkeypatch.setitem(
         sys.modules,
         "vllm",
-        SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams),
+        SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams, __path__=[]),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.v1", SimpleNamespace(__path__=[]))
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine", SimpleNamespace(__path__=[]))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.engine.exceptions",
+        SimpleNamespace(EngineDeadError=FakeEngineDeadError),
     )
     backend = modal_llm_runtime_module._default_backend_factory(profile, tmp_path)
     progress: list[int] = []
@@ -584,7 +594,10 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert observed["llm_kwargs"]["kv_cache_memory_bytes"] == 12 * 1024**3
     assert "gpu_memory_utilization" not in observed["llm_kwargs"]
     assert observed["llm_kwargs"]["quantization"] == "fp8"
-    assert observed["llm_kwargs"]["attention_backend"] == "FLASH_ATTN"
+    assert observed["llm_kwargs"]["attention_config"] == {
+        "backend": "FLASH_ATTN",
+        "flash_attn_version": 3,
+    }
     assert observed["prompts"] == [{"prompt": "rendered prompt"}]
     assert observed["chat_kwargs"]["tokenize"] is False
     assert progress == [0, 2]
@@ -607,13 +620,16 @@ def test_vllm_backend_translates_private_runtime_errors(
             del messages, kwargs
             return "rendered prompt"
 
+    class FakeEngineDeadError(Exception):
+        """Stand in for vLLM's non-RuntimeError engine exception."""
+
     class FailingLLM:
         """Raise the RuntimeError shape used by vLLM engine failures."""
 
         def generate(self, prompts: Any, **kwargs: Any) -> list[Any]:
             """Fail after accepting a well-formed generation request."""
             del prompts, kwargs
-            raise RuntimeError("engine subprocess stopped")
+            raise FakeEngineDeadError("engine subprocess stopped")
 
     class FakeSamplingParams:
         """Accept backend-neutral generation options without vLLM installed."""
@@ -625,7 +641,14 @@ def test_vllm_backend_translates_private_runtime_errors(
     monkeypatch.setitem(
         sys.modules,
         "vllm",
-        SimpleNamespace(SamplingParams=FakeSamplingParams),
+        SimpleNamespace(SamplingParams=FakeSamplingParams, __path__=[]),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.v1", SimpleNamespace(__path__=[]))
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine", SimpleNamespace(__path__=[]))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.engine.exceptions",
+        SimpleNamespace(EngineDeadError=FakeEngineDeadError),
     )
 
     backend = object.__new__(modal_llm_runtime_module.VLLMMultimodalBackend)
