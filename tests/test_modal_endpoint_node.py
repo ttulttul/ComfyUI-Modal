@@ -271,6 +271,38 @@ def test_credential_resolver_authorizes_vault_credentials(
     assert authorizer.calls == [(credentials.key, "ComfyUI")]
 
 
+def test_credential_resolver_treats_blank_environment_as_main(
+    modal_endpoint_module: Any,
+) -> None:
+    """Keep workflows saved with an empty advanced environment compatible."""
+    credentials = _credentials(modal_endpoint_module)
+
+    class Store:
+        """Return a credential pair previously created by the node."""
+
+        def load(self) -> Any:
+            """Return stored credentials."""
+            return credentials
+
+    class Authorizer:
+        """Record the normalized environment association."""
+
+        environment: str | None = None
+
+        def allow(self, token_key: str, environment: str) -> None:
+            """Record one authorization operation."""
+            assert token_key == credentials.key
+            self.environment = environment
+
+    authorizer = Authorizer()
+    resolver = modal_endpoint_module.ModalCredentialResolver(
+        Store(), object(), authorizer=authorizer, environment="  "
+    )
+
+    assert resolver.resolve() == credentials
+    assert authorizer.environment == "main"
+
+
 def test_credential_resolver_saves_new_token_before_authorization(
     modal_endpoint_module: Any,
 ) -> None:
