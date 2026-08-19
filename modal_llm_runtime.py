@@ -375,16 +375,16 @@ def _apply_multimodal_chat_template(
     has_predecoded_video: bool,
 ) -> Any:
     """Tokenize chat content without resampling video frames prepared by ComfyUI."""
-    processor_kwargs: dict[str, Any] = {}
+    video_sampling_kwargs: dict[str, Any] = {}
     if has_predecoded_video:
-        processor_kwargs["do_sample_frames"] = False
+        video_sampling_kwargs["do_sample_frames"] = False
     return processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-        processor_kwargs=processor_kwargs,
+        **video_sampling_kwargs,
     )
 
 
