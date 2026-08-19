@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 if __package__:
     from .llm_profiles import LLMModelProfile, get_llm_profile
@@ -18,6 +19,26 @@ else:  # pragma: no cover - the stable cloud entrypoint imports top-level module
 logger = logging.getLogger(__name__)
 
 _COMPLETE_MARKER_FILENAME = ".comfy-modal-llm-complete.json"
+_DEFAULT_LEASE_TIMEOUT_SECONDS = 7200.0
+_LEASE_POLL_SECONDS = 2.0
+_SNAPSHOT_ALLOW_PATTERNS = (
+    "*.safetensors",
+    "*.safetensors.index.json",
+    "*.model",
+    "*.tiktoken",
+    "added_tokens.json",
+    "chat_template*",
+    "config.json",
+    "generation_config.json",
+    "hf_quant_config.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "processor*",
+    "special_tokens_map.json",
+    "tokenizer*",
+    "video_preprocessor_config.json",
+    "vocab*",
+)
 
 
 @dataclass(frozen=True)
@@ -52,7 +73,9 @@ def _read_marker(snapshot_path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def is_model_snapshot_staged(storage_root: str | Path, profile: LLMModelProfile) -> bool:
+def is_model_snapshot_staged(
+    storage_root: str | Path, profile: LLMModelProfile
+) -> bool:
     """Return whether the requested immutable snapshot is completely staged."""
     snapshot_path = model_snapshot_path(storage_root, profile)
     marker = _read_marker(snapshot_path)
@@ -82,14 +105,70 @@ def _write_marker(snapshot_path: Path, profile: LLMModelProfile) -> None:
     os.replace(temporary_path, marker_path)
 
 
+@contextmanager
+def _snapshot_lease(snapshot_path: Path) -> Iterator[None]:
+    """Serialize a snapshot download and recover an abandoned lease."""
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path = snapshot_path.parent / f".{snapshot_path.name}.download.lock"
+    timeout_seconds = float(
+        os.getenv("COMFY_MODAL_LLM_STAGE_LEASE_TIMEOUT_SECONDS", "7200")
+    )
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "COMFY_MODAL_LLM_STAGE_LEASE_TIMEOUT_SECONDS must be positive."
+        )
+    started_at = time.monotonic()
+    acquired = False
+    while not acquired:
+        try:
+            descriptor = os.open(lease_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                lease_age = time.time() - lease_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if lease_age >= _DEFAULT_LEASE_TIMEOUT_SECONDS:
+                logger.warning(
+                    "Removing abandoned Modal LLM staging lease %s.", lease_path
+                )
+                try:
+                    lease_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            if time.monotonic() - started_at >= timeout_seconds:
+                raise TimeoutError(
+                    f"Timed out waiting {timeout_seconds:.0f}s for model staging lease "
+                    f"{lease_path}."
+                )
+            time.sleep(_LEASE_POLL_SECONDS)
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as lease_file:
+                lease_file.write(f"pid={os.getpid()} acquired_at={time.time()}\n")
+            acquired = True
+    try:
+        yield
+    finally:
+        try:
+            lease_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def stage_model_profile(
     profile_id: str,
     storage_root: str | Path,
     *,
+    profile: LLMModelProfile | None = None,
     snapshot_download: Callable[..., str] | None = None,
 ) -> StagedModelSnapshot:
-    """Download one pinned profile snapshot to shared storage on a CPU worker."""
-    profile = get_llm_profile(profile_id)
+    """Download one pinned curated or generated snapshot on a CPU worker."""
+    profile = profile or get_llm_profile(profile_id, storage_root=storage_root)
+    if profile.profile_id != profile_id:
+        raise ValueError(
+            f"Stage request id {profile_id!r} does not match profile "
+            f"{profile.profile_id!r}."
+        )
     snapshot_path = model_snapshot_path(storage_root, profile)
     started_at = time.perf_counter()
     if is_model_snapshot_staged(storage_root, profile):
@@ -108,36 +187,50 @@ def stage_model_profile(
             elapsed_seconds=time.perf_counter() - started_at,
         )
 
-    if snapshot_download is None:
-        from huggingface_hub import snapshot_download as huggingface_snapshot_download
+    with _snapshot_lease(snapshot_path):
+        if is_model_snapshot_staged(storage_root, profile):
+            return StagedModelSnapshot(
+                profile_id=profile.profile_id,
+                repository=profile.repository,
+                revision=profile.revision,
+                path=str(snapshot_path),
+                downloaded=False,
+                elapsed_seconds=time.perf_counter() - started_at,
+            )
+        if snapshot_download is None:
+            from huggingface_hub import (
+                snapshot_download as huggingface_snapshot_download,
+            )
 
-        snapshot_download = huggingface_snapshot_download
-    snapshot_path.mkdir(parents=True, exist_ok=True)
-    logger.info(
-        "Staging Modal LLM profile=%s repository=%s revision=%s to %s.",
-        profile.profile_id,
-        profile.repository,
-        profile.revision,
-        snapshot_path,
-    )
-    resolved_path = Path(
-        snapshot_download(
-            repo_id=profile.repository,
-            revision=profile.revision,
-            local_dir=str(snapshot_path),
-            token=os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"),
+            snapshot_download = huggingface_snapshot_download
+        snapshot_path.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Staging Modal LLM profile=%s repository=%s revision=%s to %s.",
+            profile.profile_id,
+            profile.repository,
+            profile.revision,
+            snapshot_path,
         )
-    ).resolve()
-    if resolved_path != snapshot_path.resolve():
-        raise RuntimeError(
-            f"Hugging Face staged {profile.profile_id!r} at unexpected path {resolved_path}; "
-            f"expected {snapshot_path.resolve()}."
-        )
-    if not (snapshot_path / "config.json").is_file():
-        raise RuntimeError(
-            f"Staged Modal LLM profile {profile.profile_id!r} is missing config.json."
-        )
-    _write_marker(snapshot_path, profile)
+        resolved_path = Path(
+            snapshot_download(
+                repo_id=profile.repository,
+                revision=profile.revision,
+                local_dir=str(snapshot_path),
+                token=os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"),
+                allow_patterns=_SNAPSHOT_ALLOW_PATTERNS,
+            )
+        ).resolve()
+        if resolved_path != snapshot_path.resolve():
+            raise RuntimeError(
+                f"Hugging Face staged {profile.profile_id!r} at unexpected path "
+                f"{resolved_path}; expected {snapshot_path.resolve()}."
+            )
+        if not (snapshot_path / "config.json").is_file():
+            raise RuntimeError(
+                f"Staged Modal LLM profile {profile.profile_id!r} is missing "
+                "config.json."
+            )
+        _write_marker(snapshot_path, profile)
     result = StagedModelSnapshot(
         profile_id=profile.profile_id,
         repository=profile.repository,

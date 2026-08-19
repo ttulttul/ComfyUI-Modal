@@ -6,17 +6,18 @@ Modal LLM runs multimodal language-model inference inside the persistent RemoteE
 
 1. The V3 node exposes text, IMAGE, native VIDEO, and OPENAI_INPUT_FILES inputs.
 2. Queue rewriting places the marked node in a normal remote component.
-3. The local dispatcher scans the complete payload, including split phases, for fixed curated profile IDs.
-4. A CPU-only ModelStager downloads missing revision-pinned Hugging Face snapshots to the shared Modal Volume.
-5. The stager writes a completion marker and commits the Volume.
-6. The GPU worker reloads that exact volume revision before executing the component.
-7. The node converts ComfyUI tensors directly to processor inputs, samples video frames uniformly, and extracts bounded text from supported files.
-8. ResidentLLMManager reuses or loads the profile, generates under a process lock, and reports per-token progress and cancellation.
-9. The response and JSON telemetry return through the normal Modal-Sync node-output transport.
+3. The local dispatcher scans the complete payload, including split phases, for curated profiles or Hugging Face model IDs.
+4. For a model ID, the CPU resolver inspects Hub metadata and `config.json`, validates architecture, quantization, safetensors inventory, security status, and download budget, then pins the exact commit in a content-addressed schema-v2 manifest.
+5. The CPU ModelStager downloads only the approved revision-pinned safetensors, processor, and tokenizer assets to the shared Modal Volume.
+6. The stager writes a completion marker and commits the Volume.
+7. The dispatcher rewrites the model ID to the immutable generated profile ID, and the GPU worker reloads that exact Volume revision before executing the component.
+8. The node converts ComfyUI tensors directly to processor inputs, samples video frames uniformly, and extracts bounded text from supported files.
+9. ResidentLLMManager reuses or loads the profile, generates under a process lock, and reports progress and cancellation.
+10. The response and JSON telemetry return through the normal Modal-Sync node-output transport.
 
 ## Residency And Memory
 
-The manager is module-global in the warm RemoteEngine process. Its LRU is keyed by curated profile ID and retains up to COMFY_MODAL_LLM_MAX_RESIDENT_MODELS.
+The manager is module-global in the warm RemoteEngine process. Its LRU is keyed by immutable profile ID and retains up to COMFY_MODAL_LLM_MAX_RESIDENT_MODELS.
 
 Before loading a new LLM, the manager:
 
@@ -29,16 +30,18 @@ ComfyUI sees the LLM's real CUDA allocation when calculating free memory, even t
 
 ## Security And Reproducibility
 
-- Arbitrary repository IDs are not accepted from workflows.
+- Repository IDs are metadata-inspected on CPU before any weight download or GPU allocation.
 - Every profile pins a 40-character repository commit.
-- trust_remote_code must remain false.
-- The remote model loader uses local_files_only=true.
+- Generated profile IDs include the SHA-256 digest of all runtime-defining fields.
+- `trust_remote_code` must remain false.
+- The remote model loader uses `local_files_only=true`.
 - The CPU stager is the only network download path.
+- Snapshot allow-patterns omit Python source and pickle weight formats.
 - Text and PDF input sizes are bounded before prompt construction.
-- The profile registry participates in the remote runtime fingerprint.
+- The compatibility policy participates in the remote runtime fingerprint.
 
-Add a model by reviewing and extending llm_profiles.json, then validate its exact Transformers/CUDA combination on the target GPU. A new profile is a deployment change, not merely a user-provided string.
+Compatibility-policy changes remain deployment changes. New repositories using a reviewed architecture and quantization can generate immutable profiles without changing the image.
 
 ## Current Backend Boundary
 
-The backend-neutral request and resident-manager boundary permits a later vLLM backend, but the initial backend is Hugging Face Transformers. That choice reuses the image's pinned PyTorch/CUDA stack and supports direct multimodal processor inputs without another server lifecycle. vLLM should be added only after its compiled wheel is proven compatible with the B300 CUDA/PyTorch image and its KV cache has an explicit memory budget.
+The compatibility registry selects Transformers for Muse-Glimmer and vLLM for Qwen3.5. Qwen block-FP8 and NVIDIA ModelOpt NVFP4 checkpoints share the vLLM adapter. Generated vLLM profiles set an explicit KV-cache byte budget and a conservative 32K default context instead of allowing the serving engine to reserve nearly all available B300 memory.
