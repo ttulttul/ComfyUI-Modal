@@ -1,5 +1,7 @@
 # Learnings
 
+- A painless Hugging Face model-ID input still needs an immutable deployment boundary. Resolve the requested repository to an exact commit on CPU, derive a content-addressed schema-v2 profile from model metadata plus a versioned compatibility policy, and reject unknown architectures or quantization before downloading tens of gigabytes. Qwen3.5 block-FP8 and ModelOpt NVFP4 can share the current vLLM adapter; Muse-Glimmer needs the released Transformers 5.15 implementation.
+
 ## 2026-08-18
 
 - Same-worker LLM inference needs a pre-GPU staging boundary, not a lazy model download inside the node. Discover fixed revision-pinned profiles in the serialized remote payload, download them through a single-container CPU class, commit the shared Volume, and force the GPU worker to reload that revision before model construction. Otherwise first use spends expensive GPU time waiting on network I/O and a warm mount may not see the completed snapshot.

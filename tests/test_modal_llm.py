@@ -28,7 +28,7 @@ def _text_file(filename: str, text: str) -> dict[str, str]:
 def test_curated_profile_is_revision_pinned_and_found_in_nested_payload(
     llm_profiles_module: Any,
 ) -> None:
-    """The registry should reject drift and payload discovery should cross split phases."""
+    """The registry should reject drift across split-payload discovery."""
     profiles = llm_profiles_module.load_llm_profiles()
     profile = profiles["smolvlm2-2.2b-instruct"]
 
@@ -48,7 +48,9 @@ def test_curated_profile_is_revision_pinned_and_found_in_nested_payload(
         ]
     }
 
-    assert llm_profiles_module.llm_profile_ids_from_payload(payload) == (profile.profile_id,)
+    assert llm_profiles_module.llm_profile_ids_from_payload(payload) == (
+        profile.profile_id,
+    )
 
 
 def test_profile_registry_rejects_mutable_revision(
@@ -69,6 +71,80 @@ def test_profile_registry_rejects_mutable_revision(
                 "max_video_frames": 1,
                 "max_file_bytes": 1,
                 "max_file_characters": 1,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("architecture", "quantization_config", "backend", "quantization_method"),
+    [
+        (
+            "Qwen3_5ForConditionalGeneration",
+            {"quant_method": "fp8", "fmt": "e4m3"},
+            "vllm",
+            "fp8",
+        ),
+        (
+            "Qwen3_5ForConditionalGeneration",
+            {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+            "vllm",
+            "modelopt_fp4",
+        ),
+        (
+            "MuseGlimmerForConditionalGeneration",
+            {},
+            "transformers",
+            "none",
+        ),
+    ],
+)
+def test_compatibility_policy_selects_requested_model_backends(
+    llm_compatibility_module: Any,
+    architecture: str,
+    quantization_config: dict[str, str],
+    backend: str,
+    quantization_method: str,
+) -> None:
+    """The three live-canary model families should resolve before weight download."""
+    decision = llm_compatibility_module.resolve_compatibility(
+        {
+            "architectures": [architecture],
+            "dtype": "bfloat16",
+            "text_config": {"max_position_embeddings": 262144},
+            "quantization_config": quantization_config,
+        },
+        artifact_bytes=32 * 1024**3,
+    )
+
+    assert decision.backend == backend
+    assert decision.quantization_method == quantization_method
+    assert decision.default_context_tokens == 32768
+    assert decision.advertised_context_tokens == 262144
+
+
+def test_generated_profile_requires_matching_content_digest(
+    llm_profiles_module: Any,
+) -> None:
+    """A generated manifest must not be mutable under a stable profile identifier."""
+    digest = "a" * 64
+    with pytest.raises(ValueError, match="does not match its content digest"):
+        llm_profiles_module.LLMModelProfile.from_mapping(
+            {
+                "id": "hf-" + "b" * 64,
+                "repository": "owner/model",
+                "revision": "1" * 40,
+                "dtype": "bfloat16",
+                "modalities": ["text"],
+                "estimated_vram_gb": 10,
+                "max_context_tokens": 1024,
+                "max_images": 1,
+                "max_video_frames": 1,
+                "max_file_bytes": 1,
+                "max_file_characters": 1,
+                "schema_version": 2,
+                "source": "generated",
+                "profile_digest": digest,
+                "backend": "transformers",
             }
         )
 
@@ -113,7 +189,7 @@ def test_multimodal_preparation_samples_video_and_bounds_files(
     modal_llm_runtime_module: Any,
     llm_profiles_module: Any,
 ) -> None:
-    """Image tensors, native video, and files should normalize without transport encoding."""
+    """Native media and files should normalize without transport encoding."""
     profile = replace(
         llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
         allow_mixed_image_video=True,
@@ -286,7 +362,7 @@ def test_resident_manager_reuses_and_lru_evicts_models(
     llm_profiles_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Warm requests should hit cache and a bounded cache should evict least-recently used."""
+    """Warm requests should hit cache and evict the least-recently used model."""
     base_profile = llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct")
     second_profile = replace(
         base_profile,
@@ -363,10 +439,13 @@ def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
     modal_llm_runtime_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The node should register a V3 contract and refuse accidental local model loading."""
+    """The V3 node should refuse accidental local model loading."""
     schema = modal_llm_node_module.ModalLLM.define_schema()
     assert schema.node_id == "ModalLLM"
-    assert [output.display_name for output in schema.outputs] == ["response", "metadata_json"]
+    assert [output.display_name for output in schema.outputs] == [
+        "response",
+        "metadata_json",
+    ]
 
     monkeypatch.delenv("COMFY_MODAL_REMOTE_WORKER", raising=False)
     with pytest.raises(RuntimeError, match="Enable 'Run on Modal'"):
