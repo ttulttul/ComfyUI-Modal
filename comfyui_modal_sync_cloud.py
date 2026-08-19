@@ -52,7 +52,6 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     COMFYUI_RUNTIME_SOURCE_DIRECTORIES as _COMFYUI_IMAGE_RUNTIME_DIRECTORIES,
     COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
     REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
-    REMOTE_HUGGINGFACE_HUB_SPEC,
     REMOTE_PYTHON_VERSION,
     RemoteTorchBuild as _RemoteTorchBuild,
     build_remote_runtime_identity,
@@ -60,6 +59,8 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     remote_accelerator_packages as _remote_accelerator_packages,
     remote_accelerator_validation_command as _remote_accelerator_validation_command,
     remote_apt_packages as _comfyui_apt_packages,
+    remote_huggingface_packages as _remote_huggingface_packages,
+    remote_huggingface_validation_command as _remote_huggingface_validation_command,
     remote_runtime_packages as _comfyui_runtime_packages,
     select_remote_torch_build as _select_remote_torch_build,
 )
@@ -7142,7 +7143,8 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 "HF_HUB_DISABLE_TELEMETRY": "1",
             }
         )
-        .pip_install(REMOTE_HUGGINGFACE_HUB_SPEC)
+        .pip_install(*_remote_huggingface_packages())
+        .run_commands(_remote_huggingface_validation_command())
         .add_local_dir(
             _REPO_ROOT,
             remote_path="/root/comfyui_modal_sync_repo",

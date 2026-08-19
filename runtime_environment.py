@@ -22,6 +22,7 @@ REMOTE_APP_PROTOCOL_VERSION = 8
 REMOTE_PYTHON_VERSION = "3.13"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
+REMOTE_HF_XET_SPEC = "hf-xet==1.6.0"
 REMOTE_VLLM_SPEC = "vllm==0.27.1"
 REMOTE_VLLM_WHEEL_URL = (
     "https://wheels.vllm.ai/"
@@ -68,6 +69,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "tqdm==4.67.3",
     "transformers==5.15.0",
     REMOTE_HUGGINGFACE_HUB_SPEC,
+    REMOTE_HF_XET_SPEC,
 )
 _CUDA_130_TORCH_PACKAGES = ("torch==2.13.0", "torchvision==0.28.0")
 _CUDA_130_CPU_AUDIO_PACKAGES = ("torchaudio==2.11.0+cpu",)
@@ -190,6 +192,29 @@ class RemoteTorchBuild:
 def remote_runtime_packages() -> tuple[str, ...]:
     """Return the exact ComfyUI support package set used by Modal images."""
     return _REMOTE_RUNTIME_PACKAGES
+
+
+def remote_huggingface_packages() -> tuple[str, ...]:
+    """Return the pinned Hub client and its Xet transfer accelerator."""
+    return (REMOTE_HUGGINGFACE_HUB_SPEC, REMOTE_HF_XET_SPEC)
+
+
+def remote_huggingface_validation_command() -> str:
+    """Return a build-time check for the remote Hugging Face transfer stack."""
+    validation_script = (
+        "from importlib import metadata; import hf_xet, huggingface_hub; "
+        f"expected_hub={REMOTE_HUGGINGFACE_HUB_SPEC.split('==', maxsplit=1)[1]!r}; "
+        f"expected_xet={REMOTE_HF_XET_SPEC.split('==', maxsplit=1)[1]!r}; "
+        "actual_hub=metadata.version('huggingface-hub'); "
+        "actual_xet=metadata.version('hf-xet'); "
+        "assert actual_hub == expected_hub, "
+        "f'Expected huggingface-hub {expected_hub}, found {actual_hub}'; "
+        "assert actual_xet == expected_xet, "
+        "f'Expected hf-xet {expected_xet}, found {actual_xet}'; "
+        "print('Validated Hugging Face transfer stack:', "
+        "'huggingface-hub', actual_hub, 'hf-xet', actual_xet)"
+    )
+    return f"python -c {shlex.quote(validation_script)}"
 
 
 def remote_accelerator_packages(modal_gpu: str) -> tuple[str, ...]:

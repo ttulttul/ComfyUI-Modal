@@ -594,9 +594,11 @@ def test_local_resolver_reports_local_hugging_face_token_location(
 
 def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     llm_staging_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """A completed immutable snapshot should not download twice."""
+    monkeypatch.setenv("HF_TOKEN", "test-hugging-face-token")
     calls: list[dict[str, Any]] = []
     progress: list[Any] = []
 
@@ -632,6 +634,7 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     assert second.downloaded is False
     assert len(calls) == 1
     assert calls[0]["revision"] == "482adb537c021c86670beed01cd58990d01e72e4"
+    assert calls[0]["token"] == "test-hugging-face-token"
     assert "*.safetensors" in calls[0]["allow_patterns"]
     assert "*.bin" not in calls[0]["allow_patterns"]
     assert calls[0]["tqdm_class"].__name__ == "SnapshotProgressTqdm"

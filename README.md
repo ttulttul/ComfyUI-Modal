@@ -123,7 +123,9 @@ The queue planner treats an unmarked Modal LLM as an ordinary local node, includ
 Apple-local inference requires macOS on Apple Silicon and the optional pinned runtime in the Python environment that launches ComfyUI:
 
 ```bash
-uv pip install --python <comfyui-venv>/bin/python "mlx-vlm==0.6.15" "mlx-dspark==0.13.1" "psutil>=7,<8"
+uv pip install --python <comfyui-venv>/bin/python \
+  "mlx-vlm==0.6.15" "mlx-dspark==0.13.1" "psutil>=7,<8" \
+  "huggingface-hub==1.28.0" "hf-xet==1.6.0"
 ```
 
 Repository developers can instead run `uv sync --extra local-apple --extra remote --group test`. Other local platforms receive an actionable error and can enable `Run on Modal`. Local snapshots are stored under `<ComfyUI models>/modal_llm`; set `COMFY_MODAL_LOCAL_LLM_STORAGE_ROOT` to use another writable location.
@@ -145,6 +147,8 @@ Modal LLM uses immutable schema-v2 model profiles. Checked-in entries in [`llm_p
 Enter either a curated profile name or a Hugging Face `owner/model` ID directly in the node. Use `owner/model@revision` to resolve an explicit branch, tag, or commit. Each target performs metadata and compatibility inspection before downloading safetensors, pins the exact commit in a target-specific generated profile, and reuses its completed snapshot on later executions. Public models need no token. For gated local models, set `HF_TOKEN` in ComfyUI's environment; for gated Modal models, include it in the selected Modal secret collection.
 
 mlx-dspark resolution is text-only because its Qwen path intentionally omits the vision tower. Its registered DSpark or DFlash drafter is independently security-checked, pinned to an exact Hub commit, staged beneath the same local model root, and reported in output metadata.
+
+Modal-Sync explicitly installs `hf-xet` beside `huggingface-hub` for both Apple-local and Modal staging. Hugging Face automatically uses the Rust Xet transfer backend for Xet-backed repositories; no alternate download command is required. When `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` is present, Modal-Sync passes it to repository inspection, config retrieval, and the snapshot download without logging its value. Xet's adaptive concurrency remains enabled by default. Advanced users may set `HF_XET_HIGH_PERFORMANCE=1` in the same local environment or Modal secret only on high-bandwidth machines with at least 64 GiB of RAM; the default 16 GiB Modal staging worker is intentionally not configured for that mode.
 
 For remote execution, the local dispatcher finds fixed LLM profiles in the prompt and calls the deployed CPU-only `ModelStager`. It writes the immutable snapshot and completion marker to the shared Modal Volume before the selected GPU worker starts. A linked/dynamic remote `model_profile` is rejected because it cannot be staged before GPU allocation. For local execution, resolution and staging happen directly in the ComfyUI process before MLX allocation.
 

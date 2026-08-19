@@ -3965,6 +3965,8 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
         "comfy-angle",
         "comfy-aimdo",
         "comfy-kitchen",
+        "hf-xet",
+        "huggingface-hub",
         "kornia",
         "opencv-python-headless",
         "pydantic-settings",

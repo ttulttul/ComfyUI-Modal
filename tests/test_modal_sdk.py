@@ -24,16 +24,18 @@ def test_bootstrap_pin_matches_declared_remote_extra(modal_sdk_module: Any) -> N
     ]
 
 
-def test_local_apple_extra_matches_validated_mlx_runtime(
+def test_local_apple_extra_matches_validated_model_runtime(
     local_llm_runtime_module: Any,
 ) -> None:
-    """The opt-in Apple backend should pin the adapter validated by the runtime."""
+    """The Apple backend should pin its model adapter and Xet transfer stack."""
     project_metadata = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
 
     marker = "sys_platform == 'darwin' and platform_machine == 'arm64'"
     assert project_metadata["project"]["optional-dependencies"]["local-apple"] == [
+        f"hf-xet==1.6.0; {marker}",
+        f"huggingface-hub==1.28.0; {marker}",
         f"{local_llm_runtime_module.LOCAL_MLX_DSPARK_SPEC}; {marker}",
         f"{local_llm_runtime_module.LOCAL_MLX_VLM_SPEC}; {marker}",
         f"psutil>=7,<8; {marker}",
