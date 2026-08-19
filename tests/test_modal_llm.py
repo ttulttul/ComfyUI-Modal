@@ -175,6 +175,60 @@ def test_reasoning_parser_uses_architecture_fallback_for_existing_profile(
     assert parser.parser_name == "qwen3"
 
 
+def test_reasoning_chat_template_uses_qwen_hard_switch(
+    llm_reasoning_module: Any,
+) -> None:
+    """Reasoning-capable profiles should receive the exact per-request switch."""
+    qwen_profile = SimpleNamespace(
+        architecture="Qwen3_5ForConditionalGeneration",
+        reasoning_parser="qwen3",
+    )
+    ordinary_profile = SimpleNamespace(
+        architecture="SmolVLMForConditionalGeneration",
+        reasoning_parser="none",
+    )
+
+    assert llm_reasoning_module.reasoning_chat_template_kwargs(
+        qwen_profile,
+        True,
+    ) == {"enable_thinking": True}
+    assert llm_reasoning_module.reasoning_chat_template_kwargs(
+        qwen_profile,
+        False,
+    ) == {"enable_thinking": False}
+    assert (
+        llm_reasoning_module.reasoning_chat_template_kwargs(
+            ordinary_profile,
+            False,
+        )
+        == {}
+    )
+
+
+def test_disabled_reasoning_parser_returns_only_direct_response(
+    llm_reasoning_module: Any,
+) -> None:
+    """Disabling reasoning must not classify a delimiter-free answer as thinking."""
+    configured_parser = llm_reasoning_module.Qwen3ReasoningParser(
+        _FakeReasoningTokenizer()
+    )
+    parser = llm_reasoning_module.reasoning_parser_for_request(
+        configured_parser,
+        False,
+    )
+
+    result = parser.extract(
+        "final answer",
+        [3],
+        native_reasoning="unexpected backend reasoning",
+    )
+
+    assert result.response == "final answer"
+    assert result.reasoning == ""
+    assert result.reasoning_tokens == 0
+    assert result.parser == "disabled"
+
+
 def test_qwen_reasoning_parser_keeps_truncated_thinking_out_of_response(
     llm_reasoning_module: Any,
 ) -> None:
@@ -732,6 +786,7 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     }
     assert observed["prompts"] == {"prompt": "rendered prompt"}
     assert observed["chat_kwargs"]["tokenize"] is False
+    assert observed["chat_kwargs"]["enable_thinking"] is True
     assert [event.value for event in progress if event.stage == "generating"] == [2, 5]
     assert progress[-1].tokens_per_second is not None
     assert result.text == "final answer"
@@ -827,6 +882,62 @@ def test_vllm_backend_translates_private_runtime_errors(
         asyncio.run(
             backend._generate_async(prepared, settings, lambda progress: None)
         )
+
+
+def test_vllm_request_disables_thinking_and_boundary_parsing(
+    modal_llm_runtime_module: Any,
+    llm_reasoning_module: Any,
+) -> None:
+    """The vLLM request and decoder should share the disabled reasoning state."""
+    observed: dict[str, Any] = {}
+
+    class FakeProcessor:
+        """Capture the per-request chat-template controls."""
+
+        def apply_chat_template(self, messages: Any, **kwargs: Any) -> str:
+            """Record template arguments and return a direct-response prompt."""
+            del messages
+            observed.update(kwargs)
+            return "rendered direct prompt"
+
+    class FakeSamplingParams:
+        """Retain sampling arguments for assertions."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """Store the backend adapter's keyword arguments."""
+            self.kwargs = kwargs
+
+    backend = object.__new__(modal_llm_runtime_module.VLLMMultimodalBackend)
+    backend.profile = SimpleNamespace(
+        architecture="Qwen3_5ForConditionalGeneration",
+        reasoning_parser="qwen3",
+    )
+    backend.processor = FakeProcessor()
+    backend.reasoning_parser = llm_reasoning_module.Qwen3ReasoningParser(
+        _FakeReasoningTokenizer()
+    )
+    prepared = modal_llm_runtime_module.PreparedLLMInputs(
+        prompt="hello",
+        system_prompt="",
+        images=(),
+        video=None,
+        file_characters=0,
+        file_count=0,
+    )
+    settings = modal_llm_runtime_module.LLMGenerationSettings(
+        max_new_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        seed=0,
+        enable_reasoning=False,
+    )
+
+    request = backend._request(prepared, settings)
+    sampling_params = backend._sampling_params(FakeSamplingParams, settings)
+
+    assert request == {"prompt": "rendered direct prompt"}
+    assert observed["enable_thinking"] is False
+    assert sampling_params.kwargs["skip_special_tokens"] is True
 
 
 def test_vllm_backend_aborts_when_progress_callback_cancels(
@@ -1020,6 +1131,7 @@ def test_resident_manager_reuses_and_lru_evicts_models(
     )
 
     assert first.metadata["cache_hit"] is False
+    assert first.metadata["reasoning_enabled"] is True
     assert second.metadata["cache_hit"] is True
     assert backends[base_profile.profile_id].generate_calls == 2
     assert backends[base_profile.profile_id].unloaded is True
@@ -1039,6 +1151,7 @@ def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
         "metadata_json",
         "reasoning",
     ]
+    assert "enable_reasoning" in [input_value.id for input_value in schema.inputs]
 
     monkeypatch.delenv("COMFY_MODAL_REMOTE_WORKER", raising=False)
     with pytest.raises(RuntimeError, match="Enable 'Run on Modal'"):
@@ -1048,24 +1161,33 @@ def test_modal_llm_node_is_v3_remote_only_and_returns_metadata(
         )
 
     monkeypatch.setenv("COMFY_MODAL_REMOTE_WORKER", "1")
-    monkeypatch.setattr(
-        modal_llm_node_module,
-        "run_modal_llm_inference",
-        lambda **kwargs: modal_llm_runtime_module.LLMInferenceResult(
+    observed: dict[str, Any] = {}
+
+    def fake_inference(**kwargs: Any) -> Any:
+        """Capture node controls and return deterministic inference output."""
+        observed.update(kwargs)
+        return modal_llm_runtime_module.LLMInferenceResult(
             text="done",
             metadata={"output_tokens": 1, "cache_hit": True},
             reasoning="working",
-        ),
+        )
+
+    monkeypatch.setattr(
+        modal_llm_node_module,
+        "run_modal_llm_inference",
+        fake_inference,
     )
     node_output = modal_llm_node_module.ModalLLM.execute(
         prompt="hello",
         model_profile="smolvlm2-2.2b-instruct",
+        enable_reasoning=False,
         max_new_tokens=4,
     )
 
     assert node_output.result[0] == "done"
     assert json.loads(node_output.result[1])["cache_hit"] is True
     assert node_output.result[2] == "working"
+    assert observed["enable_reasoning"] is False
 
 
 def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(

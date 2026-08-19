@@ -75,6 +75,15 @@ def _modal_llm_advanced_inputs() -> list[io.Input]:
             advanced=True,
             tooltip="Maximum combined number of reasoning and response tokens.",
         ),
+        io.Boolean.Input(
+            "enable_reasoning",
+            default=True,
+            advanced=True,
+            tooltip=(
+                "Enable thinking for models whose profile supports it. Disable for a "
+                "direct response with no reasoning tokens."
+            ),
+        ),
         io.Float.Input(
             "temperature",
             default=0.2,
@@ -165,6 +174,7 @@ class ModalLLM(io.ComfyNode):
         video: Any | None = None,
         files: Sequence[Any] | None = None,
         system_prompt: str = "",
+        enable_reasoning: bool = True,
         max_new_tokens: int = 512,
         temperature: float = 0.2,
         top_p: float = 0.95,
@@ -233,6 +243,7 @@ class ModalLLM(io.ComfyNode):
             video=video,
             files=files,
             system_prompt=system_prompt,
+            enable_reasoning=enable_reasoning,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
