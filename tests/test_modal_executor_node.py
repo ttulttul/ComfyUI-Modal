@@ -7330,6 +7330,50 @@ def test_modal_cloud_tracing_prompt_server_ignores_trivial_node_progress(
     ]
 
 
+def test_modal_cloud_tracing_prompt_server_preserves_llm_progress_metadata(
+    modal_cloud_module: Any,
+) -> None:
+    """Structured LLM stages and token telemetry should survive remote tracing."""
+    observed_updates: list[dict[str, Any]] = []
+    server = modal_cloud_module._TracingPromptServer(
+        "component-1",
+        {"9": {"class_type": "ModalLLM", "inputs": {}}},
+        status_callback=observed_updates.append,
+    )
+
+    server.send_sync(
+        "modal_llm_progress",
+        {
+            "node_id": "9",
+            "stage": "generating",
+            "message": "Generating",
+            "value": 23,
+            "max": 128,
+            "unit": "tokens",
+            "time_to_first_token_seconds": 1.25,
+            "tokens_per_second": 17.5,
+        },
+        None,
+    )
+
+    assert observed_updates == [
+        {
+            "event_type": "node_progress",
+            "node_id": "9",
+            "display_node_id": "9",
+            "real_node_id": "9",
+            "value": 23.0,
+            "max": 128.0,
+            "stage": "generating",
+            "message": "Generating",
+            "indeterminate": False,
+            "unit": "tokens",
+            "time_to_first_token_seconds": 1.25,
+            "tokens_per_second": 17.5,
+        }
+    ]
+
+
 def test_modal_cloud_tracing_prompt_server_emits_executed_outputs(
     modal_cloud_module: Any,
 ) -> None:

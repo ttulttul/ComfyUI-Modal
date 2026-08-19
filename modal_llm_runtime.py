@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass
+import asyncio
 import base64
 import binascii
 import gc
-from io import BytesIO
+import json
 import logging
 import math
 import os
-from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Mapping, Protocol, Sequence
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Callable, Coroutine, Mapping, Protocol, Sequence
 
 from PIL import Image
 
@@ -74,6 +77,24 @@ class LLMGenerationSettings:
 
 
 @dataclass(frozen=True)
+class LLMProgressEvent:
+    """Describe one user-visible phase of resident LLM execution."""
+
+    stage: str
+    message: str
+    value: float | None = None
+    maximum: float | None = None
+    unit: str | None = None
+    indeterminate: bool = False
+    elapsed_seconds: float | None = None
+    time_to_first_token_seconds: float | None = None
+    tokens_per_second: float | None = None
+
+
+LLMProgressCallback = Callable[[LLMProgressEvent], None]
+
+
+@dataclass(frozen=True)
 class BackendGenerationResult:
     """Hold text and token counts returned by an inference backend."""
 
@@ -83,6 +104,8 @@ class BackendGenerationResult:
     reasoning: str = ""
     reasoning_tokens: int = 0
     reasoning_parser: str = "none"
+    time_to_first_token_seconds: float | None = None
+    tokens_per_second: float | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +124,7 @@ class LLMBackend(Protocol):
         self,
         prepared_inputs: PreparedLLMInputs,
         settings: LLMGenerationSettings,
-        progress_callback: Callable[[int], None],
+        progress_callback: LLMProgressCallback,
     ) -> BackendGenerationResult:
         """Generate one response for normalized multimodal content."""
 
@@ -109,7 +132,7 @@ class LLMBackend(Protocol):
         """Release backend-owned model resources."""
 
 
-BackendFactory = Callable[[LLMModelProfile, Path], LLMBackend]
+BackendFactory = Callable[[LLMModelProfile, Path, LLMProgressCallback], LLMBackend]
 
 
 @dataclass
@@ -362,7 +385,10 @@ def _move_batch_to_device(batch: Any, device: str) -> Any:
     raise TypeError(f"Unsupported Transformers processor output {type(batch).__name__}.")
 
 
-def _stopping_criteria(progress_callback: Callable[[int], None]) -> Any:
+def _stopping_criteria(
+    progress_callback: LLMProgressCallback,
+    maximum_tokens: int | None = None,
+) -> Any:
     """Build a Transformers stopping criterion that reports and checks every token."""
     from transformers import StoppingCriteria, StoppingCriteriaList
 
@@ -372,12 +398,33 @@ def _stopping_criteria(progress_callback: Callable[[int], None]) -> Any:
         def __init__(self) -> None:
             """Initialize the generated-token counter."""
             self.generated_tokens = 0
+            self.started_at = time.perf_counter()
+            self.first_token_at: float | None = None
 
         def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
             """Report one generation step and continue unless ComfyUI raises."""
             del input_ids, scores, kwargs
             self.generated_tokens += 1
-            progress_callback(self.generated_tokens)
+            now = time.perf_counter()
+            if self.first_token_at is None:
+                self.first_token_at = now
+            elapsed_seconds = now - self.started_at
+            progress_callback(
+                LLMProgressEvent(
+                    stage="generating",
+                    message="Generating",
+                    value=self.generated_tokens,
+                    maximum=maximum_tokens,
+                    unit="tokens",
+                    elapsed_seconds=elapsed_seconds,
+                    time_to_first_token_seconds=self.first_token_at - self.started_at,
+                    tokens_per_second=(
+                        self.generated_tokens / elapsed_seconds
+                        if elapsed_seconds > 0
+                        else None
+                    ),
+                )
+            )
             return False
 
     return StoppingCriteriaList([ComfyProgressStoppingCriteria()])
@@ -429,10 +476,45 @@ def _multimodal_messages(prepared_inputs: PreparedLLMInputs) -> list[dict[str, A
     return messages
 
 
+def _safetensor_shard_count(snapshot_path: Path) -> int | None:
+    """Return the checkpoint shard count exposed by a staged snapshot."""
+    index_files = sorted(snapshot_path.glob("*.safetensors.index.json"))
+    for index_file in index_files:
+        try:
+            index_payload = json.loads(index_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Unable to inspect safetensor index %s.", index_file)
+            continue
+        weight_map = index_payload.get("weight_map")
+        if isinstance(weight_map, Mapping):
+            shard_names = {
+                str(filename)
+                for filename in weight_map.values()
+                if str(filename).endswith(".safetensors")
+            }
+            if shard_names:
+                return len(shard_names)
+    shard_files = tuple(snapshot_path.glob("*.safetensors"))
+    return len(shard_files) if shard_files else None
+
+
+def _weight_progress_message(shard_count: int | None) -> str:
+    """Return compact copy for the model-weight startup phase."""
+    if shard_count is None:
+        return "Loading model weights"
+    noun = "shard" if shard_count == 1 else "shards"
+    return f"Loading {shard_count} weight {noun}"
+
+
 class TransformersMultimodalBackend:
     """Run a curated image-text-to-text model through Hugging Face Transformers."""
 
-    def __init__(self, profile: LLMModelProfile, snapshot_path: Path) -> None:
+    def __init__(
+        self,
+        profile: LLMModelProfile,
+        snapshot_path: Path,
+        progress_callback: LLMProgressCallback,
+    ) -> None:
         """Load processor and model entirely from the staged immutable snapshot."""
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -440,6 +522,13 @@ class TransformersMultimodalBackend:
         self.profile = profile
         self.snapshot_path = snapshot_path
         dtype = _dtype_from_name(torch, profile.dtype)
+        progress_callback(
+            LLMProgressEvent(
+                stage="processor",
+                message="Loading processor",
+                indeterminate=True,
+            )
+        )
         logger.info(
             "Loading resident Modal LLM profile=%s path=%s dtype=%s.",
             profile.profile_id,
@@ -466,11 +555,31 @@ class TransformersMultimodalBackend:
         )
         if attention_implementation:
             model_options["attn_implementation"] = attention_implementation
+        shard_count = _safetensor_shard_count(snapshot_path)
+        progress_callback(
+            LLMProgressEvent(
+                stage="weights",
+                message=_weight_progress_message(shard_count),
+                value=0 if shard_count else None,
+                maximum=shard_count,
+                unit="shards" if shard_count else None,
+                indeterminate=shard_count is None,
+            )
+        )
         self.model = AutoModelForImageTextToText.from_pretrained(
             str(snapshot_path),
             **model_options,
         )
         self.model.eval()
+        progress_callback(
+            LLMProgressEvent(
+                stage="weights",
+                message="Model weights loaded",
+                value=shard_count,
+                maximum=shard_count,
+                unit="shards" if shard_count else None,
+            )
+        )
 
     def _messages(self, prepared_inputs: PreparedLLMInputs) -> list[dict[str, Any]]:
         """Build processor-native multimodal chat messages."""
@@ -480,7 +589,7 @@ class TransformersMultimodalBackend:
         self,
         prepared_inputs: PreparedLLMInputs,
         settings: LLMGenerationSettings,
-        progress_callback: Callable[[int], None],
+        progress_callback: LLMProgressCallback,
     ) -> BackendGenerationResult:
         """Tokenize multimodal messages and generate only the assistant continuation."""
         import torch
@@ -504,7 +613,10 @@ class TransformersMultimodalBackend:
         generate_kwargs: dict[str, Any] = {
             "max_new_tokens": settings.max_new_tokens,
             "do_sample": settings.temperature > 0,
-            "stopping_criteria": _stopping_criteria(progress_callback),
+            "stopping_criteria": _stopping_criteria(
+                progress_callback,
+                settings.max_new_tokens,
+            ),
         }
         if settings.temperature > 0:
             generate_kwargs.update(temperature=settings.temperature, top_p=settings.top_p)
@@ -545,16 +657,76 @@ class TransformersMultimodalBackend:
         torch.cuda.empty_cache()
 
 
-class VLLMMultimodalBackend:
-    """Run Qwen multimodal checkpoints through an in-container vLLM engine."""
+class _AsyncLoopRunner:
+    """Keep one asyncio loop alive for a resident asynchronous vLLM engine."""
 
-    def __init__(self, profile: LLMModelProfile, snapshot_path: Path) -> None:
+    def __init__(self) -> None:
+        """Start a daemon thread and wait until its event loop is available."""
+        self.loop = asyncio.new_event_loop()
+        self._started = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="modal-llm-vllm-loop",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started.wait()
+
+    def _run_loop(self) -> None:
+        """Own and run the backend event loop until explicit shutdown."""
+        asyncio.set_event_loop(self.loop)
+        self._started.set()
+        self.loop.run_forever()
+        self.loop.close()
+
+    def run(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
+        """Run one coroutine on the resident loop and return its result."""
+        if not self._thread.is_alive():
+            raise RuntimeError("The resident vLLM event loop is not running.")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        return future.result()
+
+    def close(self) -> None:
+        """Stop and join the resident event-loop thread."""
+        if not self._thread.is_alive():
+            return
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(timeout=10.0)
+        if self._thread.is_alive():
+            logger.warning("Resident vLLM event-loop thread did not stop promptly.")
+
+
+@dataclass(frozen=True)
+class _VLLMStreamState:
+    """Retain the final cumulative output and request timing boundaries."""
+
+    request_output: Any
+    started_at: float
+    first_token_at: float | None
+
+
+class VLLMMultimodalBackend:
+    """Run Qwen multimodal checkpoints through an asynchronous vLLM engine."""
+
+    def __init__(
+        self,
+        profile: LLMModelProfile,
+        snapshot_path: Path,
+        progress_callback: LLMProgressCallback,
+    ) -> None:
         """Load an immutable local snapshot under explicit co-residency budgets."""
         from transformers import AutoProcessor
-        from vllm import LLM
+        from vllm import AsyncEngineArgs, AsyncLLMEngine
 
         self.profile = profile
         self.snapshot_path = snapshot_path
+        progress_callback(
+            LLMProgressEvent(
+                stage="processor",
+                message="Loading processor",
+                indeterminate=True,
+            )
+        )
         self.processor = AutoProcessor.from_pretrained(
             str(snapshot_path),
             local_files_only=True,
@@ -565,35 +737,100 @@ class VLLMMultimodalBackend:
             self.processor.tokenizer,
         )
         quantization = str(profile.backend_option("quantization", "")).strip()
-        logger.info(
-            "Loading vLLM profile=%s path=%s quantization=%s max_model_len=%d "
-            "kv_cache_gib=%.1f.",
-            profile.profile_id,
-            snapshot_path,
-            quantization or "auto",
-            int(profile.backend_option("max_model_len", profile.max_context_tokens)),
-            int(profile.backend_option("kv_cache_memory_bytes", 0)) / _BYTES_PER_GIB,
+        shard_count = _safetensor_shard_count(snapshot_path)
+        self._log_engine_configuration(quantization, shard_count)
+        progress_callback(
+            LLMProgressEvent(
+                stage="engine",
+                message=_weight_progress_message(shard_count) + " + engine warmup",
+                value=0 if shard_count else None,
+                maximum=shard_count,
+                unit="shards" if shard_count else None,
+                indeterminate=True,
+            )
         )
-        self.llm = LLM(
-            model=str(snapshot_path),
-            tokenizer=str(snapshot_path),
+        engine_args = self._engine_arguments(AsyncEngineArgs, quantization)
+        self.llm = self._start_engine(AsyncLLMEngine, engine_args)
+        progress_callback(
+            LLMProgressEvent(
+                stage="ready",
+                message="vLLM engine ready",
+                value=shard_count,
+                maximum=shard_count,
+                unit="shards" if shard_count else None,
+            )
+        )
+
+    def _log_engine_configuration(
+        self,
+        quantization: str,
+        shard_count: int | None,
+    ) -> None:
+        """Log the immutable vLLM configuration before its expensive startup."""
+        logger.info(
+            "Loading asynchronous vLLM profile=%s path=%s quantization=%s "
+            "max_model_len=%d kv_cache_gib=%.1f shards=%s.",
+            self.profile.profile_id,
+            self.snapshot_path,
+            quantization or "auto",
+            int(
+                self.profile.backend_option(
+                    "max_model_len",
+                    self.profile.max_context_tokens,
+                )
+            ),
+            int(self.profile.backend_option("kv_cache_memory_bytes", 0))
+            / _BYTES_PER_GIB,
+            shard_count,
+        )
+
+    def _engine_arguments(self, argument_class: Any, quantization: str) -> Any:
+        """Build explicit AsyncLLM co-residency arguments for this profile."""
+        return argument_class(
+            model=str(self.snapshot_path),
+            tokenizer=str(self.snapshot_path),
             trust_remote_code=False,
-            dtype=profile.dtype,
+            dtype=self.profile.dtype,
             quantization=quantization or None,
             max_model_len=int(
-                profile.backend_option("max_model_len", profile.max_context_tokens)
+                self.profile.backend_option(
+                    "max_model_len",
+                    self.profile.max_context_tokens,
+                )
             ),
             kv_cache_memory_bytes=int(
-                profile.backend_option("kv_cache_memory_bytes", 12 * _BYTES_PER_GIB)
+                self.profile.backend_option(
+                    "kv_cache_memory_bytes",
+                    12 * _BYTES_PER_GIB,
+                )
             ),
-            enforce_eager=bool(profile.backend_option("enforce_eager", True)),
+            enforce_eager=bool(
+                self.profile.backend_option("enforce_eager", True)
+            ),
             disable_custom_all_reduce=True,
-            attention_config={
-                "backend": "TRITON_ATTN",
-            },
+            attention_config={"backend": "TRITON_ATTN"},
             generation_config="vllm",
-            limit_mm_per_prompt={"image": profile.max_images, "video": 1},
+            limit_mm_per_prompt={"image": self.profile.max_images, "video": 1},
         )
+
+    def _start_engine(self, engine_class: Any, engine_args: Any) -> Any:
+        """Start AsyncLLM and clean up its loop if initialization fails."""
+        self._loop_runner = _AsyncLoopRunner()
+        engine_created = False
+        try:
+            engine = self._loop_runner.run(
+                self._create_engine(engine_class, engine_args)
+            )
+            engine_created = True
+            return engine
+        finally:
+            if not engine_created:
+                self._loop_runner.close()
+
+    @staticmethod
+    async def _create_engine(engine_class: Any, engine_args: Any) -> Any:
+        """Construct AsyncLLM while its long-lived event loop is current."""
+        return engine_class.from_engine_args(engine_args)
 
     def _request(self, prepared_inputs: PreparedLLMInputs) -> dict[str, Any]:
         """Build one vLLM prompt with direct in-process multimodal data."""
@@ -623,26 +860,36 @@ class VLLMMultimodalBackend:
         self,
         prepared_inputs: PreparedLLMInputs,
         settings: LLMGenerationSettings,
-        progress_callback: Callable[[int], None],
+        progress_callback: LLMProgressCallback,
     ) -> BackendGenerationResult:
-        """Generate one response and report vLLM's final token count."""
+        """Generate one response while streaming cumulative token telemetry."""
+        return self._loop_runner.run(
+            self._generate_async(prepared_inputs, settings, progress_callback)
+        )
+
+    async def _generate_async(
+        self,
+        prepared_inputs: PreparedLLMInputs,
+        settings: LLMGenerationSettings,
+        progress_callback: LLMProgressCallback,
+    ) -> BackendGenerationResult:
+        """Consume vLLM's async output stream and report every token update."""
         from vllm import SamplingParams
         from vllm.v1.engine.exceptions import EngineDeadError
 
-        progress_callback(0)
-        sampling_params = SamplingParams(
-            max_tokens=settings.max_new_tokens,
-            temperature=settings.temperature,
-            top_p=settings.top_p,
-            seed=settings.seed,
-            skip_special_tokens=not self.reasoning_parser.requires_boundary_tokens,
-        )
+        self._report_prefill(settings, progress_callback)
+        sampling_params = self._sampling_params(SamplingParams, settings)
+        request_id = f"modal-llm-{uuid.uuid4().hex}"
+        finished = False
         try:
-            outputs = self.llm.generate(
-                [self._request(prepared_inputs)],
-                sampling_params=sampling_params,
-                use_tqdm=False,
+            stream_state = await self._consume_stream(
+                prepared_inputs,
+                settings,
+                sampling_params,
+                request_id,
+                progress_callback,
             )
+            finished = True
         except (EngineDeadError, RuntimeError) as error:
             logger.exception(
                 "vLLM generation failed for profile=%s.",
@@ -652,12 +899,144 @@ class VLLMMultimodalBackend:
                 f"vLLM generation failed for profile {self.profile.profile_id!r}: "
                 f"{error}"
             ) from None
-        if len(outputs) != 1 or not outputs[0].outputs:
+        finally:
+            if not finished:
+                await self._abort_request(request_id, EngineDeadError)
+        return self._generation_result(stream_state)
+
+    @staticmethod
+    def _report_prefill(
+        settings: LLMGenerationSettings,
+        progress_callback: LLMProgressCallback,
+    ) -> None:
+        """Publish the indeterminate interval before vLLM yields a token."""
+        progress_callback(
+            LLMProgressEvent(
+                stage="prefill",
+                message="Prefill / waiting for first token",
+                value=0,
+                maximum=settings.max_new_tokens,
+                unit="tokens",
+                indeterminate=True,
+            )
+        )
+
+    def _sampling_params(
+        self,
+        parameter_class: Any,
+        settings: LLMGenerationSettings,
+    ) -> Any:
+        """Translate backend-neutral settings into vLLM sampling parameters."""
+        return parameter_class(
+            max_tokens=settings.max_new_tokens,
+            temperature=settings.temperature,
+            top_p=settings.top_p,
+            seed=settings.seed,
+            skip_special_tokens=not self.reasoning_parser.requires_boundary_tokens,
+        )
+
+    async def _consume_stream(
+        self,
+        prepared_inputs: PreparedLLMInputs,
+        settings: LLMGenerationSettings,
+        sampling_params: Any,
+        request_id: str,
+        progress_callback: LLMProgressCallback,
+    ) -> _VLLMStreamState:
+        """Consume cumulative AsyncLLM outputs and return final stream state."""
+        started_at = time.perf_counter()
+        first_token_at: float | None = None
+        request_output: Any | None = None
+        output_stream = self.llm.generate(
+            self._request(prepared_inputs),
+            sampling_params=sampling_params,
+            request_id=request_id,
+        )
+        async for streamed_output in output_stream:
+            if not streamed_output.outputs:
+                continue
+            request_output = streamed_output
+            now = time.perf_counter()
+            output_tokens = len(streamed_output.outputs[0].token_ids)
+            if output_tokens > 0 and first_token_at is None:
+                first_token_at = now
+            self._report_token_progress(
+                settings,
+                output_tokens,
+                started_at,
+                first_token_at,
+                now,
+                progress_callback,
+            )
+        if request_output is None or not request_output.outputs:
             raise RuntimeError("vLLM returned no generation candidate.")
-        request_output = outputs[0]
+        return _VLLMStreamState(
+            request_output=request_output,
+            started_at=started_at,
+            first_token_at=first_token_at,
+        )
+
+    @staticmethod
+    def _report_token_progress(
+        settings: LLMGenerationSettings,
+        output_tokens: int,
+        started_at: float,
+        first_token_at: float | None,
+        now: float,
+        progress_callback: LLMProgressCallback,
+    ) -> None:
+        """Publish one cumulative token count with live timing telemetry."""
+        elapsed_seconds = now - started_at
+        progress_callback(
+            LLMProgressEvent(
+                stage="generating",
+                message="Generating",
+                value=output_tokens,
+                maximum=settings.max_new_tokens,
+                unit="tokens",
+                elapsed_seconds=elapsed_seconds,
+                time_to_first_token_seconds=(
+                    first_token_at - started_at
+                    if first_token_at is not None
+                    else None
+                ),
+                tokens_per_second=(
+                    output_tokens / elapsed_seconds
+                    if output_tokens > 0 and elapsed_seconds > 0
+                    else None
+                ),
+            )
+        )
+
+    async def _abort_request(self, request_id: str, engine_error: type[Exception]) -> None:
+        """Best-effort abort one request without masking its original failure."""
+        try:
+            await self.llm.abort(request_id)
+        except (engine_error, RuntimeError) as abort_error:
+            logger.debug(
+                "Unable to abort failed vLLM request %s: %s",
+                request_id,
+                abort_error,
+            )
+
+    def _generation_result(
+        self,
+        stream_state: _VLLMStreamState,
+    ) -> BackendGenerationResult:
+        """Convert the final cumulative vLLM output into the backend contract."""
+        request_output = stream_state.request_output
         candidate = request_output.outputs[0]
         output_tokens = len(candidate.token_ids)
-        progress_callback(output_tokens)
+        completed_at = time.perf_counter()
+        elapsed_seconds = completed_at - stream_state.started_at
+        time_to_first_token_seconds = (
+            stream_state.first_token_at - stream_state.started_at
+            if stream_state.first_token_at is not None
+            else None
+        )
+        tokens_per_second = (
+            output_tokens / elapsed_seconds if elapsed_seconds > 0 else None
+        )
         native_reasoning = getattr(candidate, "reasoning", None)
         if native_reasoning is None:
             native_reasoning = getattr(candidate, "reasoning_content", None)
@@ -675,6 +1054,8 @@ class VLLMMultimodalBackend:
             reasoning=reasoning_output.reasoning,
             reasoning_tokens=reasoning_output.reasoning_tokens,
             reasoning_parser=reasoning_output.parser,
+            time_to_first_token_seconds=time_to_first_token_seconds,
+            tokens_per_second=tokens_per_second,
         )
 
     def unload(self) -> None:
@@ -684,25 +1065,32 @@ class VLLMMultimodalBackend:
         llm = self.llm
         self.llm = None
         self.processor = None
-        shutdown = getattr(llm, "shutdown", None)
-        if callable(shutdown):
-            shutdown()
-        else:
-            engine = getattr(llm, "llm_engine", None)
-            engine_shutdown = getattr(engine, "shutdown", None)
-            if callable(engine_shutdown):
-                engine_shutdown()
+        if llm is not None:
+            self._loop_runner.run(self._shutdown_engine(llm))
+        self._loop_runner.close()
         del llm
         gc.collect()
         torch.cuda.empty_cache()
 
+    @staticmethod
+    async def _shutdown_engine(llm: Any) -> None:
+        """Shut down AsyncLLM on the event loop that owns its output task."""
+        shutdown = getattr(llm, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+            await asyncio.sleep(0)
 
-def _default_backend_factory(profile: LLMModelProfile, snapshot_path: Path) -> LLMBackend:
+
+def _default_backend_factory(
+    profile: LLMModelProfile,
+    snapshot_path: Path,
+    progress_callback: LLMProgressCallback,
+) -> LLMBackend:
     """Create the backend selected by the immutable compatibility profile."""
     if profile.backend == "transformers":
-        return TransformersMultimodalBackend(profile, snapshot_path)
+        return TransformersMultimodalBackend(profile, snapshot_path, progress_callback)
     if profile.backend == "vllm":
-        return VLLMMultimodalBackend(profile, snapshot_path)
+        return VLLMMultimodalBackend(profile, snapshot_path, progress_callback)
     raise ValueError(
         f"Modal LLM profile {profile.profile_id!r} selects unknown backend "
         f"{profile.backend!r}."
@@ -812,12 +1200,26 @@ class ResidentLLMManager:
                 f"{total_bytes / _BYTES_PER_GIB:.1f} GiB is free."
             )
 
-    def _load(self, profile: LLMModelProfile, reserve_free_vram_gb: float) -> tuple[ResidentModel, bool]:
+    def _load(
+        self,
+        profile: LLMModelProfile,
+        reserve_free_vram_gb: float,
+        progress_callback: LLMProgressCallback,
+    ) -> tuple[ResidentModel, bool]:
         """Return a cached backend or load one after enforcing the VRAM budget."""
         cached = self._models.pop(profile.profile_id, None)
         if cached is not None:
             cached.last_used_at = time.time()
             self._models[profile.profile_id] = cached
+            progress_callback(
+                LLMProgressEvent(
+                    stage="ready",
+                    message="Reusing resident model",
+                    value=1,
+                    maximum=1,
+                    unit="model",
+                )
+            )
             return cached, True
         if not self._snapshot_ready(self.storage_root, profile):
             raise RuntimeError(
@@ -827,9 +1229,20 @@ class ResidentLLMManager:
             )
         while len(self._models) >= self.max_resident_models:
             self._evict(next(iter(self._models)))
+        progress_callback(
+            LLMProgressEvent(
+                stage="memory",
+                message="Preparing GPU memory",
+                indeterminate=True,
+            )
+        )
         self._make_room(profile, reserve_free_vram_gb)
         before_free, _ = self._memory_info()
-        backend = self.backend_factory(profile, model_snapshot_path(self.storage_root, profile))
+        backend = self.backend_factory(
+            profile,
+            model_snapshot_path(self.storage_root, profile),
+            progress_callback,
+        )
         after_free, _ = self._memory_info()
         now = time.time()
         resident = ResidentModel(
@@ -856,7 +1269,7 @@ class ResidentLLMManager:
         generation_settings: LLMGenerationSettings,
         reserve_free_vram_gb: float,
         keep_model_loaded: bool,
-        progress_callback: Callable[[int], None],
+        progress_callback: LLMProgressCallback,
     ) -> LLMInferenceResult:
         """Run one inference while protecting shared resident state."""
         if reserve_free_vram_gb < 0:
@@ -864,7 +1277,11 @@ class ResidentLLMManager:
         with self._lock:
             before_free, total_bytes = self._memory_info()
             started_at = time.perf_counter()
-            resident, cache_hit = self._load(profile, reserve_free_vram_gb)
+            resident, cache_hit = self._load(
+                profile,
+                reserve_free_vram_gb,
+                progress_callback,
+            )
             load_finished_at = time.perf_counter()
             generation_result = resident.backend.generate(
                 prepared_inputs,
@@ -891,10 +1308,17 @@ class ResidentLLMManager:
                 "output_tokens": generation_result.output_tokens,
                 "reasoning_tokens": generation_result.reasoning_tokens,
                 "reasoning_parser": generation_result.reasoning_parser,
+                "time_to_first_token_seconds": (
+                    generation_result.time_to_first_token_seconds
+                ),
                 "tokens_per_second": (
-                    generation_result.output_tokens / generation_seconds
-                    if generation_seconds > 0
-                    else None
+                    generation_result.tokens_per_second
+                    if generation_result.tokens_per_second is not None
+                    else (
+                        generation_result.output_tokens / generation_seconds
+                        if generation_seconds > 0
+                        else None
+                    )
                 ),
                 "load_seconds": load_finished_at - started_at,
                 "generation_seconds": generation_seconds,
@@ -983,10 +1407,17 @@ def run_modal_llm_inference(
     video_frames: int,
     reserve_free_vram_gb: float | None,
     keep_model_loaded: bool,
-    progress_callback: Callable[[int], None],
+    progress_callback: LLMProgressCallback,
 ) -> LLMInferenceResult:
     """Resolve a profile, normalize content, and invoke the resident manager."""
     storage_root = os.getenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", _DEFAULT_STORAGE_ROOT)
+    progress_callback(
+        LLMProgressEvent(
+            stage="profile",
+            message="Resolving model profile",
+            indeterminate=True,
+        )
+    )
     profile = get_llm_profile(model_profile, storage_root=storage_root)
     generation_settings = LLMGenerationSettings(
         max_new_tokens=_coerce_positive_int(max_new_tokens, "max_new_tokens", 32768),
@@ -998,6 +1429,13 @@ def run_modal_llm_inference(
         raise ValueError("temperature must be between 0.0 and 2.0.")
     if not 0.0 < generation_settings.top_p <= 1.0:
         raise ValueError("top_p must be greater than 0.0 and at most 1.0.")
+    progress_callback(
+        LLMProgressEvent(
+            stage="inputs",
+            message="Preparing multimodal inputs",
+            indeterminate=True,
+        )
+    )
     prepared_inputs = prepare_llm_inputs(
         prompt=prompt,
         system_prompt=system_prompt,
@@ -1029,6 +1467,7 @@ __all__ = [
     "BackendGenerationResult",
     "LLMGenerationSettings",
     "LLMInferenceResult",
+    "LLMProgressEvent",
     "PreparedLLMInputs",
     "PreparedVideo",
     "ResidentLLMManager",

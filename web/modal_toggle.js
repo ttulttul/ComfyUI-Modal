@@ -243,15 +243,36 @@ function progressIterationRate(previousState, value, maxValue, updatedAt) {
 /**
  * Format a progress rate for the compact label over a node progress bar.
  * @param {number | null | undefined} iterationRate
+ * @param {string | null | undefined} unit
  * @returns {string}
  */
-function formatIterationRate(iterationRate) {
+function formatIterationRate(iterationRate, unit = null) {
   const safeRate = iterationRate == null ? Number.NaN : Number(iterationRate);
+  const rateUnit = unit === "tokens" ? "tok/s" : "it/s";
   if (!Number.isFinite(safeRate) || safeRate < 0) {
-    return "— it/s";
+    return `— ${rateUnit}`;
   }
   const fractionDigits = safeRate < 10 ? 2 : safeRate < 100 ? 1 : 0;
-  return `${safeRate.toFixed(fractionDigits)} it/s`;
+  return `${safeRate.toFixed(fractionDigits)} ${rateUnit}`;
+}
+
+/**
+ * Trim one canvas label to fit a fixed width.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string} text
+ * @param {number} maxWidth
+ * @returns {string}
+ */
+function fitCanvasText(ctx, text, maxWidth) {
+  const safeText = String(text ?? "");
+  if (!safeText || ctx.measureText(safeText).width <= maxWidth) {
+    return safeText;
+  }
+  let end = safeText.length;
+  while (end > 1 && ctx.measureText(`${safeText.slice(0, end)}…`).width > maxWidth) {
+    end -= 1;
+  }
+  return `${safeText.slice(0, end)}…`;
 }
 
 /**
@@ -262,6 +283,7 @@ function formatIterationRate(iterationRate) {
  * @param {number} centerY
  * @param {number} barHeight
  * @param {number} scale
+ * @param {string | null | undefined} unit
  */
 function drawIterationRateOverlay(
   ctx,
@@ -270,8 +292,9 @@ function drawIterationRateOverlay(
   centerY,
   barHeight,
   scale,
+  unit = null,
 ) {
-  const label = formatIterationRate(iterationRate);
+  const label = formatIterationRate(iterationRate, unit);
   const metrics = ctx.measureText(label);
   const paddingX = 3 / scale;
   const paddingY = 1 / scale;
@@ -2479,8 +2502,9 @@ function setNodeBatchProgress(nodeIdValue, promptId, value, maxValue) {
  * @param {string} promptId
  * @param {number} value
  * @param {number} maxValue
+ * @param {Record<string, unknown>} metadata
  */
-function setNodeProgress(nodeIdValue, promptId, value, maxValue) {
+function setNodeProgress(nodeIdValue, promptId, value, maxValue, metadata = {}) {
   const safeMaxValue = Math.max(1, Number(maxValue) || 1);
   const safeValue = Math.max(0, Math.min(safeMaxValue, Number(value) || 0));
   const progressNodeIds = [String(nodeIdValue), ...ancestorNodeIds(nodeIdValue)];
@@ -2491,17 +2515,31 @@ function setNodeProgress(nodeIdValue, promptId, value, maxValue) {
       continue;
     }
     const existingProgress = modalNodeProgress.get(progressNodeId);
+    const reportedRate = Number(metadata.tokens_per_second);
     modalNodeProgress.set(progressNodeId, {
       promptId,
       value: safeValue,
       max: safeMaxValue,
       updatedAt,
-      iterationRate: progressIterationRate(
-        existingProgress?.promptId === promptId ? existingProgress : null,
-        safeValue,
-        safeMaxValue,
-        updatedAt,
-      ),
+      stage: String(metadata.stage ?? ""),
+      message: String(metadata.message ?? ""),
+      unit: String(metadata.unit ?? ""),
+      indeterminate: Boolean(metadata.indeterminate),
+      preGpu: Boolean(metadata.pre_gpu),
+      elapsedSeconds: Number.isFinite(Number(metadata.elapsed_seconds))
+        ? Number(metadata.elapsed_seconds)
+        : null,
+      timeToFirstTokenSeconds: Number.isFinite(Number(metadata.time_to_first_token_seconds))
+        ? Number(metadata.time_to_first_token_seconds)
+        : null,
+      iterationRate: Number.isFinite(reportedRate) && reportedRate >= 0
+        ? reportedRate
+        : progressIterationRate(
+            existingProgress?.promptId === promptId ? existingProgress : null,
+            safeValue,
+            safeMaxValue,
+            updatedAt,
+          ),
     });
   }
 
@@ -3656,7 +3694,10 @@ function drawModalNodeDecoration(node, ctx) {
   const hasAggregateProgress = Boolean(
     state?.progress &&
       progressOpacity > 0 &&
-      [STATE_ACTIVE, STATE_COMPLETE].includes(state.phase),
+      (
+        [STATE_ACTIVE, STATE_COMPLETE].includes(state.phase) ||
+        (state.phase === STATE_STARTING && state.progress.preGpu)
+      ),
   );
   const hasSetupLaneProgress = setupProgressLanes.length > 0;
   const hasLaneProgress =
@@ -3711,18 +3752,46 @@ function drawModalNodeDecoration(node, ctx) {
   ctx.lineWidth = 1 / scale;
   ctx.stroke();
 
-  const headerText = hasAggregateProgress
-    ? `${Math.round((state.progress.value / state.progress.max) * 100)}%`
-    : hasVisibleLaneProgress
-      ? `${visibleLaneProgress.length}x`
-      : null;
+  const aggregateProgress = hasAggregateProgress ? state.progress : null;
+  const progressPercent = aggregateProgress
+    ? Math.round((aggregateProgress.value / aggregateProgress.max) * 100)
+    : null;
+  const llmTimingLabel = aggregateProgress?.timeToFirstTokenSeconds != null
+    ? `${aggregateProgress.stage === "complete" ? "Done" : "Gen"} • TTFT ${aggregateProgress.timeToFirstTokenSeconds.toFixed(1)}s`
+    : null;
+  const headerText = llmTimingLabel
+    ? llmTimingLabel
+    : aggregateProgress?.message
+      ? aggregateProgress.message
+      : aggregateProgress
+        ? `${progressPercent}%`
+        : hasVisibleLaneProgress
+          ? `${visibleLaneProgress.length}x`
+          : null;
+  const progressUnit = aggregateProgress?.unit === "tokens"
+    ? "tok"
+    : aggregateProgress?.unit || "";
+  const headerMetric = aggregateProgress && !aggregateProgress.indeterminate
+    ? `${Math.round(aggregateProgress.value)}/${Math.round(aggregateProgress.max)}${progressUnit ? ` ${progressUnit}` : ""}`
+    : null;
   const headerBaselineY = panelY + panelPaddingY + headerHeight / 2;
   if (headerText) {
     ctx.fillStyle = "#f8fafc";
     ctx.font = `${Math.max(10 / scale, 8)}px ui-sans-serif, system-ui, sans-serif`;
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    ctx.fillText(headerText, panelPaddingX, headerBaselineY);
+    const metricWidth = headerMetric ? ctx.measureText(headerMetric).width + panelPaddingX : 0;
+    const availableLabelWidth = Math.max(0, barWidth - panelPaddingX * 2 - metricWidth);
+    ctx.fillText(
+      fitCanvasText(ctx, headerText, availableLabelWidth),
+      panelPaddingX,
+      headerBaselineY,
+    );
+    if (headerMetric) {
+      ctx.textAlign = "right";
+      ctx.fillStyle = "#cbd5e1";
+      ctx.fillText(headerMetric, node.size[0] - panelPaddingX, headerBaselineY);
+    }
   }
 
   if (badgeText) {
@@ -3778,6 +3847,7 @@ function drawModalNodeDecoration(node, ctx) {
           laneY + laneHeight / 2,
           laneHeight,
           scale,
+          laneProgress.unit,
         );
       }
       laneY += laneHeight + laneGap;
@@ -3791,7 +3861,14 @@ function drawModalNodeDecoration(node, ctx) {
     ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
     ctx.fillRect(-borderWidth, aggregateY, progressBarWidth, aggregateHeight);
     ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
-    ctx.fillRect(-borderWidth, aggregateY, progressWidth, aggregateHeight);
+    if (state.progress.indeterminate) {
+      const pulseWidth = Math.max(progressBarWidth * 0.18, 12 / scale);
+      const travelWidth = Math.max(0, progressBarWidth - pulseWidth);
+      const pulseX = -borderWidth + ((elapsed * 0.65) % 1) * travelWidth;
+      ctx.fillRect(pulseX, aggregateY, pulseWidth, aggregateHeight);
+    } else {
+      ctx.fillRect(-borderWidth, aggregateY, progressWidth, aggregateHeight);
+    }
     drawIterationRateOverlay(
       ctx,
       state.progress.iterationRate,
@@ -3799,6 +3876,7 @@ function drawModalNodeDecoration(node, ctx) {
       aggregateY + aggregateHeight / 2,
       aggregateHeight,
       scale,
+      state.progress.unit,
     );
   }
   ctx.restore();
@@ -3886,6 +3964,21 @@ function handleModalStatus(event) {
     });
     setPromptActiveNode(promptId, null);
     setNodesPhase(nodeIds, STATE_SETUP, promptId);
+    return;
+  }
+
+  if (["llm_staging", "llm_staged"].includes(detail.phase)) {
+    if (isPromptQueuedBehindActiveModal(promptId)) {
+      return;
+    }
+    setGlobalStatusPhase(promptId, STATE_STARTING, nodeIds.length, {
+      message: detail.status_message ?? "Staging LLM on CPU",
+      current: detail.status_current ?? null,
+      total: detail.status_total ?? null,
+      modalGpu,
+    });
+    setPromptActiveNode(promptId, null);
+    setNodesPhase(nodeIds, STATE_STARTING, promptId);
     return;
   }
 
@@ -4038,12 +4131,27 @@ function handleModalProgress(event) {
   if (!promptState) {
     return;
   }
-  if (!detail.cached_hit) {
+  if (!detail.cached_hit && !detail.pre_gpu) {
     promptState.hasRemoteExecutionStarted = true;
   }
   const componentNodeIds = resolveComponentNodeIds(promptId, progressNodeId);
   const readyNodeIds = (componentNodeIds ?? []).filter((nodeIdValue) => nodeIdValue !== progressNodeId);
   promptState.hasStreamedProgress = true;
+  if (detail.pre_gpu) {
+    setGlobalStatusPhase(promptId, STATE_STARTING, promptState.remoteNodeIds.length || 1, {
+      message: detail.message ? String(detail.message) : "Staging LLM on CPU",
+    });
+    setPromptActiveNode(promptId, null);
+    setNodesPhase(componentNodeIds ?? [progressNodeId], STATE_STARTING, promptId);
+    setNodeProgress(
+      progressNodeId,
+      promptId,
+      Number(detail.value ?? 0),
+      Number(detail.max ?? 1),
+      detail,
+    );
+    return;
+  }
   if (detail.aggregate_only) {
     if (componentNodeIds?.length) {
       setNodesPhase(componentNodeIds, STATE_READY, promptId);
@@ -4075,7 +4183,9 @@ function handleModalProgress(event) {
     });
     return;
   }
-  setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1);
+  setGlobalStatusPhase(promptId, EXECUTION_PHASE, promptState.remoteNodeIds.length || 1, {
+    message: detail.message ? String(detail.message) : undefined,
+  });
   if (detail.lane_id != null) {
     setPromptActiveNode(promptId, null);
     if (componentNodeIds?.length) {
@@ -4126,6 +4236,7 @@ function handleModalProgress(event) {
     promptId,
     Number(detail.value ?? 0),
     Number(detail.max ?? 1),
+    detail,
   );
 }
 

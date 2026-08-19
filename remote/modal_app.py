@@ -3524,8 +3524,16 @@ def _emit_local_modal_progress(
     setup_only: bool = False,
     cached_hit: bool = False,
     completed_ancestor_node_ids: list[str] | None = None,
+    stage: str | None = None,
+    message: str | None = None,
+    unit: str | None = None,
+    indeterminate: bool = False,
+    elapsed_seconds: float | None = None,
+    time_to_first_token_seconds: float | None = None,
+    tokens_per_second: float | None = None,
+    pre_gpu: bool = False,
 ) -> None:
-    """Forward remote numeric node progress into the local ComfyUI websocket stream."""
+    """Forward remote numeric and stage progress into the local websocket stream."""
     if client_id is None:
         return
 
@@ -3557,6 +3565,24 @@ def _emit_local_modal_progress(
         payload["cached_hit"] = True
     if completed_ancestor_node_ids:
         payload["completed_ancestor_node_ids"] = list(completed_ancestor_node_ids)
+    if stage:
+        payload["stage"] = stage
+    if message:
+        payload["message"] = message
+    if unit:
+        payload["unit"] = unit
+    if indeterminate:
+        payload["indeterminate"] = True
+    if elapsed_seconds is not None:
+        payload["elapsed_seconds"] = float(elapsed_seconds)
+    if time_to_first_token_seconds is not None:
+        payload["time_to_first_token_seconds"] = float(
+            time_to_first_token_seconds
+        )
+    if tokens_per_second is not None:
+        payload["tokens_per_second"] = float(tokens_per_second)
+    if pre_gpu:
+        payload["pre_gpu"] = True
     _record_local_modal_ui_event("modal_progress", payload, client_id)
     prompt_server.send_sync("modal_progress", payload, client_id)
 
@@ -4380,6 +4406,24 @@ def _consume_remote_payload_stream(
                             ),
                             "aggregate_only": aggregate_only,
                         }
+                        for string_field in ("stage", "message", "unit"):
+                            if stream_event.get(string_field) is not None:
+                                progress_kwargs[string_field] = str(
+                                    stream_event[string_field]
+                                )
+                        if stream_event.get("indeterminate") is not None:
+                            progress_kwargs["indeterminate"] = bool(
+                                stream_event["indeterminate"]
+                            )
+                        for numeric_field in (
+                            "elapsed_seconds",
+                            "time_to_first_token_seconds",
+                            "tokens_per_second",
+                        ):
+                            if stream_event.get(numeric_field) is not None:
+                                progress_kwargs[numeric_field] = float(
+                                    stream_event[numeric_field]
+                                )
                         if completed_ancestor_node_ids:
                             progress_kwargs[
                                 "completed_ancestor_node_ids"
@@ -5899,6 +5943,42 @@ def _lookup_deployed_remote_engine(
     return remote_engine
 
 
+def _emit_local_llm_staging_progress(
+    payload: Mapping[str, Any],
+    stage_event: Mapping[str, Any],
+) -> None:
+    """Render one CPU ModelStager update on the target component's node bar."""
+    prompt_id = (
+        str(payload["prompt_id"]) if payload.get("prompt_id") is not None else None
+    )
+    extra_data = payload.get("extra_data") or {}
+    client_id = (
+        str(extra_data["client_id"])
+        if isinstance(extra_data, Mapping) and extra_data.get("client_id") is not None
+        else None
+    )
+    component_id = str(payload.get("component_id") or "")
+    if not component_id:
+        return
+    maximum = stage_event.get("max")
+    _emit_local_modal_progress(
+        prompt_id=prompt_id,
+        client_id=client_id,
+        node_id=component_id,
+        value=float(stage_event.get("value") or 0.0),
+        max_value=float(maximum) if maximum is not None else 1.0,
+        stage=str(stage_event.get("stage") or "staging"),
+        message=str(stage_event.get("message") or "Staging LLM snapshot"),
+        unit=(
+            str(stage_event["unit"])
+            if stage_event.get("unit") is not None
+            else None
+        ),
+        indeterminate=bool(stage_event.get("indeterminate", False)),
+        pre_gpu=True,
+    )
+
+
 def _ensure_llm_profiles_staged(
     payload: dict[str, Any],
     deployment_app_name: str,
@@ -5933,7 +6013,26 @@ def _ensure_llm_profiles_staged(
                 payload.get("component_id"),
             )
             stager_cls = modal.Cls.from_name(deployment_app_name, "ModelStager")
-            stage_results = stager_cls().stage_profiles.remote(missing_model_references)
+            stager = stager_cls()
+            stage_results: list[dict[str, Any]] = []
+            stage_stream = getattr(stager, "stage_profiles_stream", None)
+            remote_generator = getattr(stage_stream, "remote_gen", None)
+            if callable(remote_generator):
+                for stage_event in remote_generator(missing_model_references):
+                    if not isinstance(stage_event, Mapping):
+                        continue
+                    if stage_event.get("kind") == "result":
+                        candidate_results = stage_event.get("results")
+                        if isinstance(candidate_results, list):
+                            stage_results = candidate_results
+                        continue
+                    if stage_event.get("kind") != "progress":
+                        continue
+                    _emit_local_llm_staging_progress(payload, stage_event)
+            else:
+                stage_results = stager.stage_profiles.remote(
+                    missing_model_references
+                )
             confirmed_references: set[str] = set()
             for stage_result in stage_results:
                 if not isinstance(stage_result, Mapping):
