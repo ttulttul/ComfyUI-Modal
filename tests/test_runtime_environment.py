@@ -63,7 +63,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     torch_packages = runtime_environment_module.remote_torch_packages()
 
     assert runtime_environment_module.DEFAULT_MODAL_GPU == "RTX-PRO-6000"
-    assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION == 7
+    assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION == 8
     assert runtime_environment_module.REMOTE_PYTHON_VERSION == "3.11"
     assert apt_packages == ("libgl1", "libglib2.0-0")
     assert all("==" in requirement for requirement in runtime_packages)
@@ -76,6 +76,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "pyopengl==3.1.10" in runtime_packages
     assert "pypdf==6.16.1" in runtime_packages
     assert "huggingface-hub==1.28.0" in runtime_packages
+    assert "transformers==5.15.0" in runtime_packages
     assert "simpleeval==1.0.7" in runtime_packages
 
 
@@ -110,7 +111,7 @@ def test_b300_capable_modal_gpus_use_cuda_132_build(
     assert build.install_layers == (
         runtime_environment_module.RemoteTorchInstallLayer(
             index_url="https://download.pytorch.org/whl/cu132",
-            packages=("torch==2.12.1", "torchvision==0.27.1"),
+            packages=("torch==2.13.0", "torchvision==0.28.0"),
         ),
         runtime_environment_module.RemoteTorchInstallLayer(
             index_url="https://download.pytorch.org/whl/cpu",
@@ -119,8 +120,8 @@ def test_b300_capable_modal_gpus_use_cuda_132_build(
         ),
     )
     assert runtime_environment_module.remote_torch_packages(modal_gpu) == (
-        "torch==2.12.1",
-        "torchvision==0.27.1",
+        "torch==2.13.0",
+        "torchvision==0.28.0",
         "torchaudio==2.11.0+cpu",
     )
 
@@ -137,6 +138,10 @@ def test_remote_torch_build_validation_imports_complete_stack(
     assert validation_command.startswith("python -c ")
     assert "import torch, torchaudio, torchvision" in validation_script
     assert "expected_cuda='13.2'" in validation_script
+    assert runtime_environment_module.remote_accelerator_packages("B300") == (
+        "vllm==0.27.1",
+    )
+    assert runtime_environment_module.remote_accelerator_packages("A100") == ()
 
 
 def test_empty_modal_gpu_cannot_select_torch_build(runtime_environment_module: Any) -> None:
@@ -242,7 +247,7 @@ def test_runtime_identity_records_gpu_specific_torch_build(
         "install_layers": [
             {
                 "index_url": "https://download.pytorch.org/whl/cu132",
-                "packages": ["torch==2.12.1", "torchvision==0.27.1"],
+                "packages": ["torch==2.13.0", "torchvision==0.28.0"],
                 "extra_options": "",
             },
             {
@@ -253,8 +258,8 @@ def test_runtime_identity_records_gpu_specific_torch_build(
         ],
     }
     assert identity.manifest["torch_packages"] == [
-        "torch==2.12.1",
-        "torchvision==0.27.1",
+        "torch==2.13.0",
+        "torchvision==0.28.0",
         "torchaudio==2.11.0+cpu",
     ]
 

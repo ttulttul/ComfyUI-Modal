@@ -45,3 +45,5 @@ Compatibility-policy changes remain deployment changes. New repositories using a
 ## Current Backend Boundary
 
 The compatibility registry selects Transformers for Muse-Glimmer and vLLM for Qwen3.5. Qwen block-FP8 and NVIDIA ModelOpt NVFP4 checkpoints share the vLLM adapter. Generated vLLM profiles set an explicit KV-cache byte budget and a conservative 32K default context instead of allowing the serving engine to reserve nearly all available B300 memory.
+
+The B300 runtime pins Torch 2.13.0, torchvision 0.28.0, Transformers 5.15.0, and vLLM 0.27.1. vLLM is installed only in CUDA 13.2 B300/B200+ images; established CUDA 12.8 GPU profiles retain their existing Torch 2.10 stack. The initial vLLM policy uses a 12 GiB KV cache, one request at a time, and eager execution to keep graph-capture allocations predictable beside ComfyUI.

@@ -6,6 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import base64
 import binascii
+import gc
 from io import BytesIO
 import logging
 import math
@@ -388,6 +389,30 @@ def _apply_multimodal_chat_template(
     )
 
 
+def _multimodal_messages(prepared_inputs: PreparedLLMInputs) -> list[dict[str, Any]]:
+    """Build processor-native multimodal chat messages for either backend."""
+    messages: list[dict[str, Any]] = []
+    if prepared_inputs.system_prompt:
+        messages.append(
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": prepared_inputs.system_prompt}
+                ],
+            }
+        )
+    content: list[dict[str, Any]] = [
+        {"type": "image", "image": image} for image in prepared_inputs.images
+    ]
+    if prepared_inputs.video is not None:
+        content.append(
+            {"type": "video", "video": list(prepared_inputs.video.frames)}
+        )
+    content.append({"type": "text", "text": prepared_inputs.prompt})
+    messages.append({"role": "user", "content": content})
+    return messages
+
+
 class TransformersMultimodalBackend:
     """Run a curated image-text-to-text model through Hugging Face Transformers."""
 
@@ -410,30 +435,26 @@ class TransformersMultimodalBackend:
             local_files_only=True,
             trust_remote_code=False,
         )
+        model_options: dict[str, Any] = {
+            "local_files_only": True,
+            "trust_remote_code": False,
+            "dtype": dtype,
+            "device_map": "cuda",
+        }
+        attention_implementation = profile.backend_option(
+            "attention_implementation", "sdpa"
+        )
+        if attention_implementation:
+            model_options["attn_implementation"] = attention_implementation
         self.model = AutoModelForImageTextToText.from_pretrained(
             str(snapshot_path),
-            local_files_only=True,
-            trust_remote_code=False,
-            dtype=dtype,
-            attn_implementation="sdpa",
-        ).to("cuda")
+            **model_options,
+        )
         self.model.eval()
 
     def _messages(self, prepared_inputs: PreparedLLMInputs) -> list[dict[str, Any]]:
         """Build processor-native multimodal chat messages."""
-        messages: list[dict[str, Any]] = []
-        if prepared_inputs.system_prompt:
-            messages.append(
-                {"role": "system", "content": [{"type": "text", "text": prepared_inputs.system_prompt}]}
-            )
-        content: list[dict[str, Any]] = [
-            {"type": "image", "image": image} for image in prepared_inputs.images
-        ]
-        if prepared_inputs.video is not None:
-            content.append({"type": "video", "video": list(prepared_inputs.video.frames)})
-        content.append({"type": "text", "text": prepared_inputs.prompt})
-        messages.append({"role": "user", "content": content})
-        return messages
+        return _multimodal_messages(prepared_inputs)
 
     def generate(
         self,
@@ -496,9 +517,135 @@ class TransformersMultimodalBackend:
         torch.cuda.empty_cache()
 
 
+class VLLMMultimodalBackend:
+    """Run Qwen multimodal checkpoints through an in-container vLLM engine."""
+
+    def __init__(self, profile: LLMModelProfile, snapshot_path: Path) -> None:
+        """Load an immutable local snapshot under explicit co-residency budgets."""
+        from transformers import AutoProcessor
+        from vllm import LLM
+
+        self.profile = profile
+        self.snapshot_path = snapshot_path
+        self.processor = AutoProcessor.from_pretrained(
+            str(snapshot_path),
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+        quantization = str(profile.backend_option("quantization", "")).strip()
+        logger.info(
+            "Loading vLLM profile=%s path=%s quantization=%s max_model_len=%d "
+            "kv_cache_gib=%.1f.",
+            profile.profile_id,
+            snapshot_path,
+            quantization or "auto",
+            int(profile.backend_option("max_model_len", profile.max_context_tokens)),
+            int(profile.backend_option("kv_cache_memory_bytes", 0)) / _BYTES_PER_GIB,
+        )
+        self.llm = LLM(
+            model=str(snapshot_path),
+            tokenizer=str(snapshot_path),
+            trust_remote_code=False,
+            dtype=profile.dtype,
+            quantization=quantization or None,
+            max_model_len=int(
+                profile.backend_option("max_model_len", profile.max_context_tokens)
+            ),
+            kv_cache_memory_bytes=int(
+                profile.backend_option("kv_cache_memory_bytes", 12 * _BYTES_PER_GIB)
+            ),
+            enforce_eager=bool(profile.backend_option("enforce_eager", True)),
+            disable_custom_all_reduce=True,
+            generation_config="vllm",
+            limit_mm_per_prompt={"image": profile.max_images, "video": 1},
+        )
+
+    def _request(self, prepared_inputs: PreparedLLMInputs) -> dict[str, Any]:
+        """Build one vLLM prompt with direct in-process multimodal data."""
+        prompt = self.processor.apply_chat_template(
+            _multimodal_messages(prepared_inputs),
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        if not isinstance(prompt, str):
+            raise RuntimeError("The multimodal processor did not return a text prompt.")
+        multimodal_data: dict[str, Any] = {}
+        if prepared_inputs.images:
+            multimodal_data["image"] = list(prepared_inputs.images)
+        if prepared_inputs.video is not None:
+            import numpy as np
+
+            multimodal_data["video"] = np.stack(
+                [np.asarray(frame) for frame in prepared_inputs.video.frames]
+            )
+        request: dict[str, Any] = {"prompt": prompt}
+        if multimodal_data:
+            request["multi_modal_data"] = multimodal_data
+        return request
+
+    def generate(
+        self,
+        prepared_inputs: PreparedLLMInputs,
+        settings: LLMGenerationSettings,
+        progress_callback: Callable[[int], None],
+    ) -> BackendGenerationResult:
+        """Generate one response and report vLLM's final token count."""
+        from vllm import SamplingParams
+
+        progress_callback(0)
+        sampling_params = SamplingParams(
+            max_tokens=settings.max_new_tokens,
+            temperature=settings.temperature,
+            top_p=settings.top_p,
+            seed=settings.seed,
+        )
+        outputs = self.llm.generate(
+            [self._request(prepared_inputs)],
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        if len(outputs) != 1 or not outputs[0].outputs:
+            raise RuntimeError("vLLM returned no generation candidate.")
+        request_output = outputs[0]
+        candidate = request_output.outputs[0]
+        output_tokens = len(candidate.token_ids)
+        progress_callback(output_tokens)
+        return BackendGenerationResult(
+            text=str(candidate.text).strip(),
+            input_tokens=len(request_output.prompt_token_ids),
+            output_tokens=output_tokens,
+        )
+
+    def unload(self) -> None:
+        """Shut down the vLLM engine and release its CUDA allocations."""
+        import torch
+
+        llm = self.llm
+        self.llm = None
+        self.processor = None
+        shutdown = getattr(llm, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+        else:
+            engine = getattr(llm, "llm_engine", None)
+            engine_shutdown = getattr(engine, "shutdown", None)
+            if callable(engine_shutdown):
+                engine_shutdown()
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 def _default_backend_factory(profile: LLMModelProfile, snapshot_path: Path) -> LLMBackend:
-    """Create the built-in Transformers multimodal backend."""
-    return TransformersMultimodalBackend(profile, snapshot_path)
+    """Create the backend selected by the immutable compatibility profile."""
+    if profile.backend == "transformers":
+        return TransformersMultimodalBackend(profile, snapshot_path)
+    if profile.backend == "vllm":
+        return VLLMMultimodalBackend(profile, snapshot_path)
+    raise ValueError(
+        f"Modal LLM profile {profile.profile_id!r} selects unknown backend "
+        f"{profile.backend!r}."
+    )
 
 
 def _comfy_loaded_model_names() -> list[str]:
@@ -674,7 +821,7 @@ class ResidentLLMManager:
             generation_seconds = generation_finished_at - load_finished_at
             comfy_loaded_model_names = _comfy_loaded_model_names()
             metadata = {
-                "backend": "transformers",
+                "backend": profile.backend,
                 "profile": profile.profile_id,
                 "repository": profile.repository,
                 "revision": profile.revision,
@@ -772,7 +919,8 @@ def run_modal_llm_inference(
     progress_callback: Callable[[int], None],
 ) -> LLMInferenceResult:
     """Resolve a profile, normalize content, and invoke the resident manager."""
-    profile = get_llm_profile(model_profile)
+    storage_root = os.getenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", _DEFAULT_STORAGE_ROOT)
+    profile = get_llm_profile(model_profile, storage_root=storage_root)
     generation_settings = LLMGenerationSettings(
         max_new_tokens=_coerce_positive_int(max_new_tokens, "max_new_tokens", 32768),
         temperature=float(temperature),
@@ -818,6 +966,7 @@ __all__ = [
     "PreparedVideo",
     "ResidentLLMManager",
     "TransformersMultimodalBackend",
+    "VLLMMultimodalBackend",
     "extract_file_context",
     "get_resident_llm_manager",
     "prepare_images",

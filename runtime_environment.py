@@ -18,10 +18,11 @@ else:  # pragma: no cover - the stable cloud entrypoint imports this module top-
 
 logger = logging.getLogger(__name__)
 
-REMOTE_APP_PROTOCOL_VERSION = 7
+REMOTE_APP_PROTOCOL_VERSION = 8
 REMOTE_PYTHON_VERSION = "3.11"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
+REMOTE_VLLM_SPEC = "vllm==0.27.1"
 
 _REMOTE_APT_PACKAGES = (
     "libgl1",
@@ -29,6 +30,7 @@ _REMOTE_APT_PACKAGES = (
 )
 _REMOTE_RUNTIME_PACKAGES = (
     "aiohttp==3.13.3",
+    "accelerate==1.14.0",
     "alembic==1.18.4",
     "av==16.1.0",
     "blake3==1.0.9",
@@ -57,7 +59,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "sqlalchemy==2.0.46",
     "torchsde==0.2.6",
     "tqdm==4.67.3",
-    "transformers==5.1.0",
+    "transformers==5.15.0",
     REMOTE_HUGGINGFACE_HUB_SPEC,
 )
 _CUDA_128_TORCH_PACKAGES = (
@@ -65,10 +67,7 @@ _CUDA_128_TORCH_PACKAGES = (
     "torchvision==0.25.0",
     "torchaudio==2.10.0",
 )
-_CUDA_132_TORCH_PACKAGES = (
-    "torch==2.12.1",
-    "torchvision==0.27.1",
-)
+_CUDA_132_TORCH_PACKAGES = ("torch==2.13.0", "torchvision==0.28.0")
 _CUDA_132_CPU_AUDIO_PACKAGES = ("torchaudio==2.11.0+cpu",)
 _CUDA_132_MODAL_GPU_TYPES = frozenset({"B200+", "B300"})
 _IGNORED_DIRECTORY_NAMES = frozenset(
@@ -190,6 +189,13 @@ class RemoteTorchBuild:
 def remote_runtime_packages() -> tuple[str, ...]:
     """Return the exact ComfyUI support package set used by Modal images."""
     return _REMOTE_RUNTIME_PACKAGES
+
+
+def remote_accelerator_packages(modal_gpu: str) -> tuple[str, ...]:
+    """Return compiled inference packages supported by one remote GPU stack."""
+    if normalized_modal_gpu_type(modal_gpu) in _CUDA_132_MODAL_GPU_TYPES:
+        return (REMOTE_VLLM_SPEC,)
+    return ()
 
 
 def remote_apt_packages() -> tuple[str, ...]:
@@ -414,6 +420,7 @@ def build_remote_runtime_identity(
         "modal_sdk_spec": REMOTE_MODAL_SDK_SPEC,
         "apt_packages": list(remote_apt_packages()),
         "runtime_packages": list(remote_runtime_packages()),
+        "accelerator_packages": list(remote_accelerator_packages(settings.modal_gpu)),
         "torch_packages": list(torch_build.packages),
         "torch_build": {
             "cuda_version": torch_build.cuda_version,
