@@ -329,11 +329,18 @@ def resolve_model_profile(
         model_info,
         max_download_bytes=resolved_max_bytes,
     )
-    config = _read_config(
-        reference.repository,
-        revision,
-        hf_hub_download=hf_hub_download,
-    )
+    try:
+        config = _read_config(
+            reference.repository,
+            revision,
+            hf_hub_download=hf_hub_download,
+        )
+    except (HfHubHTTPError, OSError, ValueError) as exc:
+        raise ValueError(
+            f"Unable to download config.json for Hugging Face model "
+            f"{reference.display()!r}. For gated or private models, add "
+            f"HF_TOKEN to the Modal Secret: {exc}"
+        ) from exc
     profile = _generated_profile(
         reference=reference,
         revision=revision,

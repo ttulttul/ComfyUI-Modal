@@ -269,6 +269,44 @@ def test_cpu_resolver_rejects_unknown_architecture_before_weights(
     assert not (tmp_path / "llm_models").exists()
 
 
+def test_cpu_resolver_wraps_gated_config_download_error(
+    llm_resolver_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A gated config failure should cross Modal as a plain actionable ValueError."""
+
+    class FakeApi:
+        """Return metadata visible without gated file access."""
+
+        def model_info(self, repo_id: str, **kwargs: Any) -> dict[str, Any]:
+            """Return one otherwise compatible repository."""
+            del repo_id, kwargs
+            return {
+                "sha": "8" * 40,
+                "siblings": [
+                    {"rfilename": "config.json", "size": 1},
+                    {"rfilename": "model.safetensors", "size": 1024},
+                ],
+                "securityStatus": {"scansDone": True},
+            }
+
+    def denied_download(**kwargs: Any) -> str:
+        """Simulate gated file access after public metadata resolution."""
+        del kwargs
+        raise OSError("401 Unauthorized")
+
+    with pytest.raises(
+        ValueError,
+        match="Unable to download config.json.*HF_TOKEN",
+    ):
+        llm_resolver_module.resolve_model_profile(
+            "owner/gated",
+            tmp_path,
+            api=FakeApi(),
+            hf_hub_download=denied_download,
+        )
+
+
 def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     llm_staging_module: Any,
     tmp_path: Path,
@@ -814,11 +852,24 @@ def test_remote_dispatch_rewrites_hugging_face_id_to_generated_profile(
     }
 
     remote_modal_app_module._ensure_llm_profiles_staged(payload, "test-b300-app")
+    direct_inputs = remote_modal_app_module.serialize_node_inputs(
+        {"model_profile": requested_model, "prompt": "hello"}
+    )
+    rewritten_inputs = remote_modal_app_module.deserialize_node_inputs(
+        remote_modal_app_module._rewrite_staged_llm_kwargs_payload(
+            direct_inputs,
+            "test-b300-app",
+        )
+    )
 
     assert (
         payload["subgraph_prompt"]["1"]["inputs"]["model_profile"]
         == generated_profile_id
     )
+    assert rewritten_inputs == {
+        "model_profile": generated_profile_id,
+        "prompt": "hello",
+    }
     assert payload["requires_volume_reload"] is True
 
 

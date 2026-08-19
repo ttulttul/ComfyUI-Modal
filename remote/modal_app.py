@@ -5685,6 +5685,37 @@ def _ensure_llm_profiles_staged(
     )
 
 
+def _rewrite_staged_llm_kwargs_payload(
+    kwargs_payload: bytes,
+    deployment_app_name: str,
+) -> bytes:
+    """Replace a direct node input model reference with its staged profile ID."""
+    hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    if not isinstance(hydrated_inputs, Mapping):
+        return kwargs_payload
+    model_reference = hydrated_inputs.get("model_profile")
+    if not isinstance(model_reference, str) or not model_reference.strip():
+        return kwargs_payload
+    normalized_reference = model_reference.strip()
+    with _STAGED_LLM_PROFILES_LOCK:
+        stage_result = _STAGED_LLM_PROFILE_RESULTS.get(
+            (deployment_app_name, normalized_reference)
+        )
+    if stage_result is None:
+        return kwargs_payload
+    profile_id = str(stage_result.get("profile_id") or "").strip()
+    if not profile_id or profile_id == normalized_reference:
+        return kwargs_payload
+    rewritten_inputs = dict(hydrated_inputs)
+    rewritten_inputs["model_profile"] = profile_id
+    logger.info(
+        "Rewrote direct Modal LLM input model=%s to generated profile=%s.",
+        normalized_reference,
+        profile_id,
+    )
+    return serialize_node_inputs(rewritten_inputs)
+
+
 async def _invoke_bound_remote_engine_async(
     remote_engine: Any,
     payload: dict[str, Any],
@@ -6878,13 +6909,18 @@ def _invoke_remote_engine_payload_with_recovery(
 ) -> bytes:
     """Retry one payload call after auto-deploy when a stale deployed handle vanishes."""
     payload = dict(payload)
+    settings = _settings_for_payload(payload)
+    if llm_model_references_from_payload(payload):
+        kwargs_payload = _rewrite_staged_llm_kwargs_payload(
+            kwargs_payload,
+            modal_deployment_app_name(settings),
+        )
     payload.setdefault("capture_remote_outputs", True)
     payload.setdefault(
         "invocation_id",
         stable_remote_invocation_id(payload, kwargs_payload),
     )
     lookup_error_types = _modal_lookup_error_types()
-    settings = _settings_for_payload(payload)
     try:
         response = _invoke_remote_engine_payload(
             remote_engine,
