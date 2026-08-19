@@ -59,9 +59,13 @@ class FakeInputFile:
 class FakeResponseContent:
     """Async byte stream for a fake aiohttp response."""
 
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(self, payload: dict[str, Any] | bytes) -> None:
         """Serialize one response object."""
-        self._body = json.dumps(payload).encode("utf-8")
+        self._body = (
+            payload
+            if isinstance(payload, bytes)
+            else json.dumps(payload).encode("utf-8")
+        )
 
     async def iter_chunked(self, chunk_size: int) -> Any:
         """Yield the serialized body in bounded pieces."""
@@ -72,7 +76,9 @@ class FakeResponseContent:
 class FakeResponse:
     """Async context manager matching the aiohttp response surface used by the client."""
 
-    def __init__(self, payload: dict[str, Any], status: int = 200) -> None:
+    def __init__(
+        self, payload: dict[str, Any] | bytes, status: int = 200
+    ) -> None:
         """Configure the response JSON and status code."""
         self.status = status
         self.content = FakeResponseContent(payload)
@@ -89,15 +95,15 @@ class FakeResponse:
 class FakeSession:
     """Capture one aiohttp-style request call."""
 
-    def __init__(self, response: FakeResponse) -> None:
-        """Configure the response returned by the request method."""
-        self.response = response
+    def __init__(self, response: FakeResponse | list[FakeResponse]) -> None:
+        """Configure one or more responses returned by request calls."""
+        self.responses = response if isinstance(response, list) else [response]
         self.calls: list[dict[str, Any]] = []
 
     def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
         """Record and return one request context manager."""
         self.calls.append({"method": method, "url": url, **kwargs})
-        return self.response
+        return self.responses.pop(0)
 
 
 def _credentials(modal_endpoint_module: Any) -> Any:
@@ -517,6 +523,103 @@ def test_endpoint_error_message_redacts_modal_proxy_tokens(
     )
 
     assert detail == '{"error": "Webhook token not found: [redacted]"}'
+
+
+def test_http_client_retries_empty_503_until_modal_replica_is_ready(
+    modal_endpoint_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat Modal Server's empty 503 as a cold-start signal, not malformed JSON."""
+    client = modal_endpoint_module.ModalEndpointClient(
+        "https://example--model.us-west.modal.direct",
+        _credentials(modal_endpoint_module),
+        timeout_seconds=30,
+    )
+    session = FakeSession(
+        [
+            FakeResponse(b"", status=503),
+            FakeResponse({"data": [{"id": "org/model"}]}),
+        ]
+    )
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        """Record retry backoff without delaying the test."""
+        delays.append(delay)
+
+    monkeypatch.setattr(modal_endpoint_module.asyncio, "sleep", record_sleep)
+
+    response = asyncio.run(client._request_json(session, "GET", "/v1/models"))
+
+    assert response == {"data": [{"id": "org/model"}]}
+    assert delays == [1.0]
+    assert len(session.calls) == 2
+
+
+def test_http_client_reports_status_for_empty_nonretryable_response(
+    modal_endpoint_module: Any,
+) -> None:
+    """Preserve the HTTP status when an endpoint error has no JSON body."""
+    client = modal_endpoint_module.ModalEndpointClient(
+        "https://example--model.us-west.modal.direct",
+        _credentials(modal_endpoint_module),
+        timeout_seconds=30,
+    )
+    session = FakeSession(FakeResponse(b"", status=502))
+
+    with pytest.raises(RuntimeError, match="HTTP 502 with an empty response body"):
+        asyncio.run(client._request_json(session, "GET", "/v1/models"))
+
+
+def test_http_client_does_not_retry_application_json_503(
+    modal_endpoint_module: Any,
+) -> None:
+    """Surface an application-level 503 body instead of treating it as scale-up."""
+    client = modal_endpoint_module.ModalEndpointClient(
+        "https://example--model.us-west.modal.direct",
+        _credentials(modal_endpoint_module),
+        timeout_seconds=30,
+    )
+    session = FakeSession(
+        FakeResponse({"error": {"message": "model failed"}}, status=503)
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 503: model failed"):
+        asyncio.run(client._request_json(session, "GET", "/v1/models"))
+    assert len(session.calls) == 1
+
+
+def test_http_client_bounds_503_retries_by_total_timeout(
+    modal_endpoint_module: Any,
+) -> None:
+    """Stop cold-start polling at the node's total request deadline."""
+    client = modal_endpoint_module.ModalEndpointClient(
+        "https://example--model.us-west.modal.direct",
+        _credentials(modal_endpoint_module),
+        timeout_seconds=0.01,
+    )
+    session = FakeSession(FakeResponse(b"", status=503))
+
+    with pytest.raises(TimeoutError, match="stayed unavailable with HTTP 503"):
+        asyncio.run(client._request_json(session, "GET", "/v1/models"))
+
+
+def test_http_client_reports_bounded_non_json_error_body(
+    modal_endpoint_module: Any,
+) -> None:
+    """Include safe upstream text when an endpoint does not return JSON."""
+    client = modal_endpoint_module.ModalEndpointClient(
+        "https://example--model.us-west.modal.direct",
+        _credentials(modal_endpoint_module),
+        timeout_seconds=30,
+    )
+    session = FakeSession(FakeResponse(b"upstream unavailable", status=502))
+
+    with pytest.raises(
+        RuntimeError,
+        match="HTTP 502 with a non-JSON response: upstream unavailable",
+    ):
+        asyncio.run(client._request_json(session, "GET", "/v1/models"))
 
 
 def test_chat_response_text_supports_string_and_part_lists(
