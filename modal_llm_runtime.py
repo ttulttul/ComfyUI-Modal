@@ -556,6 +556,7 @@ class VLLMMultimodalBackend:
             ),
             enforce_eager=bool(profile.backend_option("enforce_eager", True)),
             disable_custom_all_reduce=True,
+            attention_backend="FLASH_ATTN",
             generation_config="vllm",
             limit_mm_per_prompt={"image": profile.max_images, "video": 1},
         )
@@ -599,11 +600,21 @@ class VLLMMultimodalBackend:
             top_p=settings.top_p,
             seed=settings.seed,
         )
-        outputs = self.llm.generate(
-            [self._request(prepared_inputs)],
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )
+        try:
+            outputs = self.llm.generate(
+                [self._request(prepared_inputs)],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+        except RuntimeError as error:
+            logger.exception(
+                "vLLM generation failed for profile=%s.",
+                self.profile.profile_id,
+            )
+            raise RuntimeError(
+                f"vLLM generation failed for profile {self.profile.profile_id!r}: "
+                f"{error}"
+            ) from None
         if len(outputs) != 1 or not outputs[0].outputs:
             raise RuntimeError("vLLM returned no generation candidate.")
         request_output = outputs[0]
