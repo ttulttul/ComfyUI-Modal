@@ -3019,6 +3019,119 @@ def test_modal_cloud_rehydrates_conditioning_bridge_refs_from_durable_record_wit
     assert resolution_stats.session_restore_writes == 1
 
 
+@pytest.mark.parametrize(
+    ("io_type", "node_id", "class_type", "node_inputs"),
+    [
+        ("NOISE", "15", "RandomNoise", {"noise_seed": 42}),
+        ("SAMPLER", "17", "KSamplerSelect", {"sampler_name": "euler"}),
+    ],
+)
+def test_modal_cloud_rehydrates_literal_sampling_strategy_bridges_without_replay(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    io_type: str,
+    node_id: str,
+    class_type: str,
+    node_inputs: dict[str, Any],
+) -> None:
+    """Literal NOISE and SAMPLER strategy nodes should rebuild without producer replay."""
+    target_handle = modal_cloud_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
+        bridge_key=f"RSB_{io_type.lower()}_bridge",
+        node_id=node_id,
+        output_index=0,
+        session_id="session-source",
+    )
+    record = modal_cloud_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "image-preview-component",
+            "execute_node_ids": ["251"],
+            "subgraph_prompt": {
+                "14": {
+                    "class_type": "SamplerCustomAdvanced",
+                    "inputs": {"noise": ["15", 0], "sampler": ["17", 0]},
+                },
+                "15": {
+                    "class_type": "RandomNoise",
+                    "inputs": {"noise_seed": 42},
+                },
+                "17": {
+                    "class_type": "KSamplerSelect",
+                    "inputs": {"sampler_name": "euler"},
+                },
+                "250": {
+                    "class_type": "VAEDecode",
+                    "inputs": {"samples": ["14", 0]},
+                },
+                "251": {
+                    "class_type": "ImageFromBatch",
+                    "inputs": {"image": ["250", 0]},
+                },
+            },
+        },
+        hydrated_inputs={},
+        node_id=node_id,
+        output_index=0,
+        io_type=io_type,
+        output_value=object(),
+    )
+    assert record.recovery_kind is modal_cloud_module.RemoteSessionBridgeRecoveryKind.SINGLE_NODE_PLAN
+    assert record.rehydration_plan == {
+        "kind": "single_node_output",
+        "node_data": {"class_type": class_type},
+        "node_inputs": node_inputs,
+    }
+    execute_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_remote_session_bridge_record",
+        lambda bridge_key: record,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("literal strategy bridge should not replay its producer component")
+        ),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_execute_node_locally_raw",
+        lambda node_data, kwargs_payload, **kwargs: (
+            execute_calls.append((dict(node_data), dict(kwargs_payload))),
+            (f"restored-{io_type.lower()}",),
+        )[1],
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_store_remote_session_bridge_value",
+        lambda bridge_key, value: None,
+    )
+    resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = modal_cloud_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            custom_nodes_root=None,
+            cancellation_event=None,
+            interrupt_store=None,
+            interrupt_flag_key=None,
+            resolution_stats=resolution_stats,
+        )
+    finally:
+        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert restored_value == f"restored-{io_type.lower()}"
+    assert execute_calls == [({"class_type": class_type}, node_inputs)]
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.replay_count == 0
+
+
 def test_modal_cloud_rehydrates_sampler_latent_bridge_refs_from_durable_record_without_replay(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -3351,11 +3464,11 @@ def test_modal_cloud_rehydrates_linked_model_bridge_with_non_sampler_subgraph_pl
     assert resolution_stats.replay_count == 0
 
 
-def test_modal_cloud_refuses_sampler_bridge_replay(
+def test_modal_cloud_refuses_sampler_ancestor_bridge_replay(
     modal_cloud_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Lost sampler bridge values should fail loudly instead of replaying sampling work."""
+    """Producer replay should fail when a terminal node's dependency closure samples."""
     target_handle = modal_cloud_module.RemoteSessionHandle(
         session_id="session-target",
         prompt_id="prompt-1",
@@ -3363,7 +3476,7 @@ def test_modal_cloud_refuses_sampler_bridge_replay(
     )
     bridge_ref = modal_cloud_module.RemoteSessionBridgeRef(
         bridge_key="RSB_sampler_bridge",
-        node_id="sampler-1",
+        node_id="unsupported-bridge",
         output_index=0,
         session_id="session-source",
     )
@@ -3372,16 +3485,21 @@ def test_modal_cloud_refuses_sampler_bridge_replay(
         "_load_remote_session_bridge_record",
         lambda bridge_key: modal_cloud_module.RemoteSessionBridgeRecord(
             bridge_key=bridge_key,
-            node_id="sampler-1",
+            node_id="unsupported-bridge",
             output_index=0,
             producer_payload={
                 "component_id": "sampler-component",
-                "execute_node_ids": ["sampler-1"],
+                "execute_node_ids": ["251"],
                 "subgraph_prompt": {
-                    "sampler-1": {
-                        "class_type": "KSampler",
-                        "inputs": {},
-                    }
+                    "14": {"class_type": "KSampler", "inputs": {}},
+                    "250": {
+                        "class_type": "VAEDecode",
+                        "inputs": {"samples": ["14", 0]},
+                    },
+                    "251": {
+                        "class_type": "ImageFromBatch",
+                        "inputs": {"image": ["250", 0]},
+                    },
                 },
             },
             producer_inputs={},
@@ -9388,6 +9506,119 @@ def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_rec
     assert resolution_stats.session_restore_writes == 1
 
 
+@pytest.mark.parametrize(
+    ("io_type", "node_id", "class_type", "node_inputs"),
+    [
+        ("NOISE", "15", "RandomNoise", {"noise_seed": 42}),
+        ("SAMPLER", "17", "KSamplerSelect", {"sampler_name": "euler"}),
+    ],
+)
+def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_replay(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+    io_type: str,
+    node_id: str,
+    class_type: str,
+    node_inputs: dict[str, Any],
+) -> None:
+    """The local fallback should rebuild literal sampling strategies without replay."""
+    target_handle = remote_modal_app_module.RemoteSessionHandle(
+        session_id="session-target",
+        prompt_id="prompt-1",
+        owner_component_id="component-1",
+    )
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key=f"RSB_local_{io_type.lower()}_bridge",
+        node_id=node_id,
+        output_index=0,
+        session_id="session-source",
+    )
+    record = remote_modal_app_module._build_remote_session_bridge_record(
+        payload={
+            "component_id": "image-preview-component",
+            "execute_node_ids": ["251"],
+            "subgraph_prompt": {
+                "14": {
+                    "class_type": "SamplerCustomAdvanced",
+                    "inputs": {"noise": ["15", 0], "sampler": ["17", 0]},
+                },
+                "15": {
+                    "class_type": "RandomNoise",
+                    "inputs": {"noise_seed": 42},
+                },
+                "17": {
+                    "class_type": "KSamplerSelect",
+                    "inputs": {"sampler_name": "euler"},
+                },
+                "250": {
+                    "class_type": "VAEDecode",
+                    "inputs": {"samples": ["14", 0]},
+                },
+                "251": {
+                    "class_type": "ImageFromBatch",
+                    "inputs": {"image": ["250", 0]},
+                },
+            },
+        },
+        hydrated_inputs={},
+        node_id=node_id,
+        output_index=0,
+        io_type=io_type,
+        output_value=object(),
+    )
+    assert (
+        record.recovery_kind
+        is remote_modal_app_module.RemoteSessionBridgeRecoveryKind.SINGLE_NODE_PLAN
+    )
+    assert record.rehydration_plan == {
+        "kind": "single_node_output",
+        "node_data": {"class_type": class_type},
+        "node_inputs": node_inputs,
+    }
+    execute_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        "get_record",
+        lambda bridge_key: record,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_subgraph_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("literal strategy bridge should not replay its producer component")
+        ),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_execute_node_locally_raw",
+        lambda node_data, kwargs_payload, **kwargs: (
+            execute_calls.append((dict(node_data), dict(kwargs_payload))),
+            (f"restored-{io_type.lower()}",),
+        )[1],
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_store_remote_session_bridge_value",
+        lambda bridge_key, value: None,
+    )
+    resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
+
+    try:
+        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+            bridge_ref,
+            target_session_handle=target_handle,
+            node_mapping=None,
+            resolution_stats=resolution_stats,
+        )
+    finally:
+        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+
+    assert restored_value == f"restored-{io_type.lower()}"
+    assert execute_calls == [({"class_type": class_type}, node_inputs)]
+    assert resolution_stats.durable_bridge_hits == 1
+    assert resolution_stats.replay_count == 0
+
+
 def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without_replay(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -9605,11 +9836,11 @@ def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgra
     assert resolution_stats.replay_count == 0
 
 
-def test_local_remote_app_refuses_sampler_bridge_replay(
+def test_local_remote_app_refuses_sampler_ancestor_bridge_replay(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """The local fallback should fail loudly rather than replaying sampler bridge producers."""
+    """The local fallback should reject replay when a terminal depends on sampling."""
     target_handle = remote_modal_app_module.RemoteSessionHandle(
         session_id="session-target",
         prompt_id="prompt-1",
@@ -9617,7 +9848,7 @@ def test_local_remote_app_refuses_sampler_bridge_replay(
     )
     bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
         bridge_key="RSB_local_sampler_bridge",
-        node_id="sampler-1",
+        node_id="unsupported-bridge",
         output_index=0,
         session_id="session-source",
     )
@@ -9626,16 +9857,21 @@ def test_local_remote_app_refuses_sampler_bridge_replay(
         "get_record",
         lambda bridge_key: remote_modal_app_module.RemoteSessionBridgeRecord(
             bridge_key=bridge_key,
-            node_id="sampler-1",
+            node_id="unsupported-bridge",
             output_index=0,
             producer_payload={
                 "component_id": "sampler-component",
-                "execute_node_ids": ["sampler-1"],
+                "execute_node_ids": ["251"],
                 "subgraph_prompt": {
-                    "sampler-1": {
-                        "class_type": "KSampler",
-                        "inputs": {},
-                    }
+                    "14": {"class_type": "KSampler", "inputs": {}},
+                    "250": {
+                        "class_type": "VAEDecode",
+                        "inputs": {"samples": ["14", 0]},
+                    },
+                    "251": {
+                        "class_type": "ImageFromBatch",
+                        "inputs": {"image": ["250", 0]},
+                    },
                 },
             },
             producer_inputs={},
