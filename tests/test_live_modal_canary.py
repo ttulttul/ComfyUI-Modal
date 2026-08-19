@@ -247,6 +247,69 @@ def test_live_modal_resident_llm_image_file_video_and_warm_reuse(
     assert second_metadata["resident_profiles"] == ["smolvlm2-2.2b-instruct"]
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected_revision", "expected_backend"),
+    [
+        (
+            "orcarouter/Qwen3.8-27B-Uncensored-FP8",
+            "9228df5c6c9c509e1019f83b4e085cf643118bac",
+            "vllm",
+        ),
+        (
+            "meta-models/Muse-Glimmer-30B",
+            "a4e59da52a7bc87ae7251dd5545c0dd437c44b68",
+            "transformers",
+        ),
+        (
+            "Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4",
+            "faf7945020c138c8ef864ab1644273f3158f85fa",
+            "vllm",
+        ),
+    ],
+)
+def test_live_generated_profile_model_inference(
+    live_modal_canary: _LiveModalCanaryContext,
+    model_id: str,
+    expected_revision: str,
+    expected_backend: str,
+) -> None:
+    """Each requested Hub ID should resolve, stage, and understand one image."""
+    import json
+
+    import torch
+
+    image = torch.zeros((1, 48, 48, 3), dtype=torch.float32)
+    image[:, 8:40, 8:40, 1] = 1.0
+    outputs = live_modal_canary.invoke_node(
+        "generated-profile-" + expected_backend,
+        "ModalLLM",
+        {
+            "prompt": (
+                "State the dominant colour of the central square in one short sentence."
+            ),
+            "model_profile": model_id,
+            "images": image,
+            "system_prompt": "Answer plainly.",
+            "max_new_tokens": 24,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 0,
+            "video_frames": 1,
+            "reserve_free_vram_gb": 48.0,
+            "keep_model_loaded": False,
+        },
+    )
+    metadata = json.loads(outputs[1])
+
+    assert isinstance(outputs[0], str) and outputs[0].strip()
+    assert metadata["backend"] == expected_backend
+    assert metadata["repository"] == model_id
+    assert metadata["revision"] == expected_revision
+    assert metadata["profile"].startswith("hf-")
+    assert metadata["image_count"] == 1
+    assert metadata["output_tokens"] > 0
+
+
 def test_live_modal_llm_and_comfy_vae_are_co_resident(
     live_modal_canary: _LiveModalCanaryContext,
     sync_engine_module: Any,
