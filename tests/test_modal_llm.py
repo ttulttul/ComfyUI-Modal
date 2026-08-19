@@ -248,7 +248,8 @@ def test_transformers_processor_does_not_resample_predecoded_video(
     )
 
     assert result == "tokenized"
-    assert calls[0][1]["processor_kwargs"] == {"do_sample_frames": False}
+    assert calls[0][1]["do_sample_frames"] is False
+    assert "processor_kwargs" not in calls[0][1]
 
 
 @dataclass
