@@ -2,6 +2,9 @@
 
 ## 2026-08-18
 
+- Same-worker LLM inference needs a pre-GPU staging boundary, not a lazy model download inside the node. Discover fixed revision-pinned profiles in the serialized remote payload, download them through a single-container CPU class, commit the shared Volume, and force the GPU worker to reload that revision before model construction. Otherwise first use spends expensive GPU time waiting on network I/O and a warm mount may not see the completed snapshot.
+- A deployment-owned node cannot rely on the optional custom-node archive to register itself inside the headless worker. Register the shipped `ModalLLM` class explicitly after each ComfyUI node-registry initialization path while preserving any already-imported custom registration; this keeps the production node available even when custom-node sync is disabled.
+- Co-resident Transformers models are visible to CUDA free-memory accounting but invisible to ComfyUI's managed-model eviction list. Keep them in a separate serialized LRU, ask ComfyUI to release idle managed models before a cold LLM load, enforce a real free-VRAM reserve, and expose both resident sets in telemetry. Co-residency increases GPU utilization but should not be described as concurrent kernel execution.
 - A local ComfyUI `.env` file should remain outside the Modal image and synced custom-node bundle. Attach an existing named Modal `Secret` to the deployed `RemoteEngine` class so all contained key-value pairs become worker environment variables, and include only the collection name in the runtime fingerprint so changing `COMFY_MODAL_SECRET_NAME` replaces a deployment that references the old collection.
 
 ## 2026-08-15

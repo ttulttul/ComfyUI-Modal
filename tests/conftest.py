@@ -129,6 +129,30 @@ def modal_endpoint_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def llm_profiles_module(extension_package: object) -> object:
+    """Return the curated Modal LLM profile registry module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_profiles")
+
+
+@pytest.fixture(scope="session")
+def llm_staging_module(extension_package: object) -> object:
+    """Return the CPU-side Modal LLM staging module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_staging")
+
+
+@pytest.fixture(scope="session")
+def modal_llm_runtime_module(extension_package: object) -> object:
+    """Return the resident Modal LLM runtime module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.modal_llm_runtime")
+
+
+@pytest.fixture(scope="session")
+def modal_llm_node_module(extension_package: object) -> object:
+    """Return the V3 resident Modal LLM node module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.modal_llm_node")
+
+
+@pytest.fixture(scope="session")
 def remote_modal_app_module(extension_package: object) -> object:
     """Return the remote execution module."""
     return importlib.import_module(f"{PACKAGE_NAME}.remote.modal_app")

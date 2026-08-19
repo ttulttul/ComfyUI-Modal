@@ -46,6 +46,7 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     COMFYUI_RUNTIME_SOURCE_DIRECTORIES as _COMFYUI_IMAGE_RUNTIME_DIRECTORIES,
     COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
     REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
+    REMOTE_HUGGINGFACE_HUB_SPEC,
     REMOTE_PYTHON_VERSION,
     RemoteTorchBuild as _RemoteTorchBuild,
     build_remote_runtime_identity,
@@ -54,6 +55,7 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     remote_runtime_packages as _comfyui_runtime_packages,
     select_remote_torch_build as _select_remote_torch_build,
 )
+from llm_staging import stage_model_profile  # noqa: E402 - paths are bootstrapped above.
 from durable_state import (  # noqa: E402 - paths are bootstrapped above.
     DurableObjectCommitBatch,
     DurableObjectRef,
@@ -3136,6 +3138,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                     )
                 _install_model_state_dict_compatibility_wrappers()
                 _install_loader_cache_wrappers()
+                _register_modal_sync_runtime_nodes(nodes_module)
                 _COMFY_RUNTIME_BASE_INITIALIZED = True
                 if custom_nodes_root_key is not None:
                     _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
@@ -3148,6 +3151,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                 )
                 _install_model_state_dict_compatibility_wrappers()
                 _install_loader_cache_wrappers()
+                _register_modal_sync_runtime_nodes(nodes_module)
                 return
 
             _register_custom_nodes_root(custom_nodes_root)
@@ -3156,7 +3160,27 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                 asyncio.run(nodes_module.init_external_custom_nodes())
             _install_model_state_dict_compatibility_wrappers()
             _install_loader_cache_wrappers()
+            _register_modal_sync_runtime_nodes(nodes_module)
             _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
+
+
+def _register_modal_sync_runtime_nodes(nodes_module: Any) -> None:
+    """Register nodes shipped in the deployment image without custom-node sync."""
+    from llm_profiles import MODAL_LLM_NODE_ID
+    from modal_llm_node import ModalLLM
+
+    existing_node = nodes_module.NODE_CLASS_MAPPINGS.get(MODAL_LLM_NODE_ID)
+    if existing_node is not None and existing_node is not ModalLLM:
+        logger.info(
+            "Preserving custom-node registration for %s instead of replacing it.",
+            MODAL_LLM_NODE_ID,
+        )
+        return
+    nodes_module.NODE_CLASS_MAPPINGS[MODAL_LLM_NODE_ID] = ModalLLM
+    display_mappings = getattr(nodes_module, "NODE_DISPLAY_NAME_MAPPINGS", None)
+    if isinstance(display_mappings, dict):
+        display_mappings[MODAL_LLM_NODE_ID] = "Modal LLM"
+    logger.info("Registered deployment-owned remote node %s.", MODAL_LLM_NODE_ID)
 
 
 def _prompt_missing_node_class_types(
@@ -6569,6 +6593,12 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
     return {
         "COMFY_MODAL_APP_NAME": settings.app_name,
         "COMFY_MODAL_GPU": settings.modal_gpu,
+        "COMFY_MODAL_REMOTE_STORAGE_ROOT": getattr(
+            settings,
+            "remote_storage_root",
+            "/storage",
+        ),
+        "COMFY_MODAL_REMOTE_WORKER": "1",
         "COMFY_MODAL_SECRET_NAME": getattr(
             settings,
             "modal_secret_name",
@@ -6582,6 +6612,12 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
         ),
         "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS": str(settings.execution_timeout_seconds),
         "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS": str(settings.startup_timeout_seconds),
+        "COMFY_MODAL_LLM_MAX_RESIDENT_MODELS": str(
+            getattr(settings, "llm_max_resident_models", 2)
+        ),
+        "COMFY_MODAL_LLM_RESERVE_FREE_GB": str(
+            getattr(settings, "llm_reserve_free_vram_gb", 24.0)
+        ),
     }
 
 
@@ -6683,6 +6719,60 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         logger.warning(
             "No local ComfyUI checkout was discovered; remote Modal execution may fail to import ComfyUI core modules."
         )
+
+    stager_image = (
+        modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
+        .env(
+            {
+                "COMFY_MODAL_REMOTE_STORAGE_ROOT": settings.remote_storage_root,
+                "HF_HUB_DISABLE_TELEMETRY": "1",
+            }
+        )
+        .pip_install(REMOTE_HUGGINGFACE_HUB_SPEC)
+        .add_local_dir(
+            _REPO_ROOT,
+            remote_path="/root/comfyui_modal_sync_repo",
+            ignore=_should_ignore_repo_path,
+        )
+    )
+
+    @app.cls(
+        image=stager_image,
+        volumes={settings.remote_storage_root: vol},
+        secrets=[modal_secret],
+        cpu=4.0,
+        memory=16384,
+        max_containers=1,
+        scaledown_window=300,
+        timeout=7200,
+    )
+    @modal.concurrent(max_inputs=1)
+    class ModelStager:
+        """Stage pinned Hugging Face snapshots without consuming GPU time."""
+
+        @modal.method()
+        def stage_profiles(self, profile_ids: list[str]) -> list[dict[str, Any]]:
+            """Download missing profiles, commit the Volume, and return stage metadata."""
+            results: list[dict[str, Any]] = []
+            for profile_id in profile_ids:
+                result = stage_model_profile(
+                    profile_id,
+                    settings.remote_storage_root,
+                )
+                results.append(
+                    {
+                        "profile_id": result.profile_id,
+                        "repository": result.repository,
+                        "revision": result.revision,
+                        "path": result.path,
+                        "downloaded": result.downloaded,
+                        "elapsed_seconds": result.elapsed_seconds,
+                    }
+                )
+            if results:
+                vol.commit()
+            logger.info("Modal LLM CPU staging completed for profiles=%s.", profile_ids)
+            return results
 
     @app.cls(**_remote_engine_cls_options(settings, vol, image, modal_secret))
     @modal.concurrent(max_inputs=1)

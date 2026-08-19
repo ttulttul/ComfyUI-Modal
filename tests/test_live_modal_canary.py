@@ -76,6 +76,24 @@ class _LiveModalCanaryContext:
         assert isinstance(outputs[1], dict)
         return outputs[0], outputs[1]
 
+    def invoke_node(
+        self,
+        name: str,
+        class_type: str,
+        inputs: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        """Invoke one ordinary node through the deployed RemoteEngine."""
+        payload = self.payload(name)
+        payload.pop("payload_kind", None)
+        payload["class_type"] = class_type
+        payload["modal_gpu"] = self.settings.modal_gpu
+        response = self.remote_module.invoke_remote_engine(
+            payload,
+            self.remote_module.serialize_node_inputs(inputs),
+            allow_implicit_mapping=False,
+        )
+        return self.remote_module.deserialize_node_outputs(response)
+
     def cleanup_shared_state(self) -> None:
         """Remove invocation and barrier metadata created by the live canaries."""
         if not self.shared_store_keys:
@@ -134,6 +152,210 @@ def test_live_modal_runtime_handshake(live_modal_canary: _LiveModalCanaryContext
     assert live_modal_canary.remote_module._is_runtime_version_payload_current(
         version_payload
     )
+
+
+def test_live_modal_resident_llm_image_file_video_and_warm_reuse(
+    live_modal_canary: _LiveModalCanaryContext,
+) -> None:
+    """The B300 worker should run every supported modality and reuse resident weights."""
+    import base64
+    from fractions import Fraction
+    import json
+
+    import torch
+    from comfy_api.latest._input_impl.video_types import VideoFromComponents
+    from comfy_api.latest._util import VideoComponents
+
+    image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+    image[:, 8:56, 8:56, 0] = 1.0
+    file_payload = {
+        "filename": "instruction.txt",
+        "file_data": (
+            "data:text/plain;base64,"
+            + base64.b64encode(b"Reply with one short sentence.").decode("ascii")
+        ),
+        "type": "input_file",
+    }
+    first_outputs = live_modal_canary.invoke_node(
+        "llm-image-file",
+        "ModalLLM",
+        {
+            "prompt": "Describe the dominant colour and use the attached instruction.",
+            "model_profile": "smolvlm2-2.2b-instruct",
+            "images": image,
+            "files": [file_payload],
+            "system_prompt": "Answer plainly.",
+            "max_new_tokens": 32,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 0,
+            "video_frames": 3,
+            "reserve_free_vram_gb": 24.0,
+            "keep_model_loaded": True,
+        },
+    )
+    first_metadata = json.loads(first_outputs[1])
+
+    video = VideoFromComponents(
+        VideoComponents(
+            images=torch.stack(
+                [
+                    torch.zeros((48, 48, 3), dtype=torch.float32),
+                    torch.ones((48, 48, 3), dtype=torch.float32),
+                    torch.zeros((48, 48, 3), dtype=torch.float32),
+                ]
+            ),
+            audio=None,
+            frame_rate=Fraction(1, 1),
+        ),
+        bit_depth=8,
+    )
+    second_outputs = live_modal_canary.invoke_node(
+        "llm-video-warm",
+        "ModalLLM",
+        {
+            "prompt": "Briefly describe how the frames change.",
+            "model_profile": "smolvlm2-2.2b-instruct",
+            "video": video,
+            "system_prompt": "",
+            "max_new_tokens": 32,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 0,
+            "video_frames": 3,
+            "reserve_free_vram_gb": 24.0,
+            "keep_model_loaded": True,
+        },
+    )
+    second_metadata = json.loads(second_outputs[1])
+
+    assert isinstance(first_outputs[0], str) and first_outputs[0].strip()
+    assert first_metadata["image_count"] == 1
+    assert first_metadata["file_count"] == 1
+    assert first_metadata["output_tokens"] > 0
+    assert isinstance(second_outputs[0], str) and second_outputs[0].strip()
+    assert second_metadata["video_frame_count"] == 3
+    assert second_metadata["cache_hit"] is True
+    assert second_metadata["resident_profiles"] == ["smolvlm2-2.2b-instruct"]
+
+
+def test_live_modal_llm_and_comfy_vae_are_co_resident(
+    live_modal_canary: _LiveModalCanaryContext,
+    sync_engine_module: Any,
+) -> None:
+    """A real ComfyUI image VAE and the Transformers LLM should share one B300 worker."""
+    import json
+    from pathlib import Path
+
+    vae_path = Path(
+        os.getenv(
+            "COMFY_MODAL_LLM_CANARY_VAE",
+            "/Users/ksimpson/git/Latest_ComfyUI/models/vae/flux2-vae.safetensors",
+        )
+    ).expanduser()
+    if not vae_path.is_file():
+        pytest.skip(f"resident LLM co-residency canary VAE is missing: {vae_path}")
+    if live_modal_canary.settings.max_containers != 1:
+        pytest.skip("co-residency canary requires COMFY_MODAL_MAX_CONTAINERS=1")
+
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(
+        live_modal_canary.settings
+    )
+    synced_vae = sync_engine.sync_file(vae_path)
+
+    initial_outputs = live_modal_canary.invoke_node(
+        "llm-before-vae",
+        "ModalLLM",
+        {
+            "prompt": "Reply with the word ready.",
+            "model_profile": "smolvlm2-2.2b-instruct",
+            "max_new_tokens": 8,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 0,
+            "video_frames": 1,
+            "reserve_free_vram_gb": 24.0,
+            "keep_model_loaded": True,
+        },
+    )
+    assert json.loads(initial_outputs[1])["resident_profiles"] == [
+        "smolvlm2-2.2b-instruct"
+    ]
+
+    vae_payload = live_modal_canary.payload("comfy-vae")
+    vae_payload.update(
+        {
+            "payload_kind": "subgraph",
+            "modal_gpu": live_modal_canary.settings.modal_gpu,
+            "component_node_ids": ["empty-image", "vae-loader", "vae-encode"],
+            "subgraph_prompt": {
+                "empty-image": {
+                    "class_type": "EmptyImage",
+                    "inputs": {
+                        "width": 64,
+                        "height": 64,
+                        "batch_size": 1,
+                        "color": 0x336699,
+                    },
+                },
+                "vae-loader": {
+                    "class_type": "VAELoader",
+                    "inputs": {"vae_name": synced_vae.remote_path},
+                },
+                "vae-encode": {
+                    "class_type": "VAEEncode",
+                    "inputs": {
+                        "pixels": ["empty-image", 0],
+                        "vae": ["vae-loader", 0],
+                    },
+                },
+            },
+            "boundary_inputs": [],
+            "boundary_outputs": [
+                {
+                    "proxy_output_name": "latent",
+                    "node_id": "vae-encode",
+                    "output_index": 0,
+                    "io_type": "LATENT",
+                    "is_list": False,
+                }
+            ],
+            "execute_node_ids": ["vae-encode"],
+            "extra_data": {},
+            "uploaded_volume_paths": [synced_vae.remote_path],
+            "requires_volume_reload": True,
+            "volume_reload_marker": f"llm-vae-{synced_vae.sha256}",
+        }
+    )
+    vae_response = live_modal_canary.remote_module.invoke_remote_engine(
+        vae_payload,
+        live_modal_canary.remote_module.serialize_node_inputs({}),
+        allow_implicit_mapping=False,
+    )
+    vae_outputs = live_modal_canary.remote_module.deserialize_node_outputs(vae_response)
+    assert len(vae_outputs) == 1
+    assert "samples" in vae_outputs[0]
+
+    final_outputs = live_modal_canary.invoke_node(
+        "llm-after-vae",
+        "ModalLLM",
+        {
+            "prompt": "Reply with the word resident.",
+            "model_profile": "smolvlm2-2.2b-instruct",
+            "max_new_tokens": 8,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 0,
+            "video_frames": 1,
+            "reserve_free_vram_gb": 24.0,
+            "keep_model_loaded": True,
+        },
+    )
+    final_metadata = json.loads(final_outputs[1])
+
+    assert final_metadata["cache_hit"] is True
+    assert final_metadata["resident_profiles"] == ["smolvlm2-2.2b-instruct"]
+    assert final_metadata["comfy_loaded_model_count"] >= 1
 
 
 def test_live_modal_binary_transport_and_durable_replay(
