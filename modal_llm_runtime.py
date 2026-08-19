@@ -557,8 +557,7 @@ class VLLMMultimodalBackend:
             enforce_eager=bool(profile.backend_option("enforce_eager", True)),
             disable_custom_all_reduce=True,
             attention_config={
-                "backend": "FLASH_ATTN",
-                "flash_attn_version": 3,
+                "backend": "TRITON_ATTN",
             },
             generation_config="vllm",
             limit_mm_per_prompt={"image": profile.max_images, "video": 1},
