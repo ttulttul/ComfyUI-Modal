@@ -49,6 +49,8 @@ const transformedSource = `${[
   "  markPromptTerminal,",
   "  patchQueuePrompt,",
   "  setRemoteFlag,",
+  "  synchronizeRemoteFlagFromWidget,",
+  "  extractRemoteNodeIds,",
   "  setSandwichedLocalNodeIds,",
   "  isSandwichedLocalNode,",
   "  setAllEligibleWorkflowNodesRemote,",
@@ -337,6 +339,38 @@ assert.equal(toggleSyncNode.__modalToggleWidget.value, true);
 modalToggle.setRemoteFlag(toggleSyncNode, false);
 assert.equal(toggleSyncNode.properties.is_modal_remote, false);
 assert.equal(toggleSyncNode.__modalToggleWidget.value, false);
+
+const restoredToggleNode = {
+  comfyClass: "ModalLLM",
+  properties: { is_modal_remote: true },
+  __modalToggleWidget: { value: false },
+};
+modalToggle.synchronizeRemoteFlagFromWidget(restoredToggleNode);
+assert.equal(restoredToggleNode.properties.is_modal_remote, false);
+assert.deepEqual(
+  modalToggle.extractRemoteNodeIds({
+    nodes: [
+      {
+        id: 9,
+        properties: { is_modal_remote: true },
+        widgets_values_named: { "Run on Modal": false },
+      },
+    ],
+  }),
+  [],
+);
+assert.deepEqual(
+  modalToggle.extractRemoteNodeIds({
+    nodes: [
+      {
+        id: 9,
+        properties: { is_modal_remote: false },
+        widgets_values_named: { "Run on Modal": true },
+      },
+    ],
+  }),
+  ["9"],
+);
 
 const eligibleNode = {
   id: "eligible",

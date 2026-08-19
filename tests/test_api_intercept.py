@@ -3084,6 +3084,46 @@ def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
     ) == {"100:11"}
 
 
+def test_extract_remote_node_ids_prefers_visible_toggle_over_stale_property(
+    api_intercept_module: Any,
+    settings_module: Any,
+) -> None:
+    """A restored disabled widget must prevent stale metadata from starting Modal."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=Path("/tmp/storage"),
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=Path("/tmp/custom_nodes"),
+    )
+    workflow = {
+        "nodes": [
+            {
+                "id": 9,
+                "properties": {"is_modal_remote": True},
+                "widgets_values_named": {"Run on Modal": False},
+            },
+            {
+                "id": 10,
+                "properties": {"is_modal_remote": False},
+                "widgets_values_named": {"Run on Modal": True},
+            },
+        ]
+    }
+
+    assert api_intercept_module.extract_remote_node_ids(workflow, settings) == {"10"}
+
+
 def test_extract_remote_node_ids_maps_subgraph_container_to_descendant_prompt_nodes(
     api_intercept_module: Any,
     settings_module: Any,

@@ -116,6 +116,7 @@ For credential safety, the node accepts only HTTPS `modal.direct` origins, refus
 
 - Leave `Run on Modal` disabled to run the node locally on Apple Silicon through MLX-VLM. This is intended for MacBooks whose unified memory can hold an LLM while heavier image or video nodes run on Modal.
 - Enable `Run on Modal` to run the node inside the same Modal GPU worker as its surrounding remote component.
+- The visible toggle is authoritative at queue time. A disabled LLM node bypasses Modal setup, deployment, asset sync, and remote dispatch entirely, even if an older saved workflow contains stale remote-marker metadata.
 
 The queue planner treats an unmarked Modal LLM as an ordinary local node, including when it sits between two remote regions. Inputs and outputs cross those region boundaries through the existing transport layer; the model itself stays on the Mac.
 

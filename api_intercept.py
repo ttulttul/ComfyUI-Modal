@@ -49,6 +49,7 @@ _MODAL_UI_EVENT_LIMIT_PER_CLIENT = 512
 _MODAL_UI_EVENTS_LOCK = threading.Lock()
 _MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
 _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_installed"
+_REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
@@ -1144,8 +1145,7 @@ def extract_remote_node_ids(
     marker = (settings or get_settings()).marker_property
     remote_node_ids: set[str] = set()
     for node, ancestor_node_ids in _iter_workflow_nodes_with_ancestors(workflow):
-        properties = node.get("properties") or {}
-        if properties.get(marker):
+        if _workflow_node_remote_enabled(node, marker):
             node_id = str(node.get("id"))
             if prompt_node_ids is None:
                 remote_node_ids.add(node_id)
@@ -1165,6 +1165,18 @@ def extract_remote_node_ids(
                     sorted(resolved_prompt_node_ids),
                 )
     return remote_node_ids
+
+
+def _workflow_node_remote_enabled(node: Mapping[str, Any], marker: str) -> bool:
+    """Return the visible remote toggle, falling back to the saved marker property."""
+    named_widget_values = node.get("widgets_values_named")
+    if isinstance(named_widget_values, Mapping):
+        visible_toggle_value = named_widget_values.get(_REMOTE_TOGGLE_WIDGET_NAME)
+        if isinstance(visible_toggle_value, bool):
+            return visible_toggle_value
+
+    properties = node.get("properties")
+    return isinstance(properties, Mapping) and bool(properties.get(marker))
 
 
 def _normalize_output_metadata(node_class: type[Any]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[bool, ...]]:
