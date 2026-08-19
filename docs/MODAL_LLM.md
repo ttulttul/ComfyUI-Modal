@@ -20,7 +20,9 @@ An unmarked LLM may sit between remote regions. The planner keeps it local and c
 Local execution currently requires Apple Silicon macOS and exactly `mlx-vlm==0.6.15`. Install it into the interpreter that launches ComfyUI:
 
 ```bash
-uv pip install --python <comfyui-venv>/bin/python "mlx-vlm==0.6.15" "psutil>=7,<8"
+uv pip install --python <comfyui-venv>/bin/python \
+  "mlx-vlm==0.6.15" "psutil>=7,<8" \
+  "huggingface-hub==1.28.0" "hf-xet==1.6.0"
 ```
 
 The default snapshot root follows ComfyUI's model directory and registers the `modal_llm` model folder. `COMFY_MODAL_LOCAL_LLM_STORAGE_ROOT` overrides it. The compatibility registry currently permits unquantized or native MLX checkpoints for SmolVLM, Muse-Glimmer, and Qwen3.5 architectures. CUDA-oriented FP8, ModelOpt FP4, and unknown formats are rejected before download; users should choose an unquantized repository or an `mlx-community` conversion.
@@ -47,6 +49,8 @@ Telemetry exposes `execution_target`, `device`, `reasoning_enabled`, generic ava
 - Both loaders consume only the completed local snapshot path.
 - Text and PDF sizes are bounded before prompt construction.
 - Public models need no token. Local gated access reads `HF_TOKEN` from ComfyUI's environment; remote gated access reads it from the selected Modal secret collection.
+- `hf-xet` is pinned and build-validated in the CPU staging image and is explicit in the Apple-local extra. `huggingface_hub` automatically selects it for Xet-backed repositories and receives `HF_TOKEN` or the legacy `HUGGING_FACE_HUB_TOKEN` when configured.
+- Xet adaptive concurrency needs no tuning. `HF_XET_HIGH_PERFORMANCE=1` is reserved for high-bandwidth hosts with at least 64 GiB of RAM and should not be enabled on the default 16 GiB Modal staging worker.
 
 Changing target requires resolving the original Hugging Face reference again. A generated profile created for Modal cannot be silently loaded through MLX, and vice versa.
 

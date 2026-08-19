@@ -78,8 +78,23 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "numpy==2.3.5" in runtime_packages
     assert "safetensors==0.8.0" in runtime_packages
     assert "huggingface-hub==1.28.0" in runtime_packages
+    assert "hf-xet==1.6.0" in runtime_packages
     assert "transformers==5.15.0" in runtime_packages
     assert "simpleeval==1.0.7" in runtime_packages
+
+
+def test_remote_huggingface_stack_is_pinned_and_validated(
+    runtime_environment_module: Any,
+) -> None:
+    """Model staging should install and import the explicit Xet accelerator."""
+    assert runtime_environment_module.remote_huggingface_packages() == (
+        "huggingface-hub==1.28.0",
+        "hf-xet==1.6.0",
+    )
+    command = runtime_environment_module.remote_huggingface_validation_command()
+    assert "import hf_xet, huggingface_hub" in command
+    assert "actual_xet=metadata.version" in command
+    assert "hf-xet" in command
 
 
 @pytest.mark.parametrize(
