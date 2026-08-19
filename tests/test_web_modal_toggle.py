@@ -167,12 +167,12 @@ def test_nodes_2_0_dom_nodes_receive_remote_state_decorations() -> None:
     assert "function syncVueNodeDecorations(timestamp = performance.now())" in source
     assert 'document.querySelectorAll(".lg-node[data-node-id]")' in source
     assert 'nodeElement.dataset.modalPhase = phase;' in source
-    assert 'decoration.style.borderColor = palette.borderColor;' in source
+    assert 'decoration.style.borderColor = palette?.borderColor ?? "transparent";' in source
     assert (
-        'decoration.style.backgroundColor = palette.fillColor ?? "transparent";'
+        'decoration.style.backgroundColor = palette?.fillColor ?? "transparent";'
         in source
     )
-    assert 'decoration.style.boxShadow = `0 0 8px ${palette.shadowColor}`;' in source
+    assert 'decoration.style.boxShadow = palette ?' in source
     assert 'decoration.className = "comfy-modal-vue-node-decoration";' in source
     assert 'badge.className = "comfy-modal-vue-node-badge";' in source
 
@@ -240,15 +240,32 @@ def test_remote_modal_nodes_show_component_badges() -> None:
     assert "ctx.fillText(String(nodeBadgeText), badgeX, badgeY + 0.5 / scale);" in source
 
 
-def test_planner_highlights_sandwiched_local_nodes() -> None:
-    """Queue-time local re-entry warnings should render in both node frontends."""
+def test_planner_marks_sandwiched_local_nodes_without_error_styling() -> None:
+    """Local re-entry advice should preserve default node colors and explain itself."""
     source = _modal_toggle_source()
 
     assert "const modalSandwichedLocalNodeIds = new Set();" in source
     assert "function isSandwichedLocalNode(node)" in source
-    assert "function localBottleneckDecorationPalette()" in source
+    assert "function localBottleneckDecorationPalette()" not in source
+    assert "LOCAL_BOTTLENECK_BORDER_COLOR" not in source
+    assert "LOCAL_BOTTLENECK_FILL_COLOR" not in source
+    assert "LOCAL_BOTTLENECK_SHADOW_COLOR" not in source
+    assert 'const palette = localBottleneck ? null :' in source
+    assert 'decoration.style.borderColor = palette?.borderColor ?? "transparent";' in source
+    assert 'decoration.style.boxShadow = palette ?' in source
     assert 'const phase = localBottleneck ? "local-bottleneck"' in source
     assert 'const nodeBadgeText = localBottleneck ? "!"' in source
+    assert (
+        'const LOCAL_BOTTLENECK_TOOLTIP = "Did you mean to make this node execute '
+        'on Modal?";'
+        in source
+    )
+    assert "badge.title = localBottleneck ? LOCAL_BOTTLENECK_TOOLTIP" in source
+    assert "function localBottleneckBadgeContainsPoint(" in source
+    assert "updateLegacyBottleneckTooltip(graphCanvas, badgeHovered);" in source
+    assert 'data-modal-phase="local-bottleneck"' in source
+    assert "pointer-events: auto;" in source
+    assert "cursor: help;" in source
     assert "responsePayload.modal_sandwiched_local_node_ids" in source
     assert "setSandwichedLocalNodeIds(sandwichedLocalNodeIds);" in source
 
