@@ -144,7 +144,7 @@ It returns three strings: the clean final `response`, compact `metadata_json`, a
 
 Modal LLM uses immutable schema-v2 model profiles. Checked-in entries in [`llm_profiles.json`](llm_profiles.json) remain available, while generated profiles content-address the execution target, exact Hugging Face revision, compatibility-policy version, backend, quantization, reasoning parser, context/media limits, expected memory, and remote-code policy. The local registry selects MLX-VLM for reviewed SmolVLM, Muse-Glimmer, and Qwen3.5 architectures; the Modal registry selects Transformers or vLLM for its reviewed CUDA formats. Qwen3.5 profiles select the shared `qwen3` reasoning parser. Unknown or target-incompatible architectures and quantizations fail compatibility inspection before weight download.
 
-Enter either a curated profile name or a Hugging Face `owner/model` ID directly in the node. Use `owner/model@revision` to resolve an explicit branch, tag, or commit. Each target performs metadata and compatibility inspection before downloading safetensors, pins the exact commit in a target-specific generated profile, and reuses its completed snapshot on later executions. Public models need no token. For gated local models, set `HF_TOKEN` in ComfyUI's environment; for gated Modal models, include it in the selected Modal secret collection.
+Enter either a curated profile name or a Hugging Face `owner/model` ID directly in the node. Use `owner/model@revision` to resolve an explicit branch, tag, or commit. Each target performs metadata and compatibility inspection before downloading safetensors, pins the exact commit in a target-specific generated profile, and reuses its completed snapshot on later executions. New weight directories are keyed by repository and exact revision rather than the full runtime profile, so eager and throughput deployments do not duplicate the same checkpoint. Existing profile-keyed directories are recognized by their completion marker and reused in place, preserving compatibility with older deployed apps. Public models need no token. For gated local models, set `HF_TOKEN` in ComfyUI's environment; for gated Modal models, include it in the selected Modal secret collection.
 
 mlx-dspark resolution is text-only because its Qwen path intentionally omits the vision tower. Its registered DSpark or DFlash drafter is independently security-checked, pinned to an exact Hub commit, staged beneath the same local model root, and reported in output metadata.
 
@@ -164,6 +164,8 @@ export COMFY_MODAL_LLM_RESERVE_FREE_GB=24
 ```
 
 The Modal secret collection may include `HF_TOKEN` for gated profiles. Public profiles do not require it. Model staging can take several minutes the first time, but it consumes CPU and network resources rather than billed B300 time; later requests reuse the committed Volume snapshot.
+
+Modal vLLM deployments default to the conservative `eager` execution profile. Set `COMFY_MODAL_LLM_VLLM_EXECUTION_MODE=throughput` before deployment to enable vLLM's hybrid CUDA-graph/compiled execution. Both modes force safetensor prefetch from the mounted weight Volume. vLLM, TorchInductor, Triton, and CUDA compilation artifacts persist in a separate `<weight-volume>-llm-compile-cache` Modal Volume, namespaced by GPU and pinned accelerator runtime. Override its name with `COMFY_MODAL_LLM_COMPILE_CACHE_VOLUME_NAME`. Telemetry records the selected mode, eager flag, load strategy, and compilation-cache root.
 
 ## Using It In ComfyUI
 
@@ -445,6 +447,21 @@ uv run --extra remote pytest -q tests/test_live_modal_canary.py
 The canaries use the normal `COMFY_MODAL_APP_NAME`, environment, GPU, timeout, and container-limit settings. The parallel canary skips when either the local in-flight limit or the configured Modal container limit is below two. All ordinary tests remain local-only and do not require Modal credentials.
 
 The 2026-08-19 non-B300 regression canary passed on RTX PRO 6000 with the final reconciled Torch 2.13.0/CUDA 13.0/vLLM 0.27.1 image and real inference using the generated profile for `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4`. Model capacity and quantization compatibility are still checked per GPU; the universal image guarantees backend availability, not that every checkpoint can execute on every card.
+
+The standalone benchmark harness uses a dedicated app, one GPU container, deterministic inputs, and fixed worker affinity. Each cold cycle stops only that benchmark app, runs one cold-container inference, then runs the requested number of resident-engine repeats. Two cold cycles reveal whether the persistent compilation cache improves the second container boot. The command is billable and stops its benchmark app afterward unless `--keep-app` is supplied:
+
+```bash
+uv run --extra remote python scripts/benchmark_modal_llm.py \
+  --mode throughput \
+  --gpu RTX-PRO-6000 \
+  --cold-cycles 2 \
+  --warm-runs 1 \
+  --output /tmp/modal-llm-throughput.json
+```
+
+Run the same command with `--mode eager` and a different output path for a matched baseline. The JSON artifact includes the source revision, complete workload configuration, wall time, model load time, generation time, TTFT, token rate, output count, response digest, and resident-cache status for every invocation. Reasoning is disabled and a deterministic synthetic image is included by default; use `--enable-reasoning` or `--text-only` to change those dimensions explicitly.
+
+In a 2026-08-19 RTX PRO 6000 run with Qwen3.8 27B NVFP4 and 128 output tokens, persistent AOT reuse reduced `torch.compile` from 138.0 to as little as 22.4 seconds. Warm throughput mode reached 38.4-39.1 tokens per second with roughly 50 ms TTFT, compared with 17.2 tokens per second and 151 ms in eager mode. Cached throughput cold initialization remained slower, so eager is still useful for short-lived apps while throughput is preferred when the resident engine will serve repeated calls.
 
 To run tests against a temporary checkout:
 

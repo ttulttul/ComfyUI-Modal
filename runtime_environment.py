@@ -442,6 +442,16 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "volume_name": settings.volume_name,
         "llm_max_resident_models": getattr(settings, "llm_max_resident_models", 2),
         "llm_reserve_free_vram_gb": getattr(settings, "llm_reserve_free_vram_gb", 24.0),
+        "llm_compile_cache_volume_name": getattr(
+            settings,
+            "llm_compile_cache_volume_name",
+            f"{settings.volume_name}-llm-compile-cache",
+        ),
+        "llm_vllm_execution_mode": getattr(
+            settings,
+            "llm_vllm_execution_mode",
+            "eager",
+        ),
     }
 
 

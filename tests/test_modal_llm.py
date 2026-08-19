@@ -649,6 +649,80 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     )
 
 
+def test_weight_snapshot_is_shared_across_runtime_profiles(
+    llm_staging_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Runtime tuning changes must not duplicate one repository revision's weights."""
+    calls: list[dict[str, Any]] = []
+    base_profile = llm_staging_module.get_llm_profile("smolvlm2-2.2b-instruct")
+    throughput_profile = replace(
+        base_profile,
+        profile_id="smolvlm-throughput-test",
+        backend_options=(("enforce_eager", False),),
+    )
+
+    def fake_snapshot_download(**kwargs: Any) -> str:
+        """Materialize one minimal canonical snapshot."""
+        calls.append(kwargs)
+        snapshot_path = Path(kwargs["local_dir"])
+        snapshot_path.mkdir(parents=True, exist_ok=True)
+        (snapshot_path / "config.json").write_text("{}", encoding="utf-8")
+        return str(snapshot_path)
+
+    eager = llm_staging_module.stage_model_profile(
+        base_profile.profile_id,
+        tmp_path,
+        profile=base_profile,
+        snapshot_download=fake_snapshot_download,
+    )
+    throughput = llm_staging_module.stage_model_profile(
+        throughput_profile.profile_id,
+        tmp_path,
+        profile=throughput_profile,
+        snapshot_download=fake_snapshot_download,
+    )
+
+    assert eager.path == throughput.path
+    assert eager.downloaded is True
+    assert throughput.downloaded is False
+    assert len(calls) == 1
+
+
+def test_stager_reuses_legacy_profile_keyed_weight_snapshot_in_place(
+    llm_staging_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Existing profile-keyed weights should remain usable by older deployments."""
+    profile = llm_staging_module.get_llm_profile("smolvlm2-2.2b-instruct")
+    legacy_path = tmp_path / "llm_models" / profile.profile_id / profile.revision
+    legacy_path.mkdir(parents=True)
+    (legacy_path / "config.json").write_text("{}", encoding="utf-8")
+    (legacy_path / ".comfy-modal-llm-complete.json").write_text(
+        json.dumps(
+            {
+                "profile_id": profile.profile_id,
+                "repository": profile.repository,
+                "revision": profile.revision,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = llm_staging_module.stage_model_profile(
+        profile.profile_id,
+        tmp_path,
+        profile=profile,
+        snapshot_download=lambda **kwargs: pytest.fail(
+            f"unexpected snapshot download: {kwargs}"
+        ),
+    )
+
+    assert result.downloaded is False
+    assert Path(result.path) == legacy_path
+    assert legacy_path.is_dir()
+
+
 def test_multimodal_preparation_samples_video_and_bounds_files(
     modal_llm_runtime_module: Any,
     llm_profiles_module: Any,
@@ -932,6 +1006,8 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert observed["llm_kwargs"]["kv_cache_memory_bytes"] == 12 * 1024**3
     assert "gpu_memory_utilization" not in observed["llm_kwargs"]
     assert observed["llm_kwargs"]["quantization"] == "fp8"
+    assert observed["llm_kwargs"]["enforce_eager"] is True
+    assert observed["llm_kwargs"]["safetensors_load_strategy"] == "prefetch"
     assert observed["llm_kwargs"]["attention_config"] == {
         "backend": "TRITON_ATTN",
     }
@@ -949,6 +1025,25 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     ] is False
     assert observed["generate_kwargs"]["request_id"].startswith("modal-llm-")
     assert observed["shutdown"] is True
+
+
+def test_vllm_throughput_mode_enables_cuda_graph_execution(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The throughput deployment profile should override legacy eager metadata."""
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        backend="vllm",
+        backend_options=(("enforce_eager", True),),
+    )
+    monkeypatch.setenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", "throughput")
+
+    mode, enforce_eager = modal_llm_runtime_module._vllm_execution_policy(profile)
+
+    assert mode == "throughput"
+    assert enforce_eager is False
 
 
 def test_vllm_backend_translates_private_runtime_errors(

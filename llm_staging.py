@@ -110,8 +110,26 @@ def _snapshot_tqdm_class(
 
 
 def model_snapshot_path(storage_root: str | Path, profile: LLMModelProfile) -> Path:
-    """Return the absolute storage path for one profile's immutable snapshot."""
-    return Path(storage_root).resolve() / profile.storage_relative_path()
+    """Return the shared path, reusing a valid legacy profile path in place."""
+    resolved_root = Path(storage_root).resolve()
+    canonical_path = resolved_root / profile.storage_relative_path()
+    if canonical_path.exists():
+        return canonical_path
+    model_root = resolved_root / "llm_models"
+    for legacy_path in sorted(model_root.glob(f"*/{profile.revision}")):
+        if legacy_path != canonical_path and _legacy_snapshot_matches(
+            legacy_path,
+            profile,
+        ):
+            logger.info(
+                "Reusing legacy Modal LLM weight path repository=%s revision=%s "
+                "path=%s.",
+                profile.repository,
+                profile.revision,
+                legacy_path,
+            )
+            return legacy_path
+    return canonical_path
 
 
 def _marker_path(snapshot_path: Path) -> Path:
@@ -137,7 +155,6 @@ def is_model_snapshot_staged(
     marker = _read_marker(snapshot_path)
     return bool(
         marker
-        and marker.get("profile_id") == profile.profile_id
         and marker.get("repository") == profile.repository
         and marker.get("revision") == profile.revision
         and (snapshot_path / "config.json").is_file()
@@ -149,6 +166,7 @@ def _write_marker(snapshot_path: Path, profile: LLMModelProfile) -> None:
     marker_path = _marker_path(snapshot_path)
     temporary_path = marker_path.with_suffix(".tmp")
     marker_payload = {
+        "marker_version": 2,
         "profile_id": profile.profile_id,
         "repository": profile.repository,
         "revision": profile.revision,
@@ -159,6 +177,20 @@ def _write_marker(snapshot_path: Path, profile: LLMModelProfile) -> None:
         encoding="utf-8",
     )
     os.replace(temporary_path, marker_path)
+
+
+def _legacy_snapshot_matches(
+    snapshot_path: Path,
+    profile: LLMModelProfile,
+) -> bool:
+    """Return whether an old profile-keyed directory has these exact weights."""
+    marker = _read_marker(snapshot_path)
+    return bool(
+        marker
+        and marker.get("repository") == profile.repository
+        and marker.get("revision") == profile.revision
+        and (snapshot_path / "config.json").is_file()
+    )
 
 
 @contextmanager
