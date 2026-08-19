@@ -36,7 +36,7 @@
 ## 2026-08-14
 
 - A costly local re-entry is a graph property, not just a single-edge pattern. The planner can identify every affected local node by intersecting two local-only closures: nodes reachable downstream from any remote node and nodes that can reach any remote node upstream. This catches both one-node and multi-node remote-to-local-to-remote paths while excluding local preview branches that never re-enter remote execution.
-- Planner advice should remain visually distinct from execution failure even when both use red. A static red border and `!` badge on local nodes communicates a potential component-splitting bottleneck, while remote failure keeps its existing red execution-state styling and remote nodes always take precedence if a warning becomes stale.
+- Planner advice must not reuse execution-failure colors. A local node between remote regions should keep its native theme and show only a neutral `!` badge whose hover text explains the possible placement mistake; reserve red node styling for actual execution failures.
 
 ## 2026-08-13
 
