@@ -22,7 +22,11 @@ import threading
 import time
 from types import ModuleType
 import zipfile
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
@@ -73,7 +77,11 @@ from ..runtime_environment import (
     RemoteRuntimeIdentity,
     build_remote_runtime_identity,
 )
-from ..llm_profiles import get_llm_profile, llm_profile_ids_from_payload
+from ..llm_profiles import (
+    get_llm_profile,
+    llm_model_references_from_payload,
+    rewrite_llm_model_references,
+)
 from ..settings import (
     MODAL_GPU_TYPES,
     ModalSyncSettings,
@@ -92,6 +100,7 @@ _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"]
 _MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None, str]] = set()
 _STAGED_LLM_PROFILES_LOCK = threading.Lock()
 _STAGED_LLM_PROFILES: set[tuple[str, str, str]] = set()
+_STAGED_LLM_PROFILE_RESULTS: dict[tuple[str, str], dict[str, Any]] = {}
 _MODAL_APP_STOP_TIMEOUT_SECONDS = 120.0
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
@@ -119,7 +128,9 @@ _REMOTE_CONTAINER_LOG_STDERR_LOCK = threading.Lock()
 _REMOTE_CONTAINER_LOG_STREAM_IDLE_GRACE_SECONDS = 30.0
 _IMPLICIT_BATCH_PRESERVING_TARGETS = frozenset({("CreateVideo", "images")})
 _ACTIVE_REMOTE_INVOCATIONS_LOCK = threading.Lock()
-_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT: dict[str, dict[str, "_ActiveRemoteInvocation"]] = {}
+_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT: dict[
+    str, dict[str, "_ActiveRemoteInvocation"]
+] = {}
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
 _DURABLE_OBJECT_STORE_LOCK = threading.Lock()
@@ -261,8 +272,12 @@ def _remote_modal_call_worker_count() -> int:
     return max(1, int(get_settings().max_inflight_calls))
 
 
-_REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=_remote_modal_call_worker_count())
-_REMOTE_MODAL_WARMUP_EXECUTOR = ThreadPoolExecutor(max_workers=_remote_modal_call_worker_count())
+_REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_remote_modal_call_worker_count()
+)
+_REMOTE_MODAL_WARMUP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_remote_modal_call_worker_count()
+)
 
 try:
     import modal  # type: ignore
@@ -375,7 +390,9 @@ def _flush_remote_container_log_chunk(
 def _managed_modal_app_gpus(settings: ModalSyncSettings) -> dict[str, str]:
     """Map every GPU-specific app name owned by this ComfyUI instance to its GPU."""
     return {
-        modal_deployment_app_name(settings_for_modal_gpu(settings, modal_gpu)): modal_gpu
+        modal_deployment_app_name(
+            settings_for_modal_gpu(settings, modal_gpu)
+        ): modal_gpu
         for modal_gpu in MODAL_GPU_TYPES
     }
 
@@ -448,7 +465,9 @@ async def list_active_modal_containers(
             environment_name,
         )
     except (modal_error_type, OSError, AttributeError, RuntimeError) as exc:
-        raise ModalContainerStatusError(f"Unable to list Modal containers: {exc}") from exc
+        raise ModalContainerStatusError(
+            f"Unable to list Modal containers: {exc}"
+        ) from exc
 
     containers: list[ModalContainerStatus] = []
     for task in response.tasks:
@@ -478,7 +497,9 @@ async def list_active_modal_containers(
             container.container_id,
         )
     )
-    logger.debug("Listed %d active Modal container(s) for the status UI.", len(containers))
+    logger.debug(
+        "Listed %d active Modal container(s) for the status UI.", len(containers)
+    )
     return containers
 
 
@@ -512,7 +533,9 @@ async def _stream_remote_container_logs_via_modal_sdk_async(
                     if log_batch.entry_id:
                         last_entry_id = str(log_batch.entry_id)
                     if bool(log_batch.app_done):
-                        logger.info("Modal SDK log stream finished for task_id=%s.", task_id)
+                        logger.info(
+                            "Modal SDK log stream finished for task_id=%s.", task_id
+                        )
                         return
                     for log_item in log_batch.items:
                         log_data = getattr(log_item, "data", "")
@@ -625,7 +648,9 @@ def _run_remote_container_log_stream(task_id: str, stop_event: threading.Event) 
     logger.info("Starting remote Modal container log stream for task_id=%s.", task_id)
     try:
         if _stream_remote_container_logs_via_modal_cli(task_id, stop_event):
-            logger.info("Stopped remote Modal container log stream for task_id=%s.", task_id)
+            logger.info(
+                "Stopped remote Modal container log stream for task_id=%s.", task_id
+            )
             return
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
         logger.warning(
@@ -636,9 +661,18 @@ def _run_remote_container_log_stream(task_id: str, stop_event: threading.Event) 
 
     try:
         if _stream_remote_container_logs_via_modal_sdk(task_id, stop_event):
-            logger.info("Stopped remote Modal container log stream for task_id=%s.", task_id)
+            logger.info(
+                "Stopped remote Modal container log stream for task_id=%s.", task_id
+            )
             return
-    except (AttributeError, ImportError, ModuleNotFoundError, OSError, RuntimeError, ValueError) as exc:
+    except (
+        AttributeError,
+        ImportError,
+        ModuleNotFoundError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
         logger.warning(
             "Modal SDK log streaming failed for task_id=%s: %s",
             task_id,
@@ -725,11 +759,15 @@ def _retain_remote_container_log_stream(task_id: str) -> str:
         if stream_state is None:
             stream_state = _new_remote_container_log_stream_state(task_id)
             _REMOTE_CONTAINER_LOG_STREAMS[task_id] = stream_state
-            logger.info("Creating remote Modal container log stream for task_id=%s.", task_id)
+            logger.info(
+                "Creating remote Modal container log stream for task_id=%s.", task_id
+            )
             stream_state.thread.start()
         else:
             _cancel_remote_container_log_idle_stop(stream_state)
-            logger.info("Reusing remote Modal container log stream for task_id=%s.", task_id)
+            logger.info(
+                "Reusing remote Modal container log stream for task_id=%s.", task_id
+            )
         stream_state.refcount += 1
         logger.info(
             "Remote Modal container log stream retain task_id=%s refcount=%d.",
@@ -785,7 +823,9 @@ def _close_remote_payload_stream(stream_events: Iterator[dict[str, Any]]) -> Non
         logger.debug("Ignoring async remote payload stream close failure: %s", exc)
 
 
-def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHandle | None:
+def _payload_remote_session_handle(
+    payload: dict[str, Any]
+) -> RemoteSessionHandle | None:
     """Return the decoded prompt-scoped remote session handle for one payload."""
     remote_session = payload.get("remote_session")
     if not is_remote_session_handle_payload(remote_session):
@@ -793,7 +833,9 @@ def _payload_remote_session_handle(payload: dict[str, Any]) -> RemoteSessionHand
     return RemoteSessionHandle.from_payload(remote_session)
 
 
-def _sanitize_payload_for_session_bridge_record(payload: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_payload_for_session_bridge_record(
+    payload: dict[str, Any]
+) -> dict[str, Any]:
     """Strip run-scoped fields from one producer payload before persisting replay metadata."""
     sanitized_payload = copy.deepcopy(payload)
     sanitized_payload.pop("prompt_id", None)
@@ -1002,8 +1044,7 @@ def _build_remote_session_bridge_record(
         RemoteSessionBridgeRecoveryKind.PRODUCER_REPLAY,
     }
     retained_hydrated_inputs = {
-        input_name: hydrated_inputs[input_name]
-        for input_name in recovery_input_names
+        input_name: hydrated_inputs[input_name] for input_name in recovery_input_names
     }
     producer_inputs = {
         input_name: producer_input_identity[input_name]
@@ -1052,7 +1093,9 @@ def _build_remote_session_bridge_record(
             else None
         ),
         rehydration_plan=rehydration_plan,
-        rehydration_plan_io_type=(str(io_type) if rehydration_plan is not None else None),
+        rehydration_plan_io_type=(
+            str(io_type) if rehydration_plan is not None else None
+        ),
     )
 
 
@@ -1083,11 +1126,16 @@ def _store_remote_session_bridge_value(
 ) -> None:
     """Retain one live bridge value in-process so later mapped phases can skip replay."""
     with _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK:
-        _REMOTE_SESSION_BRIDGE_VALUE_CACHE[bridge_key] = _clone_cached_bridge_value(value)
+        _REMOTE_SESSION_BRIDGE_VALUE_CACHE[bridge_key] = _clone_cached_bridge_value(
+            value
+        )
         if bridge_key in _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER:
             _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.remove(bridge_key)
         _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.append(bridge_key)
-        while len(_REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER) > _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT:
+        while (
+            len(_REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER)
+            > _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT
+        ):
             evicted_key = _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.pop(0)
             _REMOTE_SESSION_BRIDGE_VALUE_CACHE.pop(evicted_key, None)
 
@@ -1156,7 +1204,9 @@ def _restore_serialized_remote_session_bridge_value(
     if resolution_stats is not None:
         resolution_stats.durable_bridge_hits += 1
         resolution_stats.session_restore_writes += 1
-        resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
+        resolution_stats.direct_restore_seconds += (
+            time.perf_counter() - restore_started_at
+        )
     logger.info(
         "Resolved remote session bridge bridge_key=%s from durable %s serialized %s payload into session_id=%s.",
         record.bridge_key,
@@ -1185,7 +1235,11 @@ def _build_durable_bridge_rehydration_plan(
         return None
     class_type = prompt_node.get("class_type")
     inputs = prompt_node.get("inputs")
-    if not isinstance(class_type, str) or not class_type.strip() or not isinstance(inputs, dict):
+    if (
+        not isinstance(class_type, str)
+        or not class_type.strip()
+        or not isinstance(inputs, dict)
+    ):
         return None
 
     normalized_inputs: dict[str, Any] = {}
@@ -1226,7 +1280,9 @@ def _build_durable_bridge_rehydration_plan(
         return None
 
     rehydration_payload = copy.deepcopy(payload)
-    rehydration_payload["component_id"] = f"{payload.get('component_id', 'component')}::rehydrate:{node_id}"
+    rehydration_payload[
+        "component_id"
+    ] = f"{payload.get('component_id', 'component')}::rehydrate:{node_id}"
     rehydration_payload["subgraph_prompt"] = {
         str(current_node_id): copy.deepcopy(prompt[current_node_id])
         for current_node_id in prompt
@@ -1246,7 +1302,10 @@ def _build_durable_bridge_rehydration_plan(
             ],
         }
         for boundary_input in payload.get("boundary_inputs", [])
-        if any(str(target.get("node_id")) in required_node_ids for target in boundary_input.get("targets", []))
+        if any(
+            str(target.get("node_id")) in required_node_ids
+            for target in boundary_input.get("targets", [])
+        )
     ]
     rehydration_payload["boundary_outputs"] = [
         {
@@ -1319,7 +1378,9 @@ def _restore_planned_remote_session_bridge_value(
     if resolution_stats is not None:
         resolution_stats.durable_bridge_hits += 1
         resolution_stats.session_restore_writes += 1
-        resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
+        resolution_stats.direct_restore_seconds += (
+            time.perf_counter() - restore_started_at
+        )
     logger.info(
         "Resolved remote session bridge bridge_key=%s from durable %s rehydration plan into session_id=%s.",
         record.bridge_key,
@@ -1394,7 +1455,9 @@ def _rehydrate_remote_session_bridge_value(
         if resolution_stats is not None:
             resolution_stats.bridge_cache_hits += 1
             resolution_stats.session_restore_writes += 1
-            resolution_stats.direct_restore_seconds += time.perf_counter() - restore_started_at
+            resolution_stats.direct_restore_seconds += (
+                time.perf_counter() - restore_started_at
+            )
         logger.info(
             "Resolved remote session bridge bridge_key=%s directly from warm cache into session_id=%s.",
             ref.bridge_key,
@@ -1478,9 +1541,12 @@ def _resolve_remote_session_inputs(
     resolution_stats: "_RemoteSessionBridgeResolutionStats | None" = None,
 ) -> dict[str, Any]:
     """Resolve any remote-session value refs embedded in boundary inputs."""
+
     def count_refs(value: Any) -> int:
         """Return the number of live or durable session refs nested in one value."""
-        if is_remote_session_value_ref_payload(value) or is_remote_session_bridge_ref_payload(value):
+        if is_remote_session_value_ref_payload(
+            value
+        ) or is_remote_session_bridge_ref_payload(value):
             return 1
         if isinstance(value, list | tuple):
             return sum(count_refs(item) for item in value)
@@ -1595,9 +1661,13 @@ class _NullPromptServer:
         self.client_id: str | None = None
         self.last_node_id: str | None = None
 
-    def send_sync(self, event: str, data: dict[str, Any], client_id: str | None) -> None:
+    def send_sync(
+        self, event: str, data: dict[str, Any], client_id: str | None
+    ) -> None:
         """Discard PromptExecutor progress and status events."""
-        logger.debug("Suppressed remote prompt event %s for client %s.", event, client_id)
+        logger.debug(
+            "Suppressed remote prompt event %s for client %s.", event, client_id
+        )
 
 
 def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
@@ -1612,7 +1682,9 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
 
     local_bundle = settings.local_storage_root / bundle_path.lstrip("/")
     if not local_bundle.exists():
-        logger.warning("Custom nodes bundle %s was not found in local storage.", local_bundle)
+        logger.warning(
+            "Custom nodes bundle %s was not found in local storage.", local_bundle
+        )
         return
 
     extraction_root = (
@@ -1621,7 +1693,9 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
         / local_bundle.stem
     )
     extraction_root.mkdir(parents=True, exist_ok=True)
-    for archive_path in _resolve_local_custom_nodes_archives(local_bundle, settings.local_storage_root):
+    for archive_path in _resolve_local_custom_nodes_archives(
+        local_bundle, settings.local_storage_root
+    ):
         with zipfile.ZipFile(archive_path, "r") as archive:
             archive.extractall(extraction_root)
     _materialize_local_custom_node_assets(
@@ -1635,7 +1709,9 @@ def _extract_custom_nodes_bundle(bundle_path: str | None) -> None:
     logger.info("Extracted remote custom_nodes bundle to %s", extraction_root)
 
 
-def _resolve_local_custom_nodes_archives(local_bundle: Path, storage_root: Path) -> list[Path]:
+def _resolve_local_custom_nodes_archives(
+    local_bundle: Path, storage_root: Path
+) -> list[Path]:
     """Return the archive paths described by one local custom_nodes bundle ZIP or manifest."""
     if local_bundle.suffix.lower() == ".zip":
         return [local_bundle]
@@ -1647,15 +1723,21 @@ def _resolve_local_custom_nodes_archives(local_bundle: Path, storage_root: Path)
     manifest_payload = _load_local_custom_nodes_manifest(local_bundle)
     entry_payloads = manifest_payload.get("entries")
     if not isinstance(entry_payloads, list):
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} did not contain a valid entries list.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} did not contain a valid entries list."
+        )
 
     archive_paths: list[Path] = []
     for entry_payload in entry_payloads:
         if not isinstance(entry_payload, dict):
-            raise RuntimeError(f"Custom nodes manifest {local_bundle} contained a non-object entry.")
+            raise RuntimeError(
+                f"Custom nodes manifest {local_bundle} contained a non-object entry."
+            )
         remote_path = entry_payload.get("remote_path")
         if not isinstance(remote_path, str) or not remote_path.strip():
-            raise RuntimeError(f"Custom nodes manifest {local_bundle} contained an entry without remote_path.")
+            raise RuntimeError(
+                f"Custom nodes manifest {local_bundle} contained an entry without remote_path."
+            )
         archive_path = storage_root / remote_path.lstrip("/")
         if not archive_path.exists():
             raise RuntimeError(
@@ -1670,11 +1752,17 @@ def _load_local_custom_nodes_manifest(local_bundle: Path) -> dict[str, Any]:
     try:
         manifest_payload = json.loads(local_bundle.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} is unreadable.") from exc
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} is unreadable."
+        ) from exc
     if not isinstance(manifest_payload, dict):
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} must be a JSON object.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} must be a JSON object."
+        )
     if manifest_payload.get("version", 1) not in {1, 2}:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} has an unsupported version.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} has an unsupported version."
+        )
     return manifest_payload
 
 
@@ -1690,18 +1778,29 @@ def _materialize_local_custom_node_assets(
     if manifest_payload.get("version", 1) < 2:
         return
     for asset_payload in _iter_local_custom_node_assets(local_bundle, manifest_payload):
-        relative_path = _validated_local_custom_node_asset_path(local_bundle, asset_payload)
+        relative_path = _validated_local_custom_node_asset_path(
+            local_bundle, asset_payload
+        )
         source_path = storage_root / str(asset_payload["remote_path"]).lstrip("/")
         if not source_path.is_file():
-            raise RuntimeError(f"Custom-node asset {source_path} was not found in local storage.")
+            raise RuntimeError(
+                f"Custom-node asset {source_path} was not found in local storage."
+            )
         if source_path.stat().st_size != int(asset_payload["size_bytes"]):
-            raise RuntimeError(f"Custom-node asset {source_path} size did not match its manifest.")
+            raise RuntimeError(
+                f"Custom-node asset {source_path} size did not match its manifest."
+            )
         destination = extraction_root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists() or destination.is_symlink():
-            if destination.is_symlink() and destination.resolve() == source_path.resolve():
+            if (
+                destination.is_symlink()
+                and destination.resolve() == source_path.resolve()
+            ):
                 continue
-            raise RuntimeError(f"Custom-node asset destination {destination} already exists.")
+            raise RuntimeError(
+                f"Custom-node asset destination {destination} already exists."
+            )
         destination.symlink_to(source_path)
 
 
@@ -1712,13 +1811,19 @@ def _iter_local_custom_node_assets(
     """Yield asset objects from one validated version-two local manifest."""
     entries = manifest_payload.get("entries")
     if not isinstance(entries, list):
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} has no valid entries list.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} has no valid entries list."
+        )
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("assets", []), list):
-            raise RuntimeError(f"Custom nodes manifest {local_bundle} contains invalid assets.")
+            raise RuntimeError(
+                f"Custom nodes manifest {local_bundle} contains invalid assets."
+            )
         for asset_payload in entry.get("assets", []):
             if not isinstance(asset_payload, dict):
-                raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset.")
+                raise RuntimeError(
+                    f"Custom nodes manifest {local_bundle} contains an invalid asset."
+                )
             yield asset_payload
 
 
@@ -1732,20 +1837,34 @@ def _validated_local_custom_node_asset_path(
     sha256 = asset_payload.get("sha256")
     size_bytes = asset_payload.get("size_bytes")
     if not isinstance(relative_path, str) or not relative_path:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an asset without a path.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} contains an asset without a path."
+        )
     if not isinstance(remote_path, str) or not remote_path:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an asset without storage.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} contains an asset without storage."
+        )
     if (
         not isinstance(sha256, str)
         or len(sha256) != 64
         or not Path(remote_path).name.startswith(f"{sha256}_")
     ):
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset digest.")
-    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an invalid asset size.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} contains an invalid asset digest."
+        )
+    if (
+        isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes < 0
+    ):
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} contains an invalid asset size."
+        )
     normalized_path = Path(relative_path)
     if normalized_path.is_absolute() or ".." in normalized_path.parts:
-        raise RuntimeError(f"Custom nodes manifest {local_bundle} contains an unsafe asset path.")
+        raise RuntimeError(
+            f"Custom nodes manifest {local_bundle} contains an unsafe asset path."
+        )
     return normalized_path
 
 
@@ -1764,7 +1883,9 @@ def _load_execution_module() -> Any:
 
 
 @contextmanager
-def _temporary_node_mapping(node_mapping: dict[str, type[Any]] | None) -> Iterator[None]:
+def _temporary_node_mapping(
+    node_mapping: dict[str, type[Any]] | None
+) -> Iterator[None]:
     """Temporarily overlay node mappings for tests or custom runtimes."""
     if node_mapping is None:
         yield
@@ -1772,7 +1893,9 @@ def _temporary_node_mapping(node_mapping: dict[str, type[Any]] | None) -> Iterat
 
     nodes_module = _load_nodes_module()
     original_mappings = dict(nodes_module.NODE_CLASS_MAPPINGS)
-    original_display_mappings = dict(getattr(nodes_module, "NODE_DISPLAY_NAME_MAPPINGS", {}))
+    original_display_mappings = dict(
+        getattr(nodes_module, "NODE_DISPLAY_NAME_MAPPINGS", {})
+    )
     try:
         nodes_module.NODE_CLASS_MAPPINGS.update(node_mapping)
         for class_type in node_mapping:
@@ -1849,7 +1972,9 @@ def _execute_node_locally_raw(
         if class_type not in resolved_node_mapping:
             raise KeyError(f"Remote node class {class_type!r} is not registered.")
 
-        return _invoke_original_node(resolved_node_mapping[class_type], node_data, kwargs)
+        return _invoke_original_node(
+            resolved_node_mapping[class_type], node_data, kwargs
+        )
 
 
 def _apply_boundary_inputs(
@@ -1858,7 +1983,10 @@ def _apply_boundary_inputs(
     hydrated_inputs: dict[str, Any],
 ) -> None:
     """Inject hydrated local boundary inputs into a remote subgraph prompt."""
-    logger.info("Applying %d hydrated boundary inputs to remote subgraph prompt.", len(boundary_input_specs))
+    logger.info(
+        "Applying %d hydrated boundary inputs to remote subgraph prompt.",
+        len(boundary_input_specs),
+    )
     for boundary_input in boundary_input_specs:
         proxy_input_name = str(boundary_input["proxy_input_name"])
         if proxy_input_name not in hydrated_inputs:
@@ -1884,7 +2012,9 @@ def _apply_boundary_inputs(
             )
             source_signature = boundary_input.get("source_signature")
             if isinstance(source_signature, str) and source_signature:
-                boundary_signatures = prompt_node.setdefault(_BOUNDARY_INPUT_SIGNATURES_KEY, {})
+                boundary_signatures = prompt_node.setdefault(
+                    _BOUNDARY_INPUT_SIGNATURES_KEY, {}
+                )
                 if isinstance(boundary_signatures, dict):
                     boundary_signatures[input_name] = source_signature
 
@@ -2162,7 +2292,9 @@ def _resolve_required_subgraph_nodes(
     """Return the dependency closure needed to execute the requested subgraph nodes."""
     required: set[str] = set()
     pending = list(execute_node_ids)
-    logger.info("Resolving dependency closure for remote execute targets: %s", execute_node_ids)
+    logger.info(
+        "Resolving dependency closure for remote execute targets: %s", execute_node_ids
+    )
     while pending:
         node_id = str(pending.pop())
         if node_id not in prompt:
@@ -2197,7 +2329,9 @@ def _trim_subgraph_payload_to_required_nodes(payload: dict[str, Any]) -> dict[st
         node_id for node_id in requested_execute_node_ids if node_id in prompt_node_ids
     ]
     dropped_execute_node_ids = [
-        node_id for node_id in requested_execute_node_ids if node_id not in prompt_node_ids
+        node_id
+        for node_id in requested_execute_node_ids
+        if node_id not in prompt_node_ids
     ]
     if dropped_execute_node_ids:
         logger.warning(
@@ -2231,7 +2365,10 @@ def _trim_subgraph_payload_to_required_nodes(payload: dict[str, Any]) -> dict[st
             ],
         }
         for boundary_input in trimmed_payload.get("boundary_inputs", [])
-        if any(str(target.get("node_id")) in required_node_ids for target in boundary_input.get("targets", []))
+        if any(
+            str(target.get("node_id")) in required_node_ids
+            for target in boundary_input.get("targets", [])
+        )
     ]
     trimmed_payload["boundary_outputs"] = [
         copy.deepcopy(boundary_output)
@@ -2339,8 +2476,12 @@ def _normalize_subgraph_payload(payload: dict[str, Any]) -> dict[str, Any]:
             inputs[input_name] = _normalize_prompt_input_value(input_value)
 
     for boundary_output in normalized_payload.get("boundary_outputs", []):
-        if "node_id" in boundary_output and isinstance(boundary_output["node_id"], list):
-            boundary_output["node_id"] = _normalize_prompt_input_value(boundary_output["node_id"])
+        if "node_id" in boundary_output and isinstance(
+            boundary_output["node_id"], list
+        ):
+            boundary_output["node_id"] = _normalize_prompt_input_value(
+                boundary_output["node_id"]
+            )
         if "output_index" in boundary_output:
             boundary_output["output_index"] = _normalize_link_output_index(
                 boundary_output["output_index"]
@@ -2436,7 +2577,9 @@ def _execute_subgraph_with_mapping(
                     if upstream_node_id not in executed_outputs:
                         unresolved_dependency = True
                         break
-                    kwargs[str(input_name)] = executed_outputs[upstream_node_id][int(input_value[1])]
+                    kwargs[str(input_name)] = executed_outputs[upstream_node_id][
+                        int(input_value[1])
+                    ]
                 else:
                     kwargs[str(input_name)] = input_value
             if unresolved_dependency:
@@ -2644,7 +2787,9 @@ def _execute_subgraph_prompt(
                     output_value=output_value,
                 )
                 _REMOTE_SESSION_BRIDGE_STORE.put_record(bridge_record)
-                _store_remote_session_bridge_value(bridge_record.bridge_key, output_value)
+                _store_remote_session_bridge_value(
+                    bridge_record.bridge_key, output_value
+                )
                 live_ref = _REMOTE_SESSION_STORE.put_bridge_output(
                     session_handle,
                     bridge_key=bridge_record.bridge_key,
@@ -2681,7 +2826,10 @@ def _short_circuit_restored_session_output_subgraph(
         return None
     if resolution_stats.input_ref_count <= 0 or resolution_stats.replay_count > 0:
         return None
-    if any(not bool(boundary_output.get("session_output")) for boundary_output in boundary_outputs):
+    if any(
+        not bool(boundary_output.get("session_output"))
+        for boundary_output in boundary_outputs
+    ):
         return None
 
     restored_outputs: list[Any] = []
@@ -2745,7 +2893,9 @@ def execute_subgraph_locally(
     )
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_execute_subgraph_prompt, payload, hydrated_inputs, node_mapping)
+            future = executor.submit(
+                _execute_subgraph_prompt, payload, hydrated_inputs, node_mapping
+            )
             try:
                 outputs = future.result()
             except Exception:
@@ -2823,9 +2973,13 @@ def _load_modal_cloud_module() -> Any:
     deployment_app_name = modal_deployment_app_name(settings)
     with _MODAL_CLOUD_MODULE_LOCK:
         existing_module = sys.modules.get(_MODAL_CLOUD_MODULE_NAME)
-        existing_gpu = getattr(existing_module, "__comfy_modal_gpu__", settings.modal_gpu)
+        existing_gpu = getattr(
+            existing_module, "__comfy_modal_gpu__", settings.modal_gpu
+        )
         existing_app_name = getattr(existing_module, "__comfy_modal_app_name__", None)
-        existing_secret_name = getattr(existing_module, "__comfy_modal_secret_name__", None)
+        existing_secret_name = getattr(
+            existing_module, "__comfy_modal_secret_name__", None
+        )
         if (
             existing_module is not None
             and getattr(existing_module, "app", None) is not None
@@ -2847,7 +3001,9 @@ def _load_modal_cloud_module() -> Any:
             )
             sys.modules.pop(_MODAL_CLOUD_MODULE_NAME, None)
 
-        cloud_module_path = Path(__file__).resolve().parents[1] / f"{_MODAL_CLOUD_MODULE_NAME}.py"
+        cloud_module_path = (
+            Path(__file__).resolve().parents[1] / f"{_MODAL_CLOUD_MODULE_NAME}.py"
+        )
         module_spec = importlib.util.spec_from_file_location(
             _MODAL_CLOUD_MODULE_NAME,
             cloud_module_path,
@@ -2912,14 +3068,18 @@ def _lookup_local_prompt_server() -> Any | None:
     return getattr(server.PromptServer, "instance", None)
 
 
-def _record_local_modal_ui_event(event: str, payload: Mapping[str, Any], client_id: str | None) -> None:
+def _record_local_modal_ui_event(
+    event: str, payload: Mapping[str, Any], client_id: str | None
+) -> None:
     """Record one local Modal UI event for browser refocus replay when available."""
     if client_id is None:
         return
     try:
         from ..api_intercept import record_modal_ui_event
     except (ImportError, AttributeError):
-        logger.debug("Modal UI event replay recorder is unavailable for event %s.", event)
+        logger.debug(
+            "Modal UI event replay recorder is unavailable for event %s.", event
+        )
         return
 
     record_modal_ui_event(event, payload, client_id)
@@ -2992,10 +3152,20 @@ def _emit_local_remote_startup_status(
     status_message: str,
 ) -> None:
     """Show one prompt-scoped Modal startup phase in the local global status pill."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     extra_data = payload.get("extra_data") or {}
-    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
-    node_ids = [str(node_id) for node_id in payload.get("component_node_ids", []) if str(node_id)]
+    client_id = (
+        str(extra_data.get("client_id"))
+        if extra_data.get("client_id") is not None
+        else None
+    )
+    node_ids = [
+        str(node_id)
+        for node_id in payload.get("component_node_ids", [])
+        if str(node_id)
+    ]
     if not node_ids and payload.get("component_id") is not None:
         node_ids = [str(payload["component_id"])]
     if not prompt_id or not client_id or not node_ids:
@@ -3006,9 +3176,7 @@ def _emit_local_remote_startup_status(
         phase=phase,
         node_ids=node_ids,
         modal_gpu=(
-            str(payload["modal_gpu"])
-            if payload.get("modal_gpu") is not None
-            else None
+            str(payload["modal_gpu"]) if payload.get("modal_gpu") is not None else None
         ),
         status_message=status_message,
     )
@@ -3116,7 +3284,9 @@ def _emit_local_preview_image(
         from PIL import Image
         from protocol import BinaryEventTypes
     except ModuleNotFoundError:
-        logger.warning("Preview forwarding is unavailable because Pillow or ComfyUI protocol imports failed.")
+        logger.warning(
+            "Preview forwarding is unavailable because Pillow or ComfyUI protocol imports failed."
+        )
         return
 
     with BytesIO(image_bytes) as image_buffer:
@@ -3157,12 +3327,16 @@ def _emit_local_preview_boundary_output(
     try:
         import nodes
     except ModuleNotFoundError:
-        logger.warning("Preview boundary streaming is unavailable because ComfyUI nodes could not be imported.")
+        logger.warning(
+            "Preview boundary streaming is unavailable because ComfyUI nodes could not be imported."
+        )
         return
 
     preview_factory = getattr(nodes, "PreviewImage", None)
     if preview_factory is None:
-        logger.warning("Preview boundary streaming is unavailable because PreviewImage is not registered.")
+        logger.warning(
+            "Preview boundary streaming is unavailable because PreviewImage is not registered."
+        )
         return
 
     preview_result = preview_factory().save_images(images=image_value)
@@ -3188,14 +3362,13 @@ def _emit_local_preview_boundary_output(
 def _allowed_suppressed_stream_node_ids(payload: dict[str, Any]) -> set[str]:
     """Return the node ids that may surface UI events for a suppressed mapped/static stream."""
     allowed_node_ids = {
-        str(node_id)
-        for node_id in payload.get("execute_node_ids", [])
-        if str(node_id)
+        str(node_id) for node_id in payload.get("execute_node_ids", []) if str(node_id)
     }
     allowed_node_ids.update(
         str(boundary_output["node_id"])
         for boundary_output in payload.get("boundary_outputs", [])
-        if boundary_output.get("node_id") is not None and str(boundary_output["node_id"])
+        if boundary_output.get("node_id") is not None
+        and str(boundary_output["node_id"])
     )
     return allowed_node_ids
 
@@ -3230,7 +3403,9 @@ def _progress_stream_event_node_id(stream_event: dict[str, Any]) -> str | None:
     return None
 
 
-def _progress_stream_event_metadata(stream_event: dict[str, Any]) -> dict[str, str | None] | None:
+def _progress_stream_event_metadata(
+    stream_event: dict[str, Any]
+) -> dict[str, str | None] | None:
     """Return normalized metadata for one streamed progress event."""
     reported_node_id = (
         str(stream_event["node_id"])
@@ -3258,7 +3433,9 @@ def _progress_stream_event_metadata(stream_event: dict[str, Any]) -> dict[str, s
     }
 
 
-def _remote_prompt_ancestor_node_ids(payload: dict[str, Any], node_id: str | None) -> list[str]:
+def _remote_prompt_ancestor_node_ids(
+    payload: dict[str, Any], node_id: str | None
+) -> list[str]:
     """Return subgraph dependency ancestors for one currently executing remote node."""
     if node_id is None:
         return []
@@ -3329,7 +3506,9 @@ def _exception_indicates_interruption(exc: BaseException) -> bool:
 
 def _remote_interrupt_key(payload: dict[str, Any]) -> tuple[str, str]:
     """Return the prompt/component pair used to interrupt one remote execution."""
-    prompt_id = str(payload.get("prompt_id") or payload.get("component_id") or "modal-subgraph")
+    prompt_id = str(
+        payload.get("prompt_id") or payload.get("component_id") or "modal-subgraph"
+    )
     component_id = str(payload.get("component_id") or "single-node")
     return prompt_id, component_id
 
@@ -3366,7 +3545,9 @@ def _remote_interrupt_flag_value() -> dict[str, float]:
     return {"requested_at": time.time()}
 
 
-def _write_remote_interrupt_flag(interrupt_store: Any, prompt_id: str, component_id: str) -> None:
+def _write_remote_interrupt_flag(
+    interrupt_store: Any, prompt_id: str, component_id: str
+) -> None:
     """Write one remote cancellation request with the blocking Modal Dict API."""
     interrupt_store.put(
         _remote_interrupt_flag_key(prompt_id, component_id),
@@ -3391,7 +3572,9 @@ async def _write_remote_interrupt_flag_async(
             await result
         return
 
-    await asyncio.to_thread(_write_remote_interrupt_flag, interrupt_store, prompt_id, component_id)
+    await asyncio.to_thread(
+        _write_remote_interrupt_flag, interrupt_store, prompt_id, component_id
+    )
 
 
 def _request_remote_interrupt(payload: dict[str, Any]) -> bool:
@@ -3449,7 +3632,9 @@ def _registered_active_remote_invocation(
         interrupt_remote_call=interrupt_remote_call,
     )
     with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
-        prompt_invocations = _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.setdefault(prompt_id, {})
+        prompt_invocations = _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.setdefault(
+            prompt_id, {}
+        )
         prompt_invocations[component_id] = invocation
     logger.info(
         "Registered active Modal invocation prompt=%s component=%s for targeted cancellation.",
@@ -3480,7 +3665,9 @@ def request_remote_modal_prompt_interrupt(prompt_id: str) -> bool:
         "prompt-level interrupt requested",
     )
     with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
-        invocations = list(_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.get(normalized_prompt_id, {}).values())
+        invocations = list(
+            _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.get(normalized_prompt_id, {}).values()
+        )
     if not invocations:
         return False
 
@@ -3493,7 +3680,10 @@ def request_remote_modal_prompt_interrupt(prompt_id: str) -> bool:
         if invocation.cancellation_event is not None:
             invocation.cancellation_event.set()
         _propagate_remote_interrupt_request(
-            {"prompt_id": invocation.prompt_id, "component_id": invocation.component_id},
+            {
+                "prompt_id": invocation.prompt_id,
+                "component_id": invocation.component_id,
+            },
             invocation.interrupt_remote_call,
         )
     return True
@@ -3507,7 +3697,9 @@ async def request_remote_modal_prompt_interrupt_async(prompt_id: str) -> bool:
         "prompt-level interrupt requested",
     )
     with _ACTIVE_REMOTE_INVOCATIONS_LOCK:
-        invocations = list(_ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.get(normalized_prompt_id, {}).values())
+        invocations = list(
+            _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT.get(normalized_prompt_id, {}).values()
+        )
     if not invocations:
         return False
 
@@ -3553,7 +3745,9 @@ def _abandon_local_modal_workflow_gate(payload: dict[str, Any], reason: str) -> 
     try:
         from ..modal_executor_node import abandon_modal_workflow_execution_prompt
     except ImportError:
-        logger.debug("Unable to import Modal workflow gate helper while abandoning prompt.")
+        logger.debug(
+            "Unable to import Modal workflow gate helper while abandoning prompt."
+        )
         return
 
     abandon_modal_workflow_execution_prompt(str(prompt_id), reason)
@@ -3676,19 +3870,30 @@ def _invoke_remote_call_with_interrupts(
     request_thread.start()
     interrupt_sent = False
     try:
-        with _registered_active_remote_invocation(payload, cancellation_event, interrupt_remote_call):
+        with _registered_active_remote_invocation(
+            payload, cancellation_event, interrupt_remote_call
+        ):
             while True:
                 try:
                     result_kind, result_payload = result_queue.get(timeout=0.1)
                 except queue.Empty:
-                    if _sync_local_interrupt_to_cancellation_event(payload, cancellation_event):
+                    if _sync_local_interrupt_to_cancellation_event(
+                        payload, cancellation_event
+                    ):
                         if not interrupt_sent:
-                            _propagate_remote_interrupt_request(payload, interrupt_remote_call)
+                            _propagate_remote_interrupt_request(
+                                payload, interrupt_remote_call
+                            )
                             interrupt_sent = True
                             cancellation_started_at = time.monotonic()
                         elif cancellation_started_at is not None:
-                            grace_seconds = max(0.0, get_settings().remote_cancel_grace_seconds)
-                            if time.monotonic() - cancellation_started_at >= grace_seconds:
+                            grace_seconds = max(
+                                0.0, get_settings().remote_cancel_grace_seconds
+                            )
+                            if (
+                                time.monotonic() - cancellation_started_at
+                                >= grace_seconds
+                            ):
                                 logger.info(
                                     "Modal component=%s did not return within %.3fs of local interrupt propagation; releasing the local prompt while remote cancellation continues.",
                                     payload.get("component_id"),
@@ -3715,11 +3920,19 @@ def _consume_remote_payload_stream(
     stream_events: Iterator[dict[str, Any]],
 ) -> bytes:
     """Forward remote progress events into the local UI and return the final payload bytes."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     extra_data = payload.get("extra_data") or {}
-    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    client_id = (
+        str(extra_data.get("client_id"))
+        if extra_data.get("client_id") is not None
+        else None
+    )
     node_ids = [str(node_id) for node_id in payload.get("component_node_ids", [])]
-    modal_gpu = str(payload["modal_gpu"]) if payload.get("modal_gpu") is not None else None
+    modal_gpu = (
+        str(payload["modal_gpu"]) if payload.get("modal_gpu") is not None else None
+    )
     suppress_status_stream = bool(payload.get("suppress_status_stream"))
     result_payload: bytes | bytearray | None = None
     suppressed_progress_node_metadata: dict[str, dict[str, str | None]] = {}
@@ -3736,14 +3949,18 @@ def _consume_remote_payload_stream(
                     and active_remote_log_task_id is None
                     and _is_remote_container_log_stream_enabled()
                 ):
-                    active_remote_log_task_id = _retain_remote_container_log_stream(task_id)
+                    active_remote_log_task_id = _retain_remote_container_log_stream(
+                        task_id
+                    )
                 continue
             if event_kind == "progress":
                 event_type = str(stream_event.get("event_type", ""))
                 if event_type == "node_progress":
                     progress_metadata = _progress_stream_event_metadata(stream_event)
                     filter_node_id = (
-                        progress_metadata["filter_node_id"] if progress_metadata is not None else None
+                        progress_metadata["filter_node_id"]
+                        if progress_metadata is not None
+                        else None
                     )
                     lane_id = (
                         str(stream_event["lane_id"])
@@ -3759,7 +3976,9 @@ def _consume_remote_payload_stream(
                         suppress_status_stream
                         and lane_id is None
                         and not aggregate_only
-                        and not _should_forward_suppressed_stream_event(payload, filter_node_id)
+                        and not _should_forward_suppressed_stream_event(
+                            payload, filter_node_id
+                        )
                     ):
                         logger.debug(
                             "Suppressing streamed Modal node progress for component=%s node_id=%s real_node_id=%s because it does not belong to this mapped/static payload.",
@@ -3769,7 +3988,9 @@ def _consume_remote_payload_stream(
                         )
                         continue
                     reported_node_id = (
-                        progress_metadata["node_id"] if progress_metadata is not None else None
+                        progress_metadata["node_id"]
+                        if progress_metadata is not None
+                        else None
                     )
                     if reported_node_id is not None:
                         display_node_id = (
@@ -3778,7 +3999,9 @@ def _consume_remote_payload_stream(
                             else str(reported_node_id)
                         )
                         real_node_id = (
-                            progress_metadata["real_node_id"] if progress_metadata is not None else None
+                            progress_metadata["real_node_id"]
+                            if progress_metadata is not None
+                            else None
                         )
                         progress_node_id = real_node_id or display_node_id
                         completed_ancestor_node_ids = _remote_prompt_ancestor_node_ids(
@@ -3786,9 +4009,17 @@ def _consume_remote_payload_stream(
                             progress_node_id,
                         )
                         if lane_id is not None:
-                            _remember_mapped_lane_node_id(payload, lane_id, progress_node_id)
-                        elif suppress_status_stream and not aggregate_only and progress_metadata is not None:
-                            suppressed_progress_node_metadata[str(progress_metadata["filter_node_id"])] = {
+                            _remember_mapped_lane_node_id(
+                                payload, lane_id, progress_node_id
+                            )
+                        elif (
+                            suppress_status_stream
+                            and not aggregate_only
+                            and progress_metadata is not None
+                        ):
+                            suppressed_progress_node_metadata[
+                                str(progress_metadata["filter_node_id"])
+                            ] = {
                                 "node_id": str(reported_node_id),
                                 "display_node_id": display_node_id,
                                 "real_node_id": real_node_id,
@@ -3824,15 +4055,17 @@ def _consume_remote_payload_stream(
                             "aggregate_only": aggregate_only,
                         }
                         if completed_ancestor_node_ids:
-                            progress_kwargs["completed_ancestor_node_ids"] = (
-                                completed_ancestor_node_ids
-                            )
+                            progress_kwargs[
+                                "completed_ancestor_node_ids"
+                            ] = completed_ancestor_node_ids
                         _emit_local_modal_progress(**progress_kwargs)
                     continue
                 if event_type == "executed":
                     reported_node_id = stream_event.get("node_id")
                     if reported_node_id is not None:
-                        if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                        if not _should_forward_suppressed_stream_event(
+                            payload, reported_node_id
+                        ):
                             logger.debug(
                                 "Suppressing streamed Modal executed output for component=%s node_id=%s because it does not belong to this mapped/static payload.",
                                 payload.get("component_id"),
@@ -3853,14 +4086,18 @@ def _consume_remote_payload_stream(
                                 if stream_event.get("display_node_id") is not None
                                 else None
                             ),
-                            output_payload=deserialize_value(stream_event.get("output")),
+                            output_payload=deserialize_value(
+                                stream_event.get("output")
+                            ),
                         )
                     continue
                 if event_type == "preview":
                     reported_node_id = stream_event.get("node_id")
                     image_bytes = deserialize_value(stream_event.get("image_bytes"))
                     if reported_node_id is not None and isinstance(image_bytes, bytes):
-                        if not _should_forward_suppressed_stream_event(payload, reported_node_id):
+                        if not _should_forward_suppressed_stream_event(
+                            payload, reported_node_id
+                        ):
                             logger.debug(
                                 "Suppressing streamed Modal preview image for component=%s node_id=%s because it does not belong to this mapped/static payload.",
                                 payload.get("component_id"),
@@ -3923,11 +4160,15 @@ def _consume_remote_payload_stream(
                 if event_type == "node_cached":
                     progress_metadata = _progress_stream_event_metadata(stream_event)
                     filter_node_id = (
-                        progress_metadata["filter_node_id"] if progress_metadata is not None else None
+                        progress_metadata["filter_node_id"]
+                        if progress_metadata is not None
+                        else None
                     )
                     if (
                         suppress_status_stream
-                        and not _should_forward_suppressed_stream_event(payload, filter_node_id)
+                        and not _should_forward_suppressed_stream_event(
+                            payload, filter_node_id
+                        )
                     ):
                         logger.debug(
                             "Suppressing streamed Modal cached-node marker for component=%s node_id=%s real_node_id=%s because it does not belong to this mapped/static payload.",
@@ -3937,7 +4178,9 @@ def _consume_remote_payload_stream(
                         )
                         continue
                     reported_node_id = (
-                        progress_metadata["node_id"] if progress_metadata is not None else None
+                        progress_metadata["node_id"]
+                        if progress_metadata is not None
+                        else None
                     )
                     if reported_node_id is not None:
                         display_node_id = (
@@ -3946,7 +4189,9 @@ def _consume_remote_payload_stream(
                             else str(reported_node_id)
                         )
                         real_node_id = (
-                            progress_metadata["real_node_id"] if progress_metadata is not None else None
+                            progress_metadata["real_node_id"]
+                            if progress_metadata is not None
+                            else None
                         )
                         logger.debug(
                             "Forwarding streamed Modal cached-node marker for component=%s node_id=%s real_node_id=%s.",
@@ -3973,8 +4218,14 @@ def _consume_remote_payload_stream(
                 )
                 if suppress_status_stream:
                     remote_phase = str(stream_event.get("phase", "executing"))
-                    if remote_phase in {"execution_success", "execution_error", "execution_interrupted"}:
-                        for progress_metadata in suppressed_progress_node_metadata.values():
+                    if remote_phase in {
+                        "execution_success",
+                        "execution_error",
+                        "execution_interrupted",
+                    }:
+                        for (
+                            progress_metadata
+                        ) in suppressed_progress_node_metadata.values():
                             _emit_local_modal_progress(
                                 prompt_id=prompt_id,
                                 client_id=client_id,
@@ -4014,7 +4265,8 @@ def _consume_remote_payload_stream(
                         str(stream_event["active_node_id"])
                         if stream_event.get("active_node_id") is not None
                         else None,
-                    ) or None,
+                    )
+                    or None,
                     active_node_class_type=(
                         str(stream_event["active_node_class_type"])
                         if stream_event.get("active_node_class_type") is not None
@@ -4064,7 +4316,9 @@ def _mapped_execution_parallelism(item_count: int) -> int:
     return max(1, min(item_count, configured_limit))
 
 
-def _mapped_phase_definition(payload: dict[str, Any], phase_key: str) -> dict[str, Any] | None:
+def _mapped_phase_definition(
+    payload: dict[str, Any], phase_key: str
+) -> dict[str, Any] | None:
     """Return one explicit mapped phase definition when queue-time planning provided it."""
     phase_payload = payload.get(phase_key)
     if isinstance(phase_payload, dict):
@@ -4080,7 +4334,9 @@ def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
         "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
         "volume_reload_marker": payload.get("volume_reload_marker"),
         "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
-        "terminate_container_on_error": bool(payload.get("terminate_container_on_error", True)),
+        "terminate_container_on_error": bool(
+            payload.get("terminate_container_on_error", True)
+        ),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
     }
     snapshot_profile_key = payload.get("snapshot_profile_key")
@@ -4146,7 +4402,9 @@ def _split_phase_outputs(
     """Split one phase result tuple into bridge values and external outputs."""
     internal_outputs: dict[str, Any] = {}
     external_outputs: list[Any] = []
-    for boundary_output, output_value in zip(boundary_outputs, phase_outputs, strict=True):
+    for boundary_output, output_value in zip(
+        boundary_outputs, phase_outputs, strict=True
+    ):
         output_name = str(boundary_output.get("proxy_output_name") or "")
         if output_name in internal_output_names:
             internal_outputs[output_name] = output_value
@@ -4164,9 +4422,13 @@ def _execute_mapped_subgraph_payload(
     mapped_input = payload.get("mapped_input") or {}
     mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
     if not mapped_input_name:
-        raise ModalRemoteInvocationError("Mapped remote payloads must define mapped_input.proxy_input_name.")
+        raise ModalRemoteInvocationError(
+            "Mapped remote payloads must define mapped_input.proxy_input_name."
+        )
     if mapped_input_name not in hydrated_inputs:
-        raise KeyError(f"Mapped remote payload input {mapped_input_name!r} was not provided.")
+        raise KeyError(
+            f"Mapped remote payload input {mapped_input_name!r} was not provided."
+        )
 
     mapped_items = split_mapped_value(
         hydrated_inputs[mapped_input_name],
@@ -4297,7 +4559,9 @@ def _build_mapped_item_payload(
         )
     item_payload = copy.deepcopy(payload)
     item_payload["payload_kind"] = "subgraph"
-    item_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}"
+    item_payload[
+        "component_id"
+    ] = f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}"
     item_payload["mapped_input"] = None
     item_payload["suppress_status_stream"] = True
     item_payload["map_item_index"] = item_index
@@ -4327,12 +4591,18 @@ def _aggregate_mapped_outputs(
 
     output_count = len(per_item_outputs[0])
     if any(len(item_outputs) != output_count for item_outputs in per_item_outputs):
-        raise RemoteSubgraphExecutionError("Mapped remote execution produced inconsistent output arity.")
+        raise RemoteSubgraphExecutionError(
+            "Mapped remote execution produced inconsistent output arity."
+        )
 
     boundary_outputs = list(payload.get("boundary_outputs", []))
     aggregated_outputs: list[Any] = []
     for output_index in range(output_count):
-        boundary_output = boundary_outputs[output_index] if output_index < len(boundary_outputs) else {}
+        boundary_output = (
+            boundary_outputs[output_index]
+            if output_index < len(boundary_outputs)
+            else {}
+        )
         aggregated_outputs.append(
             join_mapped_values_for_scheduler(
                 [item_outputs[output_index] for item_outputs in per_item_outputs],
@@ -4344,10 +4614,14 @@ def _aggregate_mapped_outputs(
     return tuple(aggregated_outputs)
 
 
-def _build_remote_session_cleanup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _build_remote_session_cleanup_payload(
+    payload: dict[str, Any]
+) -> dict[str, Any] | None:
     """Return a dedicated cleanup payload that clears one shared remote session once."""
     remote_session = payload.get("remote_session")
-    if not bool(payload.get("clear_remote_session")) or not is_remote_session_handle_payload(remote_session):
+    if not bool(
+        payload.get("clear_remote_session")
+    ) or not is_remote_session_handle_payload(remote_session):
         return None
     return {
         "payload_kind": "subgraph",
@@ -4365,12 +4639,16 @@ def _build_remote_session_cleanup_payload(payload: dict[str, Any]) -> dict[str, 
     }
 
 
-def _is_mapped_boundary_output(boundary_output: dict[str, Any], payload: dict[str, Any]) -> bool:
+def _is_mapped_boundary_output(
+    boundary_output: dict[str, Any], payload: dict[str, Any]
+) -> bool:
     """Return whether one boundary output belongs to the mapped per-item branch."""
     mapped_output = boundary_output.get("mapped_output")
     if mapped_output is not None:
         return bool(mapped_output)
-    return bool(payload.get("mapped_input")) and not bool(payload.get("static_execute_node_ids"))
+    return bool(payload.get("mapped_input")) and not bool(
+        payload.get("static_execute_node_ids")
+    )
 
 
 def _build_static_mapped_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4384,11 +4662,15 @@ def _build_static_mapped_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
     static_payload = copy.deepcopy(payload)
     static_payload["payload_kind"] = "subgraph"
-    static_payload["component_id"] = f"{payload.get('component_id', 'modal-subgraph')}::static"
+    static_payload[
+        "component_id"
+    ] = f"{payload.get('component_id', 'modal-subgraph')}::static"
     static_payload["mapped_input"] = None
     static_payload["suppress_status_stream"] = True
     static_payload.pop("clear_remote_session", None)
-    static_payload["execute_node_ids"] = list(payload.get("static_execute_node_ids") or [])
+    static_payload["execute_node_ids"] = list(
+        payload.get("static_execute_node_ids") or []
+    )
     static_payload["boundary_outputs"] = [
         copy.deepcopy(boundary_output)
         for boundary_output in payload.get("boundary_outputs", [])
@@ -4424,7 +4706,9 @@ def _merge_static_and_mapped_outputs(
         combined_outputs.append(static_outputs[static_output_index])
         static_output_index += 1
 
-    if static_output_index != len(static_outputs) or mapped_output_index != len(mapped_outputs):
+    if static_output_index != len(static_outputs) or mapped_output_index != len(
+        mapped_outputs
+    ):
         raise RemoteSubgraphExecutionError(
             "Mapped remote execution produced extra outputs that did not match the declared boundary outputs."
         )
@@ -4437,9 +4721,15 @@ def _emit_local_mapped_progress(
     total_items: int,
 ) -> None:
     """Emit one aggregate mapped-execution progress update for the component representative node."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     extra_data = payload.get("extra_data") or {}
-    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    client_id = (
+        str(extra_data.get("client_id"))
+        if extra_data.get("client_id") is not None
+        else None
+    )
     display_node_id = str(
         payload.get("mapped_progress_display_node_id")
         or payload.get("component_id")
@@ -4460,16 +4750,22 @@ def _emit_local_mapped_progress(
 
 def _mapped_progress_owner_component_id(payload: dict[str, Any]) -> str | None:
     """Return the stable component id used to track one mapped worker lane locally."""
-    owner_component_id = payload.get("mapped_progress_display_node_id", payload.get("component_id"))
+    owner_component_id = payload.get(
+        "mapped_progress_display_node_id", payload.get("component_id")
+    )
     if owner_component_id is None:
         return None
     owner_component = str(owner_component_id)
     return owner_component or None
 
 
-def _remember_mapped_lane_node_id(payload: dict[str, Any], lane_id: str, node_id: str) -> None:
+def _remember_mapped_lane_node_id(
+    payload: dict[str, Any], lane_id: str, node_id: str
+) -> None:
     """Remember the last real node id that emitted progress for one mapped worker lane."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     owner_component_id = _mapped_progress_owner_component_id(payload)
     if not prompt_id or not owner_component_id or not node_id:
         return
@@ -4479,12 +4775,16 @@ def _remember_mapped_lane_node_id(payload: dict[str, Any], lane_id: str, node_id
 
 def _pop_mapped_lane_node_id(payload: dict[str, Any], lane_id: str) -> str | None:
     """Forget and return the last real node id that emitted progress for one mapped worker lane."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     owner_component_id = _mapped_progress_owner_component_id(payload)
     if not prompt_id or not owner_component_id:
         return None
     with _MAPPED_PROGRESS_NODE_IDS_LOCK:
-        return _MAPPED_PROGRESS_NODE_IDS.pop((prompt_id, owner_component_id, lane_id), None)
+        return _MAPPED_PROGRESS_NODE_IDS.pop(
+            (prompt_id, owner_component_id, lane_id), None
+        )
 
 
 def _clear_local_mapped_lane_progress(
@@ -4493,11 +4793,19 @@ def _clear_local_mapped_lane_progress(
     item_index: int,
 ) -> None:
     """Remove one mapped worker lane from the local node overlay."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     extra_data = payload.get("extra_data") or {}
-    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    client_id = (
+        str(extra_data.get("client_id"))
+        if extra_data.get("client_id") is not None
+        else None
+    )
     lane_id = str(lane_index)
-    display_node_id = _pop_mapped_lane_node_id(payload, lane_id) or str(payload.get("component_id") or "")
+    display_node_id = _pop_mapped_lane_node_id(payload, lane_id) or str(
+        payload.get("component_id") or ""
+    )
     if not prompt_id or not client_id or not display_node_id:
         return
     _emit_local_modal_progress(
@@ -4519,9 +4827,15 @@ def _emit_local_mapped_lane_progress_start(
     item_index: int | None = None,
 ) -> None:
     """Create or reset one mapped worker lane before remote progress begins arriving."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     extra_data = payload.get("extra_data") or {}
-    client_id = str(extra_data.get("client_id")) if extra_data.get("client_id") is not None else None
+    client_id = (
+        str(extra_data.get("client_id"))
+        if extra_data.get("client_id") is not None
+        else None
+    )
     display_node_id = str(payload.get("component_id") or "")
     if not prompt_id or not client_id or not display_node_id:
         return
@@ -4565,8 +4879,12 @@ def _split_batch_boundary_inputs(
     hydrated_inputs: dict[str, Any],
 ) -> tuple[dict[str, list[Any]], int] | None:
     """Return zipped per-item boundary inputs when an ordinary subgraph receives batched values."""
-    implicitly_batchable_scalar_io_types = frozenset({"BOOLEAN", "FLOAT", "INT", "STRING"})
-    implicitly_batchable_transport_io_types = frozenset({"IMAGE", "LATENT", "MASK", "NOISE", "SIGMAS"})
+    implicitly_batchable_scalar_io_types = frozenset(
+        {"BOOLEAN", "FLOAT", "INT", "STRING"}
+    )
+    implicitly_batchable_transport_io_types = frozenset(
+        {"IMAGE", "LATENT", "MASK", "NOISE", "SIGMAS"}
+    )
     split_inputs: dict[str, list[Any]] = {}
 
     def is_session_ref_list(value: Any) -> bool:
@@ -4583,7 +4901,11 @@ def _split_batch_boundary_inputs(
 
     def unwrap_singleton_session_ref_list(value: Any) -> Any:
         """Unwrap Comfy's output-list wrapper around mapped remote session refs."""
-        if isinstance(value, list) and len(value) == 1 and is_session_ref_list(value[0]):
+        if (
+            isinstance(value, list)
+            and len(value) == 1
+            and is_session_ref_list(value[0])
+        ):
             return value[0]
         return value
 
@@ -4591,7 +4913,9 @@ def _split_batch_boundary_inputs(
         proxy_input_name = str(boundary_input.get("proxy_input_name") or "")
         if not proxy_input_name or proxy_input_name not in hydrated_inputs:
             continue
-        input_value = unwrap_singleton_session_ref_list(hydrated_inputs[proxy_input_name])
+        input_value = unwrap_singleton_session_ref_list(
+            hydrated_inputs[proxy_input_name]
+        )
         io_type = _implicit_batch_boundary_effective_io_type(
             payload=payload,
             boundary_input=boundary_input,
@@ -4615,8 +4939,10 @@ def _split_batch_boundary_inputs(
             isinstance(input_value, list)
             and not is_mapped_output_value(input_value)
             and not input_is_session_ref_list
-            and io_type not in (
-                implicitly_batchable_scalar_io_types | implicitly_batchable_transport_io_types
+            and io_type
+            not in (
+                implicitly_batchable_scalar_io_types
+                | implicitly_batchable_transport_io_types
             )
         ):
             logger.info(
@@ -4713,7 +5039,9 @@ def _implicit_batch_boundary_effective_io_type(
     if _list_is_latent_like_batch(input_value):
         return "LATENT"
 
-    target_input_types = _implicit_batch_boundary_target_input_types(payload, boundary_input)
+    target_input_types = _implicit_batch_boundary_target_input_types(
+        payload, boundary_input
+    )
     if len(target_input_types) == 1:
         return next(iter(target_input_types))
     return declared_io_type
@@ -4763,7 +5091,9 @@ def _partition_implicit_batched_execute_nodes(
     """Split one implicitly batched subgraph into static and per-item execute targets."""
     prompt = payload.get("subgraph_prompt", {})
     if not isinstance(prompt, dict):
-        execute_node_ids = [str(node_id) for node_id in payload.get("execute_node_ids", [])]
+        execute_node_ids = [
+            str(node_id) for node_id in payload.get("execute_node_ids", [])
+        ]
         return [], execute_node_ids
 
     batched_target_node_ids: set[str] = set()
@@ -4816,7 +5146,10 @@ def _annotate_implicit_batched_boundary_outputs(
     """Mark which boundary outputs belong to the per-item branch of an implicitly batched subgraph."""
     prompt = payload.get("subgraph_prompt", {})
     if not isinstance(prompt, dict) or not mapped_execute_node_ids:
-        return [copy.deepcopy(boundary_output) for boundary_output in payload.get("boundary_outputs", [])]
+        return [
+            copy.deepcopy(boundary_output)
+            for boundary_output in payload.get("boundary_outputs", [])
+        ]
 
     mapped_required_node_ids = set(
         _resolve_required_subgraph_nodes(
@@ -4854,7 +5187,9 @@ def _log_detached_mapped_lane_result(
         )
 
 
-async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+async def _invoke_implicitly_mapped_subgraph_async(
+    payload: dict[str, Any], kwargs_payload: bytes
+) -> bytes:
     """Fan out one ordinary subgraph payload when batchable boundary inputs arrive zipped."""
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
     split_batch_inputs = _split_batch_boundary_inputs(payload, hydrated_inputs)
@@ -4885,7 +5220,9 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         total_items=total_items,
         reason="implicit_mapped_component_exact_parallelism",
     )
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     if prompt_id is not None:
         await _await_prompt_warmup_slots(
             prompt_id,
@@ -4907,7 +5244,10 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         for input_name, value in hydrated_inputs.items()
         if input_name not in split_inputs
     }
-    static_execute_node_ids, mapped_execute_node_ids = _partition_implicit_batched_execute_nodes(
+    (
+        static_execute_node_ids,
+        mapped_execute_node_ids,
+    ) = _partition_implicit_batched_execute_nodes(
         payload,
         split_inputs,
     )
@@ -4935,7 +5275,9 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
             lane_remote_engines = [
                 _lookup_deployed_remote_engine(
                     hybrid_payload,
-                    affinity_key_override=_mapped_lane_affinity_key(hybrid_payload, lane_index),
+                    affinity_key_override=_mapped_lane_affinity_key(
+                        hybrid_payload, lane_index
+                    ),
                 )
                 for lane_index in range(parallelism)
             ]
@@ -4960,6 +5302,7 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     serialize_node_inputs(broadcast_inputs),
                 )
                 seeded_lane_indices.add(lane_index)
+
         elif static_execute_node_ids:
             static_response = await invoke_remote_engine_async(
                 _build_static_mapped_payload(hybrid_payload),
@@ -4974,7 +5317,9 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
         all_items_completed = asyncio.Event()
         stop_dispatch_requested = asyncio.Event()
         skip_cleanup_after_interrupt = False
-        worker_failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
+        worker_failure: asyncio.Future[
+            BaseException
+        ] = asyncio.get_running_loop().create_future()
         item_queue: asyncio.Queue[int | None] = asyncio.Queue()
         for item_index in range(total_items):
             item_queue.put_nowait(item_index)
@@ -5011,7 +5356,9 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                         return
                     raise_if_local_interrupted()
                     try:
-                        item_payload = _build_mapped_item_payload(hybrid_payload, item_index, lane_index)
+                        item_payload = _build_mapped_item_payload(
+                            hybrid_payload, item_index, lane_index
+                        )
                         item_inputs = dict(broadcast_inputs)
                         for input_name, items in split_inputs.items():
                             item_inputs[input_name] = items[item_index]
@@ -5027,13 +5374,19 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                                 serialize_node_inputs(item_inputs),
                             )
                         raise_if_local_interrupted()
-                        per_item_outputs[item_index] = deserialize_node_outputs(item_response)
+                        per_item_outputs[item_index] = deserialize_node_outputs(
+                            item_response
+                        )
                         completed_items += 1
-                        _emit_local_mapped_progress(payload, completed_items, total_items)
+                        _emit_local_mapped_progress(
+                            payload, completed_items, total_items
+                        )
                         if completed_items >= total_items:
                             all_items_completed.set()
                     finally:
-                        _clear_local_mapped_lane_progress(payload, lane_index, item_index)
+                        _clear_local_mapped_lane_progress(
+                            payload, lane_index, item_index
+                        )
             except BaseException as exc:
                 if all_items_completed.is_set():
                     logger.info(
@@ -5050,7 +5403,10 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     worker_failure.set_result(exc)
                 raise
 
-        tasks = [asyncio.create_task(run_worker(lane_index)) for lane_index in range(parallelism)]
+        tasks = [
+            asyncio.create_task(run_worker(lane_index))
+            for lane_index in range(parallelism)
+        ]
         for lane_index, task in enumerate(tasks):
             task.add_done_callback(
                 lambda completed_task, lane_index=lane_index: _log_detached_mapped_lane_result(
@@ -5067,7 +5423,9 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
                     worker_failure,
                     *tasks,
                 }
-                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    wait_set, return_when=asyncio.FIRST_COMPLETED
+                )
                 if completion_task in done or all_items_completed.is_set():
                     break
                 if worker_failure in done:
@@ -5097,13 +5455,21 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
             _merge_static_and_mapped_outputs(
                 static_outputs=static_outputs,
                 mapped_outputs=_aggregate_mapped_outputs(
-                    [item_outputs for item_outputs in per_item_outputs if item_outputs is not None],
+                    [
+                        item_outputs
+                        for item_outputs in per_item_outputs
+                        if item_outputs is not None
+                    ],
                     {
                         **hybrid_payload,
                         "boundary_outputs": [
                             boundary_output
-                            for boundary_output in hybrid_payload.get("boundary_outputs", [])
-                            if _is_mapped_boundary_output(boundary_output, hybrid_payload)
+                            for boundary_output in hybrid_payload.get(
+                                "boundary_outputs", []
+                            )
+                            if _is_mapped_boundary_output(
+                                boundary_output, hybrid_payload
+                            )
                         ],
                     },
                 ),
@@ -5140,7 +5506,9 @@ async def _invoke_implicitly_mapped_subgraph_async(payload: dict[str, Any], kwar
             )
 
 
-async def _invoke_mapped_remote_engine_async(payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+async def _invoke_mapped_remote_engine_async(
+    payload: dict[str, Any], kwargs_payload: bytes
+) -> bytes:
     """Execute one mapped payload locally using explicit static and mapped phases."""
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
     return await asyncio.to_thread(
@@ -5170,7 +5538,9 @@ def _lookup_deployed_remote_engine(
     if isinstance(payload_snapshot_profile_key, str):
         snapshot_profile_key = payload_snapshot_profile_key.strip()
     if snapshot_profile_key:
-        stored_snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
+        stored_snapshot_profile_key = _store_loader_snapshot_profile(
+            loader_prewarm_plans
+        )
         if stored_snapshot_profile_key:
             snapshot_profile_key = stored_snapshot_profile_key
             payload["snapshot_profile_key"] = snapshot_profile_key
@@ -5195,7 +5565,9 @@ def _lookup_deployed_remote_engine(
         remote_engine_kwargs["snapshot_profile_key"] = snapshot_profile_key
     remote_engine = remote_cls(**remote_engine_kwargs)
     with _MODAL_AUTO_DEPLOY_LOCK:
-        runtime_is_known_current = _modal_runtime_cache_key(payload) in _MODAL_REMOTE_APP_VERSION_OK
+        runtime_is_known_current = (
+            _modal_runtime_cache_key(payload) in _MODAL_REMOTE_APP_VERSION_OK
+        )
     if runtime_is_known_current:
         _ensure_llm_profiles_staged(payload, deployment_app_name)
     return remote_engine
@@ -5208,60 +5580,87 @@ def _ensure_llm_profiles_staged(
     """Stage every LLM profile in a payload on a CPU worker before GPU dispatch."""
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
-    profile_ids = llm_profile_ids_from_payload(payload)
-    if not profile_ids:
+    model_references = llm_model_references_from_payload(payload)
+    if not model_references:
         return
-    profile_keys = {
-        (
-            deployment_app_name,
-            profile_id,
-            get_llm_profile(profile_id).revision,
-        )
-        for profile_id in profile_ids
-    }
     with _STAGED_LLM_PROFILES_LOCK:
-        missing_profile_ids = [
-            profile_id
-            for profile_id in profile_ids
-            if (
-                deployment_app_name,
-                profile_id,
-                get_llm_profile(profile_id).revision,
-            )
-            not in _STAGED_LLM_PROFILES
+        if not _STAGED_LLM_PROFILES:
+            _STAGED_LLM_PROFILE_RESULTS.clear()
+        missing_model_references = [
+            reference
+            for reference in model_references
+            if (deployment_app_name, reference) not in _STAGED_LLM_PROFILE_RESULTS
         ]
-        if missing_profile_ids:
+        if missing_model_references:
             logger.info(
-                "Dispatching CPU model staging app=%s profiles=%s before GPU component=%s.",
+                "Dispatching CPU model resolution/staging app=%s models=%s "
+                "before GPU component=%s.",
                 deployment_app_name,
-                missing_profile_ids,
+                missing_model_references,
                 payload.get("component_id"),
             )
             stager_cls = modal.Cls.from_name(deployment_app_name, "ModelStager")
-            stage_results = stager_cls().stage_profiles.remote(missing_profile_ids)
-            staged_ids = {
-                str(result.get("profile_id"))
-                for result in stage_results
-                if isinstance(result, Mapping)
-            }
-            missing_results = set(missing_profile_ids) - staged_ids
+            stage_results = stager_cls().stage_profiles.remote(missing_model_references)
+            confirmed_references: set[str] = set()
+            for stage_result in stage_results:
+                if not isinstance(stage_result, Mapping):
+                    continue
+                requested_reference = str(
+                    stage_result.get("requested_reference")
+                    or stage_result.get("profile_id")
+                    or ""
+                )
+                profile_id = str(stage_result.get("profile_id") or "")
+                revision = str(stage_result.get("revision") or "")
+                if not revision and requested_reference == profile_id:
+                    try:
+                        revision = get_llm_profile(profile_id).revision
+                    except ValueError:
+                        pass
+                if not requested_reference or not profile_id or not revision:
+                    continue
+                normalized_result = dict(stage_result)
+                normalized_result["requested_reference"] = requested_reference
+                normalized_result["profile_id"] = profile_id
+                normalized_result["revision"] = revision
+                _STAGED_LLM_PROFILE_RESULTS[
+                    (deployment_app_name, requested_reference)
+                ] = normalized_result
+                _STAGED_LLM_PROFILE_RESULTS[
+                    (deployment_app_name, profile_id)
+                ] = normalized_result
+                _STAGED_LLM_PROFILES.add((deployment_app_name, profile_id, revision))
+                confirmed_references.add(requested_reference)
+            missing_results = set(missing_model_references) - confirmed_references
             if missing_results:
                 raise ModalRemoteInvocationError(
-                    f"Modal ModelStager did not confirm profiles {sorted(missing_results)}."
+                    f"Modal ModelStager did not confirm models {sorted(missing_results)}."
                 )
-            _STAGED_LLM_PROFILES.update(profile_keys)
+        resolved_results = {
+            reference: _STAGED_LLM_PROFILE_RESULTS[(deployment_app_name, reference)]
+            for reference in model_references
+        }
+    profile_ids_by_reference = {
+        reference: str(result["profile_id"])
+        for reference, result in resolved_results.items()
+    }
+    rewrite_llm_model_references(payload, profile_ids_by_reference)
     revisions = ",".join(
-        f"{profile_id}:{get_llm_profile(profile_id).revision}"
-        for profile_id in profile_ids
+        f"{result['profile_id']}:{result['revision']}"
+        for result in sorted(
+            resolved_results.values(),
+            key=lambda value: str(value["profile_id"]),
+        )
     )
     payload["requires_volume_reload"] = True
     payload["volume_reload_marker"] = hashlib.sha256(
         f"llm-profiles:{revisions}".encode("utf-8")
     ).hexdigest()
     logger.info(
-        "Modal LLM profiles are staged for component=%s profiles=%s reload_marker=%s.",
+        "Modal LLM models are resolved and staged for component=%s profiles=%s "
+        "reload_marker=%s.",
         payload.get("component_id"),
-        profile_ids,
+        sorted(profile_ids_by_reference.values()),
         payload["volume_reload_marker"],
     )
 
@@ -5291,10 +5690,15 @@ async def _invoke_bound_remote_engine_async(
     try:
         while True:
             try:
-                response = await asyncio.wait_for(asyncio.shield(wrapped_future), timeout=0.1)
+                response = await asyncio.wait_for(
+                    asyncio.shield(wrapped_future), timeout=0.1
+                )
                 break
             except asyncio.TimeoutError:
-                interrupt_sent, cancellation_started_at = await _handle_modal_wait_cancellation_async(
+                (
+                    interrupt_sent,
+                    cancellation_started_at,
+                ) = await _handle_modal_wait_cancellation_async(
                     payload,
                     cancellation_event,
                     interrupt_sent=interrupt_sent,
@@ -5303,7 +5707,11 @@ async def _invoke_bound_remote_engine_async(
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()
-        prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+        prompt_id = (
+            str(payload.get("prompt_id"))
+            if payload.get("prompt_id") is not None
+            else None
+        )
         if prompt_id is not None:
             await request_remote_modal_prompt_interrupt_async(prompt_id)
         raise
@@ -5362,7 +5770,9 @@ def _remote_runtime_identity_for_settings(
     )
 
 
-def _expected_remote_runtime_fingerprint(payload: Mapping[str, Any] | None = None) -> str:
+def _expected_remote_runtime_fingerprint(
+    payload: Mapping[str, Any] | None = None
+) -> str:
     """Return the exact deployment fingerprint required by this local client."""
     settings = _settings_for_payload(payload) if payload is not None else get_settings()
     return _remote_runtime_identity_for_settings(settings).fingerprint
@@ -5399,7 +5809,9 @@ def _remote_engine_runtime_version(remote_engine: Any) -> dict[str, Any] | None:
     return version_payload
 
 
-def _runtime_fingerprint_from_payload(version_payload: dict[str, Any] | None) -> str | None:
+def _runtime_fingerprint_from_payload(
+    version_payload: dict[str, Any] | None
+) -> str | None:
     """Return a normalized runtime fingerprint from remote version metadata."""
     if version_payload is None:
         return None
@@ -5524,10 +5936,14 @@ def _stop_modal_app_via_cli(app_name: str) -> bool:
 def _stop_modal_app_for_replacement(app_name: str) -> None:
     """Stop an out-of-date Modal app before replacing it with a fresh deployment."""
     if _stop_modal_app_via_sdk(app_name):
-        logger.warning("Stopped out-of-date Modal app %s through the Modal SDK.", app_name)
+        logger.warning(
+            "Stopped out-of-date Modal app %s through the Modal SDK.", app_name
+        )
         return
     if _stop_modal_app_via_cli(app_name):
-        logger.warning("Stopped out-of-date Modal app %s through the Modal CLI.", app_name)
+        logger.warning(
+            "Stopped out-of-date Modal app %s through the Modal CLI.", app_name
+        )
         return
     raise ModalRemoteInvocationError(
         f"Deployed Modal app {app_name!r} is out of date, but Modal-Sync could not stop it automatically. "
@@ -5591,7 +6007,9 @@ def _replace_outdated_modal_app(
     return replacement_engine
 
 
-def _ensure_remote_engine_protocol_current(remote_engine: Any, payload: dict[str, Any]) -> Any:
+def _ensure_remote_engine_protocol_current(
+    remote_engine: Any, payload: dict[str, Any]
+) -> Any:
     """Return a compatible remote engine, replacing the deployed app when allowed."""
     settings = _settings_for_payload(payload)
     runtime_cache_key = _modal_runtime_cache_key(payload)
@@ -5653,10 +6071,14 @@ def _lookup_deployed_remote_engine_with_retry(
             if remaining_seconds <= 0.0:
                 raise
             time.sleep(min(delay_seconds, remaining_seconds))
-            delay_seconds = min(max_delay_seconds, max(delay_seconds * 2.0, initial_delay_seconds))
+            delay_seconds = min(
+                max_delay_seconds, max(delay_seconds * 2.0, initial_delay_seconds)
+            )
     if last_error is not None:
         raise last_error
-    raise ModalRemoteInvocationError("Deployed Modal lookup retry loop exited unexpectedly.")
+    raise ModalRemoteInvocationError(
+        "Deployed Modal lookup retry loop exited unexpectedly."
+    )
 
 
 def _warmup_prompt_id(warmup_request: dict[str, Any]) -> str | None:
@@ -5696,7 +6118,9 @@ def _clamp_prompt_warmup_target(warmup_target: int) -> int:
     return normalized_target
 
 
-def _iter_loader_prewarm_prompt_payloads(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+def _iter_loader_prewarm_prompt_payloads(
+    payload: dict[str, Any]
+) -> Iterator[dict[str, Any]]:
     """Yield subgraph-like payload fragments that may contain root loader nodes."""
     split_proxy_payloads = payload.get("split_proxy_payloads")
     if isinstance(split_proxy_payloads, dict):
@@ -5798,7 +6222,9 @@ def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]
     if not get_settings().enable_loader_prewarm:
         return []
 
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
     seen_signatures: set[str] = set()
     plans: list[dict[str, Any]] = []
     for prompt_payload in _iter_loader_prewarm_prompt_payloads(payload):
@@ -5806,7 +6232,9 @@ def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]
         if not isinstance(subgraph_prompt, Mapping):
             continue
         for node_id, prompt_node in subgraph_prompt.items():
-            if not isinstance(prompt_node, Mapping) or not _is_root_literal_loader_node(prompt_node):
+            if not isinstance(prompt_node, Mapping) or not _is_root_literal_loader_node(
+                prompt_node
+            ):
                 continue
             class_type = str(prompt_node.get("class_type") or "")
             inputs = prompt_node.get("inputs")
@@ -5849,7 +6277,10 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | No
             else None
         ),
         "component_id": str(
-            payload.get("mapped_progress_display_node_id", payload.get("component_id", "modal-warmup"))
+            payload.get(
+                "mapped_progress_display_node_id",
+                payload.get("component_id", "modal-warmup"),
+            )
         ),
         "modal_gpu": settings.modal_gpu,
         "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
@@ -5895,7 +6326,9 @@ def _prompt_parallelism_target(
         for component_id_value in stage:
             component_id = str(component_id_value)
             if component_id in exact_parallelism:
-                current_stage_parallelism += max(1, int(exact_parallelism[component_id]))
+                current_stage_parallelism += max(
+                    1, int(exact_parallelism[component_id])
+                )
             elif component_id in mapped_component_ids:
                 current_stage_parallelism += 1
             else:
@@ -5908,24 +6341,42 @@ def _prompt_parallelism_target(
     return _clamp_prompt_warmup_target(max(1, stage_parallelism))
 
 
-def _register_exact_component_parallelism(payload: dict[str, Any], component_parallelism: int) -> int:
+def _register_exact_component_parallelism(
+    payload: dict[str, Any], component_parallelism: int
+) -> int:
     """Record exact mapped-component parallelism and return the refined prompt-wide warmup target."""
-    prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
-    component_id = str(payload.get("component_id")) if payload.get("component_id") is not None else None
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
+    component_id = (
+        str(payload.get("component_id"))
+        if payload.get("component_id") is not None
+        else None
+    )
     if not prompt_id or not component_id:
         return _clamp_prompt_warmup_target(component_parallelism)
 
     with _PROMPT_WARMUP_STATES_LOCK:
         warmup_state = _ensure_prompt_warmup_state(prompt_id)
-        warmup_state.exact_component_parallelism[component_id] = max(1, int(component_parallelism))
+        warmup_state.exact_component_parallelism[component_id] = max(
+            1, int(component_parallelism)
+        )
         exact_parallelism = dict(warmup_state.exact_component_parallelism)
-    return _prompt_parallelism_target(payload, exact_component_parallelism=exact_parallelism)
+    return _prompt_parallelism_target(
+        payload, exact_component_parallelism=exact_parallelism
+    )
 
 
-def _warmup_slot_payload(warmup_request: dict[str, Any], slot_index: int) -> dict[str, Any]:
+def _warmup_slot_payload(
+    warmup_request: dict[str, Any], slot_index: int
+) -> dict[str, Any]:
     """Return the remote warmup payload for one desired container slot."""
     slot_payload = copy.deepcopy(warmup_request)
-    component_id = str(slot_payload.get("component_id") or slot_payload.get("prompt_id") or "modal-warmup")
+    component_id = str(
+        slot_payload.get("component_id")
+        or slot_payload.get("prompt_id")
+        or "modal-warmup"
+    )
     slot_payload["component_id"] = f"{component_id}::warmup:{slot_index}"
     slot_payload["warmup_slot_index"] = int(slot_index)
     slot_payload["warmup_only"] = True
@@ -5937,7 +6388,9 @@ def _prompt_warmup_head_start_seconds() -> float:
     return max(0.0, float(get_settings().proactive_warmup_head_start_seconds))
 
 
-def _invoke_remote_engine_warmup(remote_engine: Any, warmup_request: dict[str, Any]) -> Any:
+def _invoke_remote_engine_warmup(
+    remote_engine: Any, warmup_request: dict[str, Any]
+) -> Any:
     """Ask one prepared remote engine instance to warm a container for a prompt."""
     warmup_method = getattr(remote_engine, "warmup_for_request", None)
     if warmup_method is None:
@@ -5992,7 +6445,9 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
                 warmup_request,
             )
             _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
-            return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
+            return _invoke_remote_engine_warmup_with_recovery(
+                remote_engine, warmup_request
+            )
         except lookup_error_types as exc:
             if settings.auto_deploy:
                 remote_engine = _auto_deploy_modal_app(warmup_request, exc)
@@ -6100,15 +6555,15 @@ async def _await_prompt_warmup_slots(
         pending_slot_futures = [
             warmup_state.slot_futures[slot_index]
             for slot_index in slot_indices
-            if slot_index in warmup_state.slot_futures and not warmup_state.slot_futures[slot_index].done()
+            if slot_index in warmup_state.slot_futures
+            and not warmup_state.slot_futures[slot_index].done()
         ]
 
     if not pending_slot_futures:
         return 0
 
     wrapped_futures = [
-        asyncio.wrap_future(slot_future)
-        for slot_future in pending_slot_futures
+        asyncio.wrap_future(slot_future) for slot_future in pending_slot_futures
     ]
     done_futures, pending_futures = await asyncio.wait(
         wrapped_futures,
@@ -6196,7 +6651,9 @@ def boost_mapped_component_warmup(
 ) -> tuple[int, int]:
     """Record exact mapped fan-out and top up prompt warmup for the resulting lane count."""
     parallelism = _mapped_execution_parallelism(total_items)
-    refined_prompt_warmup_target = _register_exact_component_parallelism(payload, parallelism)
+    refined_prompt_warmup_target = _register_exact_component_parallelism(
+        payload, parallelism
+    )
     ensure_remote_warm_capacity(
         _build_prompt_warmup_request(payload),
         warmup_target=refined_prompt_warmup_target,
@@ -6232,7 +6689,10 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
 
     while True:
         with deploy_state.condition:
-            if not _is_missing_modal_deployment_error(lookup_error) and deploy_state.ready:
+            if (
+                not _is_missing_modal_deployment_error(lookup_error)
+                and deploy_state.ready
+            ):
                 logger.info(
                     "Auto-deploy already completed for app=%s env=%s; reusing cached deployment state.",
                     deployment_app_name,
@@ -6288,7 +6748,9 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
             payload.get("component_id"),
             lookup_error,
         )
-        output_context = modal.enable_output() if hasattr(modal, "enable_output") else nullcontext()
+        output_context = (
+            modal.enable_output() if hasattr(modal, "enable_output") else nullcontext()
+        )
         deploy_started_at = time.perf_counter()
         with output_context:
             cloud_app.deploy(
@@ -6332,7 +6794,9 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
     return remote_engine
 
 
-def _build_remote_interrupt_callback(_remote_engine: Any, payload: dict[str, Any]) -> Callable[[], Any] | None:
+def _build_remote_interrupt_callback(
+    _remote_engine: Any, payload: dict[str, Any]
+) -> Callable[[], Any] | None:
     """Return a callable that requests interruption for one active Modal payload."""
     interrupt_store = _lookup_modal_interrupt_store()
     if interrupt_store is None:
@@ -6378,7 +6842,9 @@ def _invoke_remote_engine_payload(
         )
     return _invoke_remote_call_with_interrupts(
         payload=payload,
-        invoke_remote_call=lambda: remote_engine.execute_payload.remote(payload, kwargs_payload),
+        invoke_remote_call=lambda: remote_engine.execute_payload.remote(
+            payload, kwargs_payload
+        ),
         interrupt_remote_call=interrupt_remote_call,
         cancellation_event=cancellation_event,
     )
@@ -6560,7 +7026,9 @@ def _invoke_modal_payload_blocking(
         )
 
     if "app" not in globals() or "RemoteEngine" not in globals():
-        logger.debug("Local module Modal runtime objects are unavailable; loading stable cloud entry module.")
+        logger.debug(
+            "Local module Modal runtime objects are unavailable; loading stable cloud entry module."
+        )
 
     with _modal_cloud_settings_override(settings):
         cloud_module = _load_modal_cloud_module()
@@ -6607,7 +7075,9 @@ def invoke_remote_engine(
     if allow_implicit_mapping and payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
-            return asyncio.run(_invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload))
+            return asyncio.run(
+                _invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload)
+            )
     if execution_mode == "local" or modal is None:
         if payload.get("payload_kind") == "subgraph":
             return execute_subgraph_locally(payload, kwargs_payload)
@@ -6634,7 +7104,10 @@ def invoke_remote_engine(
                 response = future.result(timeout=0.1)
                 break
             except FutureTimeoutError:
-                interrupt_sent, cancellation_started_at = _handle_modal_wait_cancellation(
+                (
+                    interrupt_sent,
+                    cancellation_started_at,
+                ) = _handle_modal_wait_cancellation(
                     payload,
                     cancellation_event,
                     interrupt_sent=interrupt_sent,
@@ -6680,7 +7153,9 @@ async def invoke_remote_engine_async(
     if allow_implicit_mapping and payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
-            return await _invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload)
+            return await _invoke_implicitly_mapped_subgraph_async(
+                payload, kwargs_payload
+            )
     if execution_mode == "local" or modal is None:
         return await asyncio.to_thread(
             invoke_remote_engine,
@@ -6708,10 +7183,15 @@ async def invoke_remote_engine_async(
     try:
         while True:
             try:
-                response = await asyncio.wait_for(asyncio.shield(wrapped_future), timeout=0.1)
+                response = await asyncio.wait_for(
+                    asyncio.shield(wrapped_future), timeout=0.1
+                )
                 break
             except asyncio.TimeoutError:
-                interrupt_sent, cancellation_started_at = await _handle_modal_wait_cancellation_async(
+                (
+                    interrupt_sent,
+                    cancellation_started_at,
+                ) = await _handle_modal_wait_cancellation_async(
                     payload,
                     cancellation_event,
                     interrupt_sent=interrupt_sent,
@@ -6720,7 +7200,11 @@ async def invoke_remote_engine_async(
                 continue
     except asyncio.CancelledError:
         cancellation_event.set()
-        prompt_id = str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+        prompt_id = (
+            str(payload.get("prompt_id"))
+            if payload.get("prompt_id") is not None
+            else None
+        )
         if prompt_id is not None:
             await request_remote_modal_prompt_interrupt_async(prompt_id)
         raise
@@ -6753,7 +7237,9 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     settings = get_settings()
     app = modal.App(modal_deployment_app_name(settings))
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)
-    image = modal.Image.debian_slim().pip_install("torch", "safetensors", "pillow", "numpy")
+    image = modal.Image.debian_slim().pip_install(
+        "torch", "safetensors", "pillow", "numpy"
+    )
 
     @app.cls(
         gpu=settings.modal_gpu,
@@ -6763,6 +7249,7 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
     )
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""
+
         snapshot_profile_key: str = modal.parameter(default="")
         gpu_snapshot_enabled: bool = modal.parameter(default=False)
 
@@ -6776,7 +7263,9 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
             )
 
         @modal.method()
-        def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        def execute_payload(
+            self, payload: dict[str, Any], kwargs_payload: bytes
+        ) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
             if payload.get("payload_kind") == "mapped_subgraph":
                 hydrated_inputs = deserialize_node_inputs(kwargs_payload)
@@ -6809,7 +7298,9 @@ else:
         def setup(self) -> None:
             """No-op setup for local fallback execution."""
 
-        def execute_payload(self, payload: dict[str, Any], kwargs_payload: bytes) -> bytes:
+        def execute_payload(
+            self, payload: dict[str, Any], kwargs_payload: bytes
+        ) -> bytes:
             """Execute the proxied node or subgraph locally."""
             if payload.get("payload_kind") == "mapped_subgraph":
                 hydrated_inputs = deserialize_node_inputs(kwargs_payload)

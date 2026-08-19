@@ -339,6 +339,64 @@ def llm_profile_options() -> list[str]:
     return list(load_llm_profiles())
 
 
+def llm_model_references_from_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Find fixed curated IDs or Hugging Face references in a remote payload."""
+    model_references: set[str] = set()
+
+    def visit(value: Any) -> None:
+        """Visit nested payload values and collect Modal LLM model inputs."""
+        if isinstance(value, Mapping):
+            if value.get("class_type") == MODAL_LLM_NODE_ID:
+                inputs = value.get("inputs")
+                if isinstance(inputs, Mapping):
+                    model_reference = inputs.get("model_profile")
+                    if isinstance(model_reference, str) and model_reference.strip():
+                        model_references.add(model_reference.strip())
+                    else:
+                        raise ValueError(
+                            "Modal LLM model must be a fixed string so it can be "
+                            "resolved and staged on CPU before GPU allocation."
+                        )
+            for nested_value in value.values():
+                visit(nested_value)
+            return
+        if isinstance(value, list | tuple):
+            for nested_value in value:
+                visit(nested_value)
+
+    visit(payload)
+    return tuple(sorted(model_references))
+
+
+def rewrite_llm_model_references(
+    payload: Mapping[str, Any],
+    profile_ids_by_reference: Mapping[str, str],
+) -> None:
+    """Replace user-facing model references with generated immutable profile IDs."""
+
+    def visit(value: Any) -> None:
+        """Rewrite matching Modal LLM inputs anywhere in the payload."""
+        if isinstance(value, Mapping):
+            if value.get("class_type") == MODAL_LLM_NODE_ID:
+                inputs = value.get("inputs")
+                if isinstance(inputs, dict):
+                    model_reference = inputs.get("model_profile")
+                    if isinstance(model_reference, str):
+                        replacement = profile_ids_by_reference.get(
+                            model_reference.strip()
+                        )
+                        if replacement:
+                            inputs["model_profile"] = replacement
+            for nested_value in value.values():
+                visit(nested_value)
+            return
+        if isinstance(value, list | tuple):
+            for nested_value in value:
+                visit(nested_value)
+
+    visit(payload)
+
+
 def llm_profile_ids_from_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
     """Find curated LLM profiles referenced anywhere in a remote payload."""
     profile_ids: set[str] = set()
@@ -378,7 +436,9 @@ __all__ = [
     "get_llm_profile",
     "generated_profile_id",
     "generated_profile_manifest_path",
+    "llm_model_references_from_payload",
     "llm_profile_ids_from_payload",
     "llm_profile_options",
     "load_llm_profiles",
+    "rewrite_llm_model_references",
 ]

@@ -607,7 +607,14 @@ def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
         def remote(self, profile_ids: list[str]) -> list[dict[str, str]]:
             """Record and confirm every requested profile."""
             stage_calls.append(profile_ids)
-            return [{"profile_id": profile_id} for profile_id in profile_ids]
+            return [
+                {
+                    "requested_reference": profile_id,
+                    "profile_id": profile_id,
+                    "revision": "482adb537c021c86670beed01cd58990d01e72e4",
+                }
+                for profile_id in profile_ids
+            ]
 
     class FakeStager:
         """Expose the deployed CPU staging method."""
@@ -634,6 +641,7 @@ def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
     monkeypatch.setattr(remote_modal_app_module, "modal", SimpleNamespace(Cls=FakeCls))
     with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
         remote_modal_app_module._STAGED_LLM_PROFILES.clear()
+        remote_modal_app_module._STAGED_LLM_PROFILE_RESULTS.clear()
     payload = {
         "component_id": "llm-component",
         "subgraph_prompt": {
@@ -651,6 +659,62 @@ def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
     assert stage_calls == [["smolvlm2-2.2b-instruct"]]
     assert payload["requires_volume_reload"] is True
     assert payload["volume_reload_marker"] == first_marker
+
+
+def test_remote_dispatch_rewrites_hugging_face_id_to_generated_profile(
+    remote_modal_app_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GPU payloads should contain only immutable generated profile IDs."""
+    requested_model = "owner/model"
+    generated_profile_id = "hf-" + "a" * 64
+
+    class FakeStageMethod:
+        """Resolve one user model ID into an immutable profile."""
+
+        def remote(self, model_references: list[str]) -> list[dict[str, Any]]:
+            """Return one generated profile result."""
+            assert model_references == [requested_model]
+            return [
+                {
+                    "requested_reference": requested_model,
+                    "profile_id": generated_profile_id,
+                    "revision": "7" * 40,
+                    "downloaded": True,
+                }
+            ]
+
+    class FakeCls:
+        """Resolve the CPU ModelStager class."""
+
+        @staticmethod
+        def from_name(app_name: str, class_name: str) -> Callable[[], Any]:
+            """Return a staging class constructor."""
+            assert app_name == "test-b300-app"
+            assert class_name == "ModelStager"
+            return lambda: SimpleNamespace(stage_profiles=FakeStageMethod())
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", SimpleNamespace(Cls=FakeCls))
+    with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
+        remote_modal_app_module._STAGED_LLM_PROFILES.clear()
+        remote_modal_app_module._STAGED_LLM_PROFILE_RESULTS.clear()
+    payload = {
+        "component_id": "dynamic-llm",
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": requested_model},
+            }
+        },
+    }
+
+    remote_modal_app_module._ensure_llm_profiles_staged(payload, "test-b300-app")
+
+    assert (
+        payload["subgraph_prompt"]["1"]["inputs"]["model_profile"]
+        == generated_profile_id
+    )
+    assert payload["requires_volume_reload"] is True
 
 
 def test_remote_runtime_registers_deployment_owned_llm_node(
