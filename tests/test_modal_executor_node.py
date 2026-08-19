@@ -1577,6 +1577,32 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
 
 
+def test_modal_cloud_observes_distinct_workflows_for_llm_auto_mode(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The container boundary should count prompts while excluding canary traffic."""
+    observed_prompt_ids: list[str | None] = []
+    runtime_module = types.ModuleType("modal_llm_runtime")
+    runtime_module.observe_modal_workflow_execution = observed_prompt_ids.append
+    monkeypatch.setitem(sys.modules, "modal_llm_runtime", runtime_module)
+
+    modal_cloud_module._observe_remote_workflow_for_llm_mode(
+        {"prompt_id": "prompt-1", "payload_kind": "subgraph"}
+    )
+    modal_cloud_module._observe_remote_workflow_for_llm_mode(
+        {"prompt_id": "prompt-1", "payload_kind": "mapped_subgraph"}
+    )
+    modal_cloud_module._observe_remote_workflow_for_llm_mode(
+        {"prompt_id": "health-check", "payload_kind": "canary"}
+    )
+    modal_cloud_module._observe_remote_workflow_for_llm_mode(
+        {"prompt_id": "prompt-2", "payload_kind": "subgraph"}
+    )
+
+    assert observed_prompt_ids == ["prompt-1", "prompt-1", "prompt-2"]
+
+
 def test_modal_cloud_resolves_configured_named_secret(
     modal_cloud_module: Any,
 ) -> None:

@@ -21,6 +21,7 @@ def _runtime_settings(**overrides: Any) -> SimpleNamespace:
         "invocation_dict_name": "comfy-modal-sync-invocations",
         "invocation_result_inline_max_bytes": 4 * 1024 * 1024,
         "interrupt_dict_name": "comfy-modal-sync-interrupts",
+        "llm_vllm_execution_mode": "auto",
         "max_containers": None,
         "min_containers": 0,
         "modal_gpu": "A100",
@@ -205,10 +206,18 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
         comfyui_root,
         modal_secret_name="workflow-credentials",
     )
+    vllm_mode_changed = _runtime_identity(
+        runtime_environment_module,
+        repo_root,
+        comfyui_root,
+        llm_vllm_execution_mode="throughput",
+    )
 
     assert source_changed.fingerprint != baseline.fingerprint
     assert option_changed.fingerprint != source_changed.fingerprint
     assert secret_changed.fingerprint != source_changed.fingerprint
+    assert vllm_mode_changed.fingerprint != baseline.fingerprint
+    assert baseline.manifest["runtime_options"]["llm_vllm_execution_mode"] == "auto"
     assert secret_changed.manifest["runtime_options"]["modal_secret_name"] == (
         "workflow-credentials"
     )

@@ -69,7 +69,9 @@ Reasoning extraction remains backend-neutral:
 
 ## Modal vLLM Execution And Disk Caches
 
-`COMFY_MODAL_LLM_VLLM_EXECUTION_MODE` selects `eager` or `throughput` for a deployed app. Eager mode preserves the conservative no-compilation behavior. Throughput mode passes `enforce_eager=False`, allowing vLLM to select its hybrid compiled and CUDA-graph path. The mode is deployment-scoped rather than part of the model profile, so it cannot create another copy of identical weights. Both modes use safetensor prefetch for the Modal Volume mount.
+`COMFY_MODAL_LLM_VLLM_EXECUTION_MODE` accepts `auto`, `eager`, or `throughput` and defaults to `auto`. A container starts its first distinct workflow with eager mode. When the RemoteEngine sees a second ComfyUI prompt id, it permanently promotes that container to throughput mode. If an eager vLLM engine is resident, the next LLM request unloads and rebuilds it once with `enforce_eager=False`, allowing vLLM to select its hybrid compiled and CUDA-graph path. Persistent compilation artifacts reduce that promotion cost. Multiple components, LLM nodes, mapped phases, or durable retries with the same prompt id remain one workflow. Pin `eager` to avoid compilation entirely or `throughput` to compile on the first request. The setting is deployment-scoped rather than part of the model profile, so it cannot create another copy of identical weights. Every setting uses safetensor prefetch for the Modal Volume mount.
+
+Metadata reports `vllm_execution_setting`, the effective `vllm_execution_mode`, `vllm_auto_promoted`, and the bounded `vllm_observed_workflow_count`. Promotion also emits an indeterminate `engine` progress stage before the compiled engine initialization stages.
 
 The weight Volume retains immutable repository revisions. Legacy profile-keyed weight directories are recognized from their completion marker and reused in place so an older deployed app can continue resolving its historical path. A CPU staging call commits the Volume only when it downloaded weights or created a generated manifest.
 

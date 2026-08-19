@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Mapping, Protocol, Sequence
@@ -46,24 +46,143 @@ _BYTES_PER_GIB = 1024**3
 _DEFAULT_STORAGE_ROOT = "/storage"
 _DEFAULT_RESERVE_FREE_VRAM_GB = 24.0
 _DEFAULT_MAX_RESIDENT_MODELS = 2
-_VLLM_EXECUTION_MODES = frozenset({"eager", "throughput"})
+_VLLM_EXECUTION_SETTINGS = frozenset({"auto", "eager", "throughput"})
+_VLLM_EFFECTIVE_MODES = frozenset({"eager", "throughput"})
 _VLLM_SAFETENSORS_LOAD_STRATEGY = "prefetch"
+_VLLM_RUNTIME_MODE_OPTION = "_runtime_vllm_execution_mode"
+_VLLM_RUNTIME_SETTING_OPTION = "_runtime_vllm_execution_setting"
+
+
+def _normalize_vllm_execution_setting(value: object) -> str:
+    """Return a validated auto, eager, or throughput deployment setting."""
+    setting = str(value).strip().lower()
+    if setting not in _VLLM_EXECUTION_SETTINGS:
+        supported = ", ".join(sorted(_VLLM_EXECUTION_SETTINGS))
+        raise ValueError(
+            "COMFY_MODAL_LLM_VLLM_EXECUTION_MODE must be one of "
+            f"{supported}; got {value!r}."
+        )
+    return setting
+
+
+def _vllm_execution_setting(profile: LLMModelProfile | None = None) -> str:
+    """Return the deployment setting, including a manager-provided override."""
+    if profile is not None:
+        runtime_setting = profile.backend_option(_VLLM_RUNTIME_SETTING_OPTION)
+        if runtime_setting is not None:
+            return _normalize_vllm_execution_setting(runtime_setting)
+    return _normalize_vllm_execution_setting(
+        os.getenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", "auto")
+    )
 
 
 def _vllm_execution_policy(profile: LLMModelProfile) -> tuple[str, bool]:
-    """Resolve eager or CUDA-graph execution without changing weight identity."""
-    configured_mode = os.getenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE")
-    if configured_mode is None:
-        enforce_eager = bool(profile.backend_option("enforce_eager", True))
-        return ("eager" if enforce_eager else "throughput", enforce_eager)
-    mode = configured_mode.strip().lower()
-    if mode not in _VLLM_EXECUTION_MODES:
-        supported = ", ".join(sorted(_VLLM_EXECUTION_MODES))
-        raise ValueError(
-            "COMFY_MODAL_LLM_VLLM_EXECUTION_MODE must be one of "
-            f"{supported}; got {configured_mode!r}."
-        )
+    """Resolve the effective eager or CUDA-graph mode for one engine load."""
+    runtime_mode = profile.backend_option(_VLLM_RUNTIME_MODE_OPTION)
+    if runtime_mode is not None:
+        mode = str(runtime_mode).strip().lower()
+        if mode not in _VLLM_EFFECTIVE_MODES:
+            supported = ", ".join(sorted(_VLLM_EFFECTIVE_MODES))
+            raise ValueError(
+                f"Invalid runtime vLLM mode {runtime_mode!r}; expected {supported}."
+            )
+        return mode, mode == "eager"
+    setting = _vllm_execution_setting(profile)
+    mode = "eager" if setting == "auto" else setting
     return mode, mode == "eager"
+
+
+class VLLMExecutionModeController:
+    """Promote one container from eager to throughput after a second workflow."""
+
+    def __init__(self, setting: str | None = None) -> None:
+        """Configure one container-local execution-mode state machine."""
+        self.setting = _normalize_vllm_execution_setting(
+            setting
+            if setting is not None
+            else os.getenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", "auto")
+        )
+        self._first_workflow_execution_id: str | None = None
+        self._anonymous_execution_count = 0
+        self._promoted = False
+        self._lock = threading.RLock()
+
+    def observe(self, workflow_execution_id: str | None) -> bool:
+        """Record a workflow and return whether this observation promoted auto mode."""
+        if self.setting != "auto":
+            return False
+        with self._lock:
+            normalized_id = str(workflow_execution_id or "").strip()
+            if not normalized_id:
+                self._anonymous_execution_count += 1
+                normalized_id = f"anonymous-{self._anonymous_execution_count}"
+            if self._first_workflow_execution_id is None:
+                self._first_workflow_execution_id = normalized_id
+                logger.info(
+                    "vLLM auto mode selected eager for this container's first "
+                    "workflow execution."
+                )
+                return False
+            if normalized_id == self._first_workflow_execution_id or self._promoted:
+                return False
+            self._promoted = True
+            logger.info(
+                "vLLM auto mode observed a second workflow execution; promoting "
+                "this container to throughput mode."
+            )
+            return True
+
+    def effective_mode(self) -> str:
+        """Return the effective mode for the next vLLM engine construction."""
+        with self._lock:
+            if self.setting == "auto":
+                return "throughput" if self._promoted else "eager"
+            return self.setting
+
+    @property
+    def promoted(self) -> bool:
+        """Return whether auto mode has observed a second workflow."""
+        with self._lock:
+            return self._promoted
+
+    @property
+    def observed_workflow_count(self) -> int:
+        """Return the bounded workflow count relevant to auto promotion."""
+        with self._lock:
+            if self._first_workflow_execution_id is None:
+                return 0
+            return 2 if self._promoted else 1
+
+
+_VLLM_MODE_CONTROLLER: VLLMExecutionModeController | None = None
+_VLLM_MODE_CONTROLLER_LOCK = threading.Lock()
+
+
+def get_vllm_execution_mode_controller() -> VLLMExecutionModeController:
+    """Return the process-global controller shared by every remote workflow."""
+    global _VLLM_MODE_CONTROLLER
+    with _VLLM_MODE_CONTROLLER_LOCK:
+        if _VLLM_MODE_CONTROLLER is None:
+            _VLLM_MODE_CONTROLLER = VLLMExecutionModeController()
+        return _VLLM_MODE_CONTROLLER
+
+
+def observe_modal_workflow_execution(workflow_execution_id: str | None) -> bool:
+    """Record one workflow at the container boundary for auto-mode selection."""
+    return get_vllm_execution_mode_controller().observe(workflow_execution_id)
+
+
+def _profile_for_vllm_execution(
+    profile: LLMModelProfile,
+    controller: VLLMExecutionModeController,
+) -> LLMModelProfile:
+    """Attach ephemeral execution policy without changing profile or weight identity."""
+    if profile.backend != "vllm":
+        return profile
+    backend_options = dict(profile.backend_options)
+    backend_options[_VLLM_RUNTIME_MODE_OPTION] = controller.effective_mode()
+    backend_options[_VLLM_RUNTIME_SETTING_OPTION] = controller.setting
+    return replace(profile, backend_options=tuple(sorted(backend_options.items())))
 
 
 @dataclass(frozen=True)
@@ -748,6 +867,7 @@ class VLLMMultimodalBackend:
 
         self.profile = profile
         self.snapshot_path = snapshot_path
+        self.execution_setting = _vllm_execution_setting(profile)
         self.execution_mode, self.enforce_eager = _vllm_execution_policy(profile)
         progress_callback(
             LLMProgressEvent(
@@ -849,6 +969,7 @@ class VLLMMultimodalBackend:
     def runtime_metadata(self) -> dict[str, Any]:
         """Return the execution and persistent-cache settings used by vLLM."""
         return {
+            "vllm_execution_setting": self.execution_setting,
             "vllm_execution_mode": self.execution_mode,
             "vllm_enforce_eager": self.enforce_eager,
             "vllm_safetensors_load_strategy": _VLLM_SAFETENSORS_LOAD_STRATEGY,
@@ -1188,6 +1309,7 @@ class ResidentLLMManager:
         execution_target: str = "modal",
         device_name: str = "cuda",
         memory_label: str = "GPU memory",
+        vllm_mode_controller: VLLMExecutionModeController | None = None,
     ) -> None:
         """Configure the shared model cache and injectable hardware operations."""
         if max_resident_models <= 0:
@@ -1202,6 +1324,10 @@ class ResidentLLMManager:
         self.execution_target = execution_target
         self.device_name = device_name
         self.memory_label = memory_label
+        self._vllm_mode_controller = vllm_mode_controller
+        if self._vllm_mode_controller is None and execution_target == "modal":
+            self._vllm_mode_controller = get_vllm_execution_mode_controller()
+        self._reported_auto_promotion = False
         self._models: OrderedDict[str, ResidentModel] = OrderedDict()
         self._lock = threading.RLock()
 
@@ -1247,6 +1373,52 @@ class ResidentLLMManager:
         )
         resident.backend.unload()
         self._empty_cache()
+
+    def _prepare_vllm_profile(
+        self,
+        profile: LLMModelProfile,
+        workflow_execution_id: str | None,
+        progress_callback: LLMProgressCallback,
+    ) -> LLMModelProfile:
+        """Apply container auto-mode state and retire incompatible engines."""
+        if profile.backend != "vllm":
+            return profile
+        controller = self._vllm_mode_controller
+        if controller is None:
+            controller = get_vllm_execution_mode_controller()
+            self._vllm_mode_controller = controller
+        controller.observe(workflow_execution_id)
+        runtime_profile = _profile_for_vllm_execution(profile, controller)
+        desired_mode = controller.effective_mode()
+        mismatched_profile_ids = [
+            profile_id
+            for profile_id, resident in self._models.items()
+            if resident.profile.backend == "vllm"
+            and resident.profile.backend_option(_VLLM_RUNTIME_MODE_OPTION)
+            != desired_mode
+        ]
+        should_report_auto_promotion = (
+            controller.setting == "auto"
+            and controller.promoted
+            and not self._reported_auto_promotion
+        )
+        if mismatched_profile_ids or should_report_auto_promotion:
+            progress_callback(
+                LLMProgressEvent(
+                    stage="engine",
+                    message=(
+                        "Optimizing vLLM for repeat workflows"
+                        if controller.setting == "auto"
+                        else f"Switching vLLM to {desired_mode} mode"
+                    ),
+                    indeterminate=True,
+                )
+            )
+            if should_report_auto_promotion:
+                self._reported_auto_promotion = True
+            for profile_id in mismatched_profile_ids:
+                self._evict(profile_id)
+        return runtime_profile
 
     def _make_room(self, profile: LLMModelProfile, reserve_free_vram_gb: float) -> None:
         """Evict old LLMs until the new model plus configured reserve can fit."""
@@ -1338,15 +1510,21 @@ class ResidentLLMManager:
         reserve_free_vram_gb: float,
         keep_model_loaded: bool,
         progress_callback: LLMProgressCallback,
+        workflow_execution_id: str | None = None,
     ) -> LLMInferenceResult:
         """Run one inference while protecting shared resident state."""
         if reserve_free_vram_gb < 0:
             raise ValueError("reserve_free_vram_gb cannot be negative.")
         with self._lock:
+            runtime_profile = self._prepare_vllm_profile(
+                profile,
+                workflow_execution_id,
+                progress_callback,
+            )
             before_free, total_bytes = self._memory_info()
             started_at = time.perf_counter()
             resident, cache_hit = self._load(
-                profile,
+                runtime_profile,
                 reserve_free_vram_gb,
                 progress_callback,
             )
@@ -1410,6 +1588,23 @@ class ResidentLLMManager:
             runtime_metadata = getattr(resident.backend, "runtime_metadata", None)
             if callable(runtime_metadata):
                 metadata.update(runtime_metadata())
+            if (
+                profile.backend == "vllm"
+                and self._vllm_mode_controller is not None
+            ):
+                metadata.update(
+                    {
+                        "vllm_execution_setting": (
+                            self._vllm_mode_controller.setting
+                        ),
+                        "vllm_auto_promoted": (
+                            self._vllm_mode_controller.promoted
+                        ),
+                        "vllm_observed_workflow_count": (
+                            self._vllm_mode_controller.observed_workflow_count
+                        ),
+                    }
+                )
             if self.execution_target == "modal":
                 metadata.update(
                     {
@@ -1472,6 +1667,19 @@ def get_resident_llm_manager() -> ResidentLLMManager:
                 ),
             )
         return _RESIDENT_MANAGER
+
+
+def _current_workflow_execution_id() -> str | None:
+    """Return ComfyUI's current prompt id when inference runs inside a workflow."""
+    try:
+        from comfy_execution.utils import get_executing_context
+    except ImportError:
+        return None
+    context = get_executing_context()
+    if context is None:
+        return None
+    prompt_id = str(context.prompt_id).strip()
+    return prompt_id or None
 
 
 def run_modal_llm_inference(
@@ -1544,6 +1752,7 @@ def run_modal_llm_inference(
         reserve_free_vram_gb=reserve_gb,
         keep_model_loaded=keep_model_loaded,
         progress_callback=progress_callback,
+        workflow_execution_id=_current_workflow_execution_id(),
     )
 
 
@@ -1559,6 +1768,8 @@ __all__ = [
     "VLLMMultimodalBackend",
     "extract_file_context",
     "get_resident_llm_manager",
+    "get_vllm_execution_mode_controller",
+    "observe_modal_workflow_execution",
     "prepare_images",
     "prepare_llm_inputs",
     "prepare_video",

@@ -161,11 +161,12 @@ export COMFY_MODAL_MAX_CONTAINERS=1
 export COMFY_MODAL_MAX_INFLIGHT_CALLS=1
 export COMFY_MODAL_LLM_MAX_RESIDENT_MODELS=2
 export COMFY_MODAL_LLM_RESERVE_FREE_GB=24
+export COMFY_MODAL_LLM_VLLM_EXECUTION_MODE=auto
 ```
 
 The Modal secret collection may include `HF_TOKEN` for gated profiles. Public profiles do not require it. Model staging can take several minutes the first time, but it consumes CPU and network resources rather than billed B300 time; later requests reuse the committed Volume snapshot.
 
-Modal vLLM deployments default to the conservative `eager` execution profile. Set `COMFY_MODAL_LLM_VLLM_EXECUTION_MODE=throughput` before deployment to enable vLLM's hybrid CUDA-graph/compiled execution. Both modes force safetensor prefetch from the mounted weight Volume. vLLM, TorchInductor, Triton, and CUDA compilation artifacts persist in a separate `<weight-volume>-llm-compile-cache` Modal Volume, namespaced by GPU and pinned accelerator runtime. Override its name with `COMFY_MODAL_LLM_COMPILE_CACHE_VOLUME_NAME`. Telemetry records the selected mode, eager flag, load strategy, and compilation-cache root.
+Modal vLLM deployments default to `COMFY_MODAL_LLM_VLLM_EXECUTION_MODE=auto`. The first distinct workflow handled by a container uses eager mode for lower startup latency. When that container receives a second workflow, it unloads an eager resident vLLM engine once and rebuilds it in throughput mode, reusing the persistent compilation cache from then on. Components and retries carrying the same ComfyUI prompt id remain part of one workflow and cannot trigger promotion. Set the variable to `eager` or `throughput` to pin either behavior. All settings force safetensor prefetch from the mounted weight Volume. vLLM, TorchInductor, Triton, and CUDA compilation artifacts persist in a separate `<weight-volume>-llm-compile-cache` Modal Volume, namespaced by GPU and pinned accelerator runtime. Override its name with `COMFY_MODAL_LLM_COMPILE_CACHE_VOLUME_NAME`. Telemetry records the configured setting, effective mode, auto-promotion state, eager flag, load strategy, and compilation-cache root.
 
 ## Using It In ComfyUI
 
@@ -399,6 +400,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_STARTUP_TIMEOUT_SECONDS` | `900` | Maximum Modal container startup and snapshot-restore time. |
 | `COMFY_MODAL_LLM_MAX_RESIDENT_MODELS` | `2` | Maximum Transformers LLM profiles retained per warm GPU worker before LRU eviction. |
 | `COMFY_MODAL_LLM_RESERVE_FREE_GB` | `24.0` | Default minimum free VRAM retained for ComfyUI-managed image and video models. The node can override this per request. |
+| `COMFY_MODAL_LLM_VLLM_EXECUTION_MODE` | `auto` | `auto` uses eager on a container's first workflow and promotes to throughput on its second; `eager` and `throughput` pin one mode for the container lifetime. |
 | `COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE` | `256` | Maximum buffered remote progress/result envelopes; stale progress is coalesced when full. |
 | `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP` | `true` | Start background warmup from runtime parallelism signals such as mapped fan-out. |
 | `COMFY_MODAL_ENABLE_LOADER_PREWARM` | `true` | During warmup, execute synthetic loader prompts for root literal model-loader nodes. |
