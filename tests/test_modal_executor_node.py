@@ -6664,11 +6664,11 @@ def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
     ]
 
 
-def test_get_hourly_modal_app_billing_resolves_workspace_default_from_row(
+def test_get_hourly_modal_app_billing_sums_historical_ids_in_default_environment(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """An implicit workspace environment should use the app identity in the report."""
+    """Redeployments within one implicit environment should sum every app ID."""
     settings = remote_modal_app_module.get_settings()
     selected_settings = remote_modal_app_module.settings_for_modal_gpu(settings, "L4")
     app_name = remote_modal_app_module.modal_deployment_app_name(selected_settings)
@@ -6676,7 +6676,7 @@ def test_get_hourly_modal_app_billing_resolves_workspace_default_from_row(
     original_import_module = remote_modal_app_module.importlib.import_module
 
     def fake_import_module(name: str) -> Any:
-        """Supply an implicit environment and one unambiguous billing row."""
+        """Supply an implicit environment with two historical app identities."""
         if name == "modal._object":
             return types.SimpleNamespace(_get_environment_name=lambda _environment: None)
         if name == "modal.environments":
@@ -6685,12 +6685,19 @@ def test_get_hourly_modal_app_billing_resolves_workspace_default_from_row(
             return types.SimpleNamespace(
                 workspace_billing_report=lambda **_kwargs: [
                     {
-                        "object_id": "ap-workspace-default",
+                        "object_id": "ap-workspace-default-old",
                         "description": app_name,
                         "environment_name": "main",
                         "interval_start": interval_start,
-                        "cost": Decimal("0.42"),
-                    }
+                        "cost": Decimal("0.17"),
+                    },
+                    {
+                        "object_id": "ap-workspace-default-new",
+                        "description": app_name,
+                        "environment_name": "main",
+                        "interval_start": interval_start,
+                        "cost": Decimal("0.25"),
+                    },
                 ]
             )
         if name == "modal.exception":
@@ -6714,9 +6721,43 @@ def test_get_hourly_modal_app_billing_resolves_workspace_default_from_row(
         )
     )
 
-    assert status.app_id == "ap-workspace-default"
+    assert status.app_id is None
     assert status.environment_name == "main"
     assert status.app_cost_usd_before_credits == Decimal("0.42")
+
+
+def test_modal_hourly_billing_rejects_multiple_implicit_environments(
+    remote_modal_app_module: Any,
+) -> None:
+    """An implicit environment should reject only genuinely distinct environments."""
+    interval_start = datetime(2026, 8, 19, 7, 0, tzinfo=timezone.utc)
+    rows = [
+        {
+            "object_id": "ap-main",
+            "description": "shared-app-name",
+            "environment_name": "main",
+            "interval_start": interval_start,
+            "cost": Decimal("0.17"),
+        },
+        {
+            "object_id": "ap-dev",
+            "description": "shared-app-name",
+            "environment_name": "dev",
+            "interval_start": interval_start,
+            "cost": Decimal("0.25"),
+        },
+    ]
+
+    with pytest.raises(
+        remote_modal_app_module.ModalBillingStatusError,
+        match="multiple environments",
+    ):
+        remote_modal_app_module._matching_modal_hourly_billing_rows(
+            rows,
+            app_name="shared-app-name",
+            environment_name=None,
+            interval_start=interval_start,
+        )
 
 
 def test_get_hourly_modal_app_billing_reports_zero_for_no_usage(
