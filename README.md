@@ -94,9 +94,11 @@ Authentication is resolved in this order:
 2. A previously saved pair in the operating-system credential vault under the `ComfyUI Modal-Sync` service.
 3. A new pair created with `modal workspace proxy-tokens create --json`, using a current CLI through `uvx` when the installed Modal CLI is too old.
 
-Automatically created values go directly to the OS vault—Keychain on macOS or the configured native `keyring` backend on other platforms. They are never written into the workflow, ComfyUI settings JSON, logs, or a plaintext file. ComfyUI Cloud's Settings → Secrets service is cloud-only; when that service injects `MODAL_KEY` and `MODAL_SECRET` into the process environment, the first resolution path applies. A local/headless installation without a secure keyring backend must supply both environment variables rather than allowing automatic creation.
+Automatically created values go directly to the OS vault—Keychain on macOS or the configured native `keyring` backend on other platforms. They are never written into the workflow, ComfyUI settings JSON, logs, or a plaintext file. Because newly created proxy tokens are scoped in RBAC-enabled workspaces, the node also authorizes vault-backed tokens for the advanced `environment` setting before use; it defaults to `main` and should be changed when the endpoint is hosted in another Modal environment. A successful association is cached for the ComfyUI process so inference calls do not repeatedly invoke the CLI. Environment-supplied credentials remain administrator-managed and are not modified.
 
-The CLI must already be authenticated with Modal. Run `<comfyui-venv>/bin/python -m modal setup` if necessary. Workspaces with RBAC may also require an owner or manager to associate the new token with the endpoint environment:
+ComfyUI Cloud's Settings → Secrets service is cloud-only; when that service injects `MODAL_KEY` and `MODAL_SECRET` into the process environment, the first resolution path applies. A local/headless installation without a secure keyring backend must supply both environment variables rather than allowing automatic creation.
+
+The CLI must already be authenticated with Modal. Run `<comfyui-venv>/bin/python -m modal setup` if necessary. An owner or manager can also associate an externally managed token manually:
 
 ```bash
 modal workspace proxy-tokens allow wk-... main

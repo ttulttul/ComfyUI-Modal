@@ -229,6 +229,89 @@ def test_credential_resolver_creates_and_stores_missing_pair(
     assert store.saved == credentials
 
 
+def test_credential_resolver_authorizes_vault_credentials(
+    modal_endpoint_module: Any,
+) -> None:
+    """Authorize node-managed scoped tokens for the endpoint environment."""
+    credentials = _credentials(modal_endpoint_module)
+
+    class Store:
+        """Return a credential pair previously created by the node."""
+
+        def load(self) -> Any:
+            """Return stored credentials."""
+            return credentials
+
+    class Authorizer:
+        """Record the environment association request."""
+
+        def __init__(self) -> None:
+            """Create an empty authorization call log."""
+            self.calls: list[tuple[str, str]] = []
+
+        def allow(self, token_key: str, environment: str) -> None:
+            """Record one authorization operation."""
+            self.calls.append((token_key, environment))
+
+    authorizer = Authorizer()
+    resolver = modal_endpoint_module.ModalCredentialResolver(
+        Store(),
+        object(),
+        authorizer=authorizer,
+        environment="ComfyUI",
+    )
+
+    assert resolver.resolve() == credentials
+    assert authorizer.calls == [(credentials.key, "ComfyUI")]
+
+
+def test_credential_resolver_saves_new_token_before_authorization(
+    modal_endpoint_module: Any,
+) -> None:
+    """Keep the one-time secret recoverable when environment authorization fails."""
+    credentials = _credentials(modal_endpoint_module)
+    events: list[str] = []
+
+    class Store:
+        """Record persistence ordering for a new token."""
+
+        def load(self) -> None:
+            """Report no stored credentials."""
+
+        def ensure_writable(self) -> None:
+            """Accept the credential-vault probe."""
+
+        def save(self, value: Any) -> None:
+            """Record persistence of the new token."""
+            assert value == credentials
+            events.append("saved")
+
+    class Creator:
+        """Return one deterministic one-time token pair."""
+
+        def create(self) -> Any:
+            """Return generated credentials."""
+            return credentials
+
+    class Authorizer:
+        """Fail after verifying the secret was persisted."""
+
+        def allow(self, token_key: str, environment: str) -> None:
+            """Simulate an RBAC association failure."""
+            assert token_key == credentials.key
+            assert environment == "main"
+            assert events == ["saved"]
+            raise RuntimeError("authorization failed")
+
+    resolver = modal_endpoint_module.ModalCredentialResolver(
+        Store(), Creator(), authorizer=Authorizer()
+    )
+
+    with pytest.raises(RuntimeError, match="authorization failed"):
+        resolver.resolve()
+    assert events == ["saved"]
+
+
 def test_credential_resolver_checks_vault_before_creating_token(
     modal_endpoint_module: Any,
 ) -> None:
@@ -293,6 +376,48 @@ def test_cli_creator_falls_back_from_outdated_modal(
     assert creator.create() == modal_endpoint_module.ModalProxyCredentials(
         "wk-new", "ws-new"
     )
+
+
+def test_cli_authorizer_falls_back_and_caches_success(
+    modal_endpoint_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use a current CLI once for a scoped token and avoid per-request CLI latency."""
+    authorizer = modal_endpoint_module.ModalCliProxyTokenAuthorizer()
+    commands = [["old-modal"], ["uvx-modal"]]
+    results = iter(
+        [
+            subprocess.CompletedProcess(
+                commands[0],
+                2,
+                stdout="",
+                stderr="No such command 'workspace'.",
+            ),
+            subprocess.CompletedProcess(commands[1], 0, stdout="allowed", stderr=""),
+        ]
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        authorizer,
+        "_candidate_commands",
+        lambda token_key, environment: commands,
+    )
+
+    def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+        """Record one fake CLI invocation."""
+        calls.append(command)
+        return next(results)
+
+    monkeypatch.setattr(
+        modal_endpoint_module.ModalCliProxyTokenCreator,
+        "_run_command",
+        run_command,
+    )
+
+    authorizer.allow("wk-authorizer-test", "main")
+    authorizer.allow("wk-authorizer-test", "main")
+
+    assert calls == commands
 
 
 def test_image_batch_becomes_inline_png_content_parts(
@@ -383,6 +508,17 @@ def test_http_client_authenticates_without_following_redirects(
     ]
 
 
+def test_endpoint_error_message_redacts_modal_proxy_tokens(
+    modal_endpoint_module: Any,
+) -> None:
+    """Do not repeat credential identifiers from provider errors into ComfyUI logs."""
+    detail = modal_endpoint_module._response_error_message(
+        {"error": "Webhook token not found: wk-sensitive-token"}
+    )
+
+    assert detail == '{"error": "Webhook token not found: [redacted]"}'
+
+
 def test_chat_response_text_supports_string_and_part_lists(
     modal_endpoint_module: Any,
 ) -> None:
@@ -443,9 +579,17 @@ def test_node_execute_returns_endpoint_text(
     class Resolver:
         """Return deterministic credentials."""
 
-        def __init__(self, store: Any, creator: Any) -> None:
+        def __init__(
+            self,
+            store: Any,
+            creator: Any,
+            authorizer: Any,
+            environment: str,
+        ) -> None:
             """Accept production constructor dependencies."""
             del store, creator
+            assert authorizer is not None
+            assert environment == "main"
 
         def resolve(self) -> Any:
             """Return the test credential pair."""
@@ -476,6 +620,9 @@ def test_node_execute_returns_endpoint_text(
     monkeypatch.setattr(modal_endpoint_module, "ComfyUISecretManager", lambda: object())
     monkeypatch.setattr(
         modal_endpoint_module, "ModalCliProxyTokenCreator", lambda: object()
+    )
+    monkeypatch.setattr(
+        modal_endpoint_module, "ModalCliProxyTokenAuthorizer", lambda: object()
     )
     monkeypatch.setattr(modal_endpoint_module, "ModalCredentialResolver", Resolver)
     monkeypatch.setattr(modal_endpoint_module, "ModalEndpointClient", Client)
