@@ -160,6 +160,8 @@ def test_live_modal_runtime_handshake(live_modal_canary: _LiveModalCanaryContext
     assert live_modal_canary.remote_module._is_runtime_version_payload_current(
         version_payload
     )
+    assert version_payload is not None
+    assert version_payload["vllm_version"] == "0.27.1"
 
 
 def test_live_modal_resident_llm_image_file_video_and_warm_reuse(

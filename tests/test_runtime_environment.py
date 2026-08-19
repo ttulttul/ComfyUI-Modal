@@ -82,37 +82,37 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "simpleeval==1.0.7" in runtime_packages
 
 
-def test_default_modal_gpus_use_pinned_cuda_128_build(
-    runtime_environment_module: Any,
-) -> None:
-    """Established Modal GPU types should retain the tested CUDA 12.8 stack."""
-    build = runtime_environment_module.select_remote_torch_build("A100:2")
-
-    assert build.cuda_version == "12.8"
-    assert build.install_layers == (
-        runtime_environment_module.RemoteTorchInstallLayer(
-            index_url="https://download.pytorch.org/whl/cu128",
-            packages=(
-                "torch==2.10.0",
-                "torchvision==0.25.0",
-                "torchaudio==2.10.0",
-            ),
-        ),
-    )
-
-
-@pytest.mark.parametrize("modal_gpu", ("B300", "b300:2", "B200+", "B200+:8"))
-def test_b300_capable_modal_gpus_use_cuda_132_build(
+@pytest.mark.parametrize(
+    "modal_gpu",
+    (
+        "T4",
+        "L4",
+        "A10",
+        "L40S",
+        "A100",
+        "A100-40GB",
+        "A100-80GB",
+        "RTX-PRO-6000",
+        "H100",
+        "H100!",
+        "H200",
+        "B200",
+        "B200+",
+        "B300",
+        "b300:2",
+    ),
+)
+def test_all_supported_modal_gpus_use_vllm_compatible_cuda_130_build(
     runtime_environment_module: Any,
     modal_gpu: str,
 ) -> None:
-    """GPU specifications that may resolve to B300 should use CUDA 13.2 wheels."""
+    """Every selectable GPU should use one vLLM-compatible CUDA 13 stack."""
     build = runtime_environment_module.select_remote_torch_build(modal_gpu)
 
     assert build.cuda_version == "13.0"
     assert build.install_layers == (
         runtime_environment_module.RemoteTorchInstallLayer(
-            index_url="https://download.pytorch.org/whl/cu132",
+            index_url="https://download.pytorch.org/whl/cu130",
             packages=("torch==2.13.0", "torchvision==0.28.0"),
         ),
         runtime_environment_module.RemoteTorchInstallLayer(
@@ -126,24 +126,29 @@ def test_b300_capable_modal_gpus_use_cuda_132_build(
         "torchvision==0.28.0",
         "torchaudio==2.11.0+cpu",
     )
+    assert runtime_environment_module.remote_accelerator_packages(modal_gpu) == (
+        runtime_environment_module.REMOTE_VLLM_WHEEL_URL,
+    )
 
 
-def test_remote_torch_build_validation_imports_complete_stack(
+def test_remote_build_validation_imports_complete_torch_and_vllm_stacks(
     runtime_environment_module: Any,
 ) -> None:
-    """The image build should fail before deployment when Torch packages disagree."""
+    """The image build should fail before deployment when native packages disagree."""
     build = runtime_environment_module.select_remote_torch_build("B300")
 
     validation_command = build.validation_command()
     validation_script = shlex.split(validation_command)[2]
+    accelerator_command = runtime_environment_module.remote_accelerator_validation_command(
+        "RTX-PRO-6000"
+    )
+    accelerator_script = shlex.split(accelerator_command)[2]
 
     assert validation_command.startswith("python -c ")
     assert "import torch, torchaudio, torchvision" in validation_script
     assert "expected_cuda='13.0'" in validation_script
-    assert runtime_environment_module.remote_accelerator_packages("B300") == (
-        "vllm==0.27.1",
-    )
-    assert runtime_environment_module.remote_accelerator_packages("A100") == ()
+    assert "import torch, vllm" in accelerator_script
+    assert "expected_vllm='0.27.1'" in accelerator_script
 
 
 def test_empty_modal_gpu_cannot_select_torch_build(runtime_environment_module: Any) -> None:
@@ -227,11 +232,11 @@ def test_runtime_identity_records_system_packages(
     assert identity.manifest["apt_packages"] == ["libgl1", "libglib2.0-0"]
 
 
-def test_runtime_identity_records_gpu_specific_torch_build(
+def test_runtime_identity_records_universal_torch_and_vllm_build(
     runtime_environment_module: Any,
     tmp_path: Path,
 ) -> None:
-    """The deployment manifest should describe the wheel set selected for its GPU."""
+    """The deployment manifest should describe the universal native stack."""
     repo_root = tmp_path / "repo"
     comfyui_root = tmp_path / "ComfyUI"
     repo_root.mkdir()
@@ -248,7 +253,7 @@ def test_runtime_identity_records_gpu_specific_torch_build(
         "cuda_version": "13.0",
         "install_layers": [
             {
-                "index_url": "https://download.pytorch.org/whl/cu132",
+                "index_url": "https://download.pytorch.org/whl/cu130",
                 "packages": ["torch==2.13.0", "torchvision==0.28.0"],
                 "extra_options": "",
             },
@@ -263,6 +268,9 @@ def test_runtime_identity_records_gpu_specific_torch_build(
         "torch==2.13.0",
         "torchvision==0.28.0",
         "torchaudio==2.11.0+cpu",
+    ]
+    assert identity.manifest["accelerator_packages"] == [
+        runtime_environment_module.REMOTE_VLLM_WHEEL_URL
     ]
 
 

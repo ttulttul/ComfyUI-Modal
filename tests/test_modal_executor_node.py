@@ -4031,21 +4031,21 @@ def test_modal_cloud_returns_no_custom_node_packages_without_requirements(
 def test_modal_cloud_selects_gpu_compatible_pytorch_stack(
     modal_cloud_module: Any,
 ) -> None:
-    """The Modal cloud image should expose GPU-aware pinned PyTorch builds."""
+    """Every Modal GPU image should expose the shared pinned PyTorch build."""
     default_build = modal_cloud_module._select_remote_torch_build("A100")
     b300_build = modal_cloud_module._select_remote_torch_build("B300")
 
     assert default_build.install_layers[0].packages == (
-        "torch==2.10.0",
-        "torchvision==0.25.0",
-        "torchaudio==2.10.0",
+        "torch==2.13.0",
+        "torchvision==0.28.0",
     )
-    assert default_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu128"
+    assert default_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu130"
+    assert default_build == b300_build
     assert b300_build.install_layers[0].packages == (
         "torch==2.13.0",
         "torchvision==0.28.0",
     )
-    assert b300_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu132"
+    assert b300_build.install_layers[0].index_url == "https://download.pytorch.org/whl/cu130"
     assert b300_build.install_layers[1].packages == ("torchaudio==2.11.0+cpu",)
     assert b300_build.install_layers[1].index_url == "https://download.pytorch.org/whl/cpu"
     assert b300_build.install_layers[1].extra_options == "--no-deps"
@@ -4084,7 +4084,7 @@ def test_modal_cloud_installs_and_validates_torch_layers_in_order(
             "pip_install",
             ("torch==2.13.0", "torchvision==0.28.0"),
             {
-                "index_url": "https://download.pytorch.org/whl/cu132",
+                "index_url": "https://download.pytorch.org/whl/cu130",
                 "extra_options": "",
             },
         ),
@@ -4099,6 +4099,45 @@ def test_modal_cloud_installs_and_validates_torch_layers_in_order(
     ]
     assert image.calls[2][0] == "run_commands"
     assert "import torch, torchaudio, torchvision" in image.calls[2][1][0]
+
+
+def test_modal_cloud_installs_and_validates_vllm_for_non_b300_gpu(
+    modal_cloud_module: Any,
+) -> None:
+    """A lower-cost GPU image should install and import the pinned vLLM wheel."""
+
+    class RecordingImage:
+        """Record Modal image package and command layers."""
+
+        def __init__(self) -> None:
+            """Initialize an empty call record."""
+            self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+        def pip_install(self, *packages: str, **options: Any) -> "RecordingImage":
+            """Record one package installation layer."""
+            self.calls.append(("pip_install", packages, options))
+            return self
+
+        def run_commands(self, *commands: str) -> "RecordingImage":
+            """Record one image validation command."""
+            self.calls.append(("run_commands", commands, {}))
+            return self
+
+    image = RecordingImage()
+
+    result = modal_cloud_module._install_remote_accelerator_packages(
+        image,
+        "RTX-PRO-6000",
+    )
+
+    assert result is image
+    assert image.calls[0] == (
+        "pip_install",
+        (modal_cloud_module._remote_accelerator_packages("RTX-PRO-6000")[0],),
+        {},
+    )
+    assert image.calls[1][0] == "run_commands"
+    assert "import torch, vllm" in image.calls[1][1][0]
 
 
 def test_modal_cloud_missing_prompt_node_class_raises_clear_error(

@@ -6,6 +6,7 @@ import copy
 import gc
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 from io import BytesIO
 import inspect
@@ -57,6 +58,7 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     build_remote_runtime_identity,
     custom_node_runtime_packages as _custom_node_runtime_packages,
     remote_accelerator_packages as _remote_accelerator_packages,
+    remote_accelerator_validation_command as _remote_accelerator_validation_command,
     remote_apt_packages as _comfyui_apt_packages,
     remote_runtime_packages as _comfyui_runtime_packages,
     select_remote_torch_build as _select_remote_torch_build,
@@ -7001,6 +7003,18 @@ def _install_remote_torch_build(image: Any, torch_build: _RemoteTorchBuild) -> A
     return image.run_commands(torch_build.validation_command())
 
 
+def _install_remote_accelerator_packages(image: Any, modal_gpu: str) -> Any:
+    """Install and validate the vLLM wheel shared by all supported GPU images."""
+    accelerator_packages = _remote_accelerator_packages(modal_gpu)
+    logger.info(
+        "Installing Modal accelerator packages gpu=%s packages=%s.",
+        modal_gpu,
+        accelerator_packages,
+    )
+    image = image.pip_install(*accelerator_packages)
+    return image.run_commands(_remote_accelerator_validation_command(modal_gpu))
+
+
 if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     settings = globals().get("__comfy_modal_settings_override__") or get_settings()
     __comfy_modal_gpu__ = settings.modal_gpu
@@ -7057,12 +7071,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         .apt_install(*_comfyui_apt_packages())
         .pip_install(*_comfyui_runtime_packages())
     )
-    accelerator_packages = _remote_accelerator_packages(settings.modal_gpu)
-    if accelerator_packages:
-        image = image.pip_install(*accelerator_packages)
     if custom_node_packages:
         image = image.pip_install(*custom_node_packages)
     image = _install_remote_torch_build(image, torch_build)
+    image = _install_remote_accelerator_packages(image, settings.modal_gpu)
     image = image.env(
         _modal_image_environment(settings, runtime_identity.fingerprint)
     )
@@ -7300,6 +7312,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     "",
                 ),
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "vllm_version": importlib.metadata.version("vllm"),
             }
 
         @modal.method()
