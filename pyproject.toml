@@ -13,6 +13,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+local-apple = [
+    "mlx-vlm==0.6.15; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "psutil>=7,<8; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 remote = [
     "modal==1.4.2",
 ]
