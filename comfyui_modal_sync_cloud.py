@@ -6956,6 +6956,7 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
             "/storage",
         ),
         "COMFY_MODAL_REMOTE_WORKER": "1",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "COMFY_MODAL_SECRET_NAME": getattr(
             settings,
             "modal_secret_name",
