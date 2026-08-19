@@ -221,6 +221,36 @@ def test_transformers_stopping_criteria_propagates_cancellation(
     assert calls == [1, 2]
 
 
+def test_transformers_processor_does_not_resample_predecoded_video(
+    modal_llm_runtime_module: Any,
+) -> None:
+    """Native ComfyUI frames should bypass the processor's metadata-based sampler."""
+    calls: list[tuple[list[dict[str, Any]], dict[str, Any]]] = []
+
+    class FakeProcessor:
+        """Record the chat-template call without importing a real model processor."""
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            **kwargs: Any,
+        ) -> str:
+            """Capture processor options and return a tokenization sentinel."""
+            calls.append((messages, kwargs))
+            return "tokenized"
+
+    messages = [{"role": "user", "content": [{"type": "video", "video": [object()]}]}]
+
+    result = modal_llm_runtime_module._apply_multimodal_chat_template(
+        FakeProcessor(),
+        messages,
+        has_predecoded_video=True,
+    )
+
+    assert result == "tokenized"
+    assert calls[0][1]["processor_kwargs"] == {"do_sample_frames": False}
+
+
 @dataclass
 class _FakeBackend:
     """Record resident backend inference and unload behavior."""

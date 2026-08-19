@@ -368,6 +368,26 @@ def _stopping_criteria(progress_callback: Callable[[int], None]) -> Any:
     return StoppingCriteriaList([ComfyProgressStoppingCriteria()])
 
 
+def _apply_multimodal_chat_template(
+    processor: Any,
+    messages: list[dict[str, Any]],
+    *,
+    has_predecoded_video: bool,
+) -> Any:
+    """Tokenize chat content without resampling video frames prepared by ComfyUI."""
+    processor_kwargs: dict[str, Any] = {}
+    if has_predecoded_video:
+        processor_kwargs["do_sample_frames"] = False
+    return processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs=processor_kwargs,
+    )
+
+
 class TransformersMultimodalBackend:
     """Run a curated image-text-to-text model through Hugging Face Transformers."""
 
@@ -424,12 +444,10 @@ class TransformersMultimodalBackend:
         """Tokenize multimodal messages and generate only the assistant continuation."""
         import torch
 
-        inputs = self.processor.apply_chat_template(
+        inputs = _apply_multimodal_chat_template(
+            self.processor,
             self._messages(prepared_inputs),
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
+            has_predecoded_video=prepared_inputs.video is not None,
         )
         inputs = _move_batch_to_device(inputs, "cuda")
         input_ids = inputs.get("input_ids")
