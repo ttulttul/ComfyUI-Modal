@@ -223,6 +223,7 @@ def _generated_profile(
         "advertised_context_tokens": decision.advertised_context_tokens,
         "max_context_tokens": decision.default_context_tokens,
         "estimated_vram_gb": decision.estimated_vram_gb,
+        "reasoning_parser": decision.reasoning_parser,
         "backend_options": dict(decision.backend_options),
         "runtime_requirements": list(decision.runtime_requirements),
     }

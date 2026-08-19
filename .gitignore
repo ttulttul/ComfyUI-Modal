@@ -13,6 +13,7 @@
 !/instance_identity.py
 !/llm_profiles.json
 !/llm_profiles.py
+!/llm_reasoning.py
 !/llm_compatibility.py
 !/llm_resolver.py
 !/llm_staging.py

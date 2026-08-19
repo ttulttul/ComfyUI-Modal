@@ -73,7 +73,7 @@ def _modal_llm_advanced_inputs() -> list[io.Input]:
             max=32768,
             step=1,
             advanced=True,
-            tooltip="Maximum number of response tokens.",
+            tooltip="Maximum combined number of reasoning and response tokens.",
         ),
         io.Float.Input(
             "temperature",
@@ -149,6 +149,7 @@ class ModalLLM(io.ComfyNode):
             outputs=[
                 io.String.Output(display_name="response"),
                 io.String.Output(display_name="metadata_json"),
+                io.String.Output(display_name="reasoning"),
             ],
             hidden=[io.Hidden.unique_id],
             not_idempotent=True,
@@ -214,6 +215,7 @@ class ModalLLM(io.ComfyNode):
         return io.NodeOutput(
             result.text,
             json.dumps(result.metadata, sort_keys=True, separators=(",", ":")),
+            result.reasoning,
         )
 
 

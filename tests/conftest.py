@@ -163,6 +163,12 @@ def modal_llm_runtime_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def llm_reasoning_module(extension_package: object) -> object:
+    """Return the backend-neutral LLM reasoning-output module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_reasoning")
+
+
+@pytest.fixture(scope="session")
 def modal_llm_node_module(extension_package: object) -> object:
     """Return the V3 resident Modal LLM node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_llm_node")

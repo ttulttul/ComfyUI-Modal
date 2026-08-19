@@ -27,6 +27,7 @@ class LLMCompatibilityDecision:
     advertised_context_tokens: int
     default_context_tokens: int
     estimated_vram_gb: float
+    reasoning_parser: str
     backend_options: tuple[tuple[str, str | int | float | bool], ...]
     runtime_requirements: tuple[str, ...]
 
@@ -115,6 +116,7 @@ def resolve_compatibility(
                 "Transformers checkpoint."
             )
         backend = "transformers"
+        reasoning_parser = "none"
         modalities = frozenset({"text", "image", "file"})
         backend_options: tuple[tuple[str, str | int | float | bool], ...] = (
             ("attention_implementation", "sdpa"),
@@ -128,6 +130,7 @@ def resolve_compatibility(
                 f"v{LLM_COMPATIBILITY_POLICY_VERSION}."
             )
         backend = "vllm"
+        reasoning_parser = "qwen3"
         modalities = frozenset({"text", "image", "video", "file"})
         backend_options = (
             ("enforce_eager", True),
@@ -163,6 +166,7 @@ def resolve_compatibility(
         estimated_vram_gb=_estimated_vram_gb(
             artifact_bytes, backend, quantization_method
         ),
+        reasoning_parser=reasoning_parser,
         backend_options=backend_options,
         runtime_requirements=requirements,
     )

@@ -20,9 +20,19 @@ from PIL import Image
 
 if __package__:
     from .llm_profiles import LLMModelProfile, get_llm_profile
+    from .llm_reasoning import (
+        ReasoningOutputParser,
+        create_reasoning_parser,
+        reasoning_chat_template_kwargs,
+    )
     from .llm_staging import is_model_snapshot_staged, model_snapshot_path
 else:  # pragma: no cover - remote node bundles may import top-level modules.
     from llm_profiles import LLMModelProfile, get_llm_profile
+    from llm_reasoning import (
+        ReasoningOutputParser,
+        create_reasoning_parser,
+        reasoning_chat_template_kwargs,
+    )
     from llm_staging import is_model_snapshot_staged, model_snapshot_path
 
 logger = logging.getLogger(__name__)
@@ -70,6 +80,9 @@ class BackendGenerationResult:
     text: str
     input_tokens: int
     output_tokens: int
+    reasoning: str = ""
+    reasoning_tokens: int = 0
+    reasoning_parser: str = "none"
 
 
 @dataclass(frozen=True)
@@ -78,6 +91,7 @@ class LLMInferenceResult:
 
     text: str
     metadata: dict[str, Any]
+    reasoning: str = ""
 
 
 class LLMBackend(Protocol):
@@ -374,6 +388,7 @@ def _apply_multimodal_chat_template(
     messages: list[dict[str, Any]],
     *,
     has_predecoded_video: bool,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> Any:
     """Tokenize chat content without resampling video frames prepared by ComfyUI."""
     video_sampling_kwargs: dict[str, Any] = {}
@@ -386,6 +401,7 @@ def _apply_multimodal_chat_template(
         return_dict=True,
         return_tensors="pt",
         **video_sampling_kwargs,
+        **dict(chat_template_kwargs or {}),
     )
 
 
@@ -435,6 +451,10 @@ class TransformersMultimodalBackend:
             local_files_only=True,
             trust_remote_code=False,
         )
+        self.reasoning_parser: ReasoningOutputParser = create_reasoning_parser(
+            profile,
+            self.processor.tokenizer,
+        )
         model_options: dict[str, Any] = {
             "local_files_only": True,
             "trust_remote_code": False,
@@ -469,6 +489,7 @@ class TransformersMultimodalBackend:
             self.processor,
             self._messages(prepared_inputs),
             has_predecoded_video=prepared_inputs.video is not None,
+            chat_template_kwargs=reasoning_chat_template_kwargs(self.profile),
         )
         inputs = _move_batch_to_device(inputs, "cuda")
         input_ids = inputs.get("input_ids")
@@ -495,15 +516,22 @@ class TransformersMultimodalBackend:
             torch.manual_seed(settings.seed)
             generated_ids = self.model.generate(**inputs, **generate_kwargs)
         continuation_ids = generated_ids[:, input_tokens:]
-        text = self.processor.batch_decode(
+        raw_text = self.processor.batch_decode(
             continuation_ids,
-            skip_special_tokens=True,
+            skip_special_tokens=not self.reasoning_parser.requires_boundary_tokens,
             clean_up_tokenization_spaces=False,
         )[0].strip()
+        reasoning_output = self.reasoning_parser.extract(
+            raw_text,
+            continuation_ids[0].tolist(),
+        )
         return BackendGenerationResult(
-            text=text,
+            text=reasoning_output.response,
             input_tokens=input_tokens,
             output_tokens=int(continuation_ids.shape[-1]),
+            reasoning=reasoning_output.reasoning,
+            reasoning_tokens=reasoning_output.reasoning_tokens,
+            reasoning_parser=reasoning_output.parser,
         )
 
     def unload(self) -> None:
@@ -531,6 +559,10 @@ class VLLMMultimodalBackend:
             str(snapshot_path),
             local_files_only=True,
             trust_remote_code=False,
+        )
+        self.reasoning_parser: ReasoningOutputParser = create_reasoning_parser(
+            profile,
+            self.processor.tokenizer,
         )
         quantization = str(profile.backend_option("quantization", "")).strip()
         logger.info(
@@ -569,6 +601,7 @@ class VLLMMultimodalBackend:
             _multimodal_messages(prepared_inputs),
             add_generation_prompt=True,
             tokenize=False,
+            **reasoning_chat_template_kwargs(self.profile),
         )
         if not isinstance(prompt, str):
             raise RuntimeError("The multimodal processor did not return a text prompt.")
@@ -602,6 +635,7 @@ class VLLMMultimodalBackend:
             temperature=settings.temperature,
             top_p=settings.top_p,
             seed=settings.seed,
+            skip_special_tokens=not self.reasoning_parser.requires_boundary_tokens,
         )
         try:
             outputs = self.llm.generate(
@@ -624,10 +658,23 @@ class VLLMMultimodalBackend:
         candidate = request_output.outputs[0]
         output_tokens = len(candidate.token_ids)
         progress_callback(output_tokens)
+        native_reasoning = getattr(candidate, "reasoning", None)
+        if native_reasoning is None:
+            native_reasoning = getattr(candidate, "reasoning_content", None)
+        reasoning_output = self.reasoning_parser.extract(
+            str(candidate.text),
+            candidate.token_ids,
+            native_reasoning=(
+                str(native_reasoning) if native_reasoning is not None else None
+            ),
+        )
         return BackendGenerationResult(
-            text=str(candidate.text).strip(),
+            text=reasoning_output.response,
             input_tokens=len(request_output.prompt_token_ids),
             output_tokens=output_tokens,
+            reasoning=reasoning_output.reasoning,
+            reasoning_tokens=reasoning_output.reasoning_tokens,
+            reasoning_parser=reasoning_output.parser,
         )
 
     def unload(self) -> None:
@@ -842,6 +889,8 @@ class ResidentLLMManager:
                 "cache_hit": cache_hit,
                 "input_tokens": generation_result.input_tokens,
                 "output_tokens": generation_result.output_tokens,
+                "reasoning_tokens": generation_result.reasoning_tokens,
+                "reasoning_parser": generation_result.reasoning_parser,
                 "tokens_per_second": (
                     generation_result.output_tokens / generation_seconds
                     if generation_seconds > 0
@@ -864,7 +913,11 @@ class ResidentLLMManager:
                 "comfy_loaded_model_names": comfy_loaded_model_names,
             }
             logger.info("Completed Modal LLM inference: %s", metadata)
-            return LLMInferenceResult(text=generation_result.text, metadata=metadata)
+            return LLMInferenceResult(
+                text=generation_result.text,
+                metadata=metadata,
+                reasoning=generation_result.reasoning,
+            )
 
     def resident_profiles(self) -> tuple[str, ...]:
         """Return profile ids in least-to-most-recently-used order."""

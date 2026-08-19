@@ -13,7 +13,8 @@ Modal LLM runs multimodal language-model inference inside the persistent RemoteE
 7. The dispatcher rewrites the model ID to the immutable generated profile ID, and the GPU worker reloads that exact Volume revision before executing the component.
 8. The node converts ComfyUI tensors directly to processor inputs, samples video frames uniformly, and extracts bounded text from supported files.
 9. ResidentLLMManager reuses or loads the profile, generates under a process lock, and reports progress and cancellation.
-10. The response and JSON telemetry return through the normal Modal-Sync node-output transport.
+10. A model-aware output parser separates generated reasoning from final content using exact token boundaries, with a native engine field taking precedence when available.
+11. The clean response, JSON telemetry, and separate reasoning string return through the normal Modal-Sync node-output transport.
 
 ## Residency And Memory
 
@@ -45,6 +46,17 @@ Compatibility-policy changes remain deployment changes. New repositories using a
 ## Current Backend Boundary
 
 The compatibility registry selects Transformers for Muse-Glimmer and vLLM for Qwen3.5. Qwen block-FP8 and NVIDIA ModelOpt NVFP4 checkpoints share the vLLM adapter. Generated vLLM profiles set an explicit KV-cache byte budget and a conservative 32K default context instead of allowing the serving engine to reserve nearly all available GPU memory.
+
+Reasoning extraction is deliberately model-aware and backend-neutral:
+
+- A profile selects a top-level immutable `reasoning_parser`; known architectures provide a compatibility fallback for previously generated profiles.
+- Each backend supplies raw generated token IDs and any native separated reasoning field to the same parser contract.
+- A native field wins when an engine supplies one. This supports future engine APIs without changing the node contract.
+- Transformers generation has no standard separated reasoning result, so reasoning models retain boundary tokens until the parser splits the token sequence and decodes each channel with special tokens removed.
+- Offline vLLM `LLM.generate` returns completion text and token IDs. Its OpenAI-serving reasoning parser is not the resident node's execution path, so the same token-aware fallback applies.
+- Qwen3.5 chat templating explicitly enables thinking, and its parser treats tokens before `</think>` as reasoning. If generation stops before that terminator, the entire partial output is reasoning and `response` remains empty.
+
+The node appends `reasoning` after the pre-existing `response` and `metadata_json` outputs to preserve saved workflow link indices. `output_tokens` remains the total generated count; `reasoning_tokens` counts reasoning content tokens excluding boundary markers.
 
 Every selectable NVIDIA GPU runtime uses Python 3.13 and pins Torch 2.13.0, torchvision 0.28.0, Transformers 5.15.0, and the CUDA 13.0 vLLM 0.27.1 wheel. This covers Modal's T4-through-Blackwell choices and ensures a workflow's GPU price/capacity selection never removes its LLM backend. Python 3.13 is necessary because a FlashInfer communications module imported by vLLM's kernel warmup evaluates `array.array[int]` at runtime. The initial vLLM policy uses a 12 GiB BF16 KV cache, one request at a time, and eager execution to keep graph-capture allocations predictable beside ComfyUI. The worker sets `VLLM_USE_FLASHINFER_SAMPLER=0` and selects Triton full attention so optional FlashInfer sampling and Blackwell TRT-LLM attention kernels do not require an `nvcc` JIT compiler, while avoiding FlashAttention 4's unsupported Qwen3.5 used-sequence prefill at head dimension 256. Qwen's separate GDN kernel remains available. Torch and vLLM imports are validated while building every image; model-specific capacity remains enforced separately from backend availability.
 
