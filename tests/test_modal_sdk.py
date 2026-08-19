@@ -34,6 +34,7 @@ def test_local_apple_extra_matches_validated_mlx_runtime(
 
     marker = "sys_platform == 'darwin' and platform_machine == 'arm64'"
     assert project_metadata["project"]["optional-dependencies"]["local-apple"] == [
+        f"{local_llm_runtime_module.LOCAL_MLX_DSPARK_SPEC}; {marker}",
         f"{local_llm_runtime_module.LOCAL_MLX_VLM_SPEC}; {marker}",
         f"psutil>=7,<8; {marker}",
     ]

@@ -5,19 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import comfy.model_management
 import comfy.utils
 from comfy_api.latest import io
 
 if __package__:
-    from .local_llm_runtime import run_local_llm_inference
     from .llm_profiles import MODAL_LLM_NODE_ID, llm_profile_options
+    from .local_llm_runtime import run_local_llm_inference
     from .modal_llm_runtime import LLMProgressEvent, run_modal_llm_inference
 else:  # pragma: no cover - the stable remote runtime imports this module top-level.
-    from local_llm_runtime import run_local_llm_inference
     from llm_profiles import MODAL_LLM_NODE_ID, llm_profile_options
+    from local_llm_runtime import run_local_llm_inference
     from modal_llm_runtime import LLMProgressEvent, run_modal_llm_inference
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,17 @@ def _modal_llm_primary_inputs() -> list[io.Input]:
 def _modal_llm_advanced_inputs() -> list[io.Input]:
     """Return bounded generation and residency controls."""
     return [
+        io.Combo.Input(
+            "local_mlx_engine",
+            options=["auto", "mlx-vlm", "mlx-dspark"],
+            default="auto",
+            advanced=True,
+            tooltip=(
+                "Local-only engine selection. Auto uses mlx-dspark for a registered "
+                "text-only model and MLX-VLM for image/video requests or unsupported "
+                "models. Ignored when Run on Modal is enabled."
+            ),
+        ),
         io.Int.Input(
             "max_new_tokens",
             default=512,
@@ -200,6 +212,7 @@ class ModalLLM(io.ComfyNode):
         reserve_free_vram_gb: float = 24.0,
         keep_model_loaded: bool = True,
         local_reserve_free_memory_gb: float = 4.0,
+        local_mlx_engine: str = "auto",
         unique_id: str | None = None,
     ) -> io.NodeOutput:
         """Run one cancellation-aware resident inference request."""
@@ -227,9 +240,7 @@ class ModalLLM(io.ComfyNode):
             optional_fields = {
                 "unit": progress.unit,
                 "elapsed_seconds": progress.elapsed_seconds,
-                "time_to_first_token_seconds": (
-                    progress.time_to_first_token_seconds
-                ),
+                "time_to_first_token_seconds": (progress.time_to_first_token_seconds),
                 "tokens_per_second": progress.tokens_per_second,
             }
             payload.update(
@@ -256,27 +267,28 @@ class ModalLLM(io.ComfyNode):
             video is not None,
             len(files or ()),
         )
-        result = inference_runner(
-            prompt=prompt,
-            model_profile=model_profile,
-            images=images,
-            video=video,
-            files=files,
-            system_prompt=system_prompt,
-            enable_reasoning=enable_reasoning,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            seed=seed,
-            video_frames=video_frames,
-            reserve_free_vram_gb=(
-                reserve_free_vram_gb
-                if is_remote
-                else local_reserve_free_memory_gb
+        inference_options: dict[str, Any] = {
+            "prompt": prompt,
+            "model_profile": model_profile,
+            "images": images,
+            "video": video,
+            "files": files,
+            "system_prompt": system_prompt,
+            "enable_reasoning": enable_reasoning,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "seed": seed,
+            "video_frames": video_frames,
+            "reserve_free_vram_gb": (
+                reserve_free_vram_gb if is_remote else local_reserve_free_memory_gb
             ),
-            keep_model_loaded=keep_model_loaded,
-            progress_callback=report_progress,
-        )
+            "keep_model_loaded": keep_model_loaded,
+            "progress_callback": report_progress,
+        }
+        if not is_remote:
+            inference_options["local_mlx_engine"] = local_mlx_engine
+        result = inference_runner(**inference_options)
         report_progress(
             LLMProgressEvent(
                 stage="complete",
