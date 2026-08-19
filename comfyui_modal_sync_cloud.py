@@ -34,6 +34,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
 _LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
 _REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
+_REMOTE_LLM_COMPILE_CACHE_ROOT = Path("/root/.cache/comfy-modal-llm")
 for candidate in (
     _REPO_ROOT,
     _REMOTE_REPO_ROOT,
@@ -6377,11 +6378,15 @@ def _remote_engine_cls_options(
     vol: Any,
     image: Any,
     modal_secret: Any | None = None,
+    llm_compile_cache_vol: Any | None = None,
 ) -> dict[str, Any]:
     """Build the Modal class options for the deployed remote execution runtime."""
+    volumes = {settings.remote_storage_root: vol}
+    if llm_compile_cache_vol is not None:
+        volumes[str(_REMOTE_LLM_COMPILE_CACHE_ROOT)] = llm_compile_cache_vol
     options: dict[str, Any] = {
         "gpu": settings.modal_gpu,
-        "volumes": {settings.remote_storage_root: vol},
+        "volumes": volumes,
         "scaledown_window": settings.scaledown_window_seconds,
         "min_containers": settings.min_containers,
         "image": image,
@@ -6976,8 +6981,23 @@ def _execute_loader_prewarm_plans(
         )
 
 
+def _llm_compile_cache_namespace(settings: Any) -> str:
+    """Return a stable cache namespace for accelerator-compatible JIT artifacts."""
+    cache_identity = {
+        "accelerator_packages": _remote_accelerator_packages(settings.modal_gpu),
+        "gpu": settings.modal_gpu,
+        "python": REMOTE_PYTHON_VERSION,
+        "torch_build": _select_remote_torch_build(settings.modal_gpu),
+    }
+    payload = json.dumps(cache_identity, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
 def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[str, str]:
     """Return environment values that keep the worker aligned with local settings."""
+    compile_cache_root = (
+        _REMOTE_LLM_COMPILE_CACHE_ROOT / _llm_compile_cache_namespace(settings)
+    )
     return {
         "COMFY_MODAL_APP_NAME": settings.app_name,
         "COMFY_MODAL_GPU": settings.modal_gpu,
@@ -6987,6 +7007,13 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
             "/storage",
         ),
         "COMFY_MODAL_REMOTE_WORKER": "1",
+        "COMFY_MODAL_LLM_VLLM_EXECUTION_MODE": str(
+            getattr(settings, "llm_vllm_execution_mode", "eager")
+        ),
+        "VLLM_CACHE_ROOT": str(compile_cache_root / "vllm"),
+        "TORCHINDUCTOR_CACHE_DIR": str(compile_cache_root / "torchinductor"),
+        "TRITON_CACHE_DIR": str(compile_cache_root / "triton"),
+        "CUDA_CACHE_PATH": str(compile_cache_root / "cuda"),
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "COMFY_MODAL_SECRET_NAME": getattr(
             settings,
@@ -7063,6 +7090,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     app = modal.App(__comfy_modal_app_name__)
     modal_secret = _modal_secret_from_settings(settings, modal)
     vol = modal.Volume.from_name(settings.volume_name, create_if_missing=True)
+    llm_compile_cache_vol = modal.Volume.from_name(
+        getattr(
+            settings,
+            "llm_compile_cache_volume_name",
+            f"{settings.volume_name}-llm-compile-cache",
+        ),
+        create_if_missing=True,
+    )
     interrupt_flags = modal.Dict.from_name(
         settings.interrupt_dict_name,
         create_if_missing=True,
@@ -7246,8 +7281,17 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                         "elapsed_seconds": result.elapsed_seconds,
                     }
                 )
-            if results:
+            if any(
+                result["downloaded"]
+                or result["manifest_created"]
+                for result in results
+            ):
                 vol.commit()
+            else:
+                logger.info(
+                    "Skipping Modal Volume commit because all requested LLM "
+                    "profiles and weights were already durable."
+                )
             logger.info(
                 "Modal LLM CPU resolution and staging completed for models=%s.",
                 model_references,
@@ -7298,7 +7342,15 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                 raise errors[0]
             yield {"kind": "result", "results": results[0] if results else []}
 
-    @app.cls(**_remote_engine_cls_options(settings, vol, image, modal_secret))
+    @app.cls(
+        **_remote_engine_cls_options(
+            settings,
+            vol,
+            image,
+            modal_secret,
+            llm_compile_cache_vol,
+        )
+    )
     @modal.concurrent(max_inputs=1)
     class RemoteEngine:
         """Modal runtime class that executes proxied ComfyUI payloads."""

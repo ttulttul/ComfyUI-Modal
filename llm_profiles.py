@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -223,8 +224,15 @@ class LLMModelProfile:
             )
 
     def storage_relative_path(self) -> Path:
-        """Return the stable volume-relative directory for this immutable snapshot."""
-        return Path(LLM_MODEL_DIRECTORY_NAME) / self.profile_id / self.revision
+        """Return this repository revision's runtime-independent weight path."""
+        repository_digest = hashlib.sha256(
+            self.repository.encode("utf-8")
+        ).hexdigest()
+        return (
+            Path(LLM_MODEL_DIRECTORY_NAME)
+            / f"repo-{repository_digest}"
+            / self.revision
+        )
 
     def backend_option(self, name: str, default: Any = None) -> Any:
         """Return one immutable backend option by name."""

@@ -46,6 +46,24 @@ _BYTES_PER_GIB = 1024**3
 _DEFAULT_STORAGE_ROOT = "/storage"
 _DEFAULT_RESERVE_FREE_VRAM_GB = 24.0
 _DEFAULT_MAX_RESIDENT_MODELS = 2
+_VLLM_EXECUTION_MODES = frozenset({"eager", "throughput"})
+_VLLM_SAFETENSORS_LOAD_STRATEGY = "prefetch"
+
+
+def _vllm_execution_policy(profile: LLMModelProfile) -> tuple[str, bool]:
+    """Resolve eager or CUDA-graph execution without changing weight identity."""
+    configured_mode = os.getenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE")
+    if configured_mode is None:
+        enforce_eager = bool(profile.backend_option("enforce_eager", True))
+        return ("eager" if enforce_eager else "throughput", enforce_eager)
+    mode = configured_mode.strip().lower()
+    if mode not in _VLLM_EXECUTION_MODES:
+        supported = ", ".join(sorted(_VLLM_EXECUTION_MODES))
+        raise ValueError(
+            "COMFY_MODAL_LLM_VLLM_EXECUTION_MODE must be one of "
+            f"{supported}; got {configured_mode!r}."
+        )
+    return mode, mode == "eager"
 
 
 @dataclass(frozen=True)
@@ -730,6 +748,7 @@ class VLLMMultimodalBackend:
 
         self.profile = profile
         self.snapshot_path = snapshot_path
+        self.execution_mode, self.enforce_eager = _vllm_execution_policy(profile)
         progress_callback(
             LLMProgressEvent(
                 stage="processor",
@@ -779,10 +798,14 @@ class VLLMMultimodalBackend:
         """Log the immutable vLLM configuration before its expensive startup."""
         logger.info(
             "Loading asynchronous vLLM profile=%s path=%s quantization=%s "
-            "max_model_len=%d kv_cache_gib=%.1f shards=%s.",
+            "mode=%s enforce_eager=%s safetensors_load_strategy=%s "
+            "max_model_len=%d kv_cache_gib=%.1f shards=%s compile_cache=%s.",
             self.profile.profile_id,
             self.snapshot_path,
             quantization or "auto",
+            self.execution_mode,
+            self.enforce_eager,
+            _VLLM_SAFETENSORS_LOAD_STRATEGY,
             int(
                 self.profile.backend_option(
                     "max_model_len",
@@ -792,6 +815,7 @@ class VLLMMultimodalBackend:
             int(self.profile.backend_option("kv_cache_memory_bytes", 0))
             / _BYTES_PER_GIB,
             shard_count,
+            os.getenv("VLLM_CACHE_ROOT", "<ephemeral-default>"),
         )
 
     def _engine_arguments(self, argument_class: Any, quantization: str) -> Any:
@@ -814,14 +838,22 @@ class VLLMMultimodalBackend:
                     12 * _BYTES_PER_GIB,
                 )
             ),
-            enforce_eager=bool(
-                self.profile.backend_option("enforce_eager", True)
-            ),
+            enforce_eager=self.enforce_eager,
+            safetensors_load_strategy=_VLLM_SAFETENSORS_LOAD_STRATEGY,
             disable_custom_all_reduce=True,
             attention_config={"backend": "TRITON_ATTN"},
             generation_config="vllm",
             limit_mm_per_prompt={"image": self.profile.max_images, "video": 1},
         )
+
+    def runtime_metadata(self) -> dict[str, Any]:
+        """Return the execution and persistent-cache settings used by vLLM."""
+        return {
+            "vllm_execution_mode": self.execution_mode,
+            "vllm_enforce_eager": self.enforce_eager,
+            "vllm_safetensors_load_strategy": _VLLM_SAFETENSORS_LOAD_STRATEGY,
+            "vllm_compile_cache_root": os.getenv("VLLM_CACHE_ROOT"),
+        }
 
     def _start_engine(self, engine_class: Any, engine_args: Any) -> Any:
         """Start AsyncLLM and clean up its loop if initialization fails."""

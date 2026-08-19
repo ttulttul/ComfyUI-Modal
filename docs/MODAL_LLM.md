@@ -7,7 +7,7 @@ The `Modal LLM` V3 node runs multimodal language-model inference in the current 
 1. The node exposes text, IMAGE, native VIDEO, and `OPENAI_INPUT_FILES` inputs plus the existing `Run on Modal` toggle.
 2. Queue rewriting leaves an unmarked node in the local graph. Marking it places the node in a normal remote component.
 3. Both targets inspect a Hugging Face repository and `config.json` before weight download, validate the target-specific architecture and quantization policy, and pin the exact commit in a content-addressed schema-v2 profile.
-4. Local execution downloads the approved snapshot beneath `<ComfyUI models>/modal_llm` and loads it through pinned MLX-VLM. Modal execution uses the CPU-only ModelStager and shared Modal Volume before allocating a GPU worker.
+4. Local execution downloads the approved snapshot beneath `<ComfyUI models>/modal_llm` and loads it through pinned MLX-VLM. Modal execution uses the CPU-only ModelStager and shared Modal Volume before allocating a GPU worker. Snapshot identity is the repository plus exact revision, independent of runtime tuning, so execution-profile changes reuse the same files.
 5. The node converts ComfyUI tensors directly to processor inputs, samples video uniformly into timestamped frames, and extracts bounded text from supported files. The local adapter supplies sampled video frames as an ordered image sequence because the shared input layer has already done the sampling and timestamp annotation.
 6. A target-specific process-global `ResidentLLMManager` reuses or loads the immutable profile under a process lock.
 7. A shared model-aware parser separates generated reasoning from final content using exact token boundaries, with a native engine field taking precedence when available.
@@ -66,6 +66,18 @@ Reasoning extraction remains backend-neutral:
 - Transformers and MLX retain reasoning boundary tokens until parsing; resident vLLM uses its cumulative async token stream.
 - The node appends `reasoning` after the pre-existing `response` and `metadata_json` outputs, preserving saved workflow link indices.
 - `output_tokens` counts all generated tokens and `reasoning_tokens` counts reasoning content without boundary markers.
+
+## Modal vLLM Execution And Disk Caches
+
+`COMFY_MODAL_LLM_VLLM_EXECUTION_MODE` selects `eager` or `throughput` for a deployed app. Eager mode preserves the conservative no-compilation behavior. Throughput mode passes `enforce_eager=False`, allowing vLLM to select its hybrid compiled and CUDA-graph path. The mode is deployment-scoped rather than part of the model profile, so it cannot create another copy of identical weights. Both modes use safetensor prefetch for the Modal Volume mount.
+
+The weight Volume retains immutable repository revisions. Legacy profile-keyed weight directories are recognized from their completion marker and reused in place so an older deployed app can continue resolving its historical path. A CPU staging call commits the Volume only when it downloaded weights or created a generated manifest.
+
+Compilation artifacts use a separate Modal Volume so weight/custom-node reloads cannot invalidate open JIT cache files. `VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, and `CUDA_CACHE_PATH` point into a namespace derived from GPU type, Python version, Torch build, and pinned vLLM package. This allows ordinary source redeployments to reuse compatible compiled artifacts while keeping incompatible accelerator stacks separate. `COMFY_MODAL_LLM_COMPILE_CACHE_VOLUME_NAME` overrides the default `<weight-volume>-llm-compile-cache` name.
+
+`scripts/benchmark_modal_llm.py` creates an isolated, billable benchmark app. A cold cycle stops that app, invokes the real CPU staging and GPU execution path once, then immediately repeats on the resident engine. Multiple cold cycles reuse the persistent disk caches while forcing a new container and engine, separating four states: first compilation, cached compilation on a new container, first model load in a container, and resident model reuse. The JSON report records the exact source and workload alongside vLLM telemetry.
+
+On 2026-08-19, the harness ran `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4` on RTX PRO 6000 with one synthetic image and 128 output tokens. The uncached throughput engine spent 138.0 seconds in `torch.compile`; a later container directly loaded the 81 MB AOT cache and reduced compilation to 22.4 seconds. Two genuine cached cold containers took 133.4 and 174.9 seconds of node-reported load time, versus 93.0 seconds for eager. Resident throughput repeats generated at 38.4-39.1 tokens per second with 49-51 ms TTFT; eager generated at 17.2 tokens per second with 151 ms TTFT. Thus the throughput profile roughly doubled steady-state decode speed but retained a 40-82 second cached cold-load penalty in this sample. The JSON artifacts are the authoritative comparison because image deployment time can be independently cold and is included only in wall time.
 
 ## Progress And Cancellation
 

@@ -1554,6 +1554,7 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
         invocation_result_inline_max_bytes=2048,
         execution_timeout_seconds=3600,
         startup_timeout_seconds=900,
+        llm_vllm_execution_mode="throughput",
     )
 
     image_environment = modal_cloud_module._modal_image_environment(settings, "fingerprint-1")
@@ -1562,6 +1563,13 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     assert image_environment["COMFY_MODAL_GPU"] == "B300"
     assert image_environment["COMFY_MODAL_REMOTE_STORAGE_ROOT"] == "/storage"
     assert image_environment["COMFY_MODAL_REMOTE_WORKER"] == "1"
+    assert image_environment["COMFY_MODAL_LLM_VLLM_EXECUTION_MODE"] == "throughput"
+    assert image_environment["VLLM_CACHE_ROOT"].startswith(
+        "/root/.cache/comfy-modal-llm/"
+    )
+    assert image_environment["TORCHINDUCTOR_CACHE_DIR"].startswith(
+        "/root/.cache/comfy-modal-llm/"
+    )
     assert image_environment["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     assert image_environment["COMFY_MODAL_LLM_MAX_RESIDENT_MODELS"] == "2"
     assert image_environment["COMFY_MODAL_LLM_RESERVE_FREE_GB"] == "24.0"
@@ -4420,12 +4428,16 @@ def test_modal_cloud_builds_snapshot_enabled_cls_options(
         "volume",
         "image",
         modal_secret,
+        "compile-cache-volume",
     )
 
     assert options["enable_memory_snapshot"] is True
     assert "experimental_options" not in options
     assert options["gpu"] == "L40S"
-    assert options["volumes"] == {"/storage": "volume"}
+    assert options["volumes"] == {
+        "/storage": "volume",
+        "/root/.cache/comfy-modal-llm": "compile-cache-volume",
+    }
     assert options["scaledown_window"] == 600
     assert options["min_containers"] == 0
     assert options["timeout"] == 3600

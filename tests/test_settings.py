@@ -312,6 +312,11 @@ def test_settings_reads_resident_llm_memory_controls(
     """Resident model count and ComfyUI VRAM reserve should be configurable."""
     monkeypatch.setenv("COMFY_MODAL_LLM_MAX_RESIDENT_MODELS", "3")
     monkeypatch.setenv("COMFY_MODAL_LLM_RESERVE_FREE_GB", "48.5")
+    monkeypatch.setenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", "throughput")
+    monkeypatch.setenv(
+        "COMFY_MODAL_LLM_COMPILE_CACHE_VOLUME_NAME",
+        "benchmark-vllm-cache",
+    )
     settings_module.get_settings.cache_clear()
     try:
         settings = settings_module.get_settings()
@@ -320,6 +325,8 @@ def test_settings_reads_resident_llm_memory_controls(
 
     assert settings.llm_max_resident_models == 3
     assert settings.llm_reserve_free_vram_gb == 48.5
+    assert settings.llm_vllm_execution_mode == "throughput"
+    assert settings.llm_compile_cache_volume_name == "benchmark-vllm-cache"
 
 
 def test_settings_reads_proactive_warmup_override(
