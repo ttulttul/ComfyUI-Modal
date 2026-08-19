@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ _KEYRING_WRITE_TEST_USER = "__credential_store_write_test__"
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _TOKEN_CREATION_TIMEOUT_SECONDS = 120
 _TOKEN_CREATION_LOCK = threading.Lock()
+_AUTHORIZED_PROXY_TOKENS: set[tuple[str, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,13 @@ class ProxyTokenCreator(Protocol):
 
     def create(self) -> ModalProxyCredentials:
         """Create and return a new Modal proxy-token pair."""
+
+
+class ProxyTokenAuthorizer(Protocol):
+    """Authorization interface for scoped Modal proxy tokens."""
+
+    def allow(self, token_key: str, environment: str) -> None:
+        """Allow one proxy token to authenticate to a Modal environment."""
 
 
 class ComfyUISecretManager:
@@ -231,13 +240,82 @@ class ModalCliProxyTokenCreator:
         return " ".join(safe_lines)[-1000:] or "the CLI returned no diagnostic output"
 
 
+class ModalCliProxyTokenAuthorizer:
+    """Authorize vault-backed proxy tokens for an environment through Modal's CLI."""
+
+    def allow(self, token_key: str, environment: str) -> None:
+        """Idempotently associate a scoped proxy token with one environment."""
+        normalized_environment = environment.strip()
+        if not token_key.startswith("wk-"):
+            raise ValueError("Modal proxy-token keys must use the wk- prefix.")
+        if not normalized_environment:
+            raise ValueError("Modal environment cannot be blank.")
+        cache_key = (token_key, normalized_environment)
+        if cache_key in _AUTHORIZED_PROXY_TOKENS:
+            return
+        commands = self._candidate_commands(token_key, normalized_environment)
+        if not commands:
+            raise RuntimeError(
+                "No Modal CLI is available to authorize the scoped proxy token. "
+                "Install uv or Modal, then run `modal setup`."
+            )
+        for command_index, command in enumerate(commands):
+            result = ModalCliProxyTokenCreator._run_command(command)
+            if result.returncode == 0:
+                _AUTHORIZED_PROXY_TOKENS.add(cache_key)
+                logger.info(
+                    "Modal proxy token is authorized for environment %s.",
+                    normalized_environment,
+                )
+                return
+            if command_index + 1 < len(commands) and (
+                ModalCliProxyTokenCreator._is_unsupported_cli(result)
+            ):
+                logger.info(
+                    "Trying a current Modal CLI because the installed CLI lacks proxy-token support."
+                )
+                continue
+            detail = ModalCliProxyTokenCreator._safe_error_detail(
+                result.stderr or result.stdout
+            )
+            raise RuntimeError(
+                "Modal proxy-token environment authorization failed: " f"{detail}"
+            )
+        raise RuntimeError(
+            "Modal proxy-token environment authorization failed without a diagnostic."
+        )
+
+    @staticmethod
+    def _candidate_commands(token_key: str, environment: str) -> list[list[str]]:
+        """Return compatible CLI commands for an environment association."""
+        suffix = ["workspace", "proxy-tokens", "allow", token_key, environment]
+        commands: list[list[str]] = []
+        modal_command = shutil.which("modal")
+        if modal_command:
+            commands.append([modal_command, *suffix])
+        uvx_command = shutil.which("uvx")
+        if uvx_command:
+            commands.append([uvx_command, "--from", "modal>=1.5.4", "modal", *suffix])
+        if not modal_command:
+            commands.insert(0, [sys.executable, "-m", "modal", *suffix])
+        return commands
+
+
 class ModalCredentialResolver:
     """Resolve Modal endpoint credentials from environment, vault, or the CLI."""
 
-    def __init__(self, store: CredentialStore, creator: ProxyTokenCreator) -> None:
+    def __init__(
+        self,
+        store: CredentialStore,
+        creator: ProxyTokenCreator,
+        authorizer: ProxyTokenAuthorizer | None = None,
+        environment: str = "main",
+    ) -> None:
         """Configure secure storage and token creation implementations."""
         self._store = store
         self._creator = creator
+        self._authorizer = authorizer
+        self._environment = environment
 
     def resolve(self) -> ModalProxyCredentials:
         """Return credentials, creating and storing a pair only when none exists."""
@@ -250,12 +328,19 @@ class ModalCredentialResolver:
                 return environment_credentials
             stored_credentials = self._store.load()
             if stored_credentials is not None:
+                self._authorize(stored_credentials)
                 return stored_credentials
             self._store.ensure_writable()
             logger.info("No Modal proxy token found; creating one with the Modal CLI.")
             created_credentials = self._creator.create()
             self._store.save(created_credentials)
+            self._authorize(created_credentials)
             return created_credentials
+
+    def _authorize(self, credentials: ModalProxyCredentials) -> None:
+        """Authorize vault-backed credentials when scoped-token support is configured."""
+        if self._authorizer is not None:
+            self._authorizer.allow(credentials.key, self._environment)
 
     @staticmethod
     def _from_environment() -> ModalProxyCredentials | None:
@@ -408,8 +493,10 @@ def _response_error_message(payload: Mapping[str, Any]) -> str:
     """Extract a bounded provider error message from a response object."""
     error = payload.get("error")
     if isinstance(error, Mapping) and isinstance(error.get("message"), str):
-        return str(error["message"])[:2000]
-    return json.dumps(payload, ensure_ascii=False)[:2000]
+        detail = str(error["message"])
+    else:
+        detail = json.dumps(payload, ensure_ascii=False)
+    return re.sub(r"\b(?:wk|ws)-[A-Za-z0-9_-]+\b", "[redacted]", detail)[:2000]
 
 
 def _chat_response_text(payload: Mapping[str, Any]) -> str:
@@ -608,6 +695,16 @@ def _modal_endpoint_advanced_inputs() -> list[io.Input]:
     """Return optional generation and timeout input declarations."""
     return [
         io.String.Input(
+            "environment",
+            default="main",
+            optional=True,
+            advanced=True,
+            tooltip=(
+                "Modal environment hosting the endpoint. Auto-created scoped tokens are "
+                "authorized for this environment."
+            ),
+        ),
+        io.String.Input(
             "system_prompt",
             default="",
             multiline=True,
@@ -678,6 +775,7 @@ class ModalEndpointChat(io.ComfyNode):
         images: torch.Tensor | None = None,
         files: Sequence[Any] | None = None,
         system_prompt: str = "",
+        environment: str = "main",
         max_tokens: int = 4096,
         temperature: float = 0.7,
         timeout_seconds: int = 600,
@@ -690,6 +788,8 @@ class ModalEndpointChat(io.ComfyNode):
         resolver = ModalCredentialResolver(
             store=ComfyUISecretManager(),
             creator=ModalCliProxyTokenCreator(),
+            authorizer=ModalCliProxyTokenAuthorizer(),
+            environment=environment,
         )
         credentials = await asyncio.to_thread(resolver.resolve)
         client = ModalEndpointClient(endpoint_url, credentials, timeout_seconds)
@@ -708,6 +808,7 @@ class ModalEndpointChat(io.ComfyNode):
 
 __all__ = [
     "ComfyUISecretManager",
+    "ModalCliProxyTokenAuthorizer",
     "ModalCliProxyTokenCreator",
     "ModalCredentialResolver",
     "ModalEndpointChat",
