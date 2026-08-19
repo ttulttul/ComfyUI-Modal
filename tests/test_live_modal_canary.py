@@ -87,6 +87,14 @@ class _LiveModalCanaryContext:
         payload.pop("payload_kind", None)
         payload["class_type"] = class_type
         payload["modal_gpu"] = self.settings.modal_gpu
+        model_profile = inputs.get("model_profile")
+        if isinstance(model_profile, str) and model_profile.strip():
+            payload["subgraph_prompt"] = {
+                "canary-node": {
+                    "class_type": class_type,
+                    "inputs": {"model_profile": model_profile},
+                }
+            }
         response = self.remote_module.invoke_remote_engine(
             payload,
             self.remote_module.serialize_node_inputs(inputs),
