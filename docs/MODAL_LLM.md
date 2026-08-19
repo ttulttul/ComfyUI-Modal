@@ -56,4 +56,4 @@ On 2026-08-19, the generated-profile canary resolved exact Hub revisions, staged
 - `meta-models/Muse-Glimmer-30B` at `a4e59da52a7bc87ae7251dd5545c0dd437c44b68` through Transformers;
 - `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4` at `faf7945020c138c8ef864ab1644273f3158f85fa` through vLLM ModelOpt FP4.
 
-The live co-residency canary can select a curated profile or Hub ID through `COMFY_MODAL_LLM_CANARY_PROFILE`. It retains that LLM, executes a real ComfyUI VAE encode on the same single B300 worker, and then requires the second LLM call to report a resident cache hit.
+The live co-residency canary can select a curated profile or Hub ID through `COMFY_MODAL_LLM_CANARY_PROFILE`. It retains that LLM, executes a real ComfyUI VAE encode on the same single B300 worker, and then requires the second LLM call to report a resident cache hit. The 2026-08-19 run passed with the generated Orcarouter FP8 profile retained across a real Flux VAE encode on one B300 worker.
