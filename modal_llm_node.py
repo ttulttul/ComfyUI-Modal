@@ -12,9 +12,11 @@ import comfy.utils
 from comfy_api.latest import io
 
 if __package__:
+    from .local_llm_runtime import run_local_llm_inference
     from .llm_profiles import MODAL_LLM_NODE_ID, llm_profile_options
     from .modal_llm_runtime import LLMProgressEvent, run_modal_llm_inference
 else:  # pragma: no cover - the stable remote runtime imports this module top-level.
+    from local_llm_runtime import run_local_llm_inference
     from llm_profiles import MODAL_LLM_NODE_ID, llm_profile_options
     from modal_llm_runtime import LLMProgressEvent, run_modal_llm_inference
 
@@ -35,7 +37,7 @@ def _modal_llm_primary_inputs() -> list[io.Input]:
             default=llm_profile_options()[0],
             tooltip=(
                 "A curated profile or Hugging Face ID such as owner/model. The first run "
-                "inspects, pins, and stages a compatible model on the Modal Volume."
+                "inspects and pins a compatible model for the selected local or Modal target."
             ),
         ),
         io.Image.Input(
@@ -127,19 +129,34 @@ def _modal_llm_advanced_inputs() -> list[io.Input]:
             max=256.0,
             step=1.0,
             advanced=True,
-            tooltip="VRAM kept free for ComfyUI image/video models before loading this LLM.",
+            tooltip=(
+                "Accelerator or unified memory kept free for ComfyUI and the operating "
+                "system before loading this LLM."
+            ),
         ),
         io.Boolean.Input(
             "keep_model_loaded",
             default=True,
             advanced=True,
-            tooltip="Keep the model resident for subsequent nodes in this warm Modal container.",
+            tooltip="Keep the model resident for subsequent requests in this process.",
+        ),
+        io.Float.Input(
+            "local_reserve_free_memory_gb",
+            default=4.0,
+            min=0.0,
+            max=256.0,
+            step=1.0,
+            advanced=True,
+            tooltip=(
+                "Apple unified memory kept free for ComfyUI and macOS before loading "
+                "a local LLM. Ignored when Run on Modal is enabled."
+            ),
         ),
     ]
 
 
 class ModalLLM(io.ComfyNode):
-    """Generate text with a resident multimodal Transformers model on Modal."""
+    """Generate text with a resident local or Modal multimodal model."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -151,8 +168,8 @@ class ModalLLM(io.ComfyNode):
             essentials_category="Text Generation",
             description=(
                 "Run text, image, video, and bounded file understanding through a "
-                "revision-pinned language model resident beside ComfyUI on the Modal GPU. "
-                "Enable Run on Modal for this node."
+                "revision-pinned language model. Leave Run on Modal disabled for "
+                "Apple-local MLX inference, or enable it for a Modal GPU worker."
             ),
             inputs=[*_modal_llm_primary_inputs(), *_modal_llm_advanced_inputs()],
             outputs=[
@@ -182,14 +199,15 @@ class ModalLLM(io.ComfyNode):
         video_frames: int = 12,
         reserve_free_vram_gb: float = 24.0,
         keep_model_loaded: bool = True,
+        local_reserve_free_memory_gb: float = 4.0,
         unique_id: str | None = None,
     ) -> io.NodeOutput:
         """Run one cancellation-aware resident inference request."""
-        if os.getenv("COMFY_MODAL_REMOTE_WORKER") != "1":
-            raise RuntimeError(
-                "Modal LLM only runs inside the Modal worker. Enable 'Run on Modal' for this "
-                "node and choose a GPU workflow target."
-            )
+        is_remote = os.getenv("COMFY_MODAL_REMOTE_WORKER") == "1"
+        execution_target = "modal" if is_remote else "local_apple"
+        inference_runner = (
+            run_modal_llm_inference if is_remote else run_local_llm_inference
+        )
         progress_bar = comfy.utils.ProgressBar(max_new_tokens, node_id=unique_id)
 
         def report_progress(progress: LLMProgressEvent) -> None:
@@ -229,14 +247,16 @@ class ModalLLM(io.ComfyNode):
                 PromptServer.instance.send_sync("modal_llm_progress", payload, None)
 
         logger.info(
-            "Starting Modal LLM profile=%s max_new_tokens=%d images=%s video=%s files=%d.",
+            "Starting LLM target=%s profile=%s max_new_tokens=%d images=%s "
+            "video=%s files=%d.",
+            execution_target,
             model_profile,
             max_new_tokens,
             getattr(images, "shape", None),
             video is not None,
             len(files or ()),
         )
-        result = run_modal_llm_inference(
+        result = inference_runner(
             prompt=prompt,
             model_profile=model_profile,
             images=images,
@@ -249,7 +269,11 @@ class ModalLLM(io.ComfyNode):
             top_p=top_p,
             seed=seed,
             video_frames=video_frames,
-            reserve_free_vram_gb=reserve_free_vram_gb,
+            reserve_free_vram_gb=(
+                reserve_free_vram_gb
+                if is_remote
+                else local_reserve_free_memory_gb
+            ),
             keep_model_loaded=keep_model_loaded,
             progress_callback=report_progress,
         )

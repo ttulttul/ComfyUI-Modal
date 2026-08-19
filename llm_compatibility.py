@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,8 @@ LLM_COMPATIBILITY_POLICY_VERSION = 1
 TRANSFORMERS_RUNTIME_VERSION = "5.15.0"
 VLLM_RUNTIME_VERSION = "0.27.1"
 VLLM_TORCH_VERSION = "2.13.0"
+LOCAL_MLX_VLM_VERSION = "0.6.15"
+LLMExecutionTarget = Literal["modal", "local_apple"]
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,11 @@ def _quantization_method(config: Mapping[str, Any]) -> str:
         return "modelopt_fp4"
     if method == "fp8":
         return "fp8"
+    mlx_quantization = _configuration_mapping(config, "quantization")
+    mlx_bits = mlx_quantization.get("bits")
+    mlx_mode = str(mlx_quantization.get("mode") or "").strip().lower()
+    if mlx_bits:
+        return f"mlx_{mlx_mode or 'quantized'}_{int(mlx_bits)}bit"
     return method or "none"
 
 
@@ -92,7 +99,10 @@ def _estimated_vram_gb(
 ) -> float:
     """Estimate model plus runtime allocations before the first measured load."""
     artifact_gib = artifact_bytes / 1024**3
-    runtime_overhead_gib = 12.0 if backend == "vllm" else 8.0
+    if backend == "mlx_vlm":
+        runtime_overhead_gib = 2.0
+    else:
+        runtime_overhead_gib = 12.0 if backend == "vllm" else 8.0
     multiplier = 1.12 if quantization_method != "none" else 1.08
     return round(artifact_gib * multiplier + runtime_overhead_gib, 1)
 
@@ -101,6 +111,7 @@ def resolve_compatibility(
     config: Mapping[str, Any],
     *,
     artifact_bytes: int,
+    execution_target: LLMExecutionTarget = "modal",
 ) -> LLMCompatibilityDecision:
     """Select a reviewed backend or reject an unknown model before weight download."""
     architecture = _architecture(config)
@@ -109,7 +120,35 @@ def resolve_compatibility(
     default_context_tokens = min(advertised_context_tokens, 32768)
     quantization_method = _quantization_method(config)
 
-    if architecture == "MuseGlimmerForConditionalGeneration":
+    if execution_target == "local_apple":
+        if quantization_method != "none" and not quantization_method.startswith(
+            "mlx_"
+        ):
+            raise ValueError(
+                f"Quantization {quantization_method!r} is not an MLX checkpoint "
+                "format supported by the Apple-local LLM policy. Choose an "
+                "unquantized or mlx-community conversion of this model."
+            )
+        if architecture == "SmolVLMForConditionalGeneration":
+            modalities = frozenset({"text", "image", "video", "file"})
+            reasoning_parser = "none"
+        elif architecture == "MuseGlimmerForConditionalGeneration":
+            modalities = frozenset({"text", "image", "file"})
+            reasoning_parser = "none"
+        elif architecture == "Qwen3_5ForConditionalGeneration":
+            modalities = frozenset({"text", "image", "video", "file"})
+            reasoning_parser = "qwen3"
+        else:
+            raise ValueError(
+                f"Architecture {architecture!r} is not supported by the Apple-local "
+                "LLM compatibility policy "
+                f"v{LLM_COMPATIBILITY_POLICY_VERSION}. Add and validate an MLX-VLM "
+                "adapter before downloading its weights."
+            )
+        backend = "mlx_vlm"
+        backend_options = ()
+        requirements = (f"mlx-vlm=={LOCAL_MLX_VLM_VERSION}",)
+    elif architecture == "MuseGlimmerForConditionalGeneration":
         if quantization_method != "none":
             raise ValueError(
                 "Muse-Glimmer is currently validated only for its unquantized "
@@ -171,8 +210,9 @@ def resolve_compatibility(
         runtime_requirements=requirements,
     )
     logger.info(
-        "Resolved Modal LLM compatibility architecture=%s backend=%s "
+        "Resolved LLM compatibility target=%s architecture=%s backend=%s "
         "quantization=%s policy=%d.",
+        execution_target,
         decision.architecture,
         decision.backend,
         decision.quantization_method,
@@ -185,6 +225,8 @@ __all__ = [
     "LLM_COMPATIBILITY_POLICY_VERSION",
     "LLM_PROFILE_SCHEMA_VERSION",
     "LLMCompatibilityDecision",
+    "LLMExecutionTarget",
+    "LOCAL_MLX_VLM_VERSION",
     "TRANSFORMERS_RUNTIME_VERSION",
     "VLLM_RUNTIME_VERSION",
     "VLLM_TORCH_VERSION",
