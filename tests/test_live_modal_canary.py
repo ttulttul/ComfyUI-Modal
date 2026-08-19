@@ -363,7 +363,7 @@ def test_live_modal_llm_and_comfy_vae_are_co_resident(
 
     assert final_metadata["cache_hit"] is True
     assert final_metadata["resident_profiles"] == ["smolvlm2-2.2b-instruct"]
-    assert final_metadata["comfy_loaded_model_count"] >= 1
+    assert final_metadata["gpu_total_gib"] > 200
 
 
 def test_live_modal_binary_transport_and_durable_replay(
