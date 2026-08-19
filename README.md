@@ -10,6 +10,7 @@ ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts
 Modal-Sync provides:
 
 - a ComfyUI frontend extension with a `Run on Modal` toggle, workflow-level GPU selection, and remote execution overlays
+- a `Modal Endpoint Chat` node for prompt, image, and file inference through Modal hosted-model endpoints
 - a queue route at `/modal/queue_prompt` that intercepts normal prompt submission
 - queue-time graph partitioning and proxy-node rewrite for selected remote regions
 - local in-process execution mode for development and tests
@@ -76,6 +77,32 @@ Each ComfyUI environment receives its own Modal app name on first startup. Modal
 For repository development, `uv sync --extra remote --group test` installs the same pinned SDK. Remote mode uses the stable cloud entrypoint in [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py). On first use, Modal-Sync can auto-deploy the configured Modal app if it does not exist.
 
 The deployed image uses Python 3.11 plus an exact ComfyUI support and CUDA package set, including ComfyUI's current `comfy-aimdo==0.4.13` and `comfy-kitchen==0.2.31` pins and the import-time dependencies used by built-in extras such as Math Expression and GLSL. Its headless PromptServer shim also instantiates ComfyUI's `NodeReplaceManager`, allowing current built-in and custom extensions to register replacement nodes during remote initialization. Remote prompt executors mirror both legacy scalar and current active/inactive RAM-pressure cache arguments from ComfyUI, and the cache adapter supports both synchronous legacy access and current coroutine-based cache operations. Remote pre-execution validation finalizes V3 dynamic input schemas against the live prompt before checking required sockets, so nodes using `io.Autogrow` accept expanded paths such as `images.image0` exactly as local ComfyUI does. The image's local build context is limited to the ComfyUI source packages, top-level Python modules, and runtime configuration needed by the headless worker; model directories, custom nodes, caches, tests, virtual environments, user data, and unknown top-level directories stay out of the image snapshot. Before every process's first remote invocation, Modal-Sync compares the deployed worker's runtime fingerprint with the local source, ComfyUI source, custom-node requirements, and runtime-shaping settings. A missing or mismatched fingerprint is treated as stale and replaced automatically when `COMFY_MODAL_AUTO_DEPLOY=true`; replacement uses Modal's non-interactive SDK stop API when available and an explicitly confirmed CLI fallback, so app shutdown cannot stall on a hidden terminal prompt.
+
+### Calling A Modal Hosted Model Endpoint
+
+`Modal Endpoint Chat` is a separate V3 node for Modal's hosted-model endpoints. Its layout follows ComfyUI's built-in `OpenAI ChatGPT` node: provide a prompt, an optional `IMAGE` batch, and optional files from `OpenAI ChatGPT Input Files`. Supply a Modal Direct endpoint such as:
+
+```text
+https://your-workspace--your-endpoint.us-west.modal.direct
+```
+
+The node calls the endpoint's OpenAI-compatible `/v1/chat/completions` API. Enter the base or custom Hugging Face model ID in `model`, or leave it blank to select the first ID advertised by `/v1/models`. Image and file content is sent using the OpenAI Chat Completions multimodal format; the hosted model and serving recipe must support the supplied content types.
+
+Authentication is resolved in this order:
+
+1. `MODAL_KEY` and `MODAL_SECRET` from the ComfyUI process environment. These must be proxy-token values with `wk-` and `ws-` prefixes, not Modal API credentials with `ak-` and `as-` prefixes.
+2. A previously saved pair in the operating-system credential vault under the `ComfyUI Modal-Sync` service.
+3. A new pair created with `modal workspace proxy-tokens create --json`, using a current CLI through `uvx` when the installed Modal CLI is too old.
+
+Automatically created values go directly to the OS vault—Keychain on macOS or the configured native `keyring` backend on other platforms. They are never written into the workflow, ComfyUI settings JSON, logs, or a plaintext file. ComfyUI Cloud's Settings → Secrets service is cloud-only; when that service injects `MODAL_KEY` and `MODAL_SECRET` into the process environment, the first resolution path applies. A local/headless installation without a secure keyring backend must supply both environment variables rather than allowing automatic creation.
+
+The CLI must already be authenticated with Modal. Run `<comfyui-venv>/bin/python -m modal setup` if necessary. Workspaces with RBAC may also require an owner or manager to associate the new token with the endpoint environment:
+
+```bash
+modal workspace proxy-tokens allow wk-... main
+```
+
+For credential safety, the node accepts only HTTPS `modal.direct` origins, refuses redirects, and never exposes its own `Run on Modal` toggle.
 
 ## Using It In ComfyUI
 

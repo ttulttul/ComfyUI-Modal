@@ -45,6 +45,7 @@ try:
     from comfy_api.latest import ComfyExtension, io
 
     from .api_intercept import setup_modal_queue_route
+    from .modal_endpoint_node import ModalEndpointChat
     from .modal_executor_node import (
         ModalArtifactFinalizer,
         ModalMapInput,
@@ -55,6 +56,7 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     io = None  # type: ignore[assignment]
     ModalMapInput = None  # type: ignore[assignment]
     ModalArtifactFinalizer = None  # type: ignore[assignment]
+    ModalEndpointChat = None  # type: ignore[assignment]
     ModalUniversalExecutor = None  # type: ignore[assignment]
 
     class ComfyModalSyncExtension:  # type: ignore[no-redef]
@@ -74,7 +76,12 @@ else:
         async def get_node_list(self) -> list[type[io.ComfyNode]]:
             """Return the node list after registering API routes."""
             setup_modal_queue_route()
-            return [ModalUniversalExecutor, ModalMapInput, ModalArtifactFinalizer]
+            return [
+                ModalUniversalExecutor,
+                ModalMapInput,
+                ModalArtifactFinalizer,
+                ModalEndpointChat,
+            ]
 
     async def comfy_entrypoint() -> ComfyExtension:
         """Create the ComfyUI v3 extension entrypoint."""
@@ -85,6 +92,7 @@ else:
 __all__ = [
     "ComfyModalSyncExtension",
     "ModalArtifactFinalizer",
+    "ModalEndpointChat",
     "ModalMapInput",
     "ModalUniversalExecutor",
     "WEB_DIRECTORY",

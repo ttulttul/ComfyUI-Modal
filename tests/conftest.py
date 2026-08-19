@@ -22,7 +22,10 @@ def _comfyui_root() -> Path:
     configured_root = os.getenv("COMFYUI_ROOT")
     if configured_root:
         return Path(configured_root).expanduser().resolve()
-    return Path.home() / "git" / "ComfyUI"
+    preferred_root = Path.home() / "git" / "ComfyUI"
+    if preferred_root.exists():
+        return preferred_root
+    return Path.home() / "git" / "Latest_ComfyUI"
 
 
 def _ensure_import_paths() -> None:
@@ -120,6 +123,12 @@ def modal_executor_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_endpoint_module(extension_package: object) -> object:
+    """Return the Modal hosted-model endpoint node module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")
+
+
+@pytest.fixture(scope="session")
 def remote_modal_app_module(extension_package: object) -> object:
     """Return the remote execution module."""
     return importlib.import_module(f"{PACKAGE_NAME}.remote.modal_app")
@@ -207,3 +216,5 @@ def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.delenv("COMFY_MODAL_SCALEDOWN_WINDOW", raising=False)
     monkeypatch.delenv("COMFY_MODAL_MIN_CONTAINERS", raising=False)
     monkeypatch.delenv("COMFYUI_ROOT", raising=False)
+    monkeypatch.delenv("MODAL_KEY", raising=False)
+    monkeypatch.delenv("MODAL_SECRET", raising=False)

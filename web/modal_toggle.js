@@ -11,6 +11,7 @@ const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delet
 const COMFY_QUEUE_ROUTE = "/queue";
 const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
+const LOCAL_MODAL_NODE_IDS = new Set(["ModalEndpointChat"]);
 const WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal";
 const WORKFLOW_MODAL_GPU_KEY = "gpu";
 const DEFAULT_MODAL_GPU = "RTX-PRO-6000";
@@ -106,7 +107,11 @@ let modalContainerCostUpdatedAtSeconds = null;
  * @returns {boolean}
  */
 function isEligibleNode(node) {
-  return Boolean(node?.comfyClass) && !String(node.comfyClass).startsWith(INTERNAL_NODE_PREFIX);
+  return (
+    Boolean(node?.comfyClass) &&
+    !String(node.comfyClass).startsWith(INTERNAL_NODE_PREFIX) &&
+    !LOCAL_MODAL_NODE_IDS.has(String(node.comfyClass))
+  );
 }
 
 /**
@@ -2927,7 +2932,11 @@ async function analyzeAndSetUpstreamRemoteNodes(node, value) {
  * @returns {boolean}
  */
 function isEligibleNodeDef(nodeData) {
-  return Boolean(nodeData?.name) && !String(nodeData.name).startsWith(INTERNAL_NODE_PREFIX);
+  return (
+    Boolean(nodeData?.name) &&
+    !String(nodeData.name).startsWith(INTERNAL_NODE_PREFIX) &&
+    !LOCAL_MODAL_NODE_IDS.has(String(nodeData.name))
+  );
 }
 
 /**

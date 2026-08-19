@@ -70,6 +70,15 @@ def test_frontend_defaults_modal_gpu_to_rtx_pro_6000() -> None:
     assert 'const DEFAULT_MODAL_GPU = "RTX-PRO-6000";' in source
 
 
+def test_endpoint_chat_node_is_not_offered_nested_modal_execution() -> None:
+    """The local endpoint client should not be wrapped in another Modal execution island."""
+    source = _modal_toggle_source()
+
+    assert 'const LOCAL_MODAL_NODE_IDS = new Set(["ModalEndpointChat"]);' in source
+    assert "!LOCAL_MODAL_NODE_IDS.has(String(node.comfyClass))" in source
+    assert "!LOCAL_MODAL_NODE_IDS.has(String(nodeData.name))" in source
+
+
 def test_empty_modal_status_events_do_not_show_global_pill() -> None:
     """Queue requests without Modal-enabled nodes should not create global Modal UI state."""
     source = _modal_toggle_source()
