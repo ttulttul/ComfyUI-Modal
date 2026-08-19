@@ -45,9 +45,8 @@ const COMPLETE_BORDER_COLOR = "#004FA4";
 const COMPLETE_FILL_COLOR = "#001C71";
 const FINALIZING_NODE_BORDER_COLOR = "#00358A";
 const ERROR_BORDER_COLOR = "#ef4444";
-const LOCAL_BOTTLENECK_BORDER_COLOR = "#ef4444";
-const LOCAL_BOTTLENECK_FILL_COLOR = "rgba(239, 68, 68, 0.14)";
-const LOCAL_BOTTLENECK_SHADOW_COLOR = "rgba(239, 68, 68, 0.55)";
+const LOCAL_BOTTLENECK_BADGE_BORDER_COLOR = "rgba(148, 163, 184, 0.72)";
+const LOCAL_BOTTLENECK_TOOLTIP = "Did you mean to make this node execute on Modal?";
 
 const STATE_SETUP = "setup";
 const STATE_STARTING = "starting";
@@ -3448,18 +3447,6 @@ function remoteDecorationPalette(state, elapsed) {
 }
 
 /**
- * Return the static warning palette for a local node between remote graph regions.
- * @returns {{ borderColor: string, shadowColor: string, fillColor: string }}
- */
-function localBottleneckDecorationPalette() {
-  return {
-    borderColor: LOCAL_BOTTLENECK_BORDER_COLOR,
-    shadowColor: LOCAL_BOTTLENECK_SHADOW_COLOR,
-    fillColor: LOCAL_BOTTLENECK_FILL_COLOR,
-  };
-}
-
-/**
  * Return the visible LiteGraph node matching a Nodes 2.0 DOM element.
  * @param {HTMLElement} nodeElement
  * @returns {LGraphNode | null}
@@ -3514,19 +3501,17 @@ function updateVueNodeDecoration(nodeElement, node, timestamp) {
     return;
   }
   const state = getRemoteVisualState(node);
-  const palette = localBottleneck
-    ? localBottleneckDecorationPalette()
-    : remoteDecorationPalette(state, timestamp / 1000);
+  const palette = localBottleneck ? null : remoteDecorationPalette(state, timestamp / 1000);
   const decoration = ensureVueNodeDecoration(nodeElement);
   const innerWrapper = nodeElement.querySelector(':scope > [data-testid="node-inner-wrapper"]');
   const borderRadius =
     innerWrapper && typeof getComputedStyle === "function"
       ? getComputedStyle(innerWrapper).borderRadius
       : "12px";
-  decoration.style.borderColor = palette.borderColor;
-  decoration.style.backgroundColor = palette.fillColor ?? "transparent";
+  decoration.style.borderColor = palette?.borderColor ?? "transparent";
+  decoration.style.backgroundColor = palette?.fillColor ?? "transparent";
   decoration.style.borderRadius = borderRadius || "12px";
-  decoration.style.boxShadow = `0 0 8px ${palette.shadowColor}`;
+  decoration.style.boxShadow = palette ? `0 0 8px ${palette.shadowColor}` : "none";
   const phase = localBottleneck ? "local-bottleneck" : (state?.phase ?? "idle");
   nodeElement.classList.add("comfy-modal-vue-node");
   nodeElement.dataset.modalPhase = phase;
@@ -3534,8 +3519,11 @@ function updateVueNodeDecoration(nodeElement, node, timestamp) {
   const badgeText = localBottleneck ? "!" : String(state?.componentLabel ?? "");
   badge.textContent = badgeText;
   badge.hidden = !badgeText;
-  badge.style.borderColor = palette.borderColor;
-  badge.style.boxShadow = `0 0 8px ${palette.shadowColor}`;
+  badge.title = localBottleneck ? LOCAL_BOTTLENECK_TOOLTIP : "";
+  badge.style.borderColor = localBottleneck
+    ? LOCAL_BOTTLENECK_BADGE_BORDER_COLOR
+    : palette.borderColor;
+  badge.style.boxShadow = localBottleneck ? "none" : `0 0 8px ${palette.shadowColor}`;
 }
 
 /**
@@ -3636,7 +3624,45 @@ function traceRoundedRectPath(ctx, x, y, width, height, radius) {
 }
 
 /**
- * Draw the Modal execution or local-bottleneck border and shading for a node.
+ * Return whether a node-local pointer position is over the local-warning badge.
+ * @param {LGraphNode} node
+ * @param {number[] | undefined} localPosition
+ * @param {number} scale
+ * @returns {boolean}
+ */
+function localBottleneckBadgeContainsPoint(node, localPosition, scale = 1) {
+  if (!Array.isArray(localPosition) || localPosition.length < 2) {
+    return false;
+  }
+  const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const titleHeight = node.constructor?.title_height ?? LiteGraph.NODE_TITLE_HEIGHT ?? 24;
+  const badgeRadius = 10 / safeScale;
+  const badgeX = 10 / safeScale;
+  const badgeY = -titleHeight + 10 / safeScale;
+  const deltaX = Number(localPosition[0]) - badgeX;
+  const deltaY = Number(localPosition[1]) - badgeY;
+  return deltaX * deltaX + deltaY * deltaY <= badgeRadius * badgeRadius;
+}
+
+/**
+ * Set or clear the native hover text for the legacy canvas warning badge.
+ * @param {LGraphCanvas | undefined} graphCanvas
+ * @param {boolean} visible
+ */
+function updateLegacyBottleneckTooltip(graphCanvas, visible) {
+  const canvasElement = graphCanvas?.canvas ?? app.canvas?.canvas;
+  if (!canvasElement) {
+    return;
+  }
+  if (visible) {
+    canvasElement.title = LOCAL_BOTTLENECK_TOOLTIP;
+  } else if (canvasElement.title === LOCAL_BOTTLENECK_TOOLTIP) {
+    canvasElement.removeAttribute("title");
+  }
+}
+
+/**
+ * Draw the Modal execution decoration or neutral local-bottleneck badge for a node.
  * @param {LGraphNode} node
  * @param {CanvasRenderingContext2D} ctx
  */
@@ -3652,37 +3678,37 @@ function drawModalNodeDecoration(node, ctx) {
   const borderWidth = 3 / scale;
   const cornerRadius = 12 / scale;
   const elapsed = performance.now() / 1000;
-  const { borderColor, shadowColor, fillColor } = localBottleneck
-    ? localBottleneckDecorationPalette()
-    : remoteDecorationPalette(state, elapsed);
+  const palette = localBottleneck ? null : remoteDecorationPalette(state, elapsed);
 
-  ctx.save();
-  if (fillColor) {
-    ctx.fillStyle = fillColor;
+  if (palette) {
+    ctx.save();
+    if (palette.fillColor) {
+      ctx.fillStyle = palette.fillColor;
+      traceRoundedRectPath(
+        ctx,
+        borderWidth,
+        -titleHeight + borderWidth,
+        Math.max(0, node.size[0] - borderWidth * 2),
+        Math.max(0, node.size[1] + titleHeight - borderWidth * 2),
+        Math.max(0, cornerRadius - borderWidth),
+      );
+      ctx.fill();
+    }
+    ctx.strokeStyle = palette.borderColor;
+    ctx.lineWidth = borderWidth;
+    ctx.shadowColor = palette.shadowColor;
+    ctx.shadowBlur = 8 / scale;
     traceRoundedRectPath(
       ctx,
-      borderWidth,
-      -titleHeight + borderWidth,
-      Math.max(0, node.size[0] - borderWidth * 2),
-      Math.max(0, node.size[1] + titleHeight - borderWidth * 2),
-      Math.max(0, cornerRadius - borderWidth),
+      -borderWidth,
+      -titleHeight,
+      node.size[0] + borderWidth * 2,
+      node.size[1] + titleHeight + borderWidth,
+      cornerRadius,
     );
-    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
   }
-  ctx.strokeStyle = borderColor;
-  ctx.lineWidth = borderWidth;
-  ctx.shadowColor = shadowColor;
-  ctx.shadowBlur = 8 / scale;
-  traceRoundedRectPath(
-    ctx,
-    -borderWidth,
-    -titleHeight,
-    node.size[0] + borderWidth * 2,
-    node.size[1] + titleHeight + borderWidth,
-    cornerRadius,
-  );
-  ctx.stroke();
-  ctx.restore();
 
   const nodeBadgeText = localBottleneck ? "!" : state?.componentLabel;
   if (nodeBadgeText) {
@@ -3691,10 +3717,12 @@ function drawModalNodeDecoration(node, ctx) {
     const badgeX = 10 / scale;
     const badgeY = -titleHeight + 10 / scale;
     ctx.fillStyle = "rgba(15, 23, 42, 0.92)";
-    ctx.strokeStyle = borderColor;
+    ctx.strokeStyle = localBottleneck
+      ? LOCAL_BOTTLENECK_BADGE_BORDER_COLOR
+      : palette.borderColor;
     ctx.lineWidth = 1.5 / scale;
-    ctx.shadowColor = shadowColor;
-    ctx.shadowBlur = 8 / scale;
+    ctx.shadowColor = localBottleneck ? "transparent" : palette.shadowColor;
+    ctx.shadowBlur = localBottleneck ? 0 : 8 / scale;
     ctx.beginPath();
     ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);
     ctx.fill();
@@ -3946,6 +3974,22 @@ function decorateNode(node) {
   node.onDrawForeground = function onDrawForeground(ctx) {
     originalDrawForeground?.apply(this, arguments);
     drawModalNodeDecoration(this, ctx);
+  };
+  const originalOnMouseMove = node.onMouseMove;
+  node.onMouseMove = function onMouseMove(event, localPosition, graphCanvas) {
+    const result = originalOnMouseMove?.apply(this, arguments);
+    const scale = graphCanvas?.ds?.scale ?? app.canvas?.ds?.scale ?? 1;
+    const badgeHovered =
+      isSandwichedLocalNode(this) &&
+      localBottleneckBadgeContainsPoint(this, localPosition, scale);
+    updateLegacyBottleneckTooltip(graphCanvas, badgeHovered);
+    return result;
+  };
+  const originalOnMouseLeave = node.onMouseLeave;
+  node.onMouseLeave = function onMouseLeave(event, graphCanvas) {
+    const result = originalOnMouseLeave?.apply(this, arguments);
+    updateLegacyBottleneckTooltip(graphCanvas, false);
+    return result;
   };
   queueVueNodeDecorationSync();
 }
@@ -4791,6 +4835,11 @@ function installGlobalStatusStyles() {
       background: rgba(15, 23, 42, 0.92);
       color: #f8fafc;
       font: 10px/1 ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .comfy-modal-vue-node[data-modal-phase="local-bottleneck"] .comfy-modal-vue-node-badge {
+      pointer-events: auto;
+      cursor: help;
     }
 
     .comfy-modal-vue-node-badge[hidden] {
