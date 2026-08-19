@@ -24,6 +24,7 @@ globalThis.__modalApiStub = {
 globalThis.requestAnimationFrame = () => 1;
 globalThis.cancelAnimationFrame = () => {};
 globalThis.performance = { now: () => 0 };
+globalThis.LiteGraph = { NODE_TITLE_HEIGHT: 24 };
 globalThis.CustomEvent = class CustomEvent {
   constructor(type, init = {}) {
     this.type = type;
@@ -53,6 +54,8 @@ const transformedSource = `${[
   "  extractRemoteNodeIds,",
   "  setSandwichedLocalNodeIds,",
   "  isSandwichedLocalNode,",
+  "  localBottleneckBadgeContainsPoint,",
+  "  decorateNode,",
   "  setAllEligibleWorkflowNodesRemote,",
   "  selectedModalGpu,",
   "  setSelectedModalGpu,",
@@ -105,6 +108,45 @@ localBottleneckNode.properties.is_modal_remote = true;
 assert.equal(modalToggle.isSandwichedLocalNode(localBottleneckNode), false);
 modalToggle.setRemoteFlag(localBottleneckNode, false);
 assert.equal(modalToggle.modalSandwichedLocalNodeIds.size, 0);
+
+resetFrontendState();
+const legacyCanvasElement = {
+  title: "",
+  removeAttribute(name) {
+    if (name === "title") {
+      this.title = "";
+    }
+  },
+};
+const legacyGraphCanvas = {
+  canvas: legacyCanvasElement,
+  ds: { scale: 1 },
+};
+const legacyBottleneckNode = {
+  id: 175,
+  comfyClass: "ModalLLM",
+  properties: {},
+  addWidget() {
+    return {};
+  },
+};
+modalToggle.setSandwichedLocalNodeIds([175]);
+assert.equal(
+  modalToggle.localBottleneckBadgeContainsPoint(legacyBottleneckNode, [10, -14], 1),
+  true,
+);
+assert.equal(
+  modalToggle.localBottleneckBadgeContainsPoint(legacyBottleneckNode, [40, 40], 1),
+  false,
+);
+modalToggle.decorateNode(legacyBottleneckNode);
+legacyBottleneckNode.onMouseMove({}, [10, -14], legacyGraphCanvas);
+assert.equal(
+  legacyCanvasElement.title,
+  "Did you mean to make this node execute on Modal?",
+);
+legacyBottleneckNode.onMouseMove({}, [40, 40], legacyGraphCanvas);
+assert.equal(legacyCanvasElement.title, "");
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-a", ["10", "11", "12"], [
