@@ -23,6 +23,11 @@ REMOTE_PYTHON_VERSION = "3.13"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
 REMOTE_VLLM_SPEC = "vllm==0.27.1"
+REMOTE_VLLM_WHEEL_URL = (
+    "https://wheels.vllm.ai/"
+    "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac/"
+    "vllm-0.27.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+)
 
 _REMOTE_APT_PACKAGES = (
     "libgl1",
@@ -62,14 +67,8 @@ _REMOTE_RUNTIME_PACKAGES = (
     "transformers==5.15.0",
     REMOTE_HUGGINGFACE_HUB_SPEC,
 )
-_CUDA_128_TORCH_PACKAGES = (
-    "torch==2.10.0",
-    "torchvision==0.25.0",
-    "torchaudio==2.10.0",
-)
-_CUDA_132_TORCH_PACKAGES = ("torch==2.13.0", "torchvision==0.28.0")
-_CUDA_132_CPU_AUDIO_PACKAGES = ("torchaudio==2.11.0+cpu",)
-_CUDA_132_MODAL_GPU_TYPES = frozenset({"B200+", "B300"})
+_CUDA_130_TORCH_PACKAGES = ("torch==2.13.0", "torchvision==0.28.0")
+_CUDA_130_CPU_AUDIO_PACKAGES = ("torchaudio==2.11.0+cpu",)
 _IGNORED_DIRECTORY_NAMES = frozenset(
     {
         ".cache",
@@ -192,10 +191,25 @@ def remote_runtime_packages() -> tuple[str, ...]:
 
 
 def remote_accelerator_packages(modal_gpu: str) -> tuple[str, ...]:
-    """Return compiled inference packages supported by one remote GPU stack."""
-    if normalized_modal_gpu_type(modal_gpu) in _CUDA_132_MODAL_GPU_TYPES:
-        return (REMOTE_VLLM_SPEC,)
-    return ()
+    """Return the immutable vLLM wheel installed for every supported GPU."""
+    normalized_modal_gpu_type(modal_gpu)
+    return (REMOTE_VLLM_WHEEL_URL,)
+
+
+def remote_accelerator_validation_command(modal_gpu: str) -> str:
+    """Return a build-time import and version check for the GPU inference stack."""
+    normalized_modal_gpu_type(modal_gpu)
+    validation_script = (
+        "from importlib import metadata; import torch, vllm; "
+        f"expected_vllm={REMOTE_VLLM_SPEC.split('==', maxsplit=1)[1]!r}; "
+        "actual_vllm=metadata.version('vllm'); "
+        "assert actual_vllm == expected_vllm, "
+        "f'Expected vLLM {expected_vllm}, found {actual_vllm}'; "
+        "print('Validated Modal accelerator stack:', "
+        "'vLLM', actual_vllm, 'Torch', torch.__version__, "
+        "'CUDA', torch.version.cuda)"
+    )
+    return f"python -c {shlex.quote(validation_script)}"
 
 
 def remote_apt_packages() -> tuple[str, ...]:
@@ -212,29 +226,19 @@ def normalized_modal_gpu_type(modal_gpu: str) -> str:
 
 
 def select_remote_torch_build(modal_gpu: str) -> RemoteTorchBuild:
-    """Select a CUDA wheel set compatible with the requested Modal GPU."""
-    gpu_type = normalized_modal_gpu_type(modal_gpu)
-    if gpu_type in _CUDA_132_MODAL_GPU_TYPES:
-        return RemoteTorchBuild(
-            cuda_version="13.0",
-            install_layers=(
-                RemoteTorchInstallLayer(
-                    index_url="https://download.pytorch.org/whl/cu132",
-                    packages=_CUDA_132_TORCH_PACKAGES,
-                ),
-                RemoteTorchInstallLayer(
-                    index_url="https://download.pytorch.org/whl/cpu",
-                    packages=_CUDA_132_CPU_AUDIO_PACKAGES,
-                    extra_options="--no-deps",
-                ),
-            ),
-        )
+    """Select the CUDA 13 stack shared by every supported Modal GPU."""
+    normalized_modal_gpu_type(modal_gpu)
     return RemoteTorchBuild(
-        cuda_version="12.8",
+        cuda_version="13.0",
         install_layers=(
             RemoteTorchInstallLayer(
-                index_url="https://download.pytorch.org/whl/cu128",
-                packages=_CUDA_128_TORCH_PACKAGES,
+                index_url="https://download.pytorch.org/whl/cu130",
+                packages=_CUDA_130_TORCH_PACKAGES,
+            ),
+            RemoteTorchInstallLayer(
+                index_url="https://download.pytorch.org/whl/cpu",
+                packages=_CUDA_130_CPU_AUDIO_PACKAGES,
+                extra_options="--no-deps",
             ),
         ),
     )
