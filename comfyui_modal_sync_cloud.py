@@ -7054,7 +7054,6 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     image = (
         modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
         .apt_install(*_comfyui_apt_packages())
-        .env(_modal_image_environment(settings, runtime_identity.fingerprint))
         .pip_install(*_comfyui_runtime_packages())
     )
     accelerator_packages = _remote_accelerator_packages(settings.modal_gpu)
@@ -7063,6 +7062,9 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     if custom_node_packages:
         image = image.pip_install(*custom_node_packages)
     image = _install_remote_torch_build(image, torch_build)
+    image = image.env(
+        _modal_image_environment(settings, runtime_identity.fingerprint)
+    )
     image = image.add_local_dir(
         _REPO_ROOT,
         remote_path="/root/comfyui_modal_sync_repo",
