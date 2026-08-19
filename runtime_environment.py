@@ -51,7 +51,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "pyopengl==3.1.10",
     "pyyaml==6.0.3",
     "requests==2.32.5",
-    "safetensors==0.7.0",
+    "safetensors==0.8.0",
     "scipy==1.17.0",
     "sentencepiece==0.2.1",
     "simpleeval==1.0.7",

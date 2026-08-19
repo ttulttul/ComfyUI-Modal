@@ -75,6 +75,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "comfy-kitchen==0.2.31" in runtime_packages
     assert "pyopengl==3.1.10" in runtime_packages
     assert "pypdf==6.16.1" in runtime_packages
+    assert "safetensors==0.8.0" in runtime_packages
     assert "huggingface-hub==1.28.0" in runtime_packages
     assert "transformers==5.15.0" in runtime_packages
     assert "simpleeval==1.0.7" in runtime_packages
