@@ -4638,6 +4638,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         """Stand-in for Modal deployed lookup failures."""
 
     deploy_calls: list[tuple[str | None, str | None]] = []
+    stage_calls: list[list[str]] = []
     status_events: list[dict[str, Any]] = []
 
     class FakeExecuteMethod:
@@ -4653,6 +4654,14 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         execute_payload = FakeExecuteMethod()
         runtime_version = types.SimpleNamespace(
             remote=lambda: _current_remote_runtime_payload(remote_modal_app_module)
+        )
+
+    class FakeModelStager:
+        """Minimal CPU model stager used by the first deployed LLM request."""
+
+        stage_profiles = types.SimpleNamespace(
+            remote=lambda profile_ids: stage_calls.append(list(profile_ids))
+            or [{"profile_id": profile_id} for profile_id in profile_ids]
         )
 
     class FakeApp:
@@ -4682,6 +4691,8 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
                 """Return a deployed class after the first auto-deploy."""
                 if not FakeModal.deployed:
                     raise FakeLookupError("not deployed")
+                if class_name == "ModelStager":
+                    return lambda: FakeModelStager()
                 return lambda **kwargs: FakeRemoteEngine()
 
         @staticmethod
@@ -4704,6 +4715,8 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
     remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
+        remote_modal_app_module._STAGED_LLM_PROFILES.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {
@@ -4711,6 +4724,12 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
                 "component_node_ids": ["node-1"],
                 "prompt_id": "prompt-1",
                 "extra_data": {"client_id": "client-1"},
+                "subgraph_prompt": {
+                    "node-1": {
+                        "class_type": "ModalLLM",
+                        "inputs": {"model_profile": "smolvlm2-2.2b-instruct"},
+                    }
+                },
             },
             b"{}",
         )
@@ -4718,9 +4737,12 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
+            remote_modal_app_module._STAGED_LLM_PROFILES.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, None)]
+    assert stage_calls == [["smolvlm2-2.2b-instruct"]]
     assert [
         (event["phase"], event["status_message"])
         for event in status_events

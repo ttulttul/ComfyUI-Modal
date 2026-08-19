@@ -6301,6 +6301,7 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
             deploy_key[1] or "<default>",
             time.perf_counter() - deploy_started_at,
         )
+        _ensure_llm_profiles_staged(payload, deployment_app_name)
         remote_engine = _lookup_deployed_remote_engine_with_retry(payload)
         if not _is_remote_engine_runtime_current(remote_engine, payload):
             raise ModalRemoteInvocationError(

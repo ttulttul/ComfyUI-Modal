@@ -14,7 +14,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "comfyui_modal_sync_under_test"
-os.environ["COMFY_MODAL_APP_NAME"] = "comfy-modal-sync"
+os.environ.setdefault("COMFY_MODAL_APP_NAME", "comfy-modal-sync")
 
 
 def _comfyui_root() -> Path:
@@ -208,8 +208,14 @@ def modal_cloud_module() -> object:
 
 
 @pytest.fixture(autouse=True)
-def reset_modal_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def reset_modal_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
     """Isolate Modal-Sync environment variables between tests."""
+    if request.node.get_closest_marker("live_modal") is not None:
+        return
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
     monkeypatch.setenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync")
     monkeypatch.setenv("COMFY_MODAL_LOCAL_STORAGE_ROOT", str(tmp_path / "storage"))
