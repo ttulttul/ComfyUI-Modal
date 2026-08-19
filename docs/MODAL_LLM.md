@@ -48,7 +48,7 @@ The compatibility registry selects Transformers for Muse-Glimmer and vLLM for Qw
 
 Every selectable NVIDIA GPU runtime uses Python 3.13 and pins Torch 2.13.0, torchvision 0.28.0, Transformers 5.15.0, and the CUDA 13.0 vLLM 0.27.1 wheel. This covers Modal's T4-through-Blackwell choices and ensures a workflow's GPU price/capacity selection never removes its LLM backend. Python 3.13 is necessary because a FlashInfer communications module imported by vLLM's kernel warmup evaluates `array.array[int]` at runtime. The initial vLLM policy uses a 12 GiB BF16 KV cache, one request at a time, and eager execution to keep graph-capture allocations predictable beside ComfyUI. The worker sets `VLLM_USE_FLASHINFER_SAMPLER=0` and selects Triton full attention so optional FlashInfer sampling and Blackwell TRT-LLM attention kernels do not require an `nvcc` JIT compiler, while avoiding FlashAttention 4's unsupported Qwen3.5 used-sequence prefill at head dimension 256. Qwen's separate GDN kernel remains available. Torch and vLLM imports are validated while building every image; model-specific capacity remains enforced separately from backend availability.
 
-## Live B300 Validation
+## Live GPU Validation
 
 On 2026-08-19, the generated-profile canary resolved exact Hub revisions, staged immutable snapshots, loaded each model, accepted a real ComfyUI IMAGE input, and generated non-empty output for:
 
@@ -57,3 +57,5 @@ On 2026-08-19, the generated-profile canary resolved exact Hub revisions, staged
 - `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4` at `faf7945020c138c8ef864ab1644273f3158f85fa` through vLLM ModelOpt FP4.
 
 The live co-residency canary can select a curated profile or Hub ID through `COMFY_MODAL_LLM_CANARY_PROFILE`. It retains that LLM, executes a real ComfyUI VAE encode on the same single B300 worker, and then requires the second LLM call to report a resident cache hit. The 2026-08-19 run passed with the generated Orcarouter FP8 profile retained across a real Flux VAE encode on one B300 worker.
+
+The same date's isolated RTX PRO 6000 canary rebuilt the universal image from its custom-node requirements, validated the final pinned dependency versions, and passed both the remote runtime handshake and real generated-profile inference for `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4`. This specifically covers the non-B300 path that previously omitted vLLM. It does not imply that every model fits or supports every selectable GPU; profile compatibility and measured-VRAM admission remain independent checks.
