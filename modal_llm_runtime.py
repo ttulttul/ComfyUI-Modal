@@ -556,7 +556,10 @@ class VLLMMultimodalBackend:
             ),
             enforce_eager=bool(profile.backend_option("enforce_eager", True)),
             disable_custom_all_reduce=True,
-            attention_backend="FLASH_ATTN",
+            attention_config={
+                "backend": "FLASH_ATTN",
+                "flash_attn_version": 3,
+            },
             generation_config="vllm",
             limit_mm_per_prompt={"image": profile.max_images, "video": 1},
         )
@@ -592,6 +595,7 @@ class VLLMMultimodalBackend:
     ) -> BackendGenerationResult:
         """Generate one response and report vLLM's final token count."""
         from vllm import SamplingParams
+        from vllm.v1.engine.exceptions import EngineDeadError
 
         progress_callback(0)
         sampling_params = SamplingParams(
@@ -606,7 +610,7 @@ class VLLMMultimodalBackend:
                 sampling_params=sampling_params,
                 use_tqdm=False,
             )
-        except RuntimeError as error:
+        except (EngineDeadError, RuntimeError) as error:
             logger.exception(
                 "vLLM generation failed for profile=%s.",
                 self.profile.profile_id,
