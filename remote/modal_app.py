@@ -557,7 +557,7 @@ def _matching_modal_hourly_billing_rows(
     environment_name: str | None,
     interval_start: datetime,
 ) -> tuple[list[Any], str]:
-    """Select one app/environment from a Modal hourly billing report."""
+    """Select every historical app identity from one billing environment."""
     candidate_rows = [
         row
         for row in rows
@@ -573,14 +573,11 @@ def _matching_modal_hourly_billing_rows(
         ]
         return matching_rows, environment_name
 
-    candidate_identities = {
-        (
-            str(_modal_billing_row_value(row, "object_id") or ""),
-            str(_modal_billing_row_value(row, "environment_name") or ""),
-        )
+    candidate_environment_names = {
+        str(_modal_billing_row_value(row, "environment_name") or "").strip()
         for row in candidate_rows
     }
-    if len(candidate_identities) > 1:
+    if len(candidate_environment_names) > 1:
         raise ModalBillingStatusError(
             f"Modal returned billing for app {app_name!r} in multiple "
             "environments; set MODAL_ENVIRONMENT to select one."

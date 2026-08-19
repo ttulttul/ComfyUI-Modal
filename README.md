@@ -336,6 +336,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `COMFY_MODAL_EXECUTION_MODE` | `local` | Set to `remote` for Modal-backed execution. |
+| `MODAL_ENVIRONMENT` | active Modal profile or workspace default | Select the Modal environment used for app deployment, lookup, status, and billing. Set it explicitly when the same app name exists in multiple environments. |
 | `COMFY_MODAL_APP_NAME` | `comfy-modal-sync-<instance_id>` | Explicit Modal app name override; otherwise derived from the persistent per-ComfyUI identity. |
 | `COMFY_MODAL_INSTANCE_ID_PATH` | `<ComfyUI user directory>/.comfy-modal-sync-instance-id` | Override the persistent 64-bit identity file location. |
 | `COMFY_MODAL_SECRET_NAME` | `comfy` | Existing Modal secret collection injected into every remote worker as environment variables. |
