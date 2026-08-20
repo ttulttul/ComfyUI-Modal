@@ -794,22 +794,161 @@ def test_modal_artifact_finalizer_requires_completed_components(
         )
 
 
-def test_modal_deferred_local_passthrough_requires_completed_components(
+def test_modal_parallel_local_passthrough_releases_after_remote_dispatch(
     modal_executor_module: Any,
 ) -> None:
-    """The local scheduling barrier should preserve values after remote completion."""
-    schema = modal_executor_module.ModalDeferredLocalPassthrough.GET_SCHEMA()
+    """A local preview should unblock when its remote continuation starts."""
+    schema = modal_executor_module.ModalParallelLocalPassthrough.GET_SCHEMA()
+    dispatch_context = {
+        "dispatch_group_id": "prompt-parallel",
+        "component_ids": ["component-b"],
+    }
+
+    async def run_scenario() -> tuple[Any, ...]:
+        """Prove the passthrough remains pending until remote dispatch is signalled."""
+        passthrough_task = asyncio.create_task(
+            modal_executor_module.ModalParallelLocalPassthrough.execute(
+                "image-value",
+                dispatch_context,
+            )
+        )
+        await asyncio.sleep(0)
+        assert passthrough_task.done() is False
+        assert modal_executor_module._signal_parallel_local_dispatch(
+            {
+                "parallel_local_dispatch_group_id": "prompt-parallel",
+                "component_id": "component-b",
+                "signal_parallel_local_dispatch": True,
+            }
+        ) is True
+        result = await asyncio.wait_for(passthrough_task, timeout=1.0)
+        return result.result
+
+    try:
+        result = asyncio.run(run_scenario())
+    finally:
+        modal_executor_module._clear_parallel_dispatch_events("prompt-parallel")
 
     assert schema.is_output_node is False
-    assert modal_executor_module.ModalDeferredLocalPassthrough.execute(
-        "image-value",
-        {"component_0": True, "component_1": True},
-    ).result == ("image-value",)
-    with pytest.raises(RuntimeError, match="component_1"):
-        modal_executor_module.ModalDeferredLocalPassthrough.execute(
-            "image-value",
-            {"component_0": True, "component_1": False},
+    assert result == ("image-value",)
+
+
+def test_modal_parallel_local_passthrough_runs_before_remote_result_returns(
+    modal_executor_module: Any,
+) -> None:
+    """A local preview should run while its downstream remote call is in flight."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    proxy_node_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        output_types=("STRING",),
+        output_names=("value",),
+        output_is_list=(False,),
+        nodes_module=fake_nodes_module,
+        is_output_node=False,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    remote_started = asyncio.Event()
+    release_remote = asyncio.Event()
+
+    class FakeClient:
+        """Fake async remote client that remains in flight until explicitly released."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[str]:
+            """Record dispatch, then keep the remote result pending."""
+            remote_started.set()
+            await release_remote.wait()
+            return (str(payload["component_id"]),)
+
+    async def run_scenario() -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Prove local passthrough completion precedes the remote result."""
+        dispatch_group_id = "prompt-parallel-in-flight"
+        local_task = asyncio.create_task(
+            modal_executor_module.ModalParallelLocalPassthrough.execute(
+                "preview-image",
+                {
+                    "dispatch_group_id": dispatch_group_id,
+                    "component_ids": ["component-b"],
+                },
+            )
         )
+        remote_task = asyncio.create_task(
+            proxy_class.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "prompt_id": dispatch_group_id,
+                    "component_id": "component-b",
+                    "parallel_local_dispatch_group_id": dispatch_group_id,
+                    "signal_parallel_local_dispatch": True,
+                },
+                unique_id="component-b",
+            )
+        )
+        await asyncio.wait_for(remote_started.wait(), timeout=1.0)
+        local_result = await asyncio.wait_for(local_task, timeout=1.0)
+        assert remote_task.done() is False
+        release_remote.set()
+        remote_result = await asyncio.wait_for(remote_task, timeout=1.0)
+        return local_result.result, remote_result.result
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        local_result, remote_result = asyncio.run(run_scenario())
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+        modal_executor_module._clear_parallel_dispatch_events(
+            "prompt-parallel-in-flight"
+        )
+
+    assert local_result == ("preview-image",)
+    assert remote_result == ("component-b",)
+
+
+def test_parallel_local_dispatch_frontier_stops_at_nearest_remote_component(
+    api_intercept_module: Any,
+) -> None:
+    """A preview gate should not wait for remote descendants of a remote frontier."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "RemoteProxy": _FakeRewriteRemoteSamplerNode,
+            "LocalFeedback": _FakeRewriteLocalFeedbackNode,
+        },
+    )
+    rewritten_prompt = {
+        "source": {"class_type": "RemoteProxy", "inputs": {}},
+        "feedback": {
+            "class_type": "LocalFeedback",
+            "inputs": {"value": ["source", 0]},
+        },
+        "nearest": {
+            "class_type": "RemoteProxy",
+            "inputs": {"value": ["feedback", 0]},
+        },
+        "later": {
+            "class_type": "RemoteProxy",
+            "inputs": {"value": ["nearest", 0]},
+        },
+    }
+    consumers = api_intercept_module._build_consumer_map(rewritten_prompt)
+
+    nearest_component_ids = (
+        api_intercept_module._nearest_downstream_remote_component_ids(
+            rewritten_prompt=rewritten_prompt,
+            consumers=consumers,
+            seed_targets=consumers[
+                api_intercept_module.LinkedOutputRef("source", 0)
+            ],
+            remote_component_id_set={"source", "nearest", "later"},
+            nodes_module=fake_nodes_module,
+        )
+    )
+
+    assert nearest_component_ids == ["nearest"]
 
 
 def test_proxy_execution_uses_injected_remote_client(
@@ -10394,6 +10533,7 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
 
 def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies(
     api_intercept_module: Any,
+    modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
@@ -10507,15 +10647,16 @@ def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies
     assert summary.component_execution_stages == [["3"], ["7"]]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["3", 0]
     assert rewritten_prompt["7"]["inputs"]["remote_input_2"] == ["4", 0]
-    assert len(summary.deferred_local_branch_node_ids) == 1
-    barrier_node_id = summary.deferred_local_branch_node_ids[0]
-    barrier_node = rewritten_prompt[barrier_node_id]
-    assert barrier_node["class_type"] == (
-        api_intercept_module.MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID
+    assert len(summary.parallel_local_branch_node_ids) == 1
+    passthrough_node_id = summary.parallel_local_branch_node_ids[0]
+    passthrough_node = rewritten_prompt[passthrough_node_id]
+    assert passthrough_node["class_type"] == (
+        api_intercept_module.MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID
     )
-    assert barrier_node["inputs"]["value"] == ["3", 0]
-    assert barrier_node["inputs"]["components.component_0"][0] == "7"
-    assert rewritten_prompt["9"]["inputs"]["image"] == [barrier_node_id, 0]
+    assert passthrough_node["inputs"]["value"] == ["3", 0]
+    dispatch_context = passthrough_node["inputs"]["dispatch_context"]
+    assert dispatch_context["component_ids"] == ["7"]
+    assert rewritten_prompt["9"]["inputs"]["image"] == [passthrough_node_id, 0]
     first_payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
     mapped_payload = rewritten_prompt["7"]["inputs"]["original_node_data"]
     assert first_payload["component_node_ids"] == ["1", "3"]
@@ -10526,6 +10667,15 @@ def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies
     assert mapped_payload["remote_local_gap_pool"] is True
     assert "keepalive_after_remote_component" not in mapped_payload
     assert mapped_payload["stop_local_gap_keepalive_before_remote_component"] is True
+    assert mapped_payload["parallel_local_dispatch_group_id"] == (
+        dispatch_context["dispatch_group_id"]
+    )
+    assert mapped_payload["signal_parallel_local_dispatch"] is True
+    rehydrated_mapped_payload = modal_executor_module._rehydrate_proxy_payload(
+        mapped_payload,
+        unique_id="7",
+    )
+    assert rehydrated_mapped_payload["signal_parallel_local_dispatch"] is True
     assert {
         boundary_input["proxy_input_name"]
         for boundary_input in mapped_payload["boundary_inputs"]

@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import threading
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from .serialization import deserialize_node_outputs, serialize_node_inputs, spli
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
 MODAL_ARTIFACT_FINALIZER_NODE_ID = "ModalArtifactFinalizer"
-MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID = "ModalDeferredLocalPassthrough"
+MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID = "ModalParallelLocalPassthrough"
 MODAL_COMPONENT_COMPLETION_OUTPUT_NAME = "modal_component_complete"
 MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS = 100
 _PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
@@ -83,6 +84,11 @@ _MODAL_WORKFLOW_EXECUTION_GATE = threading.Condition()
 _MODAL_WORKFLOW_ACTIVE_PROMPT_ID: str | None = None
 _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS = 0
 _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID: dict[str, int] = {}
+_MODAL_PARALLEL_DISPATCH_EVENTS_LOCK = threading.Lock()
+_MODAL_PARALLEL_DISPATCH_EVENTS: OrderedDict[
+    tuple[str, str], asyncio.Event
+] = OrderedDict()
+_MODAL_PARALLEL_DISPATCH_EVENT_LIMIT = 512
 
 
 @dataclass(frozen=True)
@@ -197,6 +203,8 @@ def abandon_modal_workflow_execution_prompt(prompt_id: str | None, reason: str) 
     if normalized_prompt_id is None:
         return
 
+    _clear_parallel_dispatch_events(normalized_prompt_id)
+
     global _MODAL_WORKFLOW_ACTIVE_PROMPT_ID
     global _MODAL_WORKFLOW_ACTIVE_REMOTE_CALLS
     global _MODAL_WORKFLOW_ABANDONED_RELEASES_BY_PROMPT_ID
@@ -255,6 +263,112 @@ async def _modal_workflow_execution_slot(payload: Mapping[str, Any]) -> AsyncIte
                 prompt_id,
                 component_id,
             )
+
+
+def _parallel_dispatch_key(
+    dispatch_group_id: Any,
+    component_id: Any,
+) -> tuple[str, str] | None:
+    """Return one normalized parallel-preview dispatch key."""
+    normalized_group_id = _normalize_prompt_id(dispatch_group_id)
+    normalized_component_id = _normalize_prompt_id(component_id)
+    if normalized_group_id is None or normalized_component_id is None:
+        return None
+    return (normalized_group_id, normalized_component_id)
+
+
+def _parallel_dispatch_event(
+    dispatch_group_id: Any,
+    component_id: Any,
+) -> asyncio.Event | None:
+    """Return the bounded dispatch event for one remote continuation."""
+    dispatch_key = _parallel_dispatch_key(dispatch_group_id, component_id)
+    if dispatch_key is None:
+        return None
+    with _MODAL_PARALLEL_DISPATCH_EVENTS_LOCK:
+        dispatch_event = _MODAL_PARALLEL_DISPATCH_EVENTS.get(dispatch_key)
+        if dispatch_event is None:
+            dispatch_event = asyncio.Event()
+            _MODAL_PARALLEL_DISPATCH_EVENTS[dispatch_key] = dispatch_event
+            while len(_MODAL_PARALLEL_DISPATCH_EVENTS) > (
+                _MODAL_PARALLEL_DISPATCH_EVENT_LIMIT
+            ):
+                completed_dispatch_key = next(
+                    (
+                        candidate_key
+                        for candidate_key, candidate_event in (
+                            _MODAL_PARALLEL_DISPATCH_EVENTS.items()
+                        )
+                        if candidate_event.is_set()
+                    ),
+                    None,
+                )
+                if completed_dispatch_key is None:
+                    break
+                _MODAL_PARALLEL_DISPATCH_EVENTS.pop(completed_dispatch_key, None)
+        else:
+            _MODAL_PARALLEL_DISPATCH_EVENTS.move_to_end(dispatch_key)
+    return dispatch_event
+
+
+def _signal_parallel_local_dispatch(payload: Mapping[str, Any]) -> bool:
+    """Signal that one remote continuation acquired its local dispatch slot."""
+    if not bool(payload.get("signal_parallel_local_dispatch")):
+        return False
+    dispatch_event = _parallel_dispatch_event(
+        payload.get("parallel_local_dispatch_group_id"),
+        payload.get("component_id"),
+    )
+    if dispatch_event is None:
+        return False
+    dispatch_event.set()
+    logger.info(
+        "Released parallel local branches after remote dispatch started group=%s component=%s.",
+        payload.get("parallel_local_dispatch_group_id"),
+        payload.get("component_id"),
+    )
+    return True
+
+
+async def _wait_for_parallel_local_dispatches(
+    dispatch_context: Mapping[str, Any],
+) -> None:
+    """Wait until every nearest downstream remote continuation has started."""
+    dispatch_group_id = dispatch_context.get("dispatch_group_id")
+    component_ids = dispatch_context.get("component_ids")
+    if not isinstance(component_ids, Sequence) or isinstance(
+        component_ids,
+        str | bytes | bytearray,
+    ):
+        raise TypeError("Parallel local dispatch context must define component_ids.")
+    dispatch_events = [
+        dispatch_event
+        for component_id in component_ids
+        if (
+            dispatch_event := _parallel_dispatch_event(
+                dispatch_group_id,
+                component_id,
+            )
+        )
+        is not None
+    ]
+    if not dispatch_events:
+        raise RuntimeError(
+            "Parallel local dispatch context did not identify a remote continuation."
+        )
+    await asyncio.gather(*(dispatch_event.wait() for dispatch_event in dispatch_events))
+
+
+def _clear_parallel_dispatch_events(dispatch_group_id: str) -> None:
+    """Forget dispatch events for one completed or abandoned prompt group."""
+    with _MODAL_PARALLEL_DISPATCH_EVENTS_LOCK:
+        dispatch_keys = [
+            dispatch_key
+            for dispatch_key in _MODAL_PARALLEL_DISPATCH_EVENTS
+            if dispatch_key[0] == dispatch_group_id
+        ]
+        for dispatch_key in dispatch_keys:
+            _MODAL_PARALLEL_DISPATCH_EVENTS.pop(dispatch_key, None)
 
 
 async def _execute_payload_async(
@@ -416,6 +530,21 @@ def register_cache_friendly_proxy_payload(
         payload.get("remote_session") is not None,
     )
     return sanitized_payload
+
+
+def update_registered_proxy_payload_fields(
+    node_id: str,
+    embedded_payload: Mapping[str, Any],
+    fields: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Update both the embedded cache surface and run-scoped execution payload."""
+    with _PROXY_EXECUTION_CONTEXTS_LOCK:
+        context = _PROXY_EXECUTION_CONTEXTS.get(str(node_id))
+        execution_payload = dict(
+            context.execution_payload if context is not None else embedded_payload
+        )
+    execution_payload.update(fields)
+    return register_cache_friendly_proxy_payload(node_id, execution_payload)
 
 
 def register_modal_map_input_warmup_context(
@@ -584,6 +713,7 @@ def _build_proxy_node_class(
             )
 
             async with _modal_workflow_execution_slot(payload):
+                _signal_parallel_local_dispatch(payload)
                 outputs = _normalize_scheduler_list_outputs(
                     payload,
                     await _execute_payload_async(
@@ -688,14 +818,14 @@ def ensure_modal_artifact_finalizer_registered(nodes_module: Any) -> None:
     )
 
 
-def ensure_modal_deferred_local_passthrough_registered(nodes_module: Any) -> None:
-    """Register the internal local-branch scheduling barrier."""
-    nodes_module.NODE_CLASS_MAPPINGS[MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID] = (
-        ModalDeferredLocalPassthrough
+def ensure_modal_parallel_local_passthrough_registered(nodes_module: Any) -> None:
+    """Register the internal parallel local-branch dispatch gate."""
+    nodes_module.NODE_CLASS_MAPPINGS[MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID] = (
+        ModalParallelLocalPassthrough
     )
     nodes_module.NODE_DISPLAY_NAME_MAPPINGS[
-        MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID
-    ] = "Modal Deferred Local Passthrough"
+        MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID
+    ] = "Modal Parallel Local Passthrough"
 
 
 class ModalUniversalExecutor(io.ComfyNode):
@@ -811,29 +941,23 @@ class ModalArtifactFinalizer(io.ComfyNode):
         return io.NodeOutput()
 
 
-class ModalDeferredLocalPassthrough(io.ComfyNode):
-    """Delay a non-returning local branch until continuing remote work completes."""
+class ModalParallelLocalPassthrough(io.ComfyNode):
+    """Release a local-only branch once continuing remote work is in flight."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
-        """Accept one arbitrary value plus completion tokens from remote components."""
-        completion_template = io.Autogrow.TemplatePrefix(
-            input=io.Boolean.Input("completion", force_input=True),
-            prefix="component_",
-            min=1,
-            max=MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
-        )
+        """Accept one arbitrary value plus remote dispatch metadata."""
         return io.Schema(
-            node_id=MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID,
-            display_name="Modal Deferred Local Passthrough",
+            node_id=MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
+            display_name="Modal Parallel Local Passthrough",
             category="Modal",
             description=(
-                "Internal scheduling barrier that prevents an independent local tap "
-                "from delaying downstream Modal execution."
+                "Internal async gate that releases an independent local tap once "
+                "downstream Modal execution has started."
             ),
             inputs=[
                 io.AnyType.Input("value"),
-                io.Autogrow.Input("components", template=completion_template),
+                io.AnyType.Input("dispatch_context"),
             ],
             outputs=[io.AnyType.Output(display_name="value")],
             is_dev_only=True,
@@ -841,16 +965,11 @@ class ModalDeferredLocalPassthrough(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, value: Any, components: io.Autogrow.Type) -> io.NodeOutput:
-        """Return the original value after every required remote component completes."""
-        incomplete_component_names = [
-            str(component_name)
-            for component_name, completed in components.items()
-            if completed is not True
-        ]
-        if incomplete_component_names:
-            raise RuntimeError(
-                "Deferred local branch received incomplete Modal component tokens: "
-                f"{incomplete_component_names}."
-            )
+    async def execute(
+        cls,
+        value: Any,
+        dispatch_context: Mapping[str, Any],
+    ) -> io.NodeOutput:
+        """Return the original value once the remote continuation is in flight."""
+        await _wait_for_parallel_local_dispatches(dispatch_context)
         return io.NodeOutput(value)
