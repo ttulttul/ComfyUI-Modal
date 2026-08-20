@@ -2979,6 +2979,53 @@ def test_rewrite_stamps_snapshot_profile_on_split_static_and_mapped_payloads(
     assert mapped_payload["modal_gpu"] == "L40S"
 
 
+def test_snapshot_profile_stamping_excludes_llm_phase_from_comfy_profile(
+    api_intercept_module: Any,
+) -> None:
+    """A split LLM phase must not inherit the surrounding Comfy loader profile."""
+    split_payload = {
+        "split_proxy_payloads": [
+            {
+                "component_id": "251",
+                "remote_worker_affinity_group": "comfy",
+                "subgraph_prompt": {
+                    "6": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"unet_name": "minimax.safetensors"},
+                    }
+                },
+            },
+            {
+                "component_id": "249:263",
+                "remote_worker_affinity_group": "llm",
+                "subgraph_prompt": {
+                    "249:263": {"class_type": "ModalLLM", "inputs": {}}
+                },
+            },
+            {
+                "component_id": "172",
+                "remote_worker_affinity_group": "comfy",
+                "subgraph_prompt": {
+                    "172": {"class_type": "SaveVideo", "inputs": {}}
+                },
+            },
+        ]
+    }
+    settings = SimpleNamespace(
+        enable_gpu_memory_snapshot=True,
+        enable_loader_prewarm=True,
+    )
+
+    result = api_intercept_module._attach_snapshot_profile_key(split_payload, settings)
+
+    snapshot_profile_key = result["snapshot_profile_key"]
+    phases = result["split_proxy_payloads"]
+    assert snapshot_profile_key.startswith("loader-profile:")
+    assert phases[0]["snapshot_profile_key"] == snapshot_profile_key
+    assert "snapshot_profile_key" not in phases[1]
+    assert phases[2]["snapshot_profile_key"] == snapshot_profile_key
+
+
 def test_rewrite_keeps_unmapped_remote_siblings_without_local_reentry_together(
     api_intercept_module: Any,
     settings_module: Any,

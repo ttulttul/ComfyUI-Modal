@@ -737,6 +737,14 @@ def _loader_prewarm_plan_signature(class_type: str, inputs: Mapping[str, Any]) -
     )
 
 
+def _uses_llm_worker_affinity(payload: Mapping[str, Any]) -> bool:
+    """Return whether an execution payload belongs to the isolated LLM worker pool."""
+    affinity_group = str(
+        payload.get("remote_worker_affinity_group") or ""
+    ).strip().lower()
+    return affinity_group == "llm"
+
+
 def _payload_loader_snapshot_profile_key(payload: Mapping[str, Any]) -> str:
     """Return the stable loader snapshot profile key derivable from one payload."""
     prompt_id = payload.get("prompt_id")
@@ -770,20 +778,27 @@ def _payload_loader_snapshot_profile_key(payload: Mapping[str, Any]) -> str:
 
 
 def _stamp_snapshot_profile_key(payload: dict[str, Any], snapshot_profile_key: str) -> None:
-    """Attach one loader snapshot profile key to a payload and any split descendants."""
+    """Attach one loader snapshot profile to eligible Comfy payload descendants."""
     if not snapshot_profile_key:
         return
-    payload["snapshot_profile_key"] = snapshot_profile_key
+    if _uses_llm_worker_affinity(payload):
+        payload.pop("snapshot_profile_key", None)
+        logger.info(
+            "Omitting Comfy loader snapshot profile from LLM worker component=%s.",
+            payload.get("component_id"),
+        )
+    else:
+        payload["snapshot_profile_key"] = snapshot_profile_key
     split_proxy_payloads = payload.get("split_proxy_payloads")
     if isinstance(split_proxy_payloads, dict):
         for phase_payload in split_proxy_payloads.values():
             if isinstance(phase_payload, dict):
-                phase_payload["snapshot_profile_key"] = snapshot_profile_key
+                _stamp_snapshot_profile_key(phase_payload, snapshot_profile_key)
         return
     if isinstance(split_proxy_payloads, list):
         for phase_payload in split_proxy_payloads:
             if isinstance(phase_payload, dict):
-                phase_payload["snapshot_profile_key"] = snapshot_profile_key
+                _stamp_snapshot_profile_key(phase_payload, snapshot_profile_key)
 
 
 def _attach_snapshot_profile_key(payload: dict[str, Any], settings: ModalSyncSettings) -> dict[str, Any]:
