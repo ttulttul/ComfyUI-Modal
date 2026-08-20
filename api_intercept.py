@@ -20,9 +20,11 @@ from .modal_executor_node import (
     MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
     MODAL_ARTIFACT_FINALIZER_NODE_ID,
     MODAL_COMPONENT_COMPLETION_OUTPUT_NAME,
+    MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID,
     MODAL_MAP_INPUT_NODE_ID,
     ensure_modal_artifact_finalizer_registered,
     ensure_modal_component_proxy_node_registered,
+    ensure_modal_deferred_local_passthrough_registered,
     register_cache_friendly_proxy_payload,
     register_modal_map_input_warmup_context,
 )
@@ -182,6 +184,7 @@ class RewriteSummary:
     uploaded_volume_paths: list[str] = field(default_factory=list)
     rewritten_node_id_map: dict[str, str] = field(default_factory=dict)
     sandwiched_local_node_ids: list[str] = field(default_factory=list)
+    deferred_local_branch_node_ids: list[str] = field(default_factory=list)
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
     artifact_finalizer_node_id: str | None = None
@@ -545,6 +548,9 @@ def _modal_rewritten_prompt_diagnostics(
         )
         diagnostics["component_execution_stages"] = copy.deepcopy(
             summary.component_execution_stages
+        )
+        diagnostics["deferred_local_branch_node_ids"] = list(
+            summary.deferred_local_branch_node_ids
         )
         diagnostics["rewritten_node_id_map"] = copy.deepcopy(summary.rewritten_node_id_map)
     return diagnostics
@@ -3912,6 +3918,157 @@ def _attach_modal_artifact_finalizer(
     return finalizer_node_id
 
 
+def _defer_non_returning_local_branches(
+    *,
+    rewritten_prompt: dict[str, Any],
+    remote_component_ids: list[str],
+    nodes_module: Any,
+) -> list[str]:
+    """Keep local-only taps from winning scheduler priority over downstream remote work."""
+    remote_component_id_set = set(remote_component_ids)
+    if len(remote_component_id_set) < 2:
+        return []
+
+    consumers = _build_consumer_map(rewritten_prompt)
+    ensure_modal_deferred_local_passthrough_registered(nodes_module)
+    barrier_node_ids: list[str] = []
+    for source_component_id in remote_component_ids:
+        for source in _node_output_refs(
+            rewritten_prompt,
+            source_component_id,
+            nodes_module,
+        ):
+            output_consumers = list(consumers.get(source, []))
+            if not output_consumers:
+                continue
+            downstream_node_ids = _downstream_node_ids_from_targets(
+                prompt=rewritten_prompt,
+                consumers=consumers,
+                seed_targets=output_consumers,
+                nodes_module=nodes_module,
+            )
+            downstream_remote_component_ids = sorted(
+                (downstream_node_ids & remote_component_id_set)
+                - {source_component_id}
+            )
+            if not downstream_remote_component_ids:
+                continue
+
+            local_only_consumers: list[InputTarget] = []
+            for target in output_consumers:
+                if target.node_id in remote_component_id_set:
+                    continue
+                branch_node_ids = _downstream_node_ids_from_targets(
+                    prompt=rewritten_prompt,
+                    consumers=consumers,
+                    seed_targets=[target],
+                    nodes_module=nodes_module,
+                )
+                if branch_node_ids & remote_component_id_set:
+                    continue
+                local_only_consumers.append(target)
+            if not local_only_consumers:
+                continue
+
+            barrier_node_id = (
+                f"__{MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID}__"
+                f"{len(barrier_node_ids)}"
+            )
+            while barrier_node_id in rewritten_prompt:
+                barrier_node_id = f"{barrier_node_id}_proxy"
+            barrier_inputs: dict[str, Any] = {
+                "value": [source.node_id, source.output_index],
+            }
+            for component_index, component_id in enumerate(
+                downstream_remote_component_ids
+            ):
+                barrier_inputs[f"components.component_{component_index}"] = [
+                    component_id,
+                    _modal_component_completion_output_index(
+                        proxy_node_id=component_id,
+                        rewritten_prompt=rewritten_prompt,
+                        nodes_module=nodes_module,
+                    ),
+                ]
+            rewritten_prompt[barrier_node_id] = {
+                "class_type": MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID,
+                "inputs": barrier_inputs,
+                "_meta": {"title": "Modal Deferred Local Branch"},
+            }
+            for target in local_only_consumers:
+                rewritten_prompt[target.node_id]["inputs"][target.input_name] = [
+                    barrier_node_id,
+                    0,
+                ]
+            barrier_node_ids.append(barrier_node_id)
+            logger.info(
+                "Deferred local-only consumers %s of remote output %s:%d until downstream Modal components %s complete via barrier=%s.",
+                [target.node_id for target in local_only_consumers],
+                source.node_id,
+                source.output_index,
+                downstream_remote_component_ids,
+                barrier_node_id,
+            )
+    return barrier_node_ids
+
+
+def _configure_local_gap_keepalive_payloads(
+    *,
+    rewritten_prompt: dict[str, Any],
+    remote_component_ids: list[str],
+    sandwiched_local_node_ids: set[str],
+) -> None:
+    """Mark only remote proxies that precede a local-to-remote execution gap."""
+    if not sandwiched_local_node_ids:
+        return
+
+    payloads_by_component_id: dict[str, dict[str, Any]] = {}
+    for component_id in remote_component_ids:
+        payload = (
+            rewritten_prompt.get(component_id, {})
+            .get("inputs", {})
+            .get("original_node_data")
+        )
+        if not isinstance(payload, dict):
+            continue
+        payload["remote_local_gap_pool"] = True
+        payload.pop("keepalive_after_remote_component", None)
+        payload.pop("stop_local_gap_keepalive_before_remote_component", None)
+        payloads_by_component_id[component_id] = payload
+
+    keepalive_component_ids: set[str] = set()
+    continuation_component_ids: set[str] = set()
+    for local_node_id in sandwiched_local_node_ids:
+        for component_id in remote_component_ids:
+            if _component_ancestors_of_local_source(
+                prompt=rewritten_prompt,
+                source_node_id=local_node_id,
+                component_node_id_set={component_id},
+            ):
+                keepalive_component_ids.add(component_id)
+            if _component_ancestors_of_local_source(
+                prompt=rewritten_prompt,
+                source_node_id=component_id,
+                component_node_id_set={local_node_id},
+            ):
+                continuation_component_ids.add(component_id)
+
+    for component_id in sorted(keepalive_component_ids):
+        payload = payloads_by_component_id.get(component_id)
+        if payload is not None:
+            payload["keepalive_after_remote_component"] = True
+    for component_id in sorted(continuation_component_ids):
+        payload = payloads_by_component_id.get(component_id)
+        if payload is not None:
+            payload["stop_local_gap_keepalive_before_remote_component"] = True
+    logger.info(
+        "Configured local-gap Modal pool for components=%s keepalive_producers=%s continuations=%s.",
+        sorted(payloads_by_component_id),
+        sorted(keepalive_component_ids),
+        sorted(continuation_component_ids),
+    )
+
+
 def rewrite_prompt_for_modal(
     prompt: dict[str, Any],
     workflow: dict[str, Any] | None,
@@ -4029,6 +4186,7 @@ def rewrite_prompt_for_modal(
         asset.remote_path for asset in summary.synced_assets if asset.uploaded
     ]
     mapped_proxy_component_ids: set[str] = set()
+    sandwiched_local_node_id_set = set(summary.sandwiched_local_node_ids)
     for component in components:
         logger.info(
             "Rewriting remote component %s covering nodes %s.",
@@ -4108,6 +4266,16 @@ def rewrite_prompt_for_modal(
         if component.mapped_boundary_input_name or implicitly_mapped_output_sources:
             mapped_proxy_component_ids.add(proxy_node_ids[0])
 
+    _configure_local_gap_keepalive_payloads(
+        rewritten_prompt=rewritten_prompt,
+        remote_component_ids=summary.remote_component_ids,
+        sandwiched_local_node_ids=sandwiched_local_node_id_set,
+    )
+    summary.deferred_local_branch_node_ids = _defer_non_returning_local_branches(
+        rewritten_prompt=rewritten_prompt,
+        remote_component_ids=summary.remote_component_ids,
+        nodes_module=resolved_nodes_module,
+    )
     summary.artifact_finalizer_node_id = _attach_modal_artifact_finalizer(
         rewritten_prompt=rewritten_prompt,
         remote_component_ids=summary.remote_component_ids,
@@ -4751,6 +4919,9 @@ def setup_modal_queue_route(
                         "modal_remote_node_ids": list(summary.remote_node_ids),
                         "modal_sandwiched_local_node_ids": list(
                             summary.sandwiched_local_node_ids
+                        ),
+                        "modal_deferred_local_branch_node_ids": list(
+                            summary.deferred_local_branch_node_ids
                         ),
                         "modal_components": [
                             {

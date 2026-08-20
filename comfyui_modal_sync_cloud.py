@@ -7515,6 +7515,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
 
         snapshot_profile_key: str = modal.parameter(default="")
         gpu_snapshot_enabled: bool = modal.parameter(default=False)
+        worker_affinity_key: str = modal.parameter(default="worker-pool:slot:0")
 
         @modal.enter(snap=True)
         def setup_snapshot_state(self) -> None:
@@ -7525,9 +7526,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     snapshot_profile_key=self.snapshot_profile_key,
                 )
                 logger.info(
-                    "RemoteEngine snapshot setup complete for snapshot_profile_key=%s gpu_snapshot_enabled=%s.",
+                    "RemoteEngine snapshot setup complete for snapshot_profile_key=%s gpu_snapshot_enabled=%s worker_affinity=%s.",
                     self.snapshot_profile_key or None,
                     bool(self.gpu_snapshot_enabled),
+                    self.worker_affinity_key,
                 )
 
         @modal.enter(snap=False)
@@ -7619,6 +7621,21 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def warmup_for_request(self, payload: dict[str, Any]) -> dict[str, Any]:
             """Prime the current or a newly started Modal container for one prompt."""
             return _prepare_warm_container_for_request(vol, payload)
+
+        @modal.method()
+        def keepalive_for_local_gap(self, payload: dict[str, Any]) -> dict[str, Any]:
+            """Keep this affinity slot active while the workflow executes locally."""
+            logger.info(
+                "Remote local-gap keepalive prompt=%s component=%s worker_affinity=%s.",
+                payload.get("prompt_id"),
+                payload.get("component_id"),
+                self.worker_affinity_key,
+            )
+            return {
+                "component_id": str(payload.get("component_id") or "modal-keepalive"),
+                "task_id": os.getenv("MODAL_TASK_ID"),
+                "worker_affinity_key": self.worker_affinity_key,
+            }
 
         @modal.method()
         def runtime_version(self) -> dict[str, Any]:

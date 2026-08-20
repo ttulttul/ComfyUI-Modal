@@ -85,6 +85,8 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_BUFFER_CONTAINERS",
     "COMFY_MODAL_MAX_INFLIGHT_CALLS",
     "COMFY_MODAL_SCALEDOWN_WINDOW",
+    "COMFY_MODAL_LOCAL_GAP_KEEPALIVE_SECONDS",
+    "COMFY_MODAL_LOCAL_GAP_KEEPALIVE_INTERVAL_SECONDS",
     "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS",
     "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS",
     "COMFY_MODAL_ENABLE_LOADER_PREWARM",
@@ -136,6 +138,8 @@ class ModalSyncSettings:
     terminate_container_on_error: bool = True
     modal_gpu: str = DEFAULT_MODAL_GPU
     scaledown_window_seconds: int = 600
+    local_gap_keepalive_seconds: float = 900.0
+    local_gap_keepalive_interval_seconds: float = 15.0
     min_containers: int = 0
     max_containers: int | None = None
     buffer_containers: int | None = None
@@ -483,6 +487,17 @@ def _get_settings_cached(
         is not False,
         modal_gpu=os.getenv("COMFY_MODAL_GPU", DEFAULT_MODAL_GPU).strip() or DEFAULT_MODAL_GPU,
         scaledown_window_seconds=_read_int_env("COMFY_MODAL_SCALEDOWN_WINDOW", 600),
+        local_gap_keepalive_seconds=max(
+            0.0,
+            _read_float_env("COMFY_MODAL_LOCAL_GAP_KEEPALIVE_SECONDS", 900.0),
+        ),
+        local_gap_keepalive_interval_seconds=max(
+            1.0,
+            _read_float_env(
+                "COMFY_MODAL_LOCAL_GAP_KEEPALIVE_INTERVAL_SECONDS",
+                15.0,
+            ),
+        ),
         min_containers=_read_int_env("COMFY_MODAL_MIN_CONTAINERS", 0),
         max_containers=_read_optional_int_env("COMFY_MODAL_MAX_CONTAINERS"),
         buffer_containers=_read_optional_int_env("COMFY_MODAL_BUFFER_CONTAINERS"),

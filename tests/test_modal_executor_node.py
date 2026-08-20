@@ -794,6 +794,24 @@ def test_modal_artifact_finalizer_requires_completed_components(
         )
 
 
+def test_modal_deferred_local_passthrough_requires_completed_components(
+    modal_executor_module: Any,
+) -> None:
+    """The local scheduling barrier should preserve values after remote completion."""
+    schema = modal_executor_module.ModalDeferredLocalPassthrough.GET_SCHEMA()
+
+    assert schema.is_output_node is False
+    assert modal_executor_module.ModalDeferredLocalPassthrough.execute(
+        "image-value",
+        {"component_0": True, "component_1": True},
+    ).result == ("image-value",)
+    with pytest.raises(RuntimeError, match="component_1"):
+        modal_executor_module.ModalDeferredLocalPassthrough.execute(
+            "image-value",
+            {"component_0": True, "component_1": False},
+        )
+
+
 def test_proxy_execution_uses_injected_remote_client(
     modal_executor_module: Any,
 ) -> None:
@@ -1341,6 +1359,62 @@ def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
     assert [args[1] for _fn, args in submitted_tasks] == [0, 1, 2, 3]
 
 
+def test_local_gap_keepalive_is_bounded_and_stopped_by_next_remote_component(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A completed producer should retain its slot only until downstream remote work starts."""
+    submitted_tasks: list[tuple[Any, tuple[Any, ...], Future[Any]]] = []
+
+    class FakeExecutor:
+        """Executor double that captures but does not run the keepalive loop."""
+
+        def submit(self, fn: Any, *args: Any) -> Future[Any]:
+            """Record one keepalive job and return its pending future."""
+            future: Future[Any] = Future()
+            submitted_tasks.append((fn, args, future))
+            return future
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_REMOTE_MODAL_KEEPALIVE_EXECUTOR",
+        FakeExecutor(),
+    )
+    remote_modal_app_module.get_settings.cache_clear()
+    with remote_modal_app_module._LOCAL_GAP_KEEPALIVES_LOCK:
+        remote_modal_app_module._LOCAL_GAP_KEEPALIVES.clear()
+    producer_payload = {
+        "prompt_id": "prompt-gap",
+        "component_id": "component-a",
+        "keepalive_after_remote_component": True,
+    }
+    consumer_payload = {
+        "prompt_id": "prompt-gap",
+        "component_id": "component-b",
+        "stop_local_gap_keepalive_before_remote_component": True,
+    }
+
+    try:
+        assert remote_modal_app_module._start_local_gap_keepalive(producer_payload) is True
+        assert len(submitted_tasks) == 1
+        _fn, args, _future = submitted_tasks[0]
+        stop_event = args[1]
+        assert args[2:] == (900.0, 15.0)
+        assert stop_event.is_set() is False
+
+        assert remote_modal_app_module._stop_local_gap_keepalive(
+            consumer_payload,
+            reason="test_next_component",
+        ) is True
+        assert stop_event.is_set() is True
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        with remote_modal_app_module._LOCAL_GAP_KEEPALIVES_LOCK:
+            remote_modal_app_module._LOCAL_GAP_KEEPALIVES.clear()
+
+
 def test_await_prompt_warmup_slots_waits_for_inflight_futures(
     remote_modal_app_module: Any,
 ) -> None:
@@ -1539,6 +1613,14 @@ def test_stable_modal_cloud_entry_imports_without_modal_sdk(
     """The stable Modal cloud module should stay importable when modal is unavailable."""
     assert modal_cloud_module.__name__ == "comfyui_modal_sync_cloud"
     assert hasattr(modal_cloud_module, "RemoteEngine")
+
+
+def test_modal_cloud_exposes_affinity_parameter_and_local_gap_keepalive() -> None:
+    """The deployed class must make affinity part of identity and expose a heartbeat."""
+    source = (Path(__file__).resolve().parents[1] / "comfyui_modal_sync_cloud.py").read_text()
+
+    assert "worker_affinity_key: str = modal.parameter" in source
+    assert "def keepalive_for_local_gap" in source
 
 
 def test_modal_cloud_image_environment_preserves_unique_app_name(
@@ -5609,6 +5691,42 @@ def test_remote_modal_rejects_fingerprint_mismatch_when_auto_deploy_is_disabled(
         remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
 
+def test_remote_modal_rebinds_affinity_after_compatible_protocol_probe(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A legacy-safe version probe should be replaced before real execution."""
+    version_payload = _current_remote_runtime_payload(remote_modal_app_module)
+    probe_engine = types.SimpleNamespace(
+        runtime_version=types.SimpleNamespace(remote=lambda: version_payload)
+    )
+    affinity_engine = object()
+    observed_payloads: list[dict[str, Any]] = []
+
+    def fake_lookup(payload: dict[str, Any]) -> object:
+        """Return the affinity-aware handle created after protocol validation."""
+        observed_payloads.append(payload)
+        return affinity_engine
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_lookup_deployed_remote_engine",
+        fake_lookup,
+    )
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    payload = {"component_id": "component-1"}
+    try:
+        result = remote_modal_app_module._ensure_remote_engine_protocol_current(
+            probe_engine,
+            payload,
+        )
+    finally:
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+
+    assert result is affinity_engine
+    assert observed_payloads == [payload]
+
+
 def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
     remote_modal_app_module: Any,
 ) -> None:
@@ -5776,11 +5894,11 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
 
 
-def test_lookup_deployed_remote_engine_excludes_affinity_from_modal_class_parameters(
+def test_lookup_deployed_remote_engine_uses_affinity_as_modal_class_parameter(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Deployed Modal lookups should keep scheduler lane affinity out of Modal class identity."""
+    """Deployed Modal lookups should isolate reusable worker slots by class identity."""
     observed_kwargs: list[dict[str, Any]] = []
 
     class FakeModal:
@@ -5814,14 +5932,22 @@ def test_lookup_deployed_remote_engine_excludes_affinity_from_modal_class_parame
             ).to_payload(),
         }
     )
+    probe_result = remote_modal_app_module._lookup_deployed_remote_engine(
+        {"component_id": "component-1"},
+        protocol_probe=True,
+    )
 
     assert result == {
         "gpu_snapshot_enabled": True,
+        "worker_affinity_key": "worker-pool:slot:0",
     }
+    assert probe_result == {"gpu_snapshot_enabled": True}
     assert observed_kwargs == [
         {
             "gpu_snapshot_enabled": True,
-        }
+            "worker_affinity_key": "worker-pool:slot:0",
+        },
+        {"gpu_snapshot_enabled": True},
     ]
 
 
@@ -5850,8 +5976,91 @@ def test_lookup_deployed_remote_engine_uses_workflow_gpu_app_identity(
         {"component_id": "component-1", "modal_gpu": "B300"}
     )
 
-    assert result == {"gpu_snapshot_enabled": True}
+    assert result == {
+        "gpu_snapshot_enabled": True,
+        "worker_affinity_key": "worker-pool:slot:0",
+    }
     assert observed_lookups == [("comfy-modal-sync-gpu-b300", "RemoteEngine")]
+
+
+def test_lookup_deployed_remote_engine_extends_local_gap_pool_scaledown(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Sandwiched local work should use a longer independently autoscaled Modal pool."""
+    observed_options: list[dict[str, Any]] = []
+    observed_kwargs: list[dict[str, Any]] = []
+
+    class FakeRemoteCls:
+        """Minimal deployed class supporting Modal runtime option overrides."""
+
+        def with_options(self, **kwargs: Any) -> "FakeRemoteCls":
+            """Record the independent autoscaler configuration."""
+            observed_options.append(kwargs)
+            return self
+
+        def __call__(self, **kwargs: Any) -> dict[str, Any]:
+            """Record the parametrized class instance identity."""
+            observed_kwargs.append(kwargs)
+            return kwargs
+
+    class FakeModal:
+        """Minimal Modal SDK double for deployed class lookup."""
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> FakeRemoteCls:
+                """Return the shared fake deployed class."""
+                assert app_name == DEFAULT_TEST_DEPLOYMENT_APP_NAME
+                assert class_name == "RemoteEngine"
+                return FakeRemoteCls()
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+
+    result = remote_modal_app_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            "prompt_id": "prompt-1",
+            "remote_local_gap_pool": True,
+        }
+    )
+
+    assert observed_options == [{"scaledown_window": 900}]
+    assert observed_kwargs == [result]
+    assert result["worker_affinity_key"] == "worker-pool:slot:0"
+
+
+def test_local_gap_components_share_one_affinity_slot(
+    remote_modal_app_module: Any,
+) -> None:
+    """Sequential remote phases around local work must address the same worker pool."""
+    parallelism_metadata = {
+        "modal": {
+            "component_execution_stages": [
+                ["component-a", "independent-component"],
+                ["component-b"],
+            ],
+            "estimated_max_parallel_requests": 2,
+        }
+    }
+    first_payload = {
+        "component_id": "component-a",
+        "remote_local_gap_pool": True,
+        "extra_data": parallelism_metadata,
+    }
+    second_payload = {
+        "component_id": "component-b",
+        "remote_local_gap_pool": True,
+        "extra_data": parallelism_metadata,
+    }
+
+    assert remote_modal_app_module._component_pool_slot_index(first_payload) == 0
+    assert remote_modal_app_module._component_pool_slot_index(second_payload) == 0
+    assert remote_modal_app_module._remote_worker_affinity_key(first_payload) == (
+        remote_modal_app_module._remote_worker_affinity_key(second_payload)
+    )
 
 
 def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu_snapshots(
@@ -6042,25 +6251,29 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
 
     assert first_result == {
         "gpu_snapshot_enabled": True,
+        "worker_affinity_key": "worker-pool:slot:0",
     }
     assert second_result == {
         "gpu_snapshot_enabled": True,
+        "worker_affinity_key": "worker-pool:slot:0",
     }
     assert observed_kwargs == [
         {
             "gpu_snapshot_enabled": True,
+            "worker_affinity_key": "worker-pool:slot:0",
         },
         {
             "gpu_snapshot_enabled": True,
+            "worker_affinity_key": "worker-pool:slot:0",
         },
     ]
 
 
-def test_lookup_deployed_remote_engine_shares_profiled_identity_across_lane_overrides(
+def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Lane-specific affinity overrides should not create separate Modal class identities."""
+    """Lane-specific affinity overrides should create stable separate Modal identities."""
     observed_kwargs: list[dict[str, Any]] = []
     snapshot_profiles: dict[str, Any] = {}
 
@@ -6119,8 +6332,9 @@ def test_lookup_deployed_remote_engine_shares_profiled_identity_across_lane_over
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
-    assert first_result == second_result
-    assert "worker_affinity_key" not in first_result
+    assert first_result != second_result
+    assert first_result["worker_affinity_key"] == "worker-pool:slot:0"
+    assert second_result["worker_affinity_key"] == "worker-pool:slot:3"
     assert first_result["snapshot_profile_key"].startswith("loader-profile:")
     assert observed_kwargs == [first_result, second_result]
 
@@ -10229,6 +10443,7 @@ def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies
             {"id": 6, "properties": {"is_modal_remote": False}},
             {"id": 7, "properties": {"is_modal_remote": True}},
             {"id": 8, "properties": {"is_modal_remote": False}},
+            {"id": 9, "properties": {"is_modal_remote": False}},
         ]
     }
     prompt = {
@@ -10272,6 +10487,11 @@ def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies
             "inputs": {"image": ["7", 0]},
             "_meta": {"title": "Local Sink"},
         },
+        "9": {
+            "class_type": "LocalSink",
+            "inputs": {"image": ["3", 0]},
+            "_meta": {"title": "Independent Local Preview"},
+        },
     }
 
     rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
@@ -10287,10 +10507,25 @@ def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies
     assert summary.component_execution_stages == [["3"], ["7"]]
     assert rewritten_prompt["4"]["inputs"]["image"] == ["3", 0]
     assert rewritten_prompt["7"]["inputs"]["remote_input_2"] == ["4", 0]
+    assert len(summary.deferred_local_branch_node_ids) == 1
+    barrier_node_id = summary.deferred_local_branch_node_ids[0]
+    barrier_node = rewritten_prompt[barrier_node_id]
+    assert barrier_node["class_type"] == (
+        api_intercept_module.MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID
+    )
+    assert barrier_node["inputs"]["value"] == ["3", 0]
+    assert barrier_node["inputs"]["components.component_0"][0] == "7"
+    assert rewritten_prompt["9"]["inputs"]["image"] == [barrier_node_id, 0]
     first_payload = rewritten_prompt["3"]["inputs"]["original_node_data"]
     mapped_payload = rewritten_prompt["7"]["inputs"]["original_node_data"]
     assert first_payload["component_node_ids"] == ["1", "3"]
     assert mapped_payload["component_node_ids"] == ["7"]
+    assert first_payload["remote_local_gap_pool"] is True
+    assert first_payload["keepalive_after_remote_component"] is True
+    assert "stop_local_gap_keepalive_before_remote_component" not in first_payload
+    assert mapped_payload["remote_local_gap_pool"] is True
+    assert "keepalive_after_remote_component" not in mapped_payload
+    assert mapped_payload["stop_local_gap_keepalive_before_remote_component"] is True
     assert {
         boundary_input["proxy_input_name"]
         for boundary_input in mapped_payload["boundary_inputs"]
