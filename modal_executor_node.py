@@ -25,6 +25,7 @@ MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID = "ModalParallelLocalPassthrough"
 MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID = "ModalLocalBridgeMaterializer"
 MODAL_COMPONENT_COMPLETION_OUTPUT_NAME = "modal_component_complete"
 MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS = 100
+MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY = "comfy_modal_prompt_id"
 _PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
 _VOLATILE_PROXY_CACHE_KEYS = frozenset(
     {
@@ -80,6 +81,10 @@ _REMOTE_EXECUTOR_CLIENT_FACTORY: Callable[[], RemoteExecutorClient] = ModalRemot
 _PROXY_NODE_CACHE: dict[str, type[io.ComfyNode]] = {}
 _PROXY_EXECUTION_CONTEXTS_LOCK = threading.Lock()
 _PROXY_EXECUTION_CONTEXTS: dict[str, "_ProxyExecutionContext"] = {}
+_PROXY_EXECUTION_CONTEXTS_BY_PROMPT: OrderedDict[
+    tuple[str, str], "_ProxyExecutionContext"
+] = OrderedDict()
+_PROXY_EXECUTION_CONTEXT_LIMIT = 2048
 _MODAL_MAP_WARMUP_CONTEXTS_LOCK = threading.Lock()
 _MODAL_MAP_WARMUP_CONTEXTS: dict[str, "_ModalMapWarmupContext"] = {}
 _MODAL_WORKFLOW_EXECUTION_GATE = threading.Condition()
@@ -521,14 +526,20 @@ def register_cache_friendly_proxy_payload(
 
     sanitized_payload = _sanitize_cache_surface_payload(payload)
     sanitized_payload[_PROXY_CACHE_CONTEXT_ID_KEY] = str(node_id)
+    prompt_id = _normalize_prompt_id(payload.get("prompt_id"))
+    context = _ProxyExecutionContext(execution_payload=dict(payload))
     with _PROXY_EXECUTION_CONTEXTS_LOCK:
-        _PROXY_EXECUTION_CONTEXTS[str(node_id)] = _ProxyExecutionContext(
-            execution_payload=dict(payload),
-        )
+        _PROXY_EXECUTION_CONTEXTS[str(node_id)] = context
+        if prompt_id is not None:
+            context_key = (prompt_id, str(node_id))
+            _PROXY_EXECUTION_CONTEXTS_BY_PROMPT[context_key] = context
+            _PROXY_EXECUTION_CONTEXTS_BY_PROMPT.move_to_end(context_key)
+            while len(_PROXY_EXECUTION_CONTEXTS_BY_PROMPT) > _PROXY_EXECUTION_CONTEXT_LIMIT:
+                _PROXY_EXECUTION_CONTEXTS_BY_PROMPT.popitem(last=False)
     logger.debug(
         "Registered cache-friendly Modal proxy payload for node_id=%s prompt_id=%s session_backed=%s.",
         node_id,
-        _normalize_prompt_id(payload.get("prompt_id")),
+        prompt_id,
         payload.get("remote_session") is not None,
     )
     return sanitized_payload
@@ -618,23 +629,44 @@ def _rehydrate_proxy_payload(
     payload: Mapping[str, Any],
     *,
     unique_id: str | None,
+    prompt_id: str | None = None,
 ) -> Mapping[str, Any]:
     """Restore any execution-scoped fields stripped from a cache-friendly proxy payload."""
+    candidate_context_id = payload.get(_PROXY_CACHE_CONTEXT_ID_KEY)
+    if candidate_context_id is None:
+        return payload
+
     context_id = unique_id
     if context_id is None:
-        candidate_context_id = payload.get(_PROXY_CACHE_CONTEXT_ID_KEY)
-        if candidate_context_id is not None:
-            normalized_context_id = str(candidate_context_id).strip()
-            context_id = normalized_context_id or None
+        normalized_context_id = str(candidate_context_id).strip()
+        context_id = normalized_context_id or None
     if context_id is None:
         return payload
 
+    normalized_prompt_id = _normalize_prompt_id(prompt_id)
     with _PROXY_EXECUTION_CONTEXTS_LOCK:
-        context = _PROXY_EXECUTION_CONTEXTS.get(str(context_id))
+        if normalized_prompt_id is not None:
+            context_key = (normalized_prompt_id, str(context_id))
+            context = _PROXY_EXECUTION_CONTEXTS_BY_PROMPT.pop(context_key, None)
+        else:
+            context = _PROXY_EXECUTION_CONTEXTS.get(str(context_id))
     if context is None:
+        if normalized_prompt_id is not None:
+            logger.warning(
+                "No prompt-scoped Modal proxy payload found for prompt_id=%s node_id=%s; using embedded cache surface.",
+                normalized_prompt_id,
+                context_id,
+            )
         return payload
 
     return dict(context.execution_payload)
+
+
+def _prompt_id_from_extra_pnginfo(extra_pnginfo: Any) -> str | None:
+    """Read the queue prompt id carried through ComfyUI's hidden PNG metadata input."""
+    if not isinstance(extra_pnginfo, Mapping):
+        return None
+    return _normalize_prompt_id(extra_pnginfo.get(MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY))
 
 
 def _normalized_output_metadata(
@@ -712,7 +744,7 @@ def _build_proxy_node_class(
                 outputs=outputs,
                 is_input_list=True,
                 accept_all_inputs=True,
-                hidden=[io.Hidden.unique_id],
+                hidden=[io.Hidden.unique_id, io.Hidden.extra_pnginfo],
                 is_dev_only=True,
                 is_experimental=True,
             )
@@ -721,9 +753,13 @@ def _build_proxy_node_class(
         async def execute(cls, **kwargs: Any) -> io.NodeOutput:
             """Forward the execution payload to the configured remote executor."""
             unique_id = _normalize_prompt_id(kwargs.pop(io.Hidden.unique_id.name, None))
+            prompt_id = _prompt_id_from_extra_pnginfo(
+                kwargs.pop(io.Hidden.extra_pnginfo.name, None)
+            )
             payload = _rehydrate_proxy_payload(
                 _normalize_proxy_payload(kwargs.pop(payload_input_name, None)),
                 unique_id=unique_id,
+                prompt_id=prompt_id,
             )
 
             async with _modal_workflow_execution_slot(payload):

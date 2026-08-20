@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -1386,7 +1386,7 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
 def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
     modal_executor_module: Any,
 ) -> None:
-    """Cache-friendly proxy payloads should strip prompt_id from inputs and restore it when they execute."""
+    """Queued proxies should restore their own prompt context when executions overlap."""
     fake_nodes_module = type(
         "FakeNodesModule",
         (),
@@ -1413,6 +1413,16 @@ def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
             "execute_node_ids": [],
         },
     )
+    next_payload = modal_executor_module.register_cache_friendly_proxy_payload(
+        "node-1",
+        {
+            "payload_kind": "subgraph",
+            "component_id": "component-1",
+            "prompt_id": "prompt-2",
+            "boundary_outputs": [],
+            "execute_node_ids": [],
+        },
+    )
 
     class FakeClient:
         """Test client that captures the rehydrated payload."""
@@ -1431,6 +1441,9 @@ def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
             proxy_class.execute(
                 original_node_data=payload,
                 unique_id="node-1",
+                extra_pnginfo={
+                    modal_executor_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY: "prompt-1"
+                },
                 value="payload",
             )
         )
@@ -1438,6 +1451,7 @@ def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
         modal_executor_module.set_remote_executor_client_factory(None)
 
     assert "prompt_id" not in payload
+    assert payload == next_payload
     assert result.result == ("prompt-1", 1)
 
 
@@ -1582,7 +1596,30 @@ def test_cache_friendly_proxy_payload_ignores_volatile_queue_metadata(
         "execute_node_ids": ["12"],
         modal_executor_module._PROXY_CACHE_CONTEXT_ID_KEY: "node-9",
     }
-    assert modal_executor_module._rehydrate_proxy_payload(first_payload, unique_id="node-9") == {
+    assert modal_executor_module._rehydrate_proxy_payload(
+        first_payload,
+        unique_id="node-9",
+        prompt_id="prompt-1",
+    ) == {
+        "payload_kind": "subgraph",
+        "component_id": "component-9",
+        "prompt_id": "prompt-1",
+        "boundary_outputs": [],
+        "execute_node_ids": ["12"],
+        "extra_data": {
+            "client_id": "client-1",
+            "create_time": 1000,
+            "modal": {"remote_component_ids": ["12"]},
+        },
+        "requires_volume_reload": True,
+        "volume_reload_marker": "marker-1",
+        "uploaded_volume_paths": ["/storage/assets/a.bin"],
+    }
+    assert modal_executor_module._rehydrate_proxy_payload(
+        second_payload,
+        unique_id="node-9",
+        prompt_id="prompt-2",
+    ) == {
         "payload_kind": "subgraph",
         "component_id": "component-9",
         "prompt_id": "prompt-2",
@@ -15067,6 +15104,70 @@ def test_modal_cloud_accepts_absolute_asset_paths_in_folder_lookup(
             )
     finally:
         modal_cloud_module.get_settings.cache_clear()
+
+
+def test_modal_cloud_preserves_absolute_lookup_until_overlapping_contexts_exit(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """One loader finishing must not remove the lookup patch from another loader."""
+    asset_path = tmp_path / "unet.safetensors"
+    asset_path.write_bytes(b"unet")
+
+    def original_get_full_path(folder_name: str, filename: str) -> None:
+        """Represent ComfyUI's original lookup missing the absolute asset."""
+        del folder_name, filename
+        return None
+
+    def original_get_full_path_or_raise(folder_name: str, filename: str) -> str:
+        """Represent ComfyUI's original raising lookup."""
+        del folder_name
+        raise FileNotFoundError(filename)
+
+    fake_folder_paths_module = types.SimpleNamespace(
+        get_full_path=original_get_full_path,
+        get_full_path_or_raise=original_get_full_path_or_raise,
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths_module)
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    first_exited = threading.Event()
+    release_second = threading.Event()
+    results: list[str | None] = []
+
+    def first_loader() -> None:
+        """Enter first and exit while the second lookup context remains active."""
+        with modal_cloud_module._patched_folder_paths_absolute_lookup():
+            first_entered.set()
+            assert release_first.wait(timeout=2.0)
+        first_exited.set()
+
+    def second_loader() -> None:
+        """Resolve an absolute model after the first overlapping loader exits."""
+        assert first_entered.wait(timeout=2.0)
+        with modal_cloud_module._patched_folder_paths_absolute_lookup():
+            second_entered.set()
+            assert first_exited.wait(timeout=2.0)
+            results.append(
+                fake_folder_paths_module.get_full_path("diffusion_models", str(asset_path))
+            )
+            assert release_second.wait(timeout=2.0)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first_loader)
+        second_future = executor.submit(second_loader)
+        assert second_entered.wait(timeout=2.0)
+        release_first.set()
+        assert first_exited.wait(timeout=2.0)
+        first_future.result(timeout=2.0)
+        release_second.set()
+        second_future.result(timeout=2.0)
+
+    assert results == [str(asset_path)]
+    assert fake_folder_paths_module.get_full_path is original_get_full_path
+    assert fake_folder_paths_module.get_full_path_or_raise is original_get_full_path_or_raise
 
 
 def test_modal_cloud_aliases_flux_rms_norm_weight_keys_for_model_detection(
