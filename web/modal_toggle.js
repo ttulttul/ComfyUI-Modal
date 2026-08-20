@@ -3808,7 +3808,7 @@ function drawModalNodeDecoration(node, ctx) {
   ctx.beginPath();
   ctx.roundRect(-borderWidth, panelY, barWidth, panelHeight, 10 / scale);
   ctx.fill();
-  ctx.strokeStyle = shadowColor;
+  ctx.strokeStyle = palette?.shadowColor ?? LOCAL_BOTTLENECK_BADGE_BORDER_COLOR;
   ctx.lineWidth = 1 / scale;
   ctx.stroke();
 

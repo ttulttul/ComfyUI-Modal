@@ -149,6 +149,52 @@ legacyBottleneckNode.onMouseMove({}, [40, 40], legacyGraphCanvas);
 assert.equal(legacyCanvasElement.title, "");
 
 resetFrontendState();
+const remoteProgressNode = {
+  id: 176,
+  comfyClass: "KSampler",
+  properties: { is_modal_remote: true },
+  size: [160, 80],
+  addWidget() {
+    return {};
+  },
+};
+modalToggle.registerPromptComponents("prompt-decoration", ["176"], [
+  {
+    representative_node_id: "176",
+    node_ids: ["176"],
+  },
+]);
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-decoration",
+    node_id: "176",
+    value: 2,
+    max: 10,
+  },
+});
+modalToggle.decorateNode(remoteProgressNode);
+const progressPanelStrokeStyles = [];
+const progressCanvasContext = {
+  globalAlpha: 1,
+  save() {},
+  restore() {},
+  beginPath() {},
+  roundRect() {},
+  arc() {},
+  fill() {},
+  fillRect() {},
+  fillText() {},
+  measureText(text) {
+    return { width: String(text).length * 6 };
+  },
+  stroke() {
+    progressPanelStrokeStyles.push(this.strokeStyle);
+  },
+};
+assert.doesNotThrow(() => remoteProgressNode.onDrawForeground(progressCanvasContext));
+assert.match(progressPanelStrokeStyles.at(-1), /^rgba\(168, 85, 247, 0\.44/);
+
+resetFrontendState();
 modalToggle.registerPromptComponents("prompt-a", ["10", "11", "12"], [
   {
     representative_node_id: "11",
