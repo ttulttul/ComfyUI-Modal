@@ -122,6 +122,10 @@ _COMFY_RUNTIME_INIT_LOCK = threading.Lock()
 _COMFY_RUNTIME_BASE_INITIALIZED = False
 _COMFY_RUNTIME_CUSTOM_NODE_ROOTS: set[str] = set()
 _EXTRACTED_CUSTOM_NODE_BUNDLES: dict[str, Path] = {}
+_FOLDER_PATHS_PATCH_LOCK = threading.Lock()
+_FOLDER_PATHS_PATCH_DEPTH = 0
+_FOLDER_PATHS_ORIGINAL_GET_FULL_PATH: Callable[[str, str], str | None] | None = None
+_FOLDER_PATHS_ORIGINAL_GET_FULL_PATH_OR_RAISE: Callable[[str, str], str] | None = None
 _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _MODEL_STATE_DICT_COMPAT_WRAPPED = False
@@ -3378,35 +3382,65 @@ def _rewrite_modal_asset_references(value: Any) -> Any:
 
 @contextmanager
 def _patched_folder_paths_absolute_lookup() -> Iterator[None]:
-    """Teach ComfyUI folder lookups to accept already-materialized absolute asset paths."""
+    """Teach ComfyUI folder lookups to accept absolute assets across overlapping callers."""
     import folder_paths
 
-    original_get_full_path = folder_paths.get_full_path
-    original_get_full_path_or_raise = folder_paths.get_full_path_or_raise
+    global _FOLDER_PATHS_PATCH_DEPTH
+    global _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH
+    global _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH_OR_RAISE
 
-    def patched_get_full_path(folder_name: str, filename: str) -> str | None:
-        """Return the absolute file when the prompt already points at a materialized asset."""
-        resolved_filename = _resolve_runtime_asset_path(filename)
-        if os.path.isabs(resolved_filename) and Path(resolved_filename).is_file():
-            return resolved_filename
-        return original_get_full_path(folder_name, resolved_filename)
-
-    def patched_get_full_path_or_raise(folder_name: str, filename: str) -> str:
-        """Raise with the original message when no absolute or folder-based match exists."""
-        full_path = patched_get_full_path(folder_name, filename)
-        if full_path is None:
-            raise FileNotFoundError(
-                f"Model in folder '{folder_name}' with filename '{filename}' not found."
+    with _FOLDER_PATHS_PATCH_LOCK:
+        if _FOLDER_PATHS_PATCH_DEPTH == 0:
+            original_get_full_path = folder_paths.get_full_path
+            original_get_full_path_or_raise = folder_paths.get_full_path_or_raise
+            _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH = original_get_full_path
+            _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH_OR_RAISE = (
+                original_get_full_path_or_raise
             )
-        return full_path
 
-    folder_paths.get_full_path = patched_get_full_path
-    folder_paths.get_full_path_or_raise = patched_get_full_path_or_raise
+            def patched_get_full_path(folder_name: str, filename: str) -> str | None:
+                """Return an absolute file or delegate to ComfyUI's original lookup."""
+                resolved_filename = _resolve_runtime_asset_path(filename)
+                if os.path.isabs(resolved_filename) and Path(resolved_filename).is_file():
+                    return resolved_filename
+                return original_get_full_path(folder_name, resolved_filename)
+
+            def patched_get_full_path_or_raise(folder_name: str, filename: str) -> str:
+                """Raise with the original message when no absolute or folder match exists."""
+                full_path = patched_get_full_path(folder_name, filename)
+                if full_path is None:
+                    raise FileNotFoundError(
+                        f"Model in folder '{folder_name}' with filename '{filename}' not found."
+                    )
+                return full_path
+
+            folder_paths.get_full_path = patched_get_full_path
+            folder_paths.get_full_path_or_raise = patched_get_full_path_or_raise
+        _FOLDER_PATHS_PATCH_DEPTH += 1
+        logger.debug(
+            "Entered absolute folder-path lookup patch depth=%d.",
+            _FOLDER_PATHS_PATCH_DEPTH,
+        )
     try:
         yield
     finally:
-        folder_paths.get_full_path = original_get_full_path
-        folder_paths.get_full_path_or_raise = original_get_full_path_or_raise
+        with _FOLDER_PATHS_PATCH_LOCK:
+            _FOLDER_PATHS_PATCH_DEPTH -= 1
+            logger.debug(
+                "Exited absolute folder-path lookup patch depth=%d.",
+                _FOLDER_PATHS_PATCH_DEPTH,
+            )
+            if _FOLDER_PATHS_PATCH_DEPTH == 0:
+                original_get_full_path = _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH
+                original_get_full_path_or_raise = (
+                    _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH_OR_RAISE
+                )
+                if original_get_full_path is None or original_get_full_path_or_raise is None:
+                    raise RuntimeError("Absolute folder-path lookup patch lost its originals.")
+                folder_paths.get_full_path = original_get_full_path
+                folder_paths.get_full_path_or_raise = original_get_full_path_or_raise
+                _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH = None
+                _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH_OR_RAISE = None
 
 
 def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:

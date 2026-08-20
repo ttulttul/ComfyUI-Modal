@@ -741,6 +741,9 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     assert observed_rewrite_settings[0].modal_gpu == "B300"
     queued_extra_data = prompt_server.prompt_queue.items[0][3]
     assert queued_extra_data["modal"]["gpu"] == "B300"
+    assert queued_extra_data["extra_pnginfo"][
+        api_intercept_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY
+    ] == "prompt-queue-warmup"
     assert len(prompt_server.prompt_queue.items) == 1
 
 

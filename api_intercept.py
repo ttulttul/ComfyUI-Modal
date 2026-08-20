@@ -23,6 +23,7 @@ from .modal_executor_node import (
     MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
     MODAL_MAP_INPUT_NODE_ID,
     MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
+    MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY,
     ensure_modal_artifact_finalizer_registered,
     ensure_modal_component_proxy_node_registered,
     ensure_modal_local_bridge_materializer_registered,
@@ -5353,6 +5354,14 @@ def setup_modal_queue_route(
                     time.perf_counter() - request_started_at,
                 )
                 return response
+
+            if prompt_id is not None:
+                extra_pnginfo[MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY] = prompt_id
+                json_data["extra_data"]["extra_pnginfo"] = extra_pnginfo
+                logger.debug(
+                    "Attached prompt-scoped Modal execution metadata prompt_id=%s.",
+                    prompt_id,
+                )
 
             try:
                 request_settings = settings_for_modal_gpu(
