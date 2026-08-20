@@ -1620,6 +1620,58 @@ class ResidentLLMManager:
                 reasoning=generation_result.reasoning,
             )
 
+    def prewarm(
+        self,
+        *,
+        profile: LLMModelProfile,
+        reserve_free_vram_gb: float,
+        representative_request_count: int,
+        workflow_execution_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Load one profile and execute bounded requests that populate compiler caches."""
+        if representative_request_count <= 0:
+            raise ValueError("representative_request_count must be positive.")
+
+        def report_progress(event: LLMProgressEvent) -> None:
+            """Log warmup progress without emitting synthetic ComfyUI node events."""
+            logger.info(
+                "LLM prewarm profile=%s stage=%s message=%s.",
+                profile.profile_id,
+                event.stage,
+                event.message,
+            )
+
+        started_at = time.perf_counter()
+        request_timings: list[float] = []
+        cache_hits: list[bool] = []
+        for request_index in range(representative_request_count):
+            request_started_at = time.perf_counter()
+            prepared_inputs = _representative_prewarm_inputs(profile, request_index)
+            result = self.infer(
+                profile=profile,
+                prepared_inputs=prepared_inputs,
+                generation_settings=LLMGenerationSettings(
+                    max_new_tokens=1,
+                    temperature=0.0,
+                    top_p=1.0,
+                    seed=request_index,
+                    enable_reasoning=False,
+                ),
+                reserve_free_vram_gb=reserve_free_vram_gb,
+                keep_model_loaded=True,
+                progress_callback=report_progress,
+                workflow_execution_id=workflow_execution_id,
+            )
+            request_timings.append(time.perf_counter() - request_started_at)
+            cache_hits.append(bool(result.metadata.get("cache_hit")))
+        return {
+            "profile_id": profile.profile_id,
+            "representative_request_count": representative_request_count,
+            "request_seconds": request_timings,
+            "cache_hits": cache_hits,
+            "elapsed_seconds": time.perf_counter() - started_at,
+        }
+
     def resident_profiles(self) -> tuple[str, ...]:
         """Return profile ids in least-to-most-recently-used order."""
         with self._lock:
@@ -1680,6 +1732,51 @@ def _current_workflow_execution_id() -> str | None:
         return None
     prompt_id = str(context.prompt_id).strip()
     return prompt_id or None
+
+
+def _representative_prewarm_inputs(
+    profile: LLMModelProfile,
+    request_index: int,
+) -> PreparedLLMInputs:
+    """Build a small deterministic request covering text and supported vision shapes."""
+    images: tuple[Image.Image, ...] = ()
+    if "image" in profile.modalities and request_index > 0:
+        side_length = 512 if request_index == 1 else 1024
+        images = (Image.new("RGB", (side_length, side_length), color=(127, 127, 127)),)
+    return PreparedLLMInputs(
+        prompt="Reply with OK.",
+        system_prompt="This is a runtime compilation warmup request.",
+        images=images,
+        video=None,
+        file_characters=0,
+        file_count=0,
+    )
+
+
+def prewarm_modal_llm_profile(
+    *,
+    model_profile: str,
+    reserve_free_vram_gb: float | None = None,
+    representative_request_count: int = 3,
+    workflow_execution_id: str | None = None,
+) -> dict[str, Any]:
+    """Load one staged Modal LLM and populate its reusable compiler caches."""
+    storage_root = os.getenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", _DEFAULT_STORAGE_ROOT)
+    profile = get_llm_profile(model_profile, storage_root=storage_root)
+    reserve_gb = (
+        _read_float_environment(
+            "COMFY_MODAL_LLM_RESERVE_FREE_GB",
+            _DEFAULT_RESERVE_FREE_VRAM_GB,
+        )
+        if reserve_free_vram_gb is None
+        else float(reserve_free_vram_gb)
+    )
+    return get_resident_llm_manager().prewarm(
+        profile=profile,
+        reserve_free_vram_gb=reserve_gb,
+        representative_request_count=representative_request_count,
+        workflow_execution_id=workflow_execution_id,
+    )
 
 
 def run_modal_llm_inference(
@@ -1763,6 +1860,7 @@ __all__ = [
     "LLMProgressEvent",
     "PreparedLLMInputs",
     "PreparedVideo",
+    "prewarm_modal_llm_profile",
     "ResidentLLMManager",
     "TransformersMultimodalBackend",
     "VLLMMultimodalBackend",

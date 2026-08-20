@@ -1897,7 +1897,9 @@ def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
     scheduled_function, scheduled_args = submitted_tasks[0]
     assert scheduled_function is remote_modal_app_module._run_speculative_affinity_prewarm
     assert scheduled_args[0] == "prompt-spec"
-    assert scheduled_args[1] == "worker-pool:comfy:slot:0"
+    scheduled_identity = json.loads(scheduled_args[1])
+    assert scheduled_identity["affinity"] == "worker-pool:comfy:slot:0"
+    assert scheduled_identity["snapshot_variant"] == "direct"
     assert scheduled_args[2]["remote_worker_affinity_group"] == "comfy"
     assert scheduled_args[2]["remote_local_gap_pool"] is True
     assert [
@@ -2125,6 +2127,189 @@ def test_build_prompt_warmup_request_skips_generic_gpu_snapshot_warmup_without_p
         remote_modal_app_module.get_settings.cache_clear()
 
     assert warmup_request is None
+
+
+def test_build_prompt_warmup_request_includes_llm_load_and_jit_plan(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """An LLM-only future component should warm even without a Comfy loader profile."""
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        warmup_request = remote_modal_app_module._build_prompt_warmup_request(
+            {
+                "prompt_id": "prompt-llm",
+                "component_id": "component-llm",
+                "remote_worker_affinity_group": "llm",
+                "subgraph_prompt": {
+                    "263": {
+                        "class_type": "ModalLLM",
+                        "inputs": {
+                            "model_profile": "qwen-test",
+                            "images": ["251", 0],
+                        },
+                    }
+                },
+            }
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert warmup_request is not None
+    assert warmup_request["snapshot_profile_key"] == ""
+    assert warmup_request["loader_prewarm_plans"] == []
+    assert len(warmup_request["llm_prewarm_plans"]) == 1
+    assert warmup_request["llm_prewarm_plans"][0]["model_profile"] == "qwen-test"
+    assert warmup_request["llm_prewarm_plans"][0]["representative_request_count"] == 3
+
+
+def test_dispatch_joins_matching_speculative_warmup(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A real dispatch should wait on the exact active speculative worker identity."""
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "false")
+    remote_modal_app_module.get_settings.cache_clear()
+    payload = {
+        "prompt_id": "prompt-join",
+        "component_id": "component-llm",
+        "remote_worker_affinity_group": "llm",
+    }
+    future: Future[Any] = Future()
+    identity = remote_modal_app_module._speculative_warmup_identity(
+        {**payload, "gpu_snapshot_variant": "direct"}
+    )
+    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+        state = remote_modal_app_module._ensure_prompt_warmup_state("prompt-join")
+        state.speculative_affinity_futures[identity] = future
+
+    timer = threading.Timer(0.03, lambda: future.set_result({"ready": True}))
+    timer.start()
+    started_at = time.perf_counter()
+    try:
+        remote_modal_app_module._await_matching_speculative_prewarm(payload, None)
+    finally:
+        timer.join()
+        remote_modal_app_module.get_settings.cache_clear()
+        with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+            remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+
+    assert time.perf_counter() - started_at >= 0.02
+
+
+def test_snapshot_policy_samples_both_variants_then_selects_faster(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Loader profiles should learn snapshot versus direct startup independently."""
+    profile_key = "loader-profile:test"
+    store: dict[str, Any] = {
+        profile_key: {
+            "snapshot_profile_key": profile_key,
+            "loader_prewarm_plans": [],
+            "snapshot_policy": {
+                "selected_variant": None,
+                "measurements": {"snapshot": [], "direct": []},
+            },
+        }
+    }
+
+    class FakeModal:
+        """Expose the shared policy dict through Modal's named-object shape."""
+
+        class Dict:
+            """Return the in-memory profile store."""
+
+            @staticmethod
+            def from_name(name: str, create_if_missing: bool = False) -> Any:
+                """Return the fake store."""
+                del name, create_if_missing
+                return store
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    try:
+        snapshot_payload = {"snapshot_profile_key": profile_key}
+        assert remote_modal_app_module._select_gpu_snapshot_for_profile(
+            snapshot_payload, profile_key
+        ) is True
+        remote_modal_app_module._record_snapshot_warmup_measurement(
+            snapshot_payload, 80.0
+        )
+        direct_payload = {"snapshot_profile_key": profile_key}
+        assert remote_modal_app_module._select_gpu_snapshot_for_profile(
+            direct_payload, profile_key
+        ) is False
+        remote_modal_app_module._record_snapshot_warmup_measurement(
+            direct_payload, 50.0
+        )
+        selected_payload = {"snapshot_profile_key": profile_key}
+        assert remote_modal_app_module._select_gpu_snapshot_for_profile(
+            selected_payload, profile_key
+        ) is False
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+
+    assert store[profile_key]["snapshot_policy"]["selected_variant"] == "direct"
+
+
+def test_post_deploy_seed_registers_a_joinable_profile_future(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Automatic deployment should seed the current important profile before dispatch."""
+    submitted_tasks: list[tuple[Any, tuple[Any, ...]]] = []
+
+    class FakeExecutor:
+        """Capture the automatic seed without invoking Modal."""
+
+        def submit(self, function: Any, *args: Any) -> Future[Any]:
+            """Record one seed job and return its pending future."""
+            submitted_tasks.append((function, args))
+            return Future()
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_REMOTE_MODAL_WARMUP_EXECUTOR",
+        FakeExecutor(),
+    )
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "false")
+    remote_modal_app_module.get_settings.cache_clear()
+    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+    try:
+        scheduled = remote_modal_app_module._schedule_post_deploy_runtime_seed(
+            {
+                "prompt_id": "prompt-deploy",
+                "component_id": "llm-component",
+                "remote_worker_affinity_group": "llm",
+                "subgraph_prompt": {
+                    "263": {
+                        "class_type": "ModalLLM",
+                        "inputs": {"model_profile": "qwen-test"},
+                    }
+                },
+            }
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert scheduled is True
+    assert len(submitted_tasks) == 1
+    scheduled_function, scheduled_args = submitted_tasks[0]
+    assert scheduled_function is remote_modal_app_module._run_speculative_affinity_prewarm
+    assert scheduled_args[-1] == "post_deploy_runtime_seed"
+    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+        state = remote_modal_app_module._PROMPT_WARMUP_STATES["prompt-deploy"]
+        assert len(state.speculative_affinity_futures) == 1
+        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
 
 
 def test_register_exact_component_parallelism_refines_prompt_target(
@@ -5459,6 +5644,7 @@ def test_modal_cloud_prepares_warm_container_for_request(
         "task_id": "task-123",
         "warmup_slot_index": 2,
         "reloaded_volume": True,
+        "llm_prewarm_results": [],
     }
 
 
@@ -5515,6 +5701,176 @@ def test_modal_cloud_executes_loader_prewarm_plans_once_per_worker(
         ("execute", ("component-1::loader-prewarm:7", "('7',)")),
         ("runtime", ("/tmp/extracted-bundle",)),
     ]
+
+
+def test_modal_cloud_parallelizes_independent_loader_prewarms(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Independent CLIP and UNET loads should overlap under bounded concurrency."""
+    active_count = 0
+    maximum_active_count = 0
+    counter_lock = threading.Lock()
+    original_plan_keys = set(modal_cloud_module._LOADER_PREWARM_PLAN_KEYS)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: None,
+    )
+
+    def execute_plan(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        """Record overlap while simulating one heavyweight loader."""
+        del args, kwargs
+        nonlocal active_count, maximum_active_count
+        with counter_lock:
+            active_count += 1
+            maximum_active_count = max(maximum_active_count, active_count)
+        time.sleep(0.04)
+        with counter_lock:
+            active_count -= 1
+        return ()
+
+    monkeypatch.setattr(modal_cloud_module, "_execute_subgraph_prompt", execute_plan)
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
+    monkeypatch.setenv("COMFY_MODAL_LOADER_PREWARM_WORKERS", "2")
+    modal_cloud_module.get_settings.cache_clear()
+    plans = [
+        {
+            "signature": f"parallel-loader-{index}",
+            "node_id": str(index),
+            "class_type": class_type,
+            "subgraph_prompt": {
+                str(index): {"class_type": class_type, "inputs": {}}
+            },
+            "execute_node_ids": [str(index)],
+        }
+        for index, class_type in enumerate(("CLIPLoader", "UNETLoader"), start=1)
+    ]
+    try:
+        modal_cloud_module._execute_loader_prewarm_plans(
+            component_id="parallel-component",
+            loader_prewarm_plans=plans,
+            custom_nodes_root=None,
+        )
+    finally:
+        modal_cloud_module.get_settings.cache_clear()
+        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.clear()
+        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.update(original_plan_keys)
+
+    assert maximum_active_count == 2
+
+
+def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
+    modal_cloud_module: Any,
+    modal_llm_runtime_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Successful representative LLM requests should publish and commit a JIT marker."""
+    observed_requests: list[tuple[str, int, str | None]] = []
+
+    def prewarm_profile(
+        *,
+        model_profile: str,
+        representative_request_count: int,
+        workflow_execution_id: str | None,
+    ) -> dict[str, Any]:
+        """Return deterministic warmup telemetry."""
+        observed_requests.append(
+            (model_profile, representative_request_count, workflow_execution_id)
+        )
+        return {
+            "profile_id": model_profile,
+            "representative_request_count": representative_request_count,
+        }
+
+    class FakeVolume:
+        """Count durable compile-cache commits."""
+
+        def __init__(self) -> None:
+            """Initialize counters."""
+            self.commits = 0
+
+        def commit(self) -> None:
+            """Record one commit."""
+            self.commits += 1
+
+    cloud_llm_runtime_module = sys.modules.get("modal_llm_runtime")
+    if cloud_llm_runtime_module is None:
+        cloud_llm_runtime_module = modal_llm_runtime_module
+        monkeypatch.setitem(
+            sys.modules,
+            "modal_llm_runtime",
+            cloud_llm_runtime_module,
+        )
+    monkeypatch.setattr(
+        cloud_llm_runtime_module,
+        "prewarm_modal_llm_profile",
+        prewarm_profile,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_llm_compile_manifest_path",
+        lambda signature: tmp_path / "manifests" / f"{signature}.json",
+    )
+    original_plan_keys = set(modal_cloud_module._LLM_PREWARM_PLAN_KEYS)
+    modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
+    volume = FakeVolume()
+    try:
+        results = modal_cloud_module._execute_llm_prewarm_plans(
+            component_id="llm-component",
+            prompt_id="prompt-1",
+            llm_prewarm_plans=[
+                {
+                    "signature": "plan-signature",
+                    "model_profile": "old-profile",
+                    "representative_request_count": 3,
+                    "prompt_node": {
+                        "class_type": "ModalLLM",
+                        "inputs": {"model_profile": "staged-profile"},
+                    },
+                }
+            ],
+            compile_cache_volume=volume,
+        )
+    finally:
+        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
+        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.update(original_plan_keys)
+
+    assert observed_requests == [("staged-profile", 3, "prompt-1")]
+    assert volume.commits == 1
+    assert Path(results[0]["manifest_path"]).exists()
+    assert results[0]["manifest_cache_hit"] is False
+
+
+def test_modal_cloud_reloads_compile_cache_before_restored_runtime(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Restored workers should refresh the cache Volume before importing runtimes."""
+    calls: list[str] = []
+
+    class FakeVolume:
+        """Record one reload."""
+
+        def reload(self) -> None:
+            """Record the refresh."""
+            calls.append("reload")
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: calls.append("runtime"),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_load_execution_module",
+        lambda: calls.append("execution"),
+    )
+
+    modal_cloud_module._prewarm_restored_runtime(FakeVolume())
+
+    assert calls == ["reload", "runtime", "execution"]
 
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
@@ -6640,16 +6996,16 @@ def test_lookup_deployed_remote_engine_uses_affinity_as_modal_class_parameter(
     )
 
     assert result == {
-        "gpu_snapshot_enabled": True,
+        "gpu_snapshot_enabled": False,
         "worker_affinity_key": "worker-pool:slot:0",
     }
-    assert probe_result == {"gpu_snapshot_enabled": True}
+    assert probe_result == {"gpu_snapshot_enabled": False}
     assert observed_kwargs == [
         {
-            "gpu_snapshot_enabled": True,
+            "gpu_snapshot_enabled": False,
             "worker_affinity_key": "worker-pool:slot:0",
         },
-        {"gpu_snapshot_enabled": True},
+        {"gpu_snapshot_enabled": False},
     ]
 
 
@@ -6679,7 +7035,7 @@ def test_lookup_deployed_remote_engine_uses_workflow_gpu_app_identity(
     )
 
     assert result == {
-        "gpu_snapshot_enabled": True,
+        "gpu_snapshot_enabled": False,
         "worker_affinity_key": "worker-pool:slot:0",
     }
     assert observed_lookups == [("comfy-modal-sync-gpu-b300", "RemoteEngine")]
@@ -6952,20 +7308,20 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
     )
 
     assert first_result == {
-        "gpu_snapshot_enabled": True,
+        "gpu_snapshot_enabled": False,
         "worker_affinity_key": "worker-pool:slot:0",
     }
     assert second_result == {
-        "gpu_snapshot_enabled": True,
+        "gpu_snapshot_enabled": False,
         "worker_affinity_key": "worker-pool:slot:0",
     }
     assert observed_kwargs == [
         {
-            "gpu_snapshot_enabled": True,
+            "gpu_snapshot_enabled": False,
             "worker_affinity_key": "worker-pool:slot:0",
         },
         {
-            "gpu_snapshot_enabled": True,
+            "gpu_snapshot_enabled": False,
             "worker_affinity_key": "worker-pool:slot:0",
         },
     ]

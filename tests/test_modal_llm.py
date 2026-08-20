@@ -1193,6 +1193,25 @@ def test_vllm_auto_mode_promotes_on_second_distinct_workflow(
     )
 
 
+def test_representative_llm_prewarm_inputs_cover_text_and_vision_shapes(
+    modal_llm_runtime_module: Any,
+) -> None:
+    """JIT warmup should exercise text plus two bounded image resolutions."""
+    profile = SimpleNamespace(modalities=frozenset({"text", "image"}))
+
+    text_inputs = modal_llm_runtime_module._representative_prewarm_inputs(profile, 0)
+    small_image_inputs = modal_llm_runtime_module._representative_prewarm_inputs(
+        profile, 1
+    )
+    large_image_inputs = modal_llm_runtime_module._representative_prewarm_inputs(
+        profile, 2
+    )
+
+    assert text_inputs.images == ()
+    assert small_image_inputs.images[0].size == (512, 512)
+    assert large_image_inputs.images[0].size == (1024, 1024)
+
+
 def test_vllm_backend_translates_private_runtime_errors(
     modal_llm_runtime_module: Any,
     monkeypatch: pytest.MonkeyPatch,

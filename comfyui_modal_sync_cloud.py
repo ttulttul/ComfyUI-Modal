@@ -130,6 +130,10 @@ _LOADER_CACHE_METRICS_LOCK = threading.Lock()
 _LOADER_CACHE_METRICS: dict[str, int] = {"hit": 0, "miss": 0}
 _LOADER_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
 _LOADER_PREWARM_PLAN_KEYS: set[str] = set()
+_LLM_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
+_LLM_PREWARM_PLAN_KEYS: set[str] = set()
+_LLM_ACTUAL_COMPILE_COMMITS_LOCK = threading.Lock()
+_LLM_ACTUAL_COMPILE_COMMITS: set[str] = set()
 _SNAPSHOT_PROFILE_CACHE_LOCK = threading.Lock()
 _SNAPSHOT_PROFILE_CACHE: dict[str, list[dict[str, Any]]] = {}
 _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
@@ -6524,9 +6528,23 @@ def _prewarm_snapshot_state(
             )
 
 
-def _prewarm_restored_runtime() -> None:
+def _reload_compile_cache_volume(volume: Any | None) -> bool:
+    """Refresh persistent compiler artifacts before a runtime opens its caches."""
+    if volume is None:
+        return False
+    reload_method = getattr(volume, "reload", None)
+    if not callable(reload_method):
+        logger.warning("Modal compile-cache Volume does not expose reload().")
+        return False
+    with _timed_phase("llm_compile_cache_reload"):
+        reload_method()
+    return True
+
+
+def _prewarm_restored_runtime(compile_cache_volume: Any | None = None) -> None:
     """Run post-restore initialization that should be ready before serving requests."""
     with _timed_phase("prewarm_restored_runtime"):
+        _reload_compile_cache_volume(compile_cache_volume)
         _ensure_comfy_runtime_initialized(None)
         _load_execution_module()
 
@@ -7018,7 +7036,9 @@ def _emit_modal_volume_reload_skip(component_id: Any, payload: dict[str, Any]) -
 
 
 def _prepare_warm_container_for_request(
-    volume: Any, payload: dict[str, Any]
+    volume: Any,
+    payload: dict[str, Any],
+    compile_cache_volume: Any | None = None,
 ) -> dict[str, Any]:
     """Prime one RemoteEngine container for a request before the first real execution payload arrives."""
     component_id = str(payload.get("component_id") or "modal-warmup")
@@ -7026,6 +7046,7 @@ def _prepare_warm_container_for_request(
     _hydrate_missing_payload_volume_paths(volume, payload)
     needs_volume_reload = _should_reload_modal_volume(payload)
     with _timed_phase("remote_engine_warmup", component=component_id):
+        _reload_compile_cache_volume(compile_cache_volume)
         if needs_volume_reload:
             _reload_modal_volume_for_request(
                 volume,
@@ -7048,6 +7069,19 @@ def _prepare_warm_container_for_request(
                 loader_prewarm_plans=loader_prewarm_plans,
                 custom_nodes_root=custom_nodes_root,
             )
+        llm_prewarm_plans = payload.get("llm_prewarm_plans")
+        llm_prewarm_results: list[dict[str, Any]] = []
+        if isinstance(llm_prewarm_plans, list) and llm_prewarm_plans:
+            llm_prewarm_results = _execute_llm_prewarm_plans(
+                component_id=component_id,
+                prompt_id=(
+                    str(payload["prompt_id"])
+                    if payload.get("prompt_id") is not None
+                    else None
+                ),
+                llm_prewarm_plans=llm_prewarm_plans,
+                compile_cache_volume=compile_cache_volume,
+            )
         return {
             "component_id": component_id,
             "task_id": os.getenv("MODAL_TASK_ID"),
@@ -7057,6 +7091,7 @@ def _prepare_warm_container_for_request(
                 else None
             ),
             "reloaded_volume": needs_volume_reload,
+            "llm_prewarm_results": llm_prewarm_results,
         }
 
 
@@ -7102,7 +7137,7 @@ def _execute_loader_prewarm_plans(
         return
 
     _ensure_comfy_runtime_initialized(custom_nodes_root)
-    executed_plan_count = 0
+    executable_plans: list[tuple[int, Mapping[str, Any], str | None]] = []
     skipped_plan_count = 0
     for plan_index, plan in enumerate(loader_prewarm_plans):
         if not isinstance(plan, Mapping):
@@ -7114,6 +7149,14 @@ def _execute_loader_prewarm_plans(
                     skipped_plan_count += 1
                     continue
                 _LOADER_PREWARM_PLAN_KEYS.add(plan_key)
+        executable_plans.append((plan_index, plan, plan_key))
+
+    def execute_plan(
+        plan_entry: tuple[int, Mapping[str, Any], str | None]
+    ) -> None:
+        """Execute one reserved loader plan and make failures retryable."""
+        plan_index, plan, plan_key = plan_entry
+        started_at = time.perf_counter()
         try:
             _execute_subgraph_prompt(
                 _build_loader_prewarm_payload(
@@ -7124,12 +7167,45 @@ def _execute_loader_prewarm_plans(
                 hydrated_inputs={},
                 custom_nodes_root=custom_nodes_root,
             )
-            executed_plan_count += 1
         except Exception:
             if plan_key is not None:
                 with _LOADER_PREWARM_PLAN_KEYS_LOCK:
                     _LOADER_PREWARM_PLAN_KEYS.discard(plan_key)
             raise
+        logger.info(
+            "Completed loader prewarm component=%s class_type=%s plan_index=%d elapsed_seconds=%.3f.",
+            component_id,
+            plan.get("class_type"),
+            plan_index,
+            time.perf_counter() - started_at,
+        )
+
+    worker_count = min(
+        len(executable_plans),
+        max(1, int(get_settings().loader_prewarm_workers)),
+    )
+    if worker_count > 1:
+        logger.info(
+            "Running %d independent loader prewarms with bounded concurrency=%d component=%s.",
+            len(executable_plans),
+            worker_count,
+            component_id,
+        )
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="modal-loader-prewarm",
+        ) as executor:
+            futures = [
+                executor.submit(execute_plan, plan_entry)
+                for plan_entry in executable_plans
+            ]
+            for future in futures:
+                future.result()
+    else:
+        for plan_entry in executable_plans:
+            execute_plan(plan_entry)
+
+    executed_plan_count = len(executable_plans)
     if executed_plan_count or skipped_plan_count:
         logger.info(
             "Warm container loader prewarm finished for component=%s executed=%d skipped=%d.",
@@ -7137,6 +7213,204 @@ def _execute_loader_prewarm_plans(
             executed_plan_count,
             skipped_plan_count,
         )
+
+
+def _llm_prewarm_model_profile(plan: Mapping[str, Any]) -> str:
+    """Return the staged model profile from one rewritten LLM warmup plan."""
+    prompt_node = plan.get("prompt_node")
+    if isinstance(prompt_node, Mapping):
+        inputs = prompt_node.get("inputs")
+        if isinstance(inputs, Mapping):
+            model_profile = inputs.get("model_profile")
+            if isinstance(model_profile, str) and model_profile.strip():
+                return model_profile.strip()
+    model_profile = plan.get("model_profile")
+    if not isinstance(model_profile, str) or not model_profile.strip():
+        raise ValueError("LLM prewarm plan requires a fixed model_profile.")
+    return model_profile.strip()
+
+
+def _llm_compile_manifest_path(signature: str) -> Path:
+    """Return the content-addressed completion marker for one JIT warmup plan."""
+    cache_root = Path(
+        os.getenv("TRITON_CACHE_DIR", str(_REMOTE_LLM_COMPILE_CACHE_ROOT))
+    ).parent
+    return cache_root / "manifests" / f"{signature}.json"
+
+
+def _write_llm_compile_manifest(
+    *,
+    signature: str,
+    model_profile: str,
+    result: Mapping[str, Any],
+) -> Path:
+    """Atomically publish successful representative-warmup metadata."""
+    manifest_path = _llm_compile_manifest_path(signature)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = manifest_path.with_suffix(f".{os.getpid()}.tmp")
+    temporary_path.write_text(
+        json.dumps(
+            {
+                "signature": signature,
+                "model_profile": model_profile,
+                "runtime_fingerprint": os.getenv(
+                    "COMFY_MODAL_RUNTIME_FINGERPRINT", ""
+                ),
+                "completed_at": time.time(),
+                "result": dict(result),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    temporary_path.replace(manifest_path)
+    return manifest_path
+
+
+def _execute_llm_prewarm_plans(
+    *,
+    component_id: str,
+    prompt_id: str | None,
+    llm_prewarm_plans: list[dict[str, Any]],
+    compile_cache_volume: Any | None,
+) -> list[dict[str, Any]]:
+    """Load resident LLMs, exercise representative shapes, and commit JIT caches."""
+    from modal_llm_runtime import prewarm_modal_llm_profile
+
+    results: list[dict[str, Any]] = []
+    for plan in llm_prewarm_plans:
+        if not isinstance(plan, Mapping):
+            continue
+        plan_signature = str(plan.get("signature") or "").strip()
+        if not plan_signature:
+            raise ValueError("LLM prewarm plan requires a stable signature.")
+        model_profile = _llm_prewarm_model_profile(plan)
+        signature = hashlib.sha256(
+            json.dumps(
+                {
+                    "model_profile": model_profile,
+                    "plan_signature": plan_signature,
+                    "runtime_fingerprint": os.getenv(
+                        "COMFY_MODAL_RUNTIME_FINGERPRINT", ""
+                    ),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest_path = _llm_compile_manifest_path(signature)
+        representative_request_count = (
+            1
+            if manifest_path.exists()
+            else max(1, int(plan.get("representative_request_count") or 3))
+        )
+        with _LLM_PREWARM_PLAN_KEYS_LOCK:
+            already_resident = signature in _LLM_PREWARM_PLAN_KEYS
+            _LLM_PREWARM_PLAN_KEYS.add(signature)
+        if already_resident:
+            logger.info(
+                "Skipping duplicate resident LLM prewarm profile=%s component=%s.",
+                model_profile,
+                component_id,
+            )
+            continue
+        try:
+            with _timed_phase(
+                "llm_representative_prewarm",
+                component=component_id,
+                profile=model_profile,
+                requests=representative_request_count,
+            ):
+                result = prewarm_modal_llm_profile(
+                    model_profile=model_profile,
+                    representative_request_count=representative_request_count,
+                    workflow_execution_id=prompt_id,
+                )
+            manifest_path = _write_llm_compile_manifest(
+                signature=signature,
+                model_profile=model_profile,
+                result=result,
+            )
+            if compile_cache_volume is not None:
+                commit_method = getattr(compile_cache_volume, "commit", None)
+                if not callable(commit_method):
+                    raise RuntimeError(
+                        "Modal compile-cache Volume does not expose commit()."
+                    )
+                with _timed_phase("llm_compile_cache_commit", profile=model_profile):
+                    commit_method()
+            results.append(
+                {
+                    **result,
+                    "manifest_path": str(manifest_path),
+                    "manifest_cache_hit": representative_request_count == 1,
+                }
+            )
+        except Exception:
+            with _LLM_PREWARM_PLAN_KEYS_LOCK:
+                _LLM_PREWARM_PLAN_KEYS.discard(signature)
+            raise
+    return results
+
+
+def _llm_profiles_in_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Collect the effective ModalLLM profile IDs from one execution payload."""
+    profiles: set[str] = set()
+
+    def visit(value: Any) -> None:
+        """Walk nested prompt data looking for ModalLLM nodes."""
+        if isinstance(value, Mapping):
+            if value.get("class_type") == "ModalLLM":
+                inputs = value.get("inputs")
+                if isinstance(inputs, Mapping):
+                    profile = inputs.get("model_profile")
+                    if isinstance(profile, str) and profile.strip():
+                        profiles.add(profile.strip())
+            for nested_value in value.values():
+                visit(nested_value)
+        elif isinstance(value, (list, tuple)):
+            for nested_value in value:
+                visit(nested_value)
+
+    visit(payload)
+    return tuple(sorted(profiles))
+
+
+def _commit_actual_llm_compile_cache(
+    payload: Mapping[str, Any],
+    compile_cache_volume: Any | None,
+) -> bool:
+    """Commit kernels produced by the first real request for each profile set."""
+    profiles = _llm_profiles_in_payload(payload)
+    if not profiles or compile_cache_volume is None:
+        return False
+    commit_key = hashlib.sha256(
+        json.dumps(
+            {
+                "profiles": profiles,
+                "runtime_fingerprint": os.getenv(
+                    "COMFY_MODAL_RUNTIME_FINGERPRINT", ""
+                ),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    with _LLM_ACTUAL_COMPILE_COMMITS_LOCK:
+        if commit_key in _LLM_ACTUAL_COMPILE_COMMITS:
+            return False
+        _LLM_ACTUAL_COMPILE_COMMITS.add(commit_key)
+    commit_method = getattr(compile_cache_volume, "commit", None)
+    if not callable(commit_method):
+        with _LLM_ACTUAL_COMPILE_COMMITS_LOCK:
+            _LLM_ACTUAL_COMPILE_COMMITS.discard(commit_key)
+        raise RuntimeError("Modal compile-cache Volume does not expose commit().")
+    try:
+        with _timed_phase("llm_actual_compile_cache_commit", profiles=profiles):
+            commit_method()
+    except Exception:
+        with _LLM_ACTUAL_COMPILE_COMMITS_LOCK:
+            _LLM_ACTUAL_COMPILE_COMMITS.discard(commit_key)
+        raise
+    return True
 
 
 def _llm_compile_cache_namespace(settings: Any) -> str:
@@ -7172,6 +7446,8 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
         "TORCHINDUCTOR_CACHE_DIR": str(compile_cache_root / "torchinductor"),
         "TRITON_CACHE_DIR": str(compile_cache_root / "triton"),
         "CUDA_CACHE_PATH": str(compile_cache_root / "cuda"),
+        "TORCH_EXTENSIONS_DIR": str(compile_cache_root / "torch-extensions"),
+        "NUMBA_CACHE_DIR": str(compile_cache_root / "numba"),
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "COMFY_MODAL_SECRET_NAME": getattr(
             settings,
@@ -7563,7 +7839,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def setup_restored_runtime(self) -> None:
             """Prepare request-serving runtime state after a fresh boot or snapshot restore."""
             with _timed_phase("remote_engine_setup_restored"):
-                _prewarm_restored_runtime()
+                _prewarm_restored_runtime(llm_compile_cache_vol)
                 logger.info(
                     "RemoteEngine restored-runtime setup complete for snapshot_profile_key=%s.",
                     self.snapshot_profile_key or None,
@@ -7639,7 +7915,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                                 interrupt_flag_key=execution_control.interrupt_flag_key,
                             )
 
-                        return _execute_with_durable_invocation(payload, execute_once)
+                        result = _execute_with_durable_invocation(
+                            payload, execute_once
+                        )
+                        _commit_actual_llm_compile_cache(
+                            payload,
+                            llm_compile_cache_vol,
+                        )
+                        return result
             except Exception as exc:
                 _maybe_schedule_container_termination_on_error(payload, exc)
                 raise
@@ -7647,7 +7930,11 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         @modal.method()
         def warmup_for_request(self, payload: dict[str, Any]) -> dict[str, Any]:
             """Prime the current or a newly started Modal container for one prompt."""
-            return _prepare_warm_container_for_request(vol, payload)
+            return _prepare_warm_container_for_request(
+                vol,
+                payload,
+                llm_compile_cache_vol,
+            )
 
         @modal.method()
         def keepalive_for_local_gap(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -7711,6 +7998,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                             cancellation_event=execution_control.cancellation_event,
                             interrupt_store=interrupt_flags,
                             interrupt_flag_key=execution_control.interrupt_flag_key,
+                        )
+                        _commit_actual_llm_compile_cache(
+                            payload,
+                            llm_compile_cache_vol,
                         )
             except Exception as exc:
                 _maybe_schedule_container_termination_on_error(payload, exc)

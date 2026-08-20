@@ -18,7 +18,7 @@ else:  # pragma: no cover - the stable cloud entrypoint imports this module top-
 
 logger = logging.getLogger(__name__)
 
-REMOTE_APP_PROTOCOL_VERSION = 8
+REMOTE_APP_PROTOCOL_VERSION = 9
 REMOTE_PYTHON_VERSION = "3.13"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
@@ -123,6 +123,7 @@ class RemoteRuntimeSettings(Protocol):
     invocation_dict_name: str
     invocation_result_inline_max_bytes: int
     interrupt_dict_name: str
+    loader_prewarm_workers: int
     max_containers: int | None
     min_containers: int
     modal_gpu: str
@@ -422,6 +423,11 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "invocation_dict_name": settings.invocation_dict_name,
         "invocation_result_inline_max_bytes": settings.invocation_result_inline_max_bytes,
         "interrupt_dict_name": settings.interrupt_dict_name,
+        "loader_prewarm_workers": getattr(
+            settings,
+            "loader_prewarm_workers",
+            2,
+        ),
         "max_containers": settings.max_containers,
         "min_containers": settings.min_containers,
         "modal_gpu": settings.modal_gpu,

@@ -359,6 +359,21 @@ def test_settings_reads_proactive_warmup_override(
     assert settings.enable_proactive_warmup is False
 
 
+def test_settings_reads_loader_prewarm_worker_limit(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Heavy loader overlap should have a bounded environment-configured limit."""
+    monkeypatch.setenv("COMFY_MODAL_LOADER_PREWARM_WORKERS", "3")
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.loader_prewarm_workers == 3
+
+
 def test_settings_reads_local_gap_keepalive_overrides(
     settings_module: Any,
     monkeypatch: Any,
