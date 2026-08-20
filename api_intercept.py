@@ -2455,6 +2455,17 @@ def _component_has_local_reentry_dependency(
     return False
 
 
+def _component_has_parallel_local_remote_fanout(
+    component: RemoteComponentPlan,
+) -> bool:
+    """Return whether one remote output feeds local work and a remote continuation."""
+    return any(
+        boundary_output.local_materializer_node_id is not None
+        and bool(boundary_output.session_consumer_node_ids)
+        for boundary_output in component.boundary_outputs
+    )
+
+
 def _order_execute_node_ids_for_transportable_splits(
     *,
     prompt: dict[str, Any],
@@ -3094,6 +3105,14 @@ def _build_component_payload(
         custom_nodes_bundle.remote_path if custom_nodes_bundle is not None else None
     )
 
+    def remote_worker_affinity_group(component_node_ids: list[str]) -> str:
+        """Return the worker-pool group required by one remote component phase."""
+        class_types = {
+            str((component_prompt.get(node_id) or {}).get("class_type") or "")
+            for node_id in component_node_ids
+        }
+        return "llm" if "ModalLLM" in class_types else "comfy"
+
     def build_subgraph_payload(
         *,
         component_id: str,
@@ -3111,6 +3130,9 @@ def _build_component_payload(
             "component_id": component_id,
             "prompt_id": prompt_id,
             "modal_gpu": settings.modal_gpu,
+            "remote_worker_affinity_group": remote_worker_affinity_group(
+                component_node_ids
+            ),
             "component_node_ids": list(component_node_ids),
             "subgraph_prompt": _subset_component_prompt(component_prompt, component_node_ids),
             "boundary_inputs": _serialize_boundary_input_specs(
@@ -3135,17 +3157,20 @@ def _build_component_payload(
         return payload
 
     def build_phase_payloads_for_transportable_splits() -> list[dict[str, Any]] | None:
-        """Return ordered split-proxy phase payloads for components with local feedback."""
+        """Return ordered phases for local feedback or parallel local fanout."""
         if len(component.execute_node_ids) <= 1:
             return None
         has_local_reentry_dependency = _component_has_local_reentry_dependency(
             prompt=signature_prompt,
             component=component,
         )
-        if not has_local_reentry_dependency:
+        has_parallel_local_remote_fanout = _component_has_parallel_local_remote_fanout(
+            component
+        )
+        if not has_local_reentry_dependency and not has_parallel_local_remote_fanout:
             logger.info(
                 "Keeping remote component %s as one proxy because execute targets %s "
-                "have no local re-entry dependency.",
+                "have neither a local re-entry dependency nor parallel local/remote fanout.",
                 component.representative_node_id,
                 component.execute_node_ids,
             )
@@ -3155,6 +3180,12 @@ def _build_component_payload(
                 "Allowing remote component %s with local tap nodes %s to split because it has a local re-entry dependency.",
                 component.representative_node_id,
                 component.local_tap_node_ids,
+            )
+        if has_parallel_local_remote_fanout:
+            logger.info(
+                "Forcing ordered phases for remote component %s because a remote output "
+                "feeds both a non-returning local branch and later remote execution.",
+                component.representative_node_id,
             )
 
         component_node_id_set = set(component.node_ids)
@@ -3369,6 +3400,9 @@ def _build_component_payload(
         "component_id": component.representative_node_id,
         "prompt_id": prompt_id,
         "modal_gpu": settings.modal_gpu,
+        "remote_worker_affinity_group": remote_worker_affinity_group(
+            list(component.node_ids)
+        ),
         "component_node_ids": list(component.node_ids),
         "subgraph_prompt": component_prompt,
         "boundary_inputs": _serialize_boundary_input_specs(
@@ -3693,9 +3727,26 @@ def _rewrite_component_into_proxy(
         phase_proxy_node_ids: list[str] = []
         produced_output_indices_by_name: dict[str, list[Any]] = {}
         replacement_output_indices: dict[LinkedOutputRef, list[Any]] = {}
+        materializer_output_by_consumer_and_source: dict[
+            tuple[str, LinkedOutputRef], list[Any]
+        ] = {}
+        proxy_output_by_consumer_and_source: dict[
+            tuple[str, LinkedOutputRef], list[Any]
+        ] = {}
+        materializer_proxy_output_by_node_id: dict[str, list[Any]] = {}
+        boundary_output_specs_by_source = {
+            boundary_output.source: boundary_output
+            for boundary_output in component.boundary_outputs
+        }
         component_proxy_node_ids: set[str] = set()
         phase_proxy_inputs_by_node_id: dict[str, dict[str, Any]] = {}
         phase_proxy_meta_by_node_id: dict[str, dict[str, Any]] = {}
+
+        if any(
+            spec.local_materializer_node_id is not None
+            for spec in component.boundary_outputs
+        ):
+            ensure_modal_local_bridge_materializer_registered(nodes_module)
 
         for phase_payload in phase_payloads:
             phase_proxy_node_id = str(phase_payload["component_id"])
@@ -3722,15 +3773,30 @@ def _rewrite_component_into_proxy(
 
             for output_index, boundary_output in enumerate(phase_payload.get("boundary_outputs", [])):
                 proxy_output_name = str(boundary_output["proxy_output_name"])
-                produced_output_indices_by_name[proxy_output_name] = [phase_proxy_node_id, output_index]
+                proxy_output = [phase_proxy_node_id, output_index]
+                produced_output_indices_by_name[proxy_output_name] = proxy_output
+                source = LinkedOutputRef(
+                    node_id=str(boundary_output["node_id"]),
+                    output_index=int(boundary_output["output_index"]),
+                )
+                boundary_output_spec = boundary_output_specs_by_source.get(source)
+                if boundary_output_spec is not None:
+                    for consumer_node_id in boundary_output_spec.session_consumer_node_ids:
+                        proxy_output_by_consumer_and_source[
+                            (consumer_node_id, source)
+                        ] = proxy_output
+                    materializer_node_id = boundary_output_spec.local_materializer_node_id
+                    if materializer_node_id is not None:
+                        materializer_proxy_output_by_node_id[materializer_node_id] = proxy_output
+                        for consumer_node_id in (
+                            boundary_output_spec.local_materializer_consumer_node_ids
+                        ):
+                            materializer_output_by_consumer_and_source[
+                                (consumer_node_id, source)
+                            ] = [materializer_node_id, 0]
                 if bool(boundary_output.get("session_output")):
                     continue
-                replacement_output_indices[
-                    LinkedOutputRef(
-                        node_id=str(boundary_output["node_id"]),
-                        output_index=int(boundary_output["output_index"]),
-                    )
-                ] = [phase_proxy_node_id, output_index]
+                replacement_output_indices[source] = proxy_output
 
         for node_id in component.node_ids:
             rewritten_prompt.pop(node_id, None)
@@ -3744,6 +3810,13 @@ def _rewrite_component_into_proxy(
                 meta=phase_proxy_meta_by_node_id[phase_proxy_node_id],
                 is_output_node=contains_output_node(list(phase_payload["component_node_ids"])),
             )
+
+        for materializer_node_id, proxy_output in materializer_proxy_output_by_node_id.items():
+            rewritten_prompt[materializer_node_id] = {
+                "class_type": MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
+                "inputs": {"bridge_ref": list(proxy_output)},
+                "_meta": {"title": "Modal Local Bridge Materializer"},
+            }
 
         if component.mapped_boundary_source_node_id is not None:
             mapped_node_id_set = set(component.mapped_node_ids)
@@ -3765,8 +3838,17 @@ def _rewrite_component_into_proxy(
                 if not _is_link(input_value):
                     continue
                 source = LinkedOutputRef(node_id=str(input_value[0]), output_index=int(input_value[1]))
-                if source in replacement_output_indices:
-                    prompt_node["inputs"][input_name] = list(replacement_output_indices[source])
+                replacement_output = materializer_output_by_consumer_and_source.get(
+                    (node_id, source)
+                )
+                if replacement_output is None:
+                    replacement_output = proxy_output_by_consumer_and_source.get(
+                        (node_id, source)
+                    )
+                if replacement_output is None:
+                    replacement_output = replacement_output_indices.get(source)
+                if replacement_output is not None:
+                    prompt_node["inputs"][input_name] = list(replacement_output)
 
         logger.info(
             "Rewrote remote component %s into ordered proxies %s.",

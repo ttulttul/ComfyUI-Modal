@@ -12,6 +12,27 @@ from typing import Any, Iterator
 import pytest
 
 
+def test_remote_worker_affinity_separates_llm_and_comfy_pools(
+    remote_modal_app_module: Any,
+) -> None:
+    """LLM phases must not reuse a warm worker holding ordinary Comfy models."""
+    common_payload = {
+        "component_id": "component-1",
+        "remote_local_gap_pool": True,
+    }
+
+    comfy_key = remote_modal_app_module._remote_worker_affinity_key(
+        {**common_payload, "remote_worker_affinity_group": "comfy"}
+    )
+    llm_key = remote_modal_app_module._remote_worker_affinity_key(
+        {**common_payload, "remote_worker_affinity_group": "llm"}
+    )
+
+    assert comfy_key == "worker-pool:comfy:slot:0"
+    assert llm_key == "worker-pool:llm:slot:0"
+    assert comfy_key != llm_key
+
+
 @pytest.mark.parametrize(
     "module_fixture_name",
     ["modal_cloud_module", "remote_modal_app_module"],
