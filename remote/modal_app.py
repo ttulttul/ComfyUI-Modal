@@ -6742,8 +6742,15 @@ def _ensure_remote_engine_protocol_current(
     settings = _settings_for_payload(payload)
     runtime_cache_key = _modal_runtime_cache_key(payload)
     with _MODAL_AUTO_DEPLOY_LOCK:
-        if runtime_cache_key in _MODAL_REMOTE_APP_VERSION_OK:
-            return remote_engine
+        runtime_is_known_current = runtime_cache_key in _MODAL_REMOTE_APP_VERSION_OK
+    if runtime_is_known_current:
+        logger.info(
+            "Rebinding deployed RemoteEngine after cached protocol validation "
+            "component=%s worker_affinity=%s.",
+            payload.get("component_id"),
+            _remote_worker_affinity_key(payload),
+        )
+        return _lookup_deployed_remote_engine(payload)
     version_payload = _remote_engine_runtime_version(remote_engine)
     if _is_runtime_version_payload_current(version_payload, payload):
         with _MODAL_AUTO_DEPLOY_LOCK:
