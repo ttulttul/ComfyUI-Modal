@@ -17,6 +17,7 @@ import queue
 import select
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -6098,22 +6099,12 @@ def _lookup_deployed_remote_engine(
 
     settings = _settings_for_payload(payload)
     deployment_app_name = modal_deployment_app_name(settings)
-    loader_prewarm_plans: list[dict[str, Any]] = _build_loader_prewarm_plans(payload)
-    snapshot_profile_key = ""
-    payload_snapshot_profile_key = payload.get("snapshot_profile_key")
-    if isinstance(payload_snapshot_profile_key, str):
-        snapshot_profile_key = payload_snapshot_profile_key.strip()
-    if snapshot_profile_key:
-        stored_snapshot_profile_key = _store_loader_snapshot_profile(
-            loader_prewarm_plans
-        )
-        if stored_snapshot_profile_key:
-            snapshot_profile_key = stored_snapshot_profile_key
-            payload["snapshot_profile_key"] = snapshot_profile_key
-    else:
-        snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
-        if snapshot_profile_key:
-            payload["snapshot_profile_key"] = snapshot_profile_key
+    snapshot_profile_key = _prepare_snapshot_profile_fields(payload)
+    gpu_snapshot_enabled = (
+        False
+        if protocol_probe
+        else _select_gpu_snapshot_for_profile(payload, snapshot_profile_key)
+    )
     worker_affinity_key = affinity_key_override or _remote_worker_affinity_key(payload)
     logger.info(
         "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s snapshot_profile=%s gpu_snapshot_enabled=%s.",
@@ -6122,7 +6113,7 @@ def _lookup_deployed_remote_engine(
         payload.get("component_id"),
         worker_affinity_key,
         snapshot_profile_key or None,
-        settings.enable_gpu_memory_snapshot,
+        gpu_snapshot_enabled,
     )
     remote_cls = modal.Cls.from_name(deployment_app_name, "RemoteEngine")
     if bool(payload.get("remote_local_gap_pool")) and hasattr(remote_cls, "with_options"):
@@ -6140,7 +6131,7 @@ def _lookup_deployed_remote_engine(
             local_gap_scaledown_seconds,
         )
     remote_engine_kwargs: dict[str, Any] = {
-        "gpu_snapshot_enabled": bool(settings.enable_gpu_memory_snapshot),
+        "gpu_snapshot_enabled": gpu_snapshot_enabled,
     }
     if snapshot_profile_key:
         remote_engine_kwargs["snapshot_profile_key"] = snapshot_profile_key
@@ -7016,6 +7007,10 @@ def _normalize_loader_snapshot_profile_record(
     return {
         "snapshot_profile_key": snapshot_profile_key,
         "loader_prewarm_plans": copy.deepcopy(loader_prewarm_plans),
+        "snapshot_policy": {
+            "selected_variant": None,
+            "measurements": {"snapshot": [], "direct": []},
+        },
     }
 
 
@@ -7032,15 +7027,147 @@ def _store_loader_snapshot_profile(loader_prewarm_plans: list[dict[str, Any]]) -
     snapshot_profile_key = str(normalized_record["snapshot_profile_key"])
     with _SNAPSHOT_PROFILE_RECORDS_LOCK:
         cached_record = _SNAPSHOT_PROFILE_RECORDS.get(snapshot_profile_key)
-        if cached_record == normalized_record:
+        if cached_record is not None:
             return snapshot_profile_key
         snapshot_profiles = modal.Dict.from_name(
             settings.snapshot_profile_dict_name,
             create_if_missing=True,
         )
-        snapshot_profiles[snapshot_profile_key] = normalized_record
-        _SNAPSHOT_PROFILE_RECORDS[snapshot_profile_key] = normalized_record
+        stored_record = snapshot_profiles.get(snapshot_profile_key)
+        if isinstance(stored_record, dict):
+            merged_record = copy.deepcopy(stored_record)
+            merged_record["snapshot_profile_key"] = snapshot_profile_key
+            merged_record["loader_prewarm_plans"] = copy.deepcopy(
+                loader_prewarm_plans
+            )
+        else:
+            merged_record = normalized_record
+        snapshot_profiles[snapshot_profile_key] = merged_record
+        _SNAPSHOT_PROFILE_RECORDS[snapshot_profile_key] = merged_record
     return snapshot_profile_key
+
+
+def _prepare_snapshot_profile_fields(payload: dict[str, Any]) -> str:
+    """Derive, persist, and attach the loader profile used by one request."""
+    loader_prewarm_plans = _build_loader_prewarm_plans(payload)
+    stored_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
+    existing_profile_key = str(payload.get("snapshot_profile_key") or "").strip()
+    snapshot_profile_key = stored_profile_key or existing_profile_key
+    if snapshot_profile_key:
+        payload["snapshot_profile_key"] = snapshot_profile_key
+    return snapshot_profile_key
+
+
+def _snapshot_profile_store_for_payload(payload: Mapping[str, Any]) -> Any | None:
+    """Return the shared profile store when Modal and snapshot policy are enabled."""
+    if modal is None:
+        return None
+    settings = _settings_for_payload(payload)
+    return modal.Dict.from_name(
+        settings.snapshot_profile_dict_name,
+        create_if_missing=True,
+    )
+
+
+def _snapshot_policy_record(
+    payload: Mapping[str, Any], snapshot_profile_key: str
+) -> dict[str, Any] | None:
+    """Load one profile record without discarding locally cached measurements."""
+    with _SNAPSHOT_PROFILE_RECORDS_LOCK:
+        cached = _SNAPSHOT_PROFILE_RECORDS.get(snapshot_profile_key)
+    store = _snapshot_profile_store_for_payload(payload)
+    if store is None:
+        return copy.deepcopy(cached) if cached is not None else None
+    stored = store.get(snapshot_profile_key)
+    if not isinstance(stored, dict):
+        return copy.deepcopy(cached) if cached is not None else None
+    with _SNAPSHOT_PROFILE_RECORDS_LOCK:
+        _SNAPSHOT_PROFILE_RECORDS[snapshot_profile_key] = copy.deepcopy(stored)
+    return copy.deepcopy(stored)
+
+
+def _select_gpu_snapshot_for_profile(
+    payload: dict[str, Any], snapshot_profile_key: str
+) -> bool:
+    """Choose snapshot or direct startup from persisted per-profile measurements."""
+    settings = _settings_for_payload(payload)
+    if not settings.enable_gpu_memory_snapshot or not snapshot_profile_key:
+        payload["gpu_snapshot_variant"] = "direct"
+        return False
+    requested_variant = str(payload.get("gpu_snapshot_variant") or "").strip()
+    if requested_variant in {"snapshot", "direct"}:
+        return requested_variant == "snapshot"
+
+    record = _snapshot_policy_record(payload, snapshot_profile_key) or {}
+    policy = record.get("snapshot_policy")
+    if not isinstance(policy, Mapping):
+        policy = {}
+    selected_variant = policy.get("selected_variant")
+    if selected_variant not in {"snapshot", "direct"}:
+        measurements = policy.get("measurements")
+        if not isinstance(measurements, Mapping):
+            measurements = {}
+        snapshot_samples = measurements.get("snapshot")
+        direct_samples = measurements.get("direct")
+        snapshot_count = len(snapshot_samples) if isinstance(snapshot_samples, list) else 0
+        direct_count = len(direct_samples) if isinstance(direct_samples, list) else 0
+        selected_variant = "snapshot" if snapshot_count <= direct_count else "direct"
+    payload["gpu_snapshot_variant"] = selected_variant
+    logger.info(
+        "Selected Modal startup variant=%s snapshot_profile=%s component=%s.",
+        selected_variant,
+        snapshot_profile_key,
+        payload.get("component_id"),
+    )
+    return selected_variant == "snapshot"
+
+
+def _record_snapshot_warmup_measurement(
+    payload: Mapping[str, Any], elapsed_seconds: float
+) -> None:
+    """Persist one warmup latency and select the faster profile after both variants run."""
+    snapshot_profile_key = str(payload.get("snapshot_profile_key") or "").strip()
+    variant = str(payload.get("gpu_snapshot_variant") or "").strip()
+    if not snapshot_profile_key or variant not in {"snapshot", "direct"}:
+        return
+    store = _snapshot_profile_store_for_payload(payload)
+    if store is None:
+        return
+    record = _snapshot_policy_record(payload, snapshot_profile_key) or {
+        "snapshot_profile_key": snapshot_profile_key,
+        "loader_prewarm_plans": [],
+    }
+    policy = record.get("snapshot_policy")
+    if not isinstance(policy, dict):
+        policy = {}
+    measurements = policy.get("measurements")
+    if not isinstance(measurements, dict):
+        measurements = {"snapshot": [], "direct": []}
+    for candidate in ("snapshot", "direct"):
+        samples = measurements.get(candidate)
+        if not isinstance(samples, list):
+            measurements[candidate] = []
+    measurements[variant].append(float(elapsed_seconds))
+    measurements[variant] = measurements[variant][-5:]
+    if measurements["snapshot"] and measurements["direct"]:
+        policy["selected_variant"] = min(
+            ("snapshot", "direct"),
+            key=lambda candidate: statistics.median(measurements[candidate]),
+        )
+    else:
+        policy["selected_variant"] = None
+    policy["measurements"] = measurements
+    record["snapshot_policy"] = policy
+    store[snapshot_profile_key] = record
+    with _SNAPSHOT_PROFILE_RECORDS_LOCK:
+        _SNAPSHOT_PROFILE_RECORDS[snapshot_profile_key] = copy.deepcopy(record)
+    logger.info(
+        "Recorded Modal startup measurement snapshot_profile=%s variant=%s elapsed=%.3fs selected=%s.",
+        snapshot_profile_key,
+        variant,
+        elapsed_seconds,
+        policy["selected_variant"],
+    )
 
 
 def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -7085,12 +7212,54 @@ def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]
     return plans
 
 
+def _build_llm_prewarm_plans(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return deduplicated resident-LLM load and representative JIT plans."""
+    plans: list[dict[str, Any]] = []
+    seen_profiles: set[str] = set()
+
+    def visit(value: Any) -> None:
+        """Collect fixed ModalLLM profile inputs from nested component payloads."""
+        if isinstance(value, Mapping):
+            if value.get("class_type") == "ModalLLM":
+                inputs = value.get("inputs")
+                if isinstance(inputs, Mapping):
+                    model_profile = inputs.get("model_profile")
+                    if isinstance(model_profile, str) and model_profile.strip():
+                        normalized_profile = model_profile.strip()
+                        if normalized_profile not in seen_profiles:
+                            seen_profiles.add(normalized_profile)
+                            signature_payload = {
+                                "model_profile": normalized_profile,
+                                "representative_request_count": 3,
+                            }
+                            plans.append(
+                                {
+                                    **signature_payload,
+                                    "signature": hashlib.sha256(
+                                        json.dumps(
+                                            signature_payload, sort_keys=True
+                                        ).encode("utf-8")
+                                    ).hexdigest(),
+                                    "prompt_node": copy.deepcopy(dict(value)),
+                                }
+                            )
+            for nested_value in value.values():
+                visit(nested_value)
+        elif isinstance(value, (list, tuple)):
+            for nested_value in value:
+                visit(nested_value)
+
+    visit(payload)
+    return plans
+
+
 def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Extract the prompt-scoped warmup-relevant fields from one payload."""
     settings = _settings_for_payload(payload)
     loader_prewarm_plans = _build_loader_prewarm_plans(payload)
+    llm_prewarm_plans = _build_llm_prewarm_plans(payload)
     snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
-    if settings.enable_gpu_memory_snapshot and not snapshot_profile_key:
+    if settings.enable_gpu_memory_snapshot and not snapshot_profile_key and not llm_prewarm_plans:
         logger.info(
             "Skipping proactive Modal warmup request for component=%s because GPU snapshots are enabled and no loader snapshot profile was derived.",
             payload.get("component_id"),
@@ -7118,6 +7287,7 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | No
         "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
         "loader_prewarm_plans": loader_prewarm_plans,
+        "llm_prewarm_plans": llm_prewarm_plans,
         "snapshot_profile_key": snapshot_profile_key,
     }
 
@@ -7230,9 +7400,16 @@ def _invoke_remote_engine_warmup(
             warmup_request.get("component_id"),
         )
         return None
+    started_at = time.perf_counter()
     if hasattr(warmup_method, "remote"):
-        return warmup_method.remote(warmup_request)
-    return warmup_method(warmup_request)
+        result = warmup_method.remote(warmup_request)
+    else:
+        result = warmup_method(warmup_request)
+    _record_snapshot_warmup_measurement(
+        warmup_request,
+        time.perf_counter() - started_at,
+    )
+    return result
 
 
 def _invoke_remote_engine_warmup_with_recovery(
@@ -7469,11 +7646,12 @@ def ensure_remote_warm_capacity(
 
 def _run_speculative_affinity_prewarm(
     prompt_id: str,
-    affinity_key: str,
+    warmup_identity: str,
     warmup_request: dict[str, Any],
     reason: str,
 ) -> None:
     """Prepare one future affinity worker and make a failed attempt retryable."""
+    affinity_key = _remote_worker_affinity_key(warmup_request)
     try:
         logger.info(
             "Starting speculative Modal prewarm prompt=%s affinity=%s component=%s reason=%s.",
@@ -7493,7 +7671,9 @@ def _run_speculative_affinity_prewarm(
         with _PROMPT_WARMUP_STATES_LOCK:
             warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
             if warmup_state is not None:
-                warmup_state.scheduled_speculative_affinities.discard(affinity_key)
+                warmup_state.scheduled_speculative_affinities.discard(
+                    warmup_identity
+                )
         logger.exception(
             "Speculative Modal prewarm failed prompt=%s affinity=%s component=%s.",
             prompt_id,
@@ -7533,12 +7713,15 @@ def _schedule_speculative_affinity_prewarm(
     target_affinity_key = _remote_worker_affinity_key(warmup_request)
     if target_affinity_key == current_affinity_key:
         return False
+    snapshot_profile_key = _prepare_snapshot_profile_fields(warmup_request)
+    _select_gpu_snapshot_for_profile(warmup_request, snapshot_profile_key)
+    warmup_identity = _speculative_warmup_identity(warmup_request)
 
     with _PROMPT_WARMUP_STATES_LOCK:
         warmup_state = _ensure_prompt_warmup_state(prompt_id)
-        if target_affinity_key in warmup_state.scheduled_speculative_affinities:
+        if warmup_identity in warmup_state.scheduled_speculative_affinities:
             return False
-        warmup_state.scheduled_speculative_affinities.add(target_affinity_key)
+        warmup_state.scheduled_speculative_affinities.add(warmup_identity)
 
     logger.info(
         "Scheduling speculative Modal prewarm prompt=%s current_component=%s current_affinity=%s target_component=%s target_affinity=%s reason=%s.",
@@ -7552,14 +7735,14 @@ def _schedule_speculative_affinity_prewarm(
     future = _REMOTE_MODAL_WARMUP_EXECUTOR.submit(
         _run_speculative_affinity_prewarm,
         prompt_id,
-        target_affinity_key,
+        warmup_identity,
         copy.deepcopy(warmup_request),
         reason,
     )
     with _PROMPT_WARMUP_STATES_LOCK:
         warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
         if warmup_state is not None:
-            warmup_state.speculative_affinity_futures[target_affinity_key] = future
+            warmup_state.speculative_affinity_futures[warmup_identity] = future
 
     def _clear_speculative_future(completed_future: Future[Any]) -> None:
         """Drop a completed speculative future while retaining successful dedupe state."""
@@ -7568,14 +7751,121 @@ def _schedule_speculative_affinity_prewarm(
             if warmup_state is None:
                 return
             tracked_future = warmup_state.speculative_affinity_futures.get(
-                target_affinity_key
+                warmup_identity
             )
             if tracked_future is completed_future:
                 warmup_state.speculative_affinity_futures.pop(
-                    target_affinity_key, None
+                    warmup_identity, None
                 )
 
     future.add_done_callback(_clear_speculative_future)
+    return True
+
+
+def _speculative_warmup_identity(payload: Mapping[str, Any]) -> str:
+    """Return the exact deployed-worker identity shared by warmup and dispatch."""
+    settings = _settings_for_payload(payload)
+    identity = {
+        "app": modal_deployment_app_name(settings),
+        "gpu": settings.modal_gpu,
+        "affinity": _remote_worker_affinity_key(dict(payload)),
+        "snapshot_profile": str(payload.get("snapshot_profile_key") or ""),
+        "snapshot_variant": str(payload.get("gpu_snapshot_variant") or "direct"),
+    }
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
+def _await_matching_speculative_prewarm(
+    payload: dict[str, Any],
+    cancellation_event: threading.Event | None,
+) -> None:
+    """Join an active speculative warmup instead of racing a duplicate container."""
+    prompt_id = _warmup_prompt_id(payload)
+    if prompt_id is None:
+        return
+    snapshot_profile_key = _prepare_snapshot_profile_fields(payload)
+    _select_gpu_snapshot_for_profile(payload, snapshot_profile_key)
+    warmup_identity = _speculative_warmup_identity(payload)
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+        future = (
+            warmup_state.speculative_affinity_futures.get(warmup_identity)
+            if warmup_state is not None
+            else None
+        )
+    if future is None or future.done():
+        return
+    started_at = time.perf_counter()
+    logger.info(
+        "Joining active speculative Modal prewarm before dispatch prompt=%s component=%s identity=%s.",
+        prompt_id,
+        payload.get("component_id"),
+        warmup_identity,
+    )
+    while not future.done():
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ModalRemoteInvocationError(
+                "Remote dispatch was cancelled while waiting for speculative warmup."
+            )
+        try:
+            future.result(timeout=0.1)
+        except FutureTimeoutError:
+            continue
+    future.result()
+    logger.info(
+        "Joined speculative Modal prewarm before dispatch prompt=%s component=%s wait_seconds=%.3f.",
+        prompt_id,
+        payload.get("component_id"),
+        time.perf_counter() - started_at,
+    )
+
+
+def _schedule_post_deploy_runtime_seed(payload: Mapping[str, Any]) -> bool:
+    """Seed the just-deployed profile and expose its future to the first dispatch."""
+    warmup_request = _build_prompt_warmup_request(copy.deepcopy(dict(payload)))
+    if warmup_request is None:
+        return False
+    prompt_id = _warmup_prompt_id(warmup_request)
+    if prompt_id is None:
+        return False
+    snapshot_profile_key = _prepare_snapshot_profile_fields(warmup_request)
+    _select_gpu_snapshot_for_profile(warmup_request, snapshot_profile_key)
+    warmup_identity = _speculative_warmup_identity(warmup_request)
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _ensure_prompt_warmup_state(prompt_id)
+        if warmup_identity in warmup_state.scheduled_speculative_affinities:
+            return False
+        warmup_state.scheduled_speculative_affinities.add(warmup_identity)
+        future = _REMOTE_MODAL_WARMUP_EXECUTOR.submit(
+            _run_speculative_affinity_prewarm,
+            prompt_id,
+            warmup_identity,
+            copy.deepcopy(warmup_request),
+            "post_deploy_runtime_seed",
+        )
+        warmup_state.speculative_affinity_futures[warmup_identity] = future
+
+    def clear_seed_future(completed_future: Future[Any]) -> None:
+        """Forget the completed seed future while retaining successful dedupe state."""
+        with _PROMPT_WARMUP_STATES_LOCK:
+            current_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+            if current_state is None:
+                return
+            if (
+                current_state.speculative_affinity_futures.get(warmup_identity)
+                is completed_future
+            ):
+                current_state.speculative_affinity_futures.pop(
+                    warmup_identity, None
+                )
+
+    future.add_done_callback(clear_seed_future)
+    logger.info(
+        "Scheduled automatic post-deployment Modal runtime seed prompt=%s component=%s identity=%s.",
+        prompt_id,
+        warmup_request.get("component_id"),
+        warmup_identity,
+    )
     return True
 
 
@@ -7865,6 +8155,8 @@ def _auto_deploy_modal_app(payload: dict[str, Any], lookup_error: BaseException)
         deployment_app_name,
         deploy_key[1] or "<default>",
     )
+    if _schedule_post_deploy_runtime_seed(payload):
+        _await_matching_speculative_prewarm(payload, None)
     _emit_local_remote_dispatch_status(payload)
     return remote_engine
 
@@ -8031,6 +8323,7 @@ def _invoke_modal_payload_blocking(
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
+    _await_matching_speculative_prewarm(payload, cancellation_event)
     lookup_error_types = _modal_lookup_error_types()
     settings = _settings_for_payload(payload)
     deployment_app_name = modal_deployment_app_name(settings)

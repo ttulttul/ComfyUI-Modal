@@ -90,6 +90,7 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS",
     "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS",
     "COMFY_MODAL_ENABLE_LOADER_PREWARM",
+    "COMFY_MODAL_LOADER_PREWARM_WORKERS",
     "COMFY_MODAL_MAX_LOADER_PREWARMS_PER_COMPONENT",
     "COMFY_MODAL_ENABLE_PROACTIVE_WARMUP",
     "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
@@ -148,6 +149,7 @@ class ModalSyncSettings:
     startup_timeout_seconds: int = 900
     enable_proactive_warmup: bool = True
     enable_loader_prewarm: bool = True
+    loader_prewarm_workers: int = 2
     proactive_warmup_head_start_seconds: float = 2.0
     remote_cancel_grace_seconds: float = 2.0
     remote_cancel_restart_seconds: float = 1.0
@@ -515,6 +517,10 @@ def _get_settings_cached(
         ),
         enable_proactive_warmup=_read_bool_env("COMFY_MODAL_ENABLE_PROACTIVE_WARMUP") is not False,
         enable_loader_prewarm=_read_bool_env("COMFY_MODAL_ENABLE_LOADER_PREWARM") is not False,
+        loader_prewarm_workers=max(
+            1,
+            _read_int_env("COMFY_MODAL_LOADER_PREWARM_WORKERS", 2),
+        ),
         proactive_warmup_head_start_seconds=_read_float_env(
             "COMFY_MODAL_PROACTIVE_WARMUP_HEAD_START_SECONDS",
             2.0,
