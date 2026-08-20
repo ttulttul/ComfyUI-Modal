@@ -403,21 +403,24 @@ def _output_spec(io_type: str, name: str, is_list: bool) -> io.Output:
     return comfy_type.Output(display_name=name, is_output_list=is_list)
 
 
+def _unwrap_proxy_singleton(value: Any) -> Any:
+    """Unwrap one value wrapped by ComfyUI for an INPUT_IS_LIST proxy."""
+    if isinstance(value, list) and len(value) == 1:
+        return value[0]
+    return value
+
+
 def _normalize_proxy_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Convert ComfyUI INPUT_IS_LIST proxy kwargs back into ordinary runtime values."""
-    normalized_kwargs: dict[str, Any] = {}
-    for input_name, input_value in kwargs.items():
-        if isinstance(input_value, list) and len(input_value) == 1:
-            normalized_kwargs[str(input_name)] = input_value[0]
-            continue
-        normalized_kwargs[str(input_name)] = input_value
-    return normalized_kwargs
+    return {
+        str(input_name): _unwrap_proxy_singleton(input_value)
+        for input_name, input_value in kwargs.items()
+    }
 
 
 def _normalize_proxy_payload(payload: Any) -> Mapping[str, Any]:
     """Convert ComfyUI INPUT_IS_LIST payload wrappers back into one payload mapping."""
-    if isinstance(payload, list) and len(payload) == 1:
-        payload = payload[0]
+    payload = _unwrap_proxy_singleton(payload)
     if isinstance(payload, str):
         payload = json.loads(payload)
     if not isinstance(payload, Mapping):
@@ -664,6 +667,7 @@ def _rehydrate_proxy_payload(
 
 def _prompt_id_from_extra_pnginfo(extra_pnginfo: Any) -> str | None:
     """Read the queue prompt id carried through ComfyUI's hidden PNG metadata input."""
+    extra_pnginfo = _unwrap_proxy_singleton(extra_pnginfo)
     if not isinstance(extra_pnginfo, Mapping):
         return None
     return _normalize_prompt_id(extra_pnginfo.get(MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY))
@@ -752,7 +756,9 @@ def _build_proxy_node_class(
         @classmethod
         async def execute(cls, **kwargs: Any) -> io.NodeOutput:
             """Forward the execution payload to the configured remote executor."""
-            unique_id = _normalize_prompt_id(kwargs.pop(io.Hidden.unique_id.name, None))
+            unique_id = _normalize_prompt_id(
+                _unwrap_proxy_singleton(kwargs.pop(io.Hidden.unique_id.name, None))
+            )
             prompt_id = _prompt_id_from_extra_pnginfo(
                 kwargs.pop(io.Hidden.extra_pnginfo.name, None)
             )

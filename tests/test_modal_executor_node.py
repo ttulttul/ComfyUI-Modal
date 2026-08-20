@@ -1383,10 +1383,10 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
     }
 
 
-def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
+def test_cache_friendly_proxy_payload_rehydrates_list_wrapped_prompt_id_at_execution(
     modal_executor_module: Any,
 ) -> None:
-    """Queued proxies should restore their own prompt context when executions overlap."""
+    """List-wrapped hidden inputs should select the correct overlapping prompt."""
     fake_nodes_module = type(
         "FakeNodesModule",
         (),
@@ -1439,12 +1439,15 @@ def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
     try:
         result = asyncio.run(
             proxy_class.execute(
-                original_node_data=payload,
-                unique_id="node-1",
-                extra_pnginfo={
-                    modal_executor_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY: "prompt-1"
-                },
-                value="payload",
+                original_node_data=[payload],
+                unique_id=["node-1"],
+                extra_pnginfo=[
+                    {
+                        modal_executor_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY:
+                            "prompt-1"
+                    }
+                ],
+                value=["payload"],
             )
         )
     finally:
