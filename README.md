@@ -240,12 +240,13 @@ When a prompt is queued:
 2. The backend resolves marked workflow nodes onto queued prompt node ids, including nested subgraph ids such as `195:27`. Reusable definitions under `workflow.definitions.subgraphs` are expanded through each matching subgraph instance before markers are mapped.
 3. Remote-marked nodes are partitioned into cost-aware components. Direct remote edges carrying large tensor or media values such as `LATENT`, `IMAGE`, `MASK`, `SIGMAS`, `AUDIO`, or `VIDEO` stay inside one component; inexpensive scalar edges may remain component boundaries.
 4. Components also expand across non-transportable inputs such as `MODEL`, `CLIP`, `VAE`, or `CONDITIONING`.
-5. Each component is replaced with one or more generated `ModalUniversalExecutor_<hash>` proxy nodes.
-6. Referenced model assets and, when enabled, `custom_nodes/` packages are mirrored into storage.
-7. An internal `ModalArtifactFinalizer` output sink is connected to every generated proxy so ComfyUI executes remote components even when their terminal nodes only save files and expose no normal ComfyUI output.
-8. The rewritten prompt is submitted to ComfyUI's normal execution queue.
-9. Local nodes execute normally until a proxy node is reached.
-10. The proxy dispatches local or Modal execution. Values needed by local nodes are materialized as normal ComfyUI outputs, while values consumed only by later remote components travel through the local graph as small Modal-backed references.
+5. A terminal `SaveVideo` fed by a remote `VIDEO` is also placed remotely as an artifact sink. Its encoded file is downloaded into local `output/`; raw frames and audio are not exported merely to re-encode the same video locally.
+6. Each component is replaced with one or more generated `ModalUniversalExecutor_<hash>` proxy nodes.
+7. Referenced model assets and, when enabled, `custom_nodes/` packages are mirrored into storage.
+8. An internal `ModalArtifactFinalizer` output sink is connected to every generated proxy so ComfyUI executes remote components even when their terminal nodes only save files and expose no normal ComfyUI output.
+9. The rewritten prompt is submitted to ComfyUI's normal execution queue.
+10. Local nodes execute normally until a proxy node is reached.
+11. The proxy dispatches local or Modal execution. Values needed by local nodes are materialized as normal ComfyUI outputs, while values consumed only by later remote components travel through the local graph as small Modal-backed references.
 
 Boundary-crossing values must be transportable. Supported evaluated values include:
 
@@ -300,7 +301,7 @@ Split proxies, mapped phases, and remote-to-remote component edges use component
 
 Each remote payload also carries a stable invocation id. The worker records its lifecycle in a shared Modal `Dict` and replays a completed result when the local client or Modal retries the same call. An overlapping delivery waits briefly for the active attempt to publish a terminal state instead of failing immediately. If a streamed call loses its consumer, the worker cancels unfinished compute and marks that attempt failed before the retry proceeds; uncommitted Volume writes remain unpublished. Large completed results use the same content-addressed Volume store, while failed attempts remain retryable.
 
-After every remote payload, including the final component that clears its remote session, Modal-Sync compares the remote ComfyUI `output/` tree with its pre-execution snapshot. New or replaced regular files are bundled into the durable result and downloaded into the corresponding local `output/` subdirectory. Each downloaded filename is prefixed `remote-<app_id>-<epoch>-`, where `app_id` is the unique Modal app suffix and `epoch` is the trailing nine digits of the remote completion time. Artifact paths and SHA-256 digests are validated, symlinks and escaping paths are rejected, identical retry downloads are reused, and a differing local collision receives a numeric suffix instead of being overwritten. This lets a remote video-save node return its compressed file without transporting the decoded frame tensor back through ComfyUI.
+After every remote payload, including the final component that clears its remote session, Modal-Sync compares the remote ComfyUI `output/` tree with its pre-execution snapshot. New or replaced regular files are bundled into the durable result and downloaded into the corresponding local `output/` subdirectory. Each downloaded filename is prefixed `remote-<app_id>-<epoch>-`, where `app_id` is the unique Modal app suffix and `epoch` is the trailing nine digits of the remote completion time. Artifact paths and SHA-256 digests are validated, symlinks and escaping paths are rejected, identical retry downloads are reused, and a differing local collision receives a numeric suffix instead of being overwritten. A terminal local `SaveVideo` whose input comes from a remote `VIDEO` is automatically executed as a remote artifact sink, preserving its configured filename and encoding while avoiding transport of the decoded frame and audio tensors. Nonterminal local video consumers retain ordinary lossless VIDEO transport.
 
 The proxy emits its internal completion token only after the remote result and its artifacts have been materialized locally. The finalizer consumes those tokens without producing a user-visible value, making artifact-only remote branches part of ComfyUI's required output path while preserving normal downstream graph behavior.
 
