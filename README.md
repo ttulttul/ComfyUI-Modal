@@ -288,7 +288,11 @@ CPU memory snapshots are enabled by default. GPU memory snapshots are also enabl
 
 Warm containers can reuse loaded model state, `PromptExecutor` state, remote session bridge values, and worker-local loader cache entries across compatible requests. The default Modal `scaledown_window` is `600` seconds with `min_containers=0`, so compute can scale down to zero between runs while still benefiting from warm reuse when capacity remains alive.
 
+When the planner detects a remote → local → remote gap, those remote proxies use a stable parameterized worker slot and an independently autoscaled local-gap pool. After the producing remote phase finishes, Modal-Sync sends a lightweight pulse every `15` seconds for at most `900` seconds; dispatching the next remote phase stops the pulse immediately. This protects a loaded worker during a temporarily long local LLM or transformation without continuing active pulses after the remote continuation begins or after a terminal remote phase. The pool then follows its configured idle cooldown.
+
 Independent Modal-backed components can overlap through ComfyUI's async proxy path and the local Modal call executor. Large tensor and media edges are deliberately co-located first, so this parallelism is reserved for genuinely independent branches, inexpensive scalar boundaries, mapped execution, and graph shapes that require a split for correctness. Ordinary components with several remote execution targets remain one proxy unless a local re-entry dependency would create a scheduler cycle. Each Modal GPU container handles one active workflow execution at a time, so parallel ready components can scale out across containers instead of multiplexing several active executions onto one worker. `COMFY_MODAL_MAX_INFLIGHT_CALLS` bounds local dispatch independently from the local CPU count and the remote autoscaler.
+
+If a remote output also feeds a local branch that cannot transitively reach any later remote component, Modal-Sync moves that local-only branch behind completion of the downstream remote work. The local node still executes and produces the same output, but ComfyUI cannot choose it ahead of the ready remote continuation. Local branches that do feed remote execution remain ordinary dependencies and are never deferred.
 
 When a component output is consumed exclusively by other remote components, Modal-Sync keeps it remote. The producer returns a small durable bridge reference through the local ComfyUI proxy instead of returning the underlying `IMAGE`, `AUDIO`, `LATENT`, `MASK`, `SIGMAS`, `VIDEO`, or scalar value. A downstream remote component resolves that reference from the worker's warm bridge cache when possible, or restores it from shared Modal storage when Modal schedules the components on different containers. If any consumer is local, including an interim preview or final `SaveVideo`, the planner leaves that boundary materialized so the local node receives the ordinary ComfyUI value it expects.
 
@@ -392,6 +396,8 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT` | `true` | Enable Modal CPU memory snapshots. |
 | `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT` | `true` | Enable Modal GPU memory snapshots for profiled loader states. |
 | `COMFY_MODAL_SCALEDOWN_WINDOW` | `600` | Seconds to keep idle Modal containers warm. |
+| `COMFY_MODAL_LOCAL_GAP_KEEPALIVE_SECONDS` | `900` | Maximum time to retain the matching remote worker slot while a remote → local → remote workflow gap runs; set `0` to disable pulses. |
+| `COMFY_MODAL_LOCAL_GAP_KEEPALIVE_INTERVAL_SECONDS` | `15` | Seconds between lightweight worker-retention pulses during a local gap. |
 | `COMFY_MODAL_MIN_CONTAINERS` | `0` | Minimum warm containers. |
 | `COMFY_MODAL_MAX_CONTAINERS` | unset | Optional upper bound on simultaneously scaled Modal containers. |
 | `COMFY_MODAL_BUFFER_CONTAINERS` | unset | Optional spare warm containers above current load. |

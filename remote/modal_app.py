@@ -112,6 +112,8 @@ _PROMPT_WARMUP_STATES_LOCK = threading.Lock()
 _PROMPT_WARMUP_STATES: dict[str, "_PromptWarmupState"] = {}
 _PROMPT_WARMUP_STATE_ORDER: queue.SimpleQueue[str] | None = None
 _PROMPT_WARMUP_STATE_CACHE_LIMIT = 256
+_LOCAL_GAP_KEEPALIVES_LOCK = threading.Lock()
+_LOCAL_GAP_KEEPALIVES: dict[tuple[str, int], "_LocalGapKeepaliveState"] = {}
 _SNAPSHOT_PROFILE_RECORDS_LOCK = threading.Lock()
 _SNAPSHOT_PROFILE_RECORDS: dict[str, dict[str, Any]] = {}
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
@@ -225,6 +227,15 @@ class _PromptWarmupState:
 
 
 @dataclass
+class _LocalGapKeepaliveState:
+    """Track one prompt-scoped worker-retention loop during local execution."""
+
+    component_id: str
+    stop_event: threading.Event
+    future: Future[Any]
+
+
+@dataclass
 class _ModalAutoDeployState:
     """Track one thread-safe deployed-app readiness lifecycle."""
 
@@ -288,6 +299,9 @@ _REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(
     max_workers=_remote_modal_call_worker_count()
 )
 _REMOTE_MODAL_WARMUP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_remote_modal_call_worker_count()
+)
+_REMOTE_MODAL_KEEPALIVE_EXECUTOR = ThreadPoolExecutor(
     max_workers=_remote_modal_call_worker_count()
 )
 
@@ -1951,6 +1965,8 @@ def _component_pool_slot_index(payload: dict[str, Any]) -> int:
     warmup_slot_index = payload.get("warmup_slot_index")
     if warmup_slot_index is not None:
         return max(0, int(warmup_slot_index))
+    if bool(payload.get("remote_local_gap_pool")):
+        return 0
 
     prompt_parallelism_target = _prompt_parallelism_target(payload)
     slot_count = max(1, int(prompt_parallelism_target))
@@ -5695,6 +5711,7 @@ async def _invoke_implicitly_mapped_subgraph_async(
     static_outputs: tuple[Any, ...] = ()
     lane_remote_engines: list[Any] = []
     seeded_lane_indices: set[int] = set()
+    skip_cleanup_after_interrupt = False
     try:
         if use_seeded_remote_lanes:
             lane_remote_engines = [
@@ -5741,7 +5758,6 @@ async def _invoke_implicitly_mapped_subgraph_async(
         completed_items = 0
         all_items_completed = asyncio.Event()
         stop_dispatch_requested = asyncio.Event()
-        skip_cleanup_after_interrupt = False
         worker_failure: asyncio.Future[
             BaseException
         ] = asyncio.get_running_loop().create_future()
@@ -5950,8 +5966,9 @@ def _lookup_deployed_remote_engine(
     payload: dict[str, Any],
     *,
     affinity_key_override: str | None = None,
+    protocol_probe: bool = False,
 ) -> Any:
-    """Look up the deployed Modal runtime class instance."""
+    """Look up the deployed runtime, optionally omitting new parameters for probing."""
     if modal is None:
         raise ModalRemoteInvocationError("Modal SDK is unavailable.")
 
@@ -5973,21 +5990,43 @@ def _lookup_deployed_remote_engine(
         snapshot_profile_key = _store_loader_snapshot_profile(loader_prewarm_plans)
         if snapshot_profile_key:
             payload["snapshot_profile_key"] = snapshot_profile_key
+    worker_affinity_key = affinity_key_override or _remote_worker_affinity_key(payload)
     logger.info(
         "Attempting deployed Modal invocation for app=%s class=%s component=%s worker_affinity=%s snapshot_profile=%s gpu_snapshot_enabled=%s.",
         deployment_app_name,
         "RemoteEngine",
         payload.get("component_id"),
-        affinity_key_override or _remote_worker_affinity_key(payload),
+        worker_affinity_key,
         snapshot_profile_key or None,
         settings.enable_gpu_memory_snapshot,
     )
     remote_cls = modal.Cls.from_name(deployment_app_name, "RemoteEngine")
+    if bool(payload.get("remote_local_gap_pool")) and hasattr(remote_cls, "with_options"):
+        local_gap_scaledown_seconds = max(
+            int(settings.scaledown_window_seconds),
+            int(settings.local_gap_keepalive_seconds),
+        )
+        remote_cls = remote_cls.with_options(
+            scaledown_window=local_gap_scaledown_seconds,
+        )
+        logger.info(
+            "Using local-gap Modal pool component=%s worker_affinity=%s scaledown_window=%ds.",
+            payload.get("component_id"),
+            worker_affinity_key,
+            local_gap_scaledown_seconds,
+        )
     remote_engine_kwargs: dict[str, Any] = {
         "gpu_snapshot_enabled": bool(settings.enable_gpu_memory_snapshot),
     }
     if snapshot_profile_key:
         remote_engine_kwargs["snapshot_profile_key"] = snapshot_profile_key
+    if not protocol_probe:
+        remote_engine_kwargs["worker_affinity_key"] = worker_affinity_key
+    else:
+        logger.info(
+            "Probing deployed RemoteEngine protocol without affinity parameters component=%s.",
+            payload.get("component_id"),
+        )
     remote_engine = remote_cls(**remote_engine_kwargs)
     with _MODAL_AUTO_DEPLOY_LOCK:
         runtime_is_known_current = (
@@ -6551,7 +6590,7 @@ def _ensure_remote_engine_protocol_current(
     if _is_runtime_version_payload_current(version_payload, payload):
         with _MODAL_AUTO_DEPLOY_LOCK:
             _MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
-        return remote_engine
+        return _lookup_deployed_remote_engine(payload)
     if not settings.auto_deploy:
         raise ModalRemoteInvocationError(
             "Deployed Modal app runtime fingerprint is out of date and "
@@ -6972,7 +7011,10 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
     if lookup_error_types:
         try:
             remote_engine = _ensure_remote_engine_protocol_current(
-                _lookup_deployed_remote_engine(warmup_request),
+                _lookup_deployed_remote_engine(
+                    warmup_request,
+                    protocol_probe=True,
+                ),
                 warmup_request,
             )
             _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
@@ -6997,7 +7039,10 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
                 ) from exc
     else:
         remote_engine = _ensure_remote_engine_protocol_current(
-            _lookup_deployed_remote_engine(warmup_request),
+            _lookup_deployed_remote_engine(
+                warmup_request,
+                protocol_probe=True,
+            ),
             warmup_request,
         )
         _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
@@ -7172,6 +7217,145 @@ def ensure_remote_warm_capacity(
         )
         _track_prompt_warmup_future(prompt_id, slot_index, future)
     return clamped_target
+
+
+def _local_gap_keepalive_key(payload: Mapping[str, Any]) -> tuple[str, int] | None:
+    """Return the prompt and affinity-slot key for a local-gap payload."""
+    prompt_id = _warmup_prompt_id(dict(payload))
+    if prompt_id is None:
+        return None
+    return (prompt_id, _component_pool_slot_index(dict(payload)))
+
+
+def _stop_local_gap_keepalive(payload: Mapping[str, Any], *, reason: str) -> bool:
+    """Stop a previously scheduled affinity-slot keepalive, if one exists."""
+    keepalive_key = _local_gap_keepalive_key(payload)
+    if keepalive_key is None:
+        return False
+    with _LOCAL_GAP_KEEPALIVES_LOCK:
+        keepalive_state = _LOCAL_GAP_KEEPALIVES.pop(keepalive_key, None)
+    if keepalive_state is None:
+        return False
+    keepalive_state.stop_event.set()
+    logger.info(
+        "Stopping remote local-gap keepalive prompt=%s slot=%d after component=%s reason=%s.",
+        keepalive_key[0],
+        keepalive_key[1],
+        keepalive_state.component_id,
+        reason,
+    )
+    return True
+
+
+def _invoke_remote_local_gap_keepalive(payload: dict[str, Any]) -> Any:
+    """Send one lightweight activity pulse to the payload's affinity slot."""
+    remote_engine = _lookup_deployed_remote_engine(payload)
+    keepalive_method = getattr(remote_engine, "keepalive_for_local_gap", None)
+    if keepalive_method is None:
+        raise ModalRemoteInvocationError(
+            "The deployed RemoteEngine does not expose keepalive_for_local_gap."
+        )
+    return _call_modal_method(keepalive_method, payload)
+
+
+def _run_local_gap_keepalive(
+    payload: dict[str, Any],
+    stop_event: threading.Event,
+    duration_seconds: float,
+    interval_seconds: float,
+) -> None:
+    """Pulse one remote affinity slot until local execution finishes or the budget expires."""
+    deadline = time.monotonic() + duration_seconds
+    keepalive_count = 0
+    while not stop_event.is_set():
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0.0:
+            break
+        if stop_event.wait(min(interval_seconds, remaining_seconds)):
+            break
+        keepalive_count += 1
+        pulse_started_at = time.perf_counter()
+        _invoke_remote_local_gap_keepalive(payload)
+        logger.info(
+            "Completed remote local-gap keepalive pulse=%d prompt=%s component=%s in %.3fs.",
+            keepalive_count,
+            payload.get("prompt_id"),
+            payload.get("component_id"),
+            time.perf_counter() - pulse_started_at,
+        )
+    logger.info(
+        "Remote local-gap keepalive loop finished prompt=%s component=%s pulses=%d stopped=%s.",
+        payload.get("prompt_id"),
+        payload.get("component_id"),
+        keepalive_count,
+        stop_event.is_set(),
+    )
+
+
+def _start_local_gap_keepalive(payload: Mapping[str, Any]) -> bool:
+    """Retain one remote affinity slot while a downstream local gap executes."""
+    if not bool(payload.get("keepalive_after_remote_component")):
+        return False
+    settings = _settings_for_payload(payload)
+    duration_seconds = max(0.0, float(settings.local_gap_keepalive_seconds))
+    if duration_seconds <= 0.0 or settings.execution_mode == "local" or modal is None:
+        return False
+    keepalive_key = _local_gap_keepalive_key(payload)
+    if keepalive_key is None:
+        return False
+
+    _stop_local_gap_keepalive(payload, reason="replacement")
+    stop_event = threading.Event()
+    keepalive_payload = dict(payload)
+    keepalive_payload["warmup_slot_index"] = keepalive_key[1]
+    keepalive_payload["component_id"] = (
+        f"{payload.get('component_id', 'modal-component')}::local-gap-keepalive"
+    )
+    interval_seconds = min(
+        duration_seconds,
+        max(1.0, float(settings.local_gap_keepalive_interval_seconds)),
+    )
+    future = _REMOTE_MODAL_KEEPALIVE_EXECUTOR.submit(
+        _run_local_gap_keepalive,
+        keepalive_payload,
+        stop_event,
+        duration_seconds,
+        interval_seconds,
+    )
+    keepalive_state = _LocalGapKeepaliveState(
+        component_id=str(payload.get("component_id") or "modal-component"),
+        stop_event=stop_event,
+        future=future,
+    )
+    with _LOCAL_GAP_KEEPALIVES_LOCK:
+        _LOCAL_GAP_KEEPALIVES[keepalive_key] = keepalive_state
+
+    def clear_completed_keepalive(completed_future: Future[Any]) -> None:
+        """Forget a finished keepalive and report any best-effort failure."""
+        with _LOCAL_GAP_KEEPALIVES_LOCK:
+            current_state = _LOCAL_GAP_KEEPALIVES.get(keepalive_key)
+            if current_state is keepalive_state:
+                _LOCAL_GAP_KEEPALIVES.pop(keepalive_key, None)
+        failure = completed_future.exception()
+        if failure is not None:
+            logger.warning(
+                "Remote local-gap keepalive failed prompt=%s slot=%d component=%s: %s",
+                keepalive_key[0],
+                keepalive_key[1],
+                keepalive_state.component_id,
+                failure,
+            )
+
+    future.add_done_callback(clear_completed_keepalive)
+    logger.info(
+        "Started remote local-gap keepalive prompt=%s slot=%d component=%s duration=%.1fs interval=%.1fs.",
+        keepalive_key[0],
+        keepalive_key[1],
+        keepalive_state.component_id,
+        duration_seconds,
+        interval_seconds,
+    )
+    return True
 
 
 def boost_mapped_component_warmup(
@@ -7493,7 +7677,7 @@ def _invoke_modal_payload_blocking(
     if lookup_error_types:
         try:
             remote_engine = _ensure_remote_engine_protocol_current(
-                _lookup_deployed_remote_engine(payload),
+                _lookup_deployed_remote_engine(payload, protocol_probe=True),
                 payload,
             )
             _ensure_llm_profiles_staged(payload, deployment_app_name)
@@ -7545,7 +7729,7 @@ def _invoke_modal_payload_blocking(
             )
     else:
         remote_engine = _ensure_remote_engine_protocol_current(
-            _lookup_deployed_remote_engine(payload),
+            _lookup_deployed_remote_engine(payload, protocol_probe=True),
             payload,
         )
         _ensure_llm_profiles_staged(payload, deployment_app_name)
@@ -7683,12 +7867,27 @@ async def invoke_remote_engine_async(
 ) -> bytes:
     """Invoke Modal asynchronously so multiple proxy nodes can wait on remote work in parallel."""
     execution_mode = get_settings().execution_mode
+    if (
+        execution_mode != "local"
+        and modal is not None
+        and bool(payload.get("stop_local_gap_keepalive_before_remote_component"))
+    ):
+        _stop_local_gap_keepalive(payload, reason="next_remote_component_started")
     if payload.get("payload_kind") == "mapped_subgraph":
         if execution_mode == "local" or modal is None:
             return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
     if allow_implicit_mapping and payload.get("payload_kind") == "subgraph":
         hydrated_inputs = deserialize_node_inputs(kwargs_payload)
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
+            if execution_mode != "local" and modal is not None:
+                await asyncio.to_thread(
+                    _ensure_remote_engine_protocol_current,
+                    _lookup_deployed_remote_engine(
+                        payload,
+                        protocol_probe=True,
+                    ),
+                    payload,
+                )
             return await _invoke_implicitly_mapped_subgraph_async(
                 payload, kwargs_payload
             )
@@ -7766,6 +7965,7 @@ async def invoke_remote_engine_async(
         "Async Modal remote invocation completed for component=%s.",
         payload.get("component_id"),
     )
+    _start_local_gap_keepalive(payload)
     return response
 
 
@@ -7788,6 +7988,7 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
 
         snapshot_profile_key: str = modal.parameter(default="")
         gpu_snapshot_enabled: bool = modal.parameter(default=False)
+        worker_affinity_key: str = modal.parameter(default="worker-pool:slot:0")
 
         @modal.enter()
         def setup(self) -> None:
@@ -7817,6 +8018,14 @@ if modal is not None:  # pragma: no branch - simple import-time configuration.
             """No-op local warmup entrypoint for the simplified Modal runtime."""
             return {"component_id": str(payload.get("component_id") or "modal-warmup")}
 
+        @modal.method()
+        def keepalive_for_local_gap(self, payload: dict[str, Any]) -> dict[str, Any]:
+            """Return a lightweight keepalive acknowledgement for one affinity slot."""
+            return {
+                "component_id": str(payload.get("component_id") or "modal-keepalive"),
+                "worker_affinity_key": self.worker_affinity_key,
+            }
+
 else:
 
     class RemoteEngine:
@@ -7826,10 +8035,12 @@ else:
             self,
             snapshot_profile_key: str | None = None,
             gpu_snapshot_enabled: bool = False,
+            worker_affinity_key: str = "worker-pool:slot:0",
         ) -> None:
             """Record the optional snapshot-profile key and GPU snapshot mode."""
             self.snapshot_profile_key = snapshot_profile_key
             self.gpu_snapshot_enabled = gpu_snapshot_enabled
+            self.worker_affinity_key = worker_affinity_key
 
         def setup(self) -> None:
             """No-op setup for local fallback execution."""
@@ -7850,3 +8061,10 @@ else:
         def warmup_for_request(self, payload: dict[str, Any]) -> dict[str, Any]:
             """Return a local no-op warmup result when Modal is unavailable."""
             return {"component_id": str(payload.get("component_id") or "modal-warmup")}
+
+        def keepalive_for_local_gap(self, payload: dict[str, Any]) -> dict[str, Any]:
+            """Return a local keepalive acknowledgement when Modal is unavailable."""
+            return {
+                "component_id": str(payload.get("component_id") or "modal-keepalive"),
+                "worker_affinity_key": self.worker_affinity_key,
+            }

@@ -20,6 +20,7 @@ from .serialization import deserialize_node_outputs, serialize_node_inputs, spli
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
 MODAL_ARTIFACT_FINALIZER_NODE_ID = "ModalArtifactFinalizer"
+MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID = "ModalDeferredLocalPassthrough"
 MODAL_COMPONENT_COMPLETION_OUTPUT_NAME = "modal_component_complete"
 MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS = 100
 _PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
@@ -687,6 +688,16 @@ def ensure_modal_artifact_finalizer_registered(nodes_module: Any) -> None:
     )
 
 
+def ensure_modal_deferred_local_passthrough_registered(nodes_module: Any) -> None:
+    """Register the internal local-branch scheduling barrier."""
+    nodes_module.NODE_CLASS_MAPPINGS[MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID] = (
+        ModalDeferredLocalPassthrough
+    )
+    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[
+        MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID
+    ] = "Modal Deferred Local Passthrough"
+
+
 class ModalUniversalExecutor(io.ComfyNode):
     """Base debug node for Modal execution routing."""
 
@@ -798,3 +809,48 @@ class ModalArtifactFinalizer(io.ComfyNode):
             len(components),
         )
         return io.NodeOutput()
+
+
+class ModalDeferredLocalPassthrough(io.ComfyNode):
+    """Delay a non-returning local branch until continuing remote work completes."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        """Accept one arbitrary value plus completion tokens from remote components."""
+        completion_template = io.Autogrow.TemplatePrefix(
+            input=io.Boolean.Input("completion", force_input=True),
+            prefix="component_",
+            min=1,
+            max=MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
+        )
+        return io.Schema(
+            node_id=MODAL_DEFERRED_LOCAL_PASSTHROUGH_NODE_ID,
+            display_name="Modal Deferred Local Passthrough",
+            category="Modal",
+            description=(
+                "Internal scheduling barrier that prevents an independent local tap "
+                "from delaying downstream Modal execution."
+            ),
+            inputs=[
+                io.AnyType.Input("value"),
+                io.Autogrow.Input("components", template=completion_template),
+            ],
+            outputs=[io.AnyType.Output(display_name="value")],
+            is_dev_only=True,
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, value: Any, components: io.Autogrow.Type) -> io.NodeOutput:
+        """Return the original value after every required remote component completes."""
+        incomplete_component_names = [
+            str(component_name)
+            for component_name, completed in components.items()
+            if completed is not True
+        ]
+        if incomplete_component_names:
+            raise RuntimeError(
+                "Deferred local branch received incomplete Modal component tokens: "
+                f"{incomplete_component_names}."
+            )
+        return io.NodeOutput(value)
