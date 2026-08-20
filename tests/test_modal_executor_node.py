@@ -602,6 +602,148 @@ class _FakeImplicitBatchKSamplerNode:
         }
 
 
+def _assert_node_module_identity(node_class: type[Any], expected_module: str) -> None:
+    """Assert a registered V3 node exposes its loader-assigned module identity."""
+    assert node_class.RELATIVE_PYTHON_MODULE == expected_module
+    assert node_class.GET_NODE_INFO_V1()["python_module"] == expected_module
+
+
+def test_dynamic_proxy_registration_sets_module_identity_on_new_and_cached_class(
+    modal_executor_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary proxies should serialize a valid module after creation and cache reuse."""
+    expected_module = "custom_nodes.ComfyUI-Modal"
+    monkeypatch.setattr(
+        modal_executor_module.ModalUniversalExecutor,
+        "RELATIVE_PYTHON_MODULE",
+        expected_module,
+    )
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={"OriginalNodeForModuleIdentity": _FakeOriginalNode},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+
+    proxy_node_id = modal_executor_module.ensure_modal_proxy_node_registered(
+        original_class_type="OriginalNodeForModuleIdentity",
+        original_class=_FakeOriginalNode,
+        nodes_module=fake_nodes_module,
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    _assert_node_module_identity(proxy_class, expected_module)
+
+    proxy_class.RELATIVE_PYTHON_MODULE = None
+    fake_nodes_module.NODE_CLASS_MAPPINGS.clear()
+    fake_nodes_module.NODE_DISPLAY_NAME_MAPPINGS.clear()
+
+    cached_proxy_node_id = modal_executor_module.ensure_modal_proxy_node_registered(
+        original_class_type="OriginalNodeForModuleIdentity",
+        original_class=_FakeOriginalNode,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert cached_proxy_node_id == proxy_node_id
+    assert fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] is proxy_class
+    _assert_node_module_identity(proxy_class, expected_module)
+
+
+def test_component_proxy_registration_sets_module_identity_on_new_and_cached_class(
+    modal_executor_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Component proxies should serialize a valid module after creation and cache reuse."""
+    expected_module = "custom_nodes.ComfyUI-Modal"
+    monkeypatch.setattr(
+        modal_executor_module.ModalUniversalExecutor,
+        "RELATIVE_PYTHON_MODULE",
+        expected_module,
+    )
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    registration_kwargs = {
+        "output_types": ("MODULE_IDENTITY_COMPONENT",),
+        "output_names": ("value",),
+        "output_is_list": (False,),
+        "nodes_module": fake_nodes_module,
+        "is_output_node": False,
+    }
+
+    proxy_node_id = modal_executor_module.ensure_modal_component_proxy_node_registered(
+        **registration_kwargs
+    )
+    proxy_class = fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id]
+    _assert_node_module_identity(proxy_class, expected_module)
+
+    proxy_class.RELATIVE_PYTHON_MODULE = None
+    fake_nodes_module.NODE_CLASS_MAPPINGS.clear()
+    fake_nodes_module.NODE_DISPLAY_NAME_MAPPINGS.clear()
+
+    cached_proxy_node_id = (
+        modal_executor_module.ensure_modal_component_proxy_node_registered(
+            **registration_kwargs
+        )
+    )
+
+    assert cached_proxy_node_id == proxy_node_id
+    assert fake_nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] is proxy_class
+    _assert_node_module_identity(proxy_class, expected_module)
+
+
+@pytest.mark.parametrize(
+    ("registration_function_name", "node_class_name", "node_id_constant_name"),
+    [
+        (
+            "ensure_modal_parallel_local_passthrough_registered",
+            "ModalParallelLocalPassthrough",
+            "MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID",
+        ),
+        (
+            "ensure_modal_local_bridge_materializer_registered",
+            "ModalLocalBridgeMaterializer",
+            "MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID",
+        ),
+        (
+            "ensure_modal_artifact_finalizer_registered",
+            "ModalArtifactFinalizer",
+            "MODAL_ARTIFACT_FINALIZER_NODE_ID",
+        ),
+    ],
+)
+def test_internal_node_registration_sets_module_identity(
+    modal_executor_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    registration_function_name: str,
+    node_class_name: str,
+    node_id_constant_name: str,
+) -> None:
+    """Static internal nodes should serialize the startup node's module identity."""
+    expected_module = "custom_nodes.ComfyUI-Modal"
+    monkeypatch.setattr(
+        modal_executor_module.ModalUniversalExecutor,
+        "RELATIVE_PYTHON_MODULE",
+        expected_module,
+    )
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+
+    registration_function = getattr(modal_executor_module, registration_function_name)
+    node_class = getattr(modal_executor_module, node_class_name)
+    monkeypatch.setattr(
+        node_class,
+        "RELATIVE_PYTHON_MODULE",
+        node_class.RELATIVE_PYTHON_MODULE,
+    )
+    registration_function(fake_nodes_module)
+
+    node_id = getattr(modal_executor_module, node_id_constant_name)
+    assert fake_nodes_module.NODE_CLASS_MAPPINGS[node_id] is node_class
+    _assert_node_module_identity(node_class, expected_module)
+
+
 def test_dynamic_proxy_node_preserves_output_signature(
     modal_executor_module: Any,
 ) -> None:
