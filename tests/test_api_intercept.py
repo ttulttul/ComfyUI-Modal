@@ -1579,6 +1579,113 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
     assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 
 
+def test_rewrite_splits_cyclic_remote_fanout_into_ordered_parallel_preview_phases(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Mixed local previews must not make coarse SCC merging reunify remote phases."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteImage": _FakeRemoteImageNode,
+                "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
+                "ModalLLM": _FakeTextNode,
+                "LocalSink": _FakeLocalSinkNode,
+                "PreviewImage": _FakePreviewImageNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": node_id, "properties": {"is_modal_remote": node_id in {1, 2, 3, 4}}}
+            for node_id in (1, 2, 3, 4, 5, 9, 10)
+        ]
+    }
+    prompt = {
+        "1": {"class_type": "RemoteImage", "inputs": {}},
+        "2": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["1", 0]},
+        },
+        "3": {
+            "class_type": "ModalLLM",
+            "inputs": {"image": ["2", 0]},
+        },
+        "4": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["1", 0], "prompt": ["3", 0]},
+        },
+        "5": {"class_type": "LocalSink", "inputs": {"image": ["4", 0]}},
+        "9": {"class_type": "PreviewImage", "inputs": {"images": ["2", 0]}},
+        "10": {"class_type": "PreviewImage", "inputs": {"images": ["3", 0]}},
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert summary.remote_component_ids == ["2", "3", "4"]
+    assert summary.component_execution_stages == [["2"], ["3"], ["4"]]
+    assert summary.component_node_ids_by_representative == {
+        "2": ["1", "2"],
+        "3": ["3"],
+        "4": ["4"],
+    }
+    phase_payloads = [
+        rewritten_prompt[phase_node_id]["inputs"]["original_node_data"]
+        for phase_node_id in summary.remote_component_ids
+    ]
+    assert [payload["component_node_ids"] for payload in phase_payloads] == [
+        ["1", "2"],
+        ["3"],
+        ["4"],
+    ]
+    assert [payload["remote_worker_affinity_group"] for payload in phase_payloads] == [
+        "comfy",
+        "llm",
+        "comfy",
+    ]
+    assert len(summary.parallel_local_branch_node_ids) == 2
+    materializer_node_ids = {
+        node_id
+        for node_id, prompt_node in rewritten_prompt.items()
+        if prompt_node["class_type"]
+        == api_intercept_module.MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID
+    }
+    assert len(materializer_node_ids) == 2
+    assert rewritten_prompt["9"]["inputs"]["images"][0] in materializer_node_ids
+    assert rewritten_prompt["10"]["inputs"]["images"][0] in materializer_node_ids
+    assert rewritten_prompt["5"]["inputs"]["image"] == ["4", 0]
+
+
 def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
     api_intercept_module: Any,
     settings_module: Any,

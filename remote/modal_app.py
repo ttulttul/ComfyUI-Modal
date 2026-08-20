@@ -2087,7 +2087,14 @@ def _component_pool_slot_index(payload: dict[str, Any]) -> int:
 
 def _remote_worker_affinity_key(payload: dict[str, Any]) -> str:
     """Return the reusable worker-pool affinity key for one remote payload."""
-    return _remote_worker_pool_affinity_key(_component_pool_slot_index(payload))
+    configured_affinity_group = payload.get("remote_worker_affinity_group")
+    if configured_affinity_group is None:
+        return _remote_worker_pool_affinity_key(_component_pool_slot_index(payload))
+    affinity_group = str(configured_affinity_group).strip().lower()
+    if affinity_group not in {"comfy", "llm"}:
+        affinity_group = "comfy"
+    slot_index = _component_pool_slot_index(payload)
+    return f"worker-pool:{affinity_group}:slot:{slot_index}"
 
 
 def _mapped_lane_affinity_key(payload: dict[str, Any], lane_index: int) -> str | None:

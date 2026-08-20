@@ -2,6 +2,7 @@
 
 ## 2026-08-19
 
+- Deliberate mixed-fanout cuts can still form a cycle in the coarse component graph when an earlier value bypasses the cut and feeds a later remote node. SCC merging must preserve graph correctness, so the repair belongs after that merge: force ordered split-proxy phases at annotated local-materializer/remote-session boundaries, carry the local materializers through the phase rewrite, and isolate LLM versus ordinary Comfy phases with distinct reusable worker-affinity groups.
 - ComfyUI's V3 loader assigns `RELATIVE_PYTHON_MODULE` only to nodes returned during startup. Any internal proxy or bridge class inserted into `NODE_CLASS_MAPPINGS` later must copy that loader-owned identity at the registration boundary, including cache-hit reinsertions; otherwise `/object_info` emits `python_module: null` and the frontend can abort before filtering development-only nodes.
 - A reusable worker-pool affinity key is ineffective if it appears only in diagnostics. Modal class parameters define the independently autoscaled instance identity, so the stable slot key must be passed as a `RemoteEngine` parameter on every real invocation and keepalive pulse; prompt-scoped session identity still belongs only in the payload.
 - Modal's `scaledown_window` is an idle upper bound, not a reservation that guarantees the same loaded GPU worker survives a long local phase. For a known remote → local → remote gap, combine an extended per-call class option with a bounded lightweight heartbeat, and stop that heartbeat as soon as the next remote component dispatches.
