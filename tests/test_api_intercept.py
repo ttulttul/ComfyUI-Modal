@@ -116,6 +116,15 @@ class _FakeRemoteVideoNode:
     OUTPUT_IS_LIST = (False,)
 
 
+class _FakeSaveVideoNode:
+    """Fake terminal SaveVideo node that returns its VIDEO input."""
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    OUTPUT_IS_LIST = (False,)
+    OUTPUT_NODE = True
+
+
 class _FakeRemoteAudioNode:
     """Fake remote node that produces a transportable AUDIO output."""
 
@@ -1350,13 +1359,13 @@ def test_rewrite_colocates_remote_chain_across_large_transportable_edges(
     assert api_intercept_module._is_inexpensive_remote_boundary_type("STRING") is True
 
 
-def test_rewrite_colocates_sampler_decoders_and_video_assembly(
+def test_rewrite_runs_terminal_save_video_as_remote_artifact_sink(
     api_intercept_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Sampler media branches should stay together through final video assembly."""
+    """A terminal SaveVideo should encode remotely instead of importing raw VIDEO tensors."""
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -1387,15 +1396,15 @@ def test_rewrite_colocates_sampler_decoders_and_video_assembly(
                 "VAEDecode": _FakeVAEDecodeNode,
                 "VAEDecodeAudio": _FakeRemoteAudioNode,
                 "CreateVideo": _FakeRemoteVideoNode,
-                "SaveVideo": _FakeLocalSinkNode,
+                "SaveVideo": _FakeSaveVideoNode,
             },
             "NODE_DISPLAY_NAME_MAPPINGS": {},
         },
     )()
     workflow = {
         "nodes": [
-            {"id": node_id, "properties": {"is_modal_remote": node_id != 8}}
-            for node_id in range(1, 9)
+            {"id": node_id, "properties": {"is_modal_remote": node_id != 9}}
+            for node_id in range(1, 10)
         ]
     }
     prompt = {
@@ -1416,6 +1425,7 @@ def test_rewrite_colocates_sampler_decoders_and_video_assembly(
             "inputs": {"images": ["4", 0], "audio": ["6", 0]},
         },
         "8": {"class_type": "SaveVideo", "inputs": {"video": ["7", 0]}},
+        "9": {"class_type": "SaveVideo", "inputs": {"video": ["8", 0]}},
     }
 
     rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
@@ -1426,30 +1436,62 @@ def test_rewrite_colocates_sampler_decoders_and_video_assembly(
         nodes_module=fake_nodes_module,
     )
 
-    assert set(rewritten_prompt) == {"1", "8", _artifact_finalizer_node_id(summary)}
+    assert set(rewritten_prompt) == {"1", _artifact_finalizer_node_id(summary)}
+    assert summary.remote_node_ids == [str(node_id) for node_id in range(1, 10)]
     assert summary.remote_component_ids == ["1"]
     assert summary.component_node_ids_by_representative == {
-        "1": ["1", "2", "3", "4", "5", "6", "7"],
+        "1": ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
     }
     assert summary.rewritten_node_id_map == {
         str(node_id): "1"
-        for node_id in range(1, 8)
+        for node_id in range(1, 10)
     }
     payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
-    assert payload["component_node_ids"] == ["1", "2", "3", "4", "5", "6", "7"]
-    assert payload["execute_node_ids"] == ["7"]
-    assert payload["boundary_inputs"] == []
-    assert payload["boundary_outputs"] == [
-        {
-            "proxy_output_name": "7_video",
-            "node_id": "7",
-            "output_index": 0,
-            "io_type": "VIDEO",
-            "is_list": False,
-            "preview_target_node_ids": [],
-        }
+    assert payload["component_node_ids"] == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
     ]
-    assert rewritten_prompt["8"]["inputs"]["video"] == ["1", 0]
+    assert payload["execute_node_ids"] == ["8", "9"]
+    assert payload["boundary_inputs"] == []
+    assert payload["boundary_outputs"] == []
+
+
+def test_rewrite_keeps_nonterminal_save_video_local(
+    api_intercept_module: Any,
+) -> None:
+    """SaveVideo must stay local when its VIDEO output feeds additional local work."""
+    prompt = {
+        "1": {"class_type": "RemoteVideo", "inputs": {}},
+        "2": {"class_type": "SaveVideo", "inputs": {"video": ["1", 0]}},
+        "3": {"class_type": "LocalVideoSink", "inputs": {"video": ["2", 0]}},
+    }
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "RemoteVideo": _FakeRemoteVideoNode,
+                "SaveVideo": _FakeSaveVideoNode,
+                "LocalVideoSink": _FakeRemoteVideoNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+
+    expanded = api_intercept_module._expand_remote_node_ids_for_terminal_video_sinks(
+        prompt=prompt,
+        remote_node_ids={"1"},
+        nodes_module=fake_nodes_module,
+    )
+
+    assert expanded == {"1"}
 
 
 def test_rewrite_keeps_non_returning_local_preview_taps_local(
@@ -4125,7 +4167,7 @@ def test_rewrite_allows_video_and_audio_across_remote_boundaries(
         {
             "NODE_CLASS_MAPPINGS": {
                 "CreateVideo": _FakeRemoteVideoNode,
-                "SaveVideo": _FakeLocalSinkNode,
+                "LocalVideoSink": _FakeLocalSinkNode,
             },
             "NODE_DISPLAY_NAME_MAPPINGS": {},
         },
@@ -4143,9 +4185,9 @@ def test_rewrite_allows_video_and_audio_across_remote_boundaries(
             "_meta": {"title": "Create Video"},
         },
         "2": {
-            "class_type": "SaveVideo",
+            "class_type": "LocalVideoSink",
             "inputs": {"video": ["1", 0]},
-            "_meta": {"title": "Save Video"},
+            "_meta": {"title": "Local Video Sink"},
         },
     }
 

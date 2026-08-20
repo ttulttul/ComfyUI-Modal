@@ -1964,6 +1964,83 @@ def _expand_remote_node_ids_for_non_transportable_inputs(
     return expanded_remote_node_ids, reasons
 
 
+def _terminal_remote_video_source(
+    *,
+    node_id: str,
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    nodes_module: Any,
+) -> LinkedOutputRef | None:
+    """Return the remote VIDEO feeding one safe terminal SaveVideo artifact sink."""
+    prompt_node = prompt.get(node_id)
+    if prompt_node is None or str(prompt_node.get("class_type")) != "SaveVideo":
+        return None
+    inputs = prompt_node.get("inputs") or {}
+    video_input = inputs.get("video")
+    if not _is_link(video_input):
+        return None
+    video_source = LinkedOutputRef(str(video_input[0]), int(video_input[1]))
+    linked_source_node_ids = {
+        str(input_value[0])
+        for input_value in inputs.values()
+        if _is_link(input_value)
+    }
+    if not linked_source_node_ids.issubset(remote_node_ids):
+        return None
+    if any(
+        consumers.get(output_ref)
+        for output_ref in _node_output_refs(prompt, node_id, nodes_module)
+    ):
+        return None
+    io_type = _remote_output_io_type(
+        prompt=prompt,
+        node_id=video_source.node_id,
+        output_index=video_source.output_index,
+        nodes_module=nodes_module,
+    )
+    return video_source if io_type == "VIDEO" else None
+
+
+def _expand_remote_node_ids_for_terminal_video_sinks(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    nodes_module: Any,
+) -> set[str]:
+    """Run terminal SaveVideo consumers remotely to avoid exporting raw VIDEO tensors."""
+    expanded_remote_node_ids = set(remote_node_ids)
+    consumers = _build_consumer_map(prompt)
+    added_node_ids: set[str] = set()
+    for node_id in sorted(prompt):
+        if node_id in expanded_remote_node_ids:
+            continue
+        video_source = _terminal_remote_video_source(
+            node_id=node_id,
+            prompt=prompt,
+            remote_node_ids=expanded_remote_node_ids,
+            consumers=consumers,
+            nodes_module=nodes_module,
+        )
+        if video_source is None:
+            continue
+        expanded_remote_node_ids.add(node_id)
+        added_node_ids.add(node_id)
+        logger.info(
+            "Auto-expanded terminal SaveVideo node %s into remote execution because its "
+            "VIDEO input comes from remote node %s; the encoded output artifact will be "
+            "materialized locally without exporting raw frames.",
+            node_id,
+            video_source.node_id,
+        )
+
+    if added_node_ids:
+        logger.info(
+            "Expanded remote node set with terminal video artifact sinks: %s.",
+            sorted(added_node_ids),
+        )
+    return expanded_remote_node_ids
+
+
 def analyze_remote_node_selection(
     prompt: dict[str, Any],
     workflow: dict[str, Any] | None,
@@ -2001,6 +2078,11 @@ def analyze_remote_node_selection(
     resolved_remote_node_ids, reasons = _expand_remote_node_ids_for_non_transportable_inputs(
         prompt=prompt,
         remote_node_ids=initial_remote_node_ids,
+        nodes_module=resolved_nodes_module,
+    )
+    resolved_remote_node_ids = _expand_remote_node_ids_for_terminal_video_sinks(
+        prompt=prompt,
+        remote_node_ids=resolved_remote_node_ids,
         nodes_module=resolved_nodes_module,
     )
     sandwiched_local_node_ids = _sandwiched_local_node_ids(
@@ -4362,6 +4444,11 @@ def rewrite_prompt_for_modal(
     expanded_remote_node_ids, _ = _expand_remote_node_ids_for_non_transportable_inputs(
         prompt=rewritten_prompt,
         remote_node_ids=remote_node_ids,
+        nodes_module=resolved_nodes_module,
+    )
+    expanded_remote_node_ids = _expand_remote_node_ids_for_terminal_video_sinks(
+        prompt=rewritten_prompt,
+        remote_node_ids=expanded_remote_node_ids,
         nodes_module=resolved_nodes_module,
     )
     summary.remote_node_ids = sorted(expanded_remote_node_ids)
