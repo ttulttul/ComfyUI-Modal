@@ -410,6 +410,18 @@ def _unwrap_proxy_singleton(value: Any) -> Any:
     return value
 
 
+def _pop_proxy_hidden_value(
+    proxy_class: type[Any],
+    kwargs: dict[str, Any],
+    hidden_input: io.Hidden,
+) -> Any:
+    """Read a V3 class-clone hidden value with a legacy kwargs fallback."""
+    legacy_value = kwargs.pop(hidden_input.name, None)
+    hidden_holder = getattr(proxy_class, "hidden", None)
+    hidden_value = getattr(hidden_holder, hidden_input.name, None)
+    return legacy_value if hidden_value is None else hidden_value
+
+
 def _normalize_proxy_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Convert ComfyUI INPUT_IS_LIST proxy kwargs back into ordinary runtime values."""
     return {
@@ -757,10 +769,12 @@ def _build_proxy_node_class(
         async def execute(cls, **kwargs: Any) -> io.NodeOutput:
             """Forward the execution payload to the configured remote executor."""
             unique_id = _normalize_prompt_id(
-                _unwrap_proxy_singleton(kwargs.pop(io.Hidden.unique_id.name, None))
+                _unwrap_proxy_singleton(
+                    _pop_proxy_hidden_value(cls, kwargs, io.Hidden.unique_id)
+                )
             )
             prompt_id = _prompt_id_from_extra_pnginfo(
-                kwargs.pop(io.Hidden.extra_pnginfo.name, None)
+                _pop_proxy_hidden_value(cls, kwargs, io.Hidden.extra_pnginfo)
             )
             payload = _rehydrate_proxy_payload(
                 _normalize_proxy_payload(kwargs.pop(payload_input_name, None)),

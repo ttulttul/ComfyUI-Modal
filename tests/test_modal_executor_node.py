@@ -1383,10 +1383,12 @@ def test_proxy_execution_normalizes_input_is_list_kwargs(
     }
 
 
-def test_cache_friendly_proxy_payload_rehydrates_list_wrapped_prompt_id_at_execution(
+@pytest.mark.parametrize("hidden_delivery", ["v3_class_clone", "legacy_kwargs"])
+def test_cache_friendly_proxy_payload_rehydrates_prompt_id_at_execution(
     modal_executor_module: Any,
+    hidden_delivery: str,
 ) -> None:
-    """List-wrapped hidden inputs should select the correct overlapping prompt."""
+    """V3 and legacy hidden inputs should select the correct overlapping prompt."""
     fake_nodes_module = type(
         "FakeNodesModule",
         (),
@@ -1437,17 +1439,30 @@ def test_cache_friendly_proxy_payload_rehydrates_list_wrapped_prompt_id_at_execu
 
     modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
     try:
-        result = asyncio.run(
-            proxy_class.execute(
-                original_node_data=[payload],
-                unique_id=["node-1"],
-                extra_pnginfo=[
-                    {
-                        modal_executor_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY:
-                            "prompt-1"
+        hidden_metadata = {
+            modal_executor_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY: "prompt-1"
+        }
+        execution_proxy_class = proxy_class
+        hidden_kwargs: dict[str, Any] = {}
+        if hidden_delivery == "v3_class_clone":
+            execution_proxy_class = proxy_class.PREPARE_CLASS_CLONE(
+                {
+                    "hidden_inputs": {
+                        modal_executor_module.io.Hidden.unique_id: "node-1",
+                        modal_executor_module.io.Hidden.extra_pnginfo: hidden_metadata,
                     }
-                ],
+                }
+            )
+        else:
+            hidden_kwargs = {
+                "unique_id": ["node-1"],
+                "extra_pnginfo": [hidden_metadata],
+            }
+        result = asyncio.run(
+            execution_proxy_class.execute(
+                original_node_data=[payload],
                 value=["payload"],
+                **hidden_kwargs,
             )
         )
     finally:
