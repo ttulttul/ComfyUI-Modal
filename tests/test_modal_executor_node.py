@@ -1834,6 +1834,77 @@ def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
     assert [args[1] for _fn, args in submitted_tasks] == [0, 1, 2, 3]
 
 
+def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A running component should schedule its next distinct affinity exactly once."""
+    submitted_tasks: list[tuple[Any, tuple[Any, ...]]] = []
+
+    class FakeExecutor:
+        """Minimal executor that records speculative warmup jobs."""
+
+        def submit(self, fn: Any, *args: Any) -> Future[Any]:
+            """Capture one scheduled task without running it."""
+            submitted_tasks.append((fn, args))
+            return Future()
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "false")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_REMOTE_MODAL_WARMUP_EXECUTOR",
+        FakeExecutor(),
+    )
+    remote_modal_app_module.get_settings.cache_clear()
+    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
+        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
+
+    payload = {
+        "prompt_id": "prompt-spec",
+        "component_id": "llm-component",
+        "remote_worker_affinity_group": "llm",
+        "speculative_remote_prewarm_target": {
+            "prompt_id": "prompt-spec",
+            "component_id": "comfy-component",
+            "modal_gpu": "RTX-PRO-6000",
+            "remote_worker_affinity_group": "comfy",
+            "remote_local_gap_pool": True,
+            "subgraph_prompt": {
+                "11": {
+                    "class_type": "UNETLoader",
+                    "inputs": {"unet_name": "video-model.safetensors"},
+                }
+            },
+        },
+    }
+
+    try:
+        assert remote_modal_app_module._schedule_speculative_affinity_prewarm(
+            payload,
+            reason="test_first_event",
+        ) is True
+        assert remote_modal_app_module._schedule_speculative_affinity_prewarm(
+            payload,
+            reason="test_duplicate_event",
+        ) is False
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert len(submitted_tasks) == 1
+    scheduled_function, scheduled_args = submitted_tasks[0]
+    assert scheduled_function is remote_modal_app_module._run_speculative_affinity_prewarm
+    assert scheduled_args[0] == "prompt-spec"
+    assert scheduled_args[1] == "worker-pool:comfy:slot:0"
+    assert scheduled_args[2]["remote_worker_affinity_group"] == "comfy"
+    assert scheduled_args[2]["remote_local_gap_pool"] is True
+    assert [
+        plan["class_type"] for plan in scheduled_args[2]["loader_prewarm_plans"]
+    ] == ["UNETLoader"]
+
+
 def test_local_gap_keepalive_is_bounded_and_stopped_by_next_remote_component(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -1965,7 +2036,11 @@ def test_build_prompt_warmup_request_includes_root_loader_prewarm_plans(
     loader_plans = warmup_request["loader_prewarm_plans"]
     assert warmup_request["modal_gpu"] == "B300"
     assert [plan["node_id"] for plan in loader_plans] == ["1", "2", "3"]
-    assert [plan["class_type"] for plan in loader_plans] == ["UNETLoader", "CLIPLoader", "DualCLIPLoader"]
+    assert [plan["class_type"] for plan in loader_plans] == [
+        "UNETLoader",
+        "CLIPLoader",
+        "DualCLIPLoader",
+    ]
     assert all(plan["execute_node_ids"] == [plan["node_id"]] for plan in loader_plans)
 
 
@@ -7176,6 +7251,41 @@ def test_remote_modal_consumes_streamed_progress_and_result(
             "client-1",
         ),
     ]
+
+
+def test_remote_stream_first_event_triggers_speculative_prewarm_once(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The current worker must emit an event before its future affinity is prepared."""
+    scheduled_payloads: list[tuple[dict[str, Any], str]] = []
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_schedule_speculative_affinity_prewarm",
+        lambda payload, *, reason: scheduled_payloads.append((dict(payload), reason))
+        or True,
+    )
+
+    payload = {
+        "prompt_id": "prompt-spec",
+        "component_id": "component-current",
+        "speculative_remote_prewarm_target": {
+            "component_id": "component-next",
+        },
+    }
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {"kind": "remote_logs", "task_id": "ta-spec"},
+                {"kind": "progress", "phase": "executing"},
+                {"kind": "result", "outputs": b"serialized-outputs"},
+            ]
+        ),
+    )
+
+    assert result == b"serialized-outputs"
+    assert scheduled_payloads == [(payload, "current_remote_stream_started")]
 
 
 def test_emit_local_remote_dispatch_status_marks_component_starting(

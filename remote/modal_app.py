@@ -129,6 +129,7 @@ _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
         "DualCLIPLoader",
     }
 )
+_SPECULATIVE_PREWARM_TARGET_KEY = "speculative_remote_prewarm_target"
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()
 _REMOTE_CONTAINER_LOG_STREAMS: dict[str, "_RemoteContainerLogStreamState"] = {}
@@ -228,6 +229,8 @@ class _PromptWarmupState:
     scheduled_slots: set[int] = field(default_factory=set)
     exact_component_parallelism: dict[str, int] = field(default_factory=dict)
     slot_futures: dict[int, Future[Any]] = field(default_factory=dict)
+    scheduled_speculative_affinities: set[str] = field(default_factory=set)
+    speculative_affinity_futures: dict[str, Future[Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -4420,6 +4423,7 @@ def _consume_remote_payload_stream(
     previous_event_at = stream_started_at
     event_count = 0
     progress_event_count = 0
+    speculative_prewarm_checked = False
     logger.info(
         "Starting local Modal stream consumption component=%s prompt_id=%s invocation_id=%s.",
         component_id,
@@ -4433,6 +4437,12 @@ def _consume_remote_payload_stream(
             seconds_since_previous_event = event_received_at - previous_event_at
             previous_event_at = event_received_at
             event_count += 1
+            if not speculative_prewarm_checked:
+                speculative_prewarm_checked = True
+                _schedule_speculative_affinity_prewarm(
+                    payload,
+                    reason="current_remote_stream_started",
+                )
             event_kind = str(stream_event.get("kind", ""))
             if event_kind == "remote_logs":
                 task_id = _coerce_modal_task_id(stream_event.get("task_id"))
@@ -7018,6 +7028,10 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | No
             )
         ),
         "modal_gpu": settings.modal_gpu,
+        "remote_worker_affinity_group": payload.get(
+            "remote_worker_affinity_group"
+        ),
+        "remote_local_gap_pool": bool(payload.get("remote_local_gap_pool")),
         "requires_volume_reload": bool(payload.get("requires_volume_reload", True)),
         "volume_reload_marker": payload.get("volume_reload_marker"),
         "uploaded_volume_paths": list(payload.get("uploaded_volume_paths", [])),
@@ -7382,6 +7396,118 @@ def ensure_remote_warm_capacity(
         )
         _track_prompt_warmup_future(prompt_id, slot_index, future)
     return clamped_target
+
+
+def _run_speculative_affinity_prewarm(
+    prompt_id: str,
+    affinity_key: str,
+    warmup_request: dict[str, Any],
+    reason: str,
+) -> None:
+    """Prepare one future affinity worker and make a failed attempt retryable."""
+    try:
+        logger.info(
+            "Starting speculative Modal prewarm prompt=%s affinity=%s component=%s reason=%s.",
+            prompt_id,
+            affinity_key,
+            warmup_request.get("component_id"),
+            reason,
+        )
+        _invoke_modal_warmup_blocking(_warmup_slot_payload(warmup_request, 0))
+        logger.info(
+            "Completed speculative Modal prewarm prompt=%s affinity=%s component=%s.",
+            prompt_id,
+            affinity_key,
+            warmup_request.get("component_id"),
+        )
+    except Exception:
+        with _PROMPT_WARMUP_STATES_LOCK:
+            warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+            if warmup_state is not None:
+                warmup_state.scheduled_speculative_affinities.discard(affinity_key)
+        logger.exception(
+            "Speculative Modal prewarm failed prompt=%s affinity=%s component=%s.",
+            prompt_id,
+            affinity_key,
+            warmup_request.get("component_id"),
+        )
+
+
+def _schedule_speculative_affinity_prewarm(
+    payload: Mapping[str, Any],
+    *,
+    reason: str,
+) -> bool:
+    """Schedule one planner-selected future worker without blocking current execution."""
+    target_payload = payload.get(_SPECULATIVE_PREWARM_TARGET_KEY)
+    if not isinstance(target_payload, Mapping):
+        return False
+
+    normalized_target_payload = copy.deepcopy(dict(target_payload))
+    settings = _settings_for_payload(normalized_target_payload)
+    if (
+        not settings.enable_proactive_warmup
+        or settings.execution_mode == "local"
+        or modal is None
+        or (settings.max_containers is not None and settings.max_containers < 2)
+    ):
+        return False
+
+    warmup_request = _build_prompt_warmup_request(normalized_target_payload)
+    if warmup_request is None:
+        return False
+    prompt_id = _warmup_prompt_id(warmup_request)
+    if prompt_id is None:
+        return False
+
+    current_affinity_key = _remote_worker_affinity_key(dict(payload))
+    target_affinity_key = _remote_worker_affinity_key(warmup_request)
+    if target_affinity_key == current_affinity_key:
+        return False
+
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _ensure_prompt_warmup_state(prompt_id)
+        if target_affinity_key in warmup_state.scheduled_speculative_affinities:
+            return False
+        warmup_state.scheduled_speculative_affinities.add(target_affinity_key)
+
+    logger.info(
+        "Scheduling speculative Modal prewarm prompt=%s current_component=%s current_affinity=%s target_component=%s target_affinity=%s reason=%s.",
+        prompt_id,
+        payload.get("component_id"),
+        current_affinity_key,
+        warmup_request.get("component_id"),
+        target_affinity_key,
+        reason,
+    )
+    future = _REMOTE_MODAL_WARMUP_EXECUTOR.submit(
+        _run_speculative_affinity_prewarm,
+        prompt_id,
+        target_affinity_key,
+        copy.deepcopy(warmup_request),
+        reason,
+    )
+    with _PROMPT_WARMUP_STATES_LOCK:
+        warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+        if warmup_state is not None:
+            warmup_state.speculative_affinity_futures[target_affinity_key] = future
+
+    def _clear_speculative_future(completed_future: Future[Any]) -> None:
+        """Drop a completed speculative future while retaining successful dedupe state."""
+        with _PROMPT_WARMUP_STATES_LOCK:
+            warmup_state = _PROMPT_WARMUP_STATES.get(prompt_id)
+            if warmup_state is None:
+                return
+            tracked_future = warmup_state.speculative_affinity_futures.get(
+                target_affinity_key
+            )
+            if tracked_future is completed_future:
+                warmup_state.speculative_affinity_futures.pop(
+                    target_affinity_key, None
+                )
+
+    future.add_done_callback(_clear_speculative_future)
+    return True
 
 
 def _local_gap_keepalive_key(payload: Mapping[str, Any]) -> tuple[str, int] | None:

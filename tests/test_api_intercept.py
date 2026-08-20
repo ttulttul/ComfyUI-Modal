@@ -3068,6 +3068,87 @@ def test_snapshot_profile_stamping_excludes_llm_phase_from_comfy_profile(
     assert phases[2]["snapshot_profile_key"] == snapshot_profile_key
 
 
+def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
+    api_intercept_module: Any,
+) -> None:
+    """Each proxy should prepare only its nearest reachable future worker group."""
+    rewritten_prompt = {
+        "spec-a": {
+            "class_type": "ModalProxy",
+            "inputs": {
+                "original_node_data": {
+                    "component_id": "spec-a",
+                    "prompt_id": "prompt-spec",
+                    "modal_gpu": "RTX-PRO-6000",
+                    "remote_worker_affinity_group": "llm",
+                    "subgraph_prompt": {"1": {"class_type": "ModalLLM", "inputs": {}}},
+                }
+            },
+        },
+        "spec-b": {
+            "class_type": "ModalProxy",
+            "inputs": {
+                "upstream": ["spec-local", 0],
+                "original_node_data": {
+                    "component_id": "spec-b",
+                    "prompt_id": "prompt-spec",
+                    "modal_gpu": "RTX-PRO-6000",
+                    "remote_worker_affinity_group": "comfy",
+                    "remote_local_gap_pool": True,
+                    "snapshot_profile_key": "loader-profile:abc",
+                    "subgraph_prompt": {
+                        "2": {
+                            "class_type": "UNETLoader",
+                            "inputs": {"unet_name": "video-model.safetensors"},
+                        }
+                    },
+                },
+            },
+        },
+        "spec-local": {
+            "class_type": "PreviewAny",
+            "inputs": {"source": ["spec-a", 0]},
+        },
+        "spec-c": {
+            "class_type": "ModalProxy",
+            "inputs": {
+                "upstream": ["spec-b", 0],
+                "original_node_data": {
+                    "component_id": "spec-c",
+                    "prompt_id": "prompt-spec",
+                    "modal_gpu": "RTX-PRO-6000",
+                    "remote_worker_affinity_group": "llm",
+                    "subgraph_prompt": {"3": {"class_type": "ModalLLM", "inputs": {}}},
+                },
+            },
+        },
+    }
+
+    api_intercept_module._configure_speculative_affinity_prewarm_payloads(
+        rewritten_prompt=rewritten_prompt,
+        execution_stages=[["spec-a", "spec-b"], ["spec-c"]],
+    )
+
+    first_payload = api_intercept_module.registered_proxy_execution_payload(
+        "spec-a", rewritten_prompt["spec-a"]["inputs"]["original_node_data"]
+    )
+    second_payload = api_intercept_module.registered_proxy_execution_payload(
+        "spec-b", rewritten_prompt["spec-b"]["inputs"]["original_node_data"]
+    )
+    third_payload = api_intercept_module.registered_proxy_execution_payload(
+        "spec-c", rewritten_prompt["spec-c"]["inputs"]["original_node_data"]
+    )
+
+    first_target = first_payload["speculative_remote_prewarm_target"]
+    second_target = second_payload["speculative_remote_prewarm_target"]
+    assert first_target["component_id"] == "spec-b"
+    assert first_target["remote_worker_affinity_group"] == "comfy"
+    assert first_target["snapshot_profile_key"] == "loader-profile:abc"
+    assert second_target["component_id"] == "spec-c"
+    assert second_target["remote_worker_affinity_group"] == "llm"
+    assert "speculative_remote_prewarm_target" not in third_payload
+
+
 def test_rewrite_keeps_unmapped_remote_siblings_without_local_reentry_together(
     api_intercept_module: Any,
     settings_module: Any,

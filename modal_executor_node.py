@@ -35,6 +35,7 @@ _VOLATILE_PROXY_CACHE_KEYS = frozenset(
         "requires_volume_reload",
         "volume_reload_marker",
         "uploaded_volume_paths",
+        "speculative_remote_prewarm_target",
     }
 )
 
@@ -546,6 +547,18 @@ def update_registered_proxy_payload_fields(
         )
     execution_payload.update(fields)
     return register_cache_friendly_proxy_payload(node_id, execution_payload)
+
+
+def registered_proxy_execution_payload(
+    node_id: str,
+    embedded_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the full run-scoped payload registered for one proxy node."""
+    with _PROXY_EXECUTION_CONTEXTS_LOCK:
+        context = _PROXY_EXECUTION_CONTEXTS.get(str(node_id))
+        return dict(
+            context.execution_payload if context is not None else embedded_payload
+        )
 
 
 def register_modal_map_input_warmup_context(
