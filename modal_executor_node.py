@@ -746,8 +746,12 @@ def ensure_modal_proxy_node_registered(
     proxy_node_id = _proxy_node_id(original_class_type, output_types)
 
     if proxy_node_id in _PROXY_NODE_CACHE:
-        nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = _PROXY_NODE_CACHE[proxy_node_id]
-        nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Universal Executor"
+        _register_modal_node(
+            nodes_module,
+            proxy_node_id,
+            _PROXY_NODE_CACHE[proxy_node_id],
+            "Modal Universal Executor",
+        )
         return proxy_node_id
 
     proxy_class = _build_proxy_node_class(
@@ -759,8 +763,12 @@ def ensure_modal_proxy_node_registered(
         output_is_list=output_is_list,
         is_output_node=False,
     )
-    nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = proxy_class
-    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Universal Executor"
+    _register_modal_node(
+        nodes_module,
+        proxy_node_id,
+        proxy_class,
+        "Modal Universal Executor",
+    )
     _PROXY_NODE_CACHE[proxy_node_id] = proxy_class
     logger.info("Registered Modal proxy node %s for %s", proxy_node_id, original_class_type)
     return proxy_node_id
@@ -788,8 +796,12 @@ def ensure_modal_component_proxy_node_registered(
     )
 
     if proxy_node_id in _PROXY_NODE_CACHE:
-        nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = _PROXY_NODE_CACHE[proxy_node_id]
-        nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Remote Component"
+        _register_modal_node(
+            nodes_module,
+            proxy_node_id,
+            _PROXY_NODE_CACHE[proxy_node_id],
+            "Modal Remote Component",
+        )
         return proxy_node_id
 
     proxy_class = _build_proxy_node_class(
@@ -802,41 +814,57 @@ def ensure_modal_component_proxy_node_registered(
         is_output_node=is_output_node,
         include_completion_output=include_completion_output,
     )
-    nodes_module.NODE_CLASS_MAPPINGS[proxy_node_id] = proxy_class
-    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[proxy_node_id] = "Modal Remote Component"
+    _register_modal_node(
+        nodes_module,
+        proxy_node_id,
+        proxy_class,
+        "Modal Remote Component",
+    )
     _PROXY_NODE_CACHE[proxy_node_id] = proxy_class
     logger.info("Registered Modal component proxy node %s", proxy_node_id)
     return proxy_node_id
 
 
+def _register_modal_node(
+    nodes_module: Any,
+    node_id: str,
+    node_class: type[io.ComfyNode],
+    display_name: str,
+) -> None:
+    """Register a runtime Modal node with the plugin's ComfyUI module identity."""
+    node_class.RELATIVE_PYTHON_MODULE = ModalUniversalExecutor.RELATIVE_PYTHON_MODULE
+    nodes_module.NODE_CLASS_MAPPINGS[node_id] = node_class
+    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[node_id] = display_name
+
+
 def ensure_modal_artifact_finalizer_registered(nodes_module: Any) -> None:
     """Register the internal artifact-finalization sink in a ComfyUI node mapping."""
-    nodes_module.NODE_CLASS_MAPPINGS[MODAL_ARTIFACT_FINALIZER_NODE_ID] = (
-        ModalArtifactFinalizer
-    )
-    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[MODAL_ARTIFACT_FINALIZER_NODE_ID] = (
-        "Modal Artifact Finalizer"
+    _register_modal_node(
+        nodes_module,
+        MODAL_ARTIFACT_FINALIZER_NODE_ID,
+        ModalArtifactFinalizer,
+        "Modal Artifact Finalizer",
     )
 
 
 def ensure_modal_parallel_local_passthrough_registered(nodes_module: Any) -> None:
     """Register the internal parallel local-branch dispatch gate."""
-    nodes_module.NODE_CLASS_MAPPINGS[MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID] = (
-        ModalParallelLocalPassthrough
+    _register_modal_node(
+        nodes_module,
+        MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
+        ModalParallelLocalPassthrough,
+        "Modal Parallel Local Passthrough",
     )
-    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[
-        MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID
-    ] = "Modal Parallel Local Passthrough"
 
 
 def ensure_modal_local_bridge_materializer_registered(nodes_module: Any) -> None:
     """Register the internal durable-bridge local materializer."""
-    nodes_module.NODE_CLASS_MAPPINGS[MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID] = (
-        ModalLocalBridgeMaterializer
+    _register_modal_node(
+        nodes_module,
+        MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
+        ModalLocalBridgeMaterializer,
+        "Modal Local Bridge Materializer",
     )
-    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[
-        MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID
-    ] = "Modal Local Bridge Materializer"
 
 
 class ModalUniversalExecutor(io.ComfyNode):
