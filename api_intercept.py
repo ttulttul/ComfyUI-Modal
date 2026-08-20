@@ -29,6 +29,7 @@ from .modal_executor_node import (
     ensure_modal_parallel_local_passthrough_registered,
     register_cache_friendly_proxy_payload,
     register_modal_map_input_warmup_context,
+    registered_proxy_execution_payload,
     update_registered_proxy_payload_fields,
 )
 from .session_state import RemoteSessionHandle
@@ -84,6 +85,22 @@ _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
         "UNETLoader",
         "CLIPLoader",
         "DualCLIPLoader",
+    }
+)
+_SPECULATIVE_PREWARM_TARGET_KEY = "speculative_remote_prewarm_target"
+_SPECULATIVE_PREWARM_PAYLOAD_FIELDS = frozenset(
+    {
+        "component_id",
+        "prompt_id",
+        "modal_gpu",
+        "remote_worker_affinity_group",
+        "remote_local_gap_pool",
+        "subgraph_prompt",
+        "requires_volume_reload",
+        "volume_reload_marker",
+        "uploaded_volume_paths",
+        "custom_nodes_bundle",
+        "snapshot_profile_key",
     }
 )
 
@@ -4419,6 +4436,167 @@ def _configure_local_gap_keepalive_payloads(
     )
 
 
+def _remote_proxy_payload(
+    rewritten_prompt: Mapping[str, Any], component_id: str
+) -> Mapping[str, Any] | None:
+    """Return the registered execution payload embedded in one remote proxy."""
+    prompt_node = rewritten_prompt.get(component_id)
+    if not isinstance(prompt_node, Mapping):
+        return None
+    inputs = prompt_node.get("inputs")
+    if not isinstance(inputs, Mapping):
+        return None
+    payload = inputs.get("original_node_data")
+    if not isinstance(payload, Mapping):
+        return None
+    return registered_proxy_execution_payload(component_id, payload)
+
+
+def _remote_proxy_dependency_edges(
+    rewritten_prompt: Mapping[str, Any],
+    component_ids: set[str],
+) -> dict[str, set[str]]:
+    """Return nearest remote dependencies while traversing intervening local nodes."""
+    dependency_edges = {component_id: set() for component_id in component_ids}
+    for downstream_component_id in component_ids:
+        downstream_node = rewritten_prompt.get(downstream_component_id)
+        if not isinstance(downstream_node, Mapping):
+            continue
+        pending_node_ids = [
+            str(input_value[0])
+            for input_value in (downstream_node.get("inputs") or {}).values()
+            if _is_link(input_value)
+        ]
+        visited_node_ids: set[str] = set()
+        while pending_node_ids:
+            upstream_node_id = pending_node_ids.pop()
+            if upstream_node_id in visited_node_ids:
+                continue
+            visited_node_ids.add(upstream_node_id)
+            if upstream_node_id in component_ids:
+                dependency_edges[upstream_node_id].add(downstream_component_id)
+                continue
+            upstream_node = rewritten_prompt.get(upstream_node_id)
+            if not isinstance(upstream_node, Mapping):
+                continue
+            pending_node_ids.extend(
+                str(input_value[0])
+                for input_value in (upstream_node.get("inputs") or {}).values()
+                if _is_link(input_value)
+            )
+    return dependency_edges
+
+
+def _component_descendant_distances(
+    component_id: str,
+    dependency_edges: Mapping[str, set[str]],
+) -> dict[str, int]:
+    """Return shortest downstream distances from one remote component."""
+    distances: dict[str, int] = {}
+    pending = deque(
+        (descendant_id, 1)
+        for descendant_id in dependency_edges.get(component_id, set())
+    )
+    while pending:
+        descendant_id, distance = pending.popleft()
+        previous_distance = distances.get(descendant_id)
+        if previous_distance is not None and previous_distance <= distance:
+            continue
+        distances[descendant_id] = distance
+        pending.extend(
+            (nested_descendant_id, distance + 1)
+            for nested_descendant_id in dependency_edges.get(descendant_id, set())
+        )
+    return distances
+
+
+def _speculative_prewarm_target_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the minimal side-effect-free payload needed to prepare one worker."""
+    return {
+        field_name: copy.deepcopy(payload[field_name])
+        for field_name in _SPECULATIVE_PREWARM_PAYLOAD_FIELDS
+        if field_name in payload
+    }
+
+
+def _configure_speculative_affinity_prewarm_payloads(
+    *,
+    rewritten_prompt: dict[str, Any],
+    execution_stages: list[list[str]],
+) -> None:
+    """Attach one next-affinity worker preparation target to each eligible proxy."""
+    stage_index_by_component_id = {
+        component_id: stage_index
+        for stage_index, stage in enumerate(execution_stages)
+        for component_id in stage
+    }
+    payloads_by_component_id = {
+        component_id: payload
+        for component_id in stage_index_by_component_id
+        if (
+            payload := _remote_proxy_payload(rewritten_prompt, component_id)
+        )
+        is not None
+    }
+    dependency_edges = _remote_proxy_dependency_edges(
+        rewritten_prompt,
+        set(payloads_by_component_id),
+    )
+
+    configured_targets: dict[str, str] = {}
+    for component_id, payload in payloads_by_component_id.items():
+        affinity_group = str(
+            payload.get("remote_worker_affinity_group") or "comfy"
+        ).strip().lower()
+        descendant_distances = _component_descendant_distances(
+            component_id, dependency_edges
+        )
+        candidate_ids = sorted(
+            (
+                descendant_id
+                for descendant_id in descendant_distances
+                if descendant_id in payloads_by_component_id
+                and str(
+                    payloads_by_component_id[descendant_id].get(
+                        "remote_worker_affinity_group"
+                    )
+                    or "comfy"
+                )
+                .strip()
+                .lower()
+                != affinity_group
+            ),
+            key=lambda descendant_id: (
+                descendant_distances[descendant_id],
+                stage_index_by_component_id[descendant_id],
+                descendant_id,
+            ),
+        )
+        if not candidate_ids:
+            continue
+
+        target_component_id = candidate_ids[0]
+        target_payload = _speculative_prewarm_target_payload(
+            payloads_by_component_id[target_component_id]
+        )
+        rewritten_prompt[component_id]["inputs"]["original_node_data"] = (
+            update_registered_proxy_payload_fields(
+                component_id,
+                payload,
+                {_SPECULATIVE_PREWARM_TARGET_KEY: target_payload},
+            )
+        )
+        configured_targets[component_id] = target_component_id
+
+    if configured_targets:
+        logger.info(
+            "Configured one-step speculative Modal worker prewarm targets=%s.",
+            configured_targets,
+        )
+
+
 def rewrite_prompt_for_modal(
     prompt: dict[str, Any],
     workflow: dict[str, Any] | None,
@@ -4644,6 +4822,10 @@ def rewrite_prompt_for_modal(
     }
     _, dependency_edges, _ = _component_dependency_graph(rewritten_prompt, proxy_component_groups)
     execution_stages = _component_execution_stages(rewritten_prompt, proxy_component_groups)
+    _configure_speculative_affinity_prewarm_payloads(
+        rewritten_prompt=rewritten_prompt,
+        execution_stages=execution_stages,
+    )
     summary.component_dependency_ids_by_representative = {
         representative_node_id: sorted(
             upstream_component_id
