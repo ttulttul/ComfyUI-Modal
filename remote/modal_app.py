@@ -106,6 +106,10 @@ _STAGED_LLM_PROFILE_RESULTS: dict[tuple[str, str], dict[str, Any]] = {}
 _MODAL_APP_STOP_TIMEOUT_SECONDS = 120.0
 _MODAL_INTERRUPT_DICTS_LOCK = threading.Lock()
 _MODAL_INTERRUPT_DICTS: dict[tuple[str, str | None], Any] = {}
+_MODAL_SESSION_BRIDGE_DICTS_LOCK = threading.Lock()
+_MODAL_SESSION_BRIDGE_DICTS: dict[tuple[str, str | None], Any] = {}
+_MODAL_DURABLE_VOLUMES_LOCK = threading.Lock()
+_MODAL_DURABLE_VOLUMES: dict[tuple[str, str | None], Any] = {}
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
 _MAPPED_PROGRESS_NODE_IDS: dict[tuple[str, str, str], str] = {}
 _PROMPT_WARMUP_STATES_LOCK = threading.Lock()
@@ -1545,6 +1549,109 @@ def _restore_serialized_remote_session_bridge_value(
         target_session_handle.session_id,
     )
     return restored_value
+
+
+def materialize_remote_session_bridge_ref_locally(
+    ref_payload: Mapping[str, Any],
+) -> Any:
+    """Download and deserialize one durable bridge value for local ComfyUI work."""
+    if not is_remote_session_bridge_ref_payload(ref_payload):
+        raise TypeError(
+            "Local Modal bridge materialization requires a remote session bridge ref."
+        )
+    ref = RemoteSessionBridgeRef.from_payload(ref_payload)
+    materialization_started_at = time.perf_counter()
+    logger.info(
+        "Starting local remote-bridge materialization bridge_key=%s node=%s output=%d.",
+        ref.bridge_key,
+        ref.node_id,
+        ref.output_index,
+    )
+    record_lookup_started_at = time.perf_counter()
+    record = _load_local_materialization_bridge_record(ref.bridge_key)
+    logger.info(
+        "Loaded local materialization bridge record in %.3fs bridge_key=%s object_backed=%s.",
+        time.perf_counter() - record_lookup_started_at,
+        ref.bridge_key,
+        record.serialized_output_object is not None,
+    )
+    if record.serialized_output_object is not None:
+        object_download_started_at = time.perf_counter()
+        restored_outputs = deserialize_node_outputs(
+            _read_local_materialization_bridge_object(
+                record.serialized_output_object
+            )
+        )
+        logger.info(
+            "Downloaded and deserialized local bridge object in %.3fs bridge_key=%s bytes=%d.",
+            time.perf_counter() - object_download_started_at,
+            ref.bridge_key,
+            record.serialized_output_object.size_bytes,
+        )
+        if len(restored_outputs) != 1:
+            raise DurableStateError(
+                f"Bridge object {record.serialized_output_object.object_path!r} "
+                "must contain exactly one output."
+            )
+        restored_value = restored_outputs[0]
+        storage_kind = "object-backed"
+    elif record.serialized_output is not None:
+        restored_value = deserialize_value(record.serialized_output)
+        storage_kind = "inline"
+    else:
+        raise RemoteSessionStateError(
+            "Remote bridge cannot be materialized locally without a durable "
+            f"serialized output bridge_key={ref.bridge_key!r}."
+        )
+    logger.info(
+        "Materialized remote bridge locally in %.3fs bridge_key=%s node=%s output=%d storage=%s io_type=%s.",
+        time.perf_counter() - materialization_started_at,
+        ref.bridge_key,
+        ref.node_id,
+        ref.output_index,
+        storage_kind,
+        record.serialized_output_io_type or "bridge",
+    )
+    return restored_value
+
+
+def _load_local_materialization_bridge_record(
+    bridge_key: str,
+) -> RemoteSessionBridgeRecord:
+    """Load a bridge record from local fallback state or Modal's shared Dict."""
+    settings = get_settings()
+    if settings.execution_mode != "remote":
+        return _REMOTE_SESSION_BRIDGE_STORE.get_record(bridge_key)
+    bridge_store = _lookup_modal_session_bridge_store()
+    payload = bridge_store.get(bridge_key)
+    if not isinstance(payload, Mapping):
+        raise RemoteSessionStateError(
+            f"Remote session bridge record {bridge_key!r} was not found."
+        )
+    return RemoteSessionBridgeRecord.from_payload(payload)
+
+
+def _read_local_materialization_bridge_object(
+    object_ref: DurableObjectRef,
+) -> bytes:
+    """Read and validate one bridge object locally from fallback or Modal storage."""
+    settings = get_settings()
+    if settings.execution_mode != "remote":
+        return _durable_object_store().get(object_ref)
+    volume_path = (Path("durable_objects") / object_ref.object_path).as_posix()
+    payload = read_modal_volume_file(
+        _lookup_modal_durable_volume(),
+        volume_path,
+    )
+    if len(payload) != object_ref.size_bytes:
+        raise DurableStateError(
+            f"Durable bridge object {object_ref.object_path!r} has an unexpected size."
+        )
+    if hashlib.sha256(payload).hexdigest() != object_ref.sha256:
+        raise DurableStateError(
+            f"Durable bridge object {object_ref.object_path!r} failed its content-address check."
+        )
+    return payload
 
 
 def _build_durable_bridge_rehydration_plan(
@@ -6317,6 +6424,50 @@ def _modal_environment_name() -> str | None:
         return None
     normalized = environment_name.strip()
     return normalized or None
+
+
+def _lookup_modal_session_bridge_store() -> Any:
+    """Return the shared Modal Dict that contains durable bridge records."""
+    if modal is None or not hasattr(modal, "Dict"):
+        raise RuntimeError(
+            "Modal SDK is required to materialize a remote bridge locally."
+        )
+    settings = get_settings()
+    cache_key = (settings.session_bridge_dict_name, _modal_environment_name())
+    with _MODAL_SESSION_BRIDGE_DICTS_LOCK:
+        cached_store = _MODAL_SESSION_BRIDGE_DICTS.get(cache_key)
+        if cached_store is not None:
+            return cached_store
+    bridge_store = modal.Dict.from_name(
+        settings.session_bridge_dict_name,
+        environment_name=cache_key[1],
+        create_if_missing=True,
+    )
+    with _MODAL_SESSION_BRIDGE_DICTS_LOCK:
+        _MODAL_SESSION_BRIDGE_DICTS[cache_key] = bridge_store
+    return bridge_store
+
+
+def _lookup_modal_durable_volume() -> Any:
+    """Return the shared Modal Volume that contains durable bridge objects."""
+    if modal is None or not hasattr(modal, "Volume"):
+        raise RuntimeError(
+            "Modal SDK is required to download a remote bridge object locally."
+        )
+    settings = get_settings()
+    cache_key = (settings.volume_name, _modal_environment_name())
+    with _MODAL_DURABLE_VOLUMES_LOCK:
+        cached_volume = _MODAL_DURABLE_VOLUMES.get(cache_key)
+        if cached_volume is not None:
+            return cached_volume
+    volume = modal.Volume.from_name(
+        settings.volume_name,
+        environment_name=cache_key[1],
+        create_if_missing=True,
+    )
+    with _MODAL_DURABLE_VOLUMES_LOCK:
+        _MODAL_DURABLE_VOLUMES[cache_key] = volume
+    return volume
 
 
 def _modal_deploy_cache_key(

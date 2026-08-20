@@ -8,6 +8,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import importlib.util
 import json
 import pickle
@@ -190,6 +191,31 @@ class _FakeRewriteLocalFeedbackNode:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("text",)
     OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteRemoteImageNode:
+    """Fake remote node that produces one locally previewable image."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewriteRemoteTextNode:
+    """Fake remote node that consumes an image and produces text."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+
+
+class _FakeRewritePreviewImageNode:
+    """Fake local PreviewImage output node."""
+
+    RETURN_TYPES: tuple[str, ...] = ()
+    RETURN_NAMES: tuple[str, ...] = ()
+    OUTPUT_IS_LIST: tuple[bool, ...] = ()
+    OUTPUT_NODE = True
 
 
 def _current_remote_runtime_payload(remote_modal_app_module: Any) -> dict[str, Any]:
@@ -907,6 +933,174 @@ def test_modal_parallel_local_passthrough_runs_before_remote_result_returns(
 
     assert local_result == ("preview-image",)
     assert remote_result == ("component-b",)
+
+
+def test_modal_local_bridge_materializer_downloads_without_blocking_event_loop(
+    modal_executor_module: Any,
+    remote_modal_app_module: Any,
+    session_state_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The local bridge node should perform its durable download in a worker thread."""
+    materialization_started = threading.Event()
+    release_materialization = threading.Event()
+
+    def fake_materialize(ref_payload: dict[str, Any]) -> str:
+        """Block the worker thread until the async test permits completion."""
+        assert session_state_module.is_remote_session_bridge_ref_payload(ref_payload)
+        materialization_started.set()
+        assert release_materialization.wait(timeout=1.0)
+        return "local-image"
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "materialize_remote_session_bridge_ref_locally",
+        fake_materialize,
+    )
+    bridge_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_materializer",
+        node_id="251",
+        output_index=0,
+        session_id="session-source",
+    ).to_payload()
+
+    async def run_scenario() -> tuple[Any, ...]:
+        """Verify another coroutine runs while durable materialization is blocked."""
+        materializer_task = asyncio.create_task(
+            modal_executor_module.ModalLocalBridgeMaterializer.execute(bridge_ref)
+        )
+        await asyncio.to_thread(materialization_started.wait, 1.0)
+        assert materializer_task.done() is False
+        await asyncio.sleep(0)
+        release_materialization.set()
+        result = await asyncio.wait_for(materializer_task, timeout=1.0)
+        return result.result
+
+    assert asyncio.run(run_scenario()) == ("local-image",)
+
+
+def test_local_bridge_materialization_restores_durable_inline_output(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A local branch should restore the producer's durable serialized output."""
+    import torch
+
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_inline_bridge",
+        node_id="251",
+        output_index=0,
+        session_id="session-source",
+    )
+    image = torch.arange(12, dtype=torch.float32).reshape(1, 2, 2, 3)
+    record = remote_modal_app_module.RemoteSessionBridgeRecord(
+        bridge_key=bridge_ref.bridge_key,
+        node_id=bridge_ref.node_id,
+        output_index=bridge_ref.output_index,
+        producer_payload={"component_id": "251"},
+        producer_inputs={},
+        serialized_output=remote_modal_app_module.serialize_value(image),
+        serialized_output_io_type="IMAGE",
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        "get_record",
+        lambda bridge_key: record,
+    )
+
+    restored = remote_modal_app_module.materialize_remote_session_bridge_ref_locally(
+        bridge_ref.to_payload()
+    )
+
+    assert torch.equal(restored, image)
+
+
+def test_local_bridge_materialization_downloads_object_backed_output(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A large bridge should download its content-addressed output object locally."""
+    monkeypatch.delenv("MODAL_ENVIRONMENT", raising=False)
+    bridge_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_local_object_bridge",
+        node_id="251",
+        output_index=0,
+        session_id="session-source",
+    )
+    stored_payload = remote_modal_app_module.serialize_node_outputs(("large-image",))
+    object_ref = remote_modal_app_module.DurableObjectRef(
+        object_path="bridge-outputs/sha256/value.bin",
+        sha256=hashlib.sha256(stored_payload).hexdigest(),
+        size_bytes=len(stored_payload),
+    )
+    record = remote_modal_app_module.RemoteSessionBridgeRecord(
+        bridge_key=bridge_ref.bridge_key,
+        node_id=bridge_ref.node_id,
+        output_index=bridge_ref.output_index,
+        producer_payload={"component_id": "251"},
+        producer_inputs={},
+        serialized_output_object=object_ref,
+        serialized_output_io_type="IMAGE",
+    )
+    dict_calls: list[tuple[Any, ...]] = []
+    volume_calls: list[tuple[Any, ...]] = []
+
+    class FakeDict:
+        """Expose the durable bridge record through Modal's shared Dict API."""
+
+        @staticmethod
+        def from_name(*args: Any, **kwargs: Any) -> Any:
+            """Return a Dict handle that records bridge lookups."""
+            dict_calls.append((*args, kwargs))
+            return types.SimpleNamespace(get=lambda bridge_key: record.to_payload())
+
+    class FakeVolume:
+        """Expose the durable object through Modal's direct Volume API."""
+
+        @staticmethod
+        def from_name(*args: Any, **kwargs: Any) -> Any:
+            """Return a Volume handle that records object downloads."""
+            volume_calls.append((*args, kwargs))
+            return types.SimpleNamespace(
+                read_file=lambda volume_path: iter((stored_payload[:7], stored_payload[7:]))
+            )
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(
+            execution_mode="remote",
+            session_bridge_dict_name="bridge-dict",
+            volume_name="bridge-volume",
+        ),
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "modal",
+        types.SimpleNamespace(Dict=FakeDict, Volume=FakeVolume),
+    )
+    remote_modal_app_module._MODAL_SESSION_BRIDGE_DICTS.clear()
+    remote_modal_app_module._MODAL_DURABLE_VOLUMES.clear()
+
+    restored = remote_modal_app_module.materialize_remote_session_bridge_ref_locally(
+        bridge_ref.to_payload()
+    )
+
+    assert restored == "large-image"
+    assert dict_calls == [
+        (
+            "bridge-dict",
+            {"environment_name": None, "create_if_missing": True},
+        )
+    ]
+    assert volume_calls == [
+        (
+            "bridge-volume",
+            {"environment_name": None, "create_if_missing": True},
+        )
+    ]
+    remote_modal_app_module._MODAL_SESSION_BRIDGE_DICTS.clear()
+    remote_modal_app_module._MODAL_DURABLE_VOLUMES.clear()
 
 
 def test_parallel_local_dispatch_frontier_stops_at_nearest_remote_component(
@@ -10529,6 +10723,115 @@ def test_split_hybrid_proxies_allow_local_downstream_work_before_mapped_completi
         "local_sink:static-latent",
         "mapped_proxy_finish",
     ]
+
+
+def test_mixed_remote_and_preview_fanout_uses_bridge_and_local_materializer(
+    api_intercept_module: Any,
+    modal_executor_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A remote continuation should use a bridge while its preview materializes locally."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "RemoteImage": _FakeRewriteRemoteImageNode,
+            "RemoteText": _FakeRewriteRemoteTextNode,
+            "PreviewImage": _FakeRewritePreviewImageNode,
+            "LocalSink": _FakeRewriteLocalSinkNode,
+        },
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    workflow = {
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": True}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+            {"id": 3, "properties": {"is_modal_remote": False}},
+            {"id": 4, "properties": {"is_modal_remote": False}},
+        ]
+    }
+    prompt = {
+        "1": {
+            "class_type": "RemoteImage",
+            "inputs": {},
+            "_meta": {"title": "Generated Image"},
+        },
+        "2": {
+            "class_type": "RemoteText",
+            "inputs": {"image": ["1", 0]},
+            "_meta": {"title": "Remote LLM"},
+        },
+        "3": {
+            "class_type": "PreviewImage",
+            "inputs": {"images": ["1", 0]},
+            "_meta": {"title": "Local Preview"},
+        },
+        "4": {
+            "class_type": "LocalSink",
+            "inputs": {"text": ["2", 0]},
+            "_meta": {"title": "Response"},
+        },
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+        extra_data={"prompt_id": "prompt-mixed-fanout"},
+    )
+
+    assert summary.remote_component_ids == ["1", "2"]
+    assert summary.component_execution_stages == [["1"], ["2"]]
+    producer_payload = modal_executor_module._rehydrate_proxy_payload(
+        rewritten_prompt["1"]["inputs"]["original_node_data"],
+        unique_id="1",
+    )
+    consumer_payload = modal_executor_module._rehydrate_proxy_payload(
+        rewritten_prompt["2"]["inputs"]["original_node_data"],
+        unique_id="2",
+    )
+    assert producer_payload["component_node_ids"] == ["1"]
+    assert producer_payload["boundary_outputs"][0]["session_output"] is True
+    assert consumer_payload["component_node_ids"] == ["2"]
+    assert rewritten_prompt["2"]["inputs"]["remote_input_0"] == ["1", 0]
+
+    materializer_node_ids = [
+        node_id
+        for node_id, prompt_node in rewritten_prompt.items()
+        if prompt_node["class_type"]
+        == api_intercept_module.MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID
+    ]
+    assert len(materializer_node_ids) == 1
+    materializer_node_id = materializer_node_ids[0]
+    assert len(summary.parallel_local_branch_node_ids) == 1
+    dispatch_gate_node_id = summary.parallel_local_branch_node_ids[0]
+    assert rewritten_prompt[materializer_node_id]["inputs"]["bridge_ref"] == [
+        dispatch_gate_node_id,
+        0,
+    ]
+    assert rewritten_prompt[dispatch_gate_node_id]["inputs"]["value"] == ["1", 0]
+    assert rewritten_prompt["3"]["inputs"]["images"] == [materializer_node_id, 0]
 
 
 def test_mapped_component_with_local_reentry_rewrites_to_ordered_acyclic_proxies(

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
 MODAL_ARTIFACT_FINALIZER_NODE_ID = "ModalArtifactFinalizer"
 MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID = "ModalParallelLocalPassthrough"
+MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID = "ModalLocalBridgeMaterializer"
 MODAL_COMPONENT_COMPLETION_OUTPUT_NAME = "modal_component_complete"
 MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS = 100
 _PROXY_CACHE_CONTEXT_ID_KEY = "__comfy_modal_proxy_cache_context_id__"
@@ -828,6 +829,16 @@ def ensure_modal_parallel_local_passthrough_registered(nodes_module: Any) -> Non
     ] = "Modal Parallel Local Passthrough"
 
 
+def ensure_modal_local_bridge_materializer_registered(nodes_module: Any) -> None:
+    """Register the internal durable-bridge local materializer."""
+    nodes_module.NODE_CLASS_MAPPINGS[MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID] = (
+        ModalLocalBridgeMaterializer
+    )
+    nodes_module.NODE_DISPLAY_NAME_MAPPINGS[
+        MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID
+    ] = "Modal Local Bridge Materializer"
+
+
 class ModalUniversalExecutor(io.ComfyNode):
     """Base debug node for Modal execution routing."""
 
@@ -972,4 +983,36 @@ class ModalParallelLocalPassthrough(io.ComfyNode):
     ) -> io.NodeOutput:
         """Return the original value once the remote continuation is in flight."""
         await _wait_for_parallel_local_dispatches(dispatch_context)
+        return io.NodeOutput(value)
+
+
+class ModalLocalBridgeMaterializer(io.ComfyNode):
+    """Download a durable remote bridge value for an independent local branch."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        """Accept one durable bridge reference and return its local value."""
+        return io.Schema(
+            node_id=MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
+            display_name="Modal Local Bridge Materializer",
+            category="Modal",
+            description=(
+                "Internal async node that materializes a durable Modal bridge for "
+                "local-only work while remote execution continues."
+            ),
+            inputs=[io.AnyType.Input("bridge_ref")],
+            outputs=[io.AnyType.Output(display_name="value")],
+            is_dev_only=True,
+            is_experimental=True,
+        )
+
+    @classmethod
+    async def execute(cls, bridge_ref: Mapping[str, Any]) -> io.NodeOutput:
+        """Materialize the bridge without blocking ComfyUI's async scheduler."""
+        from .remote.modal_app import materialize_remote_session_bridge_ref_locally
+
+        value = await asyncio.to_thread(
+            materialize_remote_session_bridge_ref_locally,
+            bridge_ref,
+        )
         return io.NodeOutput(value)
