@@ -6202,6 +6202,44 @@ def test_remote_modal_rebinds_affinity_after_compatible_protocol_probe(
     assert observed_payloads == [payload]
 
 
+def test_remote_modal_rebinds_affinity_after_cached_protocol_validation(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A cached protocol result must not turn its parameterless probe into execution."""
+    probe_engine = object()
+    affinity_engine = object()
+    observed_payloads: list[dict[str, Any]] = []
+
+    def fake_lookup(payload: dict[str, Any]) -> object:
+        """Return the affinity-aware handle created for actual execution."""
+        observed_payloads.append(payload)
+        return affinity_engine
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_lookup_deployed_remote_engine",
+        fake_lookup,
+    )
+    payload = {
+        "component_id": "component-llm",
+        "remote_worker_affinity_group": "llm",
+    }
+    runtime_cache_key = remote_modal_app_module._modal_runtime_cache_key(payload)
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
+    try:
+        result = remote_modal_app_module._ensure_remote_engine_protocol_current(
+            probe_engine,
+            payload,
+        )
+    finally:
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+
+    assert result is affinity_engine
+    assert observed_payloads == [payload]
+
+
 def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
     remote_modal_app_module: Any,
 ) -> None:
