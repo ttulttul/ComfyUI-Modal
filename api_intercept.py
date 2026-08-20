@@ -20,10 +20,12 @@ from .modal_executor_node import (
     MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
     MODAL_ARTIFACT_FINALIZER_NODE_ID,
     MODAL_COMPONENT_COMPLETION_OUTPUT_NAME,
+    MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
     MODAL_MAP_INPUT_NODE_ID,
     MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
     ensure_modal_artifact_finalizer_registered,
     ensure_modal_component_proxy_node_registered,
+    ensure_modal_local_bridge_materializer_registered,
     ensure_modal_parallel_local_passthrough_registered,
     register_cache_friendly_proxy_payload,
     register_modal_map_input_warmup_context,
@@ -122,6 +124,9 @@ class BoundaryOutputSpec:
     is_list: bool
     preview_target_node_ids: list[str] = field(default_factory=list)
     session_output: bool = False
+    session_consumer_node_ids: list[str] = field(default_factory=list)
+    local_materializer_node_id: str | None = None
+    local_materializer_consumer_node_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1363,15 +1368,17 @@ def _non_returning_local_tap_node_ids(
     return local_tap_node_ids, local_tap_terminal_node_ids
 
 
-def _output_has_non_returning_local_tap(
+def _non_returning_local_output_consumers(
     *,
     prompt: dict[str, Any],
     source: LinkedOutputRef,
     remote_node_ids: set[str],
     consumers: dict[LinkedOutputRef, list[InputTarget]],
     nodes_module: Any,
-) -> bool:
-    """Return whether one remote output also feeds a local branch that never returns remote."""
+) -> tuple[list[InputTarget], list[InputTarget]]:
+    """Partition local consumers by whether their branch later returns remote."""
+    non_returning_consumers: list[InputTarget] = []
+    returning_consumers: list[InputTarget] = []
     for target in consumers.get(source, []):
         if target.node_id in remote_node_ids:
             continue
@@ -1382,8 +1389,31 @@ def _output_has_non_returning_local_tap(
             nodes_module=nodes_module,
         )
         if branch_node_ids and not (branch_node_ids & remote_node_ids):
-            return True
-    return False
+            non_returning_consumers.append(target)
+        else:
+            returning_consumers.append(target)
+    return non_returning_consumers, returning_consumers
+
+
+def _output_supports_parallel_local_materialization(
+    *,
+    prompt: dict[str, Any],
+    source: LinkedOutputRef,
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    nodes_module: Any,
+) -> bool:
+    """Return whether every local consumer is independent of later remote work."""
+    non_returning_consumers, returning_consumers = (
+        _non_returning_local_output_consumers(
+            prompt=prompt,
+            source=source,
+            remote_node_ids=remote_node_ids,
+            consumers=consumers,
+            nodes_module=nodes_module,
+        )
+    )
+    return bool(non_returning_consumers) and not returning_consumers
 
 
 def _expand_component_for_non_transportable_local_outputs(
@@ -1544,7 +1574,7 @@ def _remote_component_partition_groups(
             ):
                 union(node_id, upstream_node_id)
                 continue
-            if _output_has_non_returning_local_tap(
+            if _output_supports_parallel_local_materialization(
                 prompt=prompt,
                 source=source,
                 remote_node_ids=remote_node_ids,
@@ -1552,12 +1582,11 @@ def _remote_component_partition_groups(
                 nodes_module=nodes_module,
             ):
                 logger.info(
-                    "Merging remote nodes %s -> %s because output %d has a non-returning local tap.",
+                    "Splitting remote nodes %s -> %s because output %d also feeds only non-returning local work.",
                     upstream_node_id,
                     node_id,
                     source.output_index,
                 )
-                union(node_id, upstream_node_id)
                 continue
             io_type = _remote_output_io_type(
                 prompt=prompt,
@@ -2614,8 +2643,9 @@ def _build_component_plans(
 def _mark_remote_to_remote_session_boundaries(
     prompt: dict[str, Any],
     components: list[RemoteComponentPlan],
+    nodes_module: Any,
 ) -> set[str]:
-    """Mark exclusively remote component edges for reference-based transport."""
+    """Mark remote edges for bridges and annotate independent local materializers."""
     consumers = _build_consumer_map(prompt)
     component_id_by_node_id = {
         node_id: component.representative_node_id
@@ -2629,15 +2659,59 @@ def _mark_remote_to_remote_session_boundaries(
             output_consumers = consumers.get(boundary_output.source, [])
             if not output_consumers:
                 continue
-            if not all(
-                consumer.node_id in component_id_by_node_id
+            remote_consumers = [
+                consumer
                 for consumer in output_consumers
-            ):
+                if consumer.node_id in component_id_by_node_id
+            ]
+            if not remote_consumers:
+                continue
+            non_returning_local_consumers, returning_local_consumers = (
+                _non_returning_local_output_consumers(
+                    prompt=prompt,
+                    source=boundary_output.source,
+                    remote_node_ids=set(component_id_by_node_id),
+                    consumers=consumers,
+                    nodes_module=nodes_module,
+                )
+            )
+            if returning_local_consumers:
+                logger.info(
+                    "Materializing remote boundary output normally because local consumers %s later return to remote execution source=%s:%d.",
+                    [consumer.node_id for consumer in returning_local_consumers],
+                    boundary_output.source.node_id,
+                    boundary_output.source.output_index,
+                )
                 continue
             boundary_output.session_output = True
+            boundary_output.session_consumer_node_ids = sorted(
+                {consumer.node_id for consumer in remote_consumers}
+            )
+            if non_returning_local_consumers:
+                materializer_node_id = (
+                    f"__ModalLocalBridgeMaterializer__"
+                    f"{boundary_output.source.node_id}_"
+                    f"{boundary_output.source.output_index}"
+                )
+                reserved_node_ids = {
+                    output.local_materializer_node_id
+                    for planned_component in components
+                    for output in planned_component.boundary_outputs
+                    if output.local_materializer_node_id is not None
+                }
+                while (
+                    materializer_node_id in prompt
+                    or materializer_node_id in reserved_node_ids
+                ):
+                    materializer_node_id = f"{materializer_node_id}_proxy"
+                boundary_output.local_materializer_node_id = materializer_node_id
+                boundary_output.local_materializer_consumer_node_ids = sorted(
+                    {consumer.node_id for consumer in non_returning_local_consumers}
+                )
+                boundary_output.preview_target_node_ids = []
             session_sources.add(boundary_output.source)
             logger.info(
-                "Keeping remote boundary output in Modal storage source=%s:%d io_type=%s producer_component=%s consumer_components=%s.",
+                "Keeping remote boundary output in Modal storage source=%s:%d io_type=%s producer_component=%s consumer_components=%s local_materializer=%s local_consumers=%s.",
                 boundary_output.source.node_id,
                 boundary_output.source.output_index,
                 boundary_output.io_type,
@@ -2646,8 +2720,11 @@ def _mark_remote_to_remote_session_boundaries(
                     {
                         component_id_by_node_id[consumer.node_id]
                         for consumer in output_consumers
+                        if consumer.node_id in component_id_by_node_id
                     }
                 ),
+                boundary_output.local_materializer_node_id,
+                boundary_output.local_materializer_consumer_node_ids,
             )
 
     return _remote_session_component_ids(
@@ -3822,9 +3899,37 @@ def _rewrite_component_into_proxy(
             payload,
             str(component.mapped_boundary_input_io_type or "*"),
         )
-    boundary_output_indices = {
-        spec.source: index for index, spec in enumerate(component.boundary_outputs)
-    }
+    materializer_output_by_consumer_and_source: dict[
+        tuple[str, LinkedOutputRef], list[Any]
+    ] = {}
+    proxy_output_by_consumer_and_source: dict[
+        tuple[str, LinkedOutputRef], list[Any]
+    ] = {}
+    default_proxy_output_by_source: dict[LinkedOutputRef, list[Any]] = {}
+    if any(
+        spec.local_materializer_node_id is not None
+        for spec in component.boundary_outputs
+    ):
+        ensure_modal_local_bridge_materializer_registered(nodes_module)
+    for output_index, spec in enumerate(component.boundary_outputs):
+        proxy_output = [representative_node_id, output_index]
+        default_proxy_output_by_source.setdefault(spec.source, proxy_output)
+        for consumer_node_id in spec.session_consumer_node_ids:
+            proxy_output_by_consumer_and_source[
+                (consumer_node_id, spec.source)
+            ] = proxy_output
+        materializer_node_id = spec.local_materializer_node_id
+        if materializer_node_id is None:
+            continue
+        rewritten_prompt[materializer_node_id] = {
+            "class_type": MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
+            "inputs": {"bridge_ref": proxy_output},
+            "_meta": {"title": "Modal Local Bridge Materializer"},
+        }
+        for consumer_node_id in spec.local_materializer_consumer_node_ids:
+            materializer_output_by_consumer_and_source[
+                (consumer_node_id, spec.source)
+            ] = [materializer_node_id, 0]
     for node_id, prompt_node in list(rewritten_prompt.items()):
         if node_id in component_node_id_set and node_id != representative_node_id:
             del rewritten_prompt[node_id]
@@ -3835,8 +3940,17 @@ def _rewrite_component_into_proxy(
             if not _is_link(input_value):
                 continue
             source = LinkedOutputRef(node_id=str(input_value[0]), output_index=int(input_value[1]))
-            if source in boundary_output_indices:
-                prompt_node["inputs"][input_name] = [representative_node_id, boundary_output_indices[source]]
+            replacement_output = materializer_output_by_consumer_and_source.get(
+                (node_id, source)
+            )
+            if replacement_output is None:
+                replacement_output = proxy_output_by_consumer_and_source.get(
+                    (node_id, source)
+                )
+            if replacement_output is None:
+                replacement_output = default_proxy_output_by_source.get(source)
+            if replacement_output is not None:
+                prompt_node["inputs"][input_name] = list(replacement_output)
     logger.info(
         "Rewrote remote component %s with %d nodes to Modal proxy %s.",
         representative_node_id,
@@ -4170,6 +4284,7 @@ def rewrite_prompt_for_modal(
     session_component_ids = _mark_remote_to_remote_session_boundaries(
         rewritten_prompt,
         components,
+        resolved_nodes_module,
     )
     prompt_id = (extra_data or {}).get("prompt_id")
     remote_sessions_by_component_id = {

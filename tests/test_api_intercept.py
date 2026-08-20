@@ -1530,15 +1530,28 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
         nodes_module=fake_nodes_module,
     )
 
+    materializer_node_id = next(
+        node_id
+        for node_id, prompt_node in rewritten_prompt.items()
+        if prompt_node["class_type"]
+        == api_intercept_module.MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID
+    )
     assert set(rewritten_prompt) == {
         "1",
+        "2",
         "3",
         "9",
+        materializer_node_id,
+        *summary.parallel_local_branch_node_ids,
         _artifact_finalizer_node_id(summary),
     }
-    assert summary.remote_component_ids == ["1"]
-    assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
-    assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
+    assert summary.remote_component_ids == ["1", "2"]
+    assert summary.component_execution_stages == [["1"], ["2"]]
+    assert summary.component_node_ids_by_representative == {
+        "1": ["1"],
+        "2": ["2"],
+    }
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
 
     remote_payloads = [
         rewritten_node["inputs"]["original_node_data"]
@@ -1550,27 +1563,20 @@ def test_rewrite_keeps_non_returning_local_preview_taps_local(
     assert all("9" not in payload["component_node_ids"] for payload in remote_payloads)
     assert all("9" not in payload["subgraph_prompt"] for payload in remote_payloads)
     assert all("9" not in payload["execute_node_ids"] for payload in remote_payloads)
-    payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
-    assert payload["boundary_outputs"] == [
+    producer_payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
+    assert producer_payload["boundary_outputs"] == [
         {
             "proxy_output_name": "1_image",
             "node_id": "1",
             "output_index": 0,
             "io_type": "IMAGE",
             "is_list": False,
-            "preview_target_node_ids": ["9"],
-        },
-        {
-            "proxy_output_name": "2_image",
-            "node_id": "2",
-            "output_index": 0,
-            "io_type": "IMAGE",
-            "is_list": False,
             "preview_target_node_ids": [],
+            "session_output": True,
         },
     ]
-    assert rewritten_prompt["9"]["inputs"]["images"] == ["1", 0]
-    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 1]
+    assert rewritten_prompt["9"]["inputs"]["images"] == [materializer_node_id, 0]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 
 
 def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
@@ -1683,8 +1689,15 @@ def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
         nodes_module=fake_nodes_module,
     )
 
+    materializer_node_id = next(
+        node_id
+        for node_id, prompt_node in rewritten_prompt.items()
+        if prompt_node["class_type"]
+        == api_intercept_module.MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID
+    )
     assert set(rewritten_prompt) == {
         "1",
+        "2",
         "3",
         "7",
         "8",
@@ -1692,11 +1705,17 @@ def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
         "11",
         "90",
         "192",
+        materializer_node_id,
+        *summary.parallel_local_branch_node_ids,
         _artifact_finalizer_node_id(summary),
     }
-    assert summary.remote_component_ids == ["1"]
-    assert summary.component_node_ids_by_representative == {"1": ["1", "2"]}
-    assert summary.rewritten_node_id_map == {"1": "1", "2": "1"}
+    assert summary.remote_component_ids == ["1", "2"]
+    assert summary.component_execution_stages == [["1"], ["2"]]
+    assert summary.component_node_ids_by_representative == {
+        "1": ["1"],
+        "2": ["2"],
+    }
+    assert summary.rewritten_node_id_map == {"1": "1", "2": "2"}
 
     remote_payloads = [
         rewritten_node["inputs"]["original_node_data"]
@@ -1705,13 +1724,21 @@ def test_rewrite_keeps_unmarked_preview_subgraph_nodes_local(
         and "original_node_data" in rewritten_node["inputs"]
     ]
     local_node_ids = {"7", "8", "9", "11", "90", "192"}
-    assert len(remote_payloads) == 1
+    assert len(remote_payloads) == 2
     for payload in remote_payloads:
         assert not (local_node_ids & set(payload["component_node_ids"]))
         assert not (local_node_ids & set(payload["subgraph_prompt"]))
         assert not (local_node_ids & set(payload["execute_node_ids"]))
+    assert rewritten_prompt["192"]["inputs"]["samples"] == [
+        materializer_node_id,
+        0,
+    ]
+    assert rewritten_prompt["11"]["inputs"]["samples"] == [
+        materializer_node_id,
+        0,
+    ]
     assert rewritten_prompt["90"]["inputs"]["images"] == ["192", 0]
-    assert rewritten_prompt["3"]["inputs"]["image"] == ["1", 1]
+    assert rewritten_prompt["3"]["inputs"]["image"] == ["2", 0]
 
 
 def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
