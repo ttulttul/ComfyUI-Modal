@@ -2209,6 +2209,30 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
 
 
+def test_model_stager_image_environment_preserves_deployment_identity(
+    modal_cloud_module: Any,
+) -> None:
+    """The CPU protocol helper must report the exact deployed GPU runtime identity."""
+    settings = types.SimpleNamespace(
+        app_name="comfy-modal-sync-instance",
+        modal_gpu="RTX-PRO-6000",
+        remote_storage_root="/storage",
+    )
+
+    image_environment = modal_cloud_module._model_stager_image_environment(
+        settings,
+        "fingerprint-2",
+    )
+
+    assert image_environment == {
+        "COMFY_MODAL_APP_NAME": "comfy-modal-sync-instance",
+        "COMFY_MODAL_GPU": "RTX-PRO-6000",
+        "COMFY_MODAL_REMOTE_STORAGE_ROOT": "/storage",
+        "COMFY_MODAL_RUNTIME_FINGERPRINT": "fingerprint-2",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+    }
+
+
 def test_modal_cloud_observes_distinct_workflows_for_llm_auto_mode(
     modal_cloud_module: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -6313,6 +6337,96 @@ def test_remote_modal_rebinds_affinity_after_cached_protocol_validation(
 
     assert result is affinity_engine
     assert observed_payloads == [payload]
+
+
+def test_remote_modal_cached_protocol_skips_parameterless_probe_construction(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A cached runtime must construct only the affinity-bound engine handle."""
+    affinity_engine = object()
+    observed_lookups: list[tuple[dict[str, Any], bool]] = []
+
+    def fake_lookup(
+        payload: dict[str, Any],
+        *,
+        affinity_key_override: str | None = None,
+        protocol_probe: bool = False,
+    ) -> object:
+        """Record whether lookup attempted to allocate a parameterless probe."""
+        del affinity_key_override
+        observed_lookups.append((payload, protocol_probe))
+        return affinity_engine
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_lookup_deployed_remote_engine",
+        fake_lookup,
+    )
+    payload = {
+        "component_id": "component-comfy::warmup:0",
+        "remote_worker_affinity_group": "comfy",
+    }
+    runtime_cache_key = remote_modal_app_module._modal_runtime_cache_key(payload)
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
+    try:
+        result = remote_modal_app_module._lookup_protocol_current_remote_engine(payload)
+    finally:
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+
+    assert result is affinity_engine
+    assert observed_lookups == [(payload, False)]
+
+
+def test_remote_modal_uncached_protocol_uses_cpu_stager_before_gpu_lookup(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """First validation should use CPU metadata and construct one bound GPU handle."""
+    affinity_engine = object()
+    observed_lookups: list[bool] = []
+    version_payload = _current_remote_runtime_payload(remote_modal_app_module)
+
+    def fake_lookup(
+        payload: dict[str, Any],
+        *,
+        affinity_key_override: str | None = None,
+        protocol_probe: bool = False,
+    ) -> object:
+        """Record whether lookup attempted to allocate a GPU protocol probe."""
+        del payload, affinity_key_override
+        observed_lookups.append(protocol_probe)
+        return affinity_engine
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_remote_runtime_version_from_cpu_stager",
+        lambda payload: version_payload,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_lookup_deployed_remote_engine",
+        fake_lookup,
+    )
+    payload = {
+        "component_id": "component-llm",
+        "remote_worker_affinity_group": "llm",
+    }
+    runtime_cache_key = remote_modal_app_module._modal_runtime_cache_key(payload)
+    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    try:
+        result = remote_modal_app_module._lookup_protocol_current_remote_engine(payload)
+        runtime_was_cached = (
+            runtime_cache_key
+            in remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK
+        )
+    finally:
+        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+
+    assert result is affinity_engine
+    assert runtime_was_cached is True
+    assert observed_lookups == [False]
 
 
 def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(

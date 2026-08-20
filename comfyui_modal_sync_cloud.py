@@ -7199,6 +7199,20 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
     }
 
 
+def _model_stager_image_environment(
+    settings: Any,
+    runtime_fingerprint: str,
+) -> dict[str, str]:
+    """Return deployment identity and staging values for the CPU-only helper."""
+    return {
+        "COMFY_MODAL_APP_NAME": settings.app_name,
+        "COMFY_MODAL_GPU": settings.modal_gpu,
+        "COMFY_MODAL_REMOTE_STORAGE_ROOT": settings.remote_storage_root,
+        "COMFY_MODAL_RUNTIME_FINGERPRINT": runtime_fingerprint,
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+    }
+
+
 def _install_remote_torch_build(image: Any, torch_build: _RemoteTorchBuild) -> Any:
     """Install and validate the ordered package layers for one remote Torch build."""
     for layer_number, install_layer in enumerate(torch_build.install_layers, start=1):
@@ -7331,10 +7345,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     stager_image = (
         modal.Image.debian_slim(python_version=REMOTE_PYTHON_VERSION)
         .env(
-            {
-                "COMFY_MODAL_REMOTE_STORAGE_ROOT": settings.remote_storage_root,
-                "HF_HUB_DISABLE_TELEMETRY": "1",
-            }
+            _model_stager_image_environment(
+                settings,
+                runtime_identity.fingerprint,
+            )
         )
         .pip_install(*_remote_huggingface_packages())
         .run_commands(_remote_huggingface_validation_command())
@@ -7499,6 +7513,19 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             if errors:
                 raise errors[0]
             yield {"kind": "result", "results": results[0] if results else []}
+
+        @modal.method()
+        def runtime_version(self) -> dict[str, Any]:
+            """Return deployment identity without allocating a GPU container."""
+            return {
+                "protocol_version": _REMOTE_APP_PROTOCOL_VERSION,
+                "app_name": __comfy_modal_app_name__,
+                "runtime_fingerprint": os.environ.get(
+                    "COMFY_MODAL_RUNTIME_FINGERPRINT",
+                    "",
+                ),
+                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+            }
 
     @app.cls(
         **_remote_engine_cls_options(
