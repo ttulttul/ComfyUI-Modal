@@ -6547,6 +6547,38 @@ def _remote_engine_runtime_version(remote_engine: Any) -> dict[str, Any] | None:
     return version_payload
 
 
+def _remote_runtime_version_from_cpu_stager(
+    payload: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Read deployment identity from the CPU stager when that method is available."""
+    if modal is None:
+        return None
+    settings = _settings_for_payload(payload)
+    deployment_app_name = modal_deployment_app_name(settings)
+    stager_cls = modal.Cls.from_name(deployment_app_name, "ModelStager")
+    stager = stager_cls()
+    version_method = getattr(stager, "runtime_version", None)
+    if version_method is None:
+        return None
+    try:
+        version_payload = _call_modal_method(version_method)
+    except AttributeError:
+        return None
+    except _modal_lookup_error_types() as exc:
+        if _is_missing_modal_deployment_error(exc):
+            raise
+        logger.info(
+            "CPU ModelStager runtime identity is unavailable for app=%s; "
+            "falling back to the legacy GPU protocol probe: %s",
+            deployment_app_name,
+            exc,
+        )
+        return None
+    if not isinstance(version_payload, dict):
+        return None
+    return version_payload
+
+
 def _runtime_fingerprint_from_payload(
     version_payload: dict[str, Any] | None
 ) -> str | None:
@@ -6775,6 +6807,55 @@ def _ensure_remote_engine_protocol_current(
         payload,
         remote_engine,
         version_payload=version_payload,
+    )
+
+
+def _lookup_protocol_current_remote_engine(payload: dict[str, Any]) -> Any:
+    """Return an affinity-bound engine without allocating a cached protocol probe."""
+    runtime_cache_key = _modal_runtime_cache_key(payload)
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        runtime_is_known_current = runtime_cache_key in _MODAL_REMOTE_APP_VERSION_OK
+    if runtime_is_known_current:
+        logger.info(
+            "Using cached Modal protocol validation without creating a parameterless "
+            "probe component=%s worker_affinity=%s.",
+            payload.get("component_id"),
+            _remote_worker_affinity_key(payload),
+        )
+        return _lookup_deployed_remote_engine(payload)
+
+    version_payload = _remote_runtime_version_from_cpu_stager(payload)
+    if version_payload is not None:
+        if _is_runtime_version_payload_current(version_payload, payload):
+            with _MODAL_AUTO_DEPLOY_LOCK:
+                _MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
+            logger.info(
+                "Validated Modal runtime through CPU ModelStager without allocating "
+                "a GPU protocol probe component=%s worker_affinity=%s.",
+                payload.get("component_id"),
+                _remote_worker_affinity_key(payload),
+            )
+            return _lookup_deployed_remote_engine(payload)
+        settings = _settings_for_payload(payload)
+        if not settings.auto_deploy:
+            raise ModalRemoteInvocationError(
+                "Deployed Modal app runtime fingerprint is out of date and "
+                "COMFY_MODAL_AUTO_DEPLOY=false prevents automatic replacement."
+            )
+        return _replace_outdated_modal_app(
+            payload,
+            None,
+            version_payload=version_payload,
+        )
+
+    logger.info(
+        "CPU Modal runtime validation method is unavailable for component=%s; "
+        "using the legacy parameterless GPU protocol probe.",
+        payload.get("component_id"),
+    )
+    return _ensure_remote_engine_protocol_current(
+        _lookup_deployed_remote_engine(payload, protocol_probe=True),
+        payload,
     )
 
 
@@ -7189,13 +7270,7 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
     deployment_app_name = modal_deployment_app_name(settings)
     if lookup_error_types:
         try:
-            remote_engine = _ensure_remote_engine_protocol_current(
-                _lookup_deployed_remote_engine(
-                    warmup_request,
-                    protocol_probe=True,
-                ),
-                warmup_request,
-            )
+            remote_engine = _lookup_protocol_current_remote_engine(warmup_request)
             _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
             return _invoke_remote_engine_warmup_with_recovery(
                 remote_engine, warmup_request
@@ -7217,13 +7292,7 @@ def _invoke_modal_warmup_blocking(warmup_request: dict[str, Any]) -> Any:
                     f"Lookup failed for app={deployment_app_name!r}: {exc}."
                 ) from exc
     else:
-        remote_engine = _ensure_remote_engine_protocol_current(
-            _lookup_deployed_remote_engine(
-                warmup_request,
-                protocol_probe=True,
-            ),
-            warmup_request,
-        )
+        remote_engine = _lookup_protocol_current_remote_engine(warmup_request)
         _ensure_llm_profiles_staged(warmup_request, deployment_app_name)
         return _invoke_remote_engine_warmup_with_recovery(remote_engine, warmup_request)
 
@@ -7967,10 +8036,7 @@ def _invoke_modal_payload_blocking(
     deployment_app_name = modal_deployment_app_name(settings)
     if lookup_error_types:
         try:
-            remote_engine = _ensure_remote_engine_protocol_current(
-                _lookup_deployed_remote_engine(payload, protocol_probe=True),
-                payload,
-            )
+            remote_engine = _lookup_protocol_current_remote_engine(payload)
             _ensure_llm_profiles_staged(payload, deployment_app_name)
             logger.info(
                 "Using deployed Modal app %s for component %s.",
@@ -8019,10 +8085,7 @@ def _invoke_modal_payload_blocking(
                 exc,
             )
     else:
-        remote_engine = _ensure_remote_engine_protocol_current(
-            _lookup_deployed_remote_engine(payload, protocol_probe=True),
-            payload,
-        )
+        remote_engine = _lookup_protocol_current_remote_engine(payload)
         _ensure_llm_profiles_staged(payload, deployment_app_name)
         logger.info(
             "Using deployed Modal app %s for component %s.",
@@ -8172,11 +8235,7 @@ async def invoke_remote_engine_async(
         if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
             if execution_mode != "local" and modal is not None:
                 await asyncio.to_thread(
-                    _ensure_remote_engine_protocol_current,
-                    _lookup_deployed_remote_engine(
-                        payload,
-                        protocol_probe=True,
-                    ),
+                    _lookup_protocol_current_remote_engine,
                     payload,
                 )
             return await _invoke_implicitly_mapped_subgraph_async(
