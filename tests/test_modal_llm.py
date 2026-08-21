@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import sys
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -15,6 +16,182 @@ from typing import Any, Callable
 
 import pytest
 import torch
+
+
+def test_accurate_triton_listener_distinguishes_persistent_cache_hits(
+    modal_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The vLLM EngineCore wrapper should signal only genuine compilations."""
+    signal_path = tmp_path / "triton-compile-misses.jsonl"
+    status_path = tmp_path / "triton-listeners.jsonl"
+    previous_events: list[dict[str, Any]] = []
+    engine_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    fake_triton = SimpleNamespace(
+        knobs=SimpleNamespace(
+            compilation=SimpleNamespace(
+                listener=lambda **event: previous_events.append(event)
+            )
+        )
+    )
+    original_setup_hook = object()
+    fake_jit_monitor = SimpleNamespace(
+        _setup_triton_jit_hook=original_setup_hook,
+    )
+
+    class FakeEngineCoreProc:
+        """Expose the spawn entrypoint patched by the Modal runtime."""
+
+        @staticmethod
+        def run_engine_core(*args: Any, **kwargs: Any) -> str:
+            """Record execution after the child listener is installed."""
+            engine_calls.append((args, kwargs))
+            return "engine-complete"
+
+    fake_engine_core = SimpleNamespace(EngineCoreProc=FakeEngineCoreProc)
+
+    def import_module(name: str) -> Any:
+        """Return the two runtime modules used by listener installation."""
+        if name == "triton":
+            return fake_triton
+        if name == "vllm.utils.jit_monitor":
+            return fake_jit_monitor
+        if name == "vllm.v1.engine.core":
+            return fake_engine_core
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_COMPILE_MISS_SIGNAL_PATH",
+        signal_path,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_COMPILE_LISTENER_STATUS_PATH",
+        status_path,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_COMPILE_LISTENER_INSTALLED_PID",
+        None,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_ENGINE_CORE_LISTENER_RECORDED_PID",
+        None,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_VLLM_ENGINE_CORE_ENTRYPOINT_PATCHED_PID",
+        None,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT",
+        None,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module.importlib,
+        "import_module",
+        import_module,
+    )
+    modal_llm_runtime_module._install_accurate_triton_compile_listener()
+    result = fake_engine_core.EngineCoreProc.run_engine_core("spawned")
+
+    listener = fake_triton.knobs.compilation.listener
+    compile_times = SimpleNamespace(
+        ir_initialization=1200,
+        lowering_stages=[("ttir", 2300), ("cubin", 3400)],
+        store_results=500,
+        total=7400,
+    )
+    common_event = {
+        "src": SimpleNamespace(name="example_kernel"),
+        "metadata": {"hash": "artifact-1"},
+        "times": compile_times,
+    }
+    with caplog.at_level(logging.INFO):
+        listener(**common_event, cache_hit=True)
+    assert modal_llm_runtime_module.triton_compile_miss_signal_size() == 0
+    assert "cache_hit=True" in caplog.text
+
+    listener(**common_event, cache_hit=False)
+
+    assert modal_llm_runtime_module.triton_compile_miss_signal_size() > 0
+    miss_event = json.loads(signal_path.read_text(encoding="utf-8"))
+    assert miss_event["cache_hit"] is False
+    assert miss_event["kernel"] == "example_kernel"
+    assert miss_event["timing"]["total_ms"] == 7.4
+    assert len(previous_events) == 2
+    assert fake_jit_monitor._setup_triton_jit_hook is not original_setup_hook
+    assert result == "engine-complete"
+    assert engine_calls == [(('spawned',), {})]
+    assert modal_llm_runtime_module.triton_compile_listener_engine_pids() == (
+        modal_llm_runtime_module.os.getpid(),
+    )
+
+
+def test_spawned_engine_core_recovers_original_entrypoint_and_installs_listener(
+    modal_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A spawn-fresh module must install telemetry before EngineCore startup."""
+    startup_observations: list[tuple[int, ...]] = []
+    fake_triton = SimpleNamespace(
+        knobs=SimpleNamespace(compilation=SimpleNamespace(listener=None))
+    )
+    fake_jit_monitor = SimpleNamespace(_setup_triton_jit_hook=lambda: None)
+
+    class FakeEngineCoreProc:
+        """Represent vLLM's unpatched class in a spawned interpreter."""
+
+        @staticmethod
+        def run_engine_core() -> str:
+            """Observe listener readiness at the first EngineCore instruction."""
+            startup_observations.append(
+                modal_llm_runtime_module.triton_compile_listener_engine_pids()
+            )
+            return "started"
+
+    modules = {
+        "triton": fake_triton,
+        "vllm.utils.jit_monitor": fake_jit_monitor,
+        "vllm.v1.engine.core": SimpleNamespace(EngineCoreProc=FakeEngineCoreProc),
+    }
+    monkeypatch.setattr(
+        modal_llm_runtime_module.importlib,
+        "import_module",
+        lambda name: modules[name],
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_COMPILE_LISTENER_STATUS_PATH",
+        tmp_path / "listeners.jsonl",
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_COMPILE_LISTENER_INSTALLED_PID",
+        None,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_ENGINE_CORE_LISTENER_RECORDED_PID",
+        None,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT",
+        None,
+    )
+
+    result = modal_llm_runtime_module._run_vllm_engine_core_with_accurate_triton_listener()
+
+    assert result == "started"
+    assert startup_observations == [(modal_llm_runtime_module.os.getpid(),)]
+    assert fake_triton.knobs.compilation.listener._comfy_modal_cache_aware
 
 
 def _text_file(filename: str, text: str) -> dict[str, str]:

@@ -1,6 +1,6 @@
 [project]
 name = "modal-sync"
-version = "0.3.3"
+version = "0.3.5"
 description = "ComfyUI nodes for Modal-backed workflow execution and hosted model endpoints."
 readme = "README.md"
 requires-python = ">=3.11"

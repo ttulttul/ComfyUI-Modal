@@ -2197,6 +2197,7 @@ def test_build_prompt_warmup_request_includes_llm_load_and_jit_plan(
                 "prompt_id": "prompt-llm",
                 "component_id": "component-llm",
                 "remote_worker_affinity_group": "llm",
+                "execute_node_ids": ["263"],
                 "subgraph_prompt": {
                     "263": {
                         "class_type": "ModalLLM",
@@ -2217,6 +2218,49 @@ def test_build_prompt_warmup_request_includes_llm_load_and_jit_plan(
     assert len(warmup_request["llm_prewarm_plans"]) == 1
     assert warmup_request["llm_prewarm_plans"][0]["model_profile"] == "qwen-test"
     assert warmup_request["llm_prewarm_plans"][0]["representative_request_count"] == 3
+
+
+def test_build_prompt_warmup_request_ignores_llm_outside_executable_closure(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Disconnected nodes and serialized planning metadata must not warm an LLM."""
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        warmup_request = remote_modal_app_module._build_prompt_warmup_request(
+            {
+                "prompt_id": "prompt-comfy",
+                "component_id": "251",
+                "execute_node_ids": ["251"],
+                "subgraph_prompt": {
+                    "251": {
+                        "class_type": "ImageFromBatch",
+                        "inputs": {"image": ["250", 0]},
+                    },
+                    "250": {
+                        "class_type": "VAEDecode",
+                        "inputs": {"samples": ["14", 0]},
+                    },
+                    "263": {
+                        "class_type": "ModalLLM",
+                        "inputs": {"model_profile": "disconnected-profile"},
+                    },
+                },
+                "extra_data": {
+                    "modal": {
+                        "future_component": {
+                            "class_type": "ModalLLM",
+                            "inputs": {"model_profile": "metadata-profile"},
+                        }
+                    }
+                },
+            }
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert warmup_request is None
 
 
 def test_dispatch_joins_matching_speculative_warmup(
@@ -5860,8 +5904,9 @@ def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Successful representative LLM requests should publish and commit a JIT marker."""
+    """A representative LLM cache miss should publish and commit its artifacts."""
     observed_requests: list[tuple[str, int, str | None]] = []
+    compile_miss_signal = {"size": 0}
 
     def prewarm_profile(
         *,
@@ -5873,6 +5918,7 @@ def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
         observed_requests.append(
             (model_profile, representative_request_count, workflow_execution_id)
         )
+        compile_miss_signal["size"] += 100
         return {
             "profile_id": model_profile,
             "representative_request_count": representative_request_count,
@@ -5901,6 +5947,16 @@ def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
         cloud_llm_runtime_module,
         "prewarm_modal_llm_profile",
         prewarm_profile,
+    )
+    monkeypatch.setattr(
+        cloud_llm_runtime_module,
+        "triton_compile_miss_signal_size",
+        lambda: compile_miss_signal["size"],
+    )
+    monkeypatch.setattr(
+        cloud_llm_runtime_module,
+        "triton_compile_listener_engine_pids",
+        lambda: (321,),
     )
     monkeypatch.setattr(
         modal_cloud_module,
@@ -5935,6 +5991,196 @@ def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
     assert volume.commits == 1
     assert Path(results[0]["manifest_path"]).exists()
     assert results[0]["manifest_cache_hit"] is False
+    assert results[0]["compile_cache_committed"] is True
+
+
+def test_modal_cloud_llm_prewarm_does_not_commit_persistent_cache_hit(
+    modal_cloud_module: Any,
+    modal_llm_runtime_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A successful representative request with only disk hits must not commit."""
+
+    class FakeVolume:
+        """Reject an unnecessary persistent cache commit."""
+
+        def commit(self) -> None:
+            """Fail if a disk-cache hit is committed."""
+            raise AssertionError("persistent cache hits must not be committed")
+
+    cloud_llm_runtime_module = sys.modules.get(
+        "modal_llm_runtime",
+        modal_llm_runtime_module,
+    )
+    monkeypatch.setitem(sys.modules, "modal_llm_runtime", cloud_llm_runtime_module)
+    monkeypatch.setattr(
+        cloud_llm_runtime_module,
+        "prewarm_modal_llm_profile",
+        lambda **_kwargs: {"profile_id": "cached-profile"},
+    )
+    monkeypatch.setattr(
+        cloud_llm_runtime_module,
+        "triton_compile_miss_signal_size",
+        lambda: 50,
+    )
+    monkeypatch.setattr(
+        cloud_llm_runtime_module,
+        "triton_compile_listener_engine_pids",
+        lambda: (654,),
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_llm_compile_manifest_path",
+        lambda signature: tmp_path / "manifests" / f"{signature}.json",
+    )
+    original_plan_keys = set(modal_cloud_module._LLM_PREWARM_PLAN_KEYS)
+    modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
+    try:
+        results = modal_cloud_module._execute_llm_prewarm_plans(
+            component_id="llm-component",
+            prompt_id="prompt-hit",
+            llm_prewarm_plans=[
+                {
+                    "signature": "cached-plan",
+                    "model_profile": "cached-profile",
+                    "representative_request_count": 1,
+                }
+            ],
+            compile_cache_volume=FakeVolume(),
+        )
+    finally:
+        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
+        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.update(original_plan_keys)
+
+    assert results[0]["compile_cache_committed"] is False
+
+
+def test_modal_cloud_llm_compile_profiles_are_limited_to_executable_subgraph(
+    modal_cloud_module: Any,
+) -> None:
+    """Nested metadata and disconnected LLM nodes must not trigger cache commits."""
+    payload = {
+        "payload_kind": "subgraph",
+        "execute_node_ids": ["3"],
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "executed-profile"},
+            },
+            "2": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "disconnected-profile"},
+            },
+            "3": {
+                "class_type": "PreviewText",
+                "inputs": {"text": ["1", 0]},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "source_signature": {
+                    "class_type": "ModalLLM",
+                    "inputs": {"model_profile": "metadata-profile"},
+                }
+            }
+        ],
+    }
+
+    assert modal_cloud_module._llm_profiles_in_payload(payload) == (
+        "executed-profile",
+    )
+    assert (
+        modal_cloud_module._llm_profiles_in_payload(
+            {**payload, "payload_kind": "canary"}
+        )
+        == ()
+    )
+
+
+def test_modal_cloud_commits_after_each_genuine_triton_cache_miss(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated new specializations for one profile must each become durable."""
+    signal = {"size": 10}
+    runtime_module = types.ModuleType("modal_llm_runtime")
+    runtime_module.triton_compile_miss_signal_size = lambda: signal["size"]
+    runtime_module.triton_compile_listener_engine_pids = lambda: (1234,)
+    monkeypatch.setitem(sys.modules, "modal_llm_runtime", runtime_module)
+    payload = {
+        "payload_kind": "subgraph",
+        "execute_node_ids": ["llm"],
+        "subgraph_prompt": {
+            "llm": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "same-profile"},
+            }
+        },
+    }
+
+    class FakeVolume:
+        """Count explicit compile-cache commits."""
+
+        def __init__(self) -> None:
+            """Initialize an empty commit count."""
+            self.commits = 0
+
+        def commit(self) -> None:
+            """Record one explicit commit."""
+            self.commits += 1
+
+    volume = FakeVolume()
+    checkpoint = modal_cloud_module._llm_compile_miss_checkpoint(payload)
+    assert checkpoint is not None
+    assert (
+        modal_cloud_module._commit_actual_llm_compile_cache(checkpoint, volume)
+        is False
+    )
+
+    signal["size"] = 20
+    assert modal_cloud_module._commit_actual_llm_compile_cache(checkpoint, volume)
+    second_checkpoint = modal_cloud_module._llm_compile_miss_checkpoint(payload)
+    signal["size"] = 35
+    assert modal_cloud_module._commit_actual_llm_compile_cache(
+        second_checkpoint,
+        volume,
+    )
+    assert volume.commits == 2
+
+
+def test_modal_cloud_does_not_claim_cache_hits_without_engine_listener(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Missing EngineCore telemetry must skip commits without reporting a hit."""
+    runtime_module = types.ModuleType("modal_llm_runtime")
+    runtime_module.triton_compile_miss_signal_size = lambda: 0
+    runtime_module.triton_compile_listener_engine_pids = lambda: ()
+    monkeypatch.setitem(sys.modules, "modal_llm_runtime", runtime_module)
+    checkpoint = modal_cloud_module._LLMCompileMissCheckpoint(
+        profiles=("profile",),
+        signal_size=0,
+        listener_engine_pids=(),
+    )
+
+    class FakeVolume:
+        """Reject any commit without listener evidence."""
+
+        def commit(self) -> None:
+            """Fail if missing telemetry causes a commit."""
+            raise AssertionError("listener-less execution cannot commit")
+
+    with caplog.at_level(logging.WARNING):
+        committed = modal_cloud_module._commit_actual_llm_compile_cache(
+            checkpoint,
+            FakeVolume(),
+        )
+
+    assert committed is False
+    assert "no live vLLM EngineCore" in caplog.text
+    assert "every Triton lookup hit" not in caplog.text
 
 
 def test_modal_cloud_reloads_compile_cache_before_restored_runtime(
@@ -5965,6 +6211,70 @@ def test_modal_cloud_reloads_compile_cache_before_restored_runtime(
     modal_cloud_module._prewarm_restored_runtime(FakeVolume())
 
     assert calls == ["reload", "runtime", "execution"]
+
+
+def test_modal_cloud_does_not_reload_compile_cache_during_request_warmup(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Do not reload a cache Volume after native libraries may be mapped."""
+
+    class FakeCompileCacheVolume:
+        """Fail if request-time warmup tries to reload the compile cache."""
+
+        def reload(self) -> None:
+            """Reject the unsafe request-time reload."""
+            raise AssertionError("request-time compile-cache reload is unsafe")
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_hydrate_missing_payload_volume_paths",
+        lambda volume, payload: [],
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_should_reload_modal_volume",
+        lambda payload: False,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_emit_modal_volume_reload_skip",
+        lambda component_id, payload: None,
+    )
+
+    result = modal_cloud_module._prepare_warm_container_for_request(
+        object(),
+        {"component_id": "llm-component"},
+        FakeCompileCacheVolume(),
+    )
+
+    assert result["component_id"] == "llm-component"
+
+
+def test_modal_cloud_finds_memory_mapped_compile_cache_files(
+    modal_cloud_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Identify native cache files visible only in process memory maps."""
+    volume_root = tmp_path / "compile-cache"
+    mapped_library = volume_root / "triton" / "cuda_utils.so"
+    mapped_library.parent.mkdir(parents=True)
+    mapped_library.touch()
+    proc_root = tmp_path / "proc"
+    process_root = proc_root / "191"
+    process_root.mkdir(parents=True)
+    (process_root / "maps").write_text(
+        f"7f000000-7f001000 r-xp 00000000 00:1e 144 {mapped_library}\n"
+        f"7f001000-7f002000 r--p 00001000 00:1e 144 {mapped_library}\n",
+        encoding="utf-8",
+    )
+
+    mapped_files = modal_cloud_module._mapped_process_files_under(
+        volume_root,
+        proc_root=proc_root,
+    )
+
+    assert mapped_files == ((191, str(mapped_library)),)
 
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
