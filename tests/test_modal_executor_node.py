@@ -5928,6 +5928,70 @@ def test_modal_cloud_reloads_compile_cache_before_restored_runtime(
     assert calls == ["reload", "runtime", "execution"]
 
 
+def test_modal_cloud_does_not_reload_compile_cache_during_request_warmup(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Do not reload a cache Volume after native libraries may be mapped."""
+
+    class FakeCompileCacheVolume:
+        """Fail if request-time warmup tries to reload the compile cache."""
+
+        def reload(self) -> None:
+            """Reject the unsafe request-time reload."""
+            raise AssertionError("request-time compile-cache reload is unsafe")
+
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_hydrate_missing_payload_volume_paths",
+        lambda volume, payload: [],
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_should_reload_modal_volume",
+        lambda payload: False,
+    )
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_emit_modal_volume_reload_skip",
+        lambda component_id, payload: None,
+    )
+
+    result = modal_cloud_module._prepare_warm_container_for_request(
+        object(),
+        {"component_id": "llm-component"},
+        FakeCompileCacheVolume(),
+    )
+
+    assert result["component_id"] == "llm-component"
+
+
+def test_modal_cloud_finds_memory_mapped_compile_cache_files(
+    modal_cloud_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Identify native cache files visible only in process memory maps."""
+    volume_root = tmp_path / "compile-cache"
+    mapped_library = volume_root / "triton" / "cuda_utils.so"
+    mapped_library.parent.mkdir(parents=True)
+    mapped_library.touch()
+    proc_root = tmp_path / "proc"
+    process_root = proc_root / "191"
+    process_root.mkdir(parents=True)
+    (process_root / "maps").write_text(
+        f"7f000000-7f001000 r-xp 00000000 00:1e 144 {mapped_library}\n"
+        f"7f001000-7f002000 r--p 00001000 00:1e 144 {mapped_library}\n",
+        encoding="utf-8",
+    )
+
+    mapped_files = modal_cloud_module._mapped_process_files_under(
+        volume_root,
+        proc_root=proc_root,
+    )
+
+    assert mapped_files == ((191, str(mapped_library)),)
+
+
 def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module: Any,
     monkeypatch: Any,

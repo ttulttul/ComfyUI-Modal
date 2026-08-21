@@ -6571,8 +6571,69 @@ def _reload_compile_cache_volume(volume: Any | None) -> bool:
         logger.warning("Modal compile-cache Volume does not expose reload().")
         return False
     with _timed_phase("llm_compile_cache_reload"):
-        reload_method()
+        try:
+            reload_method()
+        except RuntimeError as exc:
+            if _is_modal_volume_open_files_error(exc):
+                _log_compile_cache_memory_maps()
+            raise
     return True
+
+
+def _mapped_process_files_under(
+    volume_root: Path,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> tuple[tuple[int, str], ...]:
+    """Return process ids and files memory-mapped beneath one filesystem root."""
+    try:
+        resolved_root = volume_root.resolve(strict=True)
+        process_directories = tuple(proc_root.iterdir())
+    except OSError:
+        return ()
+
+    mapped_files: set[tuple[int, str]] = set()
+    for process_directory in process_directories:
+        if not process_directory.name.isdecimal():
+            continue
+        try:
+            maps_text = (process_directory / "maps").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            continue
+        for line in maps_text.splitlines():
+            fields = line.split(maxsplit=5)
+            if len(fields) != 6 or not fields[5].startswith("/"):
+                continue
+            mapped_path = fields[5].removesuffix(" (deleted)")
+            try:
+                Path(mapped_path).relative_to(resolved_root)
+            except ValueError:
+                continue
+            mapped_files.add((int(process_directory.name), mapped_path))
+    return tuple(sorted(mapped_files))
+
+
+def _log_compile_cache_memory_maps() -> None:
+    """Log native mappings that explain a busy compile-cache Volume reload."""
+    mapped_files = _mapped_process_files_under(_REMOTE_LLM_COMPILE_CACHE_ROOT)
+    if not mapped_files:
+        logger.warning(
+            "Modal compile-cache Volume reload reported open files, but no "
+            "memory-mapped cache files were visible in /proc."
+        )
+        return
+    logger.error(
+        "Modal compile-cache Volume reload is blocked by %d memory-mapped "
+        "native cache file(s): %s",
+        len(mapped_files),
+        [
+            {"pid": process_id, "path": mapped_path}
+            for process_id, mapped_path in mapped_files[:8]
+        ],
+    )
 
 
 def _prewarm_restored_runtime(compile_cache_volume: Any | None = None) -> None:
@@ -7080,7 +7141,6 @@ def _prepare_warm_container_for_request(
     _hydrate_missing_payload_volume_paths(volume, payload)
     needs_volume_reload = _should_reload_modal_volume(payload)
     with _timed_phase("remote_engine_warmup", component=component_id):
-        _reload_compile_cache_volume(compile_cache_volume)
         if needs_volume_reload:
             _reload_modal_volume_for_request(
                 volume,
