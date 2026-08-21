@@ -66,6 +66,10 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     select_remote_torch_build as _select_remote_torch_build,
 )
 from llm_profiles import get_llm_profile, load_llm_profiles  # noqa: E402
+from llm_recovery import (  # noqa: E402
+    LLM_FORCE_VLLM_THROUGHPUT_PAYLOAD_KEY,
+    is_llm_memory_recovery_exhausted,
+)
 from llm_resolver import resolve_model_profile  # noqa: E402
 from llm_staging import (
     stage_model_profile,
@@ -1933,7 +1937,7 @@ def _remote_failure_disposition(exc: Exception) -> RemoteFailureDisposition:
     """Classify one execution failure for worker-retirement decisions."""
     if _is_interrupt_like_failure(exc) or _is_session_state_like_failure(exc):
         return RemoteFailureDisposition.EXPECTED
-    if isinstance(exc, MemoryError):
+    if isinstance(exc, MemoryError) or is_llm_memory_recovery_exhausted(exc):
         return RemoteFailureDisposition.POISONED_WORKER
 
     message = str(exc).lower()
@@ -2520,12 +2524,17 @@ def _observe_remote_workflow_for_llm_mode(payload: dict[str, Any]) -> None:
     """Record real workflow arrivals for container-local vLLM auto promotion."""
     if payload.get("payload_kind") == "canary":
         return
-    from modal_llm_runtime import observe_modal_workflow_execution
+    from modal_llm_runtime import (
+        force_modal_vllm_throughput_after_memory_recovery,
+        observe_modal_workflow_execution,
+    )
 
     prompt_id = payload.get("prompt_id")
-    observe_modal_workflow_execution(
-        str(prompt_id).strip() if prompt_id is not None else None
-    )
+    normalized_prompt_id = str(prompt_id).strip() if prompt_id is not None else None
+    if bool(payload.get(LLM_FORCE_VLLM_THROUGHPUT_PAYLOAD_KEY)):
+        force_modal_vllm_throughput_after_memory_recovery(normalized_prompt_id)
+        return
+    observe_modal_workflow_execution(normalized_prompt_id)
 
 
 def _remote_interrupt_flag_key(prompt_id: str, component_id: str) -> str:
@@ -7502,6 +7511,9 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
         "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS": str(settings.startup_timeout_seconds),
         "COMFY_MODAL_LLM_MAX_RESIDENT_MODELS": str(
             getattr(settings, "llm_max_resident_models", 2)
+        ),
+        "COMFY_MODAL_LLM_MEMORY_RECOVERY_TIMEOUT_SECONDS": str(
+            getattr(settings, "llm_memory_recovery_timeout_seconds", 15.0)
         ),
         "COMFY_MODAL_LLM_RESERVE_FREE_GB": str(
             getattr(settings, "llm_reserve_free_vram_gb", 24.0)

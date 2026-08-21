@@ -1095,6 +1095,21 @@ def test_vllm_auto_mode_can_promote_before_first_llm_load(
     ) == "throughput"
 
 
+def test_vllm_auto_mode_preserves_throughput_on_memory_recovery_worker(
+    modal_llm_runtime_module: Any,
+) -> None:
+    """A fresh recovery worker must not reset a promoted retry back to eager."""
+    controller = modal_llm_runtime_module.VLLMExecutionModeController("auto")
+
+    promoted = controller.force_throughput_after_memory_recovery("workflow-2")
+
+    assert promoted is True
+    assert controller.effective_mode() == "throughput"
+    assert controller.promoted is True
+    assert controller.observed_workflow_count == 2
+    assert controller.observe("workflow-2") is False
+
+
 def test_vllm_auto_mode_promotes_on_second_distinct_workflow(
     modal_llm_runtime_module: Any,
     llm_profiles_module: Any,
@@ -1133,13 +1148,14 @@ def test_vllm_auto_mode_promotes_on_second_distinct_workflow(
         loaded_backends.append(backend)
         return backend
 
+    comfy_memory_releases: list[int] = []
     manager = modal_llm_runtime_module.ResidentLLMManager(
         storage_root=tmp_path,
         backend_factory=backend_factory,
         memory_info=lambda: (200 * 1024**3, 256 * 1024**3),
         empty_cache=lambda: None,
         snapshot_ready=lambda storage_root, selected_profile: True,
-        comfy_memory_release=lambda required_bytes: None,
+        comfy_memory_release=comfy_memory_releases.append,
         vllm_mode_controller=controller,
     )
     prepared = modal_llm_runtime_module.PreparedLLMInputs(
@@ -1186,11 +1202,119 @@ def test_vllm_auto_mode_promotes_on_second_distinct_workflow(
     assert warm_throughput.metadata["cache_hit"] is True
     assert [backend.mode for backend in loaded_backends] == ["eager", "throughput"]
     assert loaded_backends[0].unloaded is True
+    assert len(comfy_memory_releases) == 2
     assert any(
         event.stage == "engine"
         and event.message == "Optimizing vLLM for repeat workflows"
         for event in progress
     )
+
+
+def test_resident_manager_waits_for_post_eviction_memory_recovery(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Admission should poll until an asynchronous vLLM release becomes visible."""
+    gib = 1024**3
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        backend="vllm",
+        estimated_vram_gb=67.9,
+    )
+    controller = modal_llm_runtime_module.VLLMExecutionModeController("auto")
+    controller.force_throughput_after_memory_recovery("workflow-2")
+    runtime_profile = modal_llm_runtime_module._profile_for_vllm_execution(
+        profile,
+        controller,
+    )
+    memory_samples = iter(
+        [
+            (68 * gib, 95 * gib),
+            (75 * gib, 95 * gib),
+            (85 * gib, 95 * gib),
+        ]
+    )
+    clock = [0.0]
+    sleeps: list[float] = []
+    releases: list[int] = []
+
+    def sleep(seconds: float) -> None:
+        """Advance the deterministic recovery clock."""
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    manager = modal_llm_runtime_module.ResidentLLMManager(
+        storage_root=tmp_path,
+        memory_info=lambda: next(memory_samples),
+        empty_cache=lambda: None,
+        snapshot_ready=lambda storage_root, selected_profile: True,
+        comfy_memory_release=releases.append,
+        vllm_mode_controller=controller,
+        memory_recovery_timeout_seconds=1.0,
+        memory_recovery_poll_interval_seconds=0.25,
+        monotonic=lambda: clock[0],
+        sleep=sleep,
+    )
+
+    manager._make_room(
+        runtime_profile,
+        16.0,
+        evicted_before_load=True,
+    )
+
+    assert len(releases) == 1
+    assert sleeps == [0.25, 0.25]
+
+
+def test_resident_manager_marks_exhausted_post_eviction_memory_for_retry(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A bounded recovery timeout should emit the cross-process retry marker."""
+    gib = 1024**3
+    profile = replace(
+        llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct"),
+        backend="vllm",
+        estimated_vram_gb=67.9,
+    )
+    controller = modal_llm_runtime_module.VLLMExecutionModeController("auto")
+    controller.force_throughput_after_memory_recovery("workflow-2")
+    runtime_profile = modal_llm_runtime_module._profile_for_vllm_execution(
+        profile,
+        controller,
+    )
+    clock = [0.0]
+
+    def sleep(seconds: float) -> None:
+        """Advance the deterministic recovery clock."""
+        clock[0] += seconds
+
+    manager = modal_llm_runtime_module.ResidentLLMManager(
+        storage_root=tmp_path,
+        memory_info=lambda: (68 * gib, 95 * gib),
+        empty_cache=lambda: None,
+        snapshot_ready=lambda storage_root, selected_profile: True,
+        comfy_memory_release=lambda required_bytes: None,
+        vllm_mode_controller=controller,
+        memory_recovery_timeout_seconds=0.5,
+        memory_recovery_poll_interval_seconds=0.25,
+        monotonic=lambda: clock[0],
+        sleep=sleep,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="comfy-modal-llm-memory-recovery-exhausted.*vllm_mode=throughput",
+    ):
+        manager._make_room(
+            runtime_profile,
+            16.0,
+            evicted_before_load=True,
+        )
+
+    assert clock[0] == 0.5
 
 
 def test_representative_llm_prewarm_inputs_cover_text_and_vision_shapes(

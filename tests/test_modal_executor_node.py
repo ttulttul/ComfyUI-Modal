@@ -2444,6 +2444,7 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     )
     assert image_environment["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     assert image_environment["COMFY_MODAL_LLM_MAX_RESIDENT_MODELS"] == "2"
+    assert image_environment["COMFY_MODAL_LLM_MEMORY_RECOVERY_TIMEOUT_SECONDS"] == "15.0"
     assert image_environment["COMFY_MODAL_LLM_RESERVE_FREE_GB"] == "24.0"
     assert image_environment["COMFY_MODAL_SECRET_NAME"] == "workflow-credentials"
     assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
@@ -2479,8 +2480,12 @@ def test_modal_cloud_observes_distinct_workflows_for_llm_auto_mode(
 ) -> None:
     """The container boundary should count prompts while excluding canary traffic."""
     observed_prompt_ids: list[str | None] = []
+    forced_prompt_ids: list[str | None] = []
     runtime_module = types.ModuleType("modal_llm_runtime")
     runtime_module.observe_modal_workflow_execution = observed_prompt_ids.append
+    runtime_module.force_modal_vllm_throughput_after_memory_recovery = (
+        forced_prompt_ids.append
+    )
     monkeypatch.setitem(sys.modules, "modal_llm_runtime", runtime_module)
 
     modal_cloud_module._observe_remote_workflow_for_llm_mode(
@@ -2495,8 +2500,16 @@ def test_modal_cloud_observes_distinct_workflows_for_llm_auto_mode(
     modal_cloud_module._observe_remote_workflow_for_llm_mode(
         {"prompt_id": "prompt-2", "payload_kind": "subgraph"}
     )
+    modal_cloud_module._observe_remote_workflow_for_llm_mode(
+        {
+            "prompt_id": "prompt-3",
+            "payload_kind": "subgraph",
+            "force_vllm_throughput_after_memory_recovery": True,
+        }
+    )
 
     assert observed_prompt_ids == ["prompt-1", "prompt-1", "prompt-2"]
+    assert forced_prompt_ids == ["prompt-3"]
 
 
 def test_modal_cloud_resolves_configured_named_secret(
@@ -3380,6 +3393,32 @@ def test_modal_cloud_retires_worker_for_poisoned_cuda_runtime(
         scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
             {"component_id": "component-1", "terminate_container_on_error": True},
             RuntimeError("CUDA error: an illegal memory access was encountered"),
+        )
+    finally:
+        monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
+
+    assert scheduled is True
+    assert scheduled_exits == [(modal_cloud_module._REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS, 1)]
+
+
+def test_modal_cloud_retires_worker_after_llm_memory_recovery_timeout(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """An unrecovered eviction should retire dirty process state before retry."""
+    scheduled_exits: list[tuple[float, int]] = []
+    original_flag = modal_cloud_module._CONTAINER_TERMINATION_SCHEDULED
+    monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", False)
+    monkeypatch.setattr(modal_cloud_module, "_is_modal_container_runtime", lambda: True)
+    monkeypatch.setattr(
+        modal_cloud_module,
+        "_schedule_process_exit",
+        lambda delay_seconds, exit_code: scheduled_exits.append((delay_seconds, exit_code)),
+    )
+    try:
+        scheduled = modal_cloud_module._maybe_schedule_container_termination_on_error(
+            {"component_id": "llm-1", "terminate_container_on_error": True},
+            RuntimeError("[comfy-modal-llm-memory-recovery-exhausted] still low"),
         )
     finally:
         monkeypatch.setattr(modal_cloud_module, "_CONTAINER_TERMINATION_SCHEDULED", original_flag)
