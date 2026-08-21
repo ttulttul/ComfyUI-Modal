@@ -58,8 +58,17 @@ _TRITON_COMPILE_MISS_SIGNAL_PATH = Path(
         "/tmp/comfy-modal-triton-compile-misses.jsonl",
     )
 )
+_TRITON_COMPILE_LISTENER_STATUS_PATH = Path(
+    os.getenv(
+        "COMFY_MODAL_TRITON_COMPILE_LISTENER_STATUS_PATH",
+        "/tmp/comfy-modal-triton-listeners.jsonl",
+    )
+)
 _TRITON_COMPILE_LISTENER_LOCK = threading.Lock()
-_TRITON_COMPILE_LISTENER_INSTALLED = False
+_TRITON_COMPILE_LISTENER_INSTALLED_PID: int | None = None
+_TRITON_ENGINE_CORE_LISTENER_RECORDED_PID: int | None = None
+_VLLM_ENGINE_CORE_ENTRYPOINT_PATCHED_PID: int | None = None
+_VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT: Callable[..., Any] | None = None
 
 
 def triton_compile_miss_signal_size() -> int:
@@ -68,6 +77,53 @@ def triton_compile_miss_signal_size() -> int:
         return _TRITON_COMPILE_MISS_SIGNAL_PATH.stat().st_size
     except FileNotFoundError:
         return 0
+
+
+def _append_process_signal(path: Path, event: Mapping[str, Any]) -> None:
+    """Atomically append one JSON event shared by worker processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(dict(event), sort_keys=True, default=str).encode("utf-8") + b"\n"
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        written_bytes = os.write(descriptor, payload)
+        if written_bytes != len(payload):
+            raise OSError(
+                f"Short write for process signal {path}: "
+                f"expected={len(payload)} actual={written_bytes}."
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Return whether a process id still identifies a visible live process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def triton_compile_listener_engine_pids() -> tuple[int, ...]:
+    """Return live EngineCore processes that installed the accurate listener."""
+    try:
+        records = _TRITON_COMPILE_LISTENER_STATUS_PATH.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    except FileNotFoundError:
+        return ()
+    active_pids: set[int] = set()
+    for record in records:
+        try:
+            event = json.loads(record)
+            pid = int(event.get("pid"))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if event.get("role") == "engine_core" and _process_is_alive(pid):
+            active_pids.add(pid)
+    return tuple(sorted(active_pids))
 
 
 def _triton_compile_timing_payload(times: Any) -> dict[str, Any]:
@@ -87,23 +143,7 @@ def _triton_compile_timing_payload(times: Any) -> dict[str, Any]:
 
 def _record_triton_compile_miss(event: Mapping[str, Any]) -> None:
     """Append one genuine compile miss for observation by the Modal parent process."""
-    _TRITON_COMPILE_MISS_SIGNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    record = json.dumps(dict(event), sort_keys=True, default=str).encode("utf-8")
-    descriptor = os.open(
-        _TRITON_COMPILE_MISS_SIGNAL_PATH,
-        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-        0o600,
-    )
-    try:
-        payload = record + b"\n"
-        written_bytes = os.write(descriptor, payload)
-        if written_bytes != len(payload):
-            raise OSError(
-                "Short write while recording a Triton compile miss: "
-                f"expected={len(payload)} actual={written_bytes}."
-            )
-    finally:
-        os.close(descriptor)
+    _append_process_signal(_TRITON_COMPILE_MISS_SIGNAL_PATH, event)
 
 
 def _triton_compile_listener(**event: Any) -> None:
@@ -145,21 +185,46 @@ def _triton_compile_listener(**event: Any) -> None:
     )
 
 
-def _install_accurate_triton_compile_listener() -> None:
-    """Replace vLLM's cache-blind Triton hook with cache-aware telemetry."""
-    global _TRITON_COMPILE_LISTENER_INSTALLED
+def _record_engine_core_listener_installation() -> None:
+    """Publish that this live EngineCore installed cache-aware telemetry."""
+    global _TRITON_ENGINE_CORE_LISTENER_RECORDED_PID
+    current_pid = os.getpid()
+    if _TRITON_ENGINE_CORE_LISTENER_RECORDED_PID == current_pid:
+        return
+    _append_process_signal(
+        _TRITON_COMPILE_LISTENER_STATUS_PATH,
+        {
+            "installed_at": time.time(),
+            "pid": current_pid,
+            "ppid": os.getppid(),
+            "role": "engine_core",
+        },
+    )
+    _TRITON_ENGINE_CORE_LISTENER_RECORDED_PID = current_pid
+
+
+def _install_triton_compile_listener_in_current_process(*, engine_core: bool) -> None:
+    """Install cache-aware Triton telemetry in the current Python process."""
+    global _TRITON_COMPILE_LISTENER_INSTALLED_PID
+    current_pid = os.getpid()
     with _TRITON_COMPILE_LISTENER_LOCK:
-        if _TRITON_COMPILE_LISTENER_INSTALLED:
+        if _TRITON_COMPILE_LISTENER_INSTALLED_PID == current_pid:
+            if engine_core:
+                _record_engine_core_listener_installation()
             return
         triton = importlib.import_module("triton")
         jit_monitor = importlib.import_module("vllm.utils.jit_monitor")
         previous_listener = triton.knobs.compilation.listener
+        if getattr(previous_listener, "_comfy_modal_cache_aware", False):
+            previous_listener = None
 
         def listener(**event: Any) -> None:
             """Preserve an existing listener before recording Modal telemetry."""
             if previous_listener is not None:
                 previous_listener(**event)
             _triton_compile_listener(**event)
+
+        listener._comfy_modal_cache_aware = True  # type: ignore[attr-defined]
 
         def disable_cache_blind_post_compile_hook() -> None:
             """Leave the cache-blind Triton post-compile hook unset."""
@@ -170,7 +235,48 @@ def _install_accurate_triton_compile_listener() -> None:
 
         triton.knobs.compilation.listener = listener
         jit_monitor._setup_triton_jit_hook = disable_cache_blind_post_compile_hook
-        _TRITON_COMPILE_LISTENER_INSTALLED = True
+        _TRITON_COMPILE_LISTENER_INSTALLED_PID = current_pid
+        if engine_core:
+            _record_engine_core_listener_installation()
+
+
+def _run_vllm_engine_core_with_accurate_triton_listener(
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Install telemetry inside a spawned EngineCore before its runtime starts."""
+    _install_triton_compile_listener_in_current_process(engine_core=True)
+    core_module = importlib.import_module("vllm.v1.engine.core")
+    original_entrypoint = _VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT
+    if original_entrypoint is None:
+        original_entrypoint = core_module.EngineCoreProc.run_engine_core
+    if original_entrypoint is _run_vllm_engine_core_with_accurate_triton_listener:
+        raise RuntimeError("Unable to recover vLLM's original EngineCore entrypoint.")
+    return original_entrypoint(*args, **kwargs)
+
+
+def _patch_vllm_engine_core_entrypoint() -> None:
+    """Make multiprocessing spawn enter EngineCore through the telemetry wrapper."""
+    global _VLLM_ENGINE_CORE_ENTRYPOINT_PATCHED_PID
+    global _VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT
+    current_pid = os.getpid()
+    if _VLLM_ENGINE_CORE_ENTRYPOINT_PATCHED_PID == current_pid:
+        return
+    core_module = importlib.import_module("vllm.v1.engine.core")
+    current_entrypoint = core_module.EngineCoreProc.run_engine_core
+    if current_entrypoint is not _run_vllm_engine_core_with_accurate_triton_listener:
+        _VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT = current_entrypoint
+        core_module.EngineCoreProc.run_engine_core = staticmethod(
+            _run_vllm_engine_core_with_accurate_triton_listener
+        )
+    _VLLM_ENGINE_CORE_ENTRYPOINT_PATCHED_PID = current_pid
+    logger.info("Installed cache-aware Triton wrapper on vLLM EngineCore spawn.")
+
+
+def _install_accurate_triton_compile_listener() -> None:
+    """Replace vLLM's cache-blind hook in this process and spawned EngineCore."""
+    _install_triton_compile_listener_in_current_process(engine_core=False)
+    _patch_vllm_engine_core_entrypoint()
 
 
 def _normalize_vllm_execution_setting(value: object) -> str:

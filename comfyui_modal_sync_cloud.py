@@ -7406,6 +7406,11 @@ def _execute_llm_prewarm_plans(
             )
             continue
         try:
+            compile_checkpoint = _LLMCompileMissCheckpoint(
+                profiles=(model_profile,),
+                signal_size=_triton_compile_miss_signal_size(),
+                listener_engine_pids=_triton_compile_listener_engine_pids(),
+            )
             with _timed_phase(
                 "llm_representative_prewarm",
                 component=component_id,
@@ -7422,19 +7427,16 @@ def _execute_llm_prewarm_plans(
                 model_profile=model_profile,
                 result=result,
             )
-            if compile_cache_volume is not None:
-                commit_method = getattr(compile_cache_volume, "commit", None)
-                if not callable(commit_method):
-                    raise RuntimeError(
-                        "Modal compile-cache Volume does not expose commit()."
-                    )
-                with _timed_phase("llm_compile_cache_commit", profile=model_profile):
-                    commit_method()
+            compile_cache_committed = _commit_actual_llm_compile_cache(
+                compile_checkpoint,
+                compile_cache_volume,
+            )
             results.append(
                 {
                     **result,
                     "manifest_path": str(manifest_path),
                     "manifest_cache_hit": representative_request_count == 1,
+                    "compile_cache_committed": compile_cache_committed,
                 }
             )
         except Exception:
@@ -7487,6 +7489,7 @@ class _LLMCompileMissCheckpoint:
 
     profiles: tuple[str, ...]
     signal_size: int
+    listener_engine_pids: tuple[int, ...]
 
 
 def _triton_compile_miss_signal_size() -> int:
@@ -7500,6 +7503,22 @@ def _triton_compile_miss_signal_size() -> int:
     return int(signal_reader())
 
 
+def _triton_compile_listener_engine_pids() -> tuple[int, ...]:
+    """Return live EngineCore processes with cache-aware Triton telemetry."""
+    runtime_module = importlib.import_module("modal_llm_runtime")
+    listener_reader = getattr(
+        runtime_module,
+        "triton_compile_listener_engine_pids",
+        None,
+    )
+    if not callable(listener_reader):
+        raise RuntimeError(
+            "Modal LLM runtime does not expose "
+            "triton_compile_listener_engine_pids()."
+        )
+    return tuple(int(pid) for pid in listener_reader())
+
+
 def _llm_compile_miss_checkpoint(
     payload: Mapping[str, Any],
 ) -> _LLMCompileMissCheckpoint | None:
@@ -7510,6 +7529,7 @@ def _llm_compile_miss_checkpoint(
     return _LLMCompileMissCheckpoint(
         profiles=profiles,
         signal_size=_triton_compile_miss_signal_size(),
+        listener_engine_pids=_triton_compile_listener_engine_pids(),
     )
 
 
@@ -7520,6 +7540,16 @@ def _commit_actual_llm_compile_cache(
     """Commit the compile-cache Volume after a genuine Triton disk-cache miss."""
     if checkpoint is None or compile_cache_volume is None:
         return False
+    listener_engine_pids = _triton_compile_listener_engine_pids()
+    if not listener_engine_pids:
+        logger.warning(
+            "Skipping LLM compile-cache commit because no live vLLM EngineCore "
+            "reported the cache-aware Triton listener profiles=%s "
+            "listener_pids_before=%s.",
+            checkpoint.profiles,
+            checkpoint.listener_engine_pids,
+        )
+        return False
     signal_size = _triton_compile_miss_signal_size()
     if signal_size < checkpoint.signal_size:
         raise RuntimeError(
@@ -7529,9 +7559,10 @@ def _commit_actual_llm_compile_cache(
     if signal_size == checkpoint.signal_size:
         logger.info(
             "Skipping LLM compile-cache commit because every Triton lookup hit "
-            "the persistent cache profiles=%s signal_size=%d.",
+            "the persistent cache profiles=%s signal_size=%d listener_pids=%s.",
             checkpoint.profiles,
             signal_size,
+            listener_engine_pids,
         )
         return False
     commit_method = getattr(compile_cache_volume, "commit", None)

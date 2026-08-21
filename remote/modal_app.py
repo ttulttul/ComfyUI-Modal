@@ -7212,44 +7212,66 @@ def _build_loader_prewarm_plans(payload: dict[str, Any]) -> list[dict[str, Any]]
     return plans
 
 
+def _iter_executable_subgraph_nodes(
+    payload: Mapping[str, Any],
+) -> Iterator[Mapping[str, Any]]:
+    """Yield only prompt nodes required by this payload's execution targets."""
+    for prompt_payload in _iter_loader_prewarm_prompt_payloads(dict(payload)):
+        raw_prompt = prompt_payload.get("subgraph_prompt")
+        if not isinstance(raw_prompt, Mapping):
+            continue
+        prompt = {
+            str(node_id): dict(prompt_node)
+            for node_id, prompt_node in raw_prompt.items()
+            if isinstance(prompt_node, Mapping)
+        }
+        execute_node_ids: list[str] = []
+        for field_name in (
+            "execute_node_ids",
+            "mapped_execute_node_ids",
+            "static_execute_node_ids",
+        ):
+            field_value = prompt_payload.get(field_name)
+            if isinstance(field_value, (list, tuple)):
+                execute_node_ids.extend(str(node_id) for node_id in field_value)
+        required_node_ids = _resolve_required_subgraph_nodes(
+            prompt,
+            list(dict.fromkeys(execute_node_ids)),
+        )
+        for node_id in required_node_ids:
+            yield prompt[node_id]
+
+
 def _build_llm_prewarm_plans(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return deduplicated resident-LLM load and representative JIT plans."""
+    """Return LLM warmups found in executable subgraph dependency closures."""
     plans: list[dict[str, Any]] = []
     seen_profiles: set[str] = set()
-
-    def visit(value: Any) -> None:
-        """Collect fixed ModalLLM profile inputs from nested component payloads."""
-        if isinstance(value, Mapping):
-            if value.get("class_type") == "ModalLLM":
-                inputs = value.get("inputs")
-                if isinstance(inputs, Mapping):
-                    model_profile = inputs.get("model_profile")
-                    if isinstance(model_profile, str) and model_profile.strip():
-                        normalized_profile = model_profile.strip()
-                        if normalized_profile not in seen_profiles:
-                            seen_profiles.add(normalized_profile)
-                            signature_payload = {
-                                "model_profile": normalized_profile,
-                                "representative_request_count": 3,
-                            }
-                            plans.append(
-                                {
-                                    **signature_payload,
-                                    "signature": hashlib.sha256(
-                                        json.dumps(
-                                            signature_payload, sort_keys=True
-                                        ).encode("utf-8")
-                                    ).hexdigest(),
-                                    "prompt_node": copy.deepcopy(dict(value)),
-                                }
-                            )
-            for nested_value in value.values():
-                visit(nested_value)
-        elif isinstance(value, (list, tuple)):
-            for nested_value in value:
-                visit(nested_value)
-
-    visit(payload)
+    for prompt_node in _iter_executable_subgraph_nodes(payload):
+        if prompt_node.get("class_type") != "ModalLLM":
+            continue
+        inputs = prompt_node.get("inputs")
+        if not isinstance(inputs, Mapping):
+            continue
+        model_profile = inputs.get("model_profile")
+        if not isinstance(model_profile, str) or not model_profile.strip():
+            continue
+        normalized_profile = model_profile.strip()
+        if normalized_profile in seen_profiles:
+            continue
+        seen_profiles.add(normalized_profile)
+        signature_payload = {
+            "model_profile": normalized_profile,
+            "representative_request_count": 3,
+        }
+        plans.append(
+            {
+                **signature_payload,
+                "signature": hashlib.sha256(
+                    json.dumps(signature_payload, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "prompt_node": copy.deepcopy(dict(prompt_node)),
+            }
+        )
     return plans
 
 
