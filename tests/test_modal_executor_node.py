@@ -5898,6 +5898,98 @@ def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
     assert results[0]["manifest_cache_hit"] is False
 
 
+def test_modal_cloud_llm_compile_profiles_are_limited_to_executable_subgraph(
+    modal_cloud_module: Any,
+) -> None:
+    """Nested metadata and disconnected LLM nodes must not trigger cache commits."""
+    payload = {
+        "payload_kind": "subgraph",
+        "execute_node_ids": ["3"],
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "executed-profile"},
+            },
+            "2": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "disconnected-profile"},
+            },
+            "3": {
+                "class_type": "PreviewText",
+                "inputs": {"text": ["1", 0]},
+            },
+        },
+        "boundary_inputs": [
+            {
+                "source_signature": {
+                    "class_type": "ModalLLM",
+                    "inputs": {"model_profile": "metadata-profile"},
+                }
+            }
+        ],
+    }
+
+    assert modal_cloud_module._llm_profiles_in_payload(payload) == (
+        "executed-profile",
+    )
+    assert (
+        modal_cloud_module._llm_profiles_in_payload(
+            {**payload, "payload_kind": "canary"}
+        )
+        == ()
+    )
+
+
+def test_modal_cloud_commits_after_each_genuine_triton_cache_miss(
+    modal_cloud_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated new specializations for one profile must each become durable."""
+    signal = {"size": 10}
+    runtime_module = types.ModuleType("modal_llm_runtime")
+    runtime_module.triton_compile_miss_signal_size = lambda: signal["size"]
+    monkeypatch.setitem(sys.modules, "modal_llm_runtime", runtime_module)
+    payload = {
+        "payload_kind": "subgraph",
+        "execute_node_ids": ["llm"],
+        "subgraph_prompt": {
+            "llm": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "same-profile"},
+            }
+        },
+    }
+
+    class FakeVolume:
+        """Count explicit compile-cache commits."""
+
+        def __init__(self) -> None:
+            """Initialize an empty commit count."""
+            self.commits = 0
+
+        def commit(self) -> None:
+            """Record one explicit commit."""
+            self.commits += 1
+
+    volume = FakeVolume()
+    checkpoint = modal_cloud_module._llm_compile_miss_checkpoint(payload)
+    assert checkpoint is not None
+    assert (
+        modal_cloud_module._commit_actual_llm_compile_cache(checkpoint, volume)
+        is False
+    )
+
+    signal["size"] = 20
+    assert modal_cloud_module._commit_actual_llm_compile_cache(checkpoint, volume)
+    second_checkpoint = modal_cloud_module._llm_compile_miss_checkpoint(payload)
+    signal["size"] = 35
+    assert modal_cloud_module._commit_actual_llm_compile_cache(
+        second_checkpoint,
+        volume,
+    )
+    assert volume.commits == 2
+
+
 def test_modal_cloud_reloads_compile_cache_before_restored_runtime(
     modal_cloud_module: Any,
     monkeypatch: Any,
