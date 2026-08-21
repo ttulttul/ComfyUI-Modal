@@ -80,6 +80,7 @@ const modalTerminalPromptStates = new Map();
 const modalCancellingPromptIds = new Set();
 const modalQueuedPromptIds = new Set();
 const modalSandwichedLocalNodeIds = new Set();
+const modalRemoteDescendantNodeIdsByAncestor = new Map();
 const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 
@@ -90,6 +91,7 @@ let modalVisibilityRefreshInFlight = null;
 let modalReplayedEventUpdatedAtMs = null;
 let vueNodeObserver = null;
 let vueNodeSyncScheduled = false;
+let remoteDescendantIndexRebuildScheduled = false;
 let modalContainerStatuses = [];
 let modalContainerStatusPromptId = null;
 let modalContainerStatusLoaded = false;
@@ -123,6 +125,16 @@ function isEligibleNode(node) {
  */
 function isRemoteNode(node) {
   return Boolean(node?.properties?.[REMOTE_PROPERTY]);
+}
+
+/**
+ * Return whether a node is a subgraph container with Modal-enabled descendants.
+ * @param {LGraphNode} node
+ * @returns {boolean}
+ */
+function hasRemoteDescendants(node) {
+  const workflowPath = workflowNodePath(node) || nodeId(node);
+  return (modalRemoteDescendantNodeIdsByAncestor.get(workflowPath)?.size ?? 0) > 0;
 }
 
 /**
@@ -2100,53 +2112,105 @@ function rebuildPromptAncestorMap(promptState) {
 }
 
 /**
+ * Return a descendant's effective phase, including live streamed progress.
+ * @param {string} promptId
+ * @param {string} descendantNodeId
+ * @returns {{ phase: string, state: Record<string, any> } | null}
+ */
+function remoteDescendantPhase(promptId, descendantNodeId) {
+  const state = modalNodeStates.get(descendantNodeId);
+  if (state?.promptId !== promptId) {
+    return null;
+  }
+  return {
+    phase: deriveRemoteNodePhase(
+      state.phase,
+      hasLiveNodeProgress(descendantNodeId, promptId),
+    ),
+    state,
+  };
+}
+
+/**
+ * Select the most useful visible phase for a subgraph containing mixed remote work.
+ * @param {Record<string, number>} phaseCounts
+ * @returns {string}
+ */
+function dominantRemoteContainerPhase(phaseCounts) {
+  const phasePriority = [
+    STATE_ERROR,
+    STATE_CANCELLING,
+    STATE_ACTIVE,
+    STATE_STARTING,
+    STATE_SETUP,
+    STATE_READY,
+    STATE_FINALIZING,
+    STATE_COMPLETE,
+  ];
+  return phasePriority.find((phase) => (phaseCounts[phase] ?? 0) > 0) ?? STATE_SETUP;
+}
+
+/**
+ * Aggregate all remote descendants beneath one subgraph into a container visual state.
+ * @param {string} promptId
+ * @param {string} ancestorNodeId
+ * @param {string | undefined} errorMessage
+ * @returns {Record<string, any> | null}
+ */
+function remoteContainerVisualState(promptId, ancestorNodeId, errorMessage) {
+  const promptState = modalPromptStates.get(promptId);
+  const descendantNodeIds = promptState?.descendantNodeIdsByAncestor.get(ancestorNodeId);
+  if (!promptState || !descendantNodeIds || descendantNodeIds.size === 0) {
+    return null;
+  }
+
+  const phaseCounts = {};
+  const descendantStates = [];
+  for (const descendantNodeId of descendantNodeIds) {
+    const descendantState = remoteDescendantPhase(promptId, descendantNodeId);
+    if (!descendantState) {
+      continue;
+    }
+    phaseCounts[descendantState.phase] = (phaseCounts[descendantState.phase] ?? 0) + 1;
+    descendantStates.push(descendantState.state);
+  }
+  if (descendantStates.length === 0) {
+    return null;
+  }
+
+  const phases = Object.keys(phaseCounts);
+  const descendantErrorMessage = descendantStates.find(
+    (state) => state.phase === STATE_ERROR && state.errorMessage,
+  )?.errorMessage;
+  return {
+    phase: dominantRemoteContainerPhase(phaseCounts),
+    promptId,
+    errorMessage: descendantErrorMessage ?? errorMessage,
+    updatedAt: Math.max(...descendantStates.map((state) => Number(state.updatedAt ?? 0))),
+    isRemoteContainer: true,
+    isMixedRemoteContainer: phases.length > 1,
+    phaseCounts,
+    remoteDescendantCount: descendantNodeIds.size,
+  };
+}
+
+/**
  * Recompute one visible ancestor node's phase from its descendant remote prompt nodes.
  * @param {string} promptId
  * @param {string} ancestorNodeId
  * @param {string | undefined} errorMessage
  */
 function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage) {
-  const promptState = modalPromptStates.get(promptId);
-  const descendantNodeIds = promptState?.descendantNodeIdsByAncestor.get(ancestorNodeId);
-  if (!promptState || !descendantNodeIds || descendantNodeIds.size === 0) {
+  const ancestorState = remoteContainerVisualState(promptId, ancestorNodeId, errorMessage);
+  if (!ancestorState) {
     return;
   }
-
-  const descendantStates = Array.from(descendantNodeIds)
-    .map((descendantNodeId) => modalNodeStates.get(descendantNodeId))
-    .filter((state) => state?.promptId === promptId);
-  if (descendantStates.length === 0) {
-    return;
-  }
-
-  let ancestorPhase = STATE_SETUP;
-  if (descendantStates.some((state) => state.phase === STATE_ERROR)) {
-    ancestorPhase = STATE_ERROR;
-  } else if (descendantStates.some((state) => state.phase === STATE_ACTIVE)) {
-    ancestorPhase = STATE_ACTIVE;
-  } else if (descendantStates.every((state) => state.phase === STATE_FINALIZING)) {
-    ancestorPhase = STATE_FINALIZING;
-  } else if (descendantStates.every((state) => state.phase === STATE_COMPLETE)) {
-    ancestorPhase = STATE_COMPLETE;
-  } else if (
-    descendantStates.some((state) =>
-      [STATE_READY, STATE_COMPLETE, STATE_FINALIZING].includes(state.phase),
-    )
-  ) {
-    ancestorPhase = STATE_READY;
-  }
-
   if (!shouldApplyPromptState(ancestorNodeId, promptId)) {
     return;
   }
   clearNodeTimer(ancestorNodeId);
-  modalNodeStates.set(ancestorNodeId, {
-    phase: ancestorPhase,
-    promptId,
-    errorMessage,
-    updatedAt: nowMs(),
-  });
-  if (ancestorPhase === STATE_ERROR) {
+  modalNodeStates.set(ancestorNodeId, ancestorState);
+  if (ancestorState.phase === STATE_ERROR) {
     scheduleNodeClear(ancestorNodeId, promptId, ERROR_CLEAR_DELAY_MS);
   }
 }
@@ -2807,17 +2871,33 @@ function findSomethingInAllSubgraphs(matcher) {
     return null;
   }
 
-  const subgraphs = [graph];
-  if (graph.subgraphs?.values) {
-    subgraphs.push(...graph.subgraphs.values());
-  }
-  for (const subgraph of subgraphs) {
-    const match = matcher(subgraph);
+  const visitedGraphs = new Set();
+  const visitGraph = (candidateGraph) => {
+    if (!candidateGraph || visitedGraphs.has(candidateGraph)) {
+      return null;
+    }
+    visitedGraphs.add(candidateGraph);
+    const match = matcher(candidateGraph);
     if (match) {
       return match;
     }
-  }
-  return null;
+    for (const node of candidateGraph.nodes ?? []) {
+      const nestedMatch = visitGraph(node?.subgraph);
+      if (nestedMatch) {
+        return nestedMatch;
+      }
+    }
+    if (candidateGraph.subgraphs?.values) {
+      for (const subgraph of candidateGraph.subgraphs.values()) {
+        const nestedMatch = visitGraph(subgraph);
+        if (nestedMatch) {
+          return nestedMatch;
+        }
+      }
+    }
+    return null;
+  };
+  return visitGraph(graph);
 }
 
 /**
@@ -2892,6 +2972,40 @@ function workflowNodePath(node) {
   }
 
   return pathSegments.filter(Boolean).join(":");
+}
+
+/**
+ * Rebuild the workflow-level index of Modal-enabled leaves beneath each subgraph node.
+ */
+function rebuildRemoteDescendantIndex() {
+  modalRemoteDescendantNodeIdsByAncestor.clear();
+  for (const node of allWorkflowNodes()) {
+    if (!isRemoteNode(node)) {
+      continue;
+    }
+    const remoteNodePath = workflowNodePath(node);
+    for (const ancestorNodeId of ancestorNodeIds(remoteNodePath)) {
+      if (!modalRemoteDescendantNodeIdsByAncestor.has(ancestorNodeId)) {
+        modalRemoteDescendantNodeIdsByAncestor.set(ancestorNodeId, new Set());
+      }
+      modalRemoteDescendantNodeIdsByAncestor.get(ancestorNodeId).add(remoteNodePath);
+    }
+  }
+}
+
+/**
+ * Rebuild descendant containment after ComfyUI completes a graph mutation.
+ */
+function scheduleRemoteDescendantIndexRebuild() {
+  if (remoteDescendantIndexRebuildScheduled) {
+    return;
+  }
+  remoteDescendantIndexRebuildScheduled = true;
+  setTimeout(() => {
+    remoteDescendantIndexRebuildScheduled = false;
+    rebuildRemoteDescendantIndex();
+    refreshNodeDecorations();
+  }, 0);
 }
 
 /**
@@ -3217,6 +3331,7 @@ function setRemoteFlag(node, value) {
   if (node.__modalToggleWidget) {
     node.__modalToggleWidget.value = enabled;
   }
+  rebuildRemoteDescendantIndex();
   clearSandwichedLocalNodeWarnings();
   refreshNodeDecorations();
 }
@@ -3235,6 +3350,7 @@ function synchronizeRemoteFlagFromWidget(node) {
     return;
   }
   node.properties[REMOTE_PROPERTY] = enabled;
+  rebuildRemoteDescendantIndex();
   clearSandwichedLocalNodeWarnings();
   refreshNodeDecorations();
 }
@@ -3246,7 +3362,26 @@ function synchronizeRemoteFlagFromWidget(node) {
  */
 function getRemoteVisualState(node) {
   const visualNodeId = workflowNodePath(node) || nodeId(node);
-  const state = modalNodeStates.get(visualNodeId) ?? null;
+  const storedState = modalNodeStates.get(visualNodeId) ?? null;
+  const promptContainerState = storedState?.promptId
+    ? remoteContainerVisualState(storedState.promptId, visualNodeId, storedState.errorMessage)
+    : null;
+  const staticRemoteDescendantCount = hasRemoteDescendants(node)
+    ? (modalRemoteDescendantNodeIdsByAncestor.get(visualNodeId)?.size ?? 0)
+    : 0;
+  const state =
+    promptContainerState ??
+    storedState ??
+    (staticRemoteDescendantCount > 0
+      ? {
+          phase: "idle",
+          promptId: null,
+          isRemoteContainer: true,
+          isMixedRemoteContainer: false,
+          phaseCounts: {},
+          remoteDescendantCount: staticRemoteDescendantCount,
+        }
+      : null);
   if (!state?.promptId) {
     return state;
   }
@@ -3262,7 +3397,9 @@ function getRemoteVisualState(node) {
     isActiveRemoteNode: hasLiveProgress || promptState?.activeNodeId === visualNodeId,
     isActiveComponentMember: isNodeInActiveComponent(state.promptId, visualNodeId),
     isCachedRemoteNode: Boolean(cachedState),
-    componentLabel: promptState?.componentLabelByMember.get(visualNodeId) ?? null,
+    componentLabel: state.isRemoteContainer
+      ? null
+      : (promptState?.componentLabelByMember.get(visualNodeId) ?? null),
     cachedAt: cachedState?.cachedAt ?? null,
     progress: progressState,
     batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,
@@ -3465,7 +3602,36 @@ function vueNodeForElement(nodeElement) {
 function clearVueNodeDecoration(nodeElement) {
   nodeElement.classList.remove("comfy-modal-vue-node");
   delete nodeElement.dataset.modalPhase;
+  delete nodeElement.dataset.modalContainer;
   nodeElement.querySelector(":scope > .comfy-modal-vue-node-decoration")?.remove();
+}
+
+/**
+ * Describe the remote work summarized by a subgraph container.
+ * @param {Record<string, any> | null | undefined} state
+ * @returns {string}
+ */
+function remoteContainerTooltip(state) {
+  const descendantCount = Number(state?.remoteDescendantCount ?? 0);
+  const phaseCounts = state?.phaseCounts ?? {};
+  const phaseSummary = [
+    STATE_ERROR,
+    STATE_CANCELLING,
+    STATE_ACTIVE,
+    STATE_STARTING,
+    STATE_SETUP,
+    STATE_READY,
+    STATE_FINALIZING,
+    STATE_COMPLETE,
+  ]
+    .filter((phase) => (phaseCounts[phase] ?? 0) > 0)
+    .map((phase) => `${phaseCounts[phase]} ${phase}`)
+    .join(", ");
+  const nodeLabel = descendantCount === 1 ? "node" : "nodes";
+  if (!phaseSummary) {
+    return `${descendantCount} descendant ${nodeLabel} set to execute on Modal.`;
+  }
+  return `${descendantCount} Modal descendant ${nodeLabel}: ${phaseSummary}.`;
 }
 
 /**
@@ -3496,11 +3662,11 @@ function ensureVueNodeDecoration(nodeElement) {
  */
 function updateVueNodeDecoration(nodeElement, node, timestamp) {
   const localBottleneck = isSandwichedLocalNode(node);
-  if (!isRemoteNode(node) && !localBottleneck) {
+  const state = getRemoteVisualState(node);
+  if (!isRemoteNode(node) && !state?.isRemoteContainer && !localBottleneck) {
     clearVueNodeDecoration(nodeElement);
     return;
   }
-  const state = getRemoteVisualState(node);
   const palette = localBottleneck ? null : remoteDecorationPalette(state, timestamp / 1000);
   const decoration = ensureVueNodeDecoration(nodeElement);
   const innerWrapper = nodeElement.querySelector(':scope > [data-testid="node-inner-wrapper"]');
@@ -3515,11 +3681,20 @@ function updateVueNodeDecoration(nodeElement, node, timestamp) {
   const phase = localBottleneck ? "local-bottleneck" : (state?.phase ?? "idle");
   nodeElement.classList.add("comfy-modal-vue-node");
   nodeElement.dataset.modalPhase = phase;
+  if (state?.isRemoteContainer) {
+    nodeElement.dataset.modalContainer = "true";
+  } else {
+    delete nodeElement.dataset.modalContainer;
+  }
   const badge = decoration.querySelector(".comfy-modal-vue-node-badge");
-  const badgeText = localBottleneck ? "!" : String(state?.componentLabel ?? "");
+  const badgeText = localBottleneck
+    ? "!"
+    : (state?.isRemoteContainer ? "Σ" : String(state?.componentLabel ?? ""));
   badge.textContent = badgeText;
   badge.hidden = !badgeText;
-  badge.title = localBottleneck ? LOCAL_BOTTLENECK_TOOLTIP : "";
+  badge.title = localBottleneck
+    ? LOCAL_BOTTLENECK_TOOLTIP
+    : (state?.isRemoteContainer ? remoteContainerTooltip(state) : "");
   badge.style.borderColor = localBottleneck
     ? LOCAL_BOTTLENECK_BADGE_BORDER_COLOR
     : palette.borderColor;
@@ -3645,18 +3820,22 @@ function localBottleneckBadgeContainsPoint(node, localPosition, scale = 1) {
 }
 
 /**
- * Set or clear the native hover text for the legacy canvas warning badge.
+ * Set or clear native hover text for a legacy canvas Modal badge.
  * @param {LGraphCanvas | undefined} graphCanvas
- * @param {boolean} visible
+ * @param {string} tooltip
  */
-function updateLegacyBottleneckTooltip(graphCanvas, visible) {
+function updateLegacyModalTooltip(graphCanvas, tooltip) {
   const canvasElement = graphCanvas?.canvas ?? app.canvas?.canvas;
   if (!canvasElement) {
     return;
   }
-  if (visible) {
-    canvasElement.title = LOCAL_BOTTLENECK_TOOLTIP;
-  } else if (canvasElement.title === LOCAL_BOTTLENECK_TOOLTIP) {
+  if (tooltip) {
+    canvasElement.title = tooltip;
+  } else if (
+    canvasElement.title === LOCAL_BOTTLENECK_TOOLTIP ||
+    canvasElement.title?.includes("Modal descendant") ||
+    canvasElement.title?.includes("descendant node")
+  ) {
     canvasElement.removeAttribute("title");
   }
 }
@@ -3668,11 +3847,11 @@ function updateLegacyBottleneckTooltip(graphCanvas, visible) {
  */
 function drawModalNodeDecoration(node, ctx) {
   const localBottleneck = isSandwichedLocalNode(node);
-  if (!isRemoteNode(node) && !localBottleneck) {
+  const state = getRemoteVisualState(node);
+  if (!isRemoteNode(node) && !state?.isRemoteContainer && !localBottleneck) {
     return;
   }
 
-  const state = getRemoteVisualState(node);
   const titleHeight = node.constructor?.title_height ?? LiteGraph.NODE_TITLE_HEIGHT ?? 24;
   const scale = app.canvas?.ds?.scale ?? 1;
   const borderWidth = 3 / scale;
@@ -3710,7 +3889,9 @@ function drawModalNodeDecoration(node, ctx) {
     ctx.restore();
   }
 
-  const nodeBadgeText = localBottleneck ? "!" : state?.componentLabel;
+  const nodeBadgeText = localBottleneck
+    ? "!"
+    : (state?.isRemoteContainer ? "Σ" : state?.componentLabel);
   if (nodeBadgeText) {
     ctx.save();
     const badgeRadius = 10 / scale;
@@ -3943,11 +4124,55 @@ function drawModalNodeDecoration(node, ctx) {
 }
 
 /**
- * Inject the toggle widget and remote border behavior into a node.
+ * Install renderer and lifecycle hooks needed by Modal decorations on any graph node.
+ * @param {LGraphNode} node
+ */
+function installNodeDecorationHooks(node) {
+  if (node.__modalDecorationInjected) {
+    return;
+  }
+  const originalDrawForeground = node.onDrawForeground;
+  node.onDrawForeground = function onDrawForeground(ctx) {
+    originalDrawForeground?.apply(this, arguments);
+    drawModalNodeDecoration(this, ctx);
+  };
+  const originalOnMouseMove = node.onMouseMove;
+  node.onMouseMove = function onMouseMove(event, localPosition, graphCanvas) {
+    const result = originalOnMouseMove?.apply(this, arguments);
+    const scale = graphCanvas?.ds?.scale ?? app.canvas?.ds?.scale ?? 1;
+    const state = getRemoteVisualState(this);
+    const badgeHovered = localBottleneckBadgeContainsPoint(this, localPosition, scale);
+    const tooltip = !badgeHovered
+      ? ""
+      : isSandwichedLocalNode(this)
+        ? LOCAL_BOTTLENECK_TOOLTIP
+        : (state?.isRemoteContainer ? remoteContainerTooltip(state) : "");
+    updateLegacyModalTooltip(graphCanvas, tooltip);
+    return result;
+  };
+  const originalOnMouseLeave = node.onMouseLeave;
+  node.onMouseLeave = function onMouseLeave(event, graphCanvas) {
+    const result = originalOnMouseLeave?.apply(this, arguments);
+    updateLegacyModalTooltip(graphCanvas, "");
+    return result;
+  };
+  const originalOnRemoved = node.onRemoved;
+  node.onRemoved = function onRemoved() {
+    const result = originalOnRemoved?.apply(this, arguments);
+    scheduleRemoteDescendantIndexRebuild();
+    return result;
+  };
+  node.__modalDecorationInjected = true;
+}
+
+/**
+ * Inject the Modal decoration hooks and, where eligible, the remote toggle widget.
  * @param {LGraphNode} node
  */
 function decorateNode(node) {
+  installNodeDecorationHooks(node);
   if (!isEligibleNode(node) || node.__modalToggleInjected) {
+    scheduleRemoteDescendantIndexRebuild();
     return;
   }
 
@@ -3969,28 +4194,7 @@ function decorateNode(node) {
   widget.value = node.properties[REMOTE_PROPERTY];
   node.__modalToggleInjected = true;
   node.__modalToggleWidget = widget;
-
-  const originalDrawForeground = node.onDrawForeground;
-  node.onDrawForeground = function onDrawForeground(ctx) {
-    originalDrawForeground?.apply(this, arguments);
-    drawModalNodeDecoration(this, ctx);
-  };
-  const originalOnMouseMove = node.onMouseMove;
-  node.onMouseMove = function onMouseMove(event, localPosition, graphCanvas) {
-    const result = originalOnMouseMove?.apply(this, arguments);
-    const scale = graphCanvas?.ds?.scale ?? app.canvas?.ds?.scale ?? 1;
-    const badgeHovered =
-      isSandwichedLocalNode(this) &&
-      localBottleneckBadgeContainsPoint(this, localPosition, scale);
-    updateLegacyBottleneckTooltip(graphCanvas, badgeHovered);
-    return result;
-  };
-  const originalOnMouseLeave = node.onMouseLeave;
-  node.onMouseLeave = function onMouseLeave(event, graphCanvas) {
-    const result = originalOnMouseLeave?.apply(this, arguments);
-    updateLegacyBottleneckTooltip(graphCanvas, false);
-    return result;
-  };
+  scheduleRemoteDescendantIndexRebuild();
   queueVueNodeDecorationSync();
 }
 
@@ -4837,7 +5041,8 @@ function installGlobalStatusStyles() {
       font: 10px/1 ui-sans-serif, system-ui, sans-serif;
     }
 
-    .comfy-modal-vue-node[data-modal-phase="local-bottleneck"] .comfy-modal-vue-node-badge {
+    .comfy-modal-vue-node[data-modal-phase="local-bottleneck"] .comfy-modal-vue-node-badge,
+    .comfy-modal-vue-node[data-modal-container="true"] .comfy-modal-vue-node-badge {
       pointer-events: auto;
       cursor: help;
     }
@@ -4876,6 +5081,8 @@ app.registerExtension({
     for (const node of allWorkflowNodes()) {
       synchronizeRemoteFlagFromWidget(node);
     }
+    rebuildRemoteDescendantIndex();
+    refreshNodeDecorations();
     selectedModalGpu();
   },
 });
