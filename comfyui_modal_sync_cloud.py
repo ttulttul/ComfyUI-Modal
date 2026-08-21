@@ -140,8 +140,6 @@ _LOADER_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
 _LOADER_PREWARM_PLAN_KEYS: set[str] = set()
 _LLM_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
 _LLM_PREWARM_PLAN_KEYS: set[str] = set()
-_LLM_ACTUAL_COMPILE_COMMITS_LOCK = threading.Lock()
-_LLM_ACTUAL_COMPILE_COMMITS: set[str] = set()
 _SNAPSHOT_PROFILE_CACHE_LOCK = threading.Lock()
 _SNAPSHOT_PROFILE_CACHE: dict[str, list[dict[str, Any]]] = {}
 _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
@@ -6580,8 +6578,69 @@ def _reload_compile_cache_volume(volume: Any | None) -> bool:
         logger.warning("Modal compile-cache Volume does not expose reload().")
         return False
     with _timed_phase("llm_compile_cache_reload"):
-        reload_method()
+        try:
+            reload_method()
+        except RuntimeError as exc:
+            if _is_modal_volume_open_files_error(exc):
+                _log_compile_cache_memory_maps()
+            raise
     return True
+
+
+def _mapped_process_files_under(
+    volume_root: Path,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> tuple[tuple[int, str], ...]:
+    """Return process ids and files memory-mapped beneath one filesystem root."""
+    try:
+        resolved_root = volume_root.resolve(strict=True)
+        process_directories = tuple(proc_root.iterdir())
+    except OSError:
+        return ()
+
+    mapped_files: set[tuple[int, str]] = set()
+    for process_directory in process_directories:
+        if not process_directory.name.isdecimal():
+            continue
+        try:
+            maps_text = (process_directory / "maps").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            continue
+        for line in maps_text.splitlines():
+            fields = line.split(maxsplit=5)
+            if len(fields) != 6 or not fields[5].startswith("/"):
+                continue
+            mapped_path = fields[5].removesuffix(" (deleted)")
+            try:
+                Path(mapped_path).relative_to(resolved_root)
+            except ValueError:
+                continue
+            mapped_files.add((int(process_directory.name), mapped_path))
+    return tuple(sorted(mapped_files))
+
+
+def _log_compile_cache_memory_maps() -> None:
+    """Log native mappings that explain a busy compile-cache Volume reload."""
+    mapped_files = _mapped_process_files_under(_REMOTE_LLM_COMPILE_CACHE_ROOT)
+    if not mapped_files:
+        logger.warning(
+            "Modal compile-cache Volume reload reported open files, but no "
+            "memory-mapped cache files were visible in /proc."
+        )
+        return
+    logger.error(
+        "Modal compile-cache Volume reload is blocked by %d memory-mapped "
+        "native cache file(s): %s",
+        len(mapped_files),
+        [
+            {"pid": process_id, "path": mapped_path}
+            for process_id, mapped_path in mapped_files[:8]
+        ],
+    )
 
 
 def _prewarm_restored_runtime(compile_cache_volume: Any | None = None) -> None:
@@ -7089,7 +7148,6 @@ def _prepare_warm_container_for_request(
     _hydrate_missing_payload_volume_paths(volume, payload)
     needs_volume_reload = _should_reload_modal_volume(payload)
     with _timed_phase("remote_engine_warmup", component=component_id):
-        _reload_compile_cache_volume(compile_cache_volume)
         if needs_volume_reload:
             _reload_modal_volume_for_request(
                 volume,
@@ -7357,6 +7415,11 @@ def _execute_llm_prewarm_plans(
             )
             continue
         try:
+            compile_checkpoint = _LLMCompileMissCheckpoint(
+                profiles=(model_profile,),
+                signal_size=_triton_compile_miss_signal_size(),
+                listener_engine_pids=_triton_compile_listener_engine_pids(),
+            )
             with _timed_phase(
                 "llm_representative_prewarm",
                 component=component_id,
@@ -7373,19 +7436,16 @@ def _execute_llm_prewarm_plans(
                 model_profile=model_profile,
                 result=result,
             )
-            if compile_cache_volume is not None:
-                commit_method = getattr(compile_cache_volume, "commit", None)
-                if not callable(commit_method):
-                    raise RuntimeError(
-                        "Modal compile-cache Volume does not expose commit()."
-                    )
-                with _timed_phase("llm_compile_cache_commit", profile=model_profile):
-                    commit_method()
+            compile_cache_committed = _commit_actual_llm_compile_cache(
+                compile_checkpoint,
+                compile_cache_volume,
+            )
             results.append(
                 {
                     **result,
                     "manifest_path": str(manifest_path),
                     "manifest_cache_hit": representative_request_count == 1,
+                    "compile_cache_committed": compile_cache_committed,
                 }
             )
         except Exception:
@@ -7396,63 +7456,133 @@ def _execute_llm_prewarm_plans(
 
 
 def _llm_profiles_in_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
-    """Collect the effective ModalLLM profile IDs from one execution payload."""
+    """Collect ModalLLM profiles in the executable subgraph dependency closure."""
+    if payload.get("payload_kind") not in {"subgraph", "mapped_subgraph"}:
+        return ()
+    subgraph_prompt = payload.get("subgraph_prompt")
+    execute_node_ids = payload.get("execute_node_ids")
+    if not isinstance(subgraph_prompt, Mapping) or not isinstance(
+        execute_node_ids, (list, tuple)
+    ):
+        return ()
+    prompt = {str(node_id): node for node_id, node in subgraph_prompt.items()}
     profiles: set[str] = set()
-
-    def visit(value: Any) -> None:
-        """Walk nested prompt data looking for ModalLLM nodes."""
-        if isinstance(value, Mapping):
-            if value.get("class_type") == "ModalLLM":
-                inputs = value.get("inputs")
-                if isinstance(inputs, Mapping):
-                    profile = inputs.get("model_profile")
-                    if isinstance(profile, str) and profile.strip():
-                        profiles.add(profile.strip())
-            for nested_value in value.values():
-                visit(nested_value)
-        elif isinstance(value, (list, tuple)):
-            for nested_value in value:
-                visit(nested_value)
-
-    visit(payload)
+    visited: set[str] = set()
+    pending = [str(node_id) for node_id in execute_node_ids]
+    while pending:
+        node_id = pending.pop()
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        prompt_node = prompt.get(node_id)
+        if not isinstance(prompt_node, Mapping):
+            continue
+        inputs = prompt_node.get("inputs")
+        if prompt_node.get("class_type") == "ModalLLM" and isinstance(
+            inputs, Mapping
+        ):
+            profile = inputs.get("model_profile")
+            if isinstance(profile, str) and profile.strip():
+                profiles.add(profile.strip())
+        if not isinstance(inputs, Mapping):
+            continue
+        for input_value in inputs.values():
+            if _is_link(input_value):
+                pending.append(str(input_value[0]))
     return tuple(sorted(profiles))
 
 
-def _commit_actual_llm_compile_cache(
+@dataclass(frozen=True)
+class _LLMCompileMissCheckpoint:
+    """Capture the genuine Triton miss signal before one LLM subgraph executes."""
+
+    profiles: tuple[str, ...]
+    signal_size: int
+    listener_engine_pids: tuple[int, ...]
+
+
+def _triton_compile_miss_signal_size() -> int:
+    """Read the EngineCore compile-miss signal shared through container storage."""
+    runtime_module = importlib.import_module("modal_llm_runtime")
+    signal_reader = getattr(runtime_module, "triton_compile_miss_signal_size", None)
+    if not callable(signal_reader):
+        raise RuntimeError(
+            "Modal LLM runtime does not expose triton_compile_miss_signal_size()."
+        )
+    return int(signal_reader())
+
+
+def _triton_compile_listener_engine_pids() -> tuple[int, ...]:
+    """Return live EngineCore processes with cache-aware Triton telemetry."""
+    runtime_module = importlib.import_module("modal_llm_runtime")
+    listener_reader = getattr(
+        runtime_module,
+        "triton_compile_listener_engine_pids",
+        None,
+    )
+    if not callable(listener_reader):
+        raise RuntimeError(
+            "Modal LLM runtime does not expose "
+            "triton_compile_listener_engine_pids()."
+        )
+    return tuple(int(pid) for pid in listener_reader())
+
+
+def _llm_compile_miss_checkpoint(
     payload: Mapping[str, Any],
+) -> _LLMCompileMissCheckpoint | None:
+    """Capture the current miss signal for an executable ModalLLM subgraph."""
+    profiles = _llm_profiles_in_payload(payload)
+    if not profiles:
+        return None
+    return _LLMCompileMissCheckpoint(
+        profiles=profiles,
+        signal_size=_triton_compile_miss_signal_size(),
+        listener_engine_pids=_triton_compile_listener_engine_pids(),
+    )
+
+
+def _commit_actual_llm_compile_cache(
+    checkpoint: _LLMCompileMissCheckpoint | None,
     compile_cache_volume: Any | None,
 ) -> bool:
-    """Commit kernels produced by the first real request for each profile set."""
-    profiles = _llm_profiles_in_payload(payload)
-    if not profiles or compile_cache_volume is None:
+    """Commit the compile-cache Volume after a genuine Triton disk-cache miss."""
+    if checkpoint is None or compile_cache_volume is None:
         return False
-    commit_key = hashlib.sha256(
-        json.dumps(
-            {
-                "profiles": profiles,
-                "runtime_fingerprint": os.getenv(
-                    "COMFY_MODAL_RUNTIME_FINGERPRINT", ""
-                ),
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    with _LLM_ACTUAL_COMPILE_COMMITS_LOCK:
-        if commit_key in _LLM_ACTUAL_COMPILE_COMMITS:
-            return False
-        _LLM_ACTUAL_COMPILE_COMMITS.add(commit_key)
+    listener_engine_pids = _triton_compile_listener_engine_pids()
+    if not listener_engine_pids:
+        logger.warning(
+            "Skipping LLM compile-cache commit because no live vLLM EngineCore "
+            "reported the cache-aware Triton listener profiles=%s "
+            "listener_pids_before=%s.",
+            checkpoint.profiles,
+            checkpoint.listener_engine_pids,
+        )
+        return False
+    signal_size = _triton_compile_miss_signal_size()
+    if signal_size < checkpoint.signal_size:
+        raise RuntimeError(
+            "Triton compile-miss signal shrank during LLM execution: "
+            f"before={checkpoint.signal_size} after={signal_size}."
+        )
+    if signal_size == checkpoint.signal_size:
+        logger.info(
+            "Skipping LLM compile-cache commit because every Triton lookup hit "
+            "the persistent cache profiles=%s signal_size=%d listener_pids=%s.",
+            checkpoint.profiles,
+            signal_size,
+            listener_engine_pids,
+        )
+        return False
     commit_method = getattr(compile_cache_volume, "commit", None)
     if not callable(commit_method):
-        with _LLM_ACTUAL_COMPILE_COMMITS_LOCK:
-            _LLM_ACTUAL_COMPILE_COMMITS.discard(commit_key)
         raise RuntimeError("Modal compile-cache Volume does not expose commit().")
-    try:
-        with _timed_phase("llm_actual_compile_cache_commit", profiles=profiles):
-            commit_method()
-    except Exception:
-        with _LLM_ACTUAL_COMPILE_COMMITS_LOCK:
-            _LLM_ACTUAL_COMPILE_COMMITS.discard(commit_key)
-        raise
+    with _timed_phase(
+        "llm_actual_compile_cache_commit",
+        profiles=checkpoint.profiles,
+        miss_signal_bytes=signal_size - checkpoint.signal_size,
+    ):
+        commit_method()
     return True
 
 
@@ -7961,11 +8091,12 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                                 interrupt_flag_key=execution_control.interrupt_flag_key,
                             )
 
+                        compile_miss_checkpoint = _llm_compile_miss_checkpoint(payload)
                         result = _execute_with_durable_invocation(
                             payload, execute_once
                         )
                         _commit_actual_llm_compile_cache(
-                            payload,
+                            compile_miss_checkpoint,
                             llm_compile_cache_vol,
                         )
                         return result
@@ -8038,6 +8169,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                             )
                         else:
                             _emit_modal_volume_reload_skip(component_id, payload)
+                        compile_miss_checkpoint = _llm_compile_miss_checkpoint(payload)
                         yield from _stream_remote_payload_events(
                             payload,
                             kwargs_payload,
@@ -8046,7 +8178,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                             interrupt_flag_key=execution_control.interrupt_flag_key,
                         )
                         _commit_actual_llm_compile_cache(
-                            payload,
+                            compile_miss_checkpoint,
                             llm_compile_cache_vol,
                         )
             except Exception as exc:
