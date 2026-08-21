@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import gc
+import importlib
 import json
 import logging
 import math
@@ -51,6 +52,125 @@ _VLLM_EFFECTIVE_MODES = frozenset({"eager", "throughput"})
 _VLLM_SAFETENSORS_LOAD_STRATEGY = "prefetch"
 _VLLM_RUNTIME_MODE_OPTION = "_runtime_vllm_execution_mode"
 _VLLM_RUNTIME_SETTING_OPTION = "_runtime_vllm_execution_setting"
+_TRITON_COMPILE_MISS_SIGNAL_PATH = Path(
+    os.getenv(
+        "COMFY_MODAL_TRITON_COMPILE_MISS_SIGNAL_PATH",
+        "/tmp/comfy-modal-triton-compile-misses.jsonl",
+    )
+)
+_TRITON_COMPILE_LISTENER_LOCK = threading.Lock()
+_TRITON_COMPILE_LISTENER_INSTALLED = False
+
+
+def triton_compile_miss_signal_size() -> int:
+    """Return the process-shared signal offset for genuine Triton cache misses."""
+    try:
+        return _TRITON_COMPILE_MISS_SIGNAL_PATH.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _triton_compile_timing_payload(times: Any) -> dict[str, Any]:
+    """Return JSON-safe millisecond timings from Triton's compile listener."""
+    lowering_stages = [
+        [str(stage_name), int(duration_microseconds) / 1000.0]
+        for stage_name, duration_microseconds in getattr(times, "lowering_stages", ())
+    ]
+    return {
+        "ir_initialization_ms": int(getattr(times, "ir_initialization", 0))
+        / 1000.0,
+        "lowering_stages_ms": lowering_stages,
+        "store_results_ms": int(getattr(times, "store_results", 0)) / 1000.0,
+        "total_ms": int(getattr(times, "total", 0)) / 1000.0,
+    }
+
+
+def _record_triton_compile_miss(event: Mapping[str, Any]) -> None:
+    """Append one genuine compile miss for observation by the Modal parent process."""
+    _TRITON_COMPILE_MISS_SIGNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record = json.dumps(dict(event), sort_keys=True, default=str).encode("utf-8")
+    descriptor = os.open(
+        _TRITON_COMPILE_MISS_SIGNAL_PATH,
+        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+        0o600,
+    )
+    try:
+        payload = record + b"\n"
+        written_bytes = os.write(descriptor, payload)
+        if written_bytes != len(payload):
+            raise OSError(
+                "Short write while recording a Triton compile miss: "
+                f"expected={len(payload)} actual={written_bytes}."
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _triton_compile_listener(**event: Any) -> None:
+    """Log persistent-cache outcomes and signal only genuine Triton compilations."""
+    source = event.get("src")
+    metadata = event.get("metadata")
+    times = event.get("times")
+    cache_hit = bool(event.get("cache_hit"))
+    kernel_name = str(getattr(source, "name", "<unknown>"))
+    artifact_hash = (
+        str(metadata.get("hash") or "") if isinstance(metadata, Mapping) else ""
+    )
+    timing = _triton_compile_timing_payload(times)
+    log_method = logger.info if cache_hit else logger.warning
+    log_method(
+        "Triton persistent compile cache kernel=%s cache_hit=%s "
+        "artifact_hash=%s total_ms=%.3f ir_ms=%.3f lowering_ms=%.3f "
+        "store_ms=%.3f stages=%s.",
+        kernel_name,
+        cache_hit,
+        artifact_hash or None,
+        timing["total_ms"],
+        timing["ir_initialization_ms"],
+        sum(stage[1] for stage in timing["lowering_stages_ms"]),
+        timing["store_results_ms"],
+        timing["lowering_stages_ms"],
+    )
+    if cache_hit:
+        return
+    _record_triton_compile_miss(
+        {
+            "artifact_hash": artifact_hash,
+            "cache_hit": False,
+            "kernel": kernel_name,
+            "pid": os.getpid(),
+            "recorded_at": time.time(),
+            "timing": timing,
+        }
+    )
+
+
+def _install_accurate_triton_compile_listener() -> None:
+    """Replace vLLM's cache-blind Triton hook with cache-aware telemetry."""
+    global _TRITON_COMPILE_LISTENER_INSTALLED
+    with _TRITON_COMPILE_LISTENER_LOCK:
+        if _TRITON_COMPILE_LISTENER_INSTALLED:
+            return
+        triton = importlib.import_module("triton")
+        jit_monitor = importlib.import_module("vllm.utils.jit_monitor")
+        previous_listener = triton.knobs.compilation.listener
+
+        def listener(**event: Any) -> None:
+            """Preserve an existing listener before recording Modal telemetry."""
+            if previous_listener is not None:
+                previous_listener(**event)
+            _triton_compile_listener(**event)
+
+        def disable_cache_blind_post_compile_hook() -> None:
+            """Leave the cache-blind Triton post-compile hook unset."""
+            logger.info(
+                "Using cache-aware Triton compilation listener instead of "
+                "vLLM's cache-blind jit_post_compile_hook."
+            )
+
+        triton.knobs.compilation.listener = listener
+        jit_monitor._setup_triton_jit_hook = disable_cache_blind_post_compile_hook
+        _TRITON_COMPILE_LISTENER_INSTALLED = True
 
 
 def _normalize_vllm_execution_setting(value: object) -> str:
@@ -864,6 +984,9 @@ class VLLMMultimodalBackend:
         """Load an immutable local snapshot under explicit co-residency budgets."""
         from transformers import AutoProcessor
         from vllm import AsyncEngineArgs, AsyncLLMEngine
+
+        if os.getenv("COMFY_MODAL_REMOTE_WORKER") == "1":
+            _install_accurate_triton_compile_listener()
 
         self.profile = profile
         self.snapshot_path = snapshot_path

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import sys
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -15,6 +16,80 @@ from typing import Any, Callable
 
 import pytest
 import torch
+
+
+def test_accurate_triton_listener_distinguishes_persistent_cache_hits(
+    modal_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The vLLM replacement should signal only genuine Triton compilations."""
+    signal_path = tmp_path / "triton-compile-misses.jsonl"
+    previous_events: list[dict[str, Any]] = []
+    fake_triton = SimpleNamespace(
+        knobs=SimpleNamespace(
+            compilation=SimpleNamespace(
+                listener=lambda **event: previous_events.append(event)
+            )
+        )
+    )
+    original_setup_hook = object()
+    fake_jit_monitor = SimpleNamespace(
+        _setup_triton_jit_hook=original_setup_hook,
+    )
+
+    def import_module(name: str) -> Any:
+        """Return the two runtime modules used by listener installation."""
+        if name == "triton":
+            return fake_triton
+        if name == "vllm.utils.jit_monitor":
+            return fake_jit_monitor
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_COMPILE_MISS_SIGNAL_PATH",
+        signal_path,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module,
+        "_TRITON_COMPILE_LISTENER_INSTALLED",
+        False,
+    )
+    monkeypatch.setattr(
+        modal_llm_runtime_module.importlib,
+        "import_module",
+        import_module,
+    )
+    modal_llm_runtime_module._install_accurate_triton_compile_listener()
+
+    listener = fake_triton.knobs.compilation.listener
+    compile_times = SimpleNamespace(
+        ir_initialization=1200,
+        lowering_stages=[("ttir", 2300), ("cubin", 3400)],
+        store_results=500,
+        total=7400,
+    )
+    common_event = {
+        "src": SimpleNamespace(name="example_kernel"),
+        "metadata": {"hash": "artifact-1"},
+        "times": compile_times,
+    }
+    with caplog.at_level(logging.INFO):
+        listener(**common_event, cache_hit=True)
+    assert modal_llm_runtime_module.triton_compile_miss_signal_size() == 0
+    assert "cache_hit=True" in caplog.text
+
+    listener(**common_event, cache_hit=False)
+
+    assert modal_llm_runtime_module.triton_compile_miss_signal_size() > 0
+    miss_event = json.loads(signal_path.read_text(encoding="utf-8"))
+    assert miss_event["cache_hit"] is False
+    assert miss_event["kernel"] == "example_kernel"
+    assert miss_event["timing"]["total_ms"] == 7.4
+    assert len(previous_events) == 2
+    assert fake_jit_monitor._setup_triton_jit_hook is not original_setup_hook
 
 
 def _text_file(filename: str, text: str) -> dict[str, str]:
