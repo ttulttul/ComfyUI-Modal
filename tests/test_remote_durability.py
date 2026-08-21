@@ -718,6 +718,79 @@ def test_local_client_attaches_stable_invocation_id(
     assert "capture_remote_outputs" not in payload
 
 
+def test_local_client_retries_exhausted_llm_memory_on_fresh_throughput_worker(
+    remote_modal_app_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A marked recovery timeout should rotate affinity and retry exactly once."""
+    observed_calls: list[tuple[Any, dict[str, Any]]] = []
+    affinity_overrides: list[str | None] = []
+
+    def invoke_payload(
+        remote_engine: Any,
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        cancellation_event: Any,
+    ) -> bytes:
+        """Fail the dirty worker and complete on the rotated worker."""
+        del kwargs_payload, cancellation_event
+        observed_calls.append((remote_engine, dict(payload)))
+        if remote_engine == "dirty-worker":
+            raise remote_modal_app_module.RemoteSubgraphExecutionError(
+                "[comfy-modal-llm-memory-recovery-exhausted] "
+                "vllm_mode=throughput recovery timed out"
+            )
+        return b"recovered"
+
+    def lookup_engine(
+        payload: dict[str, Any],
+        *,
+        affinity_key_override: str | None = None,
+        protocol_probe: bool = False,
+    ) -> str:
+        """Capture the rotated worker identity selected by recovery."""
+        del payload, protocol_probe
+        affinity_overrides.append(affinity_key_override)
+        return "fresh-worker"
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_invoke_remote_engine_payload",
+        invoke_payload,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_lookup_deployed_remote_engine",
+        lookup_engine,
+    )
+    monkeypatch.setattr(remote_modal_app_module, "_modal_lookup_error_types", lambda: ())
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_remote_startup_status",
+        lambda *args, **kwargs: None,
+    )
+
+    result = remote_modal_app_module._invoke_remote_engine_payload_with_recovery(
+        "dirty-worker",
+        {
+            "component_id": "llm-component",
+            "payload_kind": "subgraph",
+            "remote_worker_affinity_group": "llm",
+        },
+        b"serialized-inputs",
+        None,
+    )
+
+    assert result == b"recovered"
+    assert len(observed_calls) == 2
+    assert observed_calls[0][1]["invocation_id"] == observed_calls[1][1]["invocation_id"]
+    assert observed_calls[1][1]["force_vllm_throughput_after_memory_recovery"] is True
+    assert affinity_overrides[0] is not None
+    assert affinity_overrides[0].startswith(
+        "worker-pool:llm:slot:0:llm-memory-recovery:"
+    )
+
+
 def test_local_fallback_restores_object_backed_bridge_output(
     remote_modal_app_module: Any,
     monkeypatch: pytest.MonkeyPatch,

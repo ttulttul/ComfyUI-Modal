@@ -140,6 +140,7 @@ class RemoteRuntimeSettings(Protocol):
     volume_name: str
     llm_max_resident_models: int
     llm_reserve_free_vram_gb: float
+    llm_memory_recovery_timeout_seconds: float
 
 
 @dataclass(frozen=True)
@@ -457,6 +458,11 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
             settings,
             "llm_vllm_execution_mode",
             "auto",
+        ),
+        "llm_memory_recovery_timeout_seconds": getattr(
+            settings,
+            "llm_memory_recovery_timeout_seconds",
+            15.0,
         ),
     }
 

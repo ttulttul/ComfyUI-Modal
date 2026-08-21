@@ -22,6 +22,10 @@ from typing import Any, Callable, Coroutine, Mapping, Protocol, Sequence
 from PIL import Image
 
 if __package__:
+    from .llm_recovery import (
+        LLM_MEMORY_RECOVERY_EXHAUSTED_MARKER,
+        LLM_VLLM_THROUGHPUT_FAILURE_MARKER,
+    )
     from .llm_profiles import LLMModelProfile, get_llm_profile
     from .llm_reasoning import (
         ReasoningOutputParser,
@@ -31,6 +35,10 @@ if __package__:
     )
     from .llm_staging import is_model_snapshot_staged, model_snapshot_path
 else:  # pragma: no cover - remote node bundles may import top-level modules.
+    from llm_recovery import (
+        LLM_MEMORY_RECOVERY_EXHAUSTED_MARKER,
+        LLM_VLLM_THROUGHPUT_FAILURE_MARKER,
+    )
     from llm_profiles import LLMModelProfile, get_llm_profile
     from llm_reasoning import (
         ReasoningOutputParser,
@@ -46,6 +54,8 @@ _BYTES_PER_GIB = 1024**3
 _DEFAULT_STORAGE_ROOT = "/storage"
 _DEFAULT_RESERVE_FREE_VRAM_GB = 24.0
 _DEFAULT_MAX_RESIDENT_MODELS = 2
+_DEFAULT_MEMORY_RECOVERY_TIMEOUT_SECONDS = 15.0
+_DEFAULT_MEMORY_RECOVERY_POLL_INTERVAL_SECONDS = 0.25
 _VLLM_EXECUTION_SETTINGS = frozenset({"auto", "eager", "throughput"})
 _VLLM_EFFECTIVE_MODES = frozenset({"eager", "throughput"})
 _VLLM_SAFETENSORS_LOAD_STRATEGY = "prefetch"
@@ -139,6 +149,27 @@ class VLLMExecutionModeController:
                 return "throughput" if self._promoted else "eager"
             return self.setting
 
+    def force_throughput_after_memory_recovery(
+        self,
+        workflow_execution_id: str | None,
+    ) -> bool:
+        """Preserve an auto-mode promotion when retrying on a fresh worker."""
+        if self.setting != "auto":
+            return False
+        with self._lock:
+            if self._promoted:
+                return False
+            normalized_id = str(workflow_execution_id or "memory-recovery").strip()
+            self._first_workflow_execution_id = (
+                f"pre-recovery:{normalized_id or 'memory-recovery'}"
+            )
+            self._promoted = True
+            logger.info(
+                "vLLM auto mode preserved throughput promotion on a fresh "
+                "memory-recovery worker."
+            )
+            return True
+
     @property
     def promoted(self) -> bool:
         """Return whether auto mode has observed a second workflow."""
@@ -170,6 +201,15 @@ def get_vllm_execution_mode_controller() -> VLLMExecutionModeController:
 def observe_modal_workflow_execution(workflow_execution_id: str | None) -> bool:
     """Record one workflow at the container boundary for auto-mode selection."""
     return get_vllm_execution_mode_controller().observe(workflow_execution_id)
+
+
+def force_modal_vllm_throughput_after_memory_recovery(
+    workflow_execution_id: str | None,
+) -> bool:
+    """Preserve throughput mode when a failed auto worker is replaced."""
+    return get_vllm_execution_mode_controller().force_throughput_after_memory_recovery(
+        workflow_execution_id
+    )
 
 
 def _profile_for_vllm_execution(
@@ -1310,10 +1350,20 @@ class ResidentLLMManager:
         device_name: str = "cuda",
         memory_label: str = "GPU memory",
         vllm_mode_controller: VLLMExecutionModeController | None = None,
+        memory_recovery_timeout_seconds: float = _DEFAULT_MEMORY_RECOVERY_TIMEOUT_SECONDS,
+        memory_recovery_poll_interval_seconds: float = (
+            _DEFAULT_MEMORY_RECOVERY_POLL_INTERVAL_SECONDS
+        ),
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         """Configure the shared model cache and injectable hardware operations."""
         if max_resident_models <= 0:
             raise ValueError("max_resident_models must be positive.")
+        if memory_recovery_timeout_seconds < 0:
+            raise ValueError("memory_recovery_timeout_seconds cannot be negative.")
+        if memory_recovery_poll_interval_seconds <= 0:
+            raise ValueError("memory_recovery_poll_interval_seconds must be positive.")
         self.storage_root = Path(storage_root).resolve()
         self.backend_factory = backend_factory
         self.max_resident_models = max_resident_models
@@ -1324,6 +1374,12 @@ class ResidentLLMManager:
         self.execution_target = execution_target
         self.device_name = device_name
         self.memory_label = memory_label
+        self.memory_recovery_timeout_seconds = memory_recovery_timeout_seconds
+        self.memory_recovery_poll_interval_seconds = (
+            memory_recovery_poll_interval_seconds
+        )
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._vllm_mode_controller = vllm_mode_controller
         if self._vllm_mode_controller is None and execution_target == "modal":
             self._vllm_mode_controller = get_vllm_execution_mode_controller()
@@ -1379,10 +1435,10 @@ class ResidentLLMManager:
         profile: LLMModelProfile,
         workflow_execution_id: str | None,
         progress_callback: LLMProgressCallback,
-    ) -> LLMModelProfile:
+    ) -> tuple[LLMModelProfile, bool]:
         """Apply container auto-mode state and retire incompatible engines."""
         if profile.backend != "vllm":
-            return profile
+            return profile, False
         controller = self._vllm_mode_controller
         if controller is None:
             controller = get_vllm_execution_mode_controller()
@@ -1418,31 +1474,95 @@ class ResidentLLMManager:
                 self._reported_auto_promotion = True
             for profile_id in mismatched_profile_ids:
                 self._evict(profile_id)
-        return runtime_profile
+        return runtime_profile, bool(mismatched_profile_ids)
 
-    def _make_room(self, profile: LLMModelProfile, reserve_free_vram_gb: float) -> None:
+    def _wait_for_memory_recovery(
+        self,
+        *,
+        required_bytes: int,
+        free_bytes: int,
+        total_bytes: int,
+    ) -> tuple[int, int]:
+        """Poll device memory until an eviction is visible or the deadline expires."""
+        started_at = self._monotonic()
+        deadline = started_at + self.memory_recovery_timeout_seconds
+        while free_bytes < required_bytes:
+            remaining_seconds = deadline - self._monotonic()
+            if remaining_seconds <= 0:
+                break
+            self._sleep(
+                min(self.memory_recovery_poll_interval_seconds, remaining_seconds)
+            )
+            self._empty_cache()
+            free_bytes, total_bytes = self._memory_info()
+        elapsed_seconds = self._monotonic() - started_at
+        logger.info(
+            "Post-eviction %s recovery finished recovered=%s elapsed_seconds=%.3f "
+            "free_gib=%.3f required_gib=%.3f total_gib=%.3f.",
+            self.memory_label,
+            free_bytes >= required_bytes,
+            elapsed_seconds,
+            free_bytes / _BYTES_PER_GIB,
+            required_bytes / _BYTES_PER_GIB,
+            total_bytes / _BYTES_PER_GIB,
+        )
+        return free_bytes, total_bytes
+
+    def _make_room(
+        self,
+        profile: LLMModelProfile,
+        reserve_free_vram_gb: float,
+        *,
+        evicted_before_load: bool = False,
+    ) -> None:
         """Evict old LLMs until the new model plus configured reserve can fit."""
         required_bytes = int((profile.estimated_vram_gb + reserve_free_vram_gb) * _BYTES_PER_GIB)
         self._comfy_memory_release(required_bytes)
+        if evicted_before_load:
+            self._empty_cache()
         free_bytes, total_bytes = self._memory_info()
+        evicted_any = evicted_before_load
         while free_bytes < required_bytes and self._models:
             oldest_profile_id = next(iter(self._models))
             self._evict(oldest_profile_id)
+            evicted_any = True
+            self._comfy_memory_release(required_bytes)
             free_bytes, total_bytes = self._memory_info()
+        if free_bytes < required_bytes and evicted_any:
+            free_bytes, total_bytes = self._wait_for_memory_recovery(
+                required_bytes=required_bytes,
+                free_bytes=free_bytes,
+                total_bytes=total_bytes,
+            )
         if free_bytes < required_bytes:
-            raise RuntimeError(
+            message = (
                 f"LLM profile {profile.profile_id!r} needs approximately "
                 f"{profile.estimated_vram_gb:.1f} GiB plus {reserve_free_vram_gb:.1f} GiB reserve, "
                 f"but only {free_bytes / _BYTES_PER_GIB:.1f} of "
                 f"{total_bytes / _BYTES_PER_GIB:.1f} GiB of {self.memory_label} is "
                 "available."
             )
+            if evicted_any:
+                effective_mode = profile.backend_option(_VLLM_RUNTIME_MODE_OPTION)
+                mode_marker = (
+                    f" {LLM_VLLM_THROUGHPUT_FAILURE_MARKER}"
+                    if effective_mode == "throughput"
+                    else ""
+                )
+                raise RuntimeError(
+                    f"[{LLM_MEMORY_RECOVERY_EXHAUSTED_MARKER}]{mode_marker} "
+                    f"{message} Post-eviction recovery remained below the admission "
+                    f"threshold for {self.memory_recovery_timeout_seconds:.1f} seconds."
+                )
+            raise RuntimeError(message)
 
     def _load(
         self,
         profile: LLMModelProfile,
         reserve_free_vram_gb: float,
         progress_callback: LLMProgressCallback,
+        *,
+        evicted_before_load: bool = False,
     ) -> tuple[ResidentModel, bool]:
         """Return a cached backend or load one after enforcing the VRAM budget."""
         cached = self._models.pop(profile.profile_id, None)
@@ -1467,6 +1587,7 @@ class ResidentLLMManager:
             )
         while len(self._models) >= self.max_resident_models:
             self._evict(next(iter(self._models)))
+            evicted_before_load = True
         progress_callback(
             LLMProgressEvent(
                 stage="memory",
@@ -1474,7 +1595,11 @@ class ResidentLLMManager:
                 indeterminate=True,
             )
         )
-        self._make_room(profile, reserve_free_vram_gb)
+        self._make_room(
+            profile,
+            reserve_free_vram_gb,
+            evicted_before_load=evicted_before_load,
+        )
         before_free, _ = self._memory_info()
         backend = self.backend_factory(
             profile,
@@ -1516,7 +1641,7 @@ class ResidentLLMManager:
         if reserve_free_vram_gb < 0:
             raise ValueError("reserve_free_vram_gb cannot be negative.")
         with self._lock:
-            runtime_profile = self._prepare_vllm_profile(
+            runtime_profile, evicted_for_mode_change = self._prepare_vllm_profile(
                 profile,
                 workflow_execution_id,
                 progress_callback,
@@ -1527,6 +1652,7 @@ class ResidentLLMManager:
                 runtime_profile,
                 reserve_free_vram_gb,
                 progress_callback,
+                evicted_before_load=evicted_for_mode_change,
             )
             load_finished_at = time.perf_counter()
             generation_result = resident.backend.generate(
@@ -1717,6 +1843,10 @@ def get_resident_llm_manager() -> ResidentLLMManager:
                     "COMFY_MODAL_LLM_MAX_RESIDENT_MODELS",
                     _DEFAULT_MAX_RESIDENT_MODELS,
                 ),
+                memory_recovery_timeout_seconds=_read_float_environment(
+                    "COMFY_MODAL_LLM_MEMORY_RECOVERY_TIMEOUT_SECONDS",
+                    _DEFAULT_MEMORY_RECOVERY_TIMEOUT_SECONDS,
+                ),
             )
         return _RESIDENT_MANAGER
 
@@ -1867,6 +1997,7 @@ __all__ = [
     "extract_file_context",
     "get_resident_llm_manager",
     "get_vllm_execution_mode_controller",
+    "force_modal_vllm_throughput_after_memory_recovery",
     "observe_modal_workflow_execution",
     "prepare_images",
     "prepare_llm_inputs",

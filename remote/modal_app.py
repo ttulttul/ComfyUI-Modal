@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 from types import ModuleType
+import uuid
 import zipfile
 from concurrent.futures import (
     Future,
@@ -84,6 +85,11 @@ from ..llm_profiles import (
     get_llm_profile,
     llm_model_references_from_payload,
     rewrite_llm_model_references,
+)
+from ..llm_recovery import (
+    LLM_FORCE_VLLM_THROUGHPUT_PAYLOAD_KEY,
+    exhausted_recovery_used_vllm_throughput,
+    is_llm_memory_recovery_exhausted,
 )
 from ..settings import (
     MODAL_GPU_TYPES,
@@ -8217,13 +8223,57 @@ def _invoke_remote_engine_payload(
     )
 
 
+def _fresh_llm_memory_recovery_affinity_key(payload: Mapping[str, Any]) -> str:
+    """Return a one-use affinity identity that cannot select the dirty worker."""
+    return (
+        f"{_remote_worker_affinity_key(dict(payload))}:llm-memory-recovery:"
+        f"{uuid.uuid4().hex[:12]}"
+    )
+
+
+def _retry_exhausted_llm_memory_on_fresh_worker(
+    *,
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    cancellation_event: threading.Event | None,
+    error: BaseException,
+) -> bytes:
+    """Retry one exhausted post-eviction admission on a distinct Modal worker."""
+    recovery_payload = dict(payload)
+    if exhausted_recovery_used_vllm_throughput(error):
+        recovery_payload[LLM_FORCE_VLLM_THROUGHPUT_PAYLOAD_KEY] = True
+    recovery_affinity_key = _fresh_llm_memory_recovery_affinity_key(payload)
+    logger.warning(
+        "Modal LLM memory recovery timed out for component=%s; retrying "
+        "invocation_id=%s once on fresh worker_affinity=%s.",
+        payload.get("component_id"),
+        payload["invocation_id"],
+        recovery_affinity_key,
+    )
+    _emit_local_remote_startup_status(
+        recovery_payload,
+        phase="starting",
+        status_message="Retrying LLM on a fresh Modal worker",
+    )
+    recovered_remote_engine = _lookup_deployed_remote_engine(
+        recovery_payload,
+        affinity_key_override=recovery_affinity_key,
+    )
+    return _invoke_remote_engine_payload(
+        recovered_remote_engine,
+        recovery_payload,
+        kwargs_payload,
+        cancellation_event,
+    )
+
+
 def _invoke_remote_engine_payload_with_recovery(
     remote_engine: Any,
     payload: dict[str, Any],
     kwargs_payload: bytes,
     cancellation_event: threading.Event | None,
 ) -> bytes:
-    """Retry one payload call after auto-deploy when a stale deployed handle vanishes."""
+    """Recover missing deployments and exhausted LLM workers with one safe retry."""
     payload = dict(payload)
     settings = _settings_for_payload(payload)
     if llm_model_references_from_payload(payload):
@@ -8237,6 +8287,9 @@ def _invoke_remote_engine_payload_with_recovery(
         stable_remote_invocation_id(payload, kwargs_payload),
     )
     lookup_error_types = _modal_lookup_error_types()
+    invocation_error_types = tuple(
+        dict.fromkeys((*lookup_error_types, RemoteSubgraphExecutionError, RuntimeError))
+    )
     try:
         response = _invoke_remote_engine_payload(
             remote_engine,
@@ -8244,25 +8297,35 @@ def _invoke_remote_engine_payload_with_recovery(
             kwargs_payload,
             cancellation_event,
         )
-    except lookup_error_types as exc:
-        if not settings.auto_deploy or not _is_missing_modal_deployment_error(exc):
+    except invocation_error_types as exc:
+        if is_llm_memory_recovery_exhausted(exc):
+            response = _retry_exhausted_llm_memory_on_fresh_worker(
+                payload=payload,
+                kwargs_payload=kwargs_payload,
+                cancellation_event=cancellation_event,
+                error=exc,
+            )
+        elif not isinstance(exc, lookup_error_types):
             raise
-        logger.warning(
-            "Modal payload invocation failed for component=%s because the deployed app was missing at call time: %s. Recreating the app and retrying.",
-            payload.get("component_id"),
-            exc,
-        )
-        recovered_remote_engine = _auto_deploy_modal_app(payload, exc)
-        _ensure_llm_profiles_staged(
-            payload,
-            modal_deployment_app_name(settings),
-        )
-        response = _invoke_remote_engine_payload(
-            recovered_remote_engine,
-            payload,
-            kwargs_payload,
-            cancellation_event,
-        )
+        elif not settings.auto_deploy or not _is_missing_modal_deployment_error(exc):
+            raise
+        else:
+            logger.warning(
+                "Modal payload invocation failed for component=%s because the deployed app was missing at call time: %s. Recreating the app and retrying.",
+                payload.get("component_id"),
+                exc,
+            )
+            recovered_remote_engine = _auto_deploy_modal_app(payload, exc)
+            _ensure_llm_profiles_staged(
+                payload,
+                modal_deployment_app_name(settings),
+            )
+            response = _invoke_remote_engine_payload(
+                recovered_remote_engine,
+                payload,
+                kwargs_payload,
+                cancellation_event,
+            )
     return _materialize_remote_execution_result(response, settings=settings)
 
 

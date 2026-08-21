@@ -102,6 +102,7 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_LLM_RESERVE_FREE_GB",
     "COMFY_MODAL_LLM_COMPILE_CACHE_VOLUME_NAME",
     "COMFY_MODAL_LLM_VLLM_EXECUTION_MODE",
+    "COMFY_MODAL_LLM_MEMORY_RECOVERY_TIMEOUT_SECONDS",
 )
 
 VLLM_EXECUTION_MODES = ("auto", "eager", "throughput")
@@ -159,6 +160,7 @@ class ModalSyncSettings:
     llm_reserve_free_vram_gb: float = 24.0
     llm_compile_cache_volume_name: str = "comfy-universal-storage-llm-compile-cache"
     llm_vllm_execution_mode: str = "auto"
+    llm_memory_recovery_timeout_seconds: float = 15.0
 
 
 def normalize_vllm_execution_mode(value: object) -> str:
@@ -556,6 +558,13 @@ def _get_settings_cached(
         ),
         llm_vllm_execution_mode=normalize_vllm_execution_mode(
             os.getenv("COMFY_MODAL_LLM_VLLM_EXECUTION_MODE", "auto")
+        ),
+        llm_memory_recovery_timeout_seconds=max(
+            0.0,
+            _read_float_env(
+                "COMFY_MODAL_LLM_MEMORY_RECOVERY_TIMEOUT_SECONDS",
+                15.0,
+            ),
         ),
     )
     logger.debug("Resolved Modal-Sync settings: %s", settings)
