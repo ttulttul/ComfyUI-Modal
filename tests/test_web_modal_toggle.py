@@ -233,8 +233,8 @@ def test_remote_modal_nodes_show_component_badges() -> None:
 
     assert "componentLabelByMember: new Map()," in source
     assert "promptState.componentLabelByMember.set(componentNodeId, componentLabel);" in source
-    assert "componentLabel: promptState?.componentLabelByMember.get(visualNodeId) ?? null," in source
-    assert 'const nodeBadgeText = localBottleneck ? "!" : state?.componentLabel;' in source
+    assert "componentLabel: state.isRemoteContainer" in source
+    assert '(state?.isRemoteContainer ? "Σ" : state?.componentLabel);' in source
     assert "if (nodeBadgeText) {" in source
     assert "ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);" in source
     assert "ctx.fillText(String(nodeBadgeText), badgeX, badgeY + 0.5 / scale);" in source
@@ -254,15 +254,15 @@ def test_planner_marks_sandwiched_local_nodes_without_error_styling() -> None:
     assert 'decoration.style.borderColor = palette?.borderColor ?? "transparent";' in source
     assert 'decoration.style.boxShadow = palette ?' in source
     assert 'const phase = localBottleneck ? "local-bottleneck"' in source
-    assert 'const nodeBadgeText = localBottleneck ? "!"' in source
+    assert "const nodeBadgeText = localBottleneck" in source
     assert (
         'const LOCAL_BOTTLENECK_TOOLTIP = "Did you mean to make this node execute '
         'on Modal?";'
         in source
     )
-    assert "badge.title = localBottleneck ? LOCAL_BOTTLENECK_TOOLTIP" in source
+    assert "badge.title = localBottleneck" in source
     assert "function localBottleneckBadgeContainsPoint(" in source
-    assert "updateLegacyBottleneckTooltip(graphCanvas, badgeHovered);" in source
+    assert "updateLegacyModalTooltip(graphCanvas, tooltip);" in source
     assert 'data-modal-phase="local-bottleneck"' in source
     assert "pointer-events: auto;" in source
     assert "cursor: help;" in source
@@ -662,7 +662,27 @@ def test_subgraph_descendant_states_percolate_to_visible_ancestor_nodes() -> Non
     assert "function rebuildPromptAncestorMap(promptState)" in source
     assert "function refreshAncestorNodePhase(promptId, ancestorNodeId, errorMessage)" in source
     assert "promptState.descendantNodeIdsByAncestor.get(ancestorNodeId)" in source
-    assert "descendantStates.every((state) => state.phase === STATE_COMPLETE)" in source
+    assert "function remoteContainerVisualState(promptId, ancestorNodeId, errorMessage)" in source
+    assert "function dominantRemoteContainerPhase(phaseCounts)" in source
+    assert "isMixedRemoteContainer: phases.length > 1" in source
+    assert "remoteDescendantCount: descendantNodeIds.size" in source
+
+
+def test_subgraph_containers_receive_recursive_idle_and_runtime_decorations() -> None:
+    """Every containing subgraph should summarize marked descendants without becoming remote."""
+    source = _modal_toggle_source()
+
+    assert "const modalRemoteDescendantNodeIdsByAncestor = new Map();" in source
+    assert "function rebuildRemoteDescendantIndex()" in source
+    assert "for (const ancestorNodeId of ancestorNodeIds(remoteNodePath)) {" in source
+    assert "function hasRemoteDescendants(node)" in source
+    assert "state?.isRemoteContainer" in source
+    assert 'state?.isRemoteContainer ? "Σ"' in source
+    assert "function remoteContainerTooltip(state)" in source
+    assert 'nodeElement.dataset.modalContainer = "true";' in source
+    assert '[data-modal-container="true"]' in source
+    assert "function installNodeDecorationHooks(node)" in source
+    assert "installNodeDecorationHooks(node);" in source
 
 
 def test_subgraph_nodes_resolve_visual_state_by_composed_workflow_path() -> None:
@@ -670,7 +690,8 @@ def test_subgraph_nodes_resolve_visual_state_by_composed_workflow_path() -> None
     source = _modal_toggle_source()
 
     assert "const visualNodeId = workflowNodePath(node) || nodeId(node);" in source
-    assert "const state = modalNodeStates.get(visualNodeId) ?? null;" in source
+    assert "const storedState = modalNodeStates.get(visualNodeId) ?? null;" in source
+    assert "const promptContainerState = storedState?.promptId" in source
     assert "const progressState = nodeProgressState(visualNodeId, state.promptId);" in source
     assert "const progressLanes = nodeProgressLanes(visualNodeId, state.promptId);" in source
     assert "const cachedState = nodeCachedState(visualNodeId, state.promptId);" in source

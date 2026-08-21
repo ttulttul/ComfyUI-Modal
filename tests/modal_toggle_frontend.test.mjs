@@ -64,6 +64,10 @@ const transformedSource = `${[
   "  MODAL_GPU_TYPES,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
+  "  rebuildRemoteDescendantIndex,",
+  "  hasRemoteDescendants,",
+  "  remoteContainerTooltip,",
+  "  drawModalNodeDecoration,",
   "  currentGlobalStatus,",
   "  formatIterationRate,",
   "  fadeNodeProgress,",
@@ -78,6 +82,9 @@ const transformedSource = `${[
   "  modalTerminalPromptStates,",
   "  modalQueuedPromptIds,",
   "  modalSandwichedLocalNodeIds,",
+  "  modalRemoteDescendantNodeIdsByAncestor,",
+  "  STATE_SETUP,",
+  "  STATE_STARTING,",
   "  STATE_READY,",
   "  STATE_ACTIVE,",
   "  STATE_COMPLETE,",
@@ -97,6 +104,7 @@ function resetFrontendState() {
   modalToggle.modalTerminalPromptStates.clear();
   modalToggle.modalQueuedPromptIds.clear();
   modalToggle.modalSandwichedLocalNodeIds.clear();
+  modalToggle.modalRemoteDescendantNodeIdsByAncestor.clear();
   modalToggle.modalGlobalStatusStates.clear();
 }
 
@@ -734,6 +742,149 @@ modalToggle.handleExecutionPhase(
 assert.equal(modalToggle.isPromptQueuedBehindActiveModal("prompt-queued"), false);
 assert.equal(modalToggle.modalNodeStates.get("60")?.phase, modalToggle.STATE_READY);
 assert.equal(modalToggle.modalNodeStates.get("61")?.phase, modalToggle.STATE_READY);
+
+resetFrontendState();
+const nestedLeafGraph = {
+  id: "nested-leaf-graph",
+  nodes: [],
+  getNodeById(id) {
+    return this.nodes.find((node) => String(node.id) === String(id)) ?? null;
+  },
+};
+const nestedMiddleGraph = {
+  id: "nested-middle-graph",
+  nodes: [],
+  getNodeById(id) {
+    return this.nodes.find((node) => String(node.id) === String(id)) ?? null;
+  },
+};
+const nestedRootGraph = {
+  id: "nested-root-graph",
+  extra: {},
+  nodes: [],
+  getNodeById(id) {
+    return this.nodes.find((node) => String(node.id) === String(id)) ?? null;
+  },
+};
+const outerSubgraphNode = {
+  id: "100",
+  comfyClass: "Subgraph",
+  graph: nestedRootGraph,
+  subgraph: nestedMiddleGraph,
+  properties: {},
+  size: [180, 90],
+  isSubgraphNode() {
+    return true;
+  },
+  addWidget() {
+    return {};
+  },
+};
+const innerSubgraphNode = {
+  id: "200",
+  comfyClass: "Subgraph",
+  graph: nestedMiddleGraph,
+  subgraph: nestedLeafGraph,
+  properties: {},
+  size: [170, 80],
+  isSubgraphNode() {
+    return true;
+  },
+  addWidget() {
+    return {};
+  },
+};
+const activeNestedLeaf = {
+  id: "1",
+  comfyClass: "KSampler",
+  graph: nestedLeafGraph,
+  properties: { is_modal_remote: true },
+};
+const startingNestedLeaf = {
+  id: "2",
+  comfyClass: "VAEDecode",
+  graph: nestedLeafGraph,
+  properties: { is_modal_remote: true },
+};
+nestedRootGraph.nodes.push(outerSubgraphNode);
+nestedMiddleGraph.nodes.push(innerSubgraphNode);
+nestedLeafGraph.nodes.push(activeNestedLeaf, startingNestedLeaf);
+globalThis.__modalAppStub.rootGraph = nestedRootGraph;
+globalThis.__modalAppStub.graph.rootGraph = nestedRootGraph;
+modalToggle.rebuildRemoteDescendantIndex();
+
+assert.equal(modalToggle.hasRemoteDescendants(outerSubgraphNode), true);
+assert.equal(modalToggle.hasRemoteDescendants(innerSubgraphNode), true);
+assert.deepEqual(
+  Array.from(modalToggle.modalRemoteDescendantNodeIdsByAncestor.get("100")),
+  ["100:200:1", "100:200:2"],
+);
+assert.deepEqual(
+  Array.from(modalToggle.modalRemoteDescendantNodeIdsByAncestor.get("100:200")),
+  ["100:200:1", "100:200:2"],
+);
+assert.equal(modalToggle.getRemoteVisualState(outerSubgraphNode)?.phase, "idle");
+assert.equal(modalToggle.getRemoteVisualState(outerSubgraphNode)?.remoteDescendantCount, 2);
+
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-nested-container",
+    phase: "setup",
+    node_ids: ["100:200:1", "100:200:2"],
+  },
+});
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-nested-container",
+    phase: "executing",
+    node_ids: ["100:200:1", "100:200:2"],
+    active_node_id: "100:200:1",
+  },
+});
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-nested-container",
+    phase: "starting",
+    node_ids: ["100:200:2"],
+  },
+});
+
+const outerMixedState = modalToggle.getRemoteVisualState(outerSubgraphNode);
+const innerMixedState = modalToggle.getRemoteVisualState(innerSubgraphNode);
+assert.equal(outerMixedState?.phase, modalToggle.STATE_ACTIVE);
+assert.equal(innerMixedState?.phase, modalToggle.STATE_ACTIVE);
+assert.equal(outerMixedState?.isRemoteContainer, true);
+assert.equal(outerMixedState?.isMixedRemoteContainer, true);
+assert.equal(outerMixedState?.phaseCounts.active, 1);
+assert.equal(outerMixedState?.phaseCounts.starting, 1);
+assert.equal(
+  modalToggle.remoteContainerTooltip(outerMixedState),
+  "2 Modal descendant nodes: 1 active, 1 starting.",
+);
+
+const containerStrokeStyles = [];
+const containerCanvasContext = {
+  save() {},
+  restore() {},
+  beginPath() {},
+  roundRect() {},
+  arc() {},
+  fill() {},
+  fillText() {},
+  stroke() {
+    containerStrokeStyles.push(this.strokeStyle);
+  },
+};
+modalToggle.drawModalNodeDecoration(outerSubgraphNode, containerCanvasContext);
+assert.equal(containerStrokeStyles.some((color) => String(color).startsWith("#a855f7")), true);
+
+modalToggle.clearPromptRemoteStates("prompt-nested-container");
+assert.equal(modalToggle.getRemoteVisualState(outerSubgraphNode)?.phase, "idle");
+activeNestedLeaf.properties.is_modal_remote = false;
+startingNestedLeaf.properties.is_modal_remote = false;
+modalToggle.rebuildRemoteDescendantIndex();
+assert.equal(modalToggle.hasRemoteDescendants(outerSubgraphNode), false);
+assert.equal(modalToggle.getRemoteVisualState(outerSubgraphNode), null);
 
 const workflowGraph = {
   extra: {},
