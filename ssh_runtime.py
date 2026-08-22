@@ -197,6 +197,7 @@ class SshRuntimeManager:
             (
                 "build",
                 "--pull",
+                "--load",
                 "--label",
                 f"{_RUNTIME_LABEL}={spec.identity.fingerprint}",
                 "-t",

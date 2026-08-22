@@ -6,6 +6,38 @@ from types import SimpleNamespace
 from typing import Any
 
 
+def test_worker_build_loads_image_into_the_remote_daemon(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """BuildKit docker-container drivers must export the image for docker run."""
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def docker(arguments: tuple[str, ...], **kwargs: Any) -> None:
+        """Record one remote Docker invocation."""
+        calls.append((arguments, kwargs))
+
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(
+            host=SimpleNamespace(environment_id="gpu-host"),
+            docker=docker,
+        ),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(startup_timeout_seconds=900),
+    )
+    spec = SimpleNamespace(
+        image_tag="comfy-remote:deadbeef",
+        identity=SimpleNamespace(fingerprint="deadbeef"),
+    )
+    monkeypatch.setattr(manager, "_build_context", lambda runtime_spec: b"context")
+
+    manager._build_image(spec)
+
+    arguments, kwargs = calls[0]
+    assert arguments[:3] == ("build", "--pull", "--load")
+    assert kwargs["input_payload"] == b"context"
+
+
 def test_worker_indices_are_distributed_across_discovered_gpus(
     ssh_runtime_module: Any,
     remote_hosts_module: Any,
