@@ -7,7 +7,13 @@ from typing import Any
 import pytest
 
 
-def _capabilities(module: Any, *, vram_gb: int, ram_gb: int = 64) -> Any:
+def _capabilities(
+    module: Any,
+    *,
+    vram_gb: int,
+    ram_gb: int = 64,
+    free_vram_gb: int | None = None,
+) -> Any:
     """Return deterministic Linux GPU capabilities for scheduler tests."""
     return module.EnvironmentCapabilities(
         architecture="x86_64",
@@ -24,6 +30,11 @@ def _capabilities(module: Any, *, vram_gb: int, ram_gb: int = 64) -> Any:
                 uuid=f"GPU-{vram_gb}",
                 name=f"Test GPU {vram_gb}",
                 total_vram_bytes=vram_gb * 1024**3,
+                free_vram_bytes=(
+                    free_vram_gb * 1024**3
+                    if free_vram_gb is not None
+                    else None
+                ),
             ),
         ),
     )
@@ -78,6 +89,34 @@ def test_scheduler_rejects_hosts_without_required_vram(
         module.CostAwareEnvironmentScheduler().choose(
             [_environment(module, "small", vram_gb=24, cost=0.0)],
             module.ComponentResourceRequirements(minimum_vram_bytes=48 * 1024**3),
+        )
+
+
+def test_scheduler_uses_probed_free_vram_for_admission(
+    execution_environments_module: Any,
+) -> None:
+    """A busy GPU must not be admitted based only on nameplate VRAM."""
+    module = execution_environments_module
+    busy_environment = module.EnvironmentSchedulingState(
+        environment_id="busy",
+        provider=module.ExecutionProvider.SSH_DOCKER,
+        enabled=True,
+        health=module.EnvironmentHealth.READY,
+        cost_usd_per_second=0.0,
+        capabilities=_capabilities(
+            module,
+            vram_gb=80,
+            free_vram_gb=16,
+        ),
+    )
+
+    with pytest.raises(
+        module.NoCompatibleExecutionEnvironmentError,
+        match=r"16\.00 GiB available, 40\.00 GiB required",
+    ):
+        module.CostAwareEnvironmentScheduler().choose(
+            [busy_environment],
+            module.ComponentResourceRequirements(minimum_vram_bytes=40 * 1024**3),
         )
 
 

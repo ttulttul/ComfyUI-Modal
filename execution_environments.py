@@ -112,6 +112,25 @@ class EnvironmentCapabilities:
             default=0,
         )
 
+    @property
+    def maximum_available_vram_bytes(self) -> int:
+        """Return probed free VRAM when known, otherwise nameplate capacity."""
+        reported_free = [
+            gpu.free_vram_bytes
+            for gpu in self.gpus
+            if gpu.free_vram_bytes is not None
+        ]
+        if reported_free:
+            return max(reported_free)
+        return self.maximum_vram_bytes
+
+    @property
+    def schedulable_ram_bytes(self) -> int:
+        """Return currently available RAM when known, otherwise total RAM."""
+        if self.available_ram_bytes is not None:
+            return self.available_ram_bytes
+        return self.total_ram_bytes
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation of these capabilities."""
         return {
@@ -323,6 +342,13 @@ class CostAwareEnvironmentScheduler:
                 reasons=(
                     f"compatible with {len(environment.capabilities.gpus) if environment.capabilities else 0} GPU(s)",
                     (
+                        "requires at least "
+                        f"{requirements.minimum_vram_bytes / 1024**3:.2f} GiB "
+                        "GPU VRAM"
+                        if requirements.minimum_vram_bytes
+                        else "no explicit GPU VRAM floor"
+                    ),
+                    (
                         f"estimated cost ${predicted_cost:.6f}"
                         if predicted_cost is not None
                         else "cost unknown"
@@ -370,15 +396,28 @@ class CostAwareEnvironmentScheduler:
                 f"architecture {capabilities.architecture!r} does not satisfy "
                 f"{requirements.architecture!r}"
             )
-        if capabilities.total_ram_bytes < requirements.minimum_ram_bytes:
-            return "insufficient RAM"
+        if capabilities.schedulable_ram_bytes < requirements.minimum_ram_bytes:
+            return (
+                "insufficient RAM "
+                f"({capabilities.schedulable_ram_bytes / 1024**3:.2f} GiB available, "
+                f"{requirements.minimum_ram_bytes / 1024**3:.2f} GiB required)"
+            )
         if not requirements.required_tags.issubset(environment.tags):
             return "required tags are missing"
         if requirements.gpu_required:
             if not capabilities.nvidia_container_runtime:
                 return "NVIDIA container runtime is unavailable"
-            if capabilities.maximum_vram_bytes < requirements.minimum_vram_bytes:
-                return "insufficient GPU VRAM"
+            if (
+                capabilities.maximum_available_vram_bytes
+                < requirements.minimum_vram_bytes
+            ):
+                return (
+                    "insufficient GPU VRAM "
+                    "("
+                    f"{capabilities.maximum_available_vram_bytes / 1024**3:.2f} "
+                    "GiB available, "
+                    f"{requirements.minimum_vram_bytes / 1024**3:.2f} GiB required)"
+                )
         return None
 
     def _preferred_rank(

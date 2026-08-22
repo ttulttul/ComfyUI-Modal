@@ -21,7 +21,20 @@ from .settings import ModalSyncSettings, get_settings
 logger = logging.getLogger(__name__)
 SyncStatusCallback = Callable[[str, int | None, int | None], None]
 
-_SYNC_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".vae"}
+_SYNC_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".pt", ".vae"})
+MODEL_FILE_EXTENSIONS = frozenset(
+    {
+        ".bin",
+        ".ckpt",
+        ".engine",
+        ".gguf",
+        ".onnx",
+        ".pt",
+        ".pth",
+        ".safetensors",
+        ".vae",
+    }
+)
 _SKIP_DIRS = {
     ".git",
     ".mypy_cache",
@@ -43,24 +56,45 @@ _SKIP_FILE_SUFFIXES = {
     ".tmp",
 }
 _CUSTOM_NODES_MANIFEST_VERSION = 2
-_CUSTOM_NODE_ASSET_SUFFIXES = frozenset(
-    {
-        ".bin",
-        ".ckpt",
-        ".engine",
-        ".gguf",
-        ".onnx",
-        ".pt",
-        ".pth",
-        ".safetensors",
-        ".vae",
-    }
-)
+_CUSTOM_NODE_ASSET_SUFFIXES = MODEL_FILE_EXTENSIONS
 
 try:
     import modal  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - exercised when Modal SDK is unavailable.
     modal = None
+
+
+def resolve_model_path(
+    value: str,
+    *,
+    comfyui_root: Path | None = None,
+    extensions: frozenset[str] = _SYNC_EXTENSIONS,
+) -> Path | None:
+    """Resolve one prompt string to a local model file when possible."""
+    path = Path(value).expanduser()
+    if path.suffix.lower() not in extensions:
+        return None
+    if path.is_file():
+        return path.resolve()
+    if os.path.isabs(value):
+        return None
+
+    try:
+        import folder_paths
+    except ModuleNotFoundError:
+        folder_paths = None
+
+    if folder_paths is not None:
+        for folder_name in folder_paths.folder_names_and_paths:
+            full_path = folder_paths.get_full_path(folder_name, value)
+            if full_path is not None:
+                return Path(full_path).resolve()
+
+    if comfyui_root is not None:
+        candidate = comfyui_root / value
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
 
 
 def _emit_sync_status(
@@ -1082,42 +1116,14 @@ class ModalAssetSyncEngine:
         if value in self._path_resolution_cache:
             cached = self._path_resolution_cache[value]
             return Path(cached) if cached is not None else None
-
-        path = Path(value).expanduser()
-        if path.suffix.lower() not in _SYNC_EXTENSIONS:
-            self._path_resolution_cache[value] = None
-            return None
-        if path.is_file():
-            resolved = path.resolve()
-            self._path_resolution_cache[value] = str(resolved)
-            return resolved
-
-        if os.path.isabs(value):
-            self._path_resolution_cache[value] = None
-            return None
-
-        try:
-            import folder_paths
-        except ModuleNotFoundError:
-            folder_paths = None
-
-        if folder_paths is not None:
-            for folder_name in folder_paths.folder_names_and_paths:
-                full_path = folder_paths.get_full_path(folder_name, value)
-                if full_path is not None:
-                    resolved = Path(full_path).resolve()
-                    self._path_resolution_cache[value] = str(resolved)
-                    return resolved
-
-        if self.settings.comfyui_root is not None:
-            candidate = self.settings.comfyui_root / value
-            if candidate.is_file():
-                resolved = candidate.resolve()
-                self._path_resolution_cache[value] = str(resolved)
-                return resolved
-
-        self._path_resolution_cache[value] = None
-        return None
+        resolved = resolve_model_path(
+            value,
+            comfyui_root=self.settings.comfyui_root,
+        )
+        self._path_resolution_cache[value] = (
+            str(resolved) if resolved is not None else None
+        )
+        return resolved
 
     def _collect_syncable_asset_paths(self, value: Any) -> list[Path]:
         """Return all prompt asset paths that resolve to syncable local files."""

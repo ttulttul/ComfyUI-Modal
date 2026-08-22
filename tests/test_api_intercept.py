@@ -449,7 +449,11 @@ def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
         "_schedulable_ssh_hosts",
         lambda _settings: (host,),
     )
-    monkeypatch.setattr(api_intercept_module, "_execution_history", lambda _settings: None)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_execution_history",
+        lambda _settings: None,
+    )
 
     assignments = api_intercept_module._plan_component_execution_assignments(
         components=[component],
@@ -467,6 +471,100 @@ def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
 
     assert assignments["1"].provider.value == "ssh_docker"
     assert assignments["1"].environment_id == "cheap-host"
+
+
+def test_automatic_policy_rejects_zero_cost_host_for_oversized_model(
+    api_intercept_module: Any,
+    remote_hosts_module: Any,
+    execution_environments_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Model weights plus headroom must exclude a cheap host before cost ranking."""
+    module = execution_environments_module
+    model_path = tmp_path / "minimax_h3_bf16.safetensors"
+    with model_path.open("wb") as model_file:
+        model_file.truncate(66 * 1024**3)
+
+    capabilities = module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=60 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        gpus=(module.GpuCapability("GPU-4090", "RTX 4090", 24 * 1024**3),),
+        probed_at_epoch=2_000_000_000.0,
+    )
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="lambda",
+        display_name="Lambda 4090",
+        ssh_target="lambda",
+        cost_usd_per_second=0.0,
+        capabilities=capabilities,
+        health=module.EnvironmentHealth.READY,
+    )
+    component = api_intercept_module.RemoteComponentPlan(
+        node_ids=["6"],
+        representative_node_id="6",
+        boundary_inputs=[],
+        boundary_outputs=[],
+        execute_node_ids=["6"],
+        contains_output_node=False,
+    )
+    prompt = {
+        "6": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": str(model_path), "weight_dtype": "default"},
+        }
+    }
+    workflow = {
+        "extra": {
+            "remote_execution": {
+                "policy": "automatic",
+                "auto_place": True,
+            }
+        }
+    }
+    settings = SimpleNamespace(
+        modal_gpu="H200",
+        max_containers=1,
+        comfyui_root=None,
+    )
+    preferences = module.WorkflowExecutionPreferences.from_workflow(workflow)
+    estimate = api_intercept_module._component_memory_estimate(
+        component,
+        prompt,
+        preferences,
+        settings,
+    )
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_schedulable_ssh_hosts",
+        lambda _settings: (host,),
+    )
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_execution_history",
+        lambda _settings: None,
+    )
+
+    assignments = api_intercept_module._plan_component_execution_assignments(
+        components=[component],
+        prompt=prompt,
+        workflow=workflow,
+        settings=settings,
+    )
+
+    assert estimate.model_asset_count == 1
+    assert estimate.largest_model_bytes == 66 * 1024**3
+    assert 24 * 1024**3 < estimate.minimum_vram_bytes < 96 * 1024**3
+    assert estimate.minimum_ram_bytes == 70 * 1024**3
+    assert assignments["6"].provider is module.ExecutionProvider.MODAL
+    assert assignments["6"].environment_id == "modal:H200"
 
 
 def test_planner_keeps_unmarked_llm_local_between_remote_text_nodes(

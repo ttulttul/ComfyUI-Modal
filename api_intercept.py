@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -58,10 +59,12 @@ from .execution_environments import (
 from .execution_history import ExecutionHistory
 from .sync_engine import (
     AssetSyncRequestCache,
+    MODEL_FILE_EXTENSIONS,
     ModalAssetSyncEngine,
     ModalVolumeBackend,
     SyncedAsset,
     modal,
+    resolve_model_path,
 )
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
 from .ssh_docker import SshDockerController, SshDockerVolumeBackend
@@ -132,6 +135,25 @@ _SPECULATIVE_PREWARM_PAYLOAD_FIELDS = frozenset(
         "snapshot_profile_key",
     }
 )
+_MODEL_VRAM_WEIGHT_MULTIPLIER = 1.20
+_MODEL_VRAM_HEADROOM_BYTES = 4 * 1024**3
+_MODEL_RAM_HEADROOM_BYTES = 4 * 1024**3
+_ADDITIVE_MODEL_CLASS_TOKENS = (
+    "adapter",
+    "controlnet",
+    "ipadapter",
+    "lora",
+)
+
+
+@dataclass(frozen=True)
+class ComponentMemoryEstimate:
+    """Describe conservative scheduler memory floors inferred from model assets."""
+
+    minimum_vram_bytes: int
+    minimum_ram_bytes: int
+    model_asset_count: int = 0
+    largest_model_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -453,8 +475,23 @@ def _component_minimum_vram_bytes(
     component: RemoteComponentPlan,
     prompt: Mapping[str, Any],
     preferences: WorkflowExecutionPreferences,
+    settings: ModalSyncSettings,
 ) -> int:
-    """Estimate a conservative component VRAM floor from explicit LLM profiles."""
+    """Return the conservative GPU VRAM floor for one remote component."""
+    return _component_memory_estimate(
+        component,
+        prompt,
+        preferences,
+        settings,
+    ).minimum_vram_bytes
+
+
+def _component_profile_minimum_vram_bytes(
+    component: RemoteComponentPlan,
+    prompt: Mapping[str, Any],
+    preferences: WorkflowExecutionPreferences,
+) -> int:
+    """Estimate a component VRAM floor from workflow and LLM profile metadata."""
     minimum_vram_bytes = preferences.minimum_vram_bytes
     try:
         from .llm_profiles import get_llm_profile
@@ -481,6 +518,111 @@ def _component_minimum_vram_bytes(
             int(max(0.0, profile.estimated_vram_gb) * 1024**3),
         )
     return minimum_vram_bytes
+
+
+def _iter_prompt_string_values(value: object) -> Iterator[str]:
+    """Yield nested prompt string values while ignoring graph links and scalars."""
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, Mapping):
+        for child in value.values():
+            yield from _iter_prompt_string_values(child)
+        return
+    if isinstance(value, (list, tuple)) and not _is_link(value):
+        for child in value:
+            yield from _iter_prompt_string_values(child)
+
+
+def _is_additive_model_node(class_type: str) -> bool:
+    """Return whether a loader contributes weights alongside a primary model."""
+    normalized = class_type.casefold()
+    return any(token in normalized for token in _ADDITIVE_MODEL_CLASS_TOKENS)
+
+
+def _component_model_asset_sizes(
+    component: RemoteComponentPlan,
+    prompt: Mapping[str, Any],
+    settings: ModalSyncSettings,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return unique primary and additive model sizes referenced by a component."""
+    asset_roles: dict[Path, bool] = {}
+    for node_id in component.node_ids:
+        prompt_node = prompt.get(node_id)
+        if not isinstance(prompt_node, Mapping):
+            continue
+        inputs = prompt_node.get("inputs")
+        if not isinstance(inputs, Mapping):
+            continue
+        additive = _is_additive_model_node(str(prompt_node.get("class_type") or ""))
+        for value in _iter_prompt_string_values(inputs):
+            resolved_path = resolve_model_path(
+                value,
+                comfyui_root=getattr(settings, "comfyui_root", None),
+                extensions=MODEL_FILE_EXTENSIONS,
+            )
+            if resolved_path is None:
+                continue
+            asset_roles[resolved_path] = (
+                asset_roles.get(resolved_path, True) and additive
+            )
+
+    primary_sizes: list[int] = []
+    additive_sizes: list[int] = []
+    for asset_path, additive in asset_roles.items():
+        try:
+            size_bytes = asset_path.stat().st_size
+        except OSError as exc:
+            logger.warning(
+                "Unable to inspect model size for placement path=%s: %s",
+                asset_path,
+                exc,
+            )
+            continue
+        if size_bytes <= 0:
+            continue
+        target = additive_sizes if additive else primary_sizes
+        target.append(size_bytes)
+    return tuple(primary_sizes), tuple(additive_sizes)
+
+
+def _component_memory_estimate(
+    component: RemoteComponentPlan,
+    prompt: Mapping[str, Any],
+    preferences: WorkflowExecutionPreferences,
+    settings: ModalSyncSettings,
+) -> ComponentMemoryEstimate:
+    """Infer conservative RAM and VRAM floors from resident model weight sizes."""
+    profile_vram_bytes = _component_profile_minimum_vram_bytes(
+        component,
+        prompt,
+        preferences,
+    )
+    primary_sizes, additive_sizes = _component_model_asset_sizes(
+        component,
+        prompt,
+        settings,
+    )
+    all_sizes = primary_sizes + additive_sizes
+    if not all_sizes:
+        return ComponentMemoryEstimate(
+            minimum_vram_bytes=profile_vram_bytes,
+            minimum_ram_bytes=0,
+        )
+
+    primary_peak_bytes = max(primary_sizes or all_sizes)
+    additive_bytes = sum(additive_sizes) if primary_sizes else 0
+    resident_weight_bytes = primary_peak_bytes + additive_bytes
+    model_vram_bytes = (
+        math.ceil(resident_weight_bytes * _MODEL_VRAM_WEIGHT_MULTIPLIER)
+        + _MODEL_VRAM_HEADROOM_BYTES
+    )
+    return ComponentMemoryEstimate(
+        minimum_vram_bytes=max(profile_vram_bytes, model_vram_bytes),
+        minimum_ram_bytes=resident_weight_bytes + _MODEL_RAM_HEADROOM_BYTES,
+        model_asset_count=len(all_sizes),
+        largest_model_bytes=max(all_sizes),
+    )
 
 
 def _component_execution_signature(
@@ -574,12 +716,25 @@ def _plan_component_execution_assignments(
             if history is not None
             else {}
         )
+        memory_estimate = _component_memory_estimate(
+            component,
+            prompt,
+            preferences,
+            settings,
+        )
+        if memory_estimate.model_asset_count:
+            logger.info(
+                "Estimated remote component=%s memory floor vram_gib=%.2f ram_gib=%.2f "
+                "from model_assets=%d largest_model_gib=%.2f.",
+                component.representative_node_id,
+                memory_estimate.minimum_vram_bytes / 1024**3,
+                memory_estimate.minimum_ram_bytes / 1024**3,
+                memory_estimate.model_asset_count,
+                memory_estimate.largest_model_bytes / 1024**3,
+            )
         requirements = ComponentResourceRequirements(
-            minimum_vram_bytes=_component_minimum_vram_bytes(
-                component,
-                prompt,
-                preferences,
-            ),
+            minimum_vram_bytes=memory_estimate.minimum_vram_bytes,
+            minimum_ram_bytes=memory_estimate.minimum_ram_bytes,
             gpu_required=True,
             architecture="x86_64",
             estimated_execution_seconds=60.0,
@@ -5127,6 +5282,7 @@ def rewrite_prompt_for_modal(
                 component,
                 rewritten_prompt,
                 preferences,
+                resolved_settings,
             ),
         )
         anchor_assignment = assignments_by_component_id[
