@@ -82,3 +82,37 @@ def test_registry_persists_probe_results(
         registry.get_host("gpu-one").health
         is execution_environments_module.EnvironmentHealth.READY
     )
+
+
+def test_scheduling_reserves_configured_vram(
+    remote_hosts_module: Any,
+    execution_environments_module: Any,
+) -> None:
+    """A host's local-use VRAM reserve must not be offered to remote work."""
+    module = execution_environments_module
+    capabilities = module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=60 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        gpus=(module.GpuCapability("GPU-1", "GPU", 48 * 1024**3, 40 * 1024**3),),
+    )
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="reserved",
+        display_name="Reserved",
+        ssh_target="reserved",
+        reserve_vram_bytes=8 * 1024**3,
+        capabilities=capabilities,
+        health=module.EnvironmentHealth.READY,
+    )
+
+    scheduling_capabilities = host.scheduling_state().capabilities
+
+    assert scheduling_capabilities is not None
+    assert scheduling_capabilities.gpus[0].total_vram_bytes == 40 * 1024**3
+    assert scheduling_capabilities.gpus[0].free_vram_bytes == 32 * 1024**3

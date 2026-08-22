@@ -125,6 +125,36 @@ def remote_hosts_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def ssh_docker_module(extension_package: object) -> object:
+    """Return the SSH Docker transport module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.ssh_docker")
+
+
+@pytest.fixture(scope="session")
+def ssh_runtime_module(extension_package: object) -> object:
+    """Return the SSH OCI runtime lifecycle module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.ssh_runtime")
+
+
+@pytest.fixture(scope="session")
+def ssh_executor_module(extension_package: object) -> object:
+    """Return the SSH remote executor client module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.ssh_executor")
+
+
+@pytest.fixture(scope="session")
+def remote_protocol_module(extension_package: object) -> object:
+    """Return the generic remote framing protocol module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote_protocol")
+
+
+@pytest.fixture(scope="session")
+def ssh_worker_module(extension_package: object) -> object:
+    """Return the persistent SSH worker module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.ssh_worker")
+
+
+@pytest.fixture(scope="session")
 def api_intercept_module(extension_package: object) -> object:
     """Return the prompt interception module."""
     return importlib.import_module(f"{PACKAGE_NAME}.api_intercept")

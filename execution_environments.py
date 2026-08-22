@@ -7,6 +7,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence
 
+WORKFLOW_REMOTE_CONFIG_KEY = "remote_execution"
+WORKFLOW_REMOTE_POLICY_KEY = "policy"
+WORKFLOW_REMOTE_AUTO_PLACE_KEY = "auto_place"
+WORKFLOW_REMOTE_PREFERRED_ENVIRONMENTS_KEY = "preferred_environment_ids"
+WORKFLOW_REMOTE_MINIMUM_VRAM_GB_KEY = "minimum_vram_gb"
+
 
 class ExecutionProvider(str, Enum):
     """Identify one implementation of remote workflow execution."""
@@ -196,6 +202,47 @@ class ExecutionAssignment:
     predicted_cost_usd: float | None
     predicted_completion_seconds: float
     reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WorkflowExecutionPreferences:
+    """Describe provider and placement preferences saved with one workflow."""
+
+    policy: ExecutionPolicy = ExecutionPolicy.MODAL
+    auto_place: bool = False
+    preferred_environment_ids: tuple[str, ...] = ()
+    minimum_vram_bytes: int = 0
+
+    @classmethod
+    def from_workflow(cls, workflow: object) -> "WorkflowExecutionPreferences":
+        """Read generic preferences while preserving legacy Modal defaults."""
+        if not isinstance(workflow, Mapping):
+            return cls()
+        extra = workflow.get("extra")
+        if not isinstance(extra, Mapping):
+            return cls()
+        payload = extra.get(WORKFLOW_REMOTE_CONFIG_KEY)
+        if not isinstance(payload, Mapping):
+            return cls()
+        raw_preferred = payload.get(WORKFLOW_REMOTE_PREFERRED_ENVIRONMENTS_KEY)
+        preferred_values = raw_preferred if isinstance(raw_preferred, list) else []
+        raw_minimum_vram_gb = payload.get(WORKFLOW_REMOTE_MINIMUM_VRAM_GB_KEY, 0)
+        minimum_vram_gb = _optional_non_negative_float(
+            raw_minimum_vram_gb,
+            WORKFLOW_REMOTE_MINIMUM_VRAM_GB_KEY,
+        )
+        return cls(
+            policy=ExecutionPolicy(
+                str(payload.get(WORKFLOW_REMOTE_POLICY_KEY) or "modal").strip().lower()
+            ),
+            auto_place=bool(payload.get(WORKFLOW_REMOTE_AUTO_PLACE_KEY, False)),
+            preferred_environment_ids=tuple(
+                str(value).strip()
+                for value in preferred_values
+                if str(value).strip()
+            ),
+            minimum_vram_bytes=int((minimum_vram_gb or 0.0) * 1024**3),
+        )
 
 
 class ExecutionEnvironmentClient(Protocol):

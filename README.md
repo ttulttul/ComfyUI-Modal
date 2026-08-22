@@ -3,7 +3,7 @@
 > [!WARNING]
 > This project is still alpha. Expect missing features, rough edges, and breaking changes.
 
-ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts of a workflow through Modal. You mark nodes with `Run on Modal`; Modal-Sync rewrites the queued prompt into transport-aware remote components, syncs required assets, and returns remote outputs to the local ComfyUI graph.
+ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts of a workflow through Modal or user-managed Docker hosts reached over SSH. You mark nodes with `Run on Modal` (the legacy-compatible remote marker), or enable workflow-wide automatic placement; the extension rewrites the queued prompt into transport-aware remote components, syncs required assets, and returns remote outputs and generated files to the local ComfyUI graph.
 
 ## Overview
 
@@ -16,6 +16,8 @@ Modal-Sync provides:
 - queue-time graph partitioning and proxy-node rewrite for selected remote regions
 - local in-process execution mode for development and tests
 - Modal-backed remote execution with deployed-app lookup and first-run auto-deploy
+- self-hosted execution through persistent, fingerprinted Docker workers over SSH
+- capability-aware, cost-aware provider and host selection with workflow-level policy controls
 - model asset sync and optional `custom_nodes/` package sync
 - streamed remote status, progress, preview, and UI payload relay
 
@@ -33,6 +35,7 @@ git clone <this-repo-url> ComfyUI-Modal
 Restart ComfyUI. On startup it should load:
 
 - [`web/modal_toggle.js`](web/modal_toggle.js), the frontend toggle and overlay extension
+- [`web/remote_environments.js`](web/remote_environments.js), the SSH host manager
 - [`api_intercept.py`](api_intercept.py), the queue rewrite route
 - [`modal_executor_node.py`](modal_executor_node.py), the internal proxy node registry
 - [`modal_llm_node.py`](modal_llm_node.py), the resident multimodal LLM node
@@ -77,6 +80,40 @@ Modal authentication remains user-managed. Run `<comfyui-venv>/bin/python -m mod
 Each ComfyUI environment receives its own Modal app name on first startup. Modal-Sync generates 64 random bits, persists them as lowercase hexadecimal in `<ComfyUI user directory>/.comfy-modal-sync-instance-id`, and uses an unpadded URL-safe Base64 encoding in names such as `comfy-modal-sync-R7uqpQZ6S1A`. The identity file is published atomically, so concurrent first startups converge on one name. It lives in ComfyUI's effective user directory and therefore follows `--user-directory`; keep the file when upgrading if the deployment and its state should remain associated with the same ComfyUI environment. `COMFY_MODAL_APP_NAME` remains an authoritative override for deliberately shared or externally managed deployments.
 
 For repository development, `uv sync --extra remote --extra local-apple --group test` installs the pinned Modal SDK plus the guarded Apple-local backend where its platform markers apply. Remote mode uses the stable cloud entrypoint in [`comfyui_modal_sync_cloud.py`](comfyui_modal_sync_cloud.py). On first use, Modal-Sync can auto-deploy the configured Modal app if it does not exist.
+
+### Self-hosted SSH Docker environments
+
+Self-hosted execution reuses the same component planner, asset synchronization, custom-node bundle, serialization, progress stream, cancellation, remote-session, and output-artifact paths as Modal. The provider-specific layer is limited to host discovery, OCI image construction, named-volume storage, warm-worker lifecycle, and a framed binary relay over SSH.
+
+Open **Settings → Remote Execution: SSH environments**, or right-click an eligible node and choose **Remote Execution → Manage SSH hosts…**. Add one or more hosts using an SSH destination or alias that already works from the account running ComfyUI. The extension deliberately stores no password or private-key path; authentication, jump hosts, ports, and key selection belong in the user's normal SSH agent and `~/.ssh/config`.
+
+Each host must provide:
+
+- Linux on `x86_64`
+- a non-interactive SSH login with an already trusted host key
+- a working Docker CLI and daemon available to that login
+- NVIDIA drivers plus Docker's NVIDIA runtime or CDI configuration for GPU work
+- outbound package/image access during the first fingerprinted worker build
+
+Use **Save and probe** to discover CPU architecture, RAM, available Docker disk, Docker/runtime state, and every GPU's name, UUID, compute capability, driver, total VRAM, and free VRAM. Use **Build / update worker** to create the host's content-addressed storage volume, stream a minimal local ComfyUI/runtime build context to Docker, and start a persistent worker. This bootstrap is optional: the first assigned component reconciles the same image and worker automatically.
+
+The host form also controls:
+
+- **Cost USD/hour**: converted to per-second cost for planning. Arbitrary machines do not expose an authoritative amortized or leased price, so this value is explicit; leaving it blank means “unknown,” not zero.
+- **Max workers**: the number of fingerprinted containers the planner may address. Worker indices are distributed across discovered GPU UUIDs.
+- **Reserve VRAM GB**: capacity withheld from the compatibility check for desktop or other local use.
+- **Tags**, **Enabled**, and **Drain**: placement metadata and safe admission controls. Draining blocks new components without killing a running worker.
+
+Workflow policy is stored under `workflow.extra.remote_execution` and travels with the workflow:
+
+- **Modal only** preserves existing behavior and is the default for old workflows.
+- **Self-hosted only** requires a ready, compatible SSH host and fails before queueing when none is available.
+- **Automatic** considers ready SSH hosts and the selected Modal GPU, rejects hard incompatibilities such as insufficient VRAM, then prefers known lowest predicted cost with deterministic tie-breaking.
+- **Automatically place eligible nodes** makes the planner select the executable prompt without requiring each node toggle. Leave it off to keep manual component boundaries.
+
+Images are immutable and named from the local node-pack source, selected ComfyUI source, custom-node requirements, and runtime-shaping settings. Warm containers use a persistent named volume mounted at `/storage`; assets and custom-node bundles are content-addressed, and a remote volume epoch prevents a deleted/recreated volume from reusing stale local index records. Requests and tensor payloads travel as bounded, length-prefixed binary frames through `ssh docker exec`; no daemon TCP port, worker port, or inbound firewall rule is required. Generated ComfyUI files are bundled into the result, integrity-checked, and atomically restored beneath the local output directory just as they are for Modal.
+
+Self-hosted worker environment secrets are administrator-managed. Put credentials needed by custom nodes into the remote host/container environment through infrastructure policy; the host registry and workflow intentionally do not copy local `.env` values or store secrets. Modal execution continues to use the named Modal secret collection described above.
 
 The deployed image uses Python 3.13 plus an exact ComfyUI support and CUDA package set, including ComfyUI's current `comfy-aimdo==0.4.13` and `comfy-kitchen==0.2.31` pins and the import-time dependencies used by built-in extras such as Math Expression and GLSL. Python 3.13 is also required by the FlashInfer communications annotations imported during vLLM 0.27.1 kernel warmup. Its headless PromptServer shim instantiates ComfyUI's `NodeReplaceManager`, allowing current built-in and custom extensions to register replacement nodes during remote initialization. Remote prompt executors mirror both legacy scalar and current active/inactive RAM-pressure cache arguments from ComfyUI, and the cache adapter supports both synchronous legacy access and current coroutine-based cache operations. Remote pre-execution validation finalizes V3 dynamic input schemas against the live prompt before checking required sockets, so nodes using `io.Autogrow` accept expanded paths such as `images.image0` exactly as local ComfyUI does. The image's local build context is limited to the ComfyUI source packages, top-level Python modules, and runtime configuration needed by the headless worker; model directories, custom nodes, caches, tests, virtual environments, user data, and unknown top-level directories stay out of the image snapshot. Before every process's first remote invocation, Modal-Sync compares the deployed worker's runtime fingerprint with the local source, ComfyUI source, custom-node requirements, and runtime-shaping settings. A missing or mismatched fingerprint is treated as stale and replaced automatically when `COMFY_MODAL_AUTO_DEPLOY=true`; replacement uses Modal's non-interactive SDK stop API when available and an explicitly confirmed CLI fallback, so app shutdown cannot stall on a hidden terminal prompt.
 

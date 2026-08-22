@@ -370,6 +370,14 @@ def _discover_comfyui_user_directory(comfyui_root: Path | None) -> Path | None:
     return (comfyui_root / "user").resolve()
 
 
+def discover_comfyui_user_directory(
+    settings: ModalSyncSettings | None = None,
+) -> Path | None:
+    """Return the effective ComfyUI user directory for extension-owned state."""
+    resolved_settings = settings or get_settings()
+    return _discover_comfyui_user_directory(resolved_settings.comfyui_root)
+
+
 def _resolve_modal_app_name(comfyui_root: Path | None, execution_mode: str) -> str:
     """Return the explicit or persistent per-ComfyUI Modal app name."""
     configured_name = os.getenv("COMFY_MODAL_APP_NAME")

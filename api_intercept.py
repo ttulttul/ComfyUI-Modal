@@ -11,7 +11,8 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from aiohttp import web
@@ -37,8 +38,21 @@ from .session_state import RemoteSessionHandle
 from .settings import (
     ModalSyncSettings,
     get_settings,
+    discover_comfyui_user_directory,
     modal_gpu_from_workflow,
     settings_for_modal_gpu,
+)
+from .execution_environments import (
+    ComponentResourceRequirements,
+    CostAwareEnvironmentScheduler,
+    EnvironmentCapabilities,
+    EnvironmentHealth,
+    EnvironmentSchedulingState,
+    ExecutionAssignment,
+    ExecutionPolicy,
+    ExecutionProvider,
+    GpuCapability,
+    WorkflowExecutionPreferences,
 )
 from .sync_engine import (
     AssetSyncRequestCache,
@@ -47,6 +61,8 @@ from .sync_engine import (
     SyncedAsset,
     modal,
 )
+from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
+from .ssh_docker import SshDockerController, SshDockerVolumeBackend
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +73,7 @@ _MODAL_UI_EVENTS_LOCK = threading.Lock()
 _MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
 _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_installed"
 _REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
+_LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset({"ModalEndpointChat"})
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
@@ -212,6 +229,15 @@ class RewriteSummary:
     synced_assets: list[SyncedAsset] = field(default_factory=list)
     custom_nodes_bundle: SyncedAsset | None = None
     artifact_finalizer_node_id: str | None = None
+    execution_assignments_by_representative: dict[str, ExecutionAssignment] = field(
+        default_factory=dict
+    )
+    execution_worker_indices_by_representative: dict[str, int] = field(
+        default_factory=dict
+    )
+    custom_nodes_bundles_by_environment: dict[str, SyncedAsset | None] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -256,6 +282,233 @@ class PromptGraphLink:
 
 class ModalPromptValidationError(ValueError):
     """Raised when a prompt cannot be executed with the current Modal transport."""
+
+
+_MODAL_GPU_VRAM_GB: dict[str, float] = {
+    "T4": 16,
+    "L4": 24,
+    "A10": 24,
+    "L40S": 48,
+    "A100": 40,
+    "A100-40GB": 40,
+    "A100-80GB": 80,
+    "RTX-PRO-6000": 96,
+    "H100": 80,
+    "H100!": 80,
+    "H200": 141,
+    "B200": 180,
+    "B200+": 180,
+    "B300": 288,
+}
+_MODAL_GPU_COST_USD_PER_SECOND: dict[str, float] = {
+    "T4": 0.000164,
+    "L4": 0.000222,
+    "A10": 0.000306,
+    "L40S": 0.000542,
+    "A100": 0.000583,
+    "A100-40GB": 0.000583,
+    "A100-80GB": 0.000694,
+    "RTX-PRO-6000": 0.000842,
+    "H100": 0.001097,
+    "H100!": 0.001097,
+    "H200": 0.001261,
+    "B200": 0.001736,
+    "B200+": 0.001736,
+    "B300": 0.001972,
+}
+
+
+def _modal_environment_state(settings: ModalSyncSettings) -> EnvironmentSchedulingState:
+    """Return the scheduler-facing state of the selected Modal GPU target."""
+    modal_gpu = settings.modal_gpu
+    vram_bytes = int(_MODAL_GPU_VRAM_GB.get(modal_gpu, 0.0) * 1024**3)
+    capabilities = EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=1,
+        total_ram_bytes=max(vram_bytes, 1),
+        available_ram_bytes=None,
+        available_disk_bytes=None,
+        docker_version="modal-managed",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        gpus=(
+            GpuCapability(
+                uuid=f"modal-{modal_gpu.lower()}",
+                name=modal_gpu,
+                total_vram_bytes=vram_bytes,
+            ),
+        ),
+    )
+    return EnvironmentSchedulingState(
+        environment_id=f"modal:{modal_gpu}",
+        provider=ExecutionProvider.MODAL,
+        enabled=True,
+        health=EnvironmentHealth.READY,
+        cost_usd_per_second=_MODAL_GPU_COST_USD_PER_SECOND.get(modal_gpu),
+        capabilities=capabilities,
+        maximum_workers=settings.max_containers or 1,
+    )
+
+
+def _ssh_host_registry(settings: ModalSyncSettings) -> RemoteHostRegistry | None:
+    """Return the persistent SSH host registry when a user directory exists."""
+    user_directory = discover_comfyui_user_directory(settings)
+    if user_directory is None:
+        return None
+    return RemoteHostRegistry.for_user_directory(user_directory)
+
+
+def _configured_ssh_hosts(settings: ModalSyncSettings) -> tuple[SshHostConfig, ...]:
+    """Return configured SSH hosts without probing during queue submission."""
+    registry = _ssh_host_registry(settings)
+    if registry is None:
+        return ()
+    return registry.load().hosts
+
+
+def _component_minimum_vram_bytes(
+    component: RemoteComponentPlan,
+    prompt: Mapping[str, Any],
+    preferences: WorkflowExecutionPreferences,
+) -> int:
+    """Estimate a conservative component VRAM floor from explicit LLM profiles."""
+    minimum_vram_bytes = preferences.minimum_vram_bytes
+    try:
+        from .llm_profiles import get_llm_profile
+    except ImportError:
+        return minimum_vram_bytes
+    for node_id in component.node_ids:
+        prompt_node = prompt.get(node_id)
+        if not isinstance(prompt_node, Mapping):
+            continue
+        if str(prompt_node.get("class_type") or "") != "ModalLLM":
+            continue
+        inputs = prompt_node.get("inputs")
+        if not isinstance(inputs, Mapping):
+            continue
+        model_profile = inputs.get("model_profile")
+        if not isinstance(model_profile, str) or not model_profile.strip():
+            continue
+        try:
+            profile = get_llm_profile(model_profile.strip())
+        except (KeyError, ValueError):
+            continue
+        minimum_vram_bytes = max(
+            minimum_vram_bytes,
+            int(max(0.0, profile.estimated_vram_gb) * 1024**3),
+        )
+    return minimum_vram_bytes
+
+
+def _plan_component_execution_assignments(
+    *,
+    components: list[RemoteComponentPlan],
+    prompt: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+    settings: ModalSyncSettings,
+) -> dict[str, ExecutionAssignment]:
+    """Assign each component to Modal or one compatible self-hosted environment."""
+    preferences = WorkflowExecutionPreferences.from_workflow(workflow)
+    if preferences.policy is ExecutionPolicy.MODAL:
+        modal_state = _modal_environment_state(settings)
+        return {
+            component.representative_node_id: ExecutionAssignment(
+                environment_id=modal_state.environment_id,
+                provider=ExecutionProvider.MODAL,
+                predicted_cost_usd=None,
+                predicted_completion_seconds=0.0,
+                reasons=("workflow policy requires Modal",),
+            )
+            for component in components
+        }
+
+    ssh_states = [host.scheduling_state() for host in _configured_ssh_hosts(settings)]
+    environments = list(ssh_states)
+    if preferences.policy is ExecutionPolicy.AUTOMATIC:
+        environments.append(_modal_environment_state(settings))
+    if not environments:
+        raise ModalPromptValidationError(
+            "This workflow requests self-hosted execution, but no SSH Docker hosts are configured."
+        )
+
+    scheduler = CostAwareEnvironmentScheduler()
+    assignments: dict[str, ExecutionAssignment] = {}
+    for component in components:
+        requirements = ComponentResourceRequirements(
+            minimum_vram_bytes=_component_minimum_vram_bytes(
+                component,
+                prompt,
+                preferences,
+            ),
+            gpu_required=True,
+            architecture="x86_64",
+            estimated_execution_seconds=1.0,
+            preferred_environment_ids=preferences.preferred_environment_ids,
+        )
+        try:
+            assignment = scheduler.choose(environments, requirements)
+        except RuntimeError as exc:
+            raise ModalPromptValidationError(str(exc)) from exc
+        assignments[component.representative_node_id] = assignment
+        logger.info(
+            "Assigned remote component=%s provider=%s environment=%s predicted_cost_usd=%s reasons=%s.",
+            component.representative_node_id,
+            assignment.provider.value,
+            assignment.environment_id,
+            assignment.predicted_cost_usd,
+            assignment.reasons,
+        )
+    return assignments
+
+
+def _ssh_sync_engine(
+    *,
+    host: SshHostConfig,
+    settings: ModalSyncSettings,
+) -> ModalAssetSyncEngine:
+    """Build a content-addressed sync engine for one SSH Docker host."""
+    ssh_settings = replace(
+        settings,
+        execution_mode="ssh_docker",
+        volume_name=host.resolved_storage_volume_name,
+        local_storage_root=(
+            settings.local_storage_root / "ssh" / host.environment_id
+        ).resolve(),
+        remote_storage_root="/storage",
+    )
+    volume = SshDockerVolumeBackend(
+        SshDockerController(host),
+        host.resolved_storage_volume_name,
+    )
+    return ModalAssetSyncEngine(volume=volume, settings=ssh_settings)
+
+
+def _stamp_execution_assignment(
+    payload: dict[str, Any],
+    assignment: ExecutionAssignment,
+    worker_index: int = 0,
+) -> None:
+    """Attach provider placement to a payload and every nested proxy phase."""
+    payload["execution_provider"] = assignment.provider.value
+    payload["execution_environment_id"] = assignment.environment_id
+    payload["execution_worker_index"] = worker_index
+    split_payloads = payload.get("split_proxy_payloads")
+    nested_payloads: list[dict[str, Any]] = []
+    if isinstance(split_payloads, dict):
+        nested_payloads.extend(
+            nested_payload
+            for nested_payload in split_payloads.values()
+            if isinstance(nested_payload, dict)
+        )
+    elif isinstance(split_payloads, list):
+        nested_payloads.extend(
+            nested_payload
+            for nested_payload in split_payloads
+            if isinstance(nested_payload, dict)
+        )
+    for nested_payload in nested_payloads:
+        _stamp_execution_assignment(nested_payload, assignment, worker_index)
 
 
 def _ensure_remote_sync_backend(
@@ -1210,6 +1463,37 @@ def extract_remote_node_ids(
                     sorted(resolved_prompt_node_ids),
                 )
     return remote_node_ids
+
+
+def requested_remote_node_ids(
+    *,
+    prompt: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+    settings: ModalSyncSettings,
+) -> set[str]:
+    """Return explicit remote markers or every eligible node for auto placement."""
+    preferences = WorkflowExecutionPreferences.from_workflow(workflow)
+    if not preferences.auto_place:
+        return extract_remote_node_ids(
+            dict(workflow) if workflow is not None else None,
+            settings,
+            set(prompt),
+        )
+    selected_node_ids = {
+        str(node_id)
+        for node_id, prompt_node in prompt.items()
+        if isinstance(prompt_node, Mapping)
+        and str(prompt_node.get("class_type") or "")
+        not in _LOCAL_ONLY_REMOTE_CLASS_TYPES
+        and not str(prompt_node.get("class_type") or "").startswith(
+            "ModalUniversalExecutor"
+        )
+    }
+    logger.info(
+        "Automatic remote placement selected %d eligible prompt nodes.",
+        len(selected_node_ids),
+    )
+    return selected_node_ids
 
 
 def _workflow_node_remote_enabled(node: Mapping[str, Any], marker: str) -> bool:
@@ -4609,7 +4893,11 @@ def rewrite_prompt_for_modal(
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Rewrite connected remote components into Modal proxy nodes."""
     resolved_settings = settings or get_settings()
-    remote_node_ids = extract_remote_node_ids(workflow, resolved_settings, set(prompt.keys()))
+    remote_node_ids = requested_remote_node_ids(
+        prompt=prompt,
+        workflow=workflow,
+        settings=resolved_settings,
+    )
     summary = RewriteSummary(remote_node_ids=sorted(remote_node_ids))
     logger.info("Found %d workflow nodes marked for Modal execution.", len(remote_node_ids))
 
@@ -4618,7 +4906,6 @@ def rewrite_prompt_for_modal(
 
     resolved_nodes_module = nodes_module or _get_nodes_module()
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(resolved_settings)
-    _ensure_remote_sync_backend(resolved_settings, resolved_sync_engine)
     rewritten_prompt = copy.deepcopy(prompt)
     expanded_remote_node_ids, _ = _expand_remote_node_ids_for_non_transportable_inputs(
         prompt=rewritten_prompt,
@@ -4670,12 +4957,120 @@ def rewrite_prompt_for_modal(
         nodes_module=resolved_nodes_module,
     )
 
+    assignments_by_component_id = _plan_component_execution_assignments(
+        components=components,
+        prompt=rewritten_prompt,
+        workflow=workflow,
+        settings=resolved_settings,
+    )
+    if session_component_ids:
+        preferences = WorkflowExecutionPreferences.from_workflow(workflow)
+        session_components = [
+            component
+            for component in components
+            if component.representative_node_id in session_component_ids
+        ]
+        anchor_component = max(
+            session_components,
+            key=lambda component: _component_minimum_vram_bytes(
+                component,
+                rewritten_prompt,
+                preferences,
+            ),
+        )
+        anchor_assignment = assignments_by_component_id[
+            anchor_component.representative_node_id
+        ]
+        for component in session_components:
+            assignments_by_component_id[component.representative_node_id] = (
+                anchor_assignment
+            )
+        logger.info(
+            "Co-located remote-session components=%s on environment=%s.",
+            sorted(session_component_ids),
+            anchor_assignment.environment_id,
+        )
+    summary.execution_assignments_by_representative = dict(
+        assignments_by_component_id
+    )
+
+    sync_engines_by_environment: dict[str, ModalAssetSyncEngine] = {}
+    ssh_hosts_by_id = {
+        host.environment_id: host for host in _configured_ssh_hosts(resolved_settings)
+    }
+    session_environment_ids = {
+        assignments_by_component_id[component_id].environment_id
+        for component_id in session_component_ids
+    }
+    worker_counts_by_environment: dict[str, int] = defaultdict(int)
+    for component in components:
+        component_id = component.representative_node_id
+        assignment = assignments_by_component_id[component_id]
+        if assignment.provider is ExecutionProvider.MODAL:
+            summary.execution_worker_indices_by_representative[component_id] = 0
+            continue
+        host = ssh_hosts_by_id.get(assignment.environment_id)
+        maximum_workers = max(1, host.maximum_workers if host is not None else 1)
+        if component_id in session_component_ids:
+            worker_index = 0
+        else:
+            first_worker = (
+                1
+                if assignment.environment_id in session_environment_ids
+                and maximum_workers > 1
+                else 0
+            )
+            available_workers = max(1, maximum_workers - first_worker)
+            worker_index = first_worker + (
+                worker_counts_by_environment[assignment.environment_id]
+                % available_workers
+            )
+            worker_counts_by_environment[assignment.environment_id] += 1
+        summary.execution_worker_indices_by_representative[component_id] = worker_index
+        logger.info(
+            "Assigned remote component=%s environment=%s worker_index=%d.",
+            component_id,
+            assignment.environment_id,
+            worker_index,
+        )
+    for assignment in assignments_by_component_id.values():
+        if assignment.environment_id in sync_engines_by_environment:
+            continue
+        if assignment.provider is ExecutionProvider.MODAL:
+            _ensure_remote_sync_backend(resolved_settings, resolved_sync_engine)
+            sync_engines_by_environment[assignment.environment_id] = resolved_sync_engine
+            continue
+        host = ssh_hosts_by_id.get(assignment.environment_id)
+        if host is None:
+            raise ModalPromptValidationError(
+                f"Assigned SSH execution environment {assignment.environment_id!r} is no longer configured."
+            )
+        sync_engines_by_environment[assignment.environment_id] = _ssh_sync_engine(
+            host=host,
+            settings=resolved_settings,
+        )
+
     if status_callback is not None:
-        status_callback("Preparing remote assets for Modal", None, None)
+        status_callback("Preparing assets for remote execution", None, None)
 
     if resolved_settings.sync_custom_nodes:
-        summary.custom_nodes_bundle = resolved_sync_engine.sync_custom_nodes_directory(
-            status_callback=status_callback,
+        for environment_id, environment_sync_engine in sync_engines_by_environment.items():
+            summary.custom_nodes_bundles_by_environment[environment_id] = (
+                environment_sync_engine.sync_custom_nodes_directory(
+                    status_callback=status_callback,
+                )
+            )
+        modal_bundle = next(
+            (
+                summary.custom_nodes_bundles_by_environment[assignment.environment_id]
+                for assignment in assignments_by_component_id.values()
+                if assignment.provider is ExecutionProvider.MODAL
+            ),
+            None,
+        )
+        summary.custom_nodes_bundle = modal_bundle or next(
+            iter(summary.custom_nodes_bundles_by_environment.values()),
+            None,
         )
     else:
         logger.info(
@@ -4685,17 +5080,26 @@ def rewrite_prompt_for_modal(
 
     synced_component_prompts: dict[str, dict[str, Any]] = {}
     synced_assets_by_component_id: dict[str, list[SyncedAsset]] = {}
-    request_asset_cache = resolved_sync_engine.create_request_asset_cache(
-        rewritten_prompt[node_id].get("inputs", {})
-        for component in components
-        for node_id in component.node_ids
-    )
+    request_asset_caches_by_environment = {
+        environment_id: environment_sync_engine.create_request_asset_cache(
+            rewritten_prompt[node_id].get("inputs", {})
+            for component in components
+            if assignments_by_component_id[component.representative_node_id].environment_id
+            == environment_id
+            for node_id in component.node_ids
+        )
+        for environment_id, environment_sync_engine in sync_engines_by_environment.items()
+    }
     for component in components:
+        assignment = assignments_by_component_id[component.representative_node_id]
+        component_sync_engine = sync_engines_by_environment[assignment.environment_id]
         component_prompt, synced_assets = _sync_component_prompt_inputs(
             component=component,
             rewritten_prompt=rewritten_prompt,
-            sync_engine=resolved_sync_engine,
-            request_cache=request_asset_cache,
+            sync_engine=component_sync_engine,
+            request_cache=request_asset_caches_by_environment[
+                assignment.environment_id
+            ],
             status_callback=status_callback,
         )
         synced_component_prompts[component.representative_node_id] = component_prompt
@@ -4704,8 +5108,26 @@ def rewrite_prompt_for_modal(
 
     summary.synced_assets = _deduplicate_synced_assets(summary.synced_assets)
 
-    requires_volume_reload = any(asset.uploaded for asset in summary.synced_assets) or (
-        summary.custom_nodes_bundle is not None and summary.custom_nodes_bundle.uploaded
+    modal_environment_ids = {
+        assignment.environment_id
+        for assignment in assignments_by_component_id.values()
+        if assignment.provider is ExecutionProvider.MODAL
+    }
+    modal_component_ids = {
+        component.representative_node_id
+        for component in components
+        if assignments_by_component_id[component.representative_node_id].provider
+        is ExecutionProvider.MODAL
+    }
+    requires_volume_reload = any(
+        asset.uploaded
+        for component_id, assets in synced_assets_by_component_id.items()
+        if component_id in modal_component_ids
+        for asset in assets
+    ) or any(
+        bundle is not None and bundle.uploaded
+        for environment_id, bundle in summary.custom_nodes_bundles_by_environment.items()
+        if environment_id in modal_environment_ids
     )
     volume_reload_marker = uuid.uuid4().hex if requires_volume_reload else None
     logger.info(
@@ -4728,10 +5150,14 @@ def rewrite_prompt_for_modal(
             component.representative_node_id,
             component.node_ids,
         )
+        assignment = assignments_by_component_id[component.representative_node_id]
+        component_custom_nodes_bundle = summary.custom_nodes_bundles_by_environment.get(
+            assignment.environment_id
+        )
         uploaded_volume_paths = _component_uploaded_volume_paths(
             component_prompt=synced_component_prompts[component.representative_node_id],
             synced_assets=synced_assets_by_component_id[component.representative_node_id],
-            custom_nodes_bundle=summary.custom_nodes_bundle,
+            custom_nodes_bundle=component_custom_nodes_bundle,
         )
         payload = _build_component_payload(
             component=component,
@@ -4739,14 +5165,25 @@ def rewrite_prompt_for_modal(
             signature_prompt=prompt,
             extra_data=extra_data,
             settings=resolved_settings,
-            requires_volume_reload=bool(uploaded_volume_paths),
+            requires_volume_reload=(
+                assignment.provider is ExecutionProvider.MODAL
+                and bool(uploaded_volume_paths)
+            ),
             volume_reload_marker=volume_reload_marker,
-            custom_nodes_bundle=summary.custom_nodes_bundle,
+            custom_nodes_bundle=component_custom_nodes_bundle,
             uploaded_volume_paths=uploaded_volume_paths,
             terminate_container_on_error=resolved_settings.terminate_container_on_error,
             nodes_module=resolved_nodes_module,
             remote_session=remote_sessions_by_component_id.get(
                 component.representative_node_id
+            ),
+        )
+        _stamp_execution_assignment(
+            payload,
+            assignment,
+            summary.execution_worker_indices_by_representative.get(
+                component.representative_node_id,
+                0,
             ),
         )
         implicitly_mapped_output_sources = _implicitly_mapped_boundary_output_sources(
@@ -5005,6 +5442,24 @@ def _delete_modal_volume_route_path(route_path: str) -> str:
     return f"{route_path.rstrip('/')}/delete_volume"
 
 
+def _remote_environments_route_path(route_path: str) -> str:
+    """Return the provider-neutral environment management route."""
+    del route_path
+    return "/remote/environments"
+
+
+def _remote_environment_probe_route_path(route_path: str) -> str:
+    """Return the provider-neutral host capability probe route."""
+    del route_path
+    return "/remote/environments/probe"
+
+
+def _remote_environment_bootstrap_route_path(route_path: str) -> str:
+    """Return the provider-neutral worker bootstrap route."""
+    del route_path
+    return "/remote/environments/bootstrap"
+
+
 def _modal_not_found_error_types() -> tuple[type[BaseException], ...]:
     """Return Modal SDK exception classes that mean a named object is absent."""
     if modal is None:
@@ -5165,9 +5620,34 @@ def setup_modal_queue_route(
     container_status_route_path = _container_status_route_path(resolved_settings.route_path)
     delete_caches_route_path = _delete_modal_caches_route_path(resolved_settings.route_path)
     delete_volume_route_path = _delete_modal_volume_route_path(resolved_settings.route_path)
+    remote_environments_route_path = _remote_environments_route_path(
+        resolved_settings.route_path
+    )
+    remote_environment_probe_route_path = _remote_environment_probe_route_path(
+        resolved_settings.route_path
+    )
+    remote_environment_bootstrap_route_path = _remote_environment_bootstrap_route_path(
+        resolved_settings.route_path
+    )
+    remote_host_registry = _ssh_host_registry(resolved_settings)
     _install_modal_interrupt_queue_bridge(prompt_server)
 
     if hasattr(prompt_server.routes, "get"):
+
+        @prompt_server.routes.get(remote_environments_route_path)
+        async def remote_environments(request: web.Request) -> web.Response:
+            """Return credential-free SSH host configuration and discovered state."""
+            del request
+            if remote_host_registry is None:
+                return web.json_response(
+                    {"error": "The ComfyUI user directory could not be resolved.", "hosts": []},
+                    status=503,
+                )
+            try:
+                config = await asyncio.to_thread(remote_host_registry.load)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc), "hosts": []}, status=500)
+            return web.json_response(config.to_dict())
 
         @prompt_server.routes.get(progress_state_route_path)
         async def modal_progress_state(request: web.Request) -> web.Response:
@@ -5234,6 +5714,99 @@ def setup_modal_queue_route(
                     "polled_at": time.time(),
                 }
             )
+
+    if hasattr(prompt_server.routes, "put"):
+
+        @prompt_server.routes.put(remote_environments_route_path)
+        async def remote_environments_update(request: web.Request) -> web.Response:
+            """Validate and atomically replace SSH host configuration."""
+            if remote_host_registry is None:
+                return web.json_response(
+                    {"error": "The ComfyUI user directory could not be resolved."},
+                    status=503,
+                )
+            try:
+                payload = await request.json()
+                if not isinstance(payload, Mapping):
+                    raise ValueError(
+                        "Remote environment configuration must be a JSON object."
+                    )
+                config = RemoteExecutionConfig.from_dict(payload)
+                await asyncio.to_thread(remote_host_registry.save, config)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+            return web.json_response(config.to_dict())
+
+    @prompt_server.routes.post(remote_environment_probe_route_path)
+    async def remote_environment_probe(request: web.Request) -> web.Response:
+        """Probe one configured SSH host and persist its discovered capabilities."""
+        if remote_host_registry is None:
+            return web.json_response(
+                {"error": "The ComfyUI user directory could not be resolved."},
+                status=503,
+            )
+        try:
+            payload = await request.json()
+            environment_id = str(payload.get("environment_id") or "").strip()
+            host = await asyncio.to_thread(remote_host_registry.get_host, environment_id)
+            capabilities = await asyncio.to_thread(
+                SshDockerController(host).probe_capabilities
+            )
+            updated_host = await asyncio.to_thread(
+                remote_host_registry.update_probe_result,
+                environment_id,
+                capabilities=capabilities,
+                health=EnvironmentHealth.READY,
+                last_error=None,
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            environment_id = str(locals().get("environment_id") or "").strip()
+            if environment_id:
+                try:
+                    await asyncio.to_thread(
+                        remote_host_registry.update_probe_result,
+                        environment_id,
+                        capabilities=None,
+                        health=EnvironmentHealth.UNAVAILABLE,
+                        last_error=str(exc),
+                    )
+                except (KeyError, ValueError):
+                    pass
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response(updated_host.to_dict())
+
+    @prompt_server.routes.post(remote_environment_bootstrap_route_path)
+    async def remote_environment_bootstrap(request: web.Request) -> web.Response:
+        """Build the current runtime and start one compatible warm SSH worker."""
+        if remote_host_registry is None:
+            return web.json_response(
+                {"error": "The ComfyUI user directory could not be resolved."},
+                status=503,
+            )
+        try:
+            from .ssh_runtime import SshRuntimeManager
+
+            payload = await request.json()
+            environment_id = str(payload.get("environment_id") or "").strip()
+            worker_index = int(payload.get("worker_index", 0))
+            host = await asyncio.to_thread(remote_host_registry.get_host, environment_id)
+            manager = SshRuntimeManager(
+                controller=SshDockerController(host),
+                repo_root=Path(__file__).resolve().parent,
+                settings=resolved_settings,
+            )
+            spec = await asyncio.to_thread(manager.ensure_worker, worker_index)
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response(
+            {
+                "environment_id": environment_id,
+                "worker_index": worker_index,
+                "container_name": spec.container_name,
+                "image_tag": spec.image_tag,
+                "runtime_fingerprint": spec.identity.fingerprint,
+            }
+        )
 
     @prompt_server.routes.post(analysis_route_path)
     async def modal_analyze_remote_nodes(request: web.Request) -> web.Response:
@@ -5336,13 +5909,12 @@ def setup_modal_queue_route(
             prompt_id = str(json_data.get("prompt_id")) if json_data.get("prompt_id") else None
             extra_pnginfo = ((json_data.get("extra_data") or {}).get("extra_pnginfo") or {})
             workflow = extra_pnginfo.get("workflow")
-            prompt_node_ids = (
-                {str(node_id) for node_id in json_data.get("prompt", {}).keys()}
-                if "prompt" in json_data
-                else None
-            )
             remote_node_ids = sorted(
-                extract_remote_node_ids(workflow, resolved_settings, prompt_node_ids)
+                requested_remote_node_ids(
+                    prompt=json_data.get("prompt", {}),
+                    workflow=workflow,
+                    settings=resolved_settings,
+                )
             )
             if "prompt" in json_data and not remote_node_ids:
                 logger.info(
@@ -5443,6 +6015,26 @@ def setup_modal_queue_route(
                 json_data["extra_data"]["modal"]["synced_assets"] = [
                     asset.remote_path for asset in summary.synced_assets
                 ]
+                json_data["extra_data"]["remote_execution"] = {
+                    "assignments": {
+                        component_id: {
+                            "provider": assignment.provider.value,
+                            "environment_id": assignment.environment_id,
+                            "predicted_cost_usd": assignment.predicted_cost_usd,
+                            "predicted_completion_seconds": (
+                                assignment.predicted_completion_seconds
+                            ),
+                            "worker_index": summary.execution_worker_indices_by_representative.get(
+                                component_id,
+                                0,
+                            ),
+                            "reasons": list(assignment.reasons),
+                        }
+                        for component_id, assignment in sorted(
+                            summary.execution_assignments_by_representative.items()
+                        )
+                    }
+                }
                 if summary.custom_nodes_bundle is not None:
                     json_data["extra_data"]["modal"]["custom_nodes_bundle"] = (
                         summary.custom_nodes_bundle.remote_path
@@ -5470,6 +6062,24 @@ def setup_modal_queue_route(
                         "modal_parallel_local_branch_node_ids": list(
                             summary.parallel_local_branch_node_ids
                         ),
+                        "remote_execution_assignments": {
+                            component_id: {
+                                "provider": assignment.provider.value,
+                                "environment_id": assignment.environment_id,
+                                "predicted_cost_usd": assignment.predicted_cost_usd,
+                                "predicted_completion_seconds": (
+                                    assignment.predicted_completion_seconds
+                                ),
+                                "worker_index": summary.execution_worker_indices_by_representative.get(
+                                    component_id,
+                                    0,
+                                ),
+                                "reasons": list(assignment.reasons),
+                            }
+                            for component_id, assignment in sorted(
+                                summary.execution_assignments_by_representative.items()
+                            )
+                        },
                         "modal_components": [
                             {
                                 "representative_node_id": representative_node_id,

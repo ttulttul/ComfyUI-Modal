@@ -1,0 +1,419 @@
+"""OCI image construction and warm-worker lifecycle for SSH Docker hosts."""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import shlex
+import tarfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+if __package__:
+    from .remote_hosts import SshHostConfig
+    from .runtime_environment import (
+        COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
+        COMFYUI_RUNTIME_SOURCE_FILES,
+        REMOTE_PYTHON_VERSION,
+        RemoteRuntimeIdentity,
+        build_remote_runtime_identity,
+        custom_node_runtime_packages,
+        remote_accelerator_packages,
+        remote_accelerator_validation_command,
+        remote_apt_packages,
+        remote_runtime_packages,
+        select_remote_torch_build,
+    )
+    from .settings import ModalSyncSettings
+    from .ssh_docker import SshDockerController, SshDockerError
+else:  # pragma: no cover - remote entrypoint compatibility.
+    from remote_hosts import SshHostConfig
+    from runtime_environment import (
+        COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
+        COMFYUI_RUNTIME_SOURCE_FILES,
+        REMOTE_PYTHON_VERSION,
+        RemoteRuntimeIdentity,
+        build_remote_runtime_identity,
+        custom_node_runtime_packages,
+        remote_accelerator_packages,
+        remote_accelerator_validation_command,
+        remote_apt_packages,
+        remote_runtime_packages,
+        select_remote_torch_build,
+    )
+    from settings import ModalSyncSettings
+    from ssh_docker import SshDockerController, SshDockerError
+
+logger = logging.getLogger(__name__)
+
+_REMOTE_REPO_ROOT = Path("/opt/comfy-remote/repo")
+_REMOTE_COMFYUI_ROOT = Path("/opt/comfy-remote/ComfyUI")
+_REMOTE_STORAGE_ROOT = Path("/storage")
+_RUNTIME_LABEL = "comfy.remote.runtime-fingerprint"
+_ENVIRONMENT_LABEL = "comfy.remote.environment-id"
+_WORKER_LABEL = "comfy.remote.worker-index"
+
+
+@dataclass(frozen=True)
+class SshRuntimeSpec:
+    """Describe one immutable SSH worker image and warm container."""
+
+    identity: RemoteRuntimeIdentity
+    image_tag: str
+    container_name: str
+    storage_volume_name: str
+    worker_index: int
+
+
+@dataclass
+class SshRuntimeManager:
+    """Build fingerprinted images and reconcile warm worker containers."""
+
+    controller: SshDockerController
+    repo_root: Path
+    settings: ModalSyncSettings
+
+    def runtime_spec(self, worker_index: int = 0) -> SshRuntimeSpec:
+        """Return the deterministic image and worker identity for one host."""
+        if worker_index < 0:
+            raise ValueError("worker_index must not be negative.")
+        identity = build_remote_runtime_identity(
+            repo_root=self.repo_root,
+            comfyui_root=self.settings.comfyui_root,
+            custom_nodes_dir=self.settings.custom_nodes_dir,
+            settings=self.settings,
+        )
+        fingerprint_short = identity.fingerprint[:16]
+        environment_id = self.controller.host.environment_id
+        return SshRuntimeSpec(
+            identity=identity,
+            image_tag=f"comfy-remote:{fingerprint_short}",
+            container_name=(
+                f"comfy-remote-{environment_id}-{fingerprint_short}-w{worker_index}"
+            ),
+            storage_volume_name=self.controller.host.resolved_storage_volume_name,
+            worker_index=worker_index,
+        )
+
+    def ensure_worker(self, worker_index: int = 0) -> SshRuntimeSpec:
+        """Ensure a compatible image and running warm worker exist."""
+        spec = self.runtime_spec(worker_index)
+        self.controller.ensure_volume(spec.storage_volume_name)
+        if not self._image_is_current(spec):
+            self._build_image(spec)
+        if not self._container_is_current_and_running(spec):
+            self._replace_worker_container(spec)
+        self._wait_until_ready(spec)
+        return spec
+
+    def stop_worker(self, worker_index: int = 0) -> bool:
+        """Stop and remove one exact managed worker container when present."""
+        spec = self.runtime_spec(worker_index)
+        inspected = self.controller.docker(
+            ("container", "inspect", spec.container_name),
+            check=False,
+        )
+        if inspected.returncode != 0:
+            return False
+        self.controller.docker(("rm", "-f", spec.container_name))
+        return True
+
+    def _image_is_current(self, spec: SshRuntimeSpec) -> bool:
+        """Return whether the expected fingerprinted image is available."""
+        result = self.controller.docker(
+            (
+                "image",
+                "inspect",
+                "--format",
+                f'{{{{index .Config.Labels "{_RUNTIME_LABEL}"}}}}',
+                spec.image_tag,
+            ),
+            check=False,
+        )
+        return (
+            result.returncode == 0
+            and result.stdout_text.strip() == spec.identity.fingerprint
+        )
+
+    def _container_is_current_and_running(self, spec: SshRuntimeSpec) -> bool:
+        """Return whether one managed worker is running the expected image."""
+        result = self.controller.docker(
+            ("container", "inspect", spec.container_name),
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        try:
+            payload = json.loads(result.stdout_text)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+            return False
+        container = payload[0]
+        state = container.get("State")
+        config = container.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        return bool(isinstance(state, dict) and state.get("Running")) and bool(
+            isinstance(labels, dict)
+            and labels.get(_RUNTIME_LABEL) == spec.identity.fingerprint
+        )
+
+    def _build_image(self, spec: SshRuntimeSpec) -> None:
+        """Stream a deterministic Docker build context to the remote daemon."""
+        context = self._build_context(spec)
+        logger.info(
+            "Building SSH runtime environment=%s image=%s fingerprint=%s context_bytes=%d.",
+            self.controller.host.environment_id,
+            spec.image_tag,
+            spec.identity.fingerprint,
+            len(context),
+        )
+        self.controller.docker(
+            (
+                "build",
+                "--pull",
+                "--label",
+                f"{_RUNTIME_LABEL}={spec.identity.fingerprint}",
+                "-t",
+                spec.image_tag,
+                "-",
+            ),
+            input_payload=context,
+            timeout_seconds=max(3600.0, self.settings.startup_timeout_seconds),
+        )
+
+    def _build_context(self, spec: SshRuntimeSpec) -> bytes:
+        """Return a tar build context containing only worker runtime sources."""
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            dockerfile = self._dockerfile(spec).encode("utf-8")
+            dockerfile_info = tarfile.TarInfo("Dockerfile")
+            dockerfile_info.size = len(dockerfile)
+            dockerfile_info.mtime = 0
+            dockerfile_info.mode = 0o644
+            archive.addfile(dockerfile_info, io.BytesIO(dockerfile))
+            for source_path, archive_path in self._runtime_context_files():
+                info = archive.gettarinfo(str(source_path), arcname=archive_path)
+                info.mtime = 0
+                with source_path.open("rb") as source_file:
+                    archive.addfile(info, source_file)
+        return output.getvalue()
+
+    def _runtime_context_files(self) -> Iterable[tuple[Path, str]]:
+        """Yield deterministic repository and ComfyUI files for the image."""
+        resolved_repo_root = self.repo_root.resolve()
+        ignored_directory_names = {
+            ".git",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".venv",
+            "__pycache__",
+            "tests",
+        }
+        repo_candidates = sorted(
+            path
+            for path in resolved_repo_root.rglob("*")
+            if path.is_file()
+            and not ignored_directory_names.intersection(
+                path.relative_to(resolved_repo_root).parts
+            )
+            and (
+                path.suffix == ".py"
+                or path.name in {"llm_profiles.json"}
+            )
+        )
+        for source_path in repo_candidates:
+            relative_path = source_path.relative_to(resolved_repo_root).as_posix()
+            yield source_path, f"repo/{relative_path}"
+
+        comfyui_root = self.settings.comfyui_root
+        if comfyui_root is None or not comfyui_root.is_dir():
+            raise SshDockerError(
+                "SSH execution requires a local ComfyUI checkout to build the worker image."
+            )
+        resolved_comfyui_root = comfyui_root.resolve()
+        for source_path in sorted(resolved_comfyui_root.rglob("*")):
+            if not source_path.is_file():
+                continue
+            relative_path = source_path.relative_to(resolved_comfyui_root)
+            top_level_name = relative_path.parts[0]
+            if top_level_name in COMFYUI_RUNTIME_SOURCE_DIRECTORIES:
+                if source_path.suffix != ".py":
+                    continue
+            elif relative_path.as_posix() not in COMFYUI_RUNTIME_SOURCE_FILES:
+                continue
+            if "__pycache__" in relative_path.parts:
+                continue
+            yield source_path, f"comfyui/{relative_path.as_posix()}"
+
+    def _dockerfile(self, spec: SshRuntimeSpec) -> str:
+        """Return the immutable Dockerfile for one runtime identity."""
+        torch_build = select_remote_torch_build(self.settings.modal_gpu)
+        lines = [
+            f"FROM python:{REMOTE_PYTHON_VERSION}-slim-bookworm",
+            "ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1",
+            _docker_run(
+                "apt-get",
+                "update",
+                "&&",
+                "apt-get",
+                "install",
+                "-y",
+                "--no-install-recommends",
+                *remote_apt_packages(),
+                "&&",
+                "rm",
+                "-rf",
+                "/var/lib/apt/lists/*",
+            ),
+            _pip_install(remote_runtime_packages()),
+        ]
+        for layer in torch_build.install_layers:
+            layer_arguments = [
+                "python",
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--index-url",
+                layer.index_url,
+            ]
+            if layer.extra_options:
+                layer_arguments.extend(shlex.split(layer.extra_options))
+            layer_arguments.extend(layer.packages)
+            lines.append(f"RUN {shlex.join(layer_arguments)}")
+        lines.extend(
+            [
+                f"RUN {torch_build.validation_command()}",
+                _pip_install(remote_accelerator_packages(self.settings.modal_gpu)),
+                f"RUN {remote_accelerator_validation_command(self.settings.modal_gpu)}",
+            ]
+        )
+        custom_packages = custom_node_runtime_packages(self.settings.custom_nodes_dir)
+        if custom_packages:
+            lines.append(_pip_install(custom_packages))
+            lines.append(_pip_install(remote_runtime_packages()))
+        lines.extend(
+            [
+                "COPY repo /opt/comfy-remote/repo",
+                "COPY comfyui /opt/comfy-remote/ComfyUI",
+                (
+                    f"ENV PYTHONPATH={_REMOTE_REPO_ROOT}:{_REMOTE_COMFYUI_ROOT} "
+                    f"COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
+                    f"COMFY_MODAL_COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
+                    f"COMFY_MODAL_LOCAL_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
+                    f"COMFY_MODAL_REMOTE_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
+                    "COMFY_MODAL_EXECUTION_MODE=local COMFY_MODAL_REMOTE_WORKER=1 "
+                    f"COMFY_MODAL_RUNTIME_FINGERPRINT={spec.identity.fingerprint}"
+                ),
+                "WORKDIR /opt/comfy-remote/repo",
+                "ENTRYPOINT [\"python\",\"-m\",\"remote.ssh_worker\",\"serve\"]",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _replace_worker_container(self, spec: SshRuntimeSpec) -> None:
+        """Replace one exact managed worker with a compatible warm container."""
+        existing = self.controller.docker(
+            ("container", "inspect", spec.container_name),
+            check=False,
+        )
+        if existing.returncode == 0:
+            self.controller.docker(("rm", "-f", spec.container_name))
+        gpu_arguments = self._gpu_arguments(spec.worker_index)
+        self.controller.docker(
+            (
+                "run",
+                "-d",
+                "--name",
+                spec.container_name,
+                "--restart",
+                "unless-stopped",
+                "--init",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--shm-size",
+                "8g",
+                "--label",
+                f"{_RUNTIME_LABEL}={spec.identity.fingerprint}",
+                "--label",
+                f"{_ENVIRONMENT_LABEL}={self.controller.host.environment_id}",
+                "--label",
+                f"{_WORKER_LABEL}={spec.worker_index}",
+                "-v",
+                f"{spec.storage_volume_name}:{_REMOTE_STORAGE_ROOT}",
+                *gpu_arguments,
+                spec.image_tag,
+            ),
+            timeout_seconds=120.0,
+        )
+
+    def _gpu_arguments(self, worker_index: int) -> tuple[str, ...]:
+        """Return Docker GPU-selection arguments for this worker."""
+        capabilities = self.controller.host.capabilities
+        if capabilities is None or not capabilities.gpus:
+            return ()
+        gpu = capabilities.gpus[worker_index % len(capabilities.gpus)]
+        return ("--gpus", f"device={gpu.uuid}")
+
+    def _wait_until_ready(self, spec: SshRuntimeSpec) -> None:
+        """Wait for the worker socket and verify its runtime fingerprint."""
+        deadline = time.monotonic() + self.settings.startup_timeout_seconds
+        last_error = "worker has not responded"
+        while time.monotonic() < deadline:
+            result = self.controller.docker(
+                (
+                    "exec",
+                    spec.container_name,
+                    "python",
+                    "-m",
+                    "remote.ssh_worker",
+                    "runtime-info",
+                ),
+                check=False,
+            )
+            if result.returncode == 0:
+                try:
+                    runtime = json.loads(result.stdout_text)
+                except json.JSONDecodeError:
+                    last_error = "worker returned invalid runtime metadata"
+                else:
+                    if runtime.get("runtime_fingerprint") == spec.identity.fingerprint:
+                        return
+                    last_error = "worker fingerprint does not match the requested runtime"
+            else:
+                last_error = result.stderr_text.strip() or "worker is still starting"
+            time.sleep(0.5)
+        raise SshDockerError(
+            f"SSH worker {spec.container_name!r} did not become ready: {last_error}."
+        )
+
+
+def _pip_install(packages: Iterable[str]) -> str:
+    """Return one deterministic Docker RUN instruction for pip packages."""
+    arguments = [
+        "python",
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        *packages,
+    ]
+    return f"RUN {shlex.join(arguments)}"
+
+
+def _docker_run(*arguments: str) -> str:
+    """Return one Docker RUN line with explicit shell operators preserved."""
+    rendered = " ".join(
+        argument if argument in {"&&", "||", ";"} else shlex.quote(argument)
+        for argument in arguments
+    )
+    return f"RUN {rendered}"

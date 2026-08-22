@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { PromptExecutionError, api } from "../../scripts/api.js";
+import { openRemoteEnvironmentManager } from "./remote_environments.js";
 
 const REMOTE_PROPERTY = "is_modal_remote";
 const REMOTE_WIDGET_NAME = "Run on Modal";
@@ -15,6 +16,14 @@ const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
 const LOCAL_MODAL_NODE_IDS = new Set(["ModalEndpointChat"]);
 const WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal";
 const WORKFLOW_MODAL_GPU_KEY = "gpu";
+const WORKFLOW_REMOTE_CONFIG_KEY = "remote_execution";
+const WORKFLOW_REMOTE_POLICY_KEY = "policy";
+const WORKFLOW_REMOTE_AUTO_PLACE_KEY = "auto_place";
+const EXECUTION_POLICIES = [
+  ["modal", "Modal only"],
+  ["self_hosted", "Self-hosted only"],
+  ["automatic", "Automatic (lowest cost compatible)"],
+];
 const DEFAULT_MODAL_GPU = "RTX-PRO-6000";
 const MODAL_GPU_TYPES = [
   "T4",
@@ -2763,6 +2772,15 @@ function extractRemoteNodeIds(workflow) {
   return remoteNodeIds;
 }
 
+/** Return remote ids used for immediate UI state, including automatic placement. */
+function effectiveRemoteNodeIds(prompt, workflow) {
+  const preferences = selectedExecutionPreferences(workflow);
+  if (preferences.autoPlace) {
+    return Object.keys(prompt ?? {});
+  }
+  return extractRemoteNodeIds(workflow);
+}
+
 /**
  * Return the user-visible Modal toggle value from a serialized workflow node.
  * @param {object | undefined} node
@@ -2782,6 +2800,37 @@ function serializedRemoteFlag(node) {
  */
 function rootGraph() {
   return app.rootGraph ?? app.graph?.rootGraph ?? app.graph ?? null;
+}
+
+/** Return generic execution preferences persisted in the workflow graph. */
+function selectedExecutionPreferences(workflow = null) {
+  const workflowContainer = workflow ?? rootGraph();
+  const remoteConfig = workflowContainer?.extra?.[WORKFLOW_REMOTE_CONFIG_KEY] ?? {};
+  const policy = EXECUTION_POLICIES.some(([value]) => value === remoteConfig[WORKFLOW_REMOTE_POLICY_KEY])
+    ? remoteConfig[WORKFLOW_REMOTE_POLICY_KEY]
+    : "modal";
+  return {
+    policy,
+    autoPlace: Boolean(remoteConfig[WORKFLOW_REMOTE_AUTO_PLACE_KEY]),
+  };
+}
+
+/** Persist one provider policy or automatic-placement change on the root graph. */
+function setExecutionPreferences(updates) {
+  const graph = rootGraph();
+  if (!graph) {
+    throw new Error("The workflow graph is unavailable.");
+  }
+  const current = selectedExecutionPreferences(graph);
+  const next = { ...current, ...updates };
+  graph.extra ||= {};
+  graph.extra[WORKFLOW_REMOTE_CONFIG_KEY] ||= {};
+  graph.extra[WORKFLOW_REMOTE_CONFIG_KEY][WORKFLOW_REMOTE_POLICY_KEY] = next.policy;
+  graph.extra[WORKFLOW_REMOTE_CONFIG_KEY][WORKFLOW_REMOTE_AUTO_PLACE_KEY] = next.autoPlace;
+  graph.change?.();
+  app.graph?.setDirtyCanvas?.(true, true);
+  const label = EXECUTION_POLICIES.find(([value]) => value === next.policy)?.[1] ?? next.policy;
+  notifyModal(`Remote execution policy: ${label}; automatic placement ${next.autoPlace ? "on" : "off"}.`);
 }
 
 /**
@@ -3229,6 +3278,45 @@ function installModalContextMenu(nodeType, nodeData) {
       selectedNodePaths.length > 1
         ? "Disable on Upstream Nodes for Selection"
         : "Disable on Upstream Nodes";
+    if (!targetOptions.some((option) => option?.content === "Remote Execution")) {
+      const executionPreferences = selectedExecutionPreferences();
+      targetOptions.push(null, {
+        content: "Remote Execution",
+        has_submenu: true,
+        submenu: {
+          options: [
+            {
+              content: "Provider policy",
+              has_submenu: true,
+              submenu: {
+                options: EXECUTION_POLICIES.map(([value, label]) => ({
+                  content: label,
+                  checked: executionPreferences.policy === value,
+                  callback: () => setExecutionPreferences({ policy: value }),
+                })),
+              },
+            },
+            {
+              content: "Automatically place eligible nodes",
+              checked: executionPreferences.autoPlace,
+              callback: () => setExecutionPreferences({
+                autoPlace: !selectedExecutionPreferences().autoPlace,
+              }),
+            },
+            null,
+            {
+              content: "Manage SSH hosts…",
+              callback: () => {
+                void openRemoteEnvironmentManager().catch((error) => {
+                  console.error("Remote environment manager failed.", error);
+                  notifyModal(`Remote environment manager failed: ${String(error?.message ?? error)}`);
+                });
+              },
+            },
+          ],
+        },
+      });
+    }
     if (!targetOptions.some((option) => option?.content === "Modal")) {
       const currentModalGpu = selectedModalGpu();
       targetOptions.push(null, {
@@ -4823,7 +4911,7 @@ function patchQueuePrompt() {
     const promptId = createPromptId();
     clearPromptTerminal(promptId);
     clearSupersededCancellingPrompts(promptId);
-    const remoteNodeIds = extractRemoteNodeIds(workflow);
+    const remoteNodeIds = effectiveRemoteNodeIds(prompt, workflow);
     registerPromptComponents(promptId, remoteNodeIds, []);
     const queuedBehindActiveModal =
       remoteNodeIds.length > 0 && markPromptQueuedBehindActiveModal(promptId);
@@ -4878,6 +4966,12 @@ function patchQueuePrompt() {
         const acceptedModalGpu = MODAL_GPU_TYPES.includes(responsePayload.modal_gpu)
           ? responsePayload.modal_gpu
           : modalGpu;
+        const executionAssignments = Object.values(
+          responsePayload.remote_execution_assignments ?? {},
+        );
+        const usesSshExecution = executionAssignments.some(
+          (assignment) => assignment?.provider === "ssh_docker",
+        );
         const resolvedRemoteNodeIds = (responsePayload.modal_remote_node_ids ?? []).map((nodeIdValue) =>
           String(nodeIdValue),
         );
@@ -4895,10 +4989,17 @@ function patchQueuePrompt() {
           promptState.remoteNodeIds.length > 0 ? promptState.remoteNodeIds : remoteNodeIds;
         if (!isPromptQueuedBehindActiveModal(promptId)) {
           endSyntheticExecutionUi(promptId);
-          setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
-            message: "Waiting for Modal startup",
-            modalGpu: acceptedModalGpu,
-          });
+          if (usesSshExecution) {
+            setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
+              message: "Waiting for self-hosted worker",
+              modalGpu: null,
+            });
+          } else {
+            setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
+              message: "Waiting for Modal startup",
+              modalGpu: acceptedModalGpu,
+            });
+          }
           setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);
         }
       }

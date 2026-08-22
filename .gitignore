@@ -27,10 +27,14 @@
 !/modal_sdk.py
 !/output_artifacts.py
 !/remote_hosts.py
+!/remote_protocol.py
 !/runtime_environment.py
 !/serialization.py
 !/settings.py
 !/session_state.py
+!/ssh_docker.py
+!/ssh_executor.py
+!/ssh_runtime.py
 !/sync_engine.py
 
 !/docs/

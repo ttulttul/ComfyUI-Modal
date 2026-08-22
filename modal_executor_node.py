@@ -77,7 +77,61 @@ class ModalRemoteExecutorClient:
         return deserialize_node_outputs(response)
 
 
-_REMOTE_EXECUTOR_CLIENT_FACTORY: Callable[[], RemoteExecutorClient] = ModalRemoteExecutorClient
+class RemoteExecutorRouterClient:
+    """Route one proxy payload to its selected execution provider."""
+
+    def execute_payload(
+        self,
+        payload: Mapping[str, Any],
+        kwargs: Mapping[str, Any],
+    ) -> Sequence[Any]:
+        """Execute one payload through Modal or an assigned SSH Docker host."""
+        client = self._client_for_payload(payload)
+        return client.execute_payload(payload, kwargs)
+
+    async def execute_payload_async(
+        self,
+        payload: Mapping[str, Any],
+        kwargs: Mapping[str, Any],
+    ) -> Sequence[Any]:
+        """Execute one payload asynchronously through its selected provider."""
+        client = self._client_for_payload(payload)
+        execute_async = getattr(client, "execute_payload_async", None)
+        if callable(execute_async):
+            result = execute_async(payload, kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        return await asyncio.to_thread(client.execute_payload, payload, kwargs)
+
+    def _client_for_payload(self, payload: Mapping[str, Any]) -> RemoteExecutorClient:
+        """Instantiate the provider client selected by one planned payload."""
+        provider = str(payload.get("execution_provider") or "modal").strip().lower()
+        if provider == "modal":
+            return ModalRemoteExecutorClient()
+        if provider != "ssh_docker":
+            raise ValueError(f"Unsupported remote execution provider {provider!r}.")
+
+        from pathlib import Path
+
+        from .remote_hosts import RemoteHostRegistry
+        from .settings import discover_comfyui_user_directory, get_settings
+        from .ssh_executor import SshDockerExecutorClient
+
+        settings = get_settings()
+        user_directory = discover_comfyui_user_directory(settings)
+        if user_directory is None:
+            raise RuntimeError(
+                "SSH execution requires a persistent ComfyUI user directory."
+            )
+        return SshDockerExecutorClient(
+            registry=RemoteHostRegistry.for_user_directory(user_directory),
+            repo_root=Path(__file__).resolve().parent,
+            settings=settings,
+        )
+
+
+_REMOTE_EXECUTOR_CLIENT_FACTORY: Callable[[], RemoteExecutorClient] = RemoteExecutorRouterClient
 _PROXY_NODE_CACHE: dict[str, type[io.ComfyNode]] = {}
 _PROXY_EXECUTION_CONTEXTS_LOCK = threading.Lock()
 _PROXY_EXECUTION_CONTEXTS: dict[str, "_ProxyExecutionContext"] = {}
@@ -118,7 +172,7 @@ def set_remote_executor_client_factory(
 ) -> None:
     """Install a custom client factory, primarily for tests."""
     global _REMOTE_EXECUTOR_CLIENT_FACTORY
-    _REMOTE_EXECUTOR_CLIENT_FACTORY = factory or ModalRemoteExecutorClient
+    _REMOTE_EXECUTOR_CLIENT_FACTORY = factory or RemoteExecutorRouterClient
 
 
 def get_remote_executor_client() -> RemoteExecutorClient:

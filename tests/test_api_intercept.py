@@ -167,6 +167,195 @@ class _FakeRemoteArtifactWriterNode:
     OUTPUT_NODE = False
 
 
+def test_auto_placement_selects_every_eligible_prompt_node(
+    api_intercept_module: Any,
+) -> None:
+    """Workflow auto placement should not require per-node remote toggles."""
+    prompt = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+        "3": {"class_type": "ModalEndpointChat", "inputs": {}},
+    }
+    workflow = {
+        "extra": {
+            "remote_execution": {
+                "policy": "automatic",
+                "auto_place": True,
+            }
+        },
+        "nodes": [],
+    }
+
+    selected = api_intercept_module.requested_remote_node_ids(
+        prompt=prompt,
+        workflow=workflow,
+        settings=SimpleNamespace(marker_property="is_modal_remote"),
+    )
+
+    assert selected == {"1", "2"}
+
+
+def test_disabled_auto_placement_preserves_explicit_markers(
+    api_intercept_module: Any,
+) -> None:
+    """Manual workflows should continue honoring the existing node property."""
+    prompt = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
+        "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+    }
+    workflow = {
+        "extra": {"remote_execution": {"policy": "self_hosted", "auto_place": False}},
+        "nodes": [
+            {"id": 1, "properties": {"is_modal_remote": False}},
+            {"id": 2, "properties": {"is_modal_remote": True}},
+        ],
+    }
+
+    selected = api_intercept_module.requested_remote_node_ids(
+        prompt=prompt,
+        workflow=workflow,
+        settings=SimpleNamespace(marker_property="is_modal_remote"),
+    )
+
+    assert selected == {"2"}
+
+
+def test_remote_environment_routes_save_and_probe_hosts(
+    api_intercept_module: Any,
+    remote_hosts_module: Any,
+    execution_environments_module: Any,
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The ComfyUI API should persist and refresh credential-free SSH hosts."""
+
+    class FakeRoutes:
+        """Capture handlers by HTTP method and route."""
+
+        def __init__(self) -> None:
+            """Initialize an empty handler map."""
+            self.handlers: dict[tuple[str, str], Any] = {}
+
+        def _decorator(self, method: str, path: str) -> Any:
+            """Return one route registration decorator."""
+
+            def register(handler: Any) -> Any:
+                """Store and return one handler."""
+                self.handlers[(method, path)] = handler
+                return handler
+
+            return register
+
+        def get(self, path: str) -> Any:
+            """Register one GET route."""
+            return self._decorator("GET", path)
+
+        def put(self, path: str) -> Any:
+            """Register one PUT route."""
+            return self._decorator("PUT", path)
+
+        def post(self, path: str) -> Any:
+            """Register one POST route."""
+            return self._decorator("POST", path)
+
+    class FakeRequest:
+        """Return one predefined JSON body."""
+
+        def __init__(self, payload: dict[str, Any]) -> None:
+            """Store the request body."""
+            self.payload = payload
+            self.query: dict[str, str] = {}
+
+        async def json(self) -> dict[str, Any]:
+            """Return the request body."""
+            return self.payload
+
+    registry = remote_hosts_module.RemoteHostRegistry.for_user_directory(tmp_path)
+    routes = FakeRoutes()
+    prompt_server = SimpleNamespace(routes=routes, prompt_queue=None)
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    capabilities = execution_environments_module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=60 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+    )
+
+    class FakeController:
+        """Return fixed capabilities without opening SSH."""
+
+        def __init__(self, host: Any) -> None:
+            """Retain the selected host."""
+            self.host = host
+
+        def probe_capabilities(self) -> Any:
+            """Return fixed ready capabilities."""
+            return capabilities
+
+    monkeypatch.setattr(api_intercept_module, "_ROUTE_REGISTERED", False)
+    monkeypatch.setattr(api_intercept_module, "_ssh_host_registry", lambda _settings: registry)
+    monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_get_server_module",
+        lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
+    )
+
+    api_intercept_module.setup_modal_queue_route(
+        prompt_server=prompt_server,
+        sync_engine=object(),
+        settings=settings,
+    )
+    update = routes.handlers[("PUT", "/remote/environments")]
+    update_response = asyncio.run(
+        update(
+            FakeRequest(
+                {
+                    "version": 1,
+                    "hosts": [
+                        {
+                            "environment_id": "gpu-one",
+                            "display_name": "GPU one",
+                            "ssh_target": "gpu-one",
+                        }
+                    ],
+                }
+            )
+        )
+    )
+    probe = routes.handlers[("POST", "/remote/environments/probe")]
+    probe_response = asyncio.run(
+        probe(FakeRequest({"environment_id": "gpu-one"}))
+    )
+
+    assert update_response.status == 200
+    assert probe_response.status == 200
+    assert registry.get_host("gpu-one").health.value == "ready"
+    assert registry.get_host("gpu-one").capabilities == capabilities
+
+
 def test_planner_keeps_unmarked_llm_local_between_remote_text_nodes(
     api_intercept_module: Any,
 ) -> None:

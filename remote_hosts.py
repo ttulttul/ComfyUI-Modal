@@ -90,13 +90,33 @@ class SshHostConfig:
     def scheduling_state(self) -> EnvironmentSchedulingState:
         """Return the scheduler-facing view of this host."""
         health = EnvironmentHealth.DRAINING if self.draining else self.health
+        capabilities = self.capabilities
+        if capabilities is not None and self.reserve_vram_bytes:
+            capabilities = replace(
+                capabilities,
+                gpus=tuple(
+                    replace(
+                        gpu,
+                        total_vram_bytes=max(
+                            0,
+                            gpu.total_vram_bytes - self.reserve_vram_bytes,
+                        ),
+                        free_vram_bytes=(
+                            max(0, gpu.free_vram_bytes - self.reserve_vram_bytes)
+                            if gpu.free_vram_bytes is not None
+                            else None
+                        ),
+                    )
+                    for gpu in capabilities.gpus
+                ),
+            )
         return EnvironmentSchedulingState(
             environment_id=self.environment_id,
             provider=ExecutionProvider.SSH_DOCKER,
             enabled=self.enabled,
             health=health,
             cost_usd_per_second=self.cost_usd_per_second,
-            capabilities=self.capabilities,
+            capabilities=capabilities,
             tags=self.tags,
             maximum_workers=self.maximum_workers,
         )

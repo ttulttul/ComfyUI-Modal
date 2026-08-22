@@ -997,15 +997,17 @@ class ModalAssetSyncEngine:
             cached_prefix = self._sync_scope_prefix_cache
             if cached_prefix is not None:
                 return cached_prefix
-            if self.settings.execution_mode != "remote" or not isinstance(self.volume, ModalVolumeBackend):
-                cached_prefix = f"local:{self.settings.local_storage_root.resolve()}"
-            else:
+            if isinstance(self.volume, ModalVolumeBackend) or bool(
+                getattr(self.volume, "remote_volume_epoch_scoped", False)
+            ):
                 cached_prefix = self._ensure_remote_volume_epoch_scope()
+            else:
+                cached_prefix = f"local:{self.settings.local_storage_root.resolve()}"
             self._sync_scope_prefix_cache = cached_prefix
             return cached_prefix
 
     def _ensure_remote_volume_epoch_scope(self) -> str:
-        """Return a sync-index prefix tied to the currently mounted Modal volume contents."""
+        """Return a sync-index prefix tied to the active remote volume contents."""
         fixed_key = f"{self.settings.volume_name}:current_volume_epoch"
         current_record = self._lookup_sync_record(fixed_key)
         if current_record is not None:
@@ -1020,7 +1022,7 @@ class ModalAssetSyncEngine:
             ):
                 return f"{self.settings.volume_name}:epoch:{epoch}"
             logger.warning(
-                "Discarding stale Modal sync-index volume epoch for volume=%s because sentinel %s is missing.",
+                "Discarding stale remote sync-index volume epoch for volume=%s because sentinel %s is missing.",
                 self.settings.volume_name,
                 sentinel_path,
             )
@@ -1047,7 +1049,7 @@ class ModalAssetSyncEngine:
             },
         )
         logger.info(
-            "Initialized Modal sync-index volume epoch %s for volume=%s sentinel=%s.",
+            "Initialized remote sync-index volume epoch %s for volume=%s sentinel=%s.",
             epoch,
             self.settings.volume_name,
             sentinel_path,
