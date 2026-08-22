@@ -10,6 +10,7 @@
 !/api_intercept.py
 !/comfyui_modal_sync_cloud.py
 !/durable_state.py
+!/execution_environments.py
 !/instance_identity.py
 !/llm_profiles.json
 !/llm_profiles.py
@@ -25,6 +26,7 @@
 !/modal_llm_runtime.py
 !/modal_sdk.py
 !/output_artifacts.py
+!/remote_hosts.py
 !/runtime_environment.py
 !/serialization.py
 !/settings.py

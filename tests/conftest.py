@@ -113,6 +113,18 @@ def instance_identity_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def execution_environments_module(extension_package: object) -> object:
+    """Return the provider-neutral execution environment module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.execution_environments")
+
+
+@pytest.fixture(scope="session")
+def remote_hosts_module(extension_package: object) -> object:
+    """Return the persistent SSH host registry module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote_hosts")
+
+
+@pytest.fixture(scope="session")
 def api_intercept_module(extension_package: object) -> object:
     """Return the prompt interception module."""
     return importlib.import_module(f"{PACKAGE_NAME}.api_intercept")

@@ -444,6 +444,13 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 
 Manage the project with `uv`.
 
+The `add-generic-execution-environments` development line is introducing a
+provider-neutral execution model alongside Modal. Remote environment records
+deliberately contain only SSH destinations, scheduling limits, tags, discovered
+capabilities, and user-supplied cost rates. SSH authentication remains in the
+user's normal SSH configuration and agent; private keys and passwords are not
+stored in workflows or node-pack configuration.
+
 ```bash
 uv sync --group test
 uv run pytest
