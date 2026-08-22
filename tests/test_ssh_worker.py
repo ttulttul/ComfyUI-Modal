@@ -3,8 +3,36 @@
 from __future__ import annotations
 
 import io
+import json
+import os
+from pathlib import Path
 import socket
+import subprocess
+import sys
 from typing import Any
+
+
+def test_top_level_worker_entrypoint_reports_runtime_info() -> None:
+    """The OCI entrypoint must import when the repository is a top-level path."""
+    repo_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(repo_root)
+    environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] = "test-fingerprint"
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "remote.ssh_worker", "runtime-info"],
+        cwd=repo_root,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        text=True,
+        timeout=15,
+    )
+
+    runtime_info = json.loads(completed.stdout)
+    assert runtime_info["runtime_fingerprint"] == "test-fingerprint"
+    assert runtime_info["protocol_version"] > 0
 
 
 def test_worker_execution_state_registers_and_cancels(ssh_worker_module: Any) -> None:
