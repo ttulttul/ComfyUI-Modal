@@ -267,7 +267,10 @@ class SshRuntimeManager:
             if top_level_name in COMFYUI_RUNTIME_SOURCE_DIRECTORIES:
                 if source_path.suffix != ".py":
                     continue
-            elif relative_path.as_posix() not in COMFYUI_RUNTIME_SOURCE_FILES:
+            elif (
+                source_path.suffix != ".py"
+                and relative_path.as_posix() not in COMFYUI_RUNTIME_SOURCE_FILES
+            ):
                 continue
             if "__pycache__" in relative_path.parts:
                 continue

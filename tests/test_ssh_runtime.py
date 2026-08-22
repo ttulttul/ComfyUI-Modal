@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,6 +37,50 @@ def test_worker_build_loads_image_into_the_remote_daemon(
     arguments, kwargs = calls[0]
     assert arguments[:3] == ("build", "--pull", "--load")
     assert kwargs["input_payload"] == b"context"
+
+
+def test_worker_context_includes_top_level_comfyui_python_modules(
+    ssh_runtime_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The SSH image must contain modules imported by headless ComfyUI startup."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    repo_root.mkdir()
+    comfyui_root.mkdir()
+    (repo_root / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+    for module_name in ("execution.py", "folder_paths.py", "nodes.py", "server.py"):
+        (comfyui_root / module_name).write_text("VALUE = 1\n", encoding="utf-8")
+    (comfyui_root / "requirements.txt").write_text(
+        "aiohttp==3.13.3\n",
+        encoding="utf-8",
+    )
+    (comfyui_root / "README.md").write_text("not runtime source\n", encoding="utf-8")
+    comfy_package = comfyui_root / "comfy"
+    comfy_package.mkdir()
+    (comfy_package / "__init__.py").write_text("", encoding="utf-8")
+    (comfy_package / "data.json").write_text("{}\n", encoding="utf-8")
+
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(),
+        repo_root=repo_root,
+        settings=SimpleNamespace(comfyui_root=comfyui_root),
+    )
+
+    archive_paths = {
+        archive_path for _, archive_path in manager._runtime_context_files()
+    }
+
+    assert {
+        "comfyui/execution.py",
+        "comfyui/folder_paths.py",
+        "comfyui/nodes.py",
+        "comfyui/server.py",
+        "comfyui/requirements.txt",
+        "comfyui/comfy/__init__.py",
+    }.issubset(archive_paths)
+    assert "comfyui/README.md" not in archive_paths
+    assert "comfyui/comfy/data.json" not in archive_paths
 
 
 def test_worker_indices_are_distributed_across_discovered_gpus(
