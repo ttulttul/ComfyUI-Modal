@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shlex
 import subprocess
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -48,6 +48,29 @@ class SshCommandResult:
     def stderr_text(self) -> str:
         """Decode standard error as UTF-8 text."""
         return self.stderr.decode("utf-8", errors="replace")
+
+
+@dataclass(frozen=True)
+class SshManagedWorkerStatus:
+    """Describe one node-pack-managed Docker worker on an SSH host."""
+
+    container_name: str
+    image: str
+    state: str
+    status: str
+    runtime_fingerprint: str | None
+    worker_index: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible worker status record."""
+        return {
+            "container_name": self.container_name,
+            "image": self.image,
+            "state": self.state,
+            "status": self.status,
+            "runtime_fingerprint": self.runtime_fingerprint,
+            "worker_index": self.worker_index,
+        }
 
 
 @dataclass
@@ -159,7 +182,6 @@ class SshDockerController:
 
     def probe_capabilities(self) -> EnvironmentCapabilities:
         """Discover host, Docker, RAM, disk, and NVIDIA GPU capabilities."""
-        runner = self._runner()
         docker_info = self._docker_info()
         architecture = self._text_command(("uname", "-m"))
         operating_system = self._text_command(("uname", "-s")).lower()
@@ -182,6 +204,7 @@ class SshDockerController:
             or docker_info.get("ServerVersionRaw")
             or "unknown"
         ).strip()
+        reported_cost = _reported_cost_usd_per_second(docker_info)
         return EnvironmentCapabilities(
             architecture=architecture,
             operating_system=operating_system,
@@ -196,6 +219,7 @@ class SshDockerController:
             ),
             gpus=tuple(gpus),
             probed_at_epoch=time.time(),
+            reported_cost_usd_per_second=reported_cost,
         )
 
     def ensure_volume(self, volume_name: str) -> str:
@@ -208,6 +232,56 @@ class SshDockerController:
                 f"Docker returned unexpected volume name {created_name!r}."
             )
         return normalized_name
+
+    def list_managed_workers(self) -> tuple[SshManagedWorkerStatus, ...]:
+        """Return containers carrying this environment's ownership label."""
+        result = self.docker(
+            (
+                "ps",
+                "-a",
+                "--filter",
+                f"label=comfy.remote.environment-id={self.host.environment_id}",
+                "--format",
+                "{{json .}}",
+            )
+        )
+        workers: list[SshManagedWorkerStatus] = []
+        for line in result.stdout_text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SshDockerError(
+                    "Docker returned invalid managed-worker status JSON."
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise SshDockerError(
+                    "Docker returned a non-object managed-worker status record."
+                )
+            workers.append(_managed_worker_status_from_payload(payload))
+        return tuple(
+            sorted(
+                workers,
+                key=lambda worker: (
+                    worker.worker_index if worker.worker_index is not None else 10**9,
+                    worker.container_name,
+                ),
+            )
+        )
+
+    def remove_managed_worker(self, container_name: str) -> None:
+        """Remove one exact managed container after validating its ownership label."""
+        normalized_name = _validated_docker_object_name(container_name)
+        managed_names = {
+            worker.container_name for worker in self.list_managed_workers()
+        }
+        if normalized_name not in managed_names:
+            raise SshDockerError(
+                f"Container {normalized_name!r} is not managed by environment "
+                f"{self.host.environment_id!r}."
+            )
+        self.docker(("rm", "-f", normalized_name))
 
     def docker(
         self,
@@ -440,6 +514,56 @@ def _validated_docker_object_name(name: str) -> str:
     ):
         raise ValueError(f"Unsafe Docker object name {name!r}.")
     return normalized
+
+
+def _parse_docker_label_text(value: str) -> dict[str, str]:
+    """Parse Docker's comma-separated label rendering into a mapping."""
+    labels: dict[str, str] = {}
+    for item in value.split(","):
+        key, separator, label_value = item.partition("=")
+        if not separator or not key.strip():
+            continue
+        labels[key.strip()] = label_value.strip()
+    return labels
+
+
+def _reported_cost_usd_per_second(docker_info: Mapping[str, Any]) -> float | None:
+    """Return an infrastructure-reported cost from a Docker daemon label."""
+    raw_labels = docker_info.get("Labels")
+    label_values = raw_labels if isinstance(raw_labels, list) else []
+    labels = _parse_docker_label_text(",".join(str(value) for value in label_values))
+    raw_cost = labels.get("comfy.remote.cost-usd-per-second")
+    if raw_cost is None:
+        return None
+    try:
+        cost = float(raw_cost)
+    except ValueError:
+        logger.warning("Ignoring invalid Docker host cost label %r.", raw_cost)
+        return None
+    if not math.isfinite(cost) or cost < 0:
+        logger.warning("Ignoring invalid Docker host cost label %r.", raw_cost)
+        return None
+    return cost
+
+
+def _managed_worker_status_from_payload(
+    payload: Mapping[str, Any],
+) -> SshManagedWorkerStatus:
+    """Normalize one Docker `ps --format json` record."""
+    labels = _parse_docker_label_text(str(payload.get("Labels") or ""))
+    raw_worker_index = labels.get("comfy.remote.worker-index")
+    try:
+        worker_index = int(raw_worker_index) if raw_worker_index is not None else None
+    except ValueError:
+        worker_index = None
+    return SshManagedWorkerStatus(
+        container_name=str(payload.get("Names") or "").strip(),
+        image=str(payload.get("Image") or "").strip(),
+        state=str(payload.get("State") or "unknown").strip().lower(),
+        status=str(payload.get("Status") or "unknown").strip(),
+        runtime_fingerprint=labels.get("comfy.remote.runtime-fingerprint"),
+        worker_index=worker_index,
+    )
 
 
 def _parse_positive_int(value: str, field_name: str) -> int:

@@ -43,3 +43,76 @@ def test_worker_indices_are_distributed_across_discovered_gpus(
     assert manager._gpu_arguments(0) == ("--gpus", "device=GPU-one")
     assert manager._gpu_arguments(1) == ("--gpus", "device=GPU-two")
     assert manager._gpu_arguments(2) == ("--gpus", "device=GPU-one")
+
+
+def test_stale_worker_reconciliation_only_replaces_the_same_slot(
+    ssh_runtime_module: Any,
+) -> None:
+    """A new fingerprint should retire its superseded logical worker container."""
+    current = SimpleNamespace(
+        worker_index=1,
+        container_name="comfy-remote-host-new-w1",
+    )
+    workers = (
+        SimpleNamespace(worker_index=0, container_name="comfy-remote-host-old-w0"),
+        SimpleNamespace(worker_index=1, container_name="comfy-remote-host-old-w1"),
+        SimpleNamespace(worker_index=1, container_name=current.container_name),
+    )
+    removed: list[str] = []
+    controller = SimpleNamespace(
+        host=SimpleNamespace(environment_id="host"),
+        list_managed_workers=lambda: workers,
+        remove_managed_worker=removed.append,
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=controller,
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+
+    manager._remove_stale_worker_containers(current)
+
+    assert removed == ["comfy-remote-host-old-w1"]
+
+
+def test_stop_all_workers_removes_only_controller_managed_names(
+    ssh_runtime_module: Any,
+) -> None:
+    """Environment shutdown should delegate every ownership check to the controller."""
+    workers = (
+        SimpleNamespace(container_name="worker-one"),
+        SimpleNamespace(container_name="worker-two"),
+    )
+    removed: list[str] = []
+    controller = SimpleNamespace(
+        list_managed_workers=lambda: workers,
+        remove_managed_worker=removed.append,
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=controller,
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+
+    result = manager.stop_all_workers()
+
+    assert result == ("worker-one", "worker-two")
+    assert removed == ["worker-one", "worker-two"]
+
+
+def test_runtime_passes_only_remote_environment_file_path(
+    ssh_runtime_module: Any,
+) -> None:
+    """Worker secrets should remain in an administrator-managed file on the host."""
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(
+            host=SimpleNamespace(docker_env_file="/etc/comfy/worker.env")
+        ),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+
+    assert manager._environment_file_arguments() == (
+        "--env-file",
+        "/etc/comfy/worker.env",
+    )

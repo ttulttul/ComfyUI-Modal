@@ -37,6 +37,7 @@ class _FakeRunner:
                     "ServerVersion": "28.1.0",
                     "Runtimes": {"nvidia": {}, "runc": {}},
                     "SecurityOptions": ["name=seccomp"],
+                    "Labels": ["comfy.remote.cost-usd-per-second=0.00025"],
                 }
             ).encode()
         elif command == ("uname", "-m"):
@@ -52,6 +53,25 @@ class _FakeRunner:
         elif command[0] == "nvidia-smi":
             stdout = b"GPU-123, NVIDIA RTX 6000 Ada, 49140, 48000, 8.9, 580.95\n"
         elif command[:3] == ("docker", "volume", "create"):
+            stdout = f"{command[3]}\n".encode()
+        elif command[:2] == ("docker", "ps"):
+            stdout = (
+                json.dumps(
+                    {
+                        "Names": "comfy-remote-gpu-host-deadbeef-w1",
+                        "Image": "comfy-remote:deadbeef",
+                        "State": "running",
+                        "Status": "Up 3 minutes",
+                        "Labels": (
+                            "comfy.remote.environment-id=gpu-host,"
+                            "comfy.remote.runtime-fingerprint=deadbeef,"
+                            "comfy.remote.worker-index=1"
+                        ),
+                    }
+                ).encode()
+                + b"\n"
+            )
+        elif command[:3] == ("docker", "rm", "-f"):
             stdout = f"{command[3]}\n".encode()
         elif command[:2] == ("docker", "run"):
             stdout = b""
@@ -92,6 +112,7 @@ def test_probe_discovers_host_docker_memory_and_gpu(
     assert capabilities.available_disk_bytes == 1900000 * 1024
     assert capabilities.nvidia_container_runtime is True
     assert capabilities.gpus[0].total_vram_bytes == 49140 * 1024**2
+    assert capabilities.reported_cost_usd_per_second == 0.00025
 
 
 def test_volume_upload_streams_payload_without_embedding_it_in_arguments(
@@ -148,3 +169,43 @@ def test_put_file_requires_a_regular_local_file(
 
     with pytest.raises(FileNotFoundError):
         volume.put_file(tmp_path / "missing.bin", "/assets/missing.bin")
+
+
+def test_managed_worker_status_and_removal_are_label_scoped(
+    ssh_docker_module: Any,
+    remote_hosts_module: Any,
+) -> None:
+    """Lifecycle operations must inspect ownership before removing a container."""
+    runner = _FakeRunner(ssh_docker_module)
+    controller = ssh_docker_module.SshDockerController(
+        _host(remote_hosts_module),
+        runner=runner,
+    )
+
+    workers = controller.list_managed_workers()
+    controller.remove_managed_worker(workers[0].container_name)
+
+    assert workers[0].worker_index == 1
+    assert workers[0].state == "running"
+    assert workers[0].runtime_fingerprint == "deadbeef"
+    assert runner.calls[-1][0] == (
+        "docker",
+        "rm",
+        "-f",
+        "comfy-remote-gpu-host-deadbeef-w1",
+    )
+
+
+def test_managed_worker_removal_rejects_unowned_container(
+    ssh_docker_module: Any,
+    remote_hosts_module: Any,
+) -> None:
+    """A caller cannot use the managed-worker API to remove arbitrary containers."""
+    runner = _FakeRunner(ssh_docker_module)
+    controller = ssh_docker_module.SshDockerController(
+        _host(remote_hosts_module),
+        runner=runner,
+    )
+
+    with pytest.raises(ssh_docker_module.SshDockerError, match="is not managed"):
+        controller.remove_managed_worker("unrelated-service")

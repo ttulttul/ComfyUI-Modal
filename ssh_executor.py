@@ -49,6 +49,10 @@ class SshRemoteInvocationError(RuntimeError):
     """Raised when an SSH worker rejects or loses an invocation."""
 
 
+class SshRemoteTransportError(SshRemoteInvocationError):
+    """Raised when the SSH relay ends without a remote application error."""
+
+
 @dataclass
 class SshDockerExecutorClient:
     """Execute serialized ComfyUI components on one configured SSH host."""
@@ -149,9 +153,41 @@ class SshDockerExecutorClient:
             _materialize_remote_execution_result,
         )
 
-        manager, spec = self._runtime(payload)
-        stream = self._invoke_stream(manager, spec, payload, inputs_payload)
-        response = _consume_remote_payload_stream(payload, stream)
+        response: bytes | None = None
+        for attempt in range(1, 3):
+            manager, spec = self._runtime(payload)
+            try:
+                stream = self._invoke_stream(manager, spec, payload, inputs_payload)
+                response = _consume_remote_payload_stream(payload, stream)
+                break
+            except (
+                BrokenPipeError,
+                ConnectionResetError,
+                OSError,
+                RemoteProtocolError,
+                SshDockerError,
+                SshRemoteTransportError,
+                subprocess.SubprocessError,
+            ) as exc:
+                if attempt >= 2:
+                    raise SshRemoteTransportError(
+                        f"SSH worker transport failed after one recovery attempt: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Recovering SSH worker transport environment=%s worker_index=%d error=%s.",
+                    manager.controller.host.environment_id,
+                    spec.worker_index,
+                    exc,
+                )
+                try:
+                    manager.stop_worker(spec.worker_index)
+                except SshDockerError as stop_error:
+                    logger.warning(
+                        "Unable to stop failed SSH worker before retry: %s",
+                        stop_error,
+                    )
+        if response is None:
+            raise SshRemoteTransportError("SSH worker returned no execution result.")
         return _materialize_remote_execution_result(
             response,
             settings=self.settings or get_settings(),
@@ -235,7 +271,7 @@ class SshDockerExecutorClient:
                 )
         if not terminal_received:
             diagnostics = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
-            raise SshRemoteInvocationError(
+            raise SshRemoteTransportError(
                 f"SSH worker stream ended without a result: {diagnostics or 'no diagnostics'}."
             )
 

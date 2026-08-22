@@ -5,16 +5,14 @@ from __future__ import annotations
 import io
 import json
 import logging
-import os
 import shlex
 import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 if __package__:
-    from .remote_hosts import SshHostConfig
     from .runtime_environment import (
         COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
         COMFYUI_RUNTIME_SOURCE_FILES,
@@ -31,7 +29,6 @@ if __package__:
     from .settings import ModalSyncSettings
     from .ssh_docker import SshDockerController, SshDockerError
 else:  # pragma: no cover - remote entrypoint compatibility.
-    from remote_hosts import SshHostConfig
     from runtime_environment import (
         COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
         COMFYUI_RUNTIME_SOURCE_FILES,
@@ -105,6 +102,7 @@ class SshRuntimeManager:
         self.controller.ensure_volume(spec.storage_volume_name)
         if not self._image_is_current(spec):
             self._build_image(spec)
+        self._remove_stale_worker_containers(spec)
         if not self._container_is_current_and_running(spec):
             self._replace_worker_container(spec)
         self._wait_until_ready(spec)
@@ -121,6 +119,29 @@ class SshRuntimeManager:
             return False
         self.controller.docker(("rm", "-f", spec.container_name))
         return True
+
+    def stop_all_workers(self) -> tuple[str, ...]:
+        """Remove every container owned by this configured environment."""
+        removed_names: list[str] = []
+        for worker in self.controller.list_managed_workers():
+            self.controller.remove_managed_worker(worker.container_name)
+            removed_names.append(worker.container_name)
+        return tuple(removed_names)
+
+    def _remove_stale_worker_containers(self, spec: SshRuntimeSpec) -> None:
+        """Remove superseded images' container for the same logical worker slot."""
+        for worker in self.controller.list_managed_workers():
+            if worker.worker_index != spec.worker_index:
+                continue
+            if worker.container_name == spec.container_name:
+                continue
+            logger.info(
+                "Removing stale SSH worker environment=%s worker_index=%d container=%s.",
+                self.controller.host.environment_id,
+                spec.worker_index,
+                worker.container_name,
+            )
+            self.controller.remove_managed_worker(worker.container_name)
 
     def _image_is_current(self, spec: SshRuntimeSpec) -> bool:
         """Return whether the expected fingerprinted image is available."""
@@ -327,6 +348,7 @@ class SshRuntimeManager:
         if existing.returncode == 0:
             self.controller.docker(("rm", "-f", spec.container_name))
         gpu_arguments = self._gpu_arguments(spec.worker_index)
+        environment_file_arguments = self._environment_file_arguments()
         self.controller.docker(
             (
                 "run",
@@ -350,6 +372,7 @@ class SshRuntimeManager:
                 f"{_WORKER_LABEL}={spec.worker_index}",
                 "-v",
                 f"{spec.storage_volume_name}:{_REMOTE_STORAGE_ROOT}",
+                *environment_file_arguments,
                 *gpu_arguments,
                 spec.image_tag,
             ),
@@ -363,6 +386,13 @@ class SshRuntimeManager:
             return ()
         gpu = capabilities.gpus[worker_index % len(capabilities.gpus)]
         return ("--gpus", f"device={gpu.uuid}")
+
+    def _environment_file_arguments(self) -> tuple[str, ...]:
+        """Return an optional administrator-managed remote Docker env-file argument."""
+        environment_file = self.controller.host.docker_env_file
+        if environment_file is None:
+            return ()
+        return ("--env-file", environment_file)
 
     def _wait_until_ready(self, spec: SshRuntimeSpec) -> None:
         """Wait for the worker socket and verify its runtime fingerprint."""

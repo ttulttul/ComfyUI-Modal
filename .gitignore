@@ -11,6 +11,7 @@
 !/comfyui_modal_sync_cloud.py
 !/durable_state.py
 !/execution_environments.py
+!/execution_history.py
 !/instance_identity.py
 !/llm_profiles.json
 !/llm_profiles.py

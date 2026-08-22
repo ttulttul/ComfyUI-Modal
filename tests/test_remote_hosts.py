@@ -42,6 +42,19 @@ def test_host_rejects_option_injection_in_ssh_target(remote_hosts_module: Any) -
         )
 
 
+def test_host_requires_safe_absolute_remote_environment_file(
+    remote_hosts_module: Any,
+) -> None:
+    """Docker environment-file paths must not escape through relative traversal."""
+    with pytest.raises(ValueError, match="safe absolute path"):
+        remote_hosts_module.SshHostConfig(
+            environment_id="unsafe-env",
+            display_name="Unsafe env",
+            ssh_target="gpu-host",
+            docker_env_file="../secrets.env",
+        )
+
+
 def test_registry_persists_probe_results(
     tmp_path: Any,
     remote_hosts_module: Any,
@@ -116,3 +129,32 @@ def test_scheduling_reserves_configured_vram(
     assert scheduling_capabilities is not None
     assert scheduling_capabilities.gpus[0].total_vram_bytes == 40 * 1024**3
     assert scheduling_capabilities.gpus[0].free_vram_bytes == 32 * 1024**3
+
+
+def test_scheduling_uses_discovered_cost_when_no_override_exists(
+    remote_hosts_module: Any,
+    execution_environments_module: Any,
+) -> None:
+    """Provisioning can publish host cost through the reserved Docker daemon label."""
+    module = execution_environments_module
+    capabilities = module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=60 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        reported_cost_usd_per_second=0.00025,
+    )
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="reported-cost",
+        display_name="Reported cost",
+        ssh_target="reported-cost",
+        capabilities=capabilities,
+        health=module.EnvironmentHealth.READY,
+    )
+
+    assert host.scheduling_state().cost_usd_per_second == 0.00025

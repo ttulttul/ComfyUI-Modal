@@ -153,6 +153,48 @@ def test_sync_file_emits_upload_status(
     assert observed_statuses == [("Uploading asset 1/2 to Modal: model.safetensors", 1, 2)]
 
 
+def test_sync_file_uses_self_hosted_destination_in_ssh_mode(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """SSH uploads should not describe the destination as Modal."""
+    monkeypatch.setattr(sync_engine_module, "modal", None)
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"model-bytes")
+    observed_statuses: list[tuple[str, int | None, int | None]] = []
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="ssh_docker",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+
+    engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    engine.sync_file(
+        asset_path,
+        status_callback=lambda message, current, total: observed_statuses.append(
+            (message, current, total)
+        ),
+    )
+
+    assert observed_statuses == [
+        ("Uploading asset to the self-hosted worker: model.safetensors", None, None)
+    ]
+
+
 def test_sync_custom_nodes_directory_creates_archive(
     settings_module: Any,
     sync_engine_module: Any,

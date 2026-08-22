@@ -93,6 +93,7 @@ class EnvironmentCapabilities:
     nvidia_container_runtime: bool
     gpus: tuple[GpuCapability, ...] = ()
     probed_at_epoch: float | None = None
+    reported_cost_usd_per_second: float | None = None
 
     @property
     def maximum_vram_bytes(self) -> int:
@@ -125,6 +126,7 @@ class EnvironmentCapabilities:
             "nvidia_container_runtime": self.nvidia_container_runtime,
             "gpus": [gpu.to_dict() for gpu in self.gpus],
             "probed_at_epoch": self.probed_at_epoch,
+            "reported_cost_usd_per_second": self.reported_cost_usd_per_second,
         }
 
     @classmethod
@@ -158,6 +160,10 @@ class EnvironmentCapabilities:
             probed_at_epoch=_optional_non_negative_float(
                 payload.get("probed_at_epoch"), "probed_at_epoch"
             ),
+            reported_cost_usd_per_second=_optional_non_negative_float(
+                payload.get("reported_cost_usd_per_second"),
+                "reported_cost_usd_per_second",
+            ),
         )
 
 
@@ -170,6 +176,9 @@ class ComponentResourceRequirements:
     gpu_required: bool = True
     architecture: str | None = None
     estimated_execution_seconds: float = 0.0
+    estimated_execution_seconds_by_environment: Mapping[str, float] = field(
+        default_factory=dict
+    )
     estimated_transfer_seconds: float = 0.0
     required_tags: frozenset[str] = frozenset()
     preferred_environment_ids: tuple[str, ...] = ()
@@ -284,12 +293,16 @@ class CostAwareEnvironmentScheduler:
                 rejection_reasons.append(f"{environment.environment_id}: {rejection}")
                 continue
 
+            execution_seconds = requirements.estimated_execution_seconds_by_environment.get(
+                environment.environment_id,
+                requirements.estimated_execution_seconds,
+            )
             completion_seconds = max(
                 0.0,
                 environment.queue_delay_seconds
                 + environment.cold_start_seconds
                 + requirements.estimated_transfer_seconds
-                + requirements.estimated_execution_seconds,
+                + execution_seconds,
             )
             predicted_cost = (
                 completion_seconds * environment.cost_usd_per_second
@@ -314,6 +327,7 @@ class CostAwareEnvironmentScheduler:
                         if predicted_cost is not None
                         else "cost unknown"
                     ),
+                    f"estimated execution {execution_seconds:.3f}s",
                 ),
             )
             candidates.append(

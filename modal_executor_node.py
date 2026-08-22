@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -87,7 +88,10 @@ class RemoteExecutorRouterClient:
     ) -> Sequence[Any]:
         """Execute one payload through Modal or an assigned SSH Docker host."""
         client = self._client_for_payload(payload)
-        return client.execute_payload(payload, kwargs)
+        started_at = time.monotonic()
+        result = client.execute_payload(payload, kwargs)
+        self._record_success(payload, time.monotonic() - started_at)
+        return result
 
     async def execute_payload_async(
         self,
@@ -96,13 +100,47 @@ class RemoteExecutorRouterClient:
     ) -> Sequence[Any]:
         """Execute one payload asynchronously through its selected provider."""
         client = self._client_for_payload(payload)
+        started_at = time.monotonic()
         execute_async = getattr(client, "execute_payload_async", None)
         if callable(execute_async):
             result = execute_async(payload, kwargs)
             if inspect.isawaitable(result):
-                return await result
+                result = await result
+            self._record_success(payload, time.monotonic() - started_at)
             return result
-        return await asyncio.to_thread(client.execute_payload, payload, kwargs)
+        result = await asyncio.to_thread(client.execute_payload, payload, kwargs)
+        self._record_success(payload, time.monotonic() - started_at)
+        return result
+
+    def _record_success(
+        self,
+        payload: Mapping[str, Any],
+        elapsed_seconds: float,
+    ) -> None:
+        """Best-effort persist timing feedback for future cost-aware placement."""
+        from .execution_history import ExecutionHistory, record_completed_execution
+        from .settings import discover_comfyui_user_directory, get_settings
+
+        settings = get_settings()
+        user_directory = discover_comfyui_user_directory(settings)
+        history = (
+            ExecutionHistory.for_user_directory(user_directory)
+            if user_directory is not None
+            else None
+        )
+        provider = str(payload.get("execution_provider") or "modal").strip().lower()
+        environment_id = str(
+            payload.get("execution_environment_id")
+            or f"modal:{settings.modal_gpu}"
+        ).strip()
+        signature = payload.get("execution_history_signature")
+        record_completed_execution(
+            history=history,
+            component_signature=(str(signature) if signature is not None else None),
+            environment_id=environment_id,
+            provider=provider,
+            elapsed_seconds=elapsed_seconds,
+        )
 
     def _client_for_payload(self, payload: Mapping[str, Any]) -> RemoteExecutorClient:
         """Instantiate the provider client selected by one planned payload."""

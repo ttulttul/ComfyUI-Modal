@@ -80,11 +80,12 @@ def _format_asset_upload_status(
     *,
     item_index: int | None,
     total_items: int | None,
+    destination: str = "Modal",
 ) -> str:
     """Return the global-status message for one asset upload."""
     if item_index is not None and total_items is not None and total_items > 1:
-        return f"Uploading asset {item_index}/{total_items} to Modal: {asset_name}"
-    return f"Uploading asset to Modal: {asset_name}"
+        return f"Uploading asset {item_index}/{total_items} to {destination}: {asset_name}"
+    return f"Uploading asset to {destination}: {asset_name}"
 
 
 class VolumeBackend(Protocol):
@@ -493,6 +494,12 @@ class ModalAssetSyncEngine:
             self.sync_index = LocalFileSyncIndex(self.settings.local_storage_root)
         self._hash_cache = self._load_hash_cache()
 
+    def _destination_label(self) -> str:
+        """Return a user-facing destination name for sync progress messages."""
+        if self.settings.execution_mode == "ssh_docker":
+            return "the self-hosted worker"
+        return "Modal"
+
     @classmethod
     def from_environment(cls, settings: ModalSyncSettings | None = None) -> "ModalAssetSyncEngine":
         """Create a sync engine using the local mirror backend by default."""
@@ -542,6 +549,7 @@ class ModalAssetSyncEngine:
                 resolved_path.name,
                 item_index=item_index,
                 total_items=total_items,
+                destination=self._destination_label(),
             ),
             status_current=item_index,
             status_total=total_items,
@@ -696,8 +704,14 @@ class ModalAssetSyncEngine:
             ).exists()
             for archive_spec in archive_specs
         ):
-            _emit_sync_status(status_callback, "Packaging custom-node code for Modal")
-        _emit_sync_status(status_callback, "Uploading custom-node code and assets to Modal")
+            _emit_sync_status(
+                status_callback,
+                f"Packaging custom-node code for {self._destination_label()}",
+            )
+        _emit_sync_status(
+            status_callback,
+            f"Uploading custom-node code and assets to {self._destination_label()}",
+        )
 
         archive_results = self._sync_custom_nodes_archives_parallel(
             custom_nodes_dir=custom_nodes_dir,
@@ -754,7 +768,9 @@ class ModalAssetSyncEngine:
             remote_path=remote_path,
             sync_key=manifest_sync_key,
             source_description=str(custom_nodes_dir),
-            upload_status_message="Uploading custom-node manifest to Modal",
+            upload_status_message=(
+                f"Uploading custom-node manifest to {self._destination_label()}"
+            ),
         )
         uploaded = uploaded or manifest_sync_result.uploaded
 
@@ -799,7 +815,11 @@ class ModalAssetSyncEngine:
         logger.info("Syncing %s to %s", source_description, remote_path)
         _emit_sync_status(
             status_callback,
-            upload_status_message or f"Uploading {Path(source_description).name} to Modal",
+            upload_status_message
+            or (
+                f"Uploading {Path(source_description).name} to "
+                f"{self._destination_label()}"
+            ),
             status_current,
             status_total,
         )

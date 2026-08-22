@@ -4,6 +4,8 @@ import { api } from "../../scripts/api.js";
 const ENVIRONMENTS_ROUTE = "/remote/environments";
 const PROBE_ROUTE = "/remote/environments/probe";
 const BOOTSTRAP_ROUTE = "/remote/environments/bootstrap";
+const STATUS_ROUTE = "/remote/environments/status";
+const STOP_ROUTE = "/remote/environments/stop";
 const STYLE_ID = "comfy-remote-environment-styles";
 
 /** Return parsed JSON or raise the server's descriptive error. */
@@ -23,7 +25,11 @@ async function requestJson(route, options = {}) {
 
 /** Convert a per-second price to the friendlier hourly value used by the form. */
 function hourlyCost(host) {
-  const perSecond = Number(host?.cost_usd_per_second);
+  const rawCost = host?.cost_usd_per_second ?? host?.capabilities?.reported_cost_usd_per_second;
+  if (rawCost == null) {
+    return "";
+  }
+  const perSecond = Number(rawCost);
   return Number.isFinite(perSecond) ? String(perSecond * 3600) : "";
 }
 
@@ -44,6 +50,7 @@ function hostFromRow(row, previousHost = {}) {
     maximum_workers: Number(value("maximum_workers") || 1),
     reserve_vram_bytes: Math.round(reserveVramGb * 1024 ** 3),
     tags: value("tags").split(",").map((tag) => tag.trim()).filter(Boolean),
+    docker_env_file: value("docker_env_file") || null,
   };
 }
 
@@ -58,7 +65,15 @@ function capabilitySummary(host) {
     return `${gpu.name} (${vramGb.toFixed(1)} GB)`;
   });
   const ramGb = Number(capabilities.total_ram_bytes || 0) / 1024 ** 3;
-  return `${gpus.join(", ") || "CPU only"}; ${ramGb.toFixed(1)} GB RAM; Docker ${capabilities.docker_version}`;
+  const workers = Array.isArray(host.workers)
+    ? `; workers: ${host.workers.map((worker) => `${worker.worker_index ?? "?"} ${worker.state}`).join(", ") || "none"}`
+    : "";
+  const rawReportedCost = capabilities.reported_cost_usd_per_second;
+  const reportedCost = Number(rawReportedCost);
+  const cost = rawReportedCost != null && Number.isFinite(reportedCost)
+    ? `; reported $${(reportedCost * 3600).toFixed(4)}/hour`
+    : "";
+  return `${gpus.join(", ") || "CPU only"}; ${ramGb.toFixed(1)} GB RAM; Docker ${capabilities.docker_version}${cost}${workers}`;
 }
 
 /** Install the scoped host-manager stylesheet once. */
@@ -73,7 +88,7 @@ function installStyles() {
     .comfy-remote-dialog { width: min(1050px, 94vw); max-height: 90vh; overflow: auto; box-sizing: border-box; padding: 22px; border: 1px solid var(--border-color, #475569); border-radius: 12px; background: var(--comfy-menu-bg, #18181b); color: var(--input-text, #f8fafc); box-shadow: 0 24px 80px rgba(0,0,0,.55); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }
     .comfy-remote-dialog h2 { margin: 0 0 6px; font-size: 20px; }
     .comfy-remote-dialog .intro { margin: 0 0 18px; color: #cbd5e1; }
-    .comfy-remote-host { display: grid; grid-template-columns: 1fr 1.2fr 1.4fr .65fr .65fr .65fr 1fr; gap: 8px; margin: 0 0 10px; padding: 12px; border: 1px solid #475569; border-radius: 8px; }
+    .comfy-remote-host { display: grid; grid-template-columns: 1fr 1.2fr 1.4fr .65fr .65fr .65fr 1fr 1.2fr; gap: 8px; margin: 0 0 10px; padding: 12px; border: 1px solid #475569; border-radius: 8px; }
     .comfy-remote-host label { display: flex; min-width: 0; flex-direction: column; gap: 4px; color: #cbd5e1; font-size: 11px; }
     .comfy-remote-host input { min-width: 0; box-sizing: border-box; padding: 7px; border: 1px solid #64748b; border-radius: 5px; background: #0f172a; color: #f8fafc; }
     .comfy-remote-host .checks { display: flex; align-items: center; gap: 12px; grid-column: 1 / span 3; }
@@ -114,6 +129,7 @@ function createHostRow(host, manager) {
   field("Max workers", "maximum_workers", host.maximum_workers ?? 1, "number", "1");
   field("Reserve VRAM GB", "reserve_vram_gb", Number(host.reserve_vram_bytes || 0) / 1024 ** 3, "number", "0.1");
   field("Tags (comma separated)", "tags", (host.tags ?? []).join(", "));
+  field("Remote Docker env file", "docker_env_file", host.docker_env_file ?? "");
 
   const checks = document.createElement("div");
   checks.className = "checks";
@@ -148,6 +164,12 @@ function createHostRow(host, manager) {
   };
   actionButton("Save and probe", () => manager.saveAndOperate(row, PROBE_ROUTE));
   actionButton("Build / update worker", () => manager.saveAndOperate(row, BOOTSTRAP_ROUTE));
+  actionButton("Refresh workers", () => manager.saveAndOperate(row, STATUS_ROUTE));
+  actionButton("Stop workers", () => {
+    if (typeof window.confirm !== "function" || window.confirm(`Stop managed workers on ${host.display_name || "this host"}?`)) {
+      void manager.saveAndOperate(row, STOP_ROUTE);
+    }
+  });
   actionButton("Remove", () => row.remove(), "danger");
   row.appendChild(actions);
   return row;
@@ -232,12 +254,35 @@ class RemoteEnvironmentManager {
     try {
       await this.save();
       const environmentId = row.querySelector('[name="environment_id"]')?.value?.trim();
-      this.status.textContent = route === PROBE_ROUTE ? "Probing host…" : "Building worker image…";
-      await requestJson(route, {
+      this.status.textContent = route === PROBE_ROUTE
+        ? "Probing host…"
+        : route === BOOTSTRAP_ROUTE
+          ? "Building worker image…"
+          : route === STOP_ROUTE
+            ? "Stopping managed workers…"
+            : "Refreshing worker status…";
+      const operationResult = await requestJson(route, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ environment_id: environmentId }),
       });
+      if (route === STATUS_ROUTE) {
+        row.__remoteHost = {
+          ...row.__remoteHost,
+          workers: operationResult.workers ?? [],
+        };
+        row.querySelector(".capabilities").textContent =
+          `${row.__remoteHost.health ?? "unknown"}: ${capabilitySummary(row.__remoteHost)}`;
+        this.status.textContent = "Refreshed worker status.";
+        return;
+      }
+      if (route === STOP_ROUTE) {
+        row.__remoteHost = { ...row.__remoteHost, workers: [] };
+        row.querySelector(".capabilities").textContent =
+          `${row.__remoteHost.health ?? "unknown"}: ${capabilitySummary(row.__remoteHost)}`;
+        this.status.textContent = `Stopped ${operationResult.removed_containers?.length ?? 0} managed worker(s).`;
+        return;
+      }
       this.overlay.remove();
       await openRemoteEnvironmentManager();
     } catch (error) {
@@ -259,10 +304,15 @@ app.registerExtension({
     app.ui.settings.addSetting({
       id: "Comfy.RemoteExecution.ManageEnvironments",
       name: "Remote Execution: SSH environments",
-      type: "button",
-      defaultValue: "Manage SSH hosts",
+      type: () => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "Manage SSH hosts";
+        button.addEventListener("click", () => void openRemoteEnvironmentManager());
+        return button;
+      },
+      defaultValue: null,
       tooltip: "Configure, probe, and bootstrap Docker workers reached through SSH.",
-      onClick: () => void openRemoteEnvironmentManager(),
     });
   },
 });

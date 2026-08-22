@@ -356,6 +356,119 @@ def test_remote_environment_routes_save_and_probe_hosts(
     assert registry.get_host("gpu-one").capabilities == capabilities
 
 
+def test_scheduler_refreshes_stale_ssh_capabilities_before_placement(
+    api_intercept_module: Any,
+    remote_hosts_module: Any,
+    execution_environments_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Automatic placement should not trust stale persisted host health forever."""
+    registry = remote_hosts_module.RemoteHostRegistry.for_user_directory(tmp_path)
+    registry.replace_hosts(
+        [
+            remote_hosts_module.SshHostConfig(
+                environment_id="freshened",
+                display_name="Freshened",
+                ssh_target="freshened",
+            )
+        ]
+    )
+    capabilities = execution_environments_module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=60 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        probed_at_epoch=1_700_000_000.0,
+    )
+
+    class FakeController:
+        """Return current capability data for one configured host."""
+
+        def __init__(self, host: Any) -> None:
+            """Retain the probed host."""
+            self.host = host
+
+        def probe_capabilities(self) -> Any:
+            """Return current capabilities."""
+            return capabilities
+
+    monkeypatch.setattr(api_intercept_module, "_ssh_host_registry", lambda _settings: registry)
+    monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
+
+    hosts = api_intercept_module._schedulable_ssh_hosts(SimpleNamespace())
+
+    assert hosts[0].health.value == "ready"
+    assert hosts[0].capabilities == capabilities
+
+
+def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
+    api_intercept_module: Any,
+    remote_hosts_module: Any,
+    execution_environments_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Automatic policy should compare a compatible SSH host with Modal."""
+    module = execution_environments_module
+    capabilities = module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=60 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        gpus=(module.GpuCapability("GPU-1", "GPU", 80 * 1024**3),),
+        probed_at_epoch=2_000_000_000.0,
+    )
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="cheap-host",
+        display_name="Cheap host",
+        ssh_target="cheap-host",
+        cost_usd_per_second=0.0001,
+        capabilities=capabilities,
+        health=module.EnvironmentHealth.READY,
+    )
+    component = api_intercept_module.RemoteComponentPlan(
+        node_ids=["1"],
+        representative_node_id="1",
+        boundary_inputs=[],
+        boundary_outputs=[],
+        execute_node_ids=["1"],
+        contains_output_node=False,
+    )
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_schedulable_ssh_hosts",
+        lambda _settings: (host,),
+    )
+    monkeypatch.setattr(api_intercept_module, "_execution_history", lambda _settings: None)
+
+    assignments = api_intercept_module._plan_component_execution_assignments(
+        components=[component],
+        prompt={"1": {"class_type": "KSampler", "inputs": {"steps": 20}}},
+        workflow={
+            "extra": {
+                "remote_execution": {
+                    "policy": "automatic",
+                    "auto_place": True,
+                }
+            }
+        },
+        settings=SimpleNamespace(modal_gpu="RTX-PRO-6000", max_containers=1),
+    )
+
+    assert assignments["1"].provider.value == "ssh_docker"
+    assert assignments["1"].environment_id == "cheap-host"
+
+
 def test_planner_keeps_unmarked_llm_local_between_remote_text_nodes(
     api_intercept_module: Any,
 ) -> None:

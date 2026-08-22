@@ -11,6 +11,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
 
 if __package__:
@@ -49,6 +50,7 @@ class SshHostConfig:
     reserve_vram_bytes: int = 0
     tags: frozenset[str] = frozenset()
     storage_volume_name: str | None = None
+    docker_env_file: str | None = None
     capabilities: EnvironmentCapabilities | None = None
     health: EnvironmentHealth = EnvironmentHealth.UNKNOWN
     last_error: str | None = None
@@ -79,6 +81,16 @@ class SshHostConfig:
             raise ValueError("cost_usd_per_second must be finite and non-negative.")
         if any(not tag.strip() for tag in self.tags):
             raise ValueError("tags must not contain empty values.")
+        if self.docker_env_file is not None:
+            normalized_env_file = PurePosixPath(self.docker_env_file)
+            if (
+                not normalized_env_file.is_absolute()
+                or ".." in normalized_env_file.parts
+                or any(character in self.docker_env_file for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(
+                    "docker_env_file must be a safe absolute path on the remote host."
+                )
 
     @property
     def resolved_storage_volume_name(self) -> str:
@@ -115,7 +127,15 @@ class SshHostConfig:
             provider=ExecutionProvider.SSH_DOCKER,
             enabled=self.enabled,
             health=health,
-            cost_usd_per_second=self.cost_usd_per_second,
+            cost_usd_per_second=(
+                self.cost_usd_per_second
+                if self.cost_usd_per_second is not None
+                else (
+                    capabilities.reported_cost_usd_per_second
+                    if capabilities is not None
+                    else None
+                )
+            ),
             capabilities=capabilities,
             tags=self.tags,
             maximum_workers=self.maximum_workers,
@@ -134,6 +154,7 @@ class SshHostConfig:
             "reserve_vram_bytes": self.reserve_vram_bytes,
             "tags": sorted(self.tags),
             "storage_volume_name": self.storage_volume_name,
+            "docker_env_file": self.docker_env_file,
             "capabilities": (
                 self.capabilities.to_dict() if self.capabilities is not None else None
             ),
@@ -161,6 +182,11 @@ class SshHostConfig:
             storage_volume_name=(
                 str(payload["storage_volume_name"]).strip()
                 if payload.get("storage_volume_name")
+                else None
+            ),
+            docker_env_file=(
+                str(payload["docker_env_file"]).strip()
+                if payload.get("docker_env_file")
                 else None
             ),
             capabilities=(

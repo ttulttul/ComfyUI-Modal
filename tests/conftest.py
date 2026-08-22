@@ -119,6 +119,12 @@ def execution_environments_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def execution_history_module(extension_package: object) -> object:
+    """Return the persistent remote execution timing history module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.execution_history")
+
+
+@pytest.fixture(scope="session")
 def remote_hosts_module(extension_package: object) -> object:
     """Return the persistent SSH host registry module."""
     return importlib.import_module(f"{PACKAGE_NAME}.remote_hosts")

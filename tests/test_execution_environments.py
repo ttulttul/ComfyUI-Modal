@@ -114,3 +114,26 @@ def test_scheduler_honors_explicit_preference_before_cost(
     )
 
     assert assignment.environment_id == "preferred"
+
+
+def test_scheduler_uses_environment_specific_runtime_estimates(
+    execution_environments_module: Any,
+) -> None:
+    """Observed speed can outweigh a higher per-second rate in total cost."""
+    module = execution_environments_module
+    assignment = module.CostAwareEnvironmentScheduler().choose(
+        [
+            _environment(module, "slow-cheap", vram_gb=80, cost=0.001),
+            _environment(module, "fast-pricey", vram_gb=80, cost=0.002),
+        ],
+        module.ComponentResourceRequirements(
+            estimated_execution_seconds=60,
+            estimated_execution_seconds_by_environment={
+                "slow-cheap": 100,
+                "fast-pricey": 10,
+            },
+        ),
+    )
+
+    assert assignment.environment_id == "fast-pricey"
+    assert assignment.predicted_cost_usd == pytest.approx(0.02)

@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -54,6 +55,7 @@ from .execution_environments import (
     GpuCapability,
     WorkflowExecutionPreferences,
 )
+from .execution_history import ExecutionHistory
 from .sync_engine import (
     AssetSyncRequestCache,
     ModalAssetSyncEngine,
@@ -73,7 +75,16 @@ _MODAL_UI_EVENTS_LOCK = threading.Lock()
 _MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
 _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_installed"
 _REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
-_LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset({"ModalEndpointChat"})
+_LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
+    {
+        "ModalEndpointChat",
+        MODAL_ARTIFACT_FINALIZER_NODE_ID,
+        MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
+        MODAL_MAP_INPUT_NODE_ID,
+        MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
+    }
+)
+_SSH_CAPABILITY_REFRESH_SECONDS = 5 * 60
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
@@ -300,6 +311,7 @@ _MODAL_GPU_VRAM_GB: dict[str, float] = {
     "B200+": 180,
     "B300": 288,
 }
+# Modal public pricing verified 2026-08-22; CPU and memory charges are excluded.
 _MODAL_GPU_COST_USD_PER_SECOND: dict[str, float] = {
     "T4": 0.000164,
     "L4": 0.000222,
@@ -367,6 +379,76 @@ def _configured_ssh_hosts(settings: ModalSyncSettings) -> tuple[SshHostConfig, .
     return registry.load().hosts
 
 
+def _schedulable_ssh_hosts(settings: ModalSyncSettings) -> tuple[SshHostConfig, ...]:
+    """Refresh stale enabled hosts concurrently before cost-aware scheduling."""
+    hosts = _configured_ssh_hosts(settings)
+    registry = _ssh_host_registry(settings)
+    if registry is None:
+        return hosts
+    now = time.time()
+    stale_hosts = [
+        host
+        for host in hosts
+        if _ssh_host_probe_is_stale(host, now)
+    ]
+    if not stale_hosts:
+        return hosts
+
+    with ThreadPoolExecutor(max_workers=min(8, len(stale_hosts))) as executor:
+        refreshed = {
+            host.environment_id: future.result()
+            for host, future in (
+                (host, executor.submit(_refresh_ssh_host, host, registry))
+                for host in stale_hosts
+            )
+        }
+    return tuple(refreshed.get(host.environment_id, host) for host in hosts)
+
+
+def _ssh_host_probe_is_stale(host: SshHostConfig, now: float) -> bool:
+    """Return whether an enabled host needs a fresh capability/health probe."""
+    if not host.enabled or host.draining:
+        return False
+    capabilities = host.capabilities
+    if capabilities is None or capabilities.probed_at_epoch is None:
+        return True
+    return now - capabilities.probed_at_epoch > _SSH_CAPABILITY_REFRESH_SECONDS
+
+
+def _refresh_ssh_host(
+    host: SshHostConfig,
+    registry: RemoteHostRegistry,
+) -> SshHostConfig:
+    """Probe and persist one host without aborting other candidates."""
+    try:
+        capabilities = SshDockerController(host).probe_capabilities()
+        return registry.update_probe_result(
+            host.environment_id,
+            capabilities=capabilities,
+            health=EnvironmentHealth.READY,
+            last_error=None,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Remote environment probe failed environment=%s: %s",
+            host.environment_id,
+            exc,
+        )
+        try:
+            return registry.update_probe_result(
+                host.environment_id,
+                capabilities=host.capabilities,
+                health=EnvironmentHealth.UNAVAILABLE,
+                last_error=str(exc),
+            )
+        except (KeyError, OSError, ValueError):
+            return replace(
+                host,
+                health=EnvironmentHealth.UNAVAILABLE,
+                last_error=str(exc),
+            )
+
+
 def _component_minimum_vram_bytes(
     component: RemoteComponentPlan,
     prompt: Mapping[str, Any],
@@ -401,6 +483,55 @@ def _component_minimum_vram_bytes(
     return minimum_vram_bytes
 
 
+def _component_execution_signature(
+    component: RemoteComponentPlan,
+    prompt: Mapping[str, Any],
+) -> str:
+    """Return a stable workload signature for runtime-history estimates."""
+    cost_shaping_input_names = frozenset(
+        {
+            "batch_size",
+            "duration",
+            "frames",
+            "height",
+            "max_new_tokens",
+            "model_profile",
+            "num_frames",
+            "steps",
+            "width",
+        }
+    )
+    nodes: list[dict[str, Any]] = []
+    for node_id in sorted(component.node_ids):
+        prompt_node = prompt.get(node_id)
+        if not isinstance(prompt_node, Mapping):
+            continue
+        inputs = prompt_node.get("inputs")
+        input_mapping = inputs if isinstance(inputs, Mapping) else {}
+        nodes.append(
+            {
+                "class_type": str(prompt_node.get("class_type") or ""),
+                "inputs": {
+                    name: input_mapping[name]
+                    for name in sorted(cost_shaping_input_names & set(input_mapping))
+                    if not _is_link(input_mapping[name])
+                },
+            }
+        )
+    serialized = json.dumps(nodes, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _execution_history(settings: ModalSyncSettings) -> ExecutionHistory | None:
+    """Return local runtime history when the ComfyUI user directory is known."""
+    user_directory = discover_comfyui_user_directory(settings)
+    if user_directory is None:
+        return None
+    return ExecutionHistory.for_user_directory(user_directory)
+
+
 def _plan_component_execution_assignments(
     *,
     components: list[RemoteComponentPlan],
@@ -423,7 +554,7 @@ def _plan_component_execution_assignments(
             for component in components
         }
 
-    ssh_states = [host.scheduling_state() for host in _configured_ssh_hosts(settings)]
+    ssh_states = [host.scheduling_state() for host in _schedulable_ssh_hosts(settings)]
     environments = list(ssh_states)
     if preferences.policy is ExecutionPolicy.AUTOMATIC:
         environments.append(_modal_environment_state(settings))
@@ -433,8 +564,16 @@ def _plan_component_execution_assignments(
         )
 
     scheduler = CostAwareEnvironmentScheduler()
+    history = _execution_history(settings)
+    environment_ids = [environment.environment_id for environment in environments]
     assignments: dict[str, ExecutionAssignment] = {}
     for component in components:
+        component_signature = _component_execution_signature(component, prompt)
+        historical_estimates = (
+            history.estimates(component_signature, environment_ids)
+            if history is not None
+            else {}
+        )
         requirements = ComponentResourceRequirements(
             minimum_vram_bytes=_component_minimum_vram_bytes(
                 component,
@@ -443,7 +582,11 @@ def _plan_component_execution_assignments(
             ),
             gpu_required=True,
             architecture="x86_64",
-            estimated_execution_seconds=1.0,
+            estimated_execution_seconds=60.0,
+            estimated_execution_seconds_by_environment={
+                environment_id: estimate.execution_seconds
+                for environment_id, estimate in historical_estimates.items()
+            },
             preferred_environment_ids=preferences.preferred_environment_ids,
         )
         try:
@@ -488,11 +631,14 @@ def _stamp_execution_assignment(
     payload: dict[str, Any],
     assignment: ExecutionAssignment,
     worker_index: int = 0,
+    execution_history_signature: str | None = None,
 ) -> None:
     """Attach provider placement to a payload and every nested proxy phase."""
     payload["execution_provider"] = assignment.provider.value
     payload["execution_environment_id"] = assignment.environment_id
     payload["execution_worker_index"] = worker_index
+    if execution_history_signature:
+        payload["execution_history_signature"] = execution_history_signature
     split_payloads = payload.get("split_proxy_payloads")
     nested_payloads: list[dict[str, Any]] = []
     if isinstance(split_payloads, dict):
@@ -508,7 +654,12 @@ def _stamp_execution_assignment(
             if isinstance(nested_payload, dict)
         )
     for nested_payload in nested_payloads:
-        _stamp_execution_assignment(nested_payload, assignment, worker_index)
+        _stamp_execution_assignment(
+            nested_payload,
+            assignment,
+            worker_index,
+            execution_history_signature,
+        )
 
 
 def _ensure_remote_sync_backend(
@@ -5185,6 +5336,7 @@ def rewrite_prompt_for_modal(
                 component.representative_node_id,
                 0,
             ),
+            _component_execution_signature(component, prompt),
         )
         implicitly_mapped_output_sources = _implicitly_mapped_boundary_output_sources(
             component=component,
@@ -5460,6 +5612,18 @@ def _remote_environment_bootstrap_route_path(route_path: str) -> str:
     return "/remote/environments/bootstrap"
 
 
+def _remote_environment_status_route_path(route_path: str) -> str:
+    """Return the provider-neutral worker status route."""
+    del route_path
+    return "/remote/environments/status"
+
+
+def _remote_environment_stop_route_path(route_path: str) -> str:
+    """Return the provider-neutral worker shutdown route."""
+    del route_path
+    return "/remote/environments/stop"
+
+
 def _modal_not_found_error_types() -> tuple[type[BaseException], ...]:
     """Return Modal SDK exception classes that mean a named object is absent."""
     if modal is None:
@@ -5629,6 +5793,12 @@ def setup_modal_queue_route(
     remote_environment_bootstrap_route_path = _remote_environment_bootstrap_route_path(
         resolved_settings.route_path
     )
+    remote_environment_status_route_path = _remote_environment_status_route_path(
+        resolved_settings.route_path
+    )
+    remote_environment_stop_route_path = _remote_environment_stop_route_path(
+        resolved_settings.route_path
+    )
     remote_host_registry = _ssh_host_registry(resolved_settings)
     _install_modal_interrupt_queue_bridge(prompt_server)
 
@@ -5783,6 +5953,7 @@ def setup_modal_queue_route(
                 {"error": "The ComfyUI user directory could not be resolved."},
                 status=503,
             )
+        environment_id = ""
         try:
             from .ssh_runtime import SshRuntimeManager
 
@@ -5797,7 +5968,25 @@ def setup_modal_queue_route(
             )
             spec = await asyncio.to_thread(manager.ensure_worker, worker_index)
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            if remote_host_registry is not None and environment_id:
+                try:
+                    await asyncio.to_thread(
+                        remote_host_registry.update_probe_result,
+                        environment_id,
+                        capabilities=host.capabilities if "host" in locals() else None,
+                        health=EnvironmentHealth.UNAVAILABLE,
+                        last_error=str(exc),
+                    )
+                except (KeyError, ValueError):
+                    pass
             return web.json_response({"error": str(exc)}, status=502)
+        await asyncio.to_thread(
+            remote_host_registry.update_probe_result,
+            environment_id,
+            capabilities=host.capabilities,
+            health=EnvironmentHealth.READY,
+            last_error=None,
+        )
         return web.json_response(
             {
                 "environment_id": environment_id,
@@ -5806,6 +5995,56 @@ def setup_modal_queue_route(
                 "image_tag": spec.image_tag,
                 "runtime_fingerprint": spec.identity.fingerprint,
             }
+        )
+
+    @prompt_server.routes.post(remote_environment_status_route_path)
+    async def remote_environment_status(request: web.Request) -> web.Response:
+        """Return managed worker state for one SSH execution environment."""
+        if remote_host_registry is None:
+            return web.json_response(
+                {"error": "The ComfyUI user directory could not be resolved."},
+                status=503,
+            )
+        try:
+            payload = await request.json()
+            environment_id = str(payload.get("environment_id") or "").strip()
+            host = await asyncio.to_thread(remote_host_registry.get_host, environment_id)
+            workers = await asyncio.to_thread(
+                SshDockerController(host).list_managed_workers
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response(
+            {
+                "environment_id": environment_id,
+                "workers": [worker.to_dict() for worker in workers],
+            }
+        )
+
+    @prompt_server.routes.post(remote_environment_stop_route_path)
+    async def remote_environment_stop(request: web.Request) -> web.Response:
+        """Stop all node-pack-managed workers on one configured SSH host."""
+        if remote_host_registry is None:
+            return web.json_response(
+                {"error": "The ComfyUI user directory could not be resolved."},
+                status=503,
+            )
+        try:
+            from .ssh_runtime import SshRuntimeManager
+
+            payload = await request.json()
+            environment_id = str(payload.get("environment_id") or "").strip()
+            host = await asyncio.to_thread(remote_host_registry.get_host, environment_id)
+            manager = SshRuntimeManager(
+                controller=SshDockerController(host),
+                repo_root=Path(__file__).resolve().parent,
+                settings=resolved_settings,
+            )
+            removed = await asyncio.to_thread(manager.stop_all_workers)
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response(
+            {"environment_id": environment_id, "removed_containers": list(removed)}
         )
 
     @prompt_server.routes.post(analysis_route_path)
