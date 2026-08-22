@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+
 if __package__:
     from .settings import DEFAULT_MODAL_GPU, DEFAULT_MODAL_SECRET_NAME
 else:  # pragma: no cover - the stable cloud entrypoint imports this module top-level.
@@ -73,6 +76,21 @@ _REMOTE_RUNTIME_PACKAGES = (
 )
 _CUDA_130_TORCH_PACKAGES = ("torch==2.13.0", "torchvision==0.28.0")
 _CUDA_130_CPU_AUDIO_PACKAGES = ("torchaudio==2.11.0+cpu",)
+_DEPLOYMENT_OWNED_PACKAGE_NAMES = frozenset(
+    {
+        *(
+            canonicalize_name(Requirement(requirement).name)
+            for requirement in (
+                *_REMOTE_RUNTIME_PACKAGES,
+                *_CUDA_130_TORCH_PACKAGES,
+                *_CUDA_130_CPU_AUDIO_PACKAGES,
+            )
+        ),
+        "opencv-python",
+        "triton",
+        "vllm",
+    }
+)
 _IGNORED_DIRECTORY_NAMES = frozenset(
     {
         ".cache",
@@ -355,6 +373,12 @@ def custom_node_runtime_packages(custom_nodes_dir: Path | None) -> tuple[str, ..
     seen_files: set[Path] = set()
     for requirements_path in _custom_node_requirement_files(custom_nodes_dir):
         for requirement in _read_requirement_file(requirements_path, seen_files):
+            if _is_deployment_owned_requirement(requirement):
+                logger.info(
+                    "Skipping custom-node requirement for deployment-owned package: %s",
+                    requirement,
+                )
+                continue
             if requirement in seen_specs:
                 continue
             seen_specs.add(requirement)
@@ -366,6 +390,15 @@ def custom_node_runtime_packages(custom_nodes_dir: Path | None) -> tuple[str, ..
             custom_nodes_dir,
         )
     return tuple(requirements)
+
+
+def _is_deployment_owned_requirement(requirement: str) -> bool:
+    """Return whether the immutable remote runtime owns this package version."""
+    try:
+        package_name = canonicalize_name(Requirement(requirement).name)
+    except InvalidRequirement:
+        return False
+    return package_name in _DEPLOYMENT_OWNED_PACKAGE_NAMES
 
 
 def _tree_digest(

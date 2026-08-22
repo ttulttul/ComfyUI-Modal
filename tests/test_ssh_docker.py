@@ -92,6 +92,17 @@ def _host(remote_hosts_module: Any) -> Any:
     )
 
 
+def test_ssh_command_disables_configured_forwardings(ssh_docker_module: Any) -> None:
+    """Controller sessions should not activate unrelated forwards from an SSH alias."""
+    runner = ssh_docker_module.SshCommandRunner("gpu-host-alias")
+
+    command = runner.command(("docker", "info"))
+
+    clear_index = command.index("ClearAllForwardings=yes")
+    assert command[clear_index - 1] == "-o"
+    assert command[-3:] == ["--", "gpu-host-alias", "docker info"]
+
+
 def test_probe_discovers_host_docker_memory_and_gpu(
     ssh_docker_module: Any,
     remote_hosts_module: Any,

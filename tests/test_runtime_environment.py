@@ -344,6 +344,36 @@ def test_runtime_identity_tracks_custom_node_requirements_but_ignores_payload_so
     assert dependency_changed.fingerprint != baseline.fingerprint
 
 
+def test_custom_node_packages_exclude_deployment_owned_runtime_conflicts(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Custom-node pins must not override the immutable Python and CUDA stack."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    custom_node_dir = custom_nodes_dir / "example"
+    custom_node_dir.mkdir(parents=True)
+    (custom_node_dir / "requirements.txt").write_text(
+        "\n".join(
+            (
+                "numpy<2",
+                "opencv-python>=4.7",
+                "torch>=2.1",
+                "Pillow>=10",
+                "triton>=3.3",
+                "vllm>=0.9",
+                "diffusers==0.38.0",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    packages = runtime_environment_module.custom_node_runtime_packages(
+        custom_nodes_dir
+    )
+
+    assert packages == ("diffusers==0.38.0",)
+
+
 def test_runtime_identity_ignores_comfyui_directories_outside_image_context(
     runtime_environment_module: Any,
     tmp_path: Path,

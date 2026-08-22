@@ -94,6 +94,8 @@ class SshCommandRunner:
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
+            "ClearAllForwardings=yes",
+            "-o",
             f"ConnectTimeout={self.connect_timeout_seconds}",
             "--",
             self.ssh_target,
