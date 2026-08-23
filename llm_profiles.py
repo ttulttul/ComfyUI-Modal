@@ -181,15 +181,20 @@ class LLMModelProfile:
                 f"parser {self.reasoning_parser!r}."
             )
         model_filename = self.backend_option("model_filename")
-        if model_filename is not None:
-            normalized_filename = str(model_filename).strip()
+        for filename_option, filename_value in (
+            ("model", model_filename),
+            ("multimodal projector", self.backend_option("mmproj_filename")),
+        ):
+            if filename_value is None:
+                continue
+            normalized_filename = str(filename_value).strip()
             if (
                 not normalized_filename
                 or Path(normalized_filename).name != normalized_filename
             ):
                 raise ValueError(
-                    f"Modal LLM profile {self.profile_id!r} has unsafe model "
-                    f"filename {model_filename!r}."
+                    f"Modal LLM profile {self.profile_id!r} has unsafe "
+                    f"{filename_option} filename {filename_value!r}."
                 )
         if self.source not in {"curated", "generated"}:
             raise ValueError(

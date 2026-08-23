@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import pytest
 import torch
+from PIL import Image
 
 
 def test_accurate_triton_listener_distinguishes_persistent_cache_hits(
@@ -826,7 +827,7 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     )
 
 
-def test_curated_huihui_gguf_profile_pins_one_16_gib_artifact(
+def test_curated_huihui_gguf_profile_pins_bounded_multimodal_artifacts(
     llm_profiles_module: Any,
 ) -> None:
     """The lambda profile should name one bounded GGUF rather than the whole repo."""
@@ -836,11 +837,12 @@ def test_curated_huihui_gguf_profile_pins_one_16_gib_artifact(
 
     assert profile.backend == "llama_cpp_server"
     assert profile.repository == "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF"
-    assert profile.estimated_vram_gb == 14.5
-    assert profile.modalities == frozenset({"text", "file"})
+    assert profile.estimated_vram_gb == 16.0
+    assert profile.modalities == frozenset({"text", "image", "file"})
     assert profile.backend_option("model_filename") == (
         "Huihui-Qwen3.8-27B-abliterated-Q2_K.gguf"
     )
+    assert profile.backend_option("mmproj_filename") == "mmproj-model-bf16.gguf"
 
 
 def test_gguf_stager_downloads_only_selected_model_and_pinned_tokenizer(
@@ -862,6 +864,9 @@ def test_gguf_stager_downloads_only_selected_model_and_pinned_tokenizer(
             (snapshot_path / profile.backend_option("model_filename")).write_bytes(
                 b"gguf"
             )
+            (snapshot_path / profile.backend_option("mmproj_filename")).write_bytes(
+                b"mmproj"
+            )
         else:
             (snapshot_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
         return str(snapshot_path)
@@ -875,7 +880,10 @@ def test_gguf_stager_downloads_only_selected_model_and_pinned_tokenizer(
 
     assert result.downloaded is True
     assert len(calls) == 2
-    assert calls[0]["allow_patterns"][-1] == profile.backend_option("model_filename")
+    assert calls[0]["allow_patterns"][-2:] == (
+        profile.backend_option("model_filename"),
+        profile.backend_option("mmproj_filename"),
+    )
     assert "*.gguf" not in calls[0]["allow_patterns"]
     assert "*.safetensors" not in calls[1]["allow_patterns"]
     assert calls[1]["repo_id"] == profile.backend_option("tokenizer_repository")
@@ -1362,6 +1370,72 @@ def test_llama_cpp_backend_generates_with_curated_gguf_profile(
     assert result.output_tokens == 4
     assert result.tokens_per_second == 12.5
     assert [event.stage for event in progress] == ["prefill", "generating"]
+
+
+def test_llama_cpp_backend_sends_images_through_chat_completion(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    llm_reasoning_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The curated projector should receive image data through the OAI route."""
+    profile = llm_profiles_module.get_llm_profile(
+        "huihui-qwen3.8-27b-abliterated-q2-k-gguf"
+    )
+    backend = object.__new__(modal_llm_runtime_module.LlamaCppServerBackend)
+    backend.profile = profile
+    backend.snapshot_path = tmp_path
+    backend.model_path = tmp_path / profile.backend_option("model_filename")
+    backend.mmproj_path = tmp_path / profile.backend_option("mmproj_filename")
+    backend.processor = SimpleNamespace(tokenizer=_FakeReasoningTokenizer())
+    backend.reasoning_parser = llm_reasoning_module.Qwen3ReasoningParser(
+        backend.processor.tokenizer
+    )
+    observed: dict[str, Any] = {}
+
+    def fake_chat_completion(
+        payload: dict[str, Any], timeout_seconds: float
+    ) -> dict[str, Any]:
+        """Capture one multimodal request and return OAI-style usage."""
+        observed["payload"] = payload
+        observed["timeout_seconds"] = timeout_seconds
+        return {
+            "choices": [{"message": {"content": "image answer"}}],
+            "usage": {"prompt_tokens": 101, "completion_tokens": 2},
+            "timings": {"predicted_per_second": 8.0},
+        }
+
+    backend._chat_completion = fake_chat_completion
+    result = backend.generate(
+        modal_llm_runtime_module.PreparedLLMInputs(
+            prompt="describe",
+            system_prompt="be concise",
+            images=(Image.new("RGB", (4, 4), color=(255, 0, 0)),),
+            video=None,
+            file_characters=0,
+            file_count=0,
+        ),
+        modal_llm_runtime_module.LLMGenerationSettings(
+            max_new_tokens=16,
+            temperature=0.2,
+            top_p=0.95,
+            seed=4,
+            enable_reasoning=False,
+        ),
+        lambda _event: None,
+    )
+
+    messages = observed["payload"]["messages"]
+    assert messages[0] == {"role": "system", "content": "be concise"}
+    assert messages[1]["content"][0]["type"] == "image_url"
+    assert messages[1]["content"][0]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+    assert messages[1]["content"][1] == {"type": "text", "text": "describe"}
+    assert result.text == "image answer"
+    assert result.input_tokens == 101
+    assert result.output_tokens == 2
+    assert result.tokens_per_second == 8.0
 
 
 @pytest.mark.parametrize(

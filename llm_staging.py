@@ -164,15 +164,19 @@ def _marker_path(snapshot_path: Path) -> Path:
     return snapshot_path / _COMPLETE_MARKER_FILENAME
 
 
-def _required_model_path(
+def _required_model_paths(
     snapshot_path: Path,
     profile: LLMModelProfile,
-) -> Path:
-    """Return the profile's required model artifact inside one snapshot."""
+) -> tuple[Path, ...]:
+    """Return every required model artifact inside one snapshot."""
     model_filename = profile.backend_option("model_filename")
     if model_filename is None:
-        return snapshot_path / "config.json"
-    return snapshot_path / str(model_filename)
+        return (snapshot_path / "config.json",)
+    filenames = [str(model_filename)]
+    mmproj_filename = profile.backend_option("mmproj_filename")
+    if mmproj_filename is not None:
+        filenames.append(str(mmproj_filename))
+    return tuple(snapshot_path / filename for filename in filenames)
 
 
 def _tokenizer_source(profile: LLMModelProfile) -> tuple[str, str] | None:
@@ -196,7 +200,10 @@ def _snapshot_has_required_artifacts(
     profile: LLMModelProfile,
 ) -> bool:
     """Return whether model and optional tokenizer artifacts are complete."""
-    if not _required_model_path(snapshot_path, profile).is_file():
+    if not all(
+        required_path.is_file()
+        for required_path in _required_model_paths(snapshot_path, profile)
+    ):
         return False
     return (
         _tokenizer_source(profile) is None
@@ -209,7 +216,11 @@ def _model_allow_patterns(profile: LLMModelProfile) -> tuple[str, ...]:
     model_filename = profile.backend_option("model_filename")
     if model_filename is None:
         return _SNAPSHOT_ALLOW_PATTERNS
-    return (*_TOKENIZER_ALLOW_PATTERNS, str(model_filename))
+    selected_filenames = [str(model_filename)]
+    mmproj_filename = profile.backend_option("mmproj_filename")
+    if mmproj_filename is not None:
+        selected_filenames.append(str(mmproj_filename))
+    return (*_TOKENIZER_ALLOW_PATTERNS, *selected_filenames)
 
 
 def _read_marker(snapshot_path: Path) -> dict[str, Any] | None:

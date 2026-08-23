@@ -83,6 +83,52 @@ def test_worker_context_includes_top_level_comfyui_python_modules(
     assert "comfyui/comfy/data.json" not in archive_paths
 
 
+def test_worker_dockerfile_disables_inherited_base_image_healthcheck(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The socket worker must not inherit llama-server's HTTP health check."""
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "select_remote_torch_build",
+        lambda _gpu: SimpleNamespace(
+            install_layers=(),
+            validation_command=lambda: "true",
+        ),
+    )
+    monkeypatch.setattr(ssh_runtime_module, "remote_apt_packages", lambda: ())
+    monkeypatch.setattr(ssh_runtime_module, "remote_runtime_packages", lambda: ())
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_packages",
+        lambda _gpu: (),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_validation_command",
+        lambda _gpu: "true",
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "custom_node_runtime_packages",
+        lambda _path: (),
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(
+            modal_gpu="RTX-PRO-6000",
+            custom_nodes_dir=Path("/custom_nodes"),
+        ),
+    )
+    spec = SimpleNamespace(identity=SimpleNamespace(fingerprint="deadbeef"))
+
+    dockerfile = manager._dockerfile(spec)
+
+    assert "HEALTHCHECK NONE" in dockerfile
+    assert dockerfile.index("HEALTHCHECK NONE") < dockerfile.index("ENTRYPOINT")
+
+
 def test_worker_indices_are_distributed_across_discovered_gpus(
     ssh_runtime_module: Any,
     remote_hosts_module: Any,

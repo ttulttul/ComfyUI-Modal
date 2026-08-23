@@ -342,6 +342,7 @@ class SshRuntimeManager:
                     f"COMFY_MODAL_RUNTIME_FINGERPRINT={spec.identity.fingerprint}"
                 ),
                 "WORKDIR /opt/comfy-remote/repo",
+                "HEALTHCHECK NONE",
                 'ENTRYPOINT ["python","-m","remote.ssh_worker","serve"]',
                 "",
             ]

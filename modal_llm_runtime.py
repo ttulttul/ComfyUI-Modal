@@ -1163,7 +1163,7 @@ class _VLLMStreamState:
 
 
 class LlamaCppServerBackend:
-    """Run one text-only GGUF model through a resident llama.cpp CUDA server."""
+    """Run one curated GGUF model through a resident llama.cpp CUDA server."""
 
     def __init__(
         self,
@@ -1177,6 +1177,7 @@ class LlamaCppServerBackend:
         self.profile = profile
         self.snapshot_path = snapshot_path
         self.model_path = self._model_path()
+        self.mmproj_path = self._mmproj_path()
         self.port = self._available_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         log_descriptor, log_path = tempfile.mkstemp(
@@ -1236,6 +1237,24 @@ class LlamaCppServerBackend:
             raise RuntimeError(f"Staged GGUF model is missing at {model_path}.")
         return model_path
 
+    def _mmproj_path(self) -> Path | None:
+        """Return the optional staged multimodal projector path."""
+        filename = self.profile.backend_option("mmproj_filename")
+        if filename is None:
+            return None
+        normalized_filename = str(filename).strip()
+        if not normalized_filename or Path(normalized_filename).name != normalized_filename:
+            raise ValueError(
+                f"GGUF profile {self.profile.profile_id!r} has no safe multimodal "
+                "projector filename."
+            )
+        mmproj_path = self.snapshot_path / normalized_filename
+        if not mmproj_path.is_file():
+            raise RuntimeError(
+                f"Staged GGUF multimodal projector is missing at {mmproj_path}."
+            )
+        return mmproj_path
+
     @staticmethod
     def _available_port() -> int:
         """Reserve and release one loopback port for the private server."""
@@ -1252,7 +1271,7 @@ class LlamaCppServerBackend:
             self.profile.backend_option("context_size", self.profile.max_context_tokens)
         )
         gpu_layers = int(self.profile.backend_option("gpu_layers", 999))
-        return [
+        command = [
             binary,
             "--model",
             str(self.model_path),
@@ -1274,6 +1293,9 @@ class LlamaCppServerBackend:
             "on",
             "--no-webui",
         ]
+        if self.mmproj_path is not None:
+            command.extend(("--mmproj", str(self.mmproj_path)))
+        return command
 
     def _start_server(self) -> subprocess.Popen[bytes]:
         """Launch llama-server without exposing a network listener."""
@@ -1364,12 +1386,44 @@ class LlamaCppServerBackend:
             raise RuntimeError("The GGUF tokenizer did not return a text prompt.")
         return prompt
 
-    def _completion(
-        self, payload: Mapping[str, Any], timeout_seconds: float
+    @staticmethod
+    def _image_data_uri(image: Image.Image) -> str:
+        """Encode one normalized image for llama.cpp's private chat endpoint."""
+        buffer = BytesIO()
+        image.convert("RGB").save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+    def _chat_messages(
+        self,
+        prepared_inputs: PreparedLLMInputs,
+    ) -> list[dict[str, Any]]:
+        """Return OpenAI-compatible text and image chat messages."""
+        messages: list[dict[str, Any]] = []
+        if prepared_inputs.system_prompt:
+            messages.append(
+                {"role": "system", "content": prepared_inputs.system_prompt}
+            )
+        content: list[dict[str, Any]] = [
+            {
+                "type": "image_url",
+                "image_url": {"url": self._image_data_uri(image)},
+            }
+            for image in prepared_inputs.images
+        ]
+        content.append({"type": "text", "text": prepared_inputs.prompt})
+        messages.append({"role": "user", "content": content})
+        return messages
+
+    def _post_json(
+        self,
+        endpoint: str,
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
     ) -> dict[str, Any]:
-        """Submit one non-streaming completion request to the private server."""
+        """Submit one JSON request to the private llama.cpp server."""
         request = Request(
-            f"{self.base_url}/completion",
+            f"{self.base_url}{endpoint}",
             data=json.dumps(dict(payload)).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1380,13 +1434,49 @@ class LlamaCppServerBackend:
         except HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
-                f"llama.cpp completion failed with HTTP {exc.code}: {error_body}"
+                f"llama.cpp request to {endpoint} failed with HTTP {exc.code}: "
+                f"{error_body}"
             ) from exc
         except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"llama.cpp completion failed: {exc}") from exc
+            raise RuntimeError(
+                f"llama.cpp request to {endpoint} failed: {exc}"
+            ) from exc
         if not isinstance(decoded, dict):
-            raise RuntimeError("llama.cpp completion returned a non-object response.")
+            raise RuntimeError(
+                f"llama.cpp request to {endpoint} returned a non-object response."
+            )
         return decoded
+
+    def _completion(
+        self, payload: Mapping[str, Any], timeout_seconds: float
+    ) -> dict[str, Any]:
+        """Submit one non-streaming completion request to the private server."""
+        return self._post_json("/completion", payload, timeout_seconds)
+
+    def _chat_completion(
+        self, payload: Mapping[str, Any], timeout_seconds: float
+    ) -> dict[str, Any]:
+        """Submit one multimodal OpenAI-compatible chat request."""
+        return self._post_json("/v1/chat/completions", payload, timeout_seconds)
+
+    @staticmethod
+    def _chat_response_content(response: Mapping[str, Any]) -> tuple[str, int, int]:
+        """Extract text and token counts from one chat-completion response."""
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("llama.cpp chat completion returned no choices.")
+        first_choice = choices[0]
+        message = first_choice.get("message") if isinstance(first_choice, Mapping) else None
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, str):
+            raise RuntimeError("llama.cpp chat completion omitted message content.")
+        usage = response.get("usage")
+        usage_mapping = usage if isinstance(usage, Mapping) else {}
+        return (
+            content,
+            int(usage_mapping.get("prompt_tokens", 0)),
+            int(usage_mapping.get("completion_tokens", 0)),
+        )
 
     def generate(
         self,
@@ -1406,28 +1496,50 @@ class LlamaCppServerBackend:
             )
         )
         started_at = time.perf_counter()
-        response = self._completion(
-            {
-                "prompt": self._prompt(prepared_inputs, settings),
-                "n_predict": settings.max_new_tokens,
-                "temperature": settings.temperature,
-                "top_p": settings.top_p,
-                "seed": settings.seed,
-                "repeat_penalty": 1.05,
-                "cache_prompt": True,
-                "return_tokens": True,
-            },
-            timeout_seconds=max(900.0, settings.max_new_tokens * 10.0),
-        )
-        completed_at = time.perf_counter()
-        content = response.get("content")
-        tokens = response.get("tokens")
-        if not isinstance(content, str) or not isinstance(tokens, list):
-            raise RuntimeError(
-                "llama.cpp completion omitted string content or generated tokens."
+        timeout_seconds = max(900.0, settings.max_new_tokens * 10.0)
+        if prepared_inputs.images:
+            response = self._chat_completion(
+                {
+                    "model": self.profile.profile_id,
+                    "messages": self._chat_messages(prepared_inputs),
+                    "max_tokens": settings.max_new_tokens,
+                    "temperature": settings.temperature,
+                    "top_p": settings.top_p,
+                    "seed": settings.seed,
+                    "repeat_penalty": 1.05,
+                    "chat_template_kwargs": reasoning_chat_template_kwargs(
+                        self.profile,
+                        settings.enable_reasoning,
+                    ),
+                },
+                timeout_seconds=timeout_seconds,
             )
-        output_token_ids = [int(token) for token in tokens]
-        output_tokens = len(output_token_ids)
+            content, input_tokens, output_tokens = self._chat_response_content(response)
+            output_token_ids: list[int] = []
+        else:
+            response = self._completion(
+                {
+                    "prompt": self._prompt(prepared_inputs, settings),
+                    "n_predict": settings.max_new_tokens,
+                    "temperature": settings.temperature,
+                    "top_p": settings.top_p,
+                    "seed": settings.seed,
+                    "repeat_penalty": 1.05,
+                    "cache_prompt": True,
+                    "return_tokens": True,
+                },
+                timeout_seconds=timeout_seconds,
+            )
+            content = response.get("content")
+            tokens = response.get("tokens")
+            if not isinstance(content, str) or not isinstance(tokens, list):
+                raise RuntimeError(
+                    "llama.cpp completion omitted string content or generated tokens."
+                )
+            output_token_ids = [int(token) for token in tokens]
+            output_tokens = len(output_token_ids)
+            input_tokens = int(response.get("tokens_evaluated", 0))
+        completed_at = time.perf_counter()
         elapsed_seconds = completed_at - started_at
         timings = response.get("timings")
         timing_mapping = timings if isinstance(timings, Mapping) else {}
@@ -1455,7 +1567,7 @@ class LlamaCppServerBackend:
         reasoning_output = reasoning_parser.extract(content, output_token_ids)
         return BackendGenerationResult(
             text=reasoning_output.response,
-            input_tokens=int(response.get("tokens_evaluated", 0)),
+            input_tokens=input_tokens,
             output_tokens=output_tokens,
             reasoning=reasoning_output.reasoning,
             reasoning_tokens=reasoning_output.reasoning_tokens,
@@ -1467,6 +1579,9 @@ class LlamaCppServerBackend:
         """Return the GGUF artifact and server configuration."""
         return {
             "llama_cpp_model_filename": self.model_path.name,
+            "llama_cpp_mmproj_filename": (
+                self.mmproj_path.name if self.mmproj_path is not None else None
+            ),
             "llama_cpp_context_size": int(
                 self.profile.backend_option(
                     "context_size",
