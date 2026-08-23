@@ -74,7 +74,10 @@ def test_endpoint_chat_node_is_not_offered_nested_modal_execution() -> None:
     """The local endpoint client should not be wrapped in another Modal execution island."""
     source = _modal_toggle_source()
 
-    assert 'const LOCAL_MODAL_NODE_IDS = new Set(["ModalEndpointChat"]);' in source
+    assert (
+        'const LOCAL_MODAL_NODE_IDS = new Set(["ModalEndpointChat", '
+        '"VastAILeaseConfiguration"]);'
+    ) in source
     assert "!LOCAL_MODAL_NODE_IDS.has(String(node.comfyClass))" in source
     assert "!LOCAL_MODAL_NODE_IDS.has(String(nodeData.name))" in source
 

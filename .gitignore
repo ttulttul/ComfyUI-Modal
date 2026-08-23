@@ -37,6 +37,10 @@
 !/ssh_executor.py
 !/ssh_runtime.py
 !/sync_engine.py
+!/vast_api.py
+!/vast_config_node.py
+!/vast_models.py
+!/vast_simulator.py
 
 !/docs/
 /docs/*

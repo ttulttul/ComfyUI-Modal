@@ -52,6 +52,7 @@ try:
         ModalMapInput,
         ModalUniversalExecutor,
     )
+    from .vast_config_node import VastAILeaseConfiguration
 except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy imports.
     ComfyExtension = object  # type: ignore[assignment]
     io = None  # type: ignore[assignment]
@@ -60,6 +61,7 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     ModalEndpointChat = None  # type: ignore[assignment]
     ModalLLM = None  # type: ignore[assignment]
     ModalUniversalExecutor = None  # type: ignore[assignment]
+    VastAILeaseConfiguration = None  # type: ignore[assignment]
 
     class ComfyModalSyncExtension:  # type: ignore[no-redef]
         """Fallback placeholder used when ComfyUI is not importable."""
@@ -84,6 +86,7 @@ else:
                 ModalArtifactFinalizer,
                 ModalEndpointChat,
                 ModalLLM,
+                VastAILeaseConfiguration,
             ]
 
     async def comfy_entrypoint() -> ComfyExtension:
@@ -99,6 +102,7 @@ __all__ = [
     "ModalLLM",
     "ModalMapInput",
     "ModalUniversalExecutor",
+    "VastAILeaseConfiguration",
     "WEB_DIRECTORY",
     "comfy_entrypoint",
 ]

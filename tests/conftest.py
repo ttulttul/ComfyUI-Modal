@@ -161,6 +161,30 @@ def ssh_worker_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def vast_models_module(extension_package: object) -> object:
+    """Return the Vast marketplace and instance models."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_models")
+
+
+@pytest.fixture(scope="session")
+def vast_api_module(extension_package: object) -> object:
+    """Return the asynchronous Vast API client."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_api")
+
+
+@pytest.fixture(scope="session")
+def vast_simulator_module(extension_package: object) -> object:
+    """Return the local Vast API simulator."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_simulator")
+
+
+@pytest.fixture(scope="session")
+def vast_config_node_module(extension_package: object) -> object:
+    """Return the disconnected Vast configuration node module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_config_node")
+
+
+@pytest.fixture(scope="session")
 def api_intercept_module(extension_package: object) -> object:
     """Return the prompt interception module."""
     return importlib.import_module(f"{PACKAGE_NAME}.api_intercept")

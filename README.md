@@ -5,6 +5,8 @@
 
 ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts of a workflow through Modal or user-managed Docker hosts reached over SSH. You mark nodes with `Run on Modal` (the legacy-compatible remote marker), or enable workflow-wide automatic placement; the extension rewrites the queued prompt into transport-aware remote components, syncs required assets, and returns remote outputs and generated files to the local ComfyUI graph.
 
+The `add-vast-ai-back-end` development line also exposes a disconnected **Vast.ai Lease Configuration** v3 node. Each node declares a named, non-secret marketplace capacity profile with GPU count, per-GPU VRAM, theoretical TFLOPS, CPU RAM, disk, reliability, duration, maximum hourly price, and idle retention. Multiple nodes may coexist as independent scheduler candidates. Configuration nodes are local output sinks so they survive ComfyUI prompt compilation without graph connections, while automatic remote placement explicitly excludes them from execution islands.
+
 ## Overview
 
 Modal-Sync provides:
@@ -84,6 +86,16 @@ For repository development, `uv sync --extra remote --extra local-apple --group 
 ### Self-hosted SSH Docker environments
 
 Self-hosted execution reuses the same component planner, asset synchronization, custom-node bundle, serialization, progress stream, cancellation, remote-session, and output-artifact paths as Modal. The provider-specific layer is limited to host discovery, OCI image construction, named-volume storage, warm-worker lifecycle, and a framed binary relay over SSH.
+
+### Vast.ai API simulator
+
+Vast development and CI do not require live credentials or billable instances. Start the stateful local simulator with:
+
+```bash
+uv run python scripts/run_vast_api_simulator.py --port 8099 --api-key vast-test-key
+```
+
+The simulator implements the authenticated account check, offer search operators and ordering, offer-rental races, instance creation, loading-to-running polling, listing, start/stop, and permanent destruction used by the extension. Its default offers cover 24 GB, 48 GB, and 80 GB GPU tiers. The production client accepts plaintext HTTP only for loopback simulator addresses; live Vast credentials are sent only to HTTPS endpoints. Simulator-backed contract tests exercise the full API lifecycle and verify that bearer and per-instance keys are not retained in request diagnostics.
 
 Open **Settings → Remote Execution: SSH environments**, or right-click an eligible node and choose **Remote Execution → Manage SSH hosts…**. Add one or more hosts using an SSH destination or alias that already works from the account running ComfyUI. The extension deliberately stores no password or private-key path; authentication, jump hosts, ports, and key selection belong in the user's normal SSH agent and `~/.ssh/config`.
 

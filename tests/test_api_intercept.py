@@ -184,6 +184,7 @@ def test_auto_placement_selects_every_eligible_prompt_node(
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
         "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
         "3": {"class_type": "ModalEndpointChat", "inputs": {}},
+        "4": {"class_type": "VastAILeaseConfiguration", "inputs": {}},
     }
     workflow = {
         "extra": {

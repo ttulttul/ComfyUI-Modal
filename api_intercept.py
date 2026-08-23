@@ -82,6 +82,7 @@ _REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
 _LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
     {
         "ModalEndpointChat",
+        "VastAILeaseConfiguration",
         MODAL_ARTIFACT_FINALIZER_NODE_ID,
         MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
         MODAL_MAP_INPUT_NODE_ID,
