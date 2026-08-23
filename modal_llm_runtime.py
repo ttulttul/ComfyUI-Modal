@@ -1300,6 +1300,7 @@ class LlamaCppServerBackend:
     def _start_server(self) -> subprocess.Popen[bytes]:
         """Launch llama-server without exposing a network listener."""
         command = self._server_command()
+        environment = self._server_environment(command)
         logger.info(
             "Starting llama.cpp profile=%s model=%s context=%s port=%d.",
             self.profile.profile_id,
@@ -1316,12 +1317,25 @@ class LlamaCppServerBackend:
                 stdout=self._log_file,
                 stderr=subprocess.STDOUT,
                 close_fds=True,
+                env=environment,
             )
         except OSError as exc:
             raise RuntimeError(
                 f"Unable to start llama.cpp for profile {self.profile.profile_id!r}: "
                 f"{exc}"
             ) from exc
+
+    @staticmethod
+    def _server_environment(command: Sequence[str]) -> dict[str, str]:
+        """Expose shared libraries installed beside the llama-server binary."""
+        environment = os.environ.copy()
+        binary_directory = str(Path(command[0]).resolve().parent)
+        existing_path = environment.get("LD_LIBRARY_PATH", "")
+        path_entries = [entry for entry in existing_path.split(":") if entry]
+        if binary_directory not in path_entries:
+            path_entries.insert(0, binary_directory)
+        environment["LD_LIBRARY_PATH"] = ":".join(path_entries)
+        return environment
 
     def _log_tail(self, maximum_bytes: int = 8192) -> str:
         """Return the bounded tail of the private server log."""

@@ -334,6 +334,7 @@ class SshRuntimeManager:
                 "COPY comfyui /opt/comfy-remote/ComfyUI",
                 (
                     f"ENV PYTHONPATH={_REMOTE_REPO_ROOT}:{_REMOTE_COMFYUI_ROOT} "
+                    "LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH} "
                     f"COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
                     f"COMFY_MODAL_COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
                     f"COMFY_MODAL_LOCAL_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "

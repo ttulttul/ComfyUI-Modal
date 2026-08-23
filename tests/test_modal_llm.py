@@ -1372,6 +1372,41 @@ def test_llama_cpp_backend_generates_with_curated_gguf_profile(
     assert [event.stage for event in progress] == ["prefill", "generating"]
 
 
+def test_llama_cpp_backend_adds_binary_directory_to_library_path(
+    modal_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The private server should find shared libraries shipped beside its binary."""
+    backend = object.__new__(modal_llm_runtime_module.LlamaCppServerBackend)
+    backend.profile = SimpleNamespace(
+        profile_id="gguf-test",
+        max_context_tokens=8192,
+        backend_option=lambda _name, default=None: default,
+    )
+    backend.model_path = tmp_path / "model.gguf"
+    backend.mmproj_path = None
+    backend.port = 18080
+    backend._log_file = BytesIO()
+    observed: dict[str, Any] = {}
+
+    def popen(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        """Capture the subprocess environment for the private server."""
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return SimpleNamespace()
+
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
+    monkeypatch.setattr(modal_llm_runtime_module.subprocess, "Popen", popen)
+
+    backend._start_server()
+
+    assert observed["command"][0] == "/app/llama-server"
+    assert observed["kwargs"]["env"]["LD_LIBRARY_PATH"] == (
+        "/app:/existing/lib"
+    )
+
+
 def test_llama_cpp_backend_sends_images_through_chat_completion(
     modal_llm_runtime_module: Any,
     llm_profiles_module: Any,

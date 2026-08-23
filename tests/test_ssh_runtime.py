@@ -127,6 +127,7 @@ def test_worker_dockerfile_disables_inherited_base_image_healthcheck(
 
     assert "HEALTHCHECK NONE" in dockerfile
     assert dockerfile.index("HEALTHCHECK NONE") < dockerfile.index("ENTRYPOINT")
+    assert "LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}" in dockerfile
 
 
 def test_worker_indices_are_distributed_across_discovered_gpus(
