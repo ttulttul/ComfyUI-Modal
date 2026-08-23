@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import threading
 import time
 import uuid
@@ -69,6 +70,10 @@ from .sync_engine import (
 )
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
 from .ssh_docker import SshDockerController, SshDockerVolumeBackend
+from .vast_config_node import extract_vast_profiles
+from .vast_service import VastProfileQuote, VastService
+from .vast_api import VastApiClient
+from .vast_leases import VastLeaseRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -953,7 +958,7 @@ def _plan_component_execution_assignments(
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
 ) -> dict[str, ExecutionAssignment]:
-    """Assign each component to Modal or one compatible self-hosted environment."""
+    """Assign components across Modal, SSH Docker, and workflow-declared Vast pools."""
     preferences = WorkflowExecutionPreferences.from_workflow(workflow)
     resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
     if preferences.policy is ExecutionPolicy.MODAL:
@@ -985,16 +990,42 @@ def _plan_component_execution_assignments(
             for component in components
         }
 
-    ssh_hosts = _schedulable_ssh_hosts(settings)
+    try:
+        vast_profiles = extract_vast_profiles(prompt)
+    except ValueError as exc:
+        raise ModalPromptValidationError(str(exc)) from exc
+    vast_service: VastService | None = None
+    if preferences.policy in {ExecutionPolicy.VAST, ExecutionPolicy.AUTOMATIC}:
+        if preferences.policy is ExecutionPolicy.VAST and not vast_profiles:
+            raise ModalPromptValidationError(
+                "Vast.ai-only execution requires at least one disconnected "
+                "Vast.ai Lease Configuration node in the workflow."
+            )
+        if vast_profiles:
+            try:
+                vast_service = VastService.from_environment(
+                    settings,
+                    repo_root=Path(__file__).resolve().parent,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                if preferences.policy is ExecutionPolicy.VAST:
+                    raise ModalPromptValidationError(str(exc)) from exc
+                logger.warning("Skipping Vast.ai automatic placement: %s", exc)
+
+    ssh_hosts = (
+        _schedulable_ssh_hosts(settings)
+        if preferences.policy in {ExecutionPolicy.SELF_HOSTED, ExecutionPolicy.AUTOMATIC}
+        else ()
+    )
     ssh_hosts_by_id = {host.environment_id: host for host in ssh_hosts}
     modal_state = (
         _modal_environment_state(settings)
         if preferences.policy is ExecutionPolicy.AUTOMATIC
         else None
     )
-    if not ssh_hosts and modal_state is None:
+    if not ssh_hosts and modal_state is None and vast_service is None:
         raise ModalPromptValidationError(
-            "This workflow requests self-hosted execution, but no SSH Docker hosts are configured."
+            "This workflow requests remote execution, but no compatible provider is configured."
         )
 
     scheduler = CostAwareEnvironmentScheduler()
@@ -1006,15 +1037,7 @@ def _plan_component_execution_assignments(
         ]
         if modal_state is not None:
             environments.append(modal_state)
-        environment_ids = [
-            environment.environment_id for environment in environments
-        ]
         component_signature = _component_execution_signature(component, prompt)
-        historical_estimates = (
-            history.estimates(component_signature, environment_ids)
-            if history is not None
-            else {}
-        )
         memory_estimate = _component_memory_estimate(
             component,
             prompt,
@@ -1032,6 +1055,45 @@ def _plan_component_execution_assignments(
                 memory_estimate.model_asset_count,
                 memory_estimate.largest_model_bytes / 1024**3,
             )
+        vast_quote: VastProfileQuote | None = None
+        if vast_service is not None:
+            try:
+                vast_quote = vast_service.quote_best_profile_sync(
+                    vast_profiles,
+                    minimum_vram_bytes=memory_estimate.minimum_vram_bytes,
+                    minimum_ram_bytes=memory_estimate.minimum_ram_bytes,
+                    predicted_execution_seconds=60.0,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                if preferences.policy is ExecutionPolicy.VAST:
+                    raise ModalPromptValidationError(str(exc)) from exc
+                logger.warning(
+                    "No Vast.ai automatic candidate for component=%s: %s",
+                    component.representative_node_id,
+                    exc,
+                )
+            else:
+                environments.append(vast_service.scheduling_state(vast_quote))
+        environment_ids = [
+            environment.environment_id for environment in environments
+        ]
+        historical_estimates = (
+            history.estimates(component_signature, environment_ids)
+            if history is not None
+            else {}
+        )
+        component_required_provider = _component_required_provider(
+            component,
+            prompt,
+            resolved_llm_profiles,
+        )
+        if preferences.policy is ExecutionPolicy.VAST:
+            if component_required_provider is ExecutionProvider.SSH_DOCKER:
+                raise ModalPromptValidationError(
+                    "Vast.ai-only execution cannot run an SSH-only component. "
+                    "Select Automatic or Self-hosted execution for this workflow."
+                )
+            component_required_provider = ExecutionProvider.VAST
         requirements = ComponentResourceRequirements(
             minimum_vram_bytes=memory_estimate.minimum_vram_bytes,
             minimum_ram_bytes=memory_estimate.minimum_ram_bytes,
@@ -1043,11 +1105,7 @@ def _plan_component_execution_assignments(
                 for environment_id, estimate in historical_estimates.items()
             },
             preferred_environment_ids=preferences.preferred_environment_ids,
-            required_provider=_component_required_provider(
-                component,
-                prompt,
-                resolved_llm_profiles,
-            ),
+            required_provider=component_required_provider,
         )
         try:
             assignment = _choose_with_idle_ssh_worker_reclaim(
@@ -1059,6 +1117,27 @@ def _plan_component_execution_assignments(
             )
         except NoCompatibleExecutionEnvironmentError as exc:
             raise ModalPromptValidationError(str(exc)) from exc
+        if assignment.provider is ExecutionProvider.VAST:
+            if vast_service is None or vast_quote is None:
+                raise ModalPromptValidationError(
+                    "Vast.ai was selected without a current marketplace quote."
+                )
+            try:
+                lease = vast_service.acquire_sync(vast_quote)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ModalPromptValidationError(
+                    f"Unable to acquire Vast.ai capacity: {exc}"
+                ) from exc
+            assignment = replace(
+                assignment,
+                environment_id=lease.environment_id,
+                predicted_cost_usd=vast_quote.predicted_incremental_cost_usd,
+                reasons=assignment.reasons
+                + (
+                    f"Vast profile {vast_quote.profile.profile_name}",
+                    f"idle retention {lease.idle_retention_seconds / 3600:.1f}h",
+                ),
+            )
         assignments[component.representative_node_id] = assignment
         logger.info(
             "Assigned remote component=%s provider=%s environment=%s predicted_cost_usd=%s reasons=%s.",
@@ -1099,6 +1178,7 @@ def _stamp_execution_assignment(
     worker_index: int = 0,
     execution_history_signature: str | None = None,
     execution_location: str | None = None,
+    provider_metadata: Mapping[str, Any] | None = None,
 ) -> None:
     """Attach provider placement to a payload and every nested proxy phase."""
     payload["execution_provider"] = assignment.provider.value
@@ -1108,6 +1188,8 @@ def _stamp_execution_assignment(
         payload["execution_location"] = execution_location
     if execution_history_signature:
         payload["execution_history_signature"] = execution_history_signature
+    if provider_metadata:
+        payload.update(provider_metadata)
     split_payloads = payload.get("split_proxy_payloads")
     nested_payloads: list[dict[str, Any]] = []
     if isinstance(split_payloads, dict):
@@ -1129,6 +1211,7 @@ def _stamp_execution_assignment(
             worker_index,
             execution_history_signature,
             execution_location,
+            provider_metadata,
         )
 
 
@@ -1143,10 +1226,16 @@ def _ssh_hostname(ssh_target: str) -> str:
 def _execution_location_for_assignment(
     assignment: ExecutionAssignment,
     ssh_hosts_by_id: Mapping[str, SshHostConfig],
+    vast_leases_by_environment: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Return the runtime location label known before remote dispatch."""
     if assignment.provider is ExecutionProvider.MODAL:
         return None
+    if assignment.provider is ExecutionProvider.VAST:
+        lease = (vast_leases_by_environment or {}).get(assignment.environment_id)
+        if lease is not None:
+            return str(lease.ssh_host or lease.gpu_name)
+        return assignment.environment_id
     host = ssh_hosts_by_id.get(assignment.environment_id)
     return _ssh_hostname(host.ssh_target) if host is not None else assignment.environment_id
 
@@ -6034,6 +6123,29 @@ def rewrite_prompt_for_modal(
         )
     summary.execution_assignments_by_representative = dict(assignments_by_component_id)
 
+    vast_service: VastService | None = None
+    vast_leases_by_environment: dict[str, Any] = {}
+    if any(
+        assignment.provider is ExecutionProvider.VAST
+        for assignment in assignments_by_component_id.values()
+    ):
+        try:
+            vast_service = VastService.from_environment(
+                resolved_settings,
+                repo_root=Path(__file__).resolve().parent,
+            )
+            vast_leases_by_environment = {
+                assignment.environment_id: vast_service.lease_for_environment_id(
+                    assignment.environment_id
+                )
+                for assignment in assignments_by_component_id.values()
+                if assignment.provider is ExecutionProvider.VAST
+            }
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            raise ModalPromptValidationError(
+                f"Unable to resolve the acquired Vast.ai lease: {exc}"
+            ) from exc
+
     sync_engines_by_environment: dict[str, ModalAssetSyncEngine] = {}
     ssh_hosts_by_id = {
         host.environment_id: host for host in _configured_ssh_hosts(resolved_settings)
@@ -6081,6 +6193,16 @@ def rewrite_prompt_for_modal(
             sync_engines_by_environment[
                 assignment.environment_id
             ] = resolved_sync_engine
+            continue
+        if assignment.provider is ExecutionProvider.VAST:
+            if vast_service is None:
+                raise ModalPromptValidationError(
+                    "Vast.ai assignment has no active controller service."
+                )
+            lease = vast_leases_by_environment[assignment.environment_id]
+            sync_engines_by_environment[assignment.environment_id] = (
+                vast_service.sync_engine(lease)
+            )
             continue
         host = ssh_hosts_by_id.get(assignment.environment_id)
         if host is None:
@@ -6240,7 +6362,23 @@ def rewrite_prompt_for_modal(
                 0,
             ),
             _component_execution_signature(component, prompt),
-            _execution_location_for_assignment(assignment, ssh_hosts_by_id),
+            _execution_location_for_assignment(
+                assignment,
+                ssh_hosts_by_id,
+                vast_leases_by_environment,
+            ),
+            (
+                {
+                    "vast_instance_id": vast_leases_by_environment[
+                        assignment.environment_id
+                    ].instance_id,
+                    "vast_idle_retention_seconds": vast_leases_by_environment[
+                        assignment.environment_id
+                    ].idle_retention_seconds,
+                }
+                if assignment.provider is ExecutionProvider.VAST
+                else None
+            ),
         )
         implicitly_mapped_output_sources = _implicitly_mapped_boundary_output_sources(
             component=component,
@@ -6415,6 +6553,15 @@ def _execution_assignments_payload(
     ssh_hosts_by_id = {
         host.environment_id: host for host in _configured_ssh_hosts(settings)
     }
+    vast_leases_by_environment: dict[str, Any] = {}
+    vast_registry = _vast_registry(settings)
+    if vast_registry is not None:
+        try:
+            vast_leases_by_environment = {
+                lease.environment_id: lease for lease in vast_registry.load().leases
+            }
+        except ValueError as exc:
+            logger.warning("Unable to load Vast lease labels for UI status: %s", exc)
     return {
         component_id: {
             "provider": assignment.provider.value,
@@ -6422,6 +6569,7 @@ def _execution_assignments_payload(
             "execution_location": _execution_location_for_assignment(
                 assignment,
                 ssh_hosts_by_id,
+                vast_leases_by_environment,
             ),
             "node_ids": list(
                 summary.component_node_ids_by_representative.get(component_id, [])
@@ -6584,6 +6732,14 @@ def _remote_environment_stop_route_path(route_path: str) -> str:
     """Return the provider-neutral worker shutdown route."""
     del route_path
     return "/remote/environments/stop"
+
+
+def _vast_registry(settings: ModalSyncSettings) -> VastLeaseRegistry | None:
+    """Return persistent credential-free Vast lease state when available."""
+    user_directory = discover_comfyui_user_directory(settings)
+    if user_directory is None:
+        return None
+    return VastLeaseRegistry.for_user_directory(user_directory)
 
 
 def _modal_not_found_error_types() -> tuple[type[BaseException], ...]:
@@ -6788,6 +6944,7 @@ def setup_modal_queue_route(
         resolved_settings.route_path
     )
     remote_host_registry = _ssh_host_registry(resolved_settings)
+    vast_registry = _vast_registry(resolved_settings)
     _install_modal_interrupt_queue_bridge(prompt_server)
 
     if hasattr(prompt_server.routes, "get"):
@@ -6876,6 +7033,30 @@ def setup_modal_queue_route(
                 }
             )
 
+        @prompt_server.routes.get("/remote/vast/status")
+        async def vast_status(request: web.Request) -> web.Response:
+            """Return credential-free managed lease state and controller readiness."""
+            del request
+            if vast_registry is None:
+                return web.json_response(
+                    {"configured": False, "leases": [], "error": "ComfyUI user directory unavailable."},
+                    status=503,
+                )
+            try:
+                state = await asyncio.to_thread(vast_registry.load)
+            except ValueError as exc:
+                return web.json_response(
+                    {"configured": bool(os.getenv("VAST_API_KEY")), "leases": [], "error": str(exc)},
+                    status=500,
+                )
+            return web.json_response(
+                {
+                    "configured": bool(os.getenv("VAST_API_KEY")),
+                    "image_configured": bool(os.getenv("COMFY_MODAL_VAST_IMAGE")),
+                    "leases": [lease.to_dict() for lease in state.leases],
+                }
+            )
+
     if hasattr(prompt_server.routes, "put"):
 
         @prompt_server.routes.put(remote_environments_route_path)
@@ -6937,6 +7118,56 @@ def setup_modal_queue_route(
                     pass
             return web.json_response({"error": str(exc)}, status=502)
         return web.json_response(updated_host.to_dict())
+
+    @prompt_server.routes.post("/remote/vast/verify")
+    async def vast_verify(request: web.Request) -> web.Response:
+        """Verify the configured Vast credential without returning it."""
+        del request
+        api_key = str(os.getenv("VAST_API_KEY") or "").strip()
+        if not api_key:
+            return web.json_response(
+                {"verified": False, "error": "Set VAST_API_KEY first."},
+                status=400,
+            )
+        base_url = str(os.getenv("COMFY_MODAL_VAST_API_BASE_URL") or "").strip()
+        try:
+            client = VastApiClient(api_key, **({"base_url": base_url} if base_url else {}))
+            account = await client.verify_credentials()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return web.json_response(
+                {"verified": False, "error": str(exc)},
+                status=502,
+            )
+        return web.json_response({"verified": True, "account": account})
+
+    @prompt_server.routes.post("/remote/vast/reap")
+    async def vast_reap(request: web.Request) -> web.Response:
+        """Destroy only owned idle leases whose configured deadline has expired."""
+        del request
+        try:
+            service = VastService.from_environment(
+                resolved_settings,
+                repo_root=Path(__file__).resolve().parent,
+            )
+            destroyed = await service.lease_manager.destroy_expired()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response({"destroyed_instance_ids": list(destroyed)})
+
+    @prompt_server.routes.post("/remote/vast/destroy")
+    async def vast_destroy(request: web.Request) -> web.Response:
+        """Destroy one exact idle registry-owned lease after server-side label checks."""
+        try:
+            payload = await request.json()
+            instance_id = int(payload.get("instance_id"))
+            service = VastService.from_environment(
+                resolved_settings,
+                repo_root=Path(__file__).resolve().parent,
+            )
+            destroyed = await service.lease_manager.destroy_owned_lease(instance_id)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response({"instance_id": instance_id, "destroyed": destroyed})
 
     @prompt_server.routes.post(remote_environment_bootstrap_route_path)
     async def remote_environment_bootstrap(request: web.Request) -> web.Response:

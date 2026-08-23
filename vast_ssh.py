@@ -1,0 +1,300 @@
+"""Direct SSH command and filesystem storage adapters for Vast containers."""
+
+from __future__ import annotations
+
+import logging
+import os
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Sequence
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_VAST_SSH_CONNECT_TIMEOUT_SECONDS = 15
+DEFAULT_VAST_SSH_COMMAND_TIMEOUT_SECONDS = 120.0
+DEFAULT_VAST_STORAGE_ROOT = PurePosixPath("/storage")
+
+
+class VastSshError(RuntimeError):
+    """Raised when a direct Vast SSH or filesystem operation fails."""
+
+
+@dataclass(frozen=True)
+class VastSshConnection:
+    """Describe one Vast instance SSH endpoint without private credentials."""
+
+    host: str
+    port: int
+    known_hosts_path: Path
+    user: str = "root"
+    identity_file: Path | None = None
+
+    def __post_init__(self) -> None:
+        """Validate endpoint and local trust-store paths."""
+        if not self.host.strip() or any(
+            character in self.host for character in ("\x00", "\n", "\r")
+        ):
+            raise ValueError("Vast SSH host must be a non-empty single-line value.")
+        if self.host.startswith("-"):
+            raise ValueError("Vast SSH host must not begin with an option prefix.")
+        if isinstance(self.port, bool) or not (1 <= self.port <= 65535):
+            raise ValueError("Vast SSH port must be between 1 and 65535.")
+        if not self.user.strip() or not all(
+            character.isalnum() or character in "_.-" for character in self.user
+        ):
+            raise ValueError("Vast SSH user contains unsafe characters.")
+        if not self.known_hosts_path.is_absolute():
+            raise ValueError("Vast known_hosts_path must be absolute.")
+        if self.identity_file is not None and not self.identity_file.is_absolute():
+            raise ValueError("Vast SSH identity_file must be absolute when configured.")
+
+    @property
+    def target(self) -> str:
+        """Return the OpenSSH user and host destination."""
+        return f"{self.user}@{self.host}"
+
+
+@dataclass(frozen=True)
+class VastSshCommandResult:
+    """Capture a completed direct SSH command."""
+
+    stdout: bytes
+    stderr: bytes
+    returncode: int
+
+    @property
+    def stdout_text(self) -> str:
+        """Decode standard output as replacement-safe UTF-8."""
+        return self.stdout.decode("utf-8", errors="replace")
+
+    @property
+    def stderr_text(self) -> str:
+        """Decode standard error as replacement-safe UTF-8."""
+        return self.stderr.decode("utf-8", errors="replace")
+
+
+@dataclass
+class VastSshRunner:
+    """Run argv-safe commands inside one Vast instance container."""
+
+    connection: VastSshConnection
+    connect_timeout_seconds: int = DEFAULT_VAST_SSH_CONNECT_TIMEOUT_SECONDS
+    command_timeout_seconds: float = DEFAULT_VAST_SSH_COMMAND_TIMEOUT_SECONDS
+    ssh_binary: str = "ssh"
+
+    def __post_init__(self) -> None:
+        """Create the dedicated trust store without weakening global SSH policy."""
+        if self.connect_timeout_seconds <= 0 or self.command_timeout_seconds <= 0:
+            raise ValueError("Vast SSH timeouts must be positive.")
+        try:
+            self.connection.known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection.known_hosts_path.touch(mode=0o600, exist_ok=True)
+            os.chmod(self.connection.known_hosts_path, 0o600)
+        except OSError as exc:
+            raise VastSshError(
+                f"Unable to initialize Vast SSH trust store at "
+                f"{self.connection.known_hosts_path}."
+            ) from exc
+
+    def command(self, remote_argv: Sequence[str]) -> list[str]:
+        """Return the local OpenSSH argv for one remote argv sequence."""
+        if not remote_argv:
+            raise ValueError("remote_argv must contain at least one command value.")
+        normalized_argv = [str(value) for value in remote_argv]
+        if any("\x00" in value for value in normalized_argv):
+            raise ValueError("remote_argv must not contain null bytes.")
+        command = [
+            self.ssh_binary,
+            "-p",
+            str(self.connection.port),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"UserKnownHostsFile={self.connection.known_hosts_path}",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            f"ConnectTimeout={self.connect_timeout_seconds}",
+        ]
+        if self.connection.identity_file is not None:
+            command.extend(("-i", str(self.connection.identity_file)))
+        command.extend(("--", self.connection.target, shlex.join(normalized_argv)))
+        return command
+
+    def run(
+        self,
+        remote_argv: Sequence[str],
+        *,
+        input_payload: bytes | None = None,
+        timeout_seconds: float | None = None,
+        check: bool = True,
+    ) -> VastSshCommandResult:
+        """Execute one command through the system SSH client."""
+        started_at = time.monotonic()
+        try:
+            completed = subprocess.run(
+                self.command(remote_argv),
+                input=input_payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=(
+                    self.command_timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
+            )
+        except FileNotFoundError as exc:
+            raise VastSshError(
+                f"The SSH client {self.ssh_binary!r} is not installed."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise VastSshError(
+                f"SSH command to Vast instance {self.connection.host!r} timed out "
+                f"after {exc.timeout} seconds."
+            ) from exc
+        result = VastSshCommandResult(
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            returncode=completed.returncode,
+        )
+        logger.debug(
+            "Finished Vast SSH command host=%s command=%s returncode=%d elapsed_seconds=%.3f.",
+            self.connection.host,
+            remote_argv[0],
+            result.returncode,
+            time.monotonic() - started_at,
+        )
+        if check and result.returncode != 0:
+            detail = result.stderr_text.strip() or result.stdout_text.strip()
+            raise VastSshError(
+                f"Vast SSH command {remote_argv[0]!r} failed with exit status "
+                f"{result.returncode}: {detail or 'no diagnostic output'}"
+            )
+        return result
+
+    def popen(self, remote_argv: Sequence[str]) -> subprocess.Popen[bytes]:
+        """Start one streaming direct SSH command."""
+        try:
+            return subprocess.Popen(
+                self.command(remote_argv),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise VastSshError(
+                f"The SSH client {self.ssh_binary!r} is not installed."
+            ) from exc
+
+
+@dataclass
+class VastSshVolumeBackend:
+    """Store content-addressed files directly on a Vast instance filesystem."""
+
+    remote_volume_epoch_scoped = True
+
+    runner: VastSshRunner
+    storage_root: PurePosixPath = DEFAULT_VAST_STORAGE_ROOT
+    _exists_cache: dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Require an absolute non-root storage location."""
+        if not self.storage_root.is_absolute() or self.storage_root == PurePosixPath("/"):
+            raise ValueError("Vast storage_root must be an absolute non-root path.")
+        self.runner.run(("mkdir", "-p", str(self.storage_root)))
+
+    def exists(self, remote_path: str) -> bool:
+        """Return whether one regular file exists under the storage root."""
+        normalized = _validated_storage_path(remote_path)
+        cached = self._exists_cache.get(normalized)
+        if cached is not None:
+            return cached
+        result = self.runner.run(
+            ("test", "-f", str(self.storage_root / normalized)),
+            check=False,
+        )
+        exists = result.returncode == 0
+        self._exists_cache[normalized] = exists
+        return exists
+
+    def put_file(self, local_path: Path, remote_path: str) -> None:
+        """Upload one local file through the atomic byte path."""
+        resolved_path = local_path.expanduser().resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Asset not found: {resolved_path}")
+        self._put_payload(resolved_path.read_bytes(), remote_path)
+
+    def put_bytes(self, payload: bytes, remote_path: str) -> None:
+        """Atomically upload bytes under the storage root."""
+        self._put_payload(payload, remote_path)
+
+    def _put_payload(self, payload: bytes, remote_path: str) -> None:
+        """Stream bytes to an argv-safe remote Python atomic writer."""
+        normalized = _validated_storage_path(remote_path)
+        target = str(self.storage_root / normalized)
+        script = (
+            "import os,pathlib,sys,tempfile;"
+            "target=pathlib.Path(sys.argv[1]);"
+            "target.parent.mkdir(parents=True,exist_ok=True);"
+            "fd,name=tempfile.mkstemp(prefix='.'+target.name+'.',suffix='.tmp',dir=target.parent);"
+            "f=os.fdopen(fd,'wb',buffering=0);"
+            "data=sys.stdin.buffer.read();f.write(data);f.flush();os.fsync(f.fileno());f.close();"
+            "os.chmod(name,0o600);os.replace(name,target)"
+        )
+        self.runner.run(
+            ("python", "-c", script, target),
+            input_payload=payload,
+            timeout_seconds=max(60.0, len(payload) / (4 * 1024 * 1024)),
+        )
+        self._exists_cache[normalized] = True
+
+
+def vast_connection_from_lease(
+    *,
+    ssh_host: str | None,
+    ssh_port: int | None,
+    user_directory: Path,
+    identity_file: Path | None = None,
+) -> VastSshConnection:
+    """Build one direct connection from a ready lease's safe public fields."""
+    if not ssh_host or ssh_port is None:
+        raise VastSshError("Vast lease does not expose an SSH endpoint.")
+    return VastSshConnection(
+        host=ssh_host,
+        port=ssh_port,
+        known_hosts_path=(
+            user_directory.expanduser().resolve()
+            / "comfyui-modal"
+            / "vast-known-hosts"
+        ),
+        identity_file=(identity_file.expanduser().resolve() if identity_file else None),
+    )
+
+
+def _validated_storage_path(remote_path: str) -> str:
+    """Return one traversal-safe path relative to Vast storage."""
+    path = PurePosixPath(str(remote_path).lstrip("/"))
+    if (
+        not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or "\x00" in str(path)
+    ):
+        raise ValueError(f"Unsafe Vast storage path {remote_path!r}.")
+    return path.as_posix()
+
+
+__all__ = [
+    "DEFAULT_VAST_STORAGE_ROOT",
+    "VastSshCommandResult",
+    "VastSshConnection",
+    "VastSshError",
+    "VastSshRunner",
+    "VastSshVolumeBackend",
+    "vast_connection_from_lease",
+]

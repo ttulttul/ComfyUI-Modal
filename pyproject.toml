@@ -63,6 +63,7 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 markers = [
     "live_modal: opt-in tests that use authenticated, billable Modal resources",
+    "live_vast: opt-in tests that rent and may bill a real Vast.ai instance",
 ]
 
 [tool.uv]

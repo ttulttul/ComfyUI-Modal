@@ -441,6 +441,26 @@ class SshRuntimeManager:
         )
 
 
+def export_worker_image_context(
+    *,
+    repo_root: Path,
+    settings: ModalSyncSettings,
+    identity: RemoteRuntimeIdentity,
+) -> bytes:
+    """Return the shared deterministic worker build context without a remote host."""
+    manager = SshRuntimeManager.__new__(SshRuntimeManager)
+    manager.repo_root = repo_root
+    manager.settings = settings
+    spec = SshRuntimeSpec(
+        identity=identity,
+        image_tag=f"comfy-remote:{identity.fingerprint[:16]}",
+        container_name="context-only",
+        storage_volume_name="context-only",
+        worker_index=0,
+    )
+    return manager._build_context(spec)
+
+
 def _pip_install(packages: Iterable[str]) -> str:
     """Return one deterministic Docker RUN instruction for pip packages."""
     arguments = [

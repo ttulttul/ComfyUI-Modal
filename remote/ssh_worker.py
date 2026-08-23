@@ -242,6 +242,7 @@ def runtime_info() -> dict[str, Any]:
         "runtime_fingerprint": os.getenv("COMFY_MODAL_RUNTIME_FINGERPRINT", ""),
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         "worker_socket": str(DEFAULT_WORKER_SOCKET_PATH),
+        "worker_socket_ready": DEFAULT_WORKER_SOCKET_PATH.is_socket(),
     }
 
 

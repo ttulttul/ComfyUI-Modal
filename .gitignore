@@ -39,8 +39,13 @@
 !/sync_engine.py
 !/vast_api.py
 !/vast_config_node.py
+!/vast_executor.py
+!/vast_leases.py
 !/vast_models.py
+!/vast_runtime.py
 !/vast_simulator.py
+!/vast_ssh.py
+!/vast_service.py
 
 !/docs/
 /docs/*

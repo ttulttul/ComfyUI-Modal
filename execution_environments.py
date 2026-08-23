@@ -19,6 +19,7 @@ class ExecutionProvider(str, Enum):
 
     MODAL = "modal"
     SSH_DOCKER = "ssh_docker"
+    VAST = "vast"
 
 
 class ExecutionPolicy(str, Enum):
@@ -26,6 +27,7 @@ class ExecutionPolicy(str, Enum):
 
     MODAL = "modal"
     SELF_HOSTED = "self_hosted"
+    VAST = "vast"
     AUTOMATIC = "automatic"
 
 

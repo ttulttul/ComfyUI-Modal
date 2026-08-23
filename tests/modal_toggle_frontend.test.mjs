@@ -293,6 +293,45 @@ assert.deepEqual(modalToggle.getRemoteVisualState({ id: 178 })?.executionLocatio
 });
 
 resetFrontendState();
+modalToggle.registerPromptComponents("prompt-active-location", ["180", "181"], [
+  { representative_node_id: "180", node_ids: ["180"] },
+  { representative_node_id: "181", node_ids: ["181"] },
+]);
+modalToggle.registerPromptExecutionAssignments("prompt-active-location", {
+  "180": {
+    provider: "modal",
+    environment_id: "modal:B300",
+    execution_location: "ta-01K3ACTIVE",
+    node_ids: ["180"],
+  },
+  "181": {
+    provider: "ssh_docker",
+    environment_id: "spark-one",
+    execution_location: "spark-one.internal.example",
+    node_ids: ["181"],
+  },
+});
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-active-location",
+    phase: "executing",
+    node_ids: ["180"],
+    active_node_id: "180",
+  },
+});
+const activeLocationLabels = [];
+modalToggle.drawModalNodeDecoration(
+  { id: 180, properties: { is_modal_remote: true }, size: [132, 80] },
+  {
+    ...mixedLocationCanvasContext,
+    fillText(text) {
+      activeLocationLabels.push(String(text));
+    },
+  },
+);
+assert.equal(activeLocationLabels.includes("ta-01K3ACTIVE"), true);
+
+resetFrontendState();
 modalToggle.registerPromptComponents("prompt-single-location", ["179"], [
   { representative_node_id: "179", node_ids: ["179"] },
 ]);

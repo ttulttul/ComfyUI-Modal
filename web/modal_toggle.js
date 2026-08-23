@@ -22,6 +22,7 @@ const WORKFLOW_REMOTE_AUTO_PLACE_KEY = "auto_place";
 const EXECUTION_POLICIES = [
   ["modal", "Modal only"],
   ["self_hosted", "Self-hosted only"],
+  ["vast", "Vast.ai only"],
   ["automatic", "Automatic (lowest cost compatible)"],
 ];
 const DEFAULT_MODAL_GPU = "RTX-PRO-6000";
@@ -4211,12 +4212,24 @@ function drawModalNodeDecoration(node, ctx) {
       [STATE_ACTIVE, STATE_COMPLETE].includes(state?.phase) &&
       !hasAggregateProgress,
   );
-  if (!hasAggregateProgress && !hasLaneProgress && !hasSetupLaneProgress && !hasBatchBadge) {
+  const executionLocation =
+    Number(state?.scheduledEnvironmentCount ?? 0) > 1 &&
+    (state?.isActiveRemoteNode || state?.isActiveComponentMember)
+      ? state?.executionLocation
+      : null;
+  const hasExecutionLocation = Boolean(executionLocation?.label);
+  if (
+    !hasAggregateProgress &&
+    !hasLaneProgress &&
+    !hasSetupLaneProgress &&
+    !hasBatchBadge &&
+    !hasExecutionLocation
+  ) {
     return;
   }
 
   ctx.save();
-  ctx.globalAlpha *= progressPanelOpacity;
+  ctx.globalAlpha *= Math.max(progressPanelOpacity, hasExecutionLocation ? 1 : 0);
   const barWidth = node.size[0] + borderWidth * 2;
   const aggregateHeight = 12 / scale;
   const laneHeight = 12 / scale;
@@ -4224,13 +4237,12 @@ function drawModalNodeDecoration(node, ctx) {
   const panelY = node.size[1] + 6 / scale;
   const panelPaddingX = 6 / scale;
   const panelPaddingY = 6 / scale;
-  const headerHeight = 16 / scale;
   const visibleLaneProgress = hasLaneProgress ? visibleActiveProgressLanes : setupProgressLanes;
   const hasVisibleLaneProgress = visibleLaneProgress.length > 0;
+  const hasProgressContent =
+    hasAggregateProgress || hasVisibleLaneProgress || hasBatchBadge;
+  const headerHeight = hasProgressContent ? 16 / scale : 0;
   const hasIterationRateLabels = hasAggregateProgress || hasLaneProgress;
-  const executionLocation =
-    Number(state?.scheduledEnvironmentCount ?? 0) > 1 ? state?.executionLocation : null;
-  const hasExecutionLocation = Boolean(executionLocation?.label);
   const progressBarWidth = barWidth;
   const laneBlockHeight = hasVisibleLaneProgress
     ? visibleLaneProgress.length * laneHeight + (visibleLaneProgress.length - 1) * laneGap
@@ -4239,7 +4251,7 @@ function drawModalNodeDecoration(node, ctx) {
     (hasVisibleLaneProgress ? laneBlockHeight + laneGap : 0) + (hasAggregateProgress ? aggregateHeight : 0);
   const progressTopGap = progressBodyHeight > 0 ? laneGap : 0;
   const locationRowHeight = 13 / scale;
-  const locationTopGap = hasExecutionLocation ? 5 / scale : 0;
+  const locationTopGap = hasExecutionLocation && hasProgressContent ? 5 / scale : 0;
   const panelHeight =
     panelPaddingY * 2 +
     headerHeight +

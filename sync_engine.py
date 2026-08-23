@@ -532,6 +532,8 @@ class ModalAssetSyncEngine:
         """Return a user-facing destination name for sync progress messages."""
         if self.settings.execution_mode == "ssh_docker":
             return "the self-hosted worker"
+        if self.settings.execution_mode == "vast":
+            return "the Vast.ai instance"
         return "Modal"
 
     @classmethod

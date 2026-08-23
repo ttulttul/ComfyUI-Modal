@@ -147,6 +147,17 @@ class RemoteExecutorRouterClient:
         provider = str(payload.get("execution_provider") or "modal").strip().lower()
         if provider == "modal":
             return ModalRemoteExecutorClient()
+        if provider == "vast":
+            from pathlib import Path
+
+            from .settings import get_settings
+            from .vast_service import VastService
+
+            settings = get_settings()
+            return VastService.from_environment(
+                settings,
+                repo_root=Path(__file__).resolve().parent,
+            ).executor()
         if provider != "ssh_docker":
             raise ValueError(f"Unsupported remote execution provider {provider!r}.")
 

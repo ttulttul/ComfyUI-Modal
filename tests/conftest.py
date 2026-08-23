@@ -185,6 +185,42 @@ def vast_config_node_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def vast_leases_module(extension_package: object) -> object:
+    """Return persistent Vast lease lifecycle helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_leases")
+
+
+@pytest.fixture(scope="session")
+def vast_ssh_module(extension_package: object) -> object:
+    """Return direct Vast SSH and storage adapters."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_ssh")
+
+
+@pytest.fixture(scope="session")
+def vast_runtime_module(extension_package: object) -> object:
+    """Return direct Vast worker runtime management."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_runtime")
+
+
+@pytest.fixture(scope="session")
+def vast_executor_module(extension_package: object) -> object:
+    """Return the direct Vast remote executor client."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_executor")
+
+
+@pytest.fixture(scope="session")
+def vast_supervisor_module(extension_package: object) -> object:
+    """Return the Vast direct-worker supervisor module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.vast_supervisor")
+
+
+@pytest.fixture(scope="session")
+def vast_service_module(extension_package: object) -> object:
+    """Return the application-level Vast controller service."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_service")
+
+
+@pytest.fixture(scope="session")
 def api_intercept_module(extension_package: object) -> object:
     """Return the prompt interception module."""
     return importlib.import_module(f"{PACKAGE_NAME}.api_intercept")
@@ -314,7 +350,10 @@ def reset_modal_environment(
     tmp_path: Path,
 ) -> None:
     """Isolate Modal-Sync environment variables between tests."""
-    if request.node.get_closest_marker("live_modal") is not None:
+    if (
+        request.node.get_closest_marker("live_modal") is not None
+        or request.node.get_closest_marker("live_vast") is not None
+    ):
         return
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
     monkeypatch.setenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync")
@@ -348,3 +387,7 @@ def reset_modal_environment(
     monkeypatch.delenv("COMFYUI_ROOT", raising=False)
     monkeypatch.delenv("MODAL_KEY", raising=False)
     monkeypatch.delenv("MODAL_SECRET", raising=False)
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_VAST_API_BASE_URL", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_VAST_IMAGE", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_VAST_SSH_IDENTITY_FILE", raising=False)

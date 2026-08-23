@@ -359,9 +359,15 @@ def test_remote_environment_routes_save_and_probe_hosts(
     probe_response = asyncio.run(
         probe(FakeRequest({"environment_id": "gpu-one"}))
     )
+    vast_verify = routes.handlers[("POST", "/remote/vast/verify")]
+    vast_verify_response = asyncio.run(vast_verify(FakeRequest({})))
 
     assert update_response.status == 200
     assert probe_response.status == 200
+    assert vast_verify_response.status == 400
+    assert ("GET", "/remote/vast/status") in routes.handlers
+    assert ("POST", "/remote/vast/reap") in routes.handlers
+    assert ("POST", "/remote/vast/destroy") in routes.handlers
     assert registry.get_host("gpu-one").health.value == "ready"
     assert registry.get_host("gpu-one").capabilities == capabilities
 

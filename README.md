@@ -3,7 +3,7 @@
 > [!WARNING]
 > This project is still alpha. Expect missing features, rough edges, and breaking changes.
 
-ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts of a workflow through Modal or user-managed Docker hosts reached over SSH. You mark nodes with `Run on Modal` (the legacy-compatible remote marker), or enable workflow-wide automatic placement; the extension rewrites the queued prompt into transport-aware remote components, syncs required assets, and returns remote outputs and generated files to the local ComfyUI graph.
+ComfyUI Modal-Sync is a ComfyUI custom node extension for running selected parts of a workflow through Modal, user-managed Docker hosts reached over SSH, or automatically rented Vast.ai instances. You mark nodes with `Run on Modal` (the legacy-compatible remote marker), or enable workflow-wide automatic placement; the extension rewrites the queued prompt into transport-aware remote components, syncs required assets, and returns remote outputs and generated files to the local ComfyUI graph.
 
 The `add-vast-ai-back-end` development line also exposes a disconnected **Vast.ai Lease Configuration** v3 node. Each node declares a named, non-secret marketplace capacity profile with GPU count, per-GPU VRAM, theoretical TFLOPS, CPU RAM, disk, reliability, duration, maximum hourly price, and idle retention. Multiple nodes may coexist as independent scheduler candidates. Configuration nodes are local output sinks so they survive ComfyUI prompt compilation without graph connections, while automatic remote placement explicitly excludes them from execution islands.
 
@@ -97,6 +97,45 @@ uv run python scripts/run_vast_api_simulator.py --port 8099 --api-key vast-test-
 
 The simulator implements the authenticated account check, offer search operators and ordering, offer-rental races, instance creation, loading-to-running polling, listing, start/stop, and permanent destruction used by the extension. Its default offers cover 24 GB, 48 GB, and 80 GB GPU tiers. The production client accepts plaintext HTTP only for loopback simulator addresses; live Vast credentials are sent only to HTTPS endpoints. Simulator-backed contract tests exercise the full API lifecycle and verify that bearer and per-instance keys are not retained in request diagnostics.
 
+### Vast.ai managed execution
+
+Vast capacity is workflow-scoped. Add one or more disconnected **Vast.ai Lease Configuration** nodes and set the workflow provider policy to **Vast.ai only** or **Automatic**. Each node is a candidate pool: the planner raises its VRAM and RAM floors when model inspection finds a larger requirement, queries current on-demand offers, locally revalidates every hard constraint, and ranks the compatible choices by incremental cost. A newly rented offer includes the configured idle-retention commitment in that comparison; an existing managed lease receives credit for retention time already being paid for. The default idle retention is 24 hours.
+
+Set credentials and the immutable worker image in the environment of the ComfyUI process. Neither value is written to the workflow, lease registry, API responses, or logs:
+
+```bash
+export VAST_API_KEY='...'
+export COMFY_MODAL_VAST_IMAGE='ghcr.io/owner/comfy-modal-worker@sha256:...'
+```
+
+Build the shared SSH/Vast worker image locally with an explicit version tag, then push it to a registry and use the digest printed by the script:
+
+```bash
+uv run python scripts/build_vast_worker_image.py \
+  --tag ghcr.io/owner/comfy-modal-worker:v0.3.6 --push
+```
+
+The image must be readable by the rented instance. The first implementation supports public images; private-registry credential plumbing is intentionally not stored in workflows. `COMFY_MODAL_VAST_SSH_IDENTITY_FILE` may name an absolute private-key path when the Vast account does not use the default SSH identity. `COMFY_MODAL_VAST_API_BASE_URL` exists for the loopback simulator and otherwise accepts only HTTPS.
+
+Queue-time acquisition creates an exact ownership label containing the ComfyUI installation, profile, profile fingerprint, and runtime fingerprint. The controller persists only non-secret lease state under `<ComfyUI user directory>/comfyui-modal/vast-leases.json`, waits for direct SSH, verifies the image fingerprint and worker socket, publishes the idle deadline to an in-instance watchdog, and then syncs assets directly to `/storage`. Worker transport has one bounded restart-and-retry path; application errors are never blindly replayed. The watchdog destroys only the exact instance identified by its injected `CONTAINER_API_KEY`, and fails closed when its state is missing, malformed, busy, or mismatched.
+
+Open **Settings → Remote Execution: Vast.ai leases** to verify the process credential, inspect hourly price/activity/deadlines, destroy expired leases immediately, or explicitly destroy one idle managed instance. Manual destruction rechecks the live Vast label and refuses active work. The same controls are available at `/remote/vast/status`, `/remote/vast/verify`, `/remote/vast/reap`, and `/remote/vast/destroy`.
+
+For offline development, point the production client at the simulator:
+
+```bash
+export VAST_API_KEY=vast-test-key
+export COMFY_MODAL_VAST_API_BASE_URL=http://127.0.0.1:8099
+```
+
+The opt-in billable canary rents bounded capacity, verifies the real direct worker, and destroys it by default:
+
+```bash
+COMFY_MODAL_RUN_LIVE_VAST=1 uv run pytest -q tests/test_live_vast_canary.py
+```
+
+Set `COMFY_MODAL_VAST_KEEP_CANARY=1` only when deliberately retaining that canary lease. Its default idle retention is one hour, separate from the workflow default.
+
 Open **Settings → Remote Execution: SSH environments**, or right-click an eligible node and choose **Remote Execution → Manage SSH hosts…**. Add one or more hosts using an SSH destination or alias that already works from the account running ComfyUI. The extension deliberately stores no password or private-key path; authentication, jump hosts, ports, and key selection belong in the user's normal SSH agent and `~/.ssh/config`.
 
 Each host must provide:
@@ -122,7 +161,8 @@ Workflow policy is stored under `workflow.extra.remote_execution` and travels wi
 
 - **Modal only** preserves existing behavior and is the default for old workflows.
 - **Self-hosted only** requires a ready, compatible SSH host and fails before queueing when none is available.
-- **Automatic** considers ready SSH hosts and the selected Modal GPU, rejects hard incompatibilities such as insufficient VRAM or a provider-specific backend, then prefers known lowest predicted cost with deterministic tie-breaking. Provider-constrained nodes form their own acyclic components, and cross-provider outputs are materialized through ComfyUI instead of being hidden in one provider's session storage.
+- **Vast.ai only** requires at least one Vast configuration node, a process-level API key, and a published worker image. It fails before asset synchronization when no current offer meets all resource and price limits.
+- **Automatic** considers ready SSH hosts, the selected Modal GPU, and any workflow-declared Vast pools, rejects hard incompatibilities such as insufficient VRAM or a provider-specific backend, then prefers known lowest predicted incremental cost with deterministic tie-breaking. Provider-constrained nodes form their own acyclic components, and cross-provider outputs are materialized through ComfyUI instead of being hidden in one provider's session storage.
 - **Automatically place eligible nodes** makes the planner select the executable prompt without requiring each node toggle. Leave it off to keep manual component boundaries.
 
 Before comparing cost, the planner resolves model files referenced by each remote component and derives conservative memory floors. It budgets the largest primary model that may be resident, adds LoRA/adapter/ControlNet weights, applies 20% weight overhead, and reserves another 4 GiB for activations and runtime state. RAM receives the resident weights plus 4 GiB. Hosts are checked against currently free VRAM and available RAM when the capability probe reports them, falling back to total capacity only when live availability is unknown. An undersized zero-cost host is therefore rejected before any model upload; automatic policy can fall back to a compatible Modal GPU, while self-hosted-only policy returns the per-host memory shortfall.
