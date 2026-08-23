@@ -2786,6 +2786,23 @@ def _remote_component_partition_groups(
             ):
                 union(node_id, upstream_node_id, preserve_coarse_dag=False)
                 continue
+            io_type = _remote_output_io_type(
+                prompt=prompt,
+                node_id=upstream_node_id,
+                output_index=source.output_index,
+                nodes_module=nodes_module,
+            )
+            if io_type is not None and not _is_transportable_output_type(io_type):
+                logger.info(
+                    "Co-locating remote nodes %s -> %s because %s output %d "
+                    "cannot cross a component boundary.",
+                    upstream_node_id,
+                    node_id,
+                    io_type,
+                    source.output_index,
+                )
+                union(node_id, upstream_node_id, preserve_coarse_dag=False)
+                continue
             downstream_provider = _prompt_node_required_provider(prompt_node)
             upstream_provider = (
                 _prompt_node_required_provider(upstream_prompt_node)
@@ -2819,12 +2836,6 @@ def _remote_component_partition_groups(
                     source.output_index,
                 )
                 continue
-            io_type = _remote_output_io_type(
-                prompt=prompt,
-                node_id=upstream_node_id,
-                output_index=source.output_index,
-                nodes_module=nodes_module,
-            )
             if io_type is not None and _is_inexpensive_remote_boundary_type(io_type):
                 continue
             if io_type is not None and _is_transportable_output_type(io_type):
@@ -4351,13 +4362,14 @@ def _describe_output_boundary_error(
     local_consumer: InputTarget,
     local_consumer_class_type: str,
 ) -> str:
-    """Format a human-readable remote-to-local transport validation error."""
+    """Format a human-readable component-output transport validation error."""
     return (
         "Remote component rooted at node "
         f"{component.representative_node_id} exports node {source.node_id} "
         f"({source_class_type}) output index {source.output_index} of type '{io_type}' "
-        f"to local node {local_consumer.node_id} ({local_consumer_class_type}) input "
-        f"'{local_consumer.input_name}', which cannot cross the current local/remote boundary. "
+        f"to node {local_consumer.node_id} ({local_consumer_class_type}) outside that "
+        f"component at input '{local_consumer.input_name}', which cannot cross the "
+        "current component boundary. "
         "Current ComfyUI-Modal transport only supports JSON-compatible values, bytes, "
         "and media or tensor-like outputs such as VIDEO, AUDIO, IMAGE, MASK, LATENT, "
         "SIGMAS, INT, FLOAT, BOOLEAN, and STRING."
@@ -4372,15 +4384,15 @@ def _describe_input_boundary_error(
     source_class_type: str,
     io_type: str,
 ) -> str:
-    """Format a human-readable local-to-remote transport validation error."""
+    """Format a human-readable component-input transport validation error."""
     return (
         "Remote node "
         f"{target.node_id} ({target_class_type}) input '{target.input_name}' "
-        f"depends on upstream node {source.node_id} ({source_class_type}) output index "
-        f"{source.output_index} of type '{io_type}', which cannot cross the current "
-        "local/remote boundary. Current ComfyUI-Modal transport only supports "
-        "JSON-compatible values, bytes, and media or tensor-like outputs such as VIDEO, "
-        "AUDIO, IMAGE, MASK, LATENT, SIGMAS, INT, FLOAT, BOOLEAN, and STRING."
+        f"depends on node {source.node_id} ({source_class_type}) outside its component, "
+        f"using output index {source.output_index} of type '{io_type}', which cannot "
+        "cross the current component boundary. Current ComfyUI-Modal transport only "
+        "supports JSON-compatible values, bytes, and media or tensor-like outputs such "
+        "as VIDEO, AUDIO, IMAGE, MASK, LATENT, SIGMAS, INT, FLOAT, BOOLEAN, and STRING."
     )
 
 

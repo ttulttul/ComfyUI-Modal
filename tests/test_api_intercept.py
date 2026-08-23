@@ -486,6 +486,77 @@ def test_remote_partition_preserves_dag_around_ssh_only_llm(
     ) == [["1"], ["3"], ["4"]]
 
 
+def test_remote_partition_co_locates_non_transportable_fanout_around_ssh_llm(
+    api_intercept_module: Any,
+) -> None:
+    """A shared runtime object must keep provider-separated remote phases together."""
+    prompt = {
+        "1": {"class_type": "VAELoader", "inputs": {}},
+        "2": {
+            "class_type": "VAEDecode",
+            "inputs": {"vae": ["1", 0]},
+        },
+        "3": {
+            "class_type": "ModalLLM",
+            "inputs": {
+                "image": ["2", 0],
+                "model_profile": "huihui-qwen3.8-27b-abliterated-q2-k-gguf",
+            },
+        },
+        "4": {
+            "class_type": "VAEDecode",
+            "inputs": {"vae": ["1", 0], "prompt": ["3", 0]},
+        },
+    }
+    fake_nodes_module = SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "VAELoader": _FakeVAELoaderNode,
+            "VAEDecode": _FakeVAEDecodeNode,
+            "ModalLLM": _FakeTextNode,
+        },
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    remote_node_ids = set(prompt)
+    consumers = api_intercept_module._build_consumer_map(prompt)
+
+    component_groups = api_intercept_module._remote_component_partition_groups(
+        prompt,
+        remote_node_ids,
+        consumers,
+        fake_nodes_module,
+    )
+    components = api_intercept_module._component_topological_order(
+        prompt,
+        component_groups,
+    )
+
+    assert components == [["1", "2", "3", "4"]]
+    component_plan = api_intercept_module._build_component_plan(
+        components[0],
+        prompt,
+        consumers,
+        remote_node_ids,
+        fake_nodes_module,
+    )
+    api_intercept_module.validate_remote_component_transport_compatibility(
+        prompt,
+        [component_plan],
+        fake_nodes_module,
+    )
+    required_provider = api_intercept_module._component_required_provider(
+        component_plan,
+        prompt,
+        {
+            "huihui-qwen3.8-27b-abliterated-q2-k-gguf": SimpleNamespace(
+                backend="llama_cpp_server"
+            )
+        },
+    )
+    assert component_plan.boundary_inputs == []
+    assert component_plan.boundary_outputs == []
+    assert required_provider.value == "ssh_docker"
+
+
 def test_modal_only_policy_rejects_ssh_only_llm_backend(
     api_intercept_module: Any,
     tmp_path: Path,
@@ -5089,7 +5160,7 @@ def test_rewrite_rejects_non_transportable_remote_outputs(
         raise AssertionError("Expected ModalPromptValidationError to be raised.")
 
     assert "exports node 1 (RemoteClip) output index 0 of type 'CLIP'" in message
-    assert "cannot cross the current local/remote boundary" in message
+    assert "cannot cross the current component boundary" in message
 
 
 def test_rewrite_allows_video_and_audio_across_remote_boundaries(

@@ -174,6 +174,8 @@ For offline development and CI, a local API simulator stands in for the live ser
 
 Before comparing costs, the planner resolves the model files referenced by each remote component and derives conservative memory floors: the largest resident model plus LoRA/adapter/ControlNet weights, a weight-overhead margin, and a fixed reserve for activations and runtime state. Candidates are checked against live free VRAM and RAM where a probe reports them, so an undersized host is rejected before any model upload. Enabled SSH hosts are re-probed immediately before every placement decision, and an unreachable host is simply excluded, letting another provider serve as the fallback under automatic policy.
 
+Provider boundaries are retained when values can be serialized between workers. In-memory ComfyUI objects such as `MODEL`, `CLIP`, `VAE`, `NOISE`, and `SAMPLER` instead impose a hard co-location constraint: if one is shared across an otherwise provider-separated cycle, the affected remote phases become one component and the strictest required provider applies to that complete component.
+
 Completed components record execution timings per environment and workload signature. The planner uses the median of past runs to predict total cost, so a faster but more expensive GPU can win when its predicted total is lower; until history exists, it uses a conservative 60-second estimate.
 
 ## Using It In ComfyUI
