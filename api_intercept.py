@@ -2354,26 +2354,34 @@ def _remote_group_dependency_edges(
     return dependency_edges
 
 
-def _has_alternate_group_path(
+def _has_alternate_group_path_through_protected_group(
     dependency_edges: Mapping[str, set[str]],
     start_group: str,
     target_group: str,
+    protected_groups: set[str],
 ) -> bool:
-    """Return whether a non-direct path connects two coarse graph groups."""
+    """Return whether a non-direct path crosses a provider-constrained group."""
     pending = [
-        downstream_group
+        (downstream_group, downstream_group in protected_groups)
         for downstream_group in dependency_edges.get(start_group, set())
         if downstream_group != target_group
     ]
-    visited: set[str] = set()
+    visited: set[tuple[str, bool]] = set()
     while pending:
-        current_group = pending.pop()
-        if current_group == target_group:
+        current_group, crossed_protected_group = pending.pop()
+        if current_group == target_group and crossed_protected_group:
             return True
-        if current_group in visited:
+        state = (current_group, crossed_protected_group)
+        if state in visited:
             continue
-        visited.add(current_group)
-        pending.extend(dependency_edges.get(current_group, set()))
+        visited.add(state)
+        pending.extend(
+            (
+                downstream_group,
+                crossed_protected_group or downstream_group in protected_groups,
+            )
+            for downstream_group in dependency_edges.get(current_group, set())
+        )
     return False
 
 
@@ -2386,11 +2394,12 @@ def _remote_component_partition_groups(
     """Return component groups after merging remote nodes across costly boundaries."""
     parent: dict[str, str] = {node_id: node_id for node_id in remote_node_ids}
     downstream_remote_node_ids_by_node_id: dict[str, set[str]] = defaultdict(set)
-    provider_partitioning_active = any(
-        _prompt_node_required_provider(prompt_node) is not None
+    provider_constrained_node_ids = {
+        node_id
         for node_id in remote_node_ids
         if isinstance((prompt_node := prompt.get(node_id)), Mapping)
-    )
+        and _prompt_node_required_provider(prompt_node) is not None
+    }
 
     def find(node_id: str) -> str:
         """Return the canonical union-find representative for one remote node."""
@@ -2415,7 +2424,7 @@ def _remote_component_partition_groups(
         if left_root == right_root:
             return True
         should_preserve_coarse_dag = (
-            provider_partitioning_active
+            bool(provider_constrained_node_ids)
             if preserve_coarse_dag is None
             else preserve_coarse_dag
         )
@@ -2425,14 +2434,19 @@ def _remote_component_partition_groups(
                 remote_node_ids,
                 find,
             )
-            creates_cycle = _has_alternate_group_path(
+            protected_groups = {
+                find(node_id) for node_id in provider_constrained_node_ids
+            }
+            creates_cycle = _has_alternate_group_path_through_protected_group(
                 dependency_edges,
                 left_root,
                 right_root,
-            ) or _has_alternate_group_path(
+                protected_groups,
+            ) or _has_alternate_group_path_through_protected_group(
                 dependency_edges,
                 right_root,
                 left_root,
+                protected_groups,
             )
             if creates_cycle:
                 logger.info(
