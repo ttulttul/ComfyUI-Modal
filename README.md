@@ -108,12 +108,13 @@ export VAST_API_KEY='...'
 export COMFY_MODAL_VAST_IMAGE='ghcr.io/owner/comfy-modal-worker@sha256:...'
 ```
 
-Build the shared SSH/Vast worker image locally with an explicit version tag, then push it to a registry and use the digest printed by the script:
+Build the shared SSH/Vast worker image locally, push it to a registry, and use the digest printed by the script (the image must be readable by the rented instance; the current implementation supports public images):
 
 ```bash
-uv run python scripts/build_vast_worker_image.py \
-  --tag ghcr.io/owner/comfy-modal-worker:v0.3.6 --push
+uv run python scripts/build_vast_worker_image.py --push
 ```
+
+By default, the builder reads `project.version` and the GitHub repository owner from `pyproject.toml`, producing `ghcr.io/<owner>/comfy-modal-worker:v<version>`. Use `--owner` or `--tag-template` to change those defaults, or `--tag` to supply the complete image tag explicitly.
 
 When running the builder outside an installed ComfyUI `custom_nodes` directory, it checks `COMFYUI_ROOT`, `~/git/ComfyUI`, and `~/git/Latest_ComfyUI`. Pass `--comfyui-root /path/to/ComfyUI` when the source checkout lives elsewhere.
 

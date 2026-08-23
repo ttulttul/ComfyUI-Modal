@@ -47,3 +47,58 @@ def test_parser_accepts_explicit_comfyui_source_root(tmp_path: Path) -> None:
     )
 
     assert arguments.comfyui_root == tmp_path
+
+
+def test_default_tag_uses_pyproject_version_and_repository_owner(
+    tmp_path: Path,
+) -> None:
+    """The normal push command should need no manually duplicated version tag."""
+    module = _module()
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "modal-sync"
+version = "1.2.3"
+
+[project.urls]
+Repository = "https://github.com/Example-Owner/ComfyUI-Modal"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assert module._resolve_image_tag(
+        None,
+        owner=None,
+        tag_template=module.DEFAULT_TAG_TEMPLATE,
+        repo_root=tmp_path,
+    ) == "ghcr.io/example-owner/comfy-modal-worker:v1.2.3"
+
+
+def test_default_tag_accepts_owner_and_template_overrides(tmp_path: Path) -> None:
+    """Non-default organizations and registries remain configurable without --tag."""
+    module = _module()
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "modal-sync"
+version = "2.0.0rc1"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assert module._resolve_image_tag(
+        None,
+        owner="Container-Org",
+        tag_template="registry.example/{owner}/vast-worker:{version}",
+        repo_root=tmp_path,
+    ) == "registry.example/container-org/vast-worker:2.0.0rc1"
+
+
+def test_parser_allows_push_without_explicit_tag() -> None:
+    """The documented one-line push command must parse without --tag."""
+    module = _module()
+
+    arguments = module._parser().parse_args(["--push"])
+
+    assert arguments.push is True
+    assert arguments.tag is None

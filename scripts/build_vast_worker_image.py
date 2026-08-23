@@ -6,9 +6,13 @@ import argparse
 import logging
 import subprocess
 import sys
+import tomllib
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Sequence
+from string import Formatter
+from typing import Any, Sequence
+from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -20,14 +24,33 @@ from ssh_runtime import export_worker_image_context
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TAG_TEMPLATE = "ghcr.io/{owner}/comfy-modal-worker:v{version}"
+
 
 def _parser() -> argparse.ArgumentParser:
     """Return the command-line parser."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--tag",
-        required=True,
-        help="Versioned registry tag, for example ghcr.io/owner/comfy-worker:v0.4.0.",
+        help=(
+            "Explicit versioned registry tag. By default, derive a GHCR tag from "
+            "pyproject.toml."
+        ),
+    )
+    parser.add_argument(
+        "--owner",
+        help=(
+            "Container registry owner used by the default tag template. Defaults to "
+            "the GitHub owner in pyproject.toml's Repository URL."
+        ),
+    )
+    parser.add_argument(
+        "--tag-template",
+        default=DEFAULT_TAG_TEMPLATE,
+        help=(
+            "Default tag template when --tag is omitted. Supports {owner} and "
+            "{version}."
+        ),
     )
     parser.add_argument(
         "--comfyui-root",
@@ -43,6 +66,124 @@ def _parser() -> argparse.ArgumentParser:
         help="Push the built tag and print its registry digest reference.",
     )
     return parser
+
+
+def _project_metadata(repo_root: Path = REPO_ROOT) -> Mapping[str, Any]:
+    """Load and return the PEP 621 project metadata from pyproject.toml."""
+    pyproject_path = repo_root / "pyproject.toml"
+    try:
+        with pyproject_path.open("rb") as handle:
+            document = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(
+            f"Unable to read project metadata from {pyproject_path}."
+        ) from error
+    project = document.get("project")
+    if not isinstance(project, Mapping):
+        raise ValueError(f"Project metadata is missing from {pyproject_path}.")
+    return project
+
+
+def _project_version(project: Mapping[str, Any]) -> str:
+    """Return the normalized project version used in the worker image tag."""
+    version = project.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("pyproject.toml must define a non-empty project.version.")
+    normalized = version.strip()
+    if any(character in normalized for character in "/:@"):
+        raise ValueError(
+            "project.version contains characters that are invalid in a tag."
+        )
+    return normalized
+
+
+def _repository_url(project: Mapping[str, Any]) -> str:
+    """Return the repository URL declared in PEP 621 project metadata."""
+    urls = project.get("urls")
+    if not isinstance(urls, Mapping):
+        raise ValueError("pyproject.toml must define project.urls.Repository.")
+    repository = next(
+        (
+            value
+            for key, value in urls.items()
+            if str(key).casefold() == "repository" and isinstance(value, str)
+        ),
+        None,
+    )
+    if repository is None or not repository.strip():
+        raise ValueError("pyproject.toml must define project.urls.Repository.")
+    return repository.strip()
+
+
+def _github_owner(repository_url: str) -> str:
+    """Extract a normalized GitHub owner from an HTTPS, SSH, or SCP-style URL."""
+    candidate = repository_url.strip()
+    if candidate.startswith("git@github.com:"):
+        repository_path = candidate.removeprefix("git@github.com:")
+    else:
+        parsed = urlparse(candidate)
+        if parsed.hostname != "github.com":
+            raise ValueError(
+                "Repository URL must point to github.com; pass --owner or --tag."
+            )
+        repository_path = parsed.path.lstrip("/")
+    return _normalize_owner(repository_path.split("/", maxsplit=1)[0])
+
+
+def _normalize_owner(owner: str) -> str:
+    """Normalize and validate a GitHub-compatible container registry owner."""
+    normalized = owner.strip().casefold()
+    if not normalized or any(
+        not (character.isascii() and (character.isalnum() or character == "-"))
+        for character in normalized
+    ):
+        raise ValueError(
+            "Unable to infer a valid GHCR owner; pass --owner or --tag."
+        )
+    return normalized
+
+
+def _render_tag_template(tag_template: str, *, owner: str, version: str) -> str:
+    """Render a tag template containing only simple owner and version fields."""
+    try:
+        parsed_fields = tuple(Formatter().parse(tag_template))
+    except ValueError as error:
+        raise ValueError("Tag template is malformed.") from error
+    invalid_field = any(
+        field_name not in {None, "owner", "version"}
+        or bool(format_spec)
+        or conversion is not None
+        for _, field_name, format_spec, conversion in parsed_fields
+    )
+    if invalid_field:
+        raise ValueError(
+            "Tag template may contain only the {owner} and {version} fields."
+        )
+    return tag_template.format(owner=owner, version=version)
+
+
+def _resolve_image_tag(
+    explicit_tag: str | None,
+    *,
+    owner: str | None,
+    tag_template: str,
+    repo_root: Path = REPO_ROOT,
+) -> str:
+    """Return an explicit tag or render the project-derived default image tag."""
+    if explicit_tag is not None:
+        return _validate_tag(explicit_tag)
+    project = _project_metadata(repo_root)
+    resolved_owner = (
+        _github_owner(_repository_url(project))
+        if owner is None
+        else _normalize_owner(owner)
+    )
+    rendered = _render_tag_template(
+        tag_template,
+        owner=resolved_owner,
+        version=_project_version(project),
+    )
+    return _validate_tag(rendered)
 
 
 def _validate_tag(tag: str) -> str:
@@ -154,8 +295,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Build the requested image and print the exact runtime configuration value."""
     arguments = _parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    image_reference = build_image(
+    image_tag = _resolve_image_tag(
         arguments.tag,
+        owner=arguments.owner,
+        tag_template=arguments.tag_template,
+    )
+    image_reference = build_image(
+        image_tag,
         push=arguments.push,
         comfyui_root=arguments.comfyui_root,
     )
