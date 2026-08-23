@@ -330,9 +330,10 @@ def _discover_comfyui_root(repo_root: Path) -> Path | None:
         if _looks_like_comfyui_root(install_root):
             return install_root
 
-    default_root = Path.home() / "git" / "ComfyUI"
-    if _looks_like_comfyui_root(default_root):
-        return default_root.resolve()
+    for default_name in ("ComfyUI", "Latest_ComfyUI"):
+        default_root = Path.home() / "git" / default_name
+        if _looks_like_comfyui_root(default_root):
+            return default_root.resolve()
 
     return None
 

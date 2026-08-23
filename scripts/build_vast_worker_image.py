@@ -5,8 +5,14 @@ from __future__ import annotations
 import argparse
 import logging
 import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from runtime_environment import build_remote_runtime_identity
 from settings import get_settings
@@ -22,6 +28,14 @@ def _parser() -> argparse.ArgumentParser:
         "--tag",
         required=True,
         help="Versioned registry tag, for example ghcr.io/owner/comfy-worker:v0.4.0.",
+    )
+    parser.add_argument(
+        "--comfyui-root",
+        type=Path,
+        help=(
+            "ComfyUI source checkout to embed. Defaults to the active installation, "
+            "COMFYUI_ROOT, ~/git/ComfyUI, or ~/git/Latest_ComfyUI."
+        ),
     )
     parser.add_argument(
         "--push",
@@ -58,11 +72,32 @@ def _run(command: Sequence[str], *, input_payload: bytes | None = None) -> str:
     return completed.stdout.decode("utf-8", errors="replace").strip()
 
 
-def build_image(tag: str, *, push: bool) -> str:
+def build_image(
+    tag: str,
+    *,
+    push: bool,
+    comfyui_root: Path | None = None,
+) -> str:
     """Build the current runtime, optionally push it, and return its image reference."""
     image_tag = _validate_tag(tag)
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = REPO_ROOT
     settings = get_settings()
+    if comfyui_root is not None:
+        resolved_comfyui_root = comfyui_root.expanduser().resolve()
+        if not (resolved_comfyui_root / "main.py").is_file() or not (
+            resolved_comfyui_root / "nodes.py"
+        ).is_file():
+            raise ValueError(
+                f"ComfyUI root {resolved_comfyui_root} must contain main.py and nodes.py."
+            )
+        custom_nodes_dir = resolved_comfyui_root / "custom_nodes"
+        settings = replace(
+            settings,
+            comfyui_root=resolved_comfyui_root,
+            custom_nodes_dir=(
+                custom_nodes_dir if custom_nodes_dir.is_dir() else None
+            ),
+        )
     identity = build_remote_runtime_identity(
         repo_root=repo_root,
         comfyui_root=settings.comfyui_root,
@@ -119,7 +154,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Build the requested image and print the exact runtime configuration value."""
     arguments = _parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    image_reference = build_image(arguments.tag, push=arguments.push)
+    image_reference = build_image(
+        arguments.tag,
+        push=arguments.push,
+        comfyui_root=arguments.comfyui_root,
+    )
     print(f"COMFY_MODAL_VAST_IMAGE={image_reference}")
     return 0
 

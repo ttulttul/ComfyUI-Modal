@@ -31,3 +31,19 @@ def test_image_tag_requires_versioned_non_latest_reference() -> None:
         module._validate_tag("ghcr.io/example/worker")
     with pytest.raises(ValueError, match="mutable latest"):
         module._validate_tag("ghcr.io/example/worker:latest")
+
+
+def test_parser_accepts_explicit_comfyui_source_root(tmp_path: Path) -> None:
+    """Standalone checkouts need a direct source-root override for image builds."""
+    module = _module()
+
+    arguments = module._parser().parse_args(
+        [
+            "--tag",
+            "ghcr.io/example/worker:v1",
+            "--comfyui-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert arguments.comfyui_root == tmp_path

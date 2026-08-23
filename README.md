@@ -115,6 +115,8 @@ uv run python scripts/build_vast_worker_image.py \
   --tag ghcr.io/owner/comfy-modal-worker:v0.3.6 --push
 ```
 
+When running the builder outside an installed ComfyUI `custom_nodes` directory, it checks `COMFYUI_ROOT`, `~/git/ComfyUI`, and `~/git/Latest_ComfyUI`. Pass `--comfyui-root /path/to/ComfyUI` when the source checkout lives elsewhere.
+
 The image must be readable by the rented instance. The first implementation supports public images; private-registry credential plumbing is intentionally not stored in workflows. `COMFY_MODAL_VAST_SSH_IDENTITY_FILE` may name an absolute private-key path when the Vast account does not use the default SSH identity. `COMFY_MODAL_VAST_API_BASE_URL` exists for the loopback simulator and otherwise accepts only HTTPS.
 
 Queue-time acquisition creates an exact ownership label containing the ComfyUI installation, profile, profile fingerprint, and runtime fingerprint. The controller persists only non-secret lease state under `<ComfyUI user directory>/comfyui-modal/vast-leases.json`, waits for direct SSH, verifies the image fingerprint and worker socket, publishes the idle deadline to an in-instance watchdog, and then syncs assets directly to `/storage`. Worker transport has one bounded restart-and-retry path; application errors are never blindly replayed. The watchdog destroys only the exact instance identified by its injected `CONTAINER_API_KEY`, and fails closed when its state is missing, malformed, busy, or mismatched.

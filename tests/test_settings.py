@@ -46,6 +46,28 @@ def test_settings_prefers_modal_specific_comfyui_root_env(
     assert resolved == env_root.resolve()
 
 
+def test_settings_discovers_latest_comfyui_standalone_checkout(
+    settings_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Standalone development should recognize the locally used checkout name."""
+    comfyui_root = tmp_path / "git" / "Latest_ComfyUI"
+    comfyui_root.mkdir(parents=True)
+    (comfyui_root / "main.py").write_text("print('main')\n", encoding="utf-8")
+    (comfyui_root / "nodes.py").write_text(
+        "NODE_CLASS_MAPPINGS = {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("COMFYUI_ROOT", raising=False)
+    monkeypatch.delenv("COMFY_MODAL_COMFYUI_ROOT", raising=False)
+    monkeypatch.setattr(settings_module.Path, "home", lambda: tmp_path)
+
+    resolved = settings_module._discover_comfyui_root(tmp_path / "standalone")
+
+    assert resolved == comfyui_root.resolve()
+
+
 def test_settings_reads_modal_gpu_override(
     settings_module: Any,
     monkeypatch: Any,
