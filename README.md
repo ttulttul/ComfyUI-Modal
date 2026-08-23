@@ -97,6 +97,8 @@ Provider policy is stored under `workflow.extra.remote_execution` and travels wi
 - **Automatic** — considers ready SSH hosts, the selected Modal GPU, and any workflow-declared Vast pools; rejects hard incompatibilities (insufficient VRAM, provider-specific requirements), then prefers the lowest predicted incremental cost with deterministic tie-breaking.
 - **Automatically place eligible nodes** — lets the planner select remote nodes itself instead of requiring per-node toggles. Leave it off to keep manual component boundaries.
 
+To change the policy from a node, right-click an eligible node and open **Remote Execution**. ComfyUI Nodes 2.0 lists **Modal only**, **Self-hosted only**, **Vast.ai only**, and **Automatic** directly below the disabled **Provider policy (current choice)** heading because its extension-menu adapter supports only one submenu level.
+
 ### Modal
 
 Authentication is user-managed — run Modal's setup once if the current user does not already have working credentials:

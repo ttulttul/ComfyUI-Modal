@@ -1191,16 +1191,48 @@ workflowGraph.nodes.push(menuNode);
 modalToggle.installModalContextMenu(MenuNode, { name: "KSampler" });
 const menuOptions = [];
 menuNode.getExtraMenuOptions(null, menuOptions);
-const modalMenu = menuOptions.find((option) => option?.content === "Modal");
-const gpuMenu = modalMenu.submenu.options.find((option) => option?.content === "GPU");
+const remoteExecutionMenu = menuOptions.find(
+  (option) => option?.content === "Remote Execution",
+);
+const providerPolicyHeading = remoteExecutionMenu.submenu.options.find(
+  (option) => option?.content === "Provider policy (Modal only)",
+);
+assert.equal(providerPolicyHeading.disabled, true);
+assert.equal(providerPolicyHeading.has_submenu, undefined);
+const providerPolicyHeadingIndex = remoteExecutionMenu.submenu.options.indexOf(
+  providerPolicyHeading,
+);
 assert.deepEqual(
-  gpuMenu.submenu.options.map((option) => option.content),
+  remoteExecutionMenu.submenu.options
+    .slice(providerPolicyHeadingIndex + 1, providerPolicyHeadingIndex + 5)
+    .map((option) => option.content),
+  ["Modal only", "Self-hosted only", "Vast.ai only", "Automatic (lowest cost compatible)"],
+);
+const vastPolicyOption = remoteExecutionMenu.submenu.options.find(
+  (option) => option?.content === "Vast.ai only",
+);
+assert.equal(vastPolicyOption.checked, false);
+assert.equal(vastPolicyOption.submenu, undefined);
+vastPolicyOption.callback();
+assert.equal(workflowGraph.extra.remote_execution.policy, "vast");
+assert.equal(workflowGraph.changeCount, 2);
+
+const modalMenu = menuOptions.find((option) => option?.content === "Modal");
+const gpuHeading = modalMenu.submenu.options.find(
+  (option) => option?.content === "GPU (B300)",
+);
+assert.equal(gpuHeading.disabled, true);
+assert.equal(gpuHeading.has_submenu, undefined);
+assert.deepEqual(
+  modalMenu.submenu.options
+    .filter((option) => modalToggle.MODAL_GPU_TYPES.includes(option?.content))
+    .map((option) => option.content),
   modalToggle.MODAL_GPU_TYPES,
 );
 assert.equal(
-  gpuMenu.submenu.options.find((option) => option.content === "B300")?.checked,
+  modalMenu.submenu.options.find((option) => option?.content === "B300")?.checked,
   true,
 );
-gpuMenu.submenu.options.find((option) => option.content === "L40S").callback();
+modalMenu.submenu.options.find((option) => option?.content === "L40S").callback();
 assert.equal(workflowGraph.extra.comfy_modal.gpu, "L40S");
-assert.equal(workflowGraph.changeCount, 2);
+assert.equal(workflowGraph.changeCount, 3);

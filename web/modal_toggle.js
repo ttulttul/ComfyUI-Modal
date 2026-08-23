@@ -3401,22 +3401,24 @@ function installModalContextMenu(nodeType, nodeData) {
         : "Disable on Upstream Nodes";
     if (!targetOptions.some((option) => option?.content === "Remote Execution")) {
       const executionPreferences = selectedExecutionPreferences();
+      const executionPolicyLabel =
+        EXECUTION_POLICIES.find(([value]) => value === executionPreferences.policy)?.[1]
+        ?? executionPreferences.policy;
       targetOptions.push(null, {
         content: "Remote Execution",
         has_submenu: true,
         submenu: {
           options: [
             {
-              content: "Provider policy",
-              has_submenu: true,
-              submenu: {
-                options: EXECUTION_POLICIES.map(([value, label]) => ({
-                  content: label,
-                  checked: executionPreferences.policy === value,
-                  callback: () => setExecutionPreferences({ policy: value }),
-                })),
-              },
+              content: `Provider policy (${executionPolicyLabel})`,
+              disabled: true,
             },
+            ...EXECUTION_POLICIES.map(([value, label]) => ({
+              content: label,
+              checked: executionPreferences.policy === value,
+              callback: () => setExecutionPreferences({ policy: value }),
+            })),
+            null,
             {
               content: "Automatically place eligible nodes",
               checked: executionPreferences.autoPlace,
@@ -3446,16 +3448,14 @@ function installModalContextMenu(nodeType, nodeData) {
         submenu: {
           options: [
             {
-              content: "GPU",
-              has_submenu: true,
-              submenu: {
-                options: MODAL_GPU_TYPES.map((modalGpu) => ({
-                  content: modalGpu,
-                  checked: modalGpu === currentModalGpu,
-                  callback: () => setSelectedModalGpu(modalGpu),
-                })),
-              },
+              content: `GPU (${currentModalGpu})`,
+              disabled: true,
             },
+            ...MODAL_GPU_TYPES.map((modalGpu) => ({
+              content: modalGpu,
+              checked: modalGpu === currentModalGpu,
+              callback: () => setSelectedModalGpu(modalGpu),
+            })),
             null,
             {
               content: enableUpstreamMenuItemLabel,
