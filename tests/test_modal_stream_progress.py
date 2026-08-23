@@ -236,3 +236,42 @@ def test_stream_progress_reports_exact_modal_container_identity(monkeypatch: Any
     assert emitted_progress[0]["execution_provider"] == "modal"
     assert emitted_progress[0]["execution_environment_id"] == "modal:B300"
     assert emitted_progress[0]["execution_location"] == "ta-01K3MODAL"
+
+
+def test_stream_status_reports_exact_modal_container_identity(monkeypatch: Any) -> None:
+    """Node status should expose a Modal task id before numeric progress begins."""
+    modal_app = _load_modal_app_module()
+    emitted_status: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        modal_app,
+        "_emit_local_modal_status",
+        lambda **kwargs: emitted_status.append(kwargs),
+    )
+    payload = {
+        "prompt_id": "prompt-location",
+        "component_id": "node-162",
+        "component_node_ids": ["node-162"],
+        "execution_provider": "modal",
+        "execution_environment_id": "modal:B300",
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    modal_app._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {"kind": "remote_logs", "task_id": "ta-01K3MODAL"},
+                {
+                    "kind": "progress",
+                    "event_type": "status",
+                    "phase": "executing",
+                    "active_node_id": "node-162",
+                },
+                {"kind": "result", "outputs": ["done"]},
+            ]
+        ),
+    )
+
+    assert emitted_status[0]["execution_provider"] == "modal"
+    assert emitted_status[0]["execution_environment_id"] == "modal:B300"
+    assert emitted_status[0]["execution_location"] == "ta-01K3MODAL"

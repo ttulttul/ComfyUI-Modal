@@ -429,7 +429,10 @@ def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
     assert "function registerPromptExecutionAssignments(promptId, assignments)" in source
     assert "promptState.scheduledEnvironmentCount = environmentIds.size;" in source
     assert "updateNodeExecutionLocation(promptId, progressNodeId, detail);" in source
+    assert "updateNodeExecutionLocation(promptId, nextActiveNodeId, detail);" in source
     assert "function drawRemoteExecutionLocation(" in source
+    assert "function updateVueExecutionLocation(decoration, state)" in source
+    assert 'text-overflow: ellipsis;' in source
     assert "Number(state?.scheduledEnvironmentCount ?? 0) > 1" in source
     assert "fitCanvasText(ctx, label, availableTextWidth)" in source
     assert "REMOTE_LOCATION_ICON_SOURCES" in source

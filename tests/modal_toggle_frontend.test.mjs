@@ -70,6 +70,7 @@ const transformedSource = `${[
   "  hasRemoteDescendants,",
   "  remoteContainerTooltip,",
   "  drawModalNodeDecoration,",
+  "  updateVueExecutionLocation,",
   "  currentGlobalStatus,",
   "  formatIterationRate,",
   "  fadeNodeProgress,",
@@ -255,6 +256,49 @@ assert.deepEqual(mixedLocationState?.executionLocation, {
   provider: "modal",
   label: "ta-01K3M0DALCONTAINERIDENTITY",
 });
+const vueLocationIcon = {
+  hidden: true,
+  attributes: new Map(),
+  getAttribute(name) {
+    return this.attributes.get(name) ?? null;
+  },
+  setAttribute(name, value) {
+    this.attributes.set(name, value);
+  },
+};
+const vueLocationLabel = { textContent: "" };
+const vueLocationElement = {
+  hidden: true,
+  dataset: {},
+  title: "",
+  removeAttribute(name) {
+    if (name === "title") {
+      this.title = "";
+    }
+  },
+  querySelector(selector) {
+    if (selector === ".comfy-modal-vue-execution-location-icon") {
+      return vueLocationIcon;
+    }
+    if (selector === ".comfy-modal-vue-execution-location-label") {
+      return vueLocationLabel;
+    }
+    return null;
+  },
+};
+const vueLocationDecoration = {
+  querySelector(selector) {
+    return selector === ".comfy-modal-vue-execution-location"
+      ? vueLocationElement
+      : null;
+  },
+};
+modalToggle.updateVueExecutionLocation(vueLocationDecoration, mixedLocationState);
+assert.equal(vueLocationElement.hidden, false);
+assert.equal(vueLocationElement.dataset.provider, "modal");
+assert.equal(vueLocationElement.title, "ta-01K3M0DALCONTAINERIDENTITY");
+assert.equal(vueLocationLabel.textContent, "ta-01K3M0DALCONTAINERIDENTITY");
+assert.match(vueLocationIcon.getAttribute("src"), /^data:image\/svg\+xml/);
 const mixedLocationLabels = [];
 const mixedLocationCanvasContext = {
   globalAlpha: 1,
@@ -291,6 +335,14 @@ assert.deepEqual(modalToggle.getRemoteVisualState({ id: 178 })?.executionLocatio
   provider: "ssh_docker",
   label: "spark-one.internal.example",
 });
+modalToggle.updateVueExecutionLocation(
+  vueLocationDecoration,
+  modalToggle.getRemoteVisualState({ id: 178 }),
+);
+assert.equal(vueLocationElement.dataset.provider, "ssh_docker");
+assert.equal(vueLocationLabel.textContent, "spark-one.internal.example");
+assert.match(vueLocationIcon.getAttribute("src"), /^data:image\/svg\+xml/);
+assert.match(decodeURIComponent(vueLocationIcon.getAttribute("src")), /viewBox="0 0 73 73"/);
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-active-location", ["180", "181"], [

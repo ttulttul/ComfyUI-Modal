@@ -3560,6 +3560,9 @@ def _emit_local_modal_status(
     status_current: int | None = None,
     status_total: int | None = None,
     completed_ancestor_node_ids: list[str] | None = None,
+    execution_provider: str | None = None,
+    execution_environment_id: str | None = None,
+    execution_location: str | None = None,
 ) -> None:
     """Forward remote execution progress into the local ComfyUI websocket stream."""
     if client_id is None:
@@ -3592,6 +3595,12 @@ def _emit_local_modal_status(
         payload["status_total"] = int(status_total)
     if completed_ancestor_node_ids:
         payload["completed_ancestor_node_ids"] = list(completed_ancestor_node_ids)
+    if execution_provider:
+        payload["execution_provider"] = execution_provider
+    if execution_environment_id:
+        payload["execution_environment_id"] = execution_environment_id
+    if execution_location:
+        payload["execution_location"] = execution_location
     _record_local_modal_ui_event("modal_status", payload, client_id)
     prompt_server.send_sync("modal_status", payload, client_id)
 
@@ -3605,6 +3614,31 @@ def _remote_execution_destination(payload: Mapping[str, Any]) -> str:
         if provider != "modal" and environment_id
         else "Modal"
     )
+
+
+def _remote_execution_identity(
+    payload: Mapping[str, Any],
+    modal_task_id: str | None = None,
+) -> dict[str, str]:
+    """Return non-empty provider, environment, and runtime location fields."""
+    provider = str(
+        payload.get("execution_provider") or ("modal" if modal_task_id else "")
+    ).strip()
+    environment_id = str(payload.get("execution_environment_id") or "").strip()
+    location = (
+        modal_task_id
+        if provider == "modal" and modal_task_id
+        else str(payload.get("execution_location") or "").strip()
+    )
+    return {
+        key: value
+        for key, value in {
+            "execution_provider": provider,
+            "execution_environment_id": environment_id,
+            "execution_location": location,
+        }.items()
+        if value
+    }
 
 
 def _emit_local_remote_dispatch_status(payload: dict[str, Any]) -> None:
@@ -3652,6 +3686,7 @@ def _emit_local_remote_startup_status(
             str(payload["modal_gpu"]) if payload.get("modal_gpu") is not None else None
         ),
         status_message=status_message,
+        **_remote_execution_identity(payload),
     )
 
 
@@ -4589,27 +4624,9 @@ def _consume_remote_payload_stream(
                             ),
                             "aggregate_only": aggregate_only,
                         }
-                        raw_execution_provider = payload.get("execution_provider")
-                        execution_provider = str(
-                            raw_execution_provider
-                            or ("modal" if active_remote_task_id else "")
-                        ).strip()
-                        execution_environment_id = str(
-                            payload.get("execution_environment_id") or ""
-                        ).strip()
-                        execution_location = (
-                            active_remote_task_id
-                            if execution_provider == "modal" and active_remote_task_id
-                            else str(payload.get("execution_location") or "").strip()
+                        progress_kwargs.update(
+                            _remote_execution_identity(payload, active_remote_task_id)
                         )
-                        if execution_provider:
-                            progress_kwargs["execution_provider"] = execution_provider
-                        if execution_environment_id:
-                            progress_kwargs[
-                                "execution_environment_id"
-                            ] = execution_environment_id
-                        if execution_location:
-                            progress_kwargs["execution_location"] = execution_location
                         for string_field in ("stage", "message", "unit"):
                             if stream_event.get(string_field) is not None:
                                 progress_kwargs[string_field] = str(
@@ -4782,6 +4799,9 @@ def _consume_remote_payload_stream(
                             display_node_id=display_node_id,
                             real_node_id=real_node_id,
                             cached_hit=True,
+                            **_remote_execution_identity(
+                                payload, active_remote_task_id
+                            ),
                         )
                     continue
                 logger.info(
@@ -4824,6 +4844,7 @@ def _consume_remote_payload_stream(
                             "Receiving remote outputs from "
                             f"{_remote_execution_destination(payload)}"
                         ),
+                        **_remote_execution_identity(payload, active_remote_task_id),
                     )
                     continue
                 _emit_local_modal_status(
@@ -4854,6 +4875,7 @@ def _consume_remote_payload_stream(
                         if stream_event.get("active_node_role") is not None
                         else None
                     ),
+                    **_remote_execution_identity(payload, active_remote_task_id),
                 )
                 continue
             if event_kind == "result":

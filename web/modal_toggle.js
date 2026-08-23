@@ -3859,17 +3859,70 @@ function remoteContainerTooltip(state) {
  */
 function ensureVueNodeDecoration(nodeElement) {
   let decoration = nodeElement.querySelector(":scope > .comfy-modal-vue-node-decoration");
-  if (decoration) {
+  if (!decoration) {
+    decoration = document.createElement("div");
+    decoration.className = "comfy-modal-vue-node-decoration";
+    decoration.setAttribute("aria-hidden", "true");
+    const badge = document.createElement("span");
+    badge.className = "comfy-modal-vue-node-badge";
+    decoration.appendChild(badge);
+    nodeElement.appendChild(decoration);
+  }
+  if (decoration.querySelector(".comfy-modal-vue-execution-location")) {
     return decoration;
   }
-  decoration = document.createElement("div");
-  decoration.className = "comfy-modal-vue-node-decoration";
-  decoration.setAttribute("aria-hidden", "true");
-  const badge = document.createElement("span");
-  badge.className = "comfy-modal-vue-node-badge";
-  decoration.appendChild(badge);
-  nodeElement.appendChild(decoration);
+  const executionLocation = document.createElement("div");
+  executionLocation.className = "comfy-modal-vue-execution-location";
+  executionLocation.hidden = true;
+  const executionLocationIcon = document.createElement("img");
+  executionLocationIcon.className = "comfy-modal-vue-execution-location-icon";
+  executionLocationIcon.alt = "";
+  executionLocationIcon.setAttribute("aria-hidden", "true");
+  const executionLocationLabel = document.createElement("span");
+  executionLocationLabel.className = "comfy-modal-vue-execution-location-label";
+  executionLocation.append(executionLocationIcon, executionLocationLabel);
+  decoration.appendChild(executionLocation);
   return decoration;
+}
+
+/**
+ * Update the execution-location badge rendered by the Nodes 2.0 DOM layer.
+ * @param {HTMLDivElement} decoration
+ * @param {Record<string, any> | null} state
+ */
+function updateVueExecutionLocation(decoration, state) {
+  const executionLocation = decoration.querySelector(
+    ".comfy-modal-vue-execution-location",
+  );
+  if (!executionLocation) {
+    return;
+  }
+  const location =
+    Number(state?.scheduledEnvironmentCount ?? 0) > 1 &&
+    (state?.isActiveRemoteNode || state?.isActiveComponentMember)
+      ? state?.executionLocation
+      : null;
+  const label = String(location?.label ?? "");
+  const provider = String(location?.provider ?? "");
+  const iconSource = REMOTE_LOCATION_ICON_SOURCES[provider] ?? "";
+  executionLocation.hidden = !label;
+  if (!label) {
+    executionLocation.removeAttribute("title");
+    return;
+  }
+  executionLocation.dataset.provider = provider;
+  executionLocation.title = label;
+  const icon = executionLocation.querySelector(".comfy-modal-vue-execution-location-icon");
+  const labelElement = executionLocation.querySelector(".comfy-modal-vue-execution-location-label");
+  if (icon) {
+    icon.hidden = !iconSource;
+    if (iconSource && icon.getAttribute("src") !== iconSource) {
+      icon.setAttribute("src", iconSource);
+    }
+  }
+  if (labelElement) {
+    labelElement.textContent = label;
+  }
 }
 
 /**
@@ -3917,6 +3970,7 @@ function updateVueNodeDecoration(nodeElement, node, timestamp) {
     ? LOCAL_BOTTLENECK_BADGE_BORDER_COLOR
     : palette.borderColor;
   badge.style.boxShadow = localBottleneck ? "none" : `0 0 8px ${palette.shadowColor}`;
+  updateVueExecutionLocation(decoration, state);
 }
 
 /**
@@ -4657,6 +4711,7 @@ function handleModalStatus(event) {
       nextActiveNodeId,
     );
     if (nextActiveNodeId) {
+      updateNodeExecutionLocation(promptId, nextActiveNodeId, detail);
       setNodesPhase([nextActiveNodeId], STATE_ACTIVE, promptId);
     }
     setPromptActiveNode(promptId, nextActiveNodeId);
@@ -5400,6 +5455,56 @@ function installGlobalStatusStyles() {
 
     .comfy-modal-vue-node-badge[hidden] {
       display: none;
+    }
+
+    .comfy-modal-vue-execution-location {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 6px;
+      right: 6px;
+      display: flex;
+      min-width: 0;
+      height: 24px;
+      align-items: center;
+      gap: 6px;
+      box-sizing: border-box;
+      overflow: hidden;
+      padding: 5px 7px;
+      border: 1px solid rgba(148, 163, 184, 0.34);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.94);
+      box-shadow: 0 3px 10px rgba(2, 6, 23, 0.42);
+      color: #cbd5e1;
+      font: 500 10px/1 ui-sans-serif, system-ui, sans-serif;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    .comfy-modal-vue-execution-location[hidden] {
+      display: none;
+    }
+
+    .comfy-modal-vue-execution-location-icon {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 auto;
+      object-fit: contain;
+    }
+
+    .comfy-modal-vue-execution-location[data-provider="modal"]
+      .comfy-modal-vue-execution-location-icon {
+      width: 22px;
+    }
+
+    .comfy-modal-vue-execution-location-icon[hidden] {
+      display: none;
+    }
+
+    .comfy-modal-vue-execution-location-label {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
   `;
   document.head.appendChild(style);
