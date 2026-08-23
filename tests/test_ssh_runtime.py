@@ -131,6 +131,54 @@ def test_worker_dockerfile_disables_inherited_base_image_healthcheck(
     assert "COMFY_MODAL_LLM_EXECUTION_TARGET=ssh_docker" in dockerfile
 
 
+def test_worker_dockerfile_retries_large_accelerator_downloads(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Large direct wheels should survive transient interrupted downloads."""
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "select_remote_torch_build",
+        lambda _gpu: SimpleNamespace(
+            install_layers=(),
+            validation_command=lambda: "true",
+        ),
+    )
+    monkeypatch.setattr(ssh_runtime_module, "remote_apt_packages", lambda: ())
+    monkeypatch.setattr(ssh_runtime_module, "remote_runtime_packages", lambda: ())
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_packages",
+        lambda _gpu: ("https://example.test/large-accelerator.whl",),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_validation_command",
+        lambda _gpu: "true",
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "custom_node_runtime_packages",
+        lambda _path: (),
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(
+            modal_gpu="RTX-PRO-6000",
+            custom_nodes_dir=Path("/custom_nodes"),
+        ),
+    )
+    spec = SimpleNamespace(identity=SimpleNamespace(fingerprint="deadbeef"))
+
+    dockerfile = manager._dockerfile(spec)
+
+    assert (
+        "RUN python -m pip install --no-cache-dir --resume-retries 20 "
+        "--timeout 120 https://example.test/large-accelerator.whl"
+    ) in dockerfile
+
+
 def test_worker_indices_are_distributed_across_discovered_gpus(
     ssh_runtime_module: Any,
     remote_hosts_module: Any,

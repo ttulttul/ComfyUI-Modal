@@ -1,5 +1,7 @@
 # Learnings
 
+- The pinned vLLM wheel is large enough that pip's default five resumptions and 15-second socket timeout can be exhausted by an unstable connection during an SSH/Vast worker build. Give the accelerator-wheel layer an extended timeout and bounded resume budget while leaving earlier package layers unchanged so Docker can reuse their successful cache entries.
+
 ## 2026-08-22
 
 - Current free VRAM is conservative only if the planner distinguishes unknown GPU consumers from its own idle warm workers. Compare normal placement with an optimistic total-capacity placement; recycle only the labeled idle worker selected by the cost model, then re-probe actual free memory before admission. A running worker is idle only when `docker top` shows neither an execution relay nor a model-staging process.

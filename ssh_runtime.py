@@ -55,6 +55,8 @@ _REMOTE_STORAGE_ROOT = Path("/storage")
 _RUNTIME_LABEL = "comfy.remote.runtime-fingerprint"
 _ENVIRONMENT_LABEL = "comfy.remote.environment-id"
 _WORKER_LABEL = "comfy.remote.worker-index"
+_LARGE_DOWNLOAD_RESUME_RETRIES = 20
+_LARGE_DOWNLOAD_TIMEOUT_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -320,7 +322,11 @@ class SshRuntimeManager:
         lines.extend(
             [
                 f"RUN {torch_build.validation_command()}",
-                _pip_install(remote_accelerator_packages(self.settings.modal_gpu)),
+                _pip_install(
+                    remote_accelerator_packages(self.settings.modal_gpu),
+                    resume_retries=_LARGE_DOWNLOAD_RESUME_RETRIES,
+                    timeout_seconds=_LARGE_DOWNLOAD_TIMEOUT_SECONDS,
+                ),
                 f"RUN {remote_accelerator_validation_command(self.settings.modal_gpu)}",
             ]
         )
@@ -461,7 +467,12 @@ def export_worker_image_context(
     return manager._build_context(spec)
 
 
-def _pip_install(packages: Iterable[str]) -> str:
+def _pip_install(
+    packages: Iterable[str],
+    *,
+    resume_retries: int | None = None,
+    timeout_seconds: int | None = None,
+) -> str:
     """Return one deterministic Docker RUN instruction for pip packages."""
     arguments = [
         "python",
@@ -469,8 +480,16 @@ def _pip_install(packages: Iterable[str]) -> str:
         "pip",
         "install",
         "--no-cache-dir",
-        *packages,
     ]
+    if resume_retries is not None:
+        if resume_retries < 0:
+            raise ValueError("resume_retries must not be negative.")
+        arguments.extend(("--resume-retries", str(resume_retries)))
+    if timeout_seconds is not None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive.")
+        arguments.extend(("--timeout", str(timeout_seconds)))
+    arguments.extend(packages)
     return f"RUN {shlex.join(arguments)}"
 
 
