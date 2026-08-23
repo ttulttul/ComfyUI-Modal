@@ -608,30 +608,6 @@ def _component_required_provider(
     return None
 
 
-def _prompt_node_declared_provider(
-    prompt_node: Mapping[str, Any],
-) -> ExecutionProvider | None:
-    """Return a provider required by a curated node backend, when declared."""
-    if str(prompt_node.get("class_type") or "") != "ModalLLM":
-        return None
-    inputs = prompt_node.get("inputs")
-    if not isinstance(inputs, Mapping):
-        return None
-    model_reference = inputs.get("model_profile")
-    if not isinstance(model_reference, str) or not model_reference.strip():
-        return None
-
-    from .llm_profiles import get_llm_profile
-
-    try:
-        profile = get_llm_profile(model_reference.strip())
-    except ValueError:
-        return None
-    if profile.backend == "llama_cpp_server":
-        return ExecutionProvider.SSH_DOCKER
-    return None
-
-
 def _iter_prompt_string_values(value: object) -> Iterator[str]:
     """Yield nested prompt string values while ignoring graph links and scalars."""
     if isinstance(value, str):
@@ -2391,25 +2367,6 @@ def _remote_component_partition_groups(
                 == MODAL_MAP_INPUT_NODE_ID
             ):
                 union(node_id, upstream_node_id)
-                continue
-            downstream_provider = _prompt_node_declared_provider(prompt_node)
-            upstream_provider = (
-                _prompt_node_declared_provider(upstream_prompt_node)
-                if isinstance(upstream_prompt_node, Mapping)
-                else None
-            )
-            if downstream_provider != upstream_provider and (
-                downstream_provider is not None or upstream_provider is not None
-            ):
-                logger.info(
-                    "Splitting remote nodes %s -> %s across required provider boundary %s -> %s.",
-                    upstream_node_id,
-                    node_id,
-                    upstream_provider.value if upstream_provider is not None else "any",
-                    downstream_provider.value
-                    if downstream_provider is not None
-                    else "any",
-                )
                 continue
             if _output_supports_parallel_local_materialization(
                 prompt=prompt,

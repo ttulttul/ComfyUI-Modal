@@ -195,42 +195,6 @@ def test_auto_placement_selects_every_eligible_prompt_node(
     assert selected == {"1", "2"}
 
 
-def test_remote_partition_splits_ssh_only_llm_from_expensive_image_producer(
-    api_intercept_module: Any,
-) -> None:
-    """A curated SSH backend must not inherit an upstream component's provider."""
-    prompt = {
-        "1": {"class_type": "RemoteImage", "inputs": {}},
-        "2": {
-            "class_type": "ModalLLM",
-            "inputs": {
-                "image": ["1", 0],
-                "model_profile": "huihui-qwen3.8-27b-abliterated-q2-k-gguf",
-            },
-        },
-    }
-    fake_nodes_module = type(
-        "FakeNodesModule",
-        (),
-        {
-            "NODE_CLASS_MAPPINGS": {
-                "RemoteImage": _FakeRemoteImageNode,
-                "ModalLLM": _FakeTextNode,
-            },
-            "NODE_DISPLAY_NAME_MAPPINGS": {},
-        },
-    )()
-
-    components = api_intercept_module._build_remote_components(
-        prompt,
-        {"1", "2"},
-        api_intercept_module._build_consumer_map(prompt),
-        fake_nodes_module,
-    )
-
-    assert components == [["1"], ["2"]]
-
-
 def test_disabled_auto_placement_preserves_explicit_markers(
     api_intercept_module: Any,
 ) -> None:
@@ -351,9 +315,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
             return capabilities
 
     monkeypatch.setattr(api_intercept_module, "_ROUTE_REGISTERED", False)
-    monkeypatch.setattr(
-        api_intercept_module, "_ssh_host_registry", lambda _settings: registry
-    )
+    monkeypatch.setattr(api_intercept_module, "_ssh_host_registry", lambda _settings: registry)
     monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
     monkeypatch.setattr(
         api_intercept_module,
@@ -384,7 +346,9 @@ def test_remote_environment_routes_save_and_probe_hosts(
         )
     )
     probe = routes.handlers[("POST", "/remote/environments/probe")]
-    probe_response = asyncio.run(probe(FakeRequest({"environment_id": "gpu-one"})))
+    probe_response = asyncio.run(
+        probe(FakeRequest({"environment_id": "gpu-one"}))
+    )
 
     assert update_response.status == 200
     assert probe_response.status == 200
@@ -434,9 +398,7 @@ def test_scheduler_refreshes_stale_ssh_capabilities_before_placement(
             """Return current capabilities."""
             return capabilities
 
-    monkeypatch.setattr(
-        api_intercept_module, "_ssh_host_registry", lambda _settings: registry
-    )
+    monkeypatch.setattr(api_intercept_module, "_ssh_host_registry", lambda _settings: registry)
     monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
 
     hosts = api_intercept_module._schedulable_ssh_hosts(SimpleNamespace())
@@ -894,9 +856,7 @@ def test_queue_prompt_json_includes_resolved_modal_metadata(
             """Accept the supplied prompt with one fake execution target."""
             return True, None, ["1"], []
 
-    monkeypatch.setattr(
-        api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule
-    )
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
     prompt_server = FakePromptServer()
 
     response = asyncio.run(
@@ -970,10 +930,7 @@ def test_rewritten_prompt_diagnostics_reports_dependency_cycles(
         reason="test",
     )
 
-    assert any(
-        "Modal rewritten prompt contains dependency cycle(s)" in item
-        for item in warning_messages
-    )
+    assert any("Modal rewritten prompt contains dependency cycle(s)" in item for item in warning_messages)
     assert any("prompt-cycle" in item for item in warning_messages)
     assert any("Modal rewritten prompt diagnostics" in item for item in log_messages)
 
@@ -1043,9 +1000,7 @@ def test_queue_prompt_json_logs_rewritten_modal_diagnostics_on_validation_failur
         """Record one rewritten-prompt diagnostics request."""
         diagnostic_calls.append(dict(kwargs))
 
-    monkeypatch.setattr(
-        api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule
-    )
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
     monkeypatch.setattr(
         api_intercept_module,
         "_log_modal_rewritten_prompt_diagnostics",
@@ -1195,7 +1150,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
                                     "type": "RemoteImage",
                                     "properties": {"is_modal_remote": True},
                                 }
-                            ],
+                            ]
                         }
                     }
                 },
@@ -1259,29 +1214,21 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
         "_get_server_module",
         lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
     )
-    monkeypatch.setattr(
-        api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule
-    )
-    monkeypatch.setattr(
-        api_intercept_module, "_emit_modal_status", lambda **_kwargs: None
-    )
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(api_intercept_module, "_emit_modal_status", lambda **_kwargs: None)
     monkeypatch.setattr(
         api_intercept_module,
         "rewrite_prompt_for_modal",
         capture_rewrite_settings,
     )
-    monkeypatch.setattr(
-        remote_modal_app_module, "ensure_remote_warm_capacity", fail_queue_time_warmup
-    )
+    monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", fail_queue_time_warmup)
 
     api_intercept_module.setup_modal_queue_route(
         prompt_server=prompt_server,
         sync_engine=object(),
         settings=settings,
     )
-    response = asyncio.run(
-        prompt_server.routes.handlers["/modal/queue_prompt"](FakeRequest())
-    )
+    response = asyncio.run(prompt_server.routes.handlers["/modal/queue_prompt"](FakeRequest()))
 
     response_payload = json.loads(response.text)
     assert response_payload["prompt_id"] == "prompt-queue-warmup"
@@ -1291,12 +1238,9 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     assert observed_rewrite_settings[0].modal_gpu == "B300"
     queued_extra_data = prompt_server.prompt_queue.items[0][3]
     assert queued_extra_data["modal"]["gpu"] == "B300"
-    assert (
-        queued_extra_data["extra_pnginfo"][
-            api_intercept_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY
-        ]
-        == "prompt-queue-warmup"
-    )
+    assert queued_extra_data["extra_pnginfo"][
+        api_intercept_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY
+    ] == "prompt-queue-warmup"
     assert len(prompt_server.prompt_queue.items) == 1
 
 
@@ -1314,9 +1258,7 @@ def test_modal_prompt_rewrite_keeps_event_loop_responsive(
         assert release_rewrite.wait(timeout=1.0)
         return kwargs["prompt"], api_intercept_module.RewriteSummary()
 
-    monkeypatch.setattr(
-        api_intercept_module, "rewrite_prompt_for_modal", blocking_rewrite
-    )
+    monkeypatch.setattr(api_intercept_module, "rewrite_prompt_for_modal", blocking_rewrite)
 
     async def run_test() -> None:
         """Run the blocking rewrite and an independent event-loop callback together."""
@@ -1450,9 +1392,7 @@ def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(
         "_get_server_module",
         lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
     )
-    monkeypatch.setattr(
-        api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule
-    )
+    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
     monkeypatch.setattr(api_intercept_module, "_emit_modal_status", fail_modal_status)
     monkeypatch.setattr(api_intercept_module, "rewrite_prompt_for_modal", fail_rewrite)
 
@@ -1461,9 +1401,7 @@ def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(
         sync_engine=object(),
         settings=settings,
     )
-    response = asyncio.run(
-        prompt_server.routes.handlers["/modal/queue_prompt"](FakeRequest())
-    )
+    response = asyncio.run(prompt_server.routes.handlers["/modal/queue_prompt"](FakeRequest()))
 
     response_payload = json.loads(response.text)
     assert response_payload["prompt_id"] == "prompt-no-modal"
@@ -1482,9 +1420,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     model_path.write_bytes(b"weights")
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -1558,9 +1494,7 @@ def test_rewrite_groups_connected_remote_nodes_into_single_proxy(
     assert payload["payload_kind"] == "subgraph"
     assert "prompt_id" not in payload
     assert payload["component_node_ids"] == ["1", "2"]
-    assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith(
-        "/assets/"
-    )
+    assert payload["subgraph_prompt"]["1"]["inputs"]["model_name"].startswith("/assets/")
     assert payload["execute_node_ids"] == ["2"]
     assert "requires_volume_reload" not in payload
     assert "volume_reload_marker" not in payload
@@ -1669,13 +1603,11 @@ def test_rewrite_anchors_terminal_artifact_only_remote_node(
     ]
     assert finalizer_class.GET_SCHEMA().is_output_node is True
     assert finalizer_class.OUTPUT_NODE is True
-    (
-        finalized_inputs,
-        _hidden_inputs,
-        _v3_data,
-    ) = modal_executor_module.io.get_finalized_class_inputs(
-        finalizer_class.INPUT_TYPES(),
-        rewritten_prompt[finalizer_node_id]["inputs"],
+    finalized_inputs, _hidden_inputs, _v3_data = (
+        modal_executor_module.io.get_finalized_class_inputs(
+            finalizer_class.INPUT_TYPES(),
+            rewritten_prompt[finalizer_node_id]["inputs"],
+        )
     )
     assert "components.component_0" in finalized_inputs["required"]
 
@@ -2011,7 +1943,8 @@ def test_rewrite_runs_terminal_save_video_as_remote_artifact_sink(
         "1": ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
     }
     assert summary.rewritten_node_id_map == {
-        str(node_id): "1" for node_id in range(1, 10)
+        str(node_id): "1"
+        for node_id in range(1, 10)
     }
     payload = rewritten_prompt["1"]["inputs"]["original_node_data"]
     assert payload["component_node_ids"] == [
@@ -2587,9 +2520,7 @@ def test_component_local_reentry_dependency_detection(
         boundary_inputs=[
             api_intercept_module.BoundaryInputSpec(
                 proxy_input_name="remote_input_0",
-                source=api_intercept_module.LinkedOutputRef(
-                    node_id="4", output_index=0
-                ),
+                source=api_intercept_module.LinkedOutputRef(node_id="4", output_index=0),
                 io_type="IMAGE",
                 targets=[
                     api_intercept_module.InputTarget(
@@ -2682,26 +2613,10 @@ def test_rewrite_reports_parallel_component_stages(
         ]
     }
     prompt = {
-        "1": {
-            "class_type": "RemoteImage",
-            "inputs": {},
-            "_meta": {"title": "Remote A"},
-        },
-        "2": {
-            "class_type": "RemoteImage",
-            "inputs": {},
-            "_meta": {"title": "Remote B"},
-        },
-        "3": {
-            "class_type": "LocalSink",
-            "inputs": {"image": ["1", 0]},
-            "_meta": {"title": "Sink A"},
-        },
-        "4": {
-            "class_type": "LocalSink",
-            "inputs": {"image": ["2", 0]},
-            "_meta": {"title": "Sink B"},
-        },
+        "1": {"class_type": "RemoteImage", "inputs": {}, "_meta": {"title": "Remote A"}},
+        "2": {"class_type": "RemoteImage", "inputs": {}, "_meta": {"title": "Remote B"}},
+        "3": {"class_type": "LocalSink", "inputs": {"image": ["1", 0]}, "_meta": {"title": "Sink A"}},
+        "4": {"class_type": "LocalSink", "inputs": {"image": ["2", 0]}, "_meta": {"title": "Sink B"}},
     }
 
     _rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
@@ -2768,26 +2683,10 @@ def test_rewrite_reports_mapped_parallelism_upper_bound(
         ]
     }
     prompt = {
-        "1": {
-            "class_type": "PromptList",
-            "inputs": {},
-            "_meta": {"title": "Prompt List"},
-        },
-        "2": {
-            "class_type": "ModalMapInput",
-            "inputs": {"value": ["1", 0]},
-            "_meta": {"title": "Map"},
-        },
-        "3": {
-            "class_type": "RemoteStringEcho",
-            "inputs": {"text": ["2", 0]},
-            "_meta": {"title": "Echo"},
-        },
-        "4": {
-            "class_type": "LocalStringSink",
-            "inputs": {"text": ["3", 0]},
-            "_meta": {"title": "Sink"},
-        },
+        "1": {"class_type": "PromptList", "inputs": {}, "_meta": {"title": "Prompt List"}},
+        "2": {"class_type": "ModalMapInput", "inputs": {"value": ["1", 0]}, "_meta": {"title": "Map"}},
+        "3": {"class_type": "RemoteStringEcho", "inputs": {"text": ["2", 0]}, "_meta": {"title": "Echo"}},
+        "4": {"class_type": "LocalStringSink", "inputs": {"text": ["3", 0]}, "_meta": {"title": "Sink"}},
     }
 
     _rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
@@ -3617,9 +3516,7 @@ def test_rewrite_stamps_snapshot_profile_on_split_static_and_mapped_payloads(
     mapped_payload = rewritten_prompt["1__mapped"]["inputs"]["original_node_data"]
 
     assert static_payload["snapshot_profile_key"].startswith("loader-profile:")
-    assert (
-        mapped_payload["snapshot_profile_key"] == static_payload["snapshot_profile_key"]
-    )
+    assert mapped_payload["snapshot_profile_key"] == static_payload["snapshot_profile_key"]
     assert static_payload["modal_gpu"] == "L40S"
     assert mapped_payload["modal_gpu"] == "L40S"
 
@@ -3650,7 +3547,9 @@ def test_snapshot_profile_stamping_excludes_llm_phase_from_comfy_profile(
             {
                 "component_id": "172",
                 "remote_worker_affinity_group": "comfy",
-                "subgraph_prompt": {"172": {"class_type": "SaveVideo", "inputs": {}}},
+                "subgraph_prompt": {
+                    "172": {"class_type": "SaveVideo", "inputs": {}}
+                },
             },
         ]
     }
@@ -3930,15 +3829,9 @@ def test_boundary_source_signature_changes_with_upstream_prompt_structure(
         },
     }
 
-    first_signature = api_intercept_module._boundary_source_signature(
-        base_prompt, source
-    )
-    second_signature = api_intercept_module._boundary_source_signature(
-        base_prompt, source
-    )
-    changed_signature = api_intercept_module._boundary_source_signature(
-        changed_prompt, source
-    )
+    first_signature = api_intercept_module._boundary_source_signature(base_prompt, source)
+    second_signature = api_intercept_module._boundary_source_signature(base_prompt, source)
+    changed_signature = api_intercept_module._boundary_source_signature(changed_prompt, source)
 
     assert first_signature == second_signature
     assert changed_signature != first_signature
@@ -4105,27 +3998,15 @@ def test_extract_remote_node_ids_maps_defined_subgraph_nodes_through_instances(
     subgraph_type = "4c314f31-ecda-4b08-ae98-faaba1bf613f"
     workflow = {
         "nodes": [
-            {
-                "id": 105,
-                "type": subgraph_type,
-                "properties": {"is_modal_remote": False},
-            },
-            {
-                "id": 205,
-                "type": subgraph_type,
-                "properties": {"is_modal_remote": False},
-            },
+            {"id": 105, "type": subgraph_type, "properties": {"is_modal_remote": False}},
+            {"id": 205, "type": subgraph_type, "properties": {"is_modal_remote": False}},
         ],
         "definitions": {
             "subgraphs": [
                 {
                     "id": subgraph_type,
                     "nodes": [
-                        {
-                            "id": 11,
-                            "type": "VAELoader",
-                            "properties": {"is_modal_remote": True},
-                        },
+                        {"id": 11, "type": "VAELoader", "properties": {"is_modal_remote": True}},
                         {
                             "id": 14,
                             "type": "SamplerCustomAdvanced",
@@ -4192,21 +4073,13 @@ def test_extract_remote_node_ids_maps_nested_defined_subgraph_instances(
                 {
                     "id": outer_type,
                     "nodes": [
-                        {
-                            "id": 7,
-                            "type": inner_type,
-                            "properties": {"is_modal_remote": False},
-                        },
+                        {"id": 7, "type": inner_type, "properties": {"is_modal_remote": False}},
                     ],
                 },
                 {
                     "id": inner_type,
                     "nodes": [
-                        {
-                            "id": 11,
-                            "type": "VAELoader",
-                            "properties": {"is_modal_remote": True},
-                        },
+                        {"id": 11, "type": "VAELoader", "properties": {"is_modal_remote": True}},
                     ],
                 },
             ]
@@ -4229,9 +4102,7 @@ def test_rewrite_rejects_non_transportable_remote_inputs(
     """Remote nodes should absorb a single non-transportable upstream dependency automatically."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -4304,9 +4175,7 @@ def test_rewrite_detects_remote_marker_inside_nested_subgraph_workflow(
     """Prompt rewrite should honor Modal markers found inside nested subgraph metadata."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -4389,9 +4258,7 @@ def test_rewrite_detects_marked_inner_subgraph_prompt_node_ids(
     """A marked nested workflow node should resolve to its composed prompt id."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -4472,9 +4339,7 @@ def test_rewrite_auto_expands_upstream_non_transportable_dependencies(
     """Marked remote nodes should absorb upstream non-transportable producers automatically."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -4632,9 +4497,7 @@ def test_analyze_remote_node_selection_returns_nodes_to_mark_and_reasons(
     assert analysis.resolved_workflow_node_paths == ["1", "2", "3"]
     assert analysis.added_node_ids == ["1", "2", "3"]
     assert analysis.added_workflow_node_paths == ["1", "2", "3"]
-    assert [
-        (reason.node_id, reason.required_by_node_id) for reason in analysis.reasons
-    ] == [
+    assert [(reason.node_id, reason.required_by_node_id) for reason in analysis.reasons] == [
         ("1", "3"),
         ("2", "3"),
     ]
@@ -4769,9 +4632,7 @@ def test_analyze_remote_node_selection_prefers_nested_workflow_paths(
     assert analysis.resolved_workflow_node_paths == ["24:23", "30"]
     assert analysis.added_node_ids == ["30"]
     assert analysis.added_workflow_node_paths == ["30"]
-    assert [
-        (reason.node_id, reason.required_by_node_id) for reason in analysis.reasons
-    ] == [
+    assert [(reason.node_id, reason.required_by_node_id) for reason in analysis.reasons] == [
         ("30", "24:23"),
     ]
 
@@ -4785,9 +4646,7 @@ def test_rewrite_rejects_non_transportable_remote_outputs(
     """Remote component boundaries should reject non-transportable local downstream edges."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -4864,9 +4723,7 @@ def test_rewrite_allows_video_and_audio_across_remote_boundaries(
     """Current ComfyUI VIDEO and AUDIO values should pass boundary validation."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -4939,9 +4796,7 @@ def test_rewrite_keeps_remote_noise_producer_with_remote_sampler(
     """NOISE strategy objects should remain inside one remote component."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
     settings = settings_module.ModalSyncSettings(
         app_name="app",
         auto_deploy=True,
@@ -5062,9 +4917,7 @@ def test_rewrite_keeps_nested_remote_nodes_remote_when_root_ids_collide(
     """Nested remote markers should survive prompt-id collisions with root workflow nodes."""
     custom_nodes_dir = tmp_path / "custom_nodes"
     custom_nodes_dir.mkdir()
-    (custom_nodes_dir / "__init__.py").write_text(
-        "NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8"
-    )
+    (custom_nodes_dir / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -5268,9 +5121,7 @@ def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) 
     )
 
 
-def test_container_status_route_is_queue_route_sibling(
-    api_intercept_module: Any,
-) -> None:
+def test_container_status_route_is_queue_route_sibling(api_intercept_module: Any) -> None:
     """The frontend should have a stable sibling route for active Modal containers."""
     assert api_intercept_module._container_status_route_path("/modal/queue_prompt") == (
         "/modal/container_status"
@@ -5280,16 +5131,14 @@ def test_container_status_route_is_queue_route_sibling(
     )
 
 
-def test_modal_reset_route_paths_are_queue_route_siblings(
-    api_intercept_module: Any,
-) -> None:
+def test_modal_reset_route_paths_are_queue_route_siblings(api_intercept_module: Any) -> None:
     """The frontend should have stable sibling routes for Modal maintenance actions."""
-    assert api_intercept_module._delete_modal_caches_route_path(
-        "/modal/queue_prompt"
-    ) == ("/modal/delete_caches")
-    assert api_intercept_module._delete_modal_volume_route_path(
-        "/modal/queue_prompt"
-    ) == ("/modal/delete_volume")
+    assert api_intercept_module._delete_modal_caches_route_path("/modal/queue_prompt") == (
+        "/modal/delete_caches"
+    )
+    assert api_intercept_module._delete_modal_volume_route_path("/modal/queue_prompt") == (
+        "/modal/delete_volume"
+    )
     assert api_intercept_module._delete_modal_caches_route_path("/custom/modal") == (
         "/custom/modal/delete_caches"
     )
