@@ -235,6 +235,8 @@ The node accepts a prompt and optional system prompt, an `IMAGE` batch, one nati
 
 Enter either a curated profile name from [`llm_profiles.json`](llm_profiles.json) or a Hugging Face `owner/model` ID directly (use `owner/model@revision` to pin a branch, tag, or commit). Each target inspects the model's metadata and compatibility before downloading weights, pins the exact commit, and reuses the completed snapshot on later runs. Unknown or target-incompatible architectures fail inspection before any weight download. Public models need no token; for gated models, set `HF_TOKEN` in ComfyUI's environment (local), in the Modal secret collection (Modal), or in the host's Docker env file (SSH).
 
+**GGUF exception:** do not enter the raw Hugging Face repository ID for a GGUF model. Raw `owner/model` values use the Transformers-compatible resolver, which requires `config.json` and safetensors; GGUF repositories normally provide neither. Select a curated GGUF profile instead so Modal-Sync knows the exact `.gguf` weight, optional multimodal projector, tokenizer source, and `llama.cpp` backend. For example, use `huihui-qwen3.8-27b-abliterated-q2-k-gguf`, not `huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF`.
+
 Apple-local inference requires macOS on Apple Silicon and the optional pinned runtime in the ComfyUI Python environment:
 
 ```bash
