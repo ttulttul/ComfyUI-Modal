@@ -49,6 +49,7 @@ const transformedSource = `${[
   "  handlePromptInterruption,",
   "  markPromptTerminal,",
   "  patchQueuePrompt,",
+  "  queueErrorMessage,",
   "  setRemoteFlag,",
   "  synchronizeRemoteFlagFromWidget,",
   "  extractRemoteNodeIds,",
@@ -94,6 +95,16 @@ const transformedSource = `${[
 runInThisContext(transformedSource, { filename: sourcePath });
 
 const modalToggle = globalThis.__modalToggleExports;
+
+assert.equal(
+  modalToggle.queueErrorMessage({
+    message: "Prompt validation failed",
+    modalQueueResponse: {
+      error: "lambda: insufficient GPU VRAM (11.40 GiB available, 16.00 GiB required)",
+    },
+  }),
+  "lambda: insufficient GPU VRAM (11.40 GiB available, 16.00 GiB required)",
+);
 
 function resetFrontendState() {
   modalToggle.modalNodeStates.clear();

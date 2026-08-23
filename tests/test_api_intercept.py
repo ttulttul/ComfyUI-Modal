@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -649,6 +650,136 @@ def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
 
     assert assignments["1"].provider.value == "ssh_docker"
     assert assignments["1"].environment_id == "cheap-host"
+
+
+def test_planner_recycles_idle_ssh_worker_before_cost_ranking(
+    api_intercept_module: Any,
+    remote_hosts_module: Any,
+    execution_environments_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Resident managed-worker VRAM should not hide a cheaper host's capacity."""
+    module = execution_environments_module
+    gib = 1024**3
+    occupied_capabilities = module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * gib,
+        available_ram_bytes=48 * gib,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        gpus=(
+            module.GpuCapability(
+                "GPU-4090",
+                "RTX 4090",
+                24 * gib,
+                free_vram_bytes=11 * gib,
+            ),
+        ),
+    )
+    reclaimed_capabilities = replace(
+        occupied_capabilities,
+        gpus=(
+            replace(
+                occupied_capabilities.gpus[0],
+                free_vram_bytes=23 * gib,
+            ),
+        ),
+    )
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="lambda",
+        display_name="Lambda 4090",
+        ssh_target="lambda",
+        cost_usd_per_second=0.0,
+        capabilities=occupied_capabilities,
+        health=module.EnvironmentHealth.READY,
+    )
+    component = api_intercept_module.RemoteComponentPlan(
+        node_ids=["1"],
+        representative_node_id="1",
+        boundary_inputs=[],
+        boundary_outputs=[],
+        execute_node_ids=["1"],
+        contains_output_node=False,
+    )
+    lifecycle_calls: list[str] = []
+
+    class FakeController:
+        """Expose one idle worker and its post-reclaim capability probe."""
+
+        def __init__(self, configured_host: Any) -> None:
+            """Retain the selected host."""
+            assert configured_host.environment_id == "lambda"
+
+        def remove_idle_managed_workers(self) -> tuple[str, ...]:
+            """Report one safely recycled warm worker."""
+            lifecycle_calls.append("remove")
+            return ("comfy-remote-lambda-fingerprint-w0",)
+
+        def probe_capabilities(self) -> Any:
+            """Return free VRAM after the managed container stopped."""
+            lifecycle_calls.append("probe")
+            return reclaimed_capabilities
+
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_schedulable_ssh_hosts",
+        lambda _settings: (host,),
+    )
+    monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_ssh_host_registry",
+        lambda _settings: None,
+    )
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_execution_history",
+        lambda _settings: None,
+    )
+
+    assignments = api_intercept_module._plan_component_execution_assignments(
+        components=[component],
+        prompt={"1": {"class_type": "KSampler", "inputs": {"steps": 20}}},
+        workflow={
+            "extra": {
+                "remote_execution": {
+                    "policy": "automatic",
+                    "auto_place": True,
+                    "minimum_vram_gb": 16,
+                }
+            }
+        },
+        settings=SimpleNamespace(modal_gpu="RTX-PRO-6000", max_containers=1),
+    )
+
+    assert lifecycle_calls == ["remove", "probe"]
+    assert assignments["1"].provider is module.ExecutionProvider.SSH_DOCKER
+    assert assignments["1"].environment_id == "lambda"
+
+
+def test_planner_does_not_recycle_for_equal_cost_tie_break(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+) -> None:
+    """A lexical tie alone must not discard a compatible worker's warm cache."""
+    module = execution_environments_module
+    actual = module.ExecutionAssignment(
+        environment_id="ready-host",
+        provider=module.ExecutionProvider.SSH_DOCKER,
+        predicted_cost_usd=0.0,
+        predicted_completion_seconds=60.0,
+    )
+    optimistic = replace(actual, environment_id="idle-host")
+
+    assert not api_intercept_module._reclaim_improves_assignment(
+        optimistic,
+        actual,
+        module.ComponentResourceRequirements(),
+    )
 
 
 def test_automatic_policy_rejects_zero_cost_host_for_oversized_model(

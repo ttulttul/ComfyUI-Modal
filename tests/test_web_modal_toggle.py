@@ -361,6 +361,22 @@ def test_queue_success_marks_all_remote_nodes_ready_before_component_execution()
     assert "setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);" in source
 
 
+def test_queue_failure_preserves_server_validation_detail() -> None:
+    """Synthetic ComfyUI errors should show the planner's actionable rejection."""
+    source = _modal_toggle_source()
+
+    assert "function queueErrorMessage(error)" in source
+    assert "promptError.modalQueueResponse = responsePayload;" in source
+    assert (
+        "endSyntheticExecutionUi(promptId, true, queueErrorMessage(error));"
+        in source
+    )
+    assert (
+        'failureMessage || "Modal queue request failed before prompt execution started."'
+        in source
+    )
+
+
 def test_completed_remote_nodes_clear_stale_global_status_entries() -> None:
     """The global pill should clear once a prompt has no active remote work left."""
     source = _modal_toggle_source()

@@ -1,5 +1,10 @@
 # Learnings
 
+## 2026-08-22
+
+- Current free VRAM is conservative only if the planner distinguishes unknown GPU consumers from its own idle warm workers. Compare normal placement with an optimistic total-capacity placement; recycle only the labeled idle worker selected by the cost model, then re-probe actual free memory before admission. A running worker is idle only when `docker top` shows neither an execution relay nor a model-staging process.
+- A queue route can return the planner's exact per-host rejection while ComfyUI's synthetic pre-execution error replaces it with a generic `ModalQueueError`. Preserve the response payload on `PromptExecutionError` and use its server message for both the node overlay and the synthetic `execution_error` event.
+
 ## 2026-08-21
 
 - vLLM engine shutdown can finish before CUDA free-memory accounting reflects all released allocations. A post-eviction admission check must ask ComfyUI to release memory again, empty allocator caches, and poll with a bounded deadline. If the threshold still cannot be recovered, classify the container as dirty, retire it, and retry once with a one-use worker affinity; when this follows auto eager-to-throughput promotion, carry throughput intent into the fresh worker so recovery does not silently undo the optimization.

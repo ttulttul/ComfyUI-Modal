@@ -4764,7 +4764,24 @@ function markQueueFailure(remoteNodeIds, promptId, error) {
   if (remoteNodeIds.length === 0) {
     return;
   }
-  setNodesPhase(remoteNodeIds, STATE_ERROR, promptId, String(error?.message ?? error));
+  setNodesPhase(remoteNodeIds, STATE_ERROR, promptId, queueErrorMessage(error));
+}
+
+/**
+ * Preserve an actionable server queue failure when PromptExecutionError is generic.
+ * @param {Error | any} error
+ * @returns {string}
+ */
+function queueErrorMessage(error) {
+  const responsePayload = error?.modalQueueResponse;
+  const serverError = responsePayload?.error;
+  if (typeof serverError === "string" && serverError.trim()) {
+    return serverError.trim();
+  }
+  if (typeof serverError?.message === "string" && serverError.message.trim()) {
+    return serverError.message.trim();
+  }
+  return String(error?.message ?? error);
 }
 
 /**
@@ -4823,8 +4840,9 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds, modalGpu = null) {
  * End a synthetic running state after real queue/execution events take over or the request fails.
  * @param {string} promptId
  * @param {boolean} failed
+ * @param {string | null} failureMessage
  */
-function endSyntheticExecutionUi(promptId, failed = false) {
+function endSyntheticExecutionUi(promptId, failed = false, failureMessage = null) {
   const syntheticState = syntheticPromptUiStates.get(promptId);
   if (!syntheticState) {
     return;
@@ -4848,7 +4866,8 @@ function endSyntheticExecutionUi(promptId, failed = false) {
       node_id: syntheticState.displayNode,
       node_type: "ModalRemoteComponent",
       executed: [],
-      exception_message: "Modal queue request failed before prompt execution started.",
+      exception_message:
+        failureMessage || "Modal queue request failed before prompt execution started.",
       exception_type: "ModalQueueError",
       traceback: [],
       current_inputs: [],
@@ -4963,7 +4982,10 @@ function patchQueuePrompt() {
       });
 
       if (response.status !== 200) {
-        throw new PromptExecutionError(await response.json());
+        const responsePayload = await response.json();
+        const promptError = new PromptExecutionError(responsePayload);
+        promptError.modalQueueResponse = responsePayload;
+        throw promptError;
       }
 
       const responsePayload = await response.json();
@@ -5028,7 +5050,7 @@ function patchQueuePrompt() {
       return responsePayload;
     } catch (error) {
       clearPromptQueued(promptId);
-      endSyntheticExecutionUi(promptId, true);
+      endSyntheticExecutionUi(promptId, true, queueErrorMessage(error));
       markQueueFailure(remoteNodeIds, promptId, error);
       throw error;
     }

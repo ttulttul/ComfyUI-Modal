@@ -54,6 +54,7 @@ from .execution_environments import (
     ExecutionPolicy,
     ExecutionProvider,
     GpuCapability,
+    NoCompatibleExecutionEnvironmentError,
     WorkflowExecutionPreferences,
 )
 from .execution_history import ExecutionHistory
@@ -771,6 +772,179 @@ def _execution_history(settings: ModalSyncSettings) -> ExecutionHistory | None:
     return ExecutionHistory.for_user_directory(user_directory)
 
 
+def _maximum_capacity_state(
+    environment: EnvironmentSchedulingState,
+) -> EnvironmentSchedulingState:
+    """Return an optimistic state used only to identify reclaimable SSH capacity."""
+    capabilities = environment.capabilities
+    if environment.provider is not ExecutionProvider.SSH_DOCKER or capabilities is None:
+        return environment
+    return replace(
+        environment,
+        capabilities=replace(
+            capabilities,
+            available_ram_bytes=capabilities.total_ram_bytes,
+            gpus=tuple(
+                replace(gpu, free_vram_bytes=gpu.total_vram_bytes)
+                for gpu in capabilities.gpus
+            ),
+        ),
+    )
+
+
+def _reprobe_reclaimed_ssh_host(
+    host: SshHostConfig,
+    settings: ModalSyncSettings,
+) -> SshHostConfig:
+    """Probe a reclaimed host and persist its new free-memory measurements."""
+    registry = _ssh_host_registry(settings)
+    if registry is not None:
+        return _refresh_ssh_host(host, registry)
+    try:
+        capabilities = SshDockerController(host).probe_capabilities()
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Remote environment re-probe failed after worker reclaim "
+            "environment=%s: %s",
+            host.environment_id,
+            exc,
+        )
+        return replace(
+            host,
+            health=EnvironmentHealth.UNAVAILABLE,
+            last_error=str(exc),
+        )
+    return replace(
+        host,
+        capabilities=capabilities,
+        health=EnvironmentHealth.READY,
+        last_error=None,
+    )
+
+
+def _optional_scheduler_choice(
+    scheduler: CostAwareEnvironmentScheduler,
+    environments: list[EnvironmentSchedulingState],
+    requirements: ComponentResourceRequirements,
+) -> tuple[
+    ExecutionAssignment | None,
+    NoCompatibleExecutionEnvironmentError | None,
+]:
+    """Return a scheduler choice and preserve a compatibility failure for fallback."""
+    try:
+        return scheduler.choose(environments, requirements), None
+    except NoCompatibleExecutionEnvironmentError as exc:
+        return None, exc
+
+
+def _require_scheduler_choice(
+    assignment: ExecutionAssignment | None,
+    error: NoCompatibleExecutionEnvironmentError | None,
+) -> ExecutionAssignment:
+    """Return an existing scheduler choice or raise its compatibility detail."""
+    if assignment is not None:
+        return assignment
+    if error is not None:
+        raise error
+    raise RuntimeError("Scheduler failed without an incompatibility reason.")
+
+
+def _remove_idle_ssh_workers_for_reclaim(host: SshHostConfig) -> tuple[str, ...]:
+    """Recycle idle managed workers without disrupting fallback placement."""
+    try:
+        return SshDockerController(host).remove_idle_managed_workers()
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Could not reclaim managed SSH worker capacity environment=%s: %s",
+            host.environment_id,
+            exc,
+        )
+        return ()
+
+
+def _reclaim_improves_assignment(
+    optimistic: ExecutionAssignment,
+    actual: ExecutionAssignment | None,
+    requirements: ComponentResourceRequirements,
+) -> bool:
+    """Return whether reclaim unlocks required or materially better placement."""
+    if actual is None:
+        return True
+    if optimistic.environment_id == actual.environment_id:
+        return False
+    preferred = requirements.preferred_environment_ids
+    if optimistic.environment_id in preferred:
+        if actual.environment_id not in preferred:
+            return True
+        return preferred.index(optimistic.environment_id) < preferred.index(
+            actual.environment_id
+        )
+    if optimistic.predicted_cost_usd is None:
+        return False
+    if actual.predicted_cost_usd is None:
+        return True
+    return optimistic.predicted_cost_usd < actual.predicted_cost_usd
+
+
+def _choose_with_idle_ssh_worker_reclaim(
+    *,
+    scheduler: CostAwareEnvironmentScheduler,
+    environments: list[EnvironmentSchedulingState],
+    requirements: ComponentResourceRequirements,
+    ssh_hosts_by_id: dict[str, SshHostConfig],
+    settings: ModalSyncSettings,
+) -> ExecutionAssignment:
+    """Choose an environment, recycling a cheaper idle SSH worker when necessary."""
+    actual_assignment, actual_error = _optional_scheduler_choice(
+        scheduler,
+        environments,
+        requirements,
+    )
+    optimistic_assignment, _ = _optional_scheduler_choice(
+        scheduler,
+        [_maximum_capacity_state(environment) for environment in environments],
+        requirements,
+    )
+    if optimistic_assignment is None:
+        return _require_scheduler_choice(actual_assignment, actual_error)
+
+    if (
+        optimistic_assignment.provider is not ExecutionProvider.SSH_DOCKER
+        or not _reclaim_improves_assignment(
+            optimistic_assignment,
+            actual_assignment,
+            requirements,
+        )
+    ):
+        return _require_scheduler_choice(actual_assignment, actual_error)
+
+    host = ssh_hosts_by_id.get(optimistic_assignment.environment_id)
+    if host is None:
+        return _require_scheduler_choice(actual_assignment, actual_error)
+
+    removed_workers = _remove_idle_ssh_workers_for_reclaim(host)
+    if not removed_workers:
+        return _require_scheduler_choice(actual_assignment, actual_error)
+
+    logger.info(
+        "Recycled idle managed SSH worker(s) environment=%s containers=%s so the "
+        "planner can re-evaluate full host capacity.",
+        host.environment_id,
+        removed_workers,
+    )
+    refreshed_host = _reprobe_reclaimed_ssh_host(host, settings)
+    ssh_hosts_by_id[host.environment_id] = refreshed_host
+    refreshed_environments = [
+        (
+            refreshed_host.scheduling_state()
+            if environment.environment_id == host.environment_id
+            else environment
+        )
+        for environment in environments
+    ]
+    return scheduler.choose(refreshed_environments, requirements)
+
+
 def _plan_component_execution_assignments(
     *,
     components: list[RemoteComponentPlan],
@@ -810,20 +984,30 @@ def _plan_component_execution_assignments(
             for component in components
         }
 
-    ssh_states = [host.scheduling_state() for host in _schedulable_ssh_hosts(settings)]
-    environments = list(ssh_states)
-    if preferences.policy is ExecutionPolicy.AUTOMATIC:
-        environments.append(_modal_environment_state(settings))
-    if not environments:
+    ssh_hosts = _schedulable_ssh_hosts(settings)
+    ssh_hosts_by_id = {host.environment_id: host for host in ssh_hosts}
+    modal_state = (
+        _modal_environment_state(settings)
+        if preferences.policy is ExecutionPolicy.AUTOMATIC
+        else None
+    )
+    if not ssh_hosts and modal_state is None:
         raise ModalPromptValidationError(
             "This workflow requests self-hosted execution, but no SSH Docker hosts are configured."
         )
 
     scheduler = CostAwareEnvironmentScheduler()
     history = _execution_history(settings)
-    environment_ids = [environment.environment_id for environment in environments]
     assignments: dict[str, ExecutionAssignment] = {}
     for component in components:
+        environments = [
+            host.scheduling_state() for host in ssh_hosts_by_id.values()
+        ]
+        if modal_state is not None:
+            environments.append(modal_state)
+        environment_ids = [
+            environment.environment_id for environment in environments
+        ]
         component_signature = _component_execution_signature(component, prompt)
         historical_estimates = (
             history.estimates(component_signature, environment_ids)
@@ -865,8 +1049,14 @@ def _plan_component_execution_assignments(
             ),
         )
         try:
-            assignment = scheduler.choose(environments, requirements)
-        except RuntimeError as exc:
+            assignment = _choose_with_idle_ssh_worker_reclaim(
+                scheduler=scheduler,
+                environments=environments,
+                requirements=requirements,
+                ssh_hosts_by_id=ssh_hosts_by_id,
+                settings=settings,
+            )
+        except NoCompatibleExecutionEnvironmentError as exc:
             raise ModalPromptValidationError(str(exc)) from exc
         assignments[component.representative_node_id] = assignment
         logger.info(

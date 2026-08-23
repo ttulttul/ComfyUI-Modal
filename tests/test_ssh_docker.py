@@ -12,10 +12,19 @@ import pytest
 class _FakeRunner:
     """Return deterministic results for remote capability commands."""
 
-    def __init__(self, ssh_docker_module: Any) -> None:
+    def __init__(
+        self,
+        ssh_docker_module: Any,
+        *,
+        worker_processes: tuple[str, ...] = (
+            "python -m remote.ssh_worker serve",
+            "/app/llama-server --model /storage/model.gguf",
+        ),
+    ) -> None:
         """Initialize the fake with the module's result type."""
         self.module = ssh_docker_module
         self.calls: list[tuple[tuple[str, ...], bytes | None]] = []
+        self.worker_processes = worker_processes
 
     def run(
         self,
@@ -73,6 +82,10 @@ class _FakeRunner:
             )
         elif command[:3] == ("docker", "rm", "-f"):
             stdout = f"{command[3]}\n".encode()
+        elif command[:2] == ("docker", "top"):
+            stdout = (
+                "COMMAND\n" + "\n".join(self.worker_processes) + "\n"
+            ).encode()
         elif command[:2] == ("docker", "run"):
             stdout = b""
         else:
@@ -220,3 +233,56 @@ def test_managed_worker_removal_rejects_unowned_container(
 
     with pytest.raises(ssh_docker_module.SshDockerError, match="is not managed"):
         controller.remove_managed_worker("unrelated-service")
+
+
+def test_idle_managed_worker_can_be_recycled_to_release_resident_gpu_memory(
+    ssh_docker_module: Any,
+    remote_hosts_module: Any,
+) -> None:
+    """A warm worker with only its server and resident model is reclaimable."""
+    runner = _FakeRunner(ssh_docker_module)
+    controller = ssh_docker_module.SshDockerController(
+        _host(remote_hosts_module),
+        runner=runner,
+    )
+
+    removed = controller.remove_idle_managed_workers()
+
+    assert removed == ("comfy-remote-gpu-host-deadbeef-w1",)
+    assert runner.calls[-1][0] == (
+        "docker",
+        "rm",
+        "-f",
+        "comfy-remote-gpu-host-deadbeef-w1",
+    )
+
+
+@pytest.mark.parametrize(
+    "active_process",
+    (
+        "python -m remote.ssh_worker client",
+        "python -m remote.ssh_worker stage-profiles --model-reference owner/model",
+    ),
+)
+def test_active_managed_worker_is_never_recycled(
+    ssh_docker_module: Any,
+    remote_hosts_module: Any,
+    active_process: str,
+) -> None:
+    """Execution and model-staging relay processes make a worker non-reclaimable."""
+    runner = _FakeRunner(
+        ssh_docker_module,
+        worker_processes=(
+            "python -m remote.ssh_worker serve",
+            active_process,
+        ),
+    )
+    controller = ssh_docker_module.SshDockerController(
+        _host(remote_hosts_module),
+        runner=runner,
+    )
+
+    removed = controller.remove_idle_managed_workers()
+
+    assert removed == ()
+    assert not any(call[0][:3] == ("docker", "rm", "-f") for call in runner.calls)

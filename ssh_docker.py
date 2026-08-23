@@ -25,6 +25,11 @@ DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS = 60.0
 DEFAULT_VOLUME_HELPER_IMAGE = "busybox:1.37.0"
 _MIB = 1024 * 1024
+_ACTIVE_MANAGED_WORKER_PROCESS_MARKERS = (
+    "remote.ssh_worker client",
+    "remote.ssh_worker stage-profiles",
+)
+_INACTIVE_CONTAINER_STATES = frozenset({"created", "dead", "exited"})
 
 
 class SshDockerError(RuntimeError):
@@ -284,6 +289,47 @@ class SshDockerController:
                 f"{self.host.environment_id!r}."
             )
         self.docker(("rm", "-f", normalized_name))
+
+    def managed_worker_is_idle(self, worker: SshManagedWorkerStatus) -> bool:
+        """Return whether a worker has no active execution or staging client."""
+        normalized_state = worker.state.strip().lower()
+        if normalized_state in _INACTIVE_CONTAINER_STATES:
+            return True
+        if normalized_state != "running":
+            return False
+        result = self.docker(
+            ("top", worker.container_name, "-eo", "pid,args"),
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Could not inspect managed SSH worker activity environment=%s "
+                "container=%s: %s",
+                self.host.environment_id,
+                worker.container_name,
+                result.stderr_text.strip() or "docker top failed",
+            )
+            return False
+        process_rows = tuple(
+            line.strip().lower()
+            for line in result.stdout_text.splitlines()[1:]
+            if line.strip()
+        )
+        return not any(
+            marker in process_row
+            for process_row in process_rows
+            for marker in _ACTIVE_MANAGED_WORKER_PROCESS_MARKERS
+        )
+
+    def remove_idle_managed_workers(self) -> tuple[str, ...]:
+        """Remove managed workers that are currently safe to recycle for capacity."""
+        removed_names: list[str] = []
+        for worker in self.list_managed_workers():
+            if not self.managed_worker_is_idle(worker):
+                continue
+            self.docker(("rm", "-f", worker.container_name))
+            removed_names.append(worker.container_name)
+        return tuple(removed_names)
 
     def docker(
         self,
