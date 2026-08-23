@@ -3679,6 +3679,9 @@ def _emit_local_modal_progress(
     time_to_first_token_seconds: float | None = None,
     tokens_per_second: float | None = None,
     pre_gpu: bool = False,
+    execution_provider: str | None = None,
+    execution_environment_id: str | None = None,
+    execution_location: str | None = None,
 ) -> None:
     """Forward remote numeric and stage progress into the local websocket stream."""
     if client_id is None:
@@ -3730,6 +3733,12 @@ def _emit_local_modal_progress(
         payload["tokens_per_second"] = float(tokens_per_second)
     if pre_gpu:
         payload["pre_gpu"] = True
+    if execution_provider:
+        payload["execution_provider"] = execution_provider
+    if execution_environment_id:
+        payload["execution_environment_id"] = execution_environment_id
+    if execution_location:
+        payload["execution_location"] = execution_location
     _record_local_modal_ui_event("modal_progress", payload, client_id)
     prompt_server.send_sync("modal_progress", payload, client_id)
 
@@ -4435,6 +4444,7 @@ def _consume_remote_payload_stream(
     suppress_status_stream = bool(payload.get("suppress_status_stream"))
     result_payload: bytes | bytearray | None = None
     suppressed_progress_node_metadata: dict[str, dict[str, str | None]] = {}
+    active_remote_task_id: str | None = None
     active_remote_log_task_id: str | None = None
     should_close_stream = False
     component_id = str(payload.get("component_id") or "payload")
@@ -4466,6 +4476,8 @@ def _consume_remote_payload_stream(
             event_kind = str(stream_event.get("kind", ""))
             if event_kind == "remote_logs":
                 task_id = _coerce_modal_task_id(stream_event.get("task_id"))
+                if task_id is not None and active_remote_task_id is None:
+                    active_remote_task_id = task_id
                 if (
                     task_id is not None
                     and active_remote_log_task_id is None
@@ -4577,6 +4589,27 @@ def _consume_remote_payload_stream(
                             ),
                             "aggregate_only": aggregate_only,
                         }
+                        raw_execution_provider = payload.get("execution_provider")
+                        execution_provider = str(
+                            raw_execution_provider
+                            or ("modal" if active_remote_task_id else "")
+                        ).strip()
+                        execution_environment_id = str(
+                            payload.get("execution_environment_id") or ""
+                        ).strip()
+                        execution_location = (
+                            active_remote_task_id
+                            if execution_provider == "modal" and active_remote_task_id
+                            else str(payload.get("execution_location") or "").strip()
+                        )
+                        if execution_provider:
+                            progress_kwargs["execution_provider"] = execution_provider
+                        if execution_environment_id:
+                            progress_kwargs[
+                                "execution_environment_id"
+                            ] = execution_environment_id
+                        if execution_location:
+                            progress_kwargs["execution_location"] = execution_location
                         for string_field in ("stage", "message", "unit"):
                             if stream_event.get(string_field) is not None:
                                 progress_kwargs[string_field] = str(

@@ -13,6 +13,14 @@ from typing import Any
 import pytest
 
 
+def test_ssh_hostname_extracts_safe_runtime_badge_label(
+    api_intercept_module: Any,
+) -> None:
+    """Planner UI metadata should show the host rather than an SSH user target."""
+    assert api_intercept_module._ssh_hostname("worker@example.internal") == "example.internal"
+    assert api_intercept_module._ssh_hostname("[2001:db8::17]") == "2001:db8::17"
+
+
 class _FakeRemoteModelNode:
     """Fake node that produces a non-transportable MODEL output."""
 

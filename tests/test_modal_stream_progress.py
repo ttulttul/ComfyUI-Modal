@@ -196,3 +196,43 @@ def test_llm_stream_progress_preserves_stage_and_token_metrics(
             "tokens_per_second": 9.75,
         }
     ]
+
+
+def test_stream_progress_reports_exact_modal_container_identity(monkeypatch: Any) -> None:
+    """A Modal task id should follow its component progress into the node badge."""
+    modal_app = _load_modal_app_module()
+    emitted_progress: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        modal_app,
+        "_emit_local_modal_progress",
+        lambda **kwargs: emitted_progress.append(kwargs),
+    )
+    payload = {
+        "prompt_id": "prompt-location",
+        "component_id": "node-162",
+        "component_node_ids": ["node-162"],
+        "execution_provider": "modal",
+        "execution_environment_id": "modal:B300",
+        "extra_data": {"client_id": "client-1"},
+    }
+
+    modal_app._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {"kind": "remote_logs", "task_id": "ta-01K3MODAL"},
+                {
+                    "kind": "progress",
+                    "event_type": "node_progress",
+                    "node_id": "node-162",
+                    "value": 1,
+                    "max": 8,
+                },
+                {"kind": "result", "outputs": ["done"]},
+            ]
+        ),
+    )
+
+    assert emitted_progress[0]["execution_provider"] == "modal"
+    assert emitted_progress[0]["execution_environment_id"] == "modal:B300"
+    assert emitted_progress[0]["execution_location"] == "ta-01K3MODAL"
