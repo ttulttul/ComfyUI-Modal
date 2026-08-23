@@ -417,6 +417,22 @@ def test_streamed_modal_node_progress_updates_active_overlay() -> None:
     assert "function fadeNodeProgress(nodeIdValue, promptId)" in source
     assert "function progressVisualOpacity(progressState)" in source
     assert 'api.addEventListener("modal_progress", handleModalProgress);' in source
+
+
+def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
+    """Mixed planner assignments should add provider identity beneath progress bars."""
+    source = _modal_toggle_source()
+
+    assert "function registerPromptExecutionAssignments(promptId, assignments)" in source
+    assert "promptState.scheduledEnvironmentCount = environmentIds.size;" in source
+    assert "updateNodeExecutionLocation(promptId, progressNodeId, detail);" in source
+    assert "updateNodeExecutionLocation(promptId, nextActiveNodeId, detail);" in source
+    assert "function drawRemoteExecutionLocation(" in source
+    assert "function updateVueExecutionLocation(decoration, state)" in source
+    assert 'text-overflow: ellipsis;' in source
+    assert "Number(state?.scheduledEnvironmentCount ?? 0) > 1" in source
+    assert "fitCanvasText(ctx, label, availableTextWidth)" in source
+    assert "REMOTE_LOCATION_ICON_SOURCES" in source
     assert "function handleModalProgress(event)" in source
     assert "if (detail.aggregate_only) {" in source
     assert "setNodeBatchProgress(" in source

@@ -56,6 +56,14 @@ const FINALIZING_NODE_BORDER_COLOR = "#00358A";
 const ERROR_BORDER_COLOR = "#ef4444";
 const LOCAL_BOTTLENECK_BADGE_BORDER_COLOR = "rgba(148, 163, 184, 0.72)";
 const LOCAL_BOTTLENECK_TOOLTIP = "Did you mean to make this node execute on Modal?";
+const REMOTE_LOCATION_ICON_SOURCES = {
+  modal: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 368 192"><path fill="#34D058" d="M0 128 73 0l37 64-73 128z"/><path fill="#00B75A" d="m110 64 74 0-74 128H37z"/><path fill="#8AEF74" d="M73 0h74l37 64h-74z"/><path fill="#34D058" d="M184 64 220 0l74 128-37 64z"/><path fill="#A7F59A" d="M220 0h74l74 128h-74z"/><path fill="#00B75A" d="m294 128h74l-37 64h-74z"/></svg>',
+  )}`,
+  ssh_docker: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 73 73"><rect x="1" y="1" width="71" height="71" rx="14" fill="#fff" stroke="#000" stroke-width="2"/><path d="M60.24 17.02H12.66A1.66 1.66 0 0 0 11 18.68v8.26h50.9v-8.26a1.66 1.66 0 0 0-1.66-1.66Zm-17.2 7.18a2.21 2.21 0 1 1 0-4.43 2.21 2.21 0 0 1 0 4.43Zm6.03 0a2.21 2.21 0 1 1 0-4.43 2.21 2.21 0 0 1 0 4.43Zm6.03 0a2.21 2.21 0 1 1 0-4.43 2.21 2.21 0 0 1 0 4.43ZM11 30.26v23.83c0 .92.74 1.66 1.66 1.66h47.58c.92 0 1.66-.74 1.66-1.66V30.26H11Zm23.41 14.01-5.44 4.62a1.66 1.66 0 0 1-2.15-2.53l3.95-3.35-3.95-3.36a1.66 1.66 0 1 1 2.15-2.53l5.44 4.62a1.66 1.66 0 0 1 0 2.53ZM45 49.29h-6.55a1.66 1.66 0 1 1 0-3.32H45a1.66 1.66 0 1 1 0 3.32Z"/></svg>',
+  )}`,
+};
 
 const STATE_SETUP = "setup";
 const STATE_STARTING = "starting";
@@ -92,6 +100,7 @@ const modalSandwichedLocalNodeIds = new Set();
 const modalRemoteDescendantNodeIdsByAncestor = new Map();
 const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
+const remoteLocationIconImages = new Map();
 
 let animationFrameHandle = null;
 let modalLastAnimationRedrawAt = 0;
@@ -294,6 +303,27 @@ function fitCanvasText(ctx, text, maxWidth) {
     end -= 1;
   }
   return `${safeText.slice(0, end)}…`;
+}
+
+/**
+ * Return a lazily loaded provider icon for the canvas location line.
+ * @param {string | null | undefined} provider
+ * @returns {HTMLImageElement | null}
+ */
+function remoteLocationIcon(provider) {
+  const safeProvider = String(provider ?? "");
+  const source = REMOTE_LOCATION_ICON_SOURCES[safeProvider];
+  if (!source || typeof Image !== "function") {
+    return null;
+  }
+  if (!remoteLocationIconImages.has(safeProvider)) {
+    const icon = new Image();
+    icon.decoding = "async";
+    icon.src = source;
+    icon.addEventListener?.("load", refreshNodeDecorations, { once: true });
+    remoteLocationIconImages.set(safeProvider, icon);
+  }
+  return remoteLocationIconImages.get(safeProvider) ?? null;
 }
 
 /**
@@ -1755,7 +1785,7 @@ function refreshModalUiAfterVisibilityChange() {
 /**
  * Return the prompt metadata bucket, creating it if needed.
  * @param {string} promptId
- * @returns {{ startedAt: number, modalGpu: string | null, executionLabel: string | null, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, componentLabelByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
+ * @returns {{ startedAt: number, modalGpu: string | null, executionLabel: string | null, scheduledEnvironmentCount: number, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, componentLabelByMember: Map<string, string>, executionAssignmentsByRepresentative: Map<string, object>, executionAssignmentByMember: Map<string, object>, laneNodeIdsByLane: Map<string, string> }}
  */
 function ensurePromptState(promptId) {
   if (isPromptTerminal(promptId)) {
@@ -1767,11 +1797,14 @@ function ensurePromptState(promptId) {
       startedAt,
       modalGpu: null,
       executionLabel: null,
+      scheduledEnvironmentCount: 0,
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
       componentNodeIdsByMember: new Map(),
       representativeNodeIdByMember: new Map(),
       componentLabelByMember: new Map(),
+      executionAssignmentsByRepresentative: new Map(),
+      executionAssignmentByMember: new Map(),
       descendantNodeIdsByAncestor: new Map(),
       laneNodeIdsByLane: new Map(),
       activeNodeId: null,
@@ -2092,6 +2125,82 @@ function registerPromptComponents(promptId, remoteNodeIds, components) {
     }
     rebuildPromptAncestorMap(promptState);
   }
+}
+
+/**
+ * Store planner assignments by both representative and visible member node.
+ * @param {string} promptId
+ * @param {Record<string, Record<string, any>>} assignments
+ */
+function registerPromptExecutionAssignments(promptId, assignments) {
+  const promptState = ensurePromptState(promptId);
+  if (!promptState) {
+    return;
+  }
+  promptState.executionAssignmentsByRepresentative.clear();
+  promptState.executionAssignmentByMember.clear();
+  const environmentIds = new Set();
+
+  for (const [representativeNodeIdValue, rawAssignment] of Object.entries(assignments ?? {})) {
+    if (!rawAssignment || typeof rawAssignment !== "object") {
+      continue;
+    }
+    const representativeNodeId = String(representativeNodeIdValue);
+    const environmentId = String(rawAssignment.environment_id ?? "").trim();
+    const assignment = {
+      provider: String(rawAssignment.provider ?? "modal"),
+      environmentId,
+      location: String(rawAssignment.execution_location ?? "").trim() || null,
+    };
+    if (environmentId) {
+      environmentIds.add(environmentId);
+    }
+    promptState.executionAssignmentsByRepresentative.set(representativeNodeId, assignment);
+    const assignedNodeIds = Array.isArray(rawAssignment.node_ids) && rawAssignment.node_ids.length > 0
+      ? rawAssignment.node_ids.map((nodeIdValue) => String(nodeIdValue))
+      : (promptState.componentNodeIdsByMember.get(representativeNodeId) ?? [representativeNodeId]);
+    for (const assignedNodeId of assignedNodeIds) {
+      promptState.executionAssignmentByMember.set(assignedNodeId, assignment);
+    }
+    promptState.executionAssignmentByMember.set(representativeNodeId, assignment);
+  }
+  promptState.scheduledEnvironmentCount = environmentIds.size;
+}
+
+/**
+ * Update one component's runtime identity from its streamed progress metadata.
+ * @param {string} promptId
+ * @param {string} nodeIdValue
+ * @param {Record<string, any>} metadata
+ */
+function updateNodeExecutionLocation(promptId, nodeIdValue, metadata) {
+  const promptState = modalPromptStates.get(promptId);
+  const location = String(metadata.execution_location ?? "").trim();
+  if (!promptState || !location) {
+    return;
+  }
+  const safeNodeIdValue = String(nodeIdValue);
+  const representativeNodeId =
+    promptState.representativeNodeIdByMember.get(safeNodeIdValue) ?? safeNodeIdValue;
+  const existingAssignment =
+    promptState.executionAssignmentByMember.get(safeNodeIdValue) ??
+    promptState.executionAssignmentsByRepresentative.get(representativeNodeId) ??
+    {};
+  const assignment = {
+    ...existingAssignment,
+    provider: String(metadata.execution_provider ?? existingAssignment.provider ?? "modal"),
+    environmentId: String(
+      metadata.execution_environment_id ?? existingAssignment.environmentId ?? "",
+    ),
+    location,
+  };
+  promptState.executionAssignmentsByRepresentative.set(representativeNodeId, assignment);
+  const componentNodeIds =
+    promptState.componentNodeIdsByMember.get(safeNodeIdValue) ?? [safeNodeIdValue];
+  for (const componentNodeId of componentNodeIds) {
+    promptState.executionAssignmentByMember.set(String(componentNodeId), assignment);
+  }
+  promptState.executionAssignmentByMember.set(representativeNodeId, assignment);
 }
 
 /**
@@ -3490,6 +3599,8 @@ function getRemoteVisualState(node) {
   const cachedState = nodeCachedState(visualNodeId, state.promptId);
   const batchProgressState = modalNodeBatchProgress.get(visualNodeId) ?? null;
   const hasLiveProgress = hasLiveNodeProgress(visualNodeId, state.promptId);
+  const executionAssignment =
+    promptState?.executionAssignmentByMember.get(visualNodeId) ?? null;
   return {
     ...state,
     phase: deriveRemoteNodePhase(state.phase, hasLiveProgress),
@@ -3503,6 +3614,13 @@ function getRemoteVisualState(node) {
     progress: progressState,
     batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,
     progressLanes,
+    scheduledEnvironmentCount: promptState?.scheduledEnvironmentCount ?? 0,
+    executionLocation: executionAssignment?.location
+      ? {
+          provider: executionAssignment.provider,
+          label: executionAssignment.location,
+        }
+      : null,
   };
 }
 
@@ -3740,17 +3858,70 @@ function remoteContainerTooltip(state) {
  */
 function ensureVueNodeDecoration(nodeElement) {
   let decoration = nodeElement.querySelector(":scope > .comfy-modal-vue-node-decoration");
-  if (decoration) {
+  if (!decoration) {
+    decoration = document.createElement("div");
+    decoration.className = "comfy-modal-vue-node-decoration";
+    decoration.setAttribute("aria-hidden", "true");
+    const badge = document.createElement("span");
+    badge.className = "comfy-modal-vue-node-badge";
+    decoration.appendChild(badge);
+    nodeElement.appendChild(decoration);
+  }
+  if (decoration.querySelector(".comfy-modal-vue-execution-location")) {
     return decoration;
   }
-  decoration = document.createElement("div");
-  decoration.className = "comfy-modal-vue-node-decoration";
-  decoration.setAttribute("aria-hidden", "true");
-  const badge = document.createElement("span");
-  badge.className = "comfy-modal-vue-node-badge";
-  decoration.appendChild(badge);
-  nodeElement.appendChild(decoration);
+  const executionLocation = document.createElement("div");
+  executionLocation.className = "comfy-modal-vue-execution-location";
+  executionLocation.hidden = true;
+  const executionLocationIcon = document.createElement("img");
+  executionLocationIcon.className = "comfy-modal-vue-execution-location-icon";
+  executionLocationIcon.alt = "";
+  executionLocationIcon.setAttribute("aria-hidden", "true");
+  const executionLocationLabel = document.createElement("span");
+  executionLocationLabel.className = "comfy-modal-vue-execution-location-label";
+  executionLocation.append(executionLocationIcon, executionLocationLabel);
+  decoration.appendChild(executionLocation);
   return decoration;
+}
+
+/**
+ * Update the execution-location badge rendered by the Nodes 2.0 DOM layer.
+ * @param {HTMLDivElement} decoration
+ * @param {Record<string, any> | null} state
+ */
+function updateVueExecutionLocation(decoration, state) {
+  const executionLocation = decoration.querySelector(
+    ".comfy-modal-vue-execution-location",
+  );
+  if (!executionLocation) {
+    return;
+  }
+  const location =
+    Number(state?.scheduledEnvironmentCount ?? 0) > 1 &&
+    (state?.isActiveRemoteNode || state?.isActiveComponentMember)
+      ? state?.executionLocation
+      : null;
+  const label = String(location?.label ?? "");
+  const provider = String(location?.provider ?? "");
+  const iconSource = REMOTE_LOCATION_ICON_SOURCES[provider] ?? "";
+  executionLocation.hidden = !label;
+  if (!label) {
+    executionLocation.removeAttribute("title");
+    return;
+  }
+  executionLocation.dataset.provider = provider;
+  executionLocation.title = label;
+  const icon = executionLocation.querySelector(".comfy-modal-vue-execution-location-icon");
+  const labelElement = executionLocation.querySelector(".comfy-modal-vue-execution-location-label");
+  if (icon) {
+    icon.hidden = !iconSource;
+    if (iconSource && icon.getAttribute("src") !== iconSource) {
+      icon.setAttribute("src", iconSource);
+    }
+  }
+  if (labelElement) {
+    labelElement.textContent = label;
+  }
 }
 
 /**
@@ -3798,6 +3969,7 @@ function updateVueNodeDecoration(nodeElement, node, timestamp) {
     ? LOCAL_BOTTLENECK_BADGE_BORDER_COLOR
     : palette.borderColor;
   badge.style.boxShadow = localBottleneck ? "none" : `0 0 8px ${palette.shadowColor}`;
+  updateVueExecutionLocation(decoration, state);
 }
 
 /**
@@ -3940,6 +4112,51 @@ function updateLegacyModalTooltip(graphCanvas, tooltip) {
 }
 
 /**
+ * Draw a clipped provider icon and runtime identity beneath node progress bars.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {{ provider?: string, label?: string }} location
+ * @param {number} rowY
+ * @param {number} rowHeight
+ * @param {number} nodeWidth
+ * @param {number} paddingX
+ * @param {number} scale
+ */
+function drawRemoteExecutionLocation(
+  ctx,
+  location,
+  rowY,
+  rowHeight,
+  nodeWidth,
+  paddingX,
+  scale,
+) {
+  const provider = String(location?.provider ?? "");
+  const label = String(location?.label ?? "");
+  if (!label) {
+    return;
+  }
+  const icon = remoteLocationIcon(provider);
+  const iconHeight = 10 / scale;
+  const iconWidth = (provider === "modal" ? 19 : 10) / scale;
+  const iconX = paddingX;
+  const iconY = rowY + (rowHeight - iconHeight) / 2;
+  if (icon?.complete && Number(icon.naturalWidth) > 0 && typeof ctx.drawImage === "function") {
+    ctx.drawImage(icon, iconX, iconY, iconWidth, iconHeight);
+  }
+  const textX = iconX + iconWidth + 5 / scale;
+  const availableTextWidth = Math.max(0, nodeWidth - paddingX - textX);
+  ctx.fillStyle = "#cbd5e1";
+  ctx.font = `${Math.max(8 / scale, 6.5)}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(
+    fitCanvasText(ctx, label, availableTextWidth),
+    textX,
+    rowY + rowHeight / 2,
+  );
+}
+
+/**
  * Draw the Modal execution decoration or neutral local-bottleneck badge for a node.
  * @param {LGraphNode} node
  * @param {CanvasRenderingContext2D} ctx
@@ -4065,13 +4282,25 @@ function drawModalNodeDecoration(node, ctx) {
   const visibleLaneProgress = hasLaneProgress ? visibleActiveProgressLanes : setupProgressLanes;
   const hasVisibleLaneProgress = visibleLaneProgress.length > 0;
   const hasIterationRateLabels = hasAggregateProgress || hasLaneProgress;
+  const executionLocation =
+    Number(state?.scheduledEnvironmentCount ?? 0) > 1 ? state?.executionLocation : null;
+  const hasExecutionLocation = Boolean(executionLocation?.label);
   const progressBarWidth = barWidth;
   const laneBlockHeight = hasVisibleLaneProgress
     ? visibleLaneProgress.length * laneHeight + (visibleLaneProgress.length - 1) * laneGap
     : 0;
-  const bodyHeight =
+  const progressBodyHeight =
     (hasVisibleLaneProgress ? laneBlockHeight + laneGap : 0) + (hasAggregateProgress ? aggregateHeight : 0);
-  const panelHeight = panelPaddingY * 2 + headerHeight + bodyHeight;
+  const progressTopGap = progressBodyHeight > 0 ? laneGap : 0;
+  const locationRowHeight = 13 / scale;
+  const locationTopGap = hasExecutionLocation ? 5 / scale : 0;
+  const panelHeight =
+    panelPaddingY * 2 +
+    headerHeight +
+    progressTopGap +
+    progressBodyHeight +
+    locationTopGap +
+    (hasExecutionLocation ? locationRowHeight : 0);
   const laneColors = [
     "rgba(196, 181, 253, 0.94)",
     "rgba(147, 197, 253, 0.94)",
@@ -4154,7 +4383,7 @@ function drawModalNodeDecoration(node, ctx) {
     ctx.fillText(badgeText, badgeX + badgeWidth / 2, badgeY + badgeHeight / 2);
   }
 
-  const barY = panelY + panelPaddingY + headerHeight + laneGap;
+  const barY = panelY + panelPaddingY + headerHeight + progressTopGap;
 
   if (hasIterationRateLabels) {
     ctx.font = `${Math.max(9 / scale, 7)}px ui-sans-serif, system-ui, sans-serif`;
@@ -4217,6 +4446,24 @@ function drawModalNodeDecoration(node, ctx) {
       aggregateHeight,
       scale,
       state.progress.unit,
+    );
+  }
+  if (hasExecutionLocation) {
+    const locationY =
+      panelY +
+      panelPaddingY +
+      headerHeight +
+      progressTopGap +
+      progressBodyHeight +
+      locationTopGap;
+    drawRemoteExecutionLocation(
+      ctx,
+      executionLocation,
+      locationY,
+      locationRowHeight,
+      node.size[0],
+      panelPaddingX,
+      scale,
     );
   }
   ctx.restore();
@@ -4452,6 +4699,7 @@ function handleModalStatus(event) {
       nextActiveNodeId,
     );
     if (nextActiveNodeId) {
+      updateNodeExecutionLocation(promptId, nextActiveNodeId, detail);
       setNodesPhase([nextActiveNodeId], STATE_ACTIVE, promptId);
     }
     setPromptActiveNode(promptId, nextActiveNodeId);
@@ -4513,6 +4761,7 @@ function handleModalProgress(event) {
   if (!detail.cached_hit && !detail.pre_gpu) {
     promptState.hasRemoteExecutionStarted = true;
   }
+  updateNodeExecutionLocation(promptId, progressNodeId, detail);
   const componentNodeIds = resolveComponentNodeIds(promptId, progressNodeId);
   const readyNodeIds = (componentNodeIds ?? []).filter((nodeIdValue) => nodeIdValue !== progressNodeId);
   promptState.hasStreamedProgress = true;
@@ -4999,9 +5248,9 @@ function patchQueuePrompt() {
         const acceptedModalGpu = MODAL_GPU_TYPES.includes(responsePayload.modal_gpu)
           ? responsePayload.modal_gpu
           : modalGpu;
-        const executionAssignments = Object.values(
-          responsePayload.remote_execution_assignments ?? {},
-        );
+        const executionAssignmentsByRepresentative =
+          responsePayload.remote_execution_assignments ?? {};
+        const executionAssignments = Object.values(executionAssignmentsByRepresentative);
         const usesSshExecution = executionAssignments.some(
           (assignment) => assignment?.provider === "ssh_docker",
         );
@@ -5023,6 +5272,7 @@ function patchQueuePrompt() {
         if (resolvedRemoteNodeIds.length > 0 || resolvedComponents.length > 0) {
           registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);
         }
+        registerPromptExecutionAssignments(promptId, executionAssignmentsByRepresentative);
         const promptState = ensurePromptState(promptId);
         if (!promptState) {
           return responsePayload;
@@ -5193,6 +5443,56 @@ function installGlobalStatusStyles() {
 
     .comfy-modal-vue-node-badge[hidden] {
       display: none;
+    }
+
+    .comfy-modal-vue-execution-location {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 6px;
+      right: 6px;
+      display: flex;
+      min-width: 0;
+      height: 24px;
+      align-items: center;
+      gap: 6px;
+      box-sizing: border-box;
+      overflow: hidden;
+      padding: 5px 7px;
+      border: 1px solid rgba(148, 163, 184, 0.34);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.94);
+      box-shadow: 0 3px 10px rgba(2, 6, 23, 0.42);
+      color: #cbd5e1;
+      font: 500 10px/1 ui-sans-serif, system-ui, sans-serif;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    .comfy-modal-vue-execution-location[hidden] {
+      display: none;
+    }
+
+    .comfy-modal-vue-execution-location-icon {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 auto;
+      object-fit: contain;
+    }
+
+    .comfy-modal-vue-execution-location[data-provider="modal"]
+      .comfy-modal-vue-execution-location-icon {
+      width: 22px;
+    }
+
+    .comfy-modal-vue-execution-location-icon[hidden] {
+      display: none;
+    }
+
+    .comfy-modal-vue-execution-location-label {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
   `;
   document.head.appendChild(style);

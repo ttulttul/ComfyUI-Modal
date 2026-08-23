@@ -1097,11 +1097,14 @@ def _stamp_execution_assignment(
     assignment: ExecutionAssignment,
     worker_index: int = 0,
     execution_history_signature: str | None = None,
+    execution_location: str | None = None,
 ) -> None:
     """Attach provider placement to a payload and every nested proxy phase."""
     payload["execution_provider"] = assignment.provider.value
     payload["execution_environment_id"] = assignment.environment_id
     payload["execution_worker_index"] = worker_index
+    if execution_location:
+        payload["execution_location"] = execution_location
     if execution_history_signature:
         payload["execution_history_signature"] = execution_history_signature
     split_payloads = payload.get("split_proxy_payloads")
@@ -1124,7 +1127,27 @@ def _stamp_execution_assignment(
             assignment,
             worker_index,
             execution_history_signature,
+            execution_location,
         )
+
+
+def _ssh_hostname(ssh_target: str) -> str:
+    """Return the host portion of one validated OpenSSH destination."""
+    host = ssh_target.rsplit("@", 1)[-1].strip()
+    if host.startswith("[") and "]" in host:
+        return host[1 : host.index("]")]
+    return host
+
+
+def _execution_location_for_assignment(
+    assignment: ExecutionAssignment,
+    ssh_hosts_by_id: Mapping[str, SshHostConfig],
+) -> str | None:
+    """Return the runtime location label known before remote dispatch."""
+    if assignment.provider is ExecutionProvider.MODAL:
+        return None
+    host = ssh_hosts_by_id.get(assignment.environment_id)
+    return _ssh_hostname(host.ssh_target) if host is not None else assignment.environment_id
 
 
 def _ensure_remote_sync_backend(
@@ -6216,6 +6239,7 @@ def rewrite_prompt_for_modal(
                 0,
             ),
             _component_execution_signature(component, prompt),
+            _execution_location_for_assignment(assignment, ssh_hosts_by_id),
         )
         implicitly_mapped_output_sources = _implicitly_mapped_boundary_output_sources(
             component=component,
@@ -6233,6 +6257,14 @@ def rewrite_prompt_for_modal(
             payload=payload,
             nodes_module=resolved_nodes_module,
         )
+        for proxy_node_id in proxy_node_ids:
+            summary.execution_assignments_by_representative[proxy_node_id] = assignment
+            summary.execution_worker_indices_by_representative[proxy_node_id] = (
+                summary.execution_worker_indices_by_representative.get(
+                    component.representative_node_id,
+                    0,
+                )
+            )
         split_proxy_payloads = payload.get("split_proxy_payloads")
         if isinstance(split_proxy_payloads, dict):
             static_proxy_node_id, mapped_proxy_node_id = proxy_node_ids
@@ -6372,6 +6404,39 @@ async def rewrite_prompt_for_modal_async(
         extra_data=extra_data,
         status_callback=status_callback,
     )
+
+
+def _execution_assignments_payload(
+    summary: RewriteSummary,
+    settings: ModalSyncSettings,
+) -> dict[str, dict[str, Any]]:
+    """Return planner assignments with member nodes and safe runtime labels."""
+    ssh_hosts_by_id = {
+        host.environment_id: host for host in _configured_ssh_hosts(settings)
+    }
+    return {
+        component_id: {
+            "provider": assignment.provider.value,
+            "environment_id": assignment.environment_id,
+            "execution_location": _execution_location_for_assignment(
+                assignment,
+                ssh_hosts_by_id,
+            ),
+            "node_ids": list(
+                summary.component_node_ids_by_representative.get(component_id, [])
+            ),
+            "predicted_cost_usd": assignment.predicted_cost_usd,
+            "predicted_completion_seconds": assignment.predicted_completion_seconds,
+            "worker_index": summary.execution_worker_indices_by_representative.get(
+                component_id,
+                0,
+            ),
+            "reasons": list(assignment.reasons),
+        }
+        for component_id, assignment in sorted(
+            summary.execution_assignments_by_representative.items()
+        )
+    }
 
 
 async def _queue_prompt_json(
@@ -7206,24 +7271,10 @@ def setup_modal_queue_route(
                     asset.remote_path for asset in summary.synced_assets
                 ]
                 json_data["extra_data"]["remote_execution"] = {
-                    "assignments": {
-                        component_id: {
-                            "provider": assignment.provider.value,
-                            "environment_id": assignment.environment_id,
-                            "predicted_cost_usd": assignment.predicted_cost_usd,
-                            "predicted_completion_seconds": (
-                                assignment.predicted_completion_seconds
-                            ),
-                            "worker_index": summary.execution_worker_indices_by_representative.get(
-                                component_id,
-                                0,
-                            ),
-                            "reasons": list(assignment.reasons),
-                        }
-                        for component_id, assignment in sorted(
-                            summary.execution_assignments_by_representative.items()
-                        )
-                    }
+                    "assignments": _execution_assignments_payload(
+                        summary,
+                        request_settings,
+                    )
                 }
                 if summary.custom_nodes_bundle is not None:
                     json_data["extra_data"]["modal"][
@@ -7252,24 +7303,10 @@ def setup_modal_queue_route(
                         "modal_parallel_local_branch_node_ids": list(
                             summary.parallel_local_branch_node_ids
                         ),
-                        "remote_execution_assignments": {
-                            component_id: {
-                                "provider": assignment.provider.value,
-                                "environment_id": assignment.environment_id,
-                                "predicted_cost_usd": assignment.predicted_cost_usd,
-                                "predicted_completion_seconds": (
-                                    assignment.predicted_completion_seconds
-                                ),
-                                "worker_index": summary.execution_worker_indices_by_representative.get(
-                                    component_id,
-                                    0,
-                                ),
-                                "reasons": list(assignment.reasons),
-                            }
-                            for component_id, assignment in sorted(
-                                summary.execution_assignments_by_representative.items()
-                            )
-                        },
+                        "remote_execution_assignments": _execution_assignments_payload(
+                            summary,
+                            request_settings,
+                        ),
                         "modal_components": [
                             {
                                 "representative_node_id": representative_node_id,

@@ -42,6 +42,7 @@ const transformedSource = `${[
   "globalThis.__modalToggleExports = {",
   "  ensurePromptState,",
   "  registerPromptComponents,",
+  "  registerPromptExecutionAssignments,",
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
   "  handleModalStatus,",
@@ -69,6 +70,7 @@ const transformedSource = `${[
   "  hasRemoteDescendants,",
   "  remoteContainerTooltip,",
   "  drawModalNodeDecoration,",
+  "  updateVueExecutionLocation,",
   "  currentGlobalStatus,",
   "  formatIterationRate,",
   "  fadeNodeProgress,",
@@ -212,6 +214,170 @@ const progressCanvasContext = {
 };
 assert.doesNotThrow(() => remoteProgressNode.onDrawForeground(progressCanvasContext));
 assert.match(progressPanelStrokeStyles.at(-1), /^rgba\(168, 85, 247, 0\.44/);
+
+resetFrontendState();
+const mixedLocationNode = {
+  id: 177,
+  comfyClass: "KSampler",
+  properties: { is_modal_remote: true },
+  size: [132, 80],
+};
+modalToggle.registerPromptComponents("prompt-mixed-location", ["177", "178"], [
+  { representative_node_id: "177", node_ids: ["177"] },
+  { representative_node_id: "178", node_ids: ["178"] },
+]);
+modalToggle.registerPromptExecutionAssignments("prompt-mixed-location", {
+  "177": {
+    provider: "modal",
+    environment_id: "modal:B300",
+    node_ids: ["177"],
+  },
+  "178": {
+    provider: "ssh_docker",
+    environment_id: "spark-one",
+    execution_location: "spark-one.internal.example",
+    node_ids: ["178"],
+  },
+});
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-mixed-location",
+    node_id: "177",
+    value: 2,
+    max: 10,
+    execution_provider: "modal",
+    execution_environment_id: "modal:B300",
+    execution_location: "ta-01K3M0DALCONTAINERIDENTITY",
+  },
+});
+const mixedLocationState = modalToggle.getRemoteVisualState(mixedLocationNode);
+assert.equal(mixedLocationState?.scheduledEnvironmentCount, 2);
+assert.deepEqual(mixedLocationState?.executionLocation, {
+  provider: "modal",
+  label: "ta-01K3M0DALCONTAINERIDENTITY",
+});
+const vueLocationIcon = {
+  hidden: true,
+  attributes: new Map(),
+  getAttribute(name) {
+    return this.attributes.get(name) ?? null;
+  },
+  setAttribute(name, value) {
+    this.attributes.set(name, value);
+  },
+};
+const vueLocationLabel = { textContent: "" };
+const vueLocationElement = {
+  hidden: true,
+  dataset: {},
+  title: "",
+  removeAttribute(name) {
+    if (name === "title") {
+      this.title = "";
+    }
+  },
+  querySelector(selector) {
+    if (selector === ".comfy-modal-vue-execution-location-icon") {
+      return vueLocationIcon;
+    }
+    if (selector === ".comfy-modal-vue-execution-location-label") {
+      return vueLocationLabel;
+    }
+    return null;
+  },
+};
+const vueLocationDecoration = {
+  querySelector(selector) {
+    return selector === ".comfy-modal-vue-execution-location"
+      ? vueLocationElement
+      : null;
+  },
+};
+modalToggle.updateVueExecutionLocation(vueLocationDecoration, mixedLocationState);
+assert.equal(vueLocationElement.hidden, false);
+assert.equal(vueLocationElement.dataset.provider, "modal");
+assert.equal(vueLocationElement.title, "ta-01K3M0DALCONTAINERIDENTITY");
+assert.equal(vueLocationLabel.textContent, "ta-01K3M0DALCONTAINERIDENTITY");
+assert.match(vueLocationIcon.getAttribute("src"), /^data:image\/svg\+xml/);
+const mixedLocationLabels = [];
+const mixedLocationCanvasContext = {
+  globalAlpha: 1,
+  save() {},
+  restore() {},
+  beginPath() {},
+  roundRect() {},
+  arc() {},
+  fill() {},
+  fillRect() {},
+  stroke() {},
+  fillText(text) {
+    mixedLocationLabels.push(String(text));
+  },
+  measureText(text) {
+    return { width: String(text).length * 6 };
+  },
+};
+modalToggle.drawModalNodeDecoration(mixedLocationNode, mixedLocationCanvasContext);
+assert.equal(mixedLocationLabels.some((label) => label.endsWith("…")), true);
+
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-mixed-location",
+    node_id: "178",
+    value: 1,
+    max: 4,
+    execution_provider: "ssh_docker",
+    execution_environment_id: "spark-one",
+    execution_location: "spark-one.internal.example",
+  },
+});
+assert.deepEqual(modalToggle.getRemoteVisualState({ id: 178 })?.executionLocation, {
+  provider: "ssh_docker",
+  label: "spark-one.internal.example",
+});
+modalToggle.updateVueExecutionLocation(
+  vueLocationDecoration,
+  modalToggle.getRemoteVisualState({ id: 178 }),
+);
+assert.equal(vueLocationElement.dataset.provider, "ssh_docker");
+assert.equal(vueLocationLabel.textContent, "spark-one.internal.example");
+assert.match(vueLocationIcon.getAttribute("src"), /^data:image\/svg\+xml/);
+assert.match(decodeURIComponent(vueLocationIcon.getAttribute("src")), /viewBox="0 0 73 73"/);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-single-location", ["179"], [
+  { representative_node_id: "179", node_ids: ["179"] },
+]);
+modalToggle.registerPromptExecutionAssignments("prompt-single-location", {
+  "179": {
+    provider: "ssh_docker",
+    environment_id: "spark-one",
+    execution_location: "spark-one.internal.example",
+    node_ids: ["179"],
+  },
+});
+modalToggle.handleModalProgress({
+  detail: {
+    prompt_id: "prompt-single-location",
+    node_id: "179",
+    value: 1,
+    max: 4,
+  },
+});
+const singleLocationLabels = [];
+modalToggle.drawModalNodeDecoration(
+  { id: 179, size: [132, 80] },
+  {
+    ...mixedLocationCanvasContext,
+    fillText(text) {
+      singleLocationLabels.push(String(text));
+    },
+  },
+);
+assert.equal(
+  singleLocationLabels.some((label) => label.includes("spark-one")),
+  false,
+);
 
 resetFrontendState();
 modalToggle.registerPromptComponents("prompt-a", ["10", "11", "12"], [
