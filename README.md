@@ -126,6 +126,8 @@ The Modal GPU is chosen per workflow from the `Modal` → `GPU` context menu (ne
 
 Self-hosted execution runs the same workers on machines you control, reached over SSH and managed through Docker. Open **Settings → Remote Execution: SSH environments**, or right-click an eligible node and choose **Remote Execution → Manage SSH hosts…**, then add hosts using an SSH destination or alias that already works from the account running ComfyUI. The extension deliberately stores no passwords or private-key paths — authentication, jump hosts, ports, and key selection stay in your normal SSH agent and `~/.ssh/config`.
 
+Parallel components assigned to the same SSH worker slot share one lifecycle operation. If two launchers race for the deterministic container name, the loser adopts the correctly labeled, fingerprint-matching worker that won the race; containers without the configured environment ownership label are never removed automatically.
+
 Each host must provide:
 
 - Linux on `x86_64`

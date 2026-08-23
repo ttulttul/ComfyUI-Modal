@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,6 +38,115 @@ def test_worker_build_loads_image_into_the_remote_daemon(
     arguments, kwargs = calls[0]
     assert arguments[:3] == ("build", "--pull", "--load")
     assert kwargs["input_payload"] == b"context"
+
+
+def test_conflicting_worker_launch_adopts_current_managed_winner(
+    ssh_runtime_module: Any,
+    ssh_docker_module: Any,
+) -> None:
+    """A concurrent launcher winning the Docker name race should be reused."""
+    fingerprint = "ac12dff11abd460ecb642f3f0f19f3c5a8fe3d345f88f0d45e7b05d4036f8fa2"
+    container_name = "comfy-remote-lambda-ac12dff11abd460e-w0"
+    inspect_count = 0
+
+    def docker(arguments: tuple[str, ...], **kwargs: Any) -> Any:
+        """Return a name conflict followed by the concurrent winner's state."""
+        nonlocal inspect_count
+        if arguments[:2] == ("container", "inspect"):
+            inspect_count += 1
+            if inspect_count == 1:
+                return ssh_docker_module.SshCommandResult(b"", b"not found", 1)
+            payload = [
+                {
+                    "State": {"Running": True},
+                    "Config": {
+                        "Labels": {
+                            "comfy.remote.runtime-fingerprint": fingerprint,
+                            "comfy.remote.environment-id": "lambda",
+                            "comfy.remote.worker-index": "0",
+                        }
+                    },
+                }
+            ]
+            return ssh_docker_module.SshCommandResult(
+                json.dumps(payload).encode(),
+                b"",
+                0,
+            )
+        if arguments[0] == "run":
+            assert kwargs["check"] is False
+            return ssh_docker_module.SshCommandResult(
+                b"",
+                b"Conflict. The container name is already in use.",
+                125,
+            )
+        raise AssertionError(f"Unexpected Docker arguments: {arguments!r}")
+
+    controller = SimpleNamespace(
+        host=SimpleNamespace(
+            environment_id="lambda",
+            ssh_target="lambda",
+            capabilities=None,
+            docker_env_file=None,
+        ),
+        docker=docker,
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=controller,
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+    spec = ssh_runtime_module.SshRuntimeSpec(
+        identity=SimpleNamespace(fingerprint=fingerprint),
+        image_tag="comfy-remote:ac12dff11abd460e",
+        container_name=container_name,
+        storage_volume_name="comfy-remote-lambda",
+        worker_index=0,
+    )
+
+    manager._replace_worker_container(spec)
+
+    assert inspect_count == 2
+
+
+def test_current_worker_requires_environment_and_slot_ownership_labels(
+    ssh_runtime_module: Any,
+    ssh_docker_module: Any,
+) -> None:
+    """A matching runtime fingerprint alone must not authorize worker adoption."""
+    fingerprint = "deadbeef" * 8
+    payload = [
+        {
+            "State": {"Running": True},
+            "Config": {
+                "Labels": {
+                    "comfy.remote.runtime-fingerprint": fingerprint,
+                    "comfy.remote.environment-id": "different-host",
+                    "comfy.remote.worker-index": "0",
+                }
+            },
+        }
+    ]
+    controller = SimpleNamespace(
+        host=SimpleNamespace(environment_id="lambda"),
+        docker=lambda *_args, **_kwargs: ssh_docker_module.SshCommandResult(
+            json.dumps(payload).encode(),
+            b"",
+            0,
+        ),
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=controller,
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+    spec = SimpleNamespace(
+        identity=SimpleNamespace(fingerprint=fingerprint),
+        container_name="comfy-remote-lambda-deadbeefdeadbeef-w0",
+        worker_index=0,
+    )
+
+    assert manager._container_is_current_and_running(spec) is False
 
 
 def test_worker_context_includes_top_level_comfyui_python_modules(

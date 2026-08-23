@@ -7,6 +7,7 @@ import json
 import logging
 import shlex
 import tarfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,8 @@ _ENVIRONMENT_LABEL = "comfy.remote.environment-id"
 _WORKER_LABEL = "comfy.remote.worker-index"
 _LARGE_DOWNLOAD_RESUME_RETRIES = 20
 _LARGE_DOWNLOAD_TIMEOUT_SECONDS = 120
+_WORKER_LIFECYCLE_LOCKS_GUARD = threading.Lock()
+_WORKER_LIFECYCLE_LOCKS: dict[tuple[str, int], threading.Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -102,15 +105,20 @@ class SshRuntimeManager:
 
     def ensure_worker(self, worker_index: int = 0) -> SshRuntimeSpec:
         """Ensure a compatible image and running warm worker exist."""
-        spec = self.runtime_spec(worker_index)
-        self.controller.ensure_volume(spec.storage_volume_name)
-        if not self._image_is_current(spec):
-            self._build_image(spec)
-        self._remove_stale_worker_containers(spec)
-        if not self._container_is_current_and_running(spec):
-            self._replace_worker_container(spec)
-        self._wait_until_ready(spec)
-        return spec
+        lifecycle_lock = _worker_lifecycle_lock(
+            self.controller.host.environment_id,
+            worker_index,
+        )
+        with lifecycle_lock:
+            spec = self.runtime_spec(worker_index)
+            self.controller.ensure_volume(spec.storage_volume_name)
+            if not self._image_is_current(spec):
+                self._build_image(spec)
+            self._remove_stale_worker_containers(spec)
+            if not self._container_is_current_and_running(spec):
+                self._replace_worker_container(spec)
+            self._wait_until_ready(spec)
+            return spec
 
     def stop_worker(self, worker_index: int = 0) -> bool:
         """Stop and remove one exact managed worker container when present."""
@@ -140,7 +148,8 @@ class SshRuntimeManager:
             if worker.container_name == spec.container_name:
                 continue
             logger.info(
-                "Removing stale SSH worker environment=%s worker_index=%d container=%s.",
+                "Removing stale SSH worker environment=%s worker_index=%d "
+                "container=%s.",
                 self.controller.host.environment_id,
                 spec.worker_index,
                 worker.container_name,
@@ -189,13 +198,16 @@ class SshRuntimeManager:
         return bool(isinstance(state, dict) and state.get("Running")) and bool(
             isinstance(labels, dict)
             and labels.get(_RUNTIME_LABEL) == spec.identity.fingerprint
+            and labels.get(_ENVIRONMENT_LABEL) == self.controller.host.environment_id
+            and labels.get(_WORKER_LABEL) == str(spec.worker_index)
         )
 
     def _build_image(self, spec: SshRuntimeSpec) -> None:
         """Stream a deterministic Docker build context to the remote daemon."""
         context = self._build_context(spec)
         logger.info(
-            "Building SSH runtime environment=%s image=%s fingerprint=%s context_bytes=%d.",
+            "Building SSH runtime environment=%s image=%s fingerprint=%s "
+            "context_bytes=%d.",
             self.controller.host.environment_id,
             spec.image_tag,
             spec.identity.fingerprint,
@@ -261,7 +273,8 @@ class SshRuntimeManager:
         comfyui_root = self.settings.comfyui_root
         if comfyui_root is None or not comfyui_root.is_dir():
             raise SshDockerError(
-                "SSH execution requires a local ComfyUI checkout to build the worker image."
+                "SSH execution requires a local ComfyUI checkout to build the "
+                "worker image."
             )
         resolved_comfyui_root = comfyui_root.resolve()
         for source_path in sorted(resolved_comfyui_root.rglob("*")):
@@ -364,10 +377,10 @@ class SshRuntimeManager:
             check=False,
         )
         if existing.returncode == 0:
-            self.controller.docker(("rm", "-f", spec.container_name))
+            self.controller.remove_managed_worker(spec.container_name)
         gpu_arguments = self._gpu_arguments(spec.worker_index)
         environment_file_arguments = self._environment_file_arguments()
-        self.controller.docker(
+        launched = self.controller.docker(
             (
                 "run",
                 "-d",
@@ -395,7 +408,37 @@ class SshRuntimeManager:
                 spec.image_tag,
             ),
             timeout_seconds=120.0,
+            check=False,
         )
+        if launched.returncode == 0:
+            return
+        if self._concurrent_worker_became_ready(spec):
+            logger.info(
+                "Adopting concurrently launched SSH worker environment=%s "
+                "worker_index=%d container=%s.",
+                self.controller.host.environment_id,
+                spec.worker_index,
+                spec.container_name,
+            )
+            return
+        error_text = launched.stderr_text.strip() or launched.stdout_text.strip()
+        failure_detail = error_text or (
+            f"Docker exited with status {launched.returncode}"
+        )
+        raise SshDockerError(
+            f"Could not start SSH worker {spec.container_name!r} on "
+            f"{self.controller.host.ssh_target!r}: "
+            f"{failure_detail}"
+        )
+
+    def _concurrent_worker_became_ready(self, spec: SshRuntimeSpec) -> bool:
+        """Return whether another launcher won a short race for this worker name."""
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if self._container_is_current_and_running(spec):
+                return True
+            time.sleep(0.1)
+        return False
 
     def _gpu_arguments(self, worker_index: int) -> tuple[str, ...]:
         """Return Docker GPU-selection arguments for this worker."""
@@ -465,6 +508,20 @@ def export_worker_image_context(
         worker_index=0,
     )
     return manager._build_context(spec)
+
+
+def _worker_lifecycle_lock(
+    environment_id: str,
+    worker_index: int,
+) -> threading.Lock:
+    """Return the process-wide lifecycle lock for one environment worker slot."""
+    key = (environment_id, worker_index)
+    with _WORKER_LIFECYCLE_LOCKS_GUARD:
+        lock = _WORKER_LIFECYCLE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _WORKER_LIFECYCLE_LOCKS[key] = lock
+        return lock
 
 
 def _pip_install(
