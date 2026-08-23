@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from aiohttp import web
 
@@ -146,6 +146,10 @@ _SPECULATIVE_PREWARM_PAYLOAD_FIELDS = frozenset(
 _MODEL_VRAM_WEIGHT_MULTIPLIER = 1.20
 _MODEL_VRAM_HEADROOM_BYTES = 4 * 1024**3
 _MODEL_RAM_HEADROOM_BYTES = 4 * 1024**3
+_REMOTE_REPLICA_NODE_PREFIX = "__ComfyModalReplica__"
+_REPLICABLE_REMOTE_OBJECT_TYPES = frozenset(
+    {"CLIP", "MODEL", "NOISE", "SAMPLER", "VAE"}
+)
 _ADDITIVE_MODEL_CLASS_TOKENS = (
     "adapter",
     "controlnet",
@@ -2693,6 +2697,8 @@ def _remote_component_partition_groups(
     remote_node_ids: set[str],
     consumers: dict[LinkedOutputRef, list[InputTarget]],
     nodes_module: Any,
+    *,
+    preserve_nontransportable_affinity: bool = True,
 ) -> dict[str, set[str]]:
     """Return component groups after merging remote nodes across costly boundaries."""
     parent: dict[str, str] = {node_id: node_id for node_id in remote_node_ids}
@@ -2792,7 +2798,11 @@ def _remote_component_partition_groups(
                 output_index=source.output_index,
                 nodes_module=nodes_module,
             )
-            if io_type is not None and not _is_transportable_output_type(io_type):
+            if (
+                preserve_nontransportable_affinity
+                and io_type is not None
+                and not _is_transportable_output_type(io_type)
+            ):
                 logger.info(
                     "Co-locating remote nodes %s -> %s because %s output %d "
                     "cannot cross a component boundary.",
@@ -4031,12 +4041,247 @@ def _subgraph_topological_node_order(
     return sorted(node_ids)
 
 
+def _remote_dependency_closure(
+    prompt: Mapping[str, Any],
+    source_node_id: str,
+) -> set[str]:
+    """Return the complete upstream dependency closure for one remote producer."""
+    closure: set[str] = set()
+    pending = [source_node_id]
+    while pending:
+        node_id = pending.pop()
+        if node_id in closure:
+            continue
+        prompt_node = prompt.get(node_id)
+        if not isinstance(prompt_node, Mapping):
+            continue
+        closure.add(node_id)
+        pending.extend(
+            str(input_value[0])
+            for input_value in (prompt_node.get("inputs") or {}).values()
+            if _is_link(input_value)
+        )
+    return closure
+
+
+def _can_replicate_remote_dependency_closure(
+    *,
+    prompt: Mapping[str, Any],
+    source_node_id: str,
+    dependency_node_ids: set[str],
+    remote_node_ids: set[str],
+) -> bool:
+    """Return whether a producer closure can be safely rebuilt on another worker."""
+    if not dependency_node_ids or not dependency_node_ids.issubset(remote_node_ids):
+        return False
+    source_node = prompt.get(source_node_id)
+    if not isinstance(source_node, Mapping):
+        return False
+    source_inputs = source_node.get("inputs")
+    if not isinstance(source_inputs, Mapping):
+        return False
+    if not any(_is_link(value) for value in source_inputs.values()):
+        return True
+    return all(
+        "sampler"
+        not in str((prompt.get(node_id) or {}).get("class_type") or "").casefold()
+        for node_id in dependency_node_ids
+    )
+
+
+def _replica_node_id_mapping(
+    *,
+    prompt: Mapping[str, Any],
+    dependency_node_ids: set[str],
+    source_node_id: str,
+    target_group_id: str,
+) -> dict[str, str]:
+    """Return collision-free deterministic ids for one replicated dependency closure."""
+    replica_digest = hashlib.sha256(
+        f"{source_node_id}\0{target_group_id}".encode("utf-8")
+    ).hexdigest()[:12]
+    reserved_node_ids = set(prompt)
+    mapping: dict[str, str] = {}
+    for node_id in sorted(dependency_node_ids):
+        base_id = f"{_REMOTE_REPLICA_NODE_PREFIX}{replica_digest}__{node_id}"
+        replica_node_id = base_id
+        suffix = 1
+        while replica_node_id in reserved_node_ids:
+            replica_node_id = f"{base_id}_{suffix}"
+            suffix += 1
+        mapping[node_id] = replica_node_id
+        reserved_node_ids.add(replica_node_id)
+    return mapping
+
+
+def _install_remote_dependency_replica(
+    *,
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    dependency_node_ids: set[str],
+    source_node_id: str,
+    target_group_id: str,
+) -> str:
+    """Clone one safe producer closure and return its replicated source node id."""
+    replica_ids = _replica_node_id_mapping(
+        prompt=prompt,
+        dependency_node_ids=dependency_node_ids,
+        source_node_id=source_node_id,
+        target_group_id=target_group_id,
+    )
+    for node_id in sorted(dependency_node_ids):
+        replica_node = copy.deepcopy(prompt[node_id])
+        for input_name, input_value in list(
+            (replica_node.get("inputs") or {}).items()
+        ):
+            if _is_link(input_value) and str(input_value[0]) in replica_ids:
+                replica_node["inputs"][input_name] = [
+                    replica_ids[str(input_value[0])],
+                    int(input_value[1]),
+                ]
+        prompt[replica_ids[node_id]] = replica_node
+    remote_node_ids.update(replica_ids.values())
+    return replica_ids[source_node_id]
+
+
+def _cross_group_replicable_boundaries(
+    *,
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    component_groups: Mapping[str, set[str]],
+    nodes_module: Any,
+) -> list[tuple[str, int, str, str, str]]:
+    """Return replicable non-transportable edges crossing tentative components."""
+    group_by_node_id = {
+        node_id: group_id
+        for group_id, node_ids in component_groups.items()
+        for node_id in node_ids
+    }
+    boundaries: list[tuple[str, int, str, str, str]] = []
+    for target_node_id in sorted(remote_node_ids):
+        target_node = prompt.get(target_node_id)
+        if not isinstance(target_node, Mapping):
+            continue
+        for input_name, input_value in (target_node.get("inputs") or {}).items():
+            if not _is_link(input_value):
+                continue
+            source_node_id = str(input_value[0])
+            if (
+                source_node_id not in remote_node_ids
+                or group_by_node_id.get(source_node_id)
+                == group_by_node_id.get(target_node_id)
+            ):
+                continue
+            output_index = int(input_value[1])
+            io_type = _remote_output_io_type(
+                prompt=prompt,
+                node_id=source_node_id,
+                output_index=output_index,
+                nodes_module=nodes_module,
+            )
+            if io_type not in _REPLICABLE_REMOTE_OBJECT_TYPES:
+                continue
+            boundaries.append(
+                (
+                    source_node_id,
+                    output_index,
+                    target_node_id,
+                    str(input_name),
+                    str(group_by_node_id[target_node_id]),
+                )
+            )
+    return boundaries
+
+
+def _replicate_safe_nontransportable_provider_boundaries(
+    *,
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    nodes_module: Any,
+) -> None:
+    """Replicate safe object producers instead of forcing provider cycles together."""
+    for _iteration in range(len(prompt) + 1):
+        consumers = _build_consumer_map(prompt)
+        tentative_groups = _remote_component_partition_groups(
+            prompt,
+            remote_node_ids,
+            consumers,
+            nodes_module,
+            preserve_nontransportable_affinity=False,
+        )
+        boundaries = _cross_group_replicable_boundaries(
+            prompt=prompt,
+            remote_node_ids=remote_node_ids,
+            component_groups=tentative_groups,
+            nodes_module=nodes_module,
+        )
+        replica_source_by_group: dict[tuple[str, str], str] = {}
+        changed = False
+        for (
+            source_node_id,
+            output_index,
+            target_node_id,
+            input_name,
+            group_id,
+        ) in boundaries:
+            dependency_node_ids = _remote_dependency_closure(prompt, source_node_id)
+            if not _can_replicate_remote_dependency_closure(
+                prompt=prompt,
+                source_node_id=source_node_id,
+                dependency_node_ids=dependency_node_ids,
+                remote_node_ids=remote_node_ids,
+            ):
+                continue
+            replica_key = (source_node_id, group_id)
+            replica_source_node_id = replica_source_by_group.get(replica_key)
+            if replica_source_node_id is None:
+                replica_source_node_id = _install_remote_dependency_replica(
+                    prompt=prompt,
+                    remote_node_ids=remote_node_ids,
+                    dependency_node_ids=dependency_node_ids,
+                    source_node_id=source_node_id,
+                    target_group_id=group_id,
+                )
+                replica_source_by_group[replica_key] = replica_source_node_id
+                logger.info(
+                    "Replicated non-transportable producer %s and dependencies %s "
+                    "for remote component group %s.",
+                    source_node_id,
+                    sorted(dependency_node_ids),
+                    group_id,
+                )
+            prompt[target_node_id]["inputs"][input_name] = [
+                replica_source_node_id,
+                output_index,
+            ]
+            changed = True
+        if not changed:
+            return
+    raise ModalPromptValidationError(
+        "Unable to stabilize provider-aware non-transportable dependency replicas."
+    )
+
+
+def _workflow_visible_remote_node_ids(node_ids: Iterable[str]) -> list[str]:
+    """Exclude internal dependency replicas from workflow-facing rewrite metadata."""
+    return [
+        str(node_id)
+        for node_id in node_ids
+        if not str(node_id).startswith(_REMOTE_REPLICA_NODE_PREFIX)
+    ]
+
+
 def _build_component_plans(
     prompt: dict[str, Any],
     remote_node_ids: set[str],
     nodes_module: Any,
 ) -> list[RemoteComponentPlan]:
     """Build plans for every connected remote component."""
+    _replicate_safe_nontransportable_provider_boundaries(
+        prompt=prompt,
+        remote_node_ids=remote_node_ids,
+        nodes_module=nodes_module,
+    )
     consumers = _build_consumer_map(prompt)
     components = _build_remote_components(
         prompt, remote_node_ids, consumers, nodes_module
@@ -6420,15 +6665,19 @@ def rewrite_prompt_for_modal(
         if isinstance(split_proxy_payloads, dict):
             static_proxy_node_id, mapped_proxy_node_id = proxy_node_ids
             summary.remote_component_ids.extend(proxy_node_ids)
-            summary.component_node_ids_by_representative[static_proxy_node_id] = list(
+            summary.component_node_ids_by_representative[static_proxy_node_id] = (
+                _workflow_visible_remote_node_ids(component.static_node_ids)
+            )
+            summary.component_node_ids_by_representative[mapped_proxy_node_id] = (
+                _workflow_visible_remote_node_ids(component.mapped_node_ids)
+            )
+            for node_id in _workflow_visible_remote_node_ids(
                 component.static_node_ids
-            )
-            summary.component_node_ids_by_representative[mapped_proxy_node_id] = list(
-                component.mapped_node_ids
-            )
-            for node_id in component.static_node_ids:
+            ):
                 summary.rewritten_node_id_map[node_id] = static_proxy_node_id
-            for node_id in component.mapped_node_ids:
+            for node_id in _workflow_visible_remote_node_ids(
+                component.mapped_node_ids
+            ):
                 summary.rewritten_node_id_map[node_id] = mapped_proxy_node_id
             mapped_proxy_component_ids.add(mapped_proxy_node_id)
             continue
@@ -6442,8 +6691,10 @@ def rewrite_prompt_for_modal(
                 ]
                 summary.component_node_ids_by_representative[
                     phase_proxy_node_id
-                ] = phase_component_node_ids
-                for node_id in phase_component_node_ids:
+                ] = _workflow_visible_remote_node_ids(phase_component_node_ids)
+                for node_id in _workflow_visible_remote_node_ids(
+                    phase_component_node_ids
+                ):
                     summary.rewritten_node_id_map[node_id] = phase_proxy_node_id
                 if mapped_node_id_set and mapped_node_id_set.intersection(
                     phase_component_node_ids
@@ -6452,10 +6703,10 @@ def rewrite_prompt_for_modal(
             continue
 
         summary.remote_component_ids.extend(proxy_node_ids)
-        summary.component_node_ids_by_representative[proxy_node_ids[0]] = list(
-            component.node_ids
+        summary.component_node_ids_by_representative[proxy_node_ids[0]] = (
+            _workflow_visible_remote_node_ids(component.node_ids)
         )
-        for node_id in component.node_ids:
+        for node_id in _workflow_visible_remote_node_ids(component.node_ids):
             summary.rewritten_node_id_map[node_id] = proxy_node_ids[0]
         if component.mapped_boundary_input_name or implicitly_mapped_output_sources:
             mapped_proxy_component_ids.add(proxy_node_ids[0])

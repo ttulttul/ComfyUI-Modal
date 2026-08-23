@@ -486,10 +486,14 @@ def test_remote_partition_preserves_dag_around_ssh_only_llm(
     ) == [["1"], ["3"], ["4"]]
 
 
-def test_remote_partition_co_locates_non_transportable_fanout_around_ssh_llm(
+def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
     api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
 ) -> None:
-    """A shared runtime object must keep provider-separated remote phases together."""
+    """A safe shared runtime producer should be rebuilt after an SSH-only phase."""
     prompt = {
         "1": {"class_type": "VAELoader", "inputs": {}},
         "2": {
@@ -508,6 +512,7 @@ def test_remote_partition_co_locates_non_transportable_fanout_around_ssh_llm(
             "inputs": {"vae": ["1", 0], "prompt": ["3", 0]},
         },
     }
+    pristine_prompt = json.loads(json.dumps(prompt))
     fake_nodes_module = SimpleNamespace(
         NODE_CLASS_MAPPINGS={
             "VAELoader": _FakeVAELoaderNode,
@@ -517,34 +522,37 @@ def test_remote_partition_co_locates_non_transportable_fanout_around_ssh_llm(
         NODE_DISPLAY_NAME_MAPPINGS={},
     )
     remote_node_ids = set(prompt)
-    consumers = api_intercept_module._build_consumer_map(prompt)
-
-    component_groups = api_intercept_module._remote_component_partition_groups(
+    component_plans = api_intercept_module._build_component_plans(
         prompt,
-        remote_node_ids,
-        consumers,
-        fake_nodes_module,
-    )
-    components = api_intercept_module._component_topological_order(
-        prompt,
-        component_groups,
-    )
-
-    assert components == [["1", "2", "3", "4"]]
-    component_plan = api_intercept_module._build_component_plan(
-        components[0],
-        prompt,
-        consumers,
         remote_node_ids,
         fake_nodes_module,
     )
     api_intercept_module.validate_remote_component_transport_compatibility(
         prompt,
-        [component_plan],
+        component_plans,
         fake_nodes_module,
     )
+    assert [component.representative_node_id for component in component_plans] == [
+        "1",
+        "3",
+        "4",
+    ]
+    replica_node_ids = {
+        node_id
+        for node_id in prompt
+        if node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+    }
+    assert len(replica_node_ids) == 1
+    replica_node_id = next(iter(replica_node_ids))
+    assert prompt["4"]["inputs"]["vae"] == [replica_node_id, 0]
+    assert prompt[replica_node_id] == prompt["1"]
+    assert replica_node_id in component_plans[2].node_ids
+    assert component_plans[0].boundary_inputs == []
+    assert component_plans[0].boundary_outputs[0].io_type == "IMAGE"
+    assert component_plans[2].boundary_inputs[0].io_type == "STRING"
+    assert component_plans[2].boundary_outputs == []
     required_provider = api_intercept_module._component_required_provider(
-        component_plan,
+        component_plans[1],
         prompt,
         {
             "huihui-qwen3.8-27b-abliterated-q2-k-gguf": SimpleNamespace(
@@ -552,9 +560,156 @@ def test_remote_partition_co_locates_non_transportable_fanout_around_ssh_llm(
             )
         },
     )
-    assert component_plan.boundary_inputs == []
-    assert component_plan.boundary_outputs == []
     assert required_provider.value == "ssh_docker"
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+
+    def assign_to_modal(*, components: list[Any], **_kwargs: Any) -> dict[str, Any]:
+        """Keep the rewrite test independent of real provider availability."""
+        return {
+            component.representative_node_id: api_intercept_module.ExecutionAssignment(
+                environment_id="modal:H200",
+                provider=api_intercept_module.ExecutionProvider.MODAL,
+                predicted_cost_usd=0.0,
+                predicted_completion_seconds=1.0,
+            )
+            for component in components
+        }
+
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_plan_component_execution_assignments",
+        assign_to_modal,
+    )
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=pristine_prompt,
+        workflow={
+            "nodes": [
+                {"id": node_id, "properties": {"is_modal_remote": True}}
+                for node_id in range(1, 5)
+            ]
+        },
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert not any(
+        node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+        for node_id in rewritten_prompt
+    )
+    assert summary.component_node_ids_by_representative["4"] == ["4"]
+    assert not any(
+        node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+        for node_id in summary.rewritten_node_id_map
+    )
+    downstream_payload = rewritten_prompt["4"]["inputs"]["original_node_data"]
+    replica_payload_node_ids = {
+        node_id
+        for node_id in downstream_payload["subgraph_prompt"]
+        if node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+    }
+    assert len(replica_payload_node_ids) == 1
+    downstream_vae_input = downstream_payload["subgraph_prompt"]["4"]["inputs"][
+        "vae"
+    ]
+    assert downstream_vae_input[0] in replica_payload_node_ids
+
+
+def test_remote_partition_replicates_linked_model_loader_closure(
+    api_intercept_module: Any,
+) -> None:
+    """A downstream provider phase should rebuild a linked loader chain, not sample."""
+    prompt = {
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": "model.safetensors"},
+        },
+        "2": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["1", 0], "lora_name": "adapter.safetensors"},
+        },
+        "3": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["2", 0]},
+        },
+        "4": {
+            "class_type": "ModalLLM",
+            "inputs": {
+                "image": ["3", 0],
+                "model_profile": "huihui-qwen3.8-27b-abliterated-q2-k-gguf",
+            },
+        },
+        "5": {
+            "class_type": "RemoteSampler",
+            "inputs": {"model": ["2", 0], "prompt": ["4", 0]},
+        },
+    }
+    fake_nodes_module = SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "UNETLoader": _FakeRemoteModelNode,
+            "LoraLoaderModelOnly": _FakeRemoteModelNode,
+            "RemoteSampler": _FakeRemoteSamplerNode,
+            "ModalLLM": _FakeTextNode,
+        },
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+
+    component_plans = api_intercept_module._build_component_plans(
+        prompt,
+        set(prompt),
+        fake_nodes_module,
+    )
+
+    assert [component.representative_node_id for component in component_plans] == [
+        "1",
+        "4",
+        "5",
+    ]
+    replica_node_ids = sorted(
+        node_id
+        for node_id in prompt
+        if node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+    )
+    assert len(replica_node_ids) == 2
+    replica_loader_id = next(
+        node_id
+        for node_id in replica_node_ids
+        if prompt[node_id]["class_type"] == "UNETLoader"
+    )
+    replica_lora_id = next(
+        node_id
+        for node_id in replica_node_ids
+        if prompt[node_id]["class_type"] == "LoraLoaderModelOnly"
+    )
+    assert prompt[replica_lora_id]["inputs"]["model"] == [replica_loader_id, 0]
+    assert prompt["5"]["inputs"]["model"] == [replica_lora_id, 0]
+    assert replica_node_ids == sorted(
+        set(component_plans[2].node_ids) - {"5"}
+    )
+    api_intercept_module.validate_remote_component_transport_compatibility(
+        prompt,
+        component_plans,
+        fake_nodes_module,
+    )
 
 
 def test_modal_only_policy_rejects_ssh_only_llm_backend(
