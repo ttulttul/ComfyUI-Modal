@@ -15,6 +15,39 @@
       "max_file_characters": 200000,
       "allow_mixed_image_video": false,
       "trust_remote_code": false
+    },
+    {
+      "id": "huihui-qwen3.8-27b-abliterated-q2-k-gguf",
+      "display_name": "Huihui Qwen3.8 27B Abliterated Q2_K GGUF",
+      "repository": "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
+      "revision": "2379b9294c14c0e55bd2ea5ac84d8bb9ffdfd98b",
+      "dtype": "bfloat16",
+      "modalities": ["text", "file"],
+      "estimated_vram_gb": 14.5,
+      "max_context_tokens": 8192,
+      "max_images": 1,
+      "max_video_frames": 1,
+      "max_file_bytes": 33554432,
+      "max_file_characters": 200000,
+      "allow_mixed_image_video": false,
+      "trust_remote_code": false,
+      "backend": "llama_cpp_server",
+      "architecture": "Qwen3_5ForConditionalGeneration",
+      "quantization_method": "gguf_q2_k",
+      "artifact_bytes": 10864592160,
+      "advertised_context_tokens": 262144,
+      "reasoning_parser": "qwen3",
+      "backend_options": {
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0",
+        "context_size": 8192,
+        "gpu_layers": 999,
+        "model_filename": "Huihui-Qwen3.8-27B-abliterated-Q2_K.gguf",
+        "server_binary": "/app/llama-server",
+        "server_startup_timeout_seconds": 900,
+        "tokenizer_repository": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+        "tokenizer_revision": "d42ca8978c5a66e92c3446d46e8adfe03ef692ff"
+      }
     }
   ]
 }

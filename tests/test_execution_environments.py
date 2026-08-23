@@ -31,9 +31,7 @@ def _capabilities(
                 name=f"Test GPU {vram_gb}",
                 total_vram_bytes=vram_gb * 1024**3,
                 free_vram_bytes=(
-                    free_vram_gb * 1024**3
-                    if free_vram_gb is not None
-                    else None
+                    free_vram_gb * 1024**3 if free_vram_gb is not None else None
                 ),
             ),
         ),
@@ -47,11 +45,12 @@ def _environment(
     vram_gb: int,
     cost: float | None,
     cold_start_seconds: float = 0.0,
+    provider: Any | None = None,
 ) -> Any:
     """Return one ready scheduling candidate."""
     return module.EnvironmentSchedulingState(
         environment_id=environment_id,
-        provider=module.ExecutionProvider.SSH_DOCKER,
+        provider=provider or module.ExecutionProvider.SSH_DOCKER,
         enabled=True,
         health=module.EnvironmentHealth.READY,
         cost_usd_per_second=cost,
@@ -85,7 +84,9 @@ def test_scheduler_rejects_hosts_without_required_vram(
 ) -> None:
     """Hard VRAM requirements must be satisfied before comparing cost."""
     module = execution_environments_module
-    with pytest.raises(module.NoCompatibleExecutionEnvironmentError, match="insufficient GPU VRAM"):
+    with pytest.raises(
+        module.NoCompatibleExecutionEnvironmentError, match="insufficient GPU VRAM"
+    ):
         module.CostAwareEnvironmentScheduler().choose(
             [_environment(module, "small", vram_gb=24, cost=0.0)],
             module.ComponentResourceRequirements(minimum_vram_bytes=48 * 1024**3),
@@ -176,3 +177,28 @@ def test_scheduler_uses_environment_specific_runtime_estimates(
 
     assert assignment.environment_id == "fast-pricey"
     assert assignment.predicted_cost_usd == pytest.approx(0.02)
+
+
+def test_scheduler_honors_required_provider(
+    execution_environments_module: Any,
+) -> None:
+    """Backend runtime requirements must override a cheaper provider."""
+    module = execution_environments_module
+    assignment = module.CostAwareEnvironmentScheduler().choose(
+        [
+            _environment(
+                module,
+                "modal",
+                vram_gb=80,
+                cost=0.0,
+                provider=module.ExecutionProvider.MODAL,
+            ),
+            _environment(module, "lambda", vram_gb=24, cost=0.001),
+        ],
+        module.ComponentResourceRequirements(
+            minimum_vram_bytes=12 * 1024**3,
+            required_provider=module.ExecutionProvider.SSH_DOCKER,
+        ),
+    )
+
+    assert assignment.environment_id == "lambda"

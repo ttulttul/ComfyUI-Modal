@@ -32,6 +32,10 @@ REMOTE_VLLM_WHEEL_URL = (
     "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac/"
     "vllm-0.27.1-cp38-abi3-manylinux_2_28_x86_64.whl"
 )
+REMOTE_LLAMA_CPP_SERVER_IMAGE = (
+    "ghcr.io/ggml-org/llama.cpp:server-cuda13@"
+    "sha256:ff73838d023dde440bea6b953c284f327783111341cea8f5cc10eb1346636aa3"
+)
 REMOTE_NUMPY_SPEC = "numpy==2.3.5"
 REMOTE_OPENCV_SPEC = "opencv-python-headless==4.13.0.92"
 
@@ -277,7 +281,9 @@ def normalized_modal_gpu_type(modal_gpu: str) -> str:
     """Return a canonical Modal GPU type without an optional count suffix."""
     gpu_type = modal_gpu.strip().split(":", maxsplit=1)[0].upper()
     if not gpu_type:
-        raise ValueError("Modal GPU type cannot be empty when selecting a PyTorch build.")
+        raise ValueError(
+            "Modal GPU type cannot be empty when selecting a PyTorch build."
+        )
     return gpu_type
 
 
@@ -345,7 +351,9 @@ def _read_requirement_file(requirements_path: Path, seen: set[Path]) -> tuple[st
         if line.startswith(("-r ", "--requirement ")):
             _, include_path = line.split(maxsplit=1)
             requirements.extend(
-                _read_requirement_file((requirements_path.parent / include_path).resolve(), seen)
+                _read_requirement_file(
+                    (requirements_path.parent / include_path).resolve(), seen
+                )
             )
             continue
         if line.startswith(("-c ", "--constraint ")):
@@ -434,7 +442,10 @@ def _tree_digest(
         )
         for file_name in sorted(file_names):
             file_path = directory_path / file_name
-            if file_name not in included_names and file_path.suffix.lower() not in included_suffixes:
+            if (
+                file_name not in included_names
+                and file_path.suffix.lower() not in included_suffixes
+            ):
                 continue
             relative_path = file_path.relative_to(resolved_root).as_posix()
             digest.update(relative_path.encode("utf-8"))

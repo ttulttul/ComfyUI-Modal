@@ -116,9 +116,7 @@ class EnvironmentCapabilities:
     def maximum_available_vram_bytes(self) -> int:
         """Return probed free VRAM when known, otherwise nameplate capacity."""
         reported_free = [
-            gpu.free_vram_bytes
-            for gpu in self.gpus
-            if gpu.free_vram_bytes is not None
+            gpu.free_vram_bytes for gpu in self.gpus if gpu.free_vram_bytes is not None
         ]
         if reported_free:
             return max(reported_free)
@@ -201,6 +199,7 @@ class ComponentResourceRequirements:
     estimated_transfer_seconds: float = 0.0
     required_tags: frozenset[str] = frozenset()
     preferred_environment_ids: tuple[str, ...] = ()
+    required_provider: ExecutionProvider | None = None
 
 
 @dataclass(frozen=True)
@@ -265,9 +264,7 @@ class WorkflowExecutionPreferences:
             ),
             auto_place=bool(payload.get(WORKFLOW_REMOTE_AUTO_PLACE_KEY, False)),
             preferred_environment_ids=tuple(
-                str(value).strip()
-                for value in preferred_values
-                if str(value).strip()
+                str(value).strip() for value in preferred_values if str(value).strip()
             ),
             minimum_vram_bytes=int((minimum_vram_gb or 0.0) * 1024**3),
         )
@@ -312,9 +309,11 @@ class CostAwareEnvironmentScheduler:
                 rejection_reasons.append(f"{environment.environment_id}: {rejection}")
                 continue
 
-            execution_seconds = requirements.estimated_execution_seconds_by_environment.get(
-                environment.environment_id,
-                requirements.estimated_execution_seconds,
+            execution_seconds = (
+                requirements.estimated_execution_seconds_by_environment.get(
+                    environment.environment_id,
+                    requirements.estimated_execution_seconds,
+                )
             )
             completion_seconds = max(
                 0.0,
@@ -384,14 +383,25 @@ class CostAwareEnvironmentScheduler:
         """Return a human-readable hard-constraint failure when incompatible."""
         if not environment.enabled:
             return "disabled"
-        if environment.health not in {EnvironmentHealth.READY, EnvironmentHealth.DEGRADED}:
+        if (
+            requirements.required_provider is not None
+            and environment.provider is not requirements.required_provider
+        ):
+            return f"provider is not {requirements.required_provider.value!r}"
+        if environment.health not in {
+            EnvironmentHealth.READY,
+            EnvironmentHealth.DEGRADED,
+        }:
             return f"health is {environment.health.value}"
         if environment.maximum_workers <= 0:
             return "worker limit is zero"
         capabilities = environment.capabilities
         if capabilities is None:
             return "capabilities have not been probed"
-        if requirements.architecture and capabilities.architecture != requirements.architecture:
+        if (
+            requirements.architecture
+            and capabilities.architecture != requirements.architecture
+        ):
             return (
                 f"architecture {capabilities.architecture!r} does not satisfy "
                 f"{requirements.architecture!r}"

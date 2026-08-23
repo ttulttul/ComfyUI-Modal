@@ -11,6 +11,9 @@ import json
 import logging
 import math
 import os
+import socket
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -19,6 +22,8 @@ from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Mapping, Protocol, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from PIL import Image
 
@@ -92,7 +97,9 @@ def triton_compile_miss_signal_size() -> int:
 def _append_process_signal(path: Path, event: Mapping[str, Any]) -> None:
     """Atomically append one JSON event shared by worker processes."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(dict(event), sort_keys=True, default=str).encode("utf-8") + b"\n"
+    payload = (
+        json.dumps(dict(event), sort_keys=True, default=str).encode("utf-8") + b"\n"
+    )
     descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
         written_bytes = os.write(descriptor, payload)
@@ -143,8 +150,7 @@ def _triton_compile_timing_payload(times: Any) -> dict[str, Any]:
         for stage_name, duration_microseconds in getattr(times, "lowering_stages", ())
     ]
     return {
-        "ir_initialization_ms": int(getattr(times, "ir_initialization", 0))
-        / 1000.0,
+        "ir_initialization_ms": int(getattr(times, "ir_initialization", 0)) / 1000.0,
         "lowering_stages_ms": lowering_stages,
         "store_results_ms": int(getattr(times, "store_results", 0)) / 1000.0,
         "total_ms": int(getattr(times, "total", 0)) / 1000.0,
@@ -565,7 +571,9 @@ def _tensor_frame_to_pil(frame: Any) -> Image.Image:
     import torch
 
     if not isinstance(frame, torch.Tensor):
-        raise TypeError(f"Expected a torch.Tensor image frame, got {type(frame).__name__}.")
+        raise TypeError(
+            f"Expected a torch.Tensor image frame, got {type(frame).__name__}."
+        )
     if frame.ndim != 3 or frame.shape[-1] not in {1, 3, 4}:
         raise ValueError(
             "Modal LLM images must use ComfyUI's [height, width, channels] frame layout."
@@ -577,14 +585,20 @@ def _tensor_frame_to_pil(frame: Any) -> Image.Image:
     return Image.fromarray(pixels).convert("RGB")
 
 
-def prepare_images(images: Any | None, profile: LLMModelProfile) -> tuple[Image.Image, ...]:
+def prepare_images(
+    images: Any | None, profile: LLMModelProfile
+) -> tuple[Image.Image, ...]:
     """Normalize an optional ComfyUI IMAGE batch under the profile limit."""
     if images is None:
         return ()
     if "image" not in profile.modalities:
-        raise ValueError(f"Model profile {profile.profile_id!r} does not support images.")
+        raise ValueError(
+            f"Model profile {profile.profile_id!r} does not support images."
+        )
     if getattr(images, "ndim", None) != 4:
-        raise ValueError("Modal LLM images must be a ComfyUI [batch, height, width, channels] tensor.")
+        raise ValueError(
+            "Modal LLM images must be a ComfyUI [batch, height, width, channels] tensor."
+        )
     image_count = int(images.shape[0])
     if image_count > profile.max_images:
         raise ValueError(
@@ -616,9 +630,13 @@ def prepare_video(
     if video is None:
         return None
     if "video" not in profile.modalities:
-        raise ValueError(f"Model profile {profile.profile_id!r} does not support video.")
+        raise ValueError(
+            f"Model profile {profile.profile_id!r} does not support video."
+        )
     frame_limit = min(
-        _coerce_positive_int(requested_frames, "video_frames", profile.max_video_frames),
+        _coerce_positive_int(
+            requested_frames, "video_frames", profile.max_video_frames
+        ),
         profile.max_video_frames,
     )
     components = video.get_components()
@@ -628,7 +646,9 @@ def prepare_video(
     indices = _uniform_sample_indices(int(frames.shape[0]), frame_limit)
     frame_rate = float(components.frame_rate)
     if not math.isfinite(frame_rate) or frame_rate <= 0:
-        raise ValueError(f"The ComfyUI VIDEO input has invalid frame rate {frame_rate!r}.")
+        raise ValueError(
+            f"The ComfyUI VIDEO input has invalid frame rate {frame_rate!r}."
+        )
     return PreparedVideo(
         frames=tuple(_tensor_frame_to_pil(frames[index]) for index in indices),
         timestamps_seconds=tuple(index / frame_rate for index in indices),
@@ -651,7 +671,9 @@ def _decode_input_file(file_value: Any, max_file_bytes: int) -> tuple[str, str, 
     try:
         metadata, encoded_payload = file_data.split(",", maxsplit=1)
     except ValueError as exc:
-        raise ValueError(f"Modal LLM file {filename!r} has an invalid data URI.") from exc
+        raise ValueError(
+            f"Modal LLM file {filename!r} has an invalid data URI."
+        ) from exc
     if ";base64" not in metadata:
         raise ValueError(f"Modal LLM file {filename!r} must use base64 encoding.")
     mime_type = metadata[5:].split(";", maxsplit=1)[0].lower()
@@ -663,7 +685,9 @@ def _decode_input_file(file_value: Any, max_file_bytes: int) -> tuple[str, str, 
     try:
         raw_bytes = base64.b64decode(encoded_payload, validate=True)
     except (ValueError, binascii.Error) as exc:
-        raise ValueError(f"Modal LLM file {filename!r} has invalid base64 content.") from exc
+        raise ValueError(
+            f"Modal LLM file {filename!r} has invalid base64 content."
+        ) from exc
     if len(raw_bytes) > max_file_bytes:
         raise ValueError(
             f"Modal LLM file {filename!r} is {len(raw_bytes)} bytes; the profile limit is "
@@ -678,12 +702,18 @@ def _extract_pdf_text(filename: str, raw_bytes: bytes) -> str:
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
     except ImportError as exc:
-        raise RuntimeError("PDF input requires the pinned pypdf remote dependency.") from exc
+        raise RuntimeError(
+            "PDF input requires the pinned pypdf remote dependency."
+        ) from exc
     try:
         reader = PdfReader(BytesIO(raw_bytes))
-        extracted_text = "\n\n".join((page.extract_text() or "") for page in reader.pages)
+        extracted_text = "\n\n".join(
+            (page.extract_text() or "") for page in reader.pages
+        )
     except (PdfReadError, OSError, ValueError) as exc:
-        raise ValueError(f"Unable to extract text from PDF file {filename!r}: {exc}") from exc
+        raise ValueError(
+            f"Unable to extract text from PDF file {filename!r}: {exc}"
+        ) from exc
     if not extracted_text.strip():
         raise ValueError(
             f"PDF file {filename!r} contains no extractable text; provide its pages as images."
@@ -699,12 +729,16 @@ def extract_file_context(
     if not files:
         return "", 0, 0
     if "file" not in profile.modalities:
-        raise ValueError(f"Model profile {profile.profile_id!r} does not support files.")
+        raise ValueError(
+            f"Model profile {profile.profile_id!r} does not support files."
+        )
     sections: list[str] = []
     total_bytes = 0
     total_characters = 0
     for file_value in files:
-        filename, mime_type, raw_bytes = _decode_input_file(file_value, profile.max_file_bytes)
+        filename, mime_type, raw_bytes = _decode_input_file(
+            file_value, profile.max_file_bytes
+        )
         total_bytes += len(raw_bytes)
         if total_bytes > profile.max_file_bytes:
             raise ValueError(
@@ -714,11 +748,15 @@ def extract_file_context(
         suffix = Path(filename).suffix.lower()
         if suffix == ".pdf" or mime_type == "application/pdf":
             text = _extract_pdf_text(filename, raw_bytes)
-        elif suffix in {".txt", ".md", ".csv", ".json"} or mime_type.startswith("text/"):
+        elif suffix in {".txt", ".md", ".csv", ".json"} or mime_type.startswith(
+            "text/"
+        ):
             try:
                 text = raw_bytes.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise ValueError(f"Modal LLM text file {filename!r} is not valid UTF-8.") from exc
+                raise ValueError(
+                    f"Modal LLM text file {filename!r} is not valid UTF-8."
+                ) from exc
         else:
             raise ValueError(
                 f"Modal LLM file {filename!r} has unsupported type {mime_type or suffix!r}; "
@@ -747,14 +785,20 @@ def prepare_llm_inputs(
     """Normalize text, image, video, and file inputs under profile limits."""
     prepared_images = prepare_images(images, profile)
     prepared_video = prepare_video(video, profile, video_frames)
-    if prepared_images and prepared_video is not None and not profile.allow_mixed_image_video:
+    if (
+        prepared_images
+        and prepared_video is not None
+        and not profile.allow_mixed_image_video
+    ):
         raise ValueError(
             f"Model profile {profile.profile_id!r} accepts images or video in one request, not both."
         )
     file_context, file_count, file_characters = extract_file_context(files, profile)
     prompt_parts = [prompt]
     if prepared_video is not None:
-        timestamps = ", ".join(f"{timestamp:.3f}s" for timestamp in prepared_video.timestamps_seconds)
+        timestamps = ", ".join(
+            f"{timestamp:.3f}s" for timestamp in prepared_video.timestamps_seconds
+        )
         prompt_parts.append(f"Video sample timestamps: {timestamps}")
     if file_context:
         prompt_parts.append("Attached file contents:\n" + file_context)
@@ -788,7 +832,9 @@ def _move_batch_to_device(batch: Any, device: str) -> Any:
             key: value.to(device) if hasattr(value, "to") else value
             for key, value in batch.items()
         }
-    raise TypeError(f"Unsupported Transformers processor output {type(batch).__name__}.")
+    raise TypeError(
+        f"Unsupported Transformers processor output {type(batch).__name__}."
+    )
 
 
 def _stopping_criteria(
@@ -865,18 +911,14 @@ def _multimodal_messages(prepared_inputs: PreparedLLMInputs) -> list[dict[str, A
         messages.append(
             {
                 "role": "system",
-                "content": [
-                    {"type": "text", "text": prepared_inputs.system_prompt}
-                ],
+                "content": [{"type": "text", "text": prepared_inputs.system_prompt}],
             }
         )
     content: list[dict[str, Any]] = [
         {"type": "image", "image": image} for image in prepared_inputs.images
     ]
     if prepared_inputs.video is not None:
-        content.append(
-            {"type": "video", "video": list(prepared_inputs.video.frames)}
-        )
+        content.append({"type": "video", "video": list(prepared_inputs.video.frames)})
     content.append({"type": "text", "text": prepared_inputs.prompt})
     messages.append({"role": "user", "content": content})
     return messages
@@ -1032,7 +1074,9 @@ class TransformersMultimodalBackend:
             ),
         }
         if settings.temperature > 0:
-            generate_kwargs.update(temperature=settings.temperature, top_p=settings.top_p)
+            generate_kwargs.update(
+                temperature=settings.temperature, top_p=settings.top_p
+            )
         pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
         if pad_token_id is not None:
             generate_kwargs["pad_token_id"] = pad_token_id
@@ -1116,6 +1160,350 @@ class _VLLMStreamState:
     request_output: Any
     started_at: float
     first_token_at: float | None
+
+
+class LlamaCppServerBackend:
+    """Run one text-only GGUF model through a resident llama.cpp CUDA server."""
+
+    def __init__(
+        self,
+        profile: LLMModelProfile,
+        snapshot_path: Path,
+        progress_callback: LLMProgressCallback,
+    ) -> None:
+        """Start a private loopback server for one immutable GGUF artifact."""
+        from transformers import AutoProcessor
+
+        self.profile = profile
+        self.snapshot_path = snapshot_path
+        self.model_path = self._model_path()
+        self.port = self._available_port()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        log_descriptor, log_path = tempfile.mkstemp(
+            prefix="comfy-llama-cpp-", suffix=".log"
+        )
+        os.close(log_descriptor)
+        self._log_path = Path(log_path)
+        self._log_file = self._log_path.open("w+b")
+        progress_callback(
+            LLMProgressEvent(
+                stage="processor",
+                message="Loading GGUF tokenizer",
+                indeterminate=True,
+            )
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            str(snapshot_path),
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+        self.reasoning_parser: ReasoningOutputParser = create_reasoning_parser(
+            profile,
+            self.processor.tokenizer,
+        )
+        progress_callback(
+            LLMProgressEvent(
+                stage="engine",
+                message="Loading GGUF weights into llama.cpp",
+                indeterminate=True,
+            )
+        )
+        self.process = self._start_server()
+        try:
+            self._wait_until_ready()
+        except (RuntimeError, TimeoutError):
+            self.unload()
+            raise
+        progress_callback(
+            LLMProgressEvent(
+                stage="ready",
+                message="llama.cpp engine ready",
+                value=1,
+                maximum=1,
+                unit="model",
+            )
+        )
+
+    def _model_path(self) -> Path:
+        """Return the required staged GGUF model path."""
+        filename = str(self.profile.backend_option("model_filename", "")).strip()
+        if not filename or Path(filename).name != filename:
+            raise ValueError(
+                f"GGUF profile {self.profile.profile_id!r} has no safe model filename."
+            )
+        model_path = self.snapshot_path / filename
+        if not model_path.is_file():
+            raise RuntimeError(f"Staged GGUF model is missing at {model_path}.")
+        return model_path
+
+    @staticmethod
+    def _available_port() -> int:
+        """Reserve and release one loopback port for the private server."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
+
+    def _server_command(self) -> list[str]:
+        """Return the bounded CUDA llama-server command for this profile."""
+        binary = str(
+            self.profile.backend_option("server_binary", "/app/llama-server")
+        ).strip()
+        context_size = int(
+            self.profile.backend_option("context_size", self.profile.max_context_tokens)
+        )
+        gpu_layers = int(self.profile.backend_option("gpu_layers", 999))
+        return [
+            binary,
+            "--model",
+            str(self.model_path),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.port),
+            "--ctx-size",
+            str(context_size),
+            "--parallel",
+            "1",
+            "--n-gpu-layers",
+            str(gpu_layers),
+            "--cache-type-k",
+            str(self.profile.backend_option("cache_type_k", "q8_0")),
+            "--cache-type-v",
+            str(self.profile.backend_option("cache_type_v", "q8_0")),
+            "--flash-attn",
+            "on",
+            "--no-webui",
+        ]
+
+    def _start_server(self) -> subprocess.Popen[bytes]:
+        """Launch llama-server without exposing a network listener."""
+        command = self._server_command()
+        logger.info(
+            "Starting llama.cpp profile=%s model=%s context=%s port=%d.",
+            self.profile.profile_id,
+            self.model_path,
+            self.profile.backend_option(
+                "context_size", self.profile.max_context_tokens
+            ),
+            self.port,
+        )
+        try:
+            return subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=self._log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Unable to start llama.cpp for profile {self.profile.profile_id!r}: "
+                f"{exc}"
+            ) from exc
+
+    def _log_tail(self, maximum_bytes: int = 8192) -> str:
+        """Return the bounded tail of the private server log."""
+        try:
+            self._log_file.flush()
+            with self._log_path.open("rb") as log_file:
+                log_file.seek(0, os.SEEK_END)
+                size = log_file.tell()
+                log_file.seek(max(0, size - maximum_bytes))
+                return log_file.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+
+    def _wait_until_ready(self) -> None:
+        """Wait until llama.cpp reports that the model is loaded."""
+        timeout_seconds = float(
+            self.profile.backend_option("server_startup_timeout_seconds", 900)
+        )
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            return_code = self.process.poll()
+            if return_code is not None:
+                raise RuntimeError(
+                    f"llama.cpp exited with code {return_code} while loading "
+                    f"{self.profile.profile_id!r}. Log tail:\n{self._log_tail()}"
+                )
+            try:
+                with urlopen(f"{self.base_url}/health", timeout=2.0) as response:
+                    if response.status == 200:
+                        return
+            except HTTPError as exc:
+                if exc.code != 503:
+                    raise RuntimeError(
+                        f"llama.cpp health check failed with HTTP {exc.code}."
+                    ) from exc
+            except (URLError, TimeoutError, OSError):
+                pass
+            time.sleep(0.25)
+        raise TimeoutError(
+            f"llama.cpp did not load profile {self.profile.profile_id!r} within "
+            f"{timeout_seconds:.0f} seconds. Log tail:\n{self._log_tail()}"
+        )
+
+    def _prompt(
+        self,
+        prepared_inputs: PreparedLLMInputs,
+        settings: LLMGenerationSettings,
+    ) -> str:
+        """Render one text-only chat prompt with the pinned tokenizer template."""
+        if prepared_inputs.images or prepared_inputs.video is not None:
+            raise ValueError(f"GGUF profile {self.profile.profile_id!r} is text-only.")
+        prompt = self.processor.apply_chat_template(
+            _multimodal_messages(prepared_inputs),
+            add_generation_prompt=True,
+            tokenize=False,
+            **reasoning_chat_template_kwargs(
+                self.profile,
+                settings.enable_reasoning,
+            ),
+        )
+        if not isinstance(prompt, str):
+            raise RuntimeError("The GGUF tokenizer did not return a text prompt.")
+        return prompt
+
+    def _completion(
+        self, payload: Mapping[str, Any], timeout_seconds: float
+    ) -> dict[str, Any]:
+        """Submit one non-streaming completion request to the private server."""
+        request = Request(
+            f"{self.base_url}/completion",
+            data=json.dumps(dict(payload)).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"llama.cpp completion failed with HTTP {exc.code}: {error_body}"
+            ) from exc
+        except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"llama.cpp completion failed: {exc}") from exc
+        if not isinstance(decoded, dict):
+            raise RuntimeError("llama.cpp completion returned a non-object response.")
+        return decoded
+
+    def generate(
+        self,
+        prepared_inputs: PreparedLLMInputs,
+        settings: LLMGenerationSettings,
+        progress_callback: LLMProgressCallback,
+    ) -> BackendGenerationResult:
+        """Generate one response and report bounded llama.cpp telemetry."""
+        progress_callback(
+            LLMProgressEvent(
+                stage="prefill",
+                message="Prefill / waiting for llama.cpp",
+                value=0,
+                maximum=settings.max_new_tokens,
+                unit="tokens",
+                indeterminate=True,
+            )
+        )
+        started_at = time.perf_counter()
+        response = self._completion(
+            {
+                "prompt": self._prompt(prepared_inputs, settings),
+                "n_predict": settings.max_new_tokens,
+                "temperature": settings.temperature,
+                "top_p": settings.top_p,
+                "seed": settings.seed,
+                "repeat_penalty": 1.05,
+                "cache_prompt": True,
+                "return_tokens": True,
+            },
+            timeout_seconds=max(900.0, settings.max_new_tokens * 10.0),
+        )
+        completed_at = time.perf_counter()
+        content = response.get("content")
+        tokens = response.get("tokens")
+        if not isinstance(content, str) or not isinstance(tokens, list):
+            raise RuntimeError(
+                "llama.cpp completion omitted string content or generated tokens."
+            )
+        output_token_ids = [int(token) for token in tokens]
+        output_tokens = len(output_token_ids)
+        elapsed_seconds = completed_at - started_at
+        timings = response.get("timings")
+        timing_mapping = timings if isinstance(timings, Mapping) else {}
+        tokens_per_second = timing_mapping.get("predicted_per_second")
+        resolved_tokens_per_second = (
+            float(tokens_per_second)
+            if isinstance(tokens_per_second, int | float)
+            else (output_tokens / elapsed_seconds if elapsed_seconds > 0 else None)
+        )
+        progress_callback(
+            LLMProgressEvent(
+                stage="generating",
+                message="Generated with llama.cpp",
+                value=output_tokens,
+                maximum=settings.max_new_tokens,
+                unit="tokens",
+                elapsed_seconds=elapsed_seconds,
+                tokens_per_second=resolved_tokens_per_second,
+            )
+        )
+        reasoning_parser = reasoning_parser_for_request(
+            self.reasoning_parser,
+            settings.enable_reasoning,
+        )
+        reasoning_output = reasoning_parser.extract(content, output_token_ids)
+        return BackendGenerationResult(
+            text=reasoning_output.response,
+            input_tokens=int(response.get("tokens_evaluated", 0)),
+            output_tokens=output_tokens,
+            reasoning=reasoning_output.reasoning,
+            reasoning_tokens=reasoning_output.reasoning_tokens,
+            reasoning_parser=reasoning_output.parser,
+            tokens_per_second=resolved_tokens_per_second,
+        )
+
+    def runtime_metadata(self) -> dict[str, Any]:
+        """Return the GGUF artifact and server configuration."""
+        return {
+            "llama_cpp_model_filename": self.model_path.name,
+            "llama_cpp_context_size": int(
+                self.profile.backend_option(
+                    "context_size",
+                    self.profile.max_context_tokens,
+                )
+            ),
+            "llama_cpp_cache_type_k": self.profile.backend_option(
+                "cache_type_k", "q8_0"
+            ),
+            "llama_cpp_cache_type_v": self.profile.backend_option(
+                "cache_type_v", "q8_0"
+            ),
+        }
+
+    def unload(self) -> None:
+        """Stop the private server and remove its bounded diagnostic log."""
+        process = getattr(self, "process", None)
+        self.process = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5.0)
+        log_file = getattr(self, "_log_file", None)
+        if log_file is not None:
+            log_file.close()
+            self._log_file = None
+        log_path = getattr(self, "_log_path", None)
+        if isinstance(log_path, Path):
+            try:
+                log_path.unlink()
+            except FileNotFoundError:
+                pass
+        self.processor = None
+        gc.collect()
 
 
 class VLLMMultimodalBackend:
@@ -1439,9 +1827,7 @@ class VLLMMultimodalBackend:
                 unit="tokens",
                 elapsed_seconds=elapsed_seconds,
                 time_to_first_token_seconds=(
-                    first_token_at - started_at
-                    if first_token_at is not None
-                    else None
+                    first_token_at - started_at if first_token_at is not None else None
                 ),
                 tokens_per_second=(
                     output_tokens / elapsed_seconds
@@ -1451,7 +1837,9 @@ class VLLMMultimodalBackend:
             )
         )
 
-    async def _abort_request(self, request_id: str, engine_error: type[Exception]) -> None:
+    async def _abort_request(
+        self, request_id: str, engine_error: type[Exception]
+    ) -> None:
         """Best-effort abort one request without masking its original failure."""
         try:
             await self.llm.abort(request_id)
@@ -1539,6 +1927,8 @@ def _default_backend_factory(
         return TransformersMultimodalBackend(profile, snapshot_path, progress_callback)
     if profile.backend == "vllm":
         return VLLMMultimodalBackend(profile, snapshot_path, progress_callback)
+    if profile.backend == "llama_cpp_server":
+        return LlamaCppServerBackend(profile, snapshot_path, progress_callback)
     raise ValueError(
         f"Modal LLM profile {profile.profile_id!r} selects unknown backend "
         f"{profile.backend!r}."
@@ -1552,7 +1942,9 @@ def _comfy_loaded_model_names() -> list[str]:
 
         loaded_models = comfy.model_management.loaded_models()
     except (ImportError, AttributeError, RuntimeError) as exc:
-        logger.debug("Unable to inspect ComfyUI model residency after LLM inference: %s", exc)
+        logger.debug(
+            "Unable to inspect ComfyUI model residency after LLM inference: %s", exc
+        )
         return []
     names: list[str] = []
     for loaded_model in loaded_models:
@@ -1573,7 +1965,9 @@ class ResidentLLMManager:
         max_resident_models: int = _DEFAULT_MAX_RESIDENT_MODELS,
         memory_info: Callable[[], tuple[int, int]] | None = None,
         empty_cache: Callable[[], None] | None = None,
-        snapshot_ready: Callable[[str | Path, LLMModelProfile], bool] = is_model_snapshot_staged,
+        snapshot_ready: Callable[
+            [str | Path, LLMModelProfile], bool
+        ] = is_model_snapshot_staged,
         comfy_memory_release: Callable[[int], None] | None = None,
         execution_target: str = "modal",
         device_name: str = "cuda",
@@ -1645,7 +2039,9 @@ class ResidentLLMManager:
                 comfy.model_management.get_torch_device(),
             )
         except (ImportError, AttributeError, RuntimeError) as exc:
-            logger.debug("ComfyUI model memory release was unavailable before LLM load: %s", exc)
+            logger.debug(
+                "ComfyUI model memory release was unavailable before LLM load: %s", exc
+            )
 
     def _evict(self, profile_id: str) -> None:
         """Unload one resident backend and release cached CUDA allocations."""
@@ -1745,7 +2141,9 @@ class ResidentLLMManager:
         evicted_before_load: bool = False,
     ) -> None:
         """Evict old LLMs until the new model plus configured reserve can fit."""
-        required_bytes = int((profile.estimated_vram_gb + reserve_free_vram_gb) * _BYTES_PER_GIB)
+        required_bytes = int(
+            (profile.estimated_vram_gb + reserve_free_vram_gb) * _BYTES_PER_GIB
+        )
         self._comfy_memory_release(required_bytes)
         if evicted_before_load:
             self._empty_cache()
@@ -1931,7 +2329,9 @@ class ResidentLLMManager:
                 "file_characters": prepared_inputs.file_characters,
                 "image_count": len(prepared_inputs.images),
                 "video_frame_count": (
-                    len(prepared_inputs.video.frames) if prepared_inputs.video is not None else 0
+                    len(prepared_inputs.video.frames)
+                    if prepared_inputs.video is not None
+                    else 0
                 ),
                 "memory_total_gib": total_bytes / _BYTES_PER_GIB,
                 "memory_available_before_gib": before_free / _BYTES_PER_GIB,
@@ -1943,18 +2343,11 @@ class ResidentLLMManager:
             runtime_metadata = getattr(resident.backend, "runtime_metadata", None)
             if callable(runtime_metadata):
                 metadata.update(runtime_metadata())
-            if (
-                profile.backend == "vllm"
-                and self._vllm_mode_controller is not None
-            ):
+            if profile.backend == "vllm" and self._vllm_mode_controller is not None:
                 metadata.update(
                     {
-                        "vllm_execution_setting": (
-                            self._vllm_mode_controller.setting
-                        ),
-                        "vllm_auto_promoted": (
-                            self._vllm_mode_controller.promoted
-                        ),
+                        "vllm_execution_setting": (self._vllm_mode_controller.setting),
+                        "vllm_auto_promoted": (self._vllm_mode_controller.promoted),
                         "vllm_observed_workflow_count": (
                             self._vllm_mode_controller.observed_workflow_count
                         ),
@@ -2067,7 +2460,9 @@ def get_resident_llm_manager() -> ResidentLLMManager:
     with _RESIDENT_MANAGER_LOCK:
         if _RESIDENT_MANAGER is None:
             _RESIDENT_MANAGER = ResidentLLMManager(
-                storage_root=os.getenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", _DEFAULT_STORAGE_ROOT),
+                storage_root=os.getenv(
+                    "COMFY_MODAL_REMOTE_STORAGE_ROOT", _DEFAULT_STORAGE_ROOT
+                ),
                 max_resident_models=_read_positive_int_environment(
                     "COMFY_MODAL_LLM_MAX_RESIDENT_MODELS",
                     _DEFAULT_MAX_RESIDENT_MODELS,

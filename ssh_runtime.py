@@ -16,6 +16,7 @@ if __package__:
     from .runtime_environment import (
         COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
         COMFYUI_RUNTIME_SOURCE_FILES,
+        REMOTE_LLAMA_CPP_SERVER_IMAGE,
         REMOTE_PYTHON_VERSION,
         RemoteRuntimeIdentity,
         build_remote_runtime_identity,
@@ -32,6 +33,7 @@ else:  # pragma: no cover - remote entrypoint compatibility.
     from runtime_environment import (
         COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
         COMFYUI_RUNTIME_SOURCE_FILES,
+        REMOTE_LLAMA_CPP_SERVER_IMAGE,
         REMOTE_PYTHON_VERSION,
         RemoteRuntimeIdentity,
         build_remote_runtime_identity,
@@ -172,7 +174,11 @@ class SshRuntimeManager:
             payload = json.loads(result.stdout_text)
         except json.JSONDecodeError:
             return False
-        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        if (
+            not isinstance(payload, list)
+            or not payload
+            or not isinstance(payload[0], dict)
+        ):
             return False
         container = payload[0]
         state = container.get("State")
@@ -244,10 +250,7 @@ class SshRuntimeManager:
             and not ignored_directory_names.intersection(
                 path.relative_to(resolved_repo_root).parts
             )
-            and (
-                path.suffix == ".py"
-                or path.name in {"llm_profiles.json"}
-            )
+            and (path.suffix == ".py" or path.name in {"llm_profiles.json"})
         )
         for source_path in repo_candidates:
             relative_path = source_path.relative_to(resolved_repo_root).as_posix()
@@ -280,7 +283,9 @@ class SshRuntimeManager:
         """Return the immutable Dockerfile for one runtime identity."""
         torch_build = select_remote_torch_build(self.settings.modal_gpu)
         lines = [
-            f"FROM python:{REMOTE_PYTHON_VERSION}-slim-bookworm",
+            f"FROM python:{REMOTE_PYTHON_VERSION}-slim-bookworm AS python-runtime",
+            f"FROM {REMOTE_LLAMA_CPP_SERVER_IMAGE}",
+            "COPY --from=python-runtime /usr/local /usr/local",
             "ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1",
             _docker_run(
                 "apt-get",
@@ -337,7 +342,7 @@ class SshRuntimeManager:
                     f"COMFY_MODAL_RUNTIME_FINGERPRINT={spec.identity.fingerprint}"
                 ),
                 "WORKDIR /opt/comfy-remote/repo",
-                "ENTRYPOINT [\"python\",\"-m\",\"remote.ssh_worker\",\"serve\"]",
+                'ENTRYPOINT ["python","-m","remote.ssh_worker","serve"]',
                 "",
             ]
         )
@@ -422,7 +427,9 @@ class SshRuntimeManager:
                 else:
                     if runtime.get("runtime_fingerprint") == spec.identity.fingerprint:
                         return
-                    last_error = "worker fingerprint does not match the requested runtime"
+                    last_error = (
+                        "worker fingerprint does not match the requested runtime"
+                    )
             else:
                 last_error = result.stderr_text.strip() or "worker is still starting"
             time.sleep(0.5)

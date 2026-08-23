@@ -127,7 +127,7 @@ def test_accurate_triton_listener_distinguishes_persistent_cache_hits(
     assert len(previous_events) == 2
     assert fake_jit_monitor._setup_triton_jit_hook is not original_setup_hook
     assert result == "engine-complete"
-    assert engine_calls == [(('spawned',), {})]
+    assert engine_calls == [(("spawned",), {})]
     assert modal_llm_runtime_module.triton_compile_listener_engine_pids() == (
         modal_llm_runtime_module.os.getpid(),
     )
@@ -187,7 +187,9 @@ def test_spawned_engine_core_recovers_original_entrypoint_and_installs_listener(
         None,
     )
 
-    result = modal_llm_runtime_module._run_vllm_engine_core_with_accurate_triton_listener()
+    result = (
+        modal_llm_runtime_module._run_vllm_engine_core_with_accurate_triton_listener()
+    )
 
     assert result == "started"
     assert startup_observations == [(modal_llm_runtime_module.os.getpid(),)]
@@ -358,9 +360,7 @@ def test_curated_profile_adapts_to_apple_without_mutating_modal_profile(
     llm_profiles_module: Any,
 ) -> None:
     """One saved curated id should resolve independently for both targets."""
-    modal_profile = llm_profiles_module.get_llm_profile(
-        "smolvlm2-2.2b-instruct"
-    )
+    modal_profile = llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct")
 
     local_profile = llm_profiles_module.profile_for_execution_target(
         modal_profile,
@@ -826,6 +826,63 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     )
 
 
+def test_curated_huihui_gguf_profile_pins_one_16_gib_artifact(
+    llm_profiles_module: Any,
+) -> None:
+    """The lambda profile should name one bounded GGUF rather than the whole repo."""
+    profile = llm_profiles_module.get_llm_profile(
+        "huihui-qwen3.8-27b-abliterated-q2-k-gguf"
+    )
+
+    assert profile.backend == "llama_cpp_server"
+    assert profile.repository == "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF"
+    assert profile.estimated_vram_gb == 14.5
+    assert profile.modalities == frozenset({"text", "file"})
+    assert profile.backend_option("model_filename") == (
+        "Huihui-Qwen3.8-27B-abliterated-Q2_K.gguf"
+    )
+
+
+def test_gguf_stager_downloads_only_selected_model_and_pinned_tokenizer(
+    llm_staging_module: Any,
+    tmp_path: Path,
+) -> None:
+    """GGUF staging must not fetch every quant or the tokenizer repo's weights."""
+    profile = llm_staging_module.get_llm_profile(
+        "huihui-qwen3.8-27b-abliterated-q2-k-gguf"
+    )
+    calls: list[dict[str, Any]] = []
+
+    def fake_snapshot_download(**kwargs: Any) -> str:
+        """Materialize the selected GGUF and tokenizer sentinel."""
+        calls.append(kwargs)
+        snapshot_path = Path(kwargs["local_dir"])
+        snapshot_path.mkdir(parents=True, exist_ok=True)
+        if kwargs["repo_id"] == profile.repository:
+            (snapshot_path / profile.backend_option("model_filename")).write_bytes(
+                b"gguf"
+            )
+        else:
+            (snapshot_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        return str(snapshot_path)
+
+    result = llm_staging_module.stage_model_profile(
+        profile.profile_id,
+        tmp_path,
+        profile=profile,
+        snapshot_download=fake_snapshot_download,
+    )
+
+    assert result.downloaded is True
+    assert len(calls) == 2
+    assert calls[0]["allow_patterns"][-1] == profile.backend_option("model_filename")
+    assert "*.gguf" not in calls[0]["allow_patterns"]
+    assert "*.safetensors" not in calls[1]["allow_patterns"]
+    assert calls[1]["repo_id"] == profile.backend_option("tokenizer_repository")
+    assert calls[1]["revision"] == profile.backend_option("tokenizer_revision")
+    assert llm_staging_module.is_model_snapshot_staged(tmp_path, profile)
+
+
 def test_provider_neutral_stager_resolves_and_stages_model_reference(
     llm_staging_module: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -1148,9 +1205,7 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
             observed["generate_kwargs"] = kwargs
             yield SimpleNamespace(
                 prompt_token_ids=[1, 2, 3],
-                outputs=[
-                    SimpleNamespace(text="<think>consider", token_ids=[10, 1])
-                ],
+                outputs=[SimpleNamespace(text="<think>consider", token_ids=[10, 1])],
             )
             yield SimpleNamespace(
                 prompt_token_ids=[1, 2, 3],
@@ -1244,11 +1299,69 @@ def test_vllm_backend_uses_explicit_kv_budget_and_local_multimodal_data(
     assert result.reasoning == "consider carefully"
     assert result.reasoning_tokens == 2
     assert result.input_tokens == 3
-    assert observed["generate_kwargs"]["sampling_params"].kwargs[
-        "skip_special_tokens"
-    ] is False
+    assert (
+        observed["generate_kwargs"]["sampling_params"].kwargs["skip_special_tokens"]
+        is False
+    )
     assert observed["generate_kwargs"]["request_id"].startswith("modal-llm-")
     assert observed["shutdown"] is True
+
+
+def test_llama_cpp_backend_generates_with_curated_gguf_profile(
+    modal_llm_runtime_module: Any,
+    llm_profiles_module: Any,
+    llm_reasoning_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The GGUF adapter should preserve reasoning parsing and token telemetry."""
+    profile = llm_profiles_module.get_llm_profile(
+        "huihui-qwen3.8-27b-abliterated-q2-k-gguf"
+    )
+    model_path = tmp_path / profile.backend_option("model_filename")
+    model_path.write_bytes(b"gguf")
+    backend = object.__new__(modal_llm_runtime_module.LlamaCppServerBackend)
+    backend.profile = profile
+    backend.snapshot_path = tmp_path
+    backend.model_path = model_path
+    backend.processor = SimpleNamespace(
+        tokenizer=_FakeReasoningTokenizer(),
+        apply_chat_template=lambda *args, **kwargs: "rendered prompt",
+    )
+    backend.reasoning_parser = llm_reasoning_module.Qwen3ReasoningParser(
+        backend.processor.tokenizer
+    )
+    backend._completion = lambda payload, timeout_seconds: {
+        "content": "<think>consider</think>answer",
+        "tokens": [10, 1, 11, 3],
+        "tokens_evaluated": 7,
+        "timings": {"predicted_per_second": 12.5},
+    }
+    progress: list[Any] = []
+
+    result = backend.generate(
+        modal_llm_runtime_module.PreparedLLMInputs(
+            prompt="hello",
+            system_prompt="",
+            images=(),
+            video=None,
+            file_characters=0,
+            file_count=0,
+        ),
+        modal_llm_runtime_module.LLMGenerationSettings(
+            max_new_tokens=16,
+            temperature=0.2,
+            top_p=0.95,
+            seed=4,
+        ),
+        progress.append,
+    )
+
+    assert result.text == "final answer"
+    assert result.reasoning == "consider"
+    assert result.input_tokens == 7
+    assert result.output_tokens == 4
+    assert result.tokens_per_second == 12.5
+    assert [event.stage for event in progress] == ["prefill", "generating"]
 
 
 @pytest.mark.parametrize(
@@ -1314,9 +1427,12 @@ def test_vllm_auto_mode_can_promote_before_first_llm_load(
         controller,
     )
 
-    assert runtime_profile.backend_option(
-        modal_llm_runtime_module._VLLM_RUNTIME_MODE_OPTION
-    ) == "throughput"
+    assert (
+        runtime_profile.backend_option(
+            modal_llm_runtime_module._VLLM_RUNTIME_MODE_OPTION
+        )
+        == "throughput"
+    )
 
 
 def test_vllm_auto_mode_preserves_throughput_on_memory_recovery_worker(
@@ -1639,9 +1755,7 @@ def test_vllm_backend_translates_private_runtime_errors(
         RuntimeError,
         match="vLLM generation failed for profile 'generated-profile'",
     ):
-        asyncio.run(
-            backend._generate_async(prepared, settings, lambda progress: None)
-        )
+        asyncio.run(backend._generate_async(prepared, settings, lambda progress: None))
 
 
 def test_vllm_request_disables_thinking_and_boundary_parsing(
@@ -1802,9 +1916,7 @@ def test_local_storage_uses_comfyui_model_directory(
     storage_root = local_llm_runtime_module.local_llm_storage_root()
 
     assert storage_root == (tmp_path / "models" / "modal_llm").resolve()
-    assert paths == [
-        f"modal_llm:{(tmp_path / 'models' / 'modal_llm').resolve()}:True"
-    ]
+    assert paths == [f"modal_llm:{(tmp_path / 'models' / 'modal_llm').resolve()}:True"]
 
 
 def test_local_runtime_rejects_non_apple_hardware_actionably(

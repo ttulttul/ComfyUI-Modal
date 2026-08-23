@@ -39,6 +39,9 @@ _SNAPSHOT_ALLOW_PATTERNS = (
     "video_preprocessor_config.json",
     "vocab*",
 )
+_TOKENIZER_ALLOW_PATTERNS = tuple(
+    pattern for pattern in _SNAPSHOT_ALLOW_PATTERNS if "safetensors" not in pattern
+)
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,54 @@ def _marker_path(snapshot_path: Path) -> Path:
     return snapshot_path / _COMPLETE_MARKER_FILENAME
 
 
+def _required_model_path(
+    snapshot_path: Path,
+    profile: LLMModelProfile,
+) -> Path:
+    """Return the profile's required model artifact inside one snapshot."""
+    model_filename = profile.backend_option("model_filename")
+    if model_filename is None:
+        return snapshot_path / "config.json"
+    return snapshot_path / str(model_filename)
+
+
+def _tokenizer_source(profile: LLMModelProfile) -> tuple[str, str] | None:
+    """Return an optional separately pinned tokenizer snapshot source."""
+    repository = profile.backend_option("tokenizer_repository")
+    revision = profile.backend_option("tokenizer_revision")
+    if repository is None and revision is None:
+        return None
+    normalized_repository = str(repository or "").strip()
+    normalized_revision = str(revision or "").strip().lower()
+    if "/" not in normalized_repository or len(normalized_revision) != 40:
+        raise ValueError(
+            f"Modal LLM profile {profile.profile_id!r} has an invalid separately "
+            "pinned tokenizer source."
+        )
+    return normalized_repository, normalized_revision
+
+
+def _snapshot_has_required_artifacts(
+    snapshot_path: Path,
+    profile: LLMModelProfile,
+) -> bool:
+    """Return whether model and optional tokenizer artifacts are complete."""
+    if not _required_model_path(snapshot_path, profile).is_file():
+        return False
+    return (
+        _tokenizer_source(profile) is None
+        or (snapshot_path / "tokenizer_config.json").is_file()
+    )
+
+
+def _model_allow_patterns(profile: LLMModelProfile) -> tuple[str, ...]:
+    """Return a bounded allowlist for this profile's primary repository."""
+    model_filename = profile.backend_option("model_filename")
+    if model_filename is None:
+        return _SNAPSHOT_ALLOW_PATTERNS
+    return (*_TOKENIZER_ALLOW_PATTERNS, str(model_filename))
+
+
 def _read_marker(snapshot_path: Path) -> dict[str, Any] | None:
     """Return a valid completion marker, if present."""
     marker_path = _marker_path(snapshot_path)
@@ -181,7 +232,7 @@ def is_model_snapshot_staged(
         marker
         and marker.get("repository") == profile.repository
         and marker.get("revision") == profile.revision
-        and (snapshot_path / "config.json").is_file()
+        and _snapshot_has_required_artifacts(snapshot_path, profile)
     )
 
 
@@ -213,7 +264,7 @@ def _legacy_snapshot_matches(
         marker
         and marker.get("repository") == profile.repository
         and marker.get("revision") == profile.revision
-        and (snapshot_path / "config.json").is_file()
+        and _snapshot_has_required_artifacts(snapshot_path, profile)
     )
 
 
@@ -338,24 +389,42 @@ def stage_model_profile(
             "repo_id": profile.repository,
             "revision": profile.revision,
             "local_dir": str(snapshot_path),
-            "token": os.getenv("HF_TOKEN")
-            or os.getenv("HUGGING_FACE_HUB_TOKEN"),
-            "allow_patterns": _SNAPSHOT_ALLOW_PATTERNS,
+            "token": os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"),
+            "allow_patterns": _model_allow_patterns(profile),
         }
         if progress_callback is not None:
-            download_options["tqdm_class"] = _snapshot_tqdm_class(
-                progress_callback
-            )
+            download_options["tqdm_class"] = _snapshot_tqdm_class(progress_callback)
         resolved_path = Path(snapshot_download(**download_options)).resolve()
         if resolved_path != snapshot_path.resolve():
             raise RuntimeError(
                 f"Hugging Face staged {profile.profile_id!r} at unexpected path "
                 f"{resolved_path}; expected {snapshot_path.resolve()}."
             )
-        if not (snapshot_path / "config.json").is_file():
+        tokenizer_source = _tokenizer_source(profile)
+        if tokenizer_source is not None:
+            tokenizer_repository, tokenizer_revision = tokenizer_source
+            tokenizer_options: dict[str, Any] = {
+                "repo_id": tokenizer_repository,
+                "revision": tokenizer_revision,
+                "local_dir": str(snapshot_path),
+                "token": download_options["token"],
+                "allow_patterns": _TOKENIZER_ALLOW_PATTERNS,
+            }
+            if progress_callback is not None:
+                tokenizer_options["tqdm_class"] = _snapshot_tqdm_class(
+                    progress_callback
+                )
+            tokenizer_path = Path(snapshot_download(**tokenizer_options)).resolve()
+            if tokenizer_path != snapshot_path.resolve():
+                raise RuntimeError(
+                    f"Hugging Face staged tokenizer for {profile.profile_id!r} at "
+                    f"unexpected path {tokenizer_path}; expected "
+                    f"{snapshot_path.resolve()}."
+                )
+        if not _snapshot_has_required_artifacts(snapshot_path, profile):
             raise RuntimeError(
-                f"Staged Modal LLM profile {profile.profile_id!r} is missing "
-                "config.json."
+                f"Staged Modal LLM profile {profile.profile_id!r} is missing its "
+                "required model or tokenizer artifacts."
             )
         _write_marker(snapshot_path, profile)
     result = StagedModelSnapshot(
@@ -417,9 +486,12 @@ def resolve_and_stage_model_references(
                 )
             )
         resolve_started_at = time.perf_counter()
-        profile, manifest_path, manifest_created, scan_complete = (
-            _resolve_profile_for_staging(model_reference, storage_root)
-        )
+        (
+            profile,
+            manifest_path,
+            manifest_created,
+            scan_complete,
+        ) = _resolve_profile_for_staging(model_reference, storage_root)
         resolve_elapsed_seconds = time.perf_counter() - resolve_started_at
         staged = stage_model_profile(
             profile.profile_id,

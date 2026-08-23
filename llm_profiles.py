@@ -36,7 +36,7 @@ _PROFILE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SUPPORTED_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 _SUPPORTED_MODALITIES = frozenset({"text", "image", "video", "file"})
-_SUPPORTED_BACKENDS = frozenset({"transformers", "vllm", "mlx_vlm"})
+_SUPPORTED_BACKENDS = frozenset({"transformers", "vllm", "mlx_vlm", "llama_cpp_server"})
 _SUPPORTED_EXECUTION_TARGETS = frozenset({"modal", "local_apple"})
 _SUPPORTED_REASONING_PARSERS = frozenset({"", "none", "qwen3"})
 _PROFILE_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -180,6 +180,17 @@ class LLMModelProfile:
                 f"Modal LLM profile {self.profile_id!r} has unsupported reasoning "
                 f"parser {self.reasoning_parser!r}."
             )
+        model_filename = self.backend_option("model_filename")
+        if model_filename is not None:
+            normalized_filename = str(model_filename).strip()
+            if (
+                not normalized_filename
+                or Path(normalized_filename).name != normalized_filename
+            ):
+                raise ValueError(
+                    f"Modal LLM profile {self.profile_id!r} has unsafe model "
+                    f"filename {model_filename!r}."
+                )
         if self.source not in {"curated", "generated"}:
             raise ValueError(
                 f"Modal LLM profile {self.profile_id!r} has invalid source "
@@ -225,13 +236,9 @@ class LLMModelProfile:
 
     def storage_relative_path(self) -> Path:
         """Return this repository revision's runtime-independent weight path."""
-        repository_digest = hashlib.sha256(
-            self.repository.encode("utf-8")
-        ).hexdigest()
+        repository_digest = hashlib.sha256(self.repository.encode("utf-8")).hexdigest()
         return (
-            Path(LLM_MODEL_DIRECTORY_NAME)
-            / f"repo-{repository_digest}"
-            / self.revision
+            Path(LLM_MODEL_DIRECTORY_NAME) / f"repo-{repository_digest}" / self.revision
         )
 
     def backend_option(self, name: str, default: Any = None) -> Any:
