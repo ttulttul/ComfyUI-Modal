@@ -340,6 +340,7 @@ class SshRuntimeManager:
                     f"COMFY_MODAL_LOCAL_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
                     f"COMFY_MODAL_REMOTE_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
                     "COMFY_MODAL_EXECUTION_MODE=local COMFY_MODAL_REMOTE_WORKER=1 "
+                    "COMFY_MODAL_LLM_EXECUTION_TARGET=ssh_docker "
                     f"COMFY_MODAL_RUNTIME_FINGERPRINT={spec.identity.fingerprint}"
                 ),
                 "WORKDIR /opt/comfy-remote/repo",

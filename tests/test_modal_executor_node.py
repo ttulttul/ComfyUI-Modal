@@ -1920,11 +1920,15 @@ def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
     payload = {
         "prompt_id": "prompt-spec",
         "component_id": "llm-component",
+        "execution_provider": "modal",
+        "execution_environment_id": "modal:RTX-PRO-6000",
         "remote_worker_affinity_group": "llm",
         "speculative_remote_prewarm_target": {
             "prompt_id": "prompt-spec",
             "component_id": "comfy-component",
             "modal_gpu": "RTX-PRO-6000",
+            "execution_provider": "modal",
+            "execution_environment_id": "modal:RTX-PRO-6000",
             "remote_worker_affinity_group": "comfy",
             "remote_local_gap_pool": True,
             "subgraph_prompt": {
@@ -1962,6 +1966,49 @@ def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
     ] == ["UNETLoader"]
 
 
+def test_speculative_affinity_prewarm_rejects_cross_provider_target(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """An SSH continuation must never stage its payload on a Modal worker."""
+    submitted_tasks: list[tuple[Any, tuple[Any, ...]]] = []
+
+    class FakeExecutor:
+        """Executor double that records unexpected warmup jobs."""
+
+        def submit(self, fn: Any, *args: Any) -> Future[Any]:
+            """Capture one scheduled job."""
+            submitted_tasks.append((fn, args))
+            return Future()
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_REMOTE_MODAL_WARMUP_EXECUTOR",
+        FakeExecutor(),
+    )
+    payload = {
+        "prompt_id": "prompt-cross-provider",
+        "component_id": "modal-component",
+        "execution_provider": "modal",
+        "execution_environment_id": "modal:H200",
+        "speculative_remote_prewarm_target": {
+            "prompt_id": "prompt-cross-provider",
+            "component_id": "ssh-component",
+            "execution_provider": "ssh_docker",
+            "execution_environment_id": "lambda",
+        },
+    }
+
+    assert (
+        remote_modal_app_module._schedule_speculative_affinity_prewarm(
+            payload,
+            reason="provider_boundary",
+        )
+        is False
+    )
+    assert submitted_tasks == []
+
+
 def test_local_gap_keepalive_is_bounded_and_stopped_by_next_remote_component(
     remote_modal_app_module: Any,
     monkeypatch: Any,
@@ -1988,15 +2035,19 @@ def test_local_gap_keepalive_is_bounded_and_stopped_by_next_remote_component(
     remote_modal_app_module.get_settings.cache_clear()
     with remote_modal_app_module._LOCAL_GAP_KEEPALIVES_LOCK:
         remote_modal_app_module._LOCAL_GAP_KEEPALIVES.clear()
-    producer_payload = {
-        "prompt_id": "prompt-gap",
-        "component_id": "component-a",
-        "keepalive_after_remote_component": True,
-    }
-    consumer_payload = {
-        "prompt_id": "prompt-gap",
-        "component_id": "component-b",
-        "stop_local_gap_keepalive_before_remote_component": True,
+        producer_payload = {
+            "prompt_id": "prompt-gap",
+            "component_id": "component-a",
+            "execution_provider": "modal",
+            "execution_environment_id": "modal:RTX-PRO-6000",
+            "keepalive_after_remote_component": True,
+        }
+        consumer_payload = {
+            "prompt_id": "prompt-gap",
+            "component_id": "component-b",
+            "execution_provider": "modal",
+            "execution_environment_id": "modal:RTX-PRO-6000",
+            "stop_local_gap_keepalive_before_remote_component": True,
     }
 
     try:
@@ -6405,7 +6456,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
                 "llm_staged",
                 "LLM staging complete (0.0 GiB downloaded); starting GPU worker",
             ),
-            ("starting", "Starting Modal component"),
+            ("starting", "Starting remote component on Modal"),
         ]
 
 
@@ -8120,7 +8171,7 @@ def test_remote_modal_consumes_streamed_progress_and_result(
                 "prompt_id": "prompt-1",
                 "node_ids": ["7", "8"],
                 "modal_gpu": "B300",
-                "status_message": "Receiving Modal outputs",
+                    "status_message": "Receiving remote outputs from Modal",
             },
             "client-1",
         ),
@@ -8200,7 +8251,7 @@ def test_emit_local_remote_dispatch_status_marks_component_starting(
                 "prompt_id": "prompt-1",
                 "node_ids": ["7", "8"],
                 "modal_gpu": "B300",
-                "status_message": "Starting Modal component",
+                    "status_message": "Starting remote component on Modal",
             },
             "client-1",
         )

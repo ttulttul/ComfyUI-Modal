@@ -217,7 +217,11 @@ class ModalLLM(io.ComfyNode):
     ) -> io.NodeOutput:
         """Run one cancellation-aware resident inference request."""
         is_remote = os.getenv("COMFY_MODAL_REMOTE_WORKER") == "1"
-        execution_target = "modal" if is_remote else "local_apple"
+        execution_target = (
+            os.getenv("COMFY_MODAL_LLM_EXECUTION_TARGET", "modal")
+            if is_remote
+            else "local_apple"
+        )
         inference_runner = (
             run_modal_llm_inference if is_remote else run_local_llm_inference
         )

@@ -671,6 +671,7 @@ function currentGlobalStatus() {
     statusCurrent: state.statusCurrent ?? null,
     statusTotal: state.statusTotal ?? null,
     modalGpu: state.modalGpu ?? null,
+    executionLabel: state.executionLabel ?? null,
     updatedAt: state.updatedAt,
   }));
   phases.sort((left, right) => right.updatedAt - left.updatedAt);
@@ -1236,21 +1237,21 @@ function refreshGlobalStatusElement() {
     dot.style.background = SETUP_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = activeState.statusMessage ?? "Syncing graph with Modal";
+    text.textContent = activeState.statusMessage ?? "Preparing remote workflow";
   } else if (activeState.phase === STATE_STARTING) {
     element.style.borderColor = "rgba(234, 179, 8, 0.58)";
     element.style.background = "rgba(54, 45, 6, 0.94)";
     dot.style.background = STARTING_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(234, 179, 8, 0.2)";
     dot.style.animation = "modal-status-pulse 0.85s ease-in-out infinite";
-    text.textContent = activeState.statusMessage ?? "Starting Modal component";
+    text.textContent = activeState.statusMessage ?? "Starting remote component";
   } else if (activeState.phase === STATE_WAITING) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
     element.style.background = "rgba(61, 42, 9, 0.94)";
     dot.style.background = SETUP_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(245, 158, 11, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = activeState.statusMessage ?? "Waiting for Modal startup";
+    text.textContent = activeState.statusMessage ?? "Waiting for remote startup";
   } else if (activeState.phase === EXECUTION_PHASE) {
     element.style.borderColor = "rgba(34, 197, 94, 0.55)";
     element.style.background = hasBatchProgress
@@ -1261,37 +1262,40 @@ function refreshGlobalStatusElement() {
     dot.style.background = ACTIVE_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(34, 197, 94, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
+    const executionLabel = activeState.executionLabel
+      ? ` via ${activeState.executionLabel}`
+      : "";
     text.textContent = hasBatchProgress
-      ? `Modal workflow running on ${activeState.nodeCount} ${nodeLabel} · ${Math.round(batchValue)}/${Math.round(batchMax)}`
-      : `Modal workflow running on ${activeState.nodeCount} ${nodeLabel}`;
+      ? `Remote workflow running on ${activeState.nodeCount} ${nodeLabel}${executionLabel} · ${Math.round(batchValue)}/${Math.round(batchMax)}`
+      : `Remote workflow running on ${activeState.nodeCount} ${nodeLabel}${executionLabel}`;
   } else if (activeState.phase === STATE_FINALIZING) {
     element.style.borderColor = "rgba(59, 130, 246, 0.55)";
     element.style.background = "rgba(15, 23, 42, 0.94)";
     dot.style.background = FINALIZING_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(59, 130, 246, 0.18)";
     dot.style.animation = "modal-status-pulse 1.1s ease-in-out infinite";
-    text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";
+    text.textContent = activeState.statusMessage ?? "Receiving remote outputs";
   } else if (activeState.phase === STATE_CANCELLING) {
     element.style.borderColor = "rgba(251, 113, 133, 0.58)";
     element.style.background = "rgba(76, 5, 25, 0.94)";
     dot.style.background = CANCELLING_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(251, 113, 133, 0.2)";
     dot.style.animation = "modal-status-pulse 0.75s ease-in-out infinite";
-    text.textContent = activeState.statusMessage ?? "Cancelling Modal workflow";
+    text.textContent = activeState.statusMessage ?? "Cancelling remote workflow";
   } else if (activeState.phase === STATE_ERROR) {
     element.style.borderColor = "rgba(239, 68, 68, 0.55)";
     element.style.background = "rgba(69, 10, 10, 0.94)";
     dot.style.background = ERROR_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(239, 68, 68, 0.18)";
     dot.style.animation = "none";
-    text.textContent = "Modal workflow failed";
+    text.textContent = "Remote workflow failed";
   } else {
     element.style.borderColor = "rgba(29, 155, 240, 0.5)";
     element.style.background = "rgba(15, 23, 42, 0.94)";
     dot.style.background = IDLE_BORDER_COLOR;
     dot.style.boxShadow = "0 0 0 6px rgba(29, 155, 240, 0.18)";
     dot.style.animation = "none";
-    text.textContent = "Modal workflow active";
+    text.textContent = "Remote workflow active";
   }
 
   dot.style.width = "10px";
@@ -1330,6 +1334,8 @@ function setGlobalStatusPhase(promptId, phase, nodeCount, details = null) {
     statusCurrent: details?.current ?? existingState?.statusCurrent ?? null,
     statusTotal: details?.total ?? existingState?.statusTotal ?? null,
     modalGpu: detailModalGpu ?? existingState?.modalGpu ?? promptState?.modalGpu ?? null,
+    executionLabel:
+      existingState?.executionLabel ?? promptState?.executionLabel ?? null,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -1361,6 +1367,10 @@ function setGlobalStatusBatchProgress(promptId, value, maxValue) {
     statusTotal: existingState?.statusTotal ?? null,
     modalGpu:
       existingState?.modalGpu ?? modalPromptStates.get(promptId)?.modalGpu ?? null,
+    executionLabel:
+      existingState?.executionLabel ??
+      modalPromptStates.get(promptId)?.executionLabel ??
+      null,
     updatedAt: nowMs(),
   });
   refreshGlobalStatusElement();
@@ -1399,7 +1409,7 @@ function markPromptCancellationRequested(promptId) {
   endSyntheticExecutionUi(promptId);
   setPromptActiveNode(promptId, null);
   setGlobalStatusPhase(promptId, STATE_CANCELLING, remoteNodeIds.length || 1, {
-    message: "Cancelling Modal workflow",
+    message: "Cancelling remote workflow",
   });
   if (remoteNodeIds.length > 0) {
     setNodesPhase(remoteNodeIds, STATE_CANCELLING, promptId);
@@ -1745,7 +1755,7 @@ function refreshModalUiAfterVisibilityChange() {
 /**
  * Return the prompt metadata bucket, creating it if needed.
  * @param {string} promptId
- * @returns {{ startedAt: number, modalGpu: string | null, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, componentLabelByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
+ * @returns {{ startedAt: number, modalGpu: string | null, executionLabel: string | null, remoteNodeIds: string[], componentsByRepresentative: Map<string, string[]>, componentNodeIdsByMember: Map<string, string[]>, representativeNodeIdByMember: Map<string, string>, componentLabelByMember: Map<string, string>, laneNodeIdsByLane: Map<string, string> }}
  */
 function ensurePromptState(promptId) {
   if (isPromptTerminal(promptId)) {
@@ -1756,6 +1766,7 @@ function ensurePromptState(promptId) {
     modalPromptStates.set(promptId, {
       startedAt,
       modalGpu: null,
+      executionLabel: null,
       remoteNodeIds: [],
       componentsByRepresentative: new Map(),
       componentNodeIdsByMember: new Map(),
@@ -4972,6 +4983,15 @@ function patchQueuePrompt() {
         const usesSshExecution = executionAssignments.some(
           (assignment) => assignment?.provider === "ssh_docker",
         );
+        const executionEnvironmentLabels = Array.from(
+          new Set(
+            executionAssignments.map((assignment) =>
+              assignment?.provider === "modal"
+                ? `Modal ${acceptedModalGpu}`
+                : String(assignment?.environment_id ?? "self-hosted"),
+            ),
+          ),
+        );
         const resolvedRemoteNodeIds = (responsePayload.modal_remote_node_ids ?? []).map((nodeIdValue) =>
           String(nodeIdValue),
         );
@@ -4985,6 +5005,7 @@ function patchQueuePrompt() {
         if (!promptState) {
           return responsePayload;
         }
+        promptState.executionLabel = executionEnvironmentLabels.join(" + ") || null;
         const acceptedRemoteNodeIds =
           promptState.remoteNodeIds.length > 0 ? promptState.remoteNodeIds : remoteNodeIds;
         if (!isPromptQueuedBehindActiveModal(promptId)) {

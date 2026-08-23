@@ -3596,12 +3596,25 @@ def _emit_local_modal_status(
     prompt_server.send_sync("modal_status", payload, client_id)
 
 
+def _remote_execution_destination(payload: Mapping[str, Any]) -> str:
+    """Return the user-facing destination for a provider-stamped payload."""
+    environment_id = str(payload.get("execution_environment_id") or "").strip()
+    provider = str(payload.get("execution_provider") or "modal").strip()
+    return (
+        environment_id
+        if provider != "modal" and environment_id
+        else "Modal"
+    )
+
+
 def _emit_local_remote_dispatch_status(payload: dict[str, Any]) -> None:
-    """Tell the local UI a remote component was dispatched before Modal streams progress."""
+    """Tell the local UI a remote component was dispatched before progress streams."""
     _emit_local_remote_startup_status(
         payload,
         phase="starting",
-        status_message="Starting Modal component",
+        status_message=(
+            f"Starting remote component on {_remote_execution_destination(payload)}"
+        ),
     )
 
 
@@ -4774,7 +4787,10 @@ def _consume_remote_payload_stream(
                         phase="finalizing",
                         node_ids=node_ids,
                         modal_gpu=modal_gpu,
-                        status_message="Receiving Modal outputs",
+                        status_message=(
+                            "Receiving remote outputs from "
+                            f"{_remote_execution_destination(payload)}"
+                        ),
                     )
                     continue
                 _emit_local_modal_status(
@@ -7719,6 +7735,19 @@ def _schedule_speculative_affinity_prewarm(
     target_payload = payload.get(_SPECULATIVE_PREWARM_TARGET_KEY)
     if not isinstance(target_payload, Mapping):
         return False
+    if (
+        payload.get("execution_provider") != "modal"
+        or target_payload.get("execution_provider") != "modal"
+        or payload.get("execution_environment_id")
+        != target_payload.get("execution_environment_id")
+    ):
+        logger.debug(
+            "Skipping speculative Modal prewarm across execution environments "
+            "source=%s target=%s.",
+            payload.get("execution_environment_id"),
+            target_payload.get("execution_environment_id"),
+        )
+        return False
 
     normalized_target_payload = copy.deepcopy(dict(target_payload))
     settings = _settings_for_payload(normalized_target_payload)
@@ -7972,7 +8001,10 @@ def _run_local_gap_keepalive(
 
 def _start_local_gap_keepalive(payload: Mapping[str, Any]) -> bool:
     """Retain one remote affinity slot while a downstream local gap executes."""
-    if not bool(payload.get("keepalive_after_remote_component")):
+    if (
+        payload.get("execution_provider") != "modal"
+        or not bool(payload.get("keepalive_after_remote_component"))
+    ):
         return False
     settings = _settings_for_payload(payload)
     duration_seconds = max(0.0, float(settings.local_gap_keepalive_seconds))

@@ -2588,6 +2588,10 @@ def get_resident_llm_manager() -> ResidentLLMManager:
     global _RESIDENT_MANAGER
     with _RESIDENT_MANAGER_LOCK:
         if _RESIDENT_MANAGER is None:
+            execution_target = os.getenv(
+                "COMFY_MODAL_LLM_EXECUTION_TARGET",
+                "modal",
+            )
             _RESIDENT_MANAGER = ResidentLLMManager(
                 storage_root=os.getenv(
                     "COMFY_MODAL_REMOTE_STORAGE_ROOT", _DEFAULT_STORAGE_ROOT
@@ -2599,6 +2603,12 @@ def get_resident_llm_manager() -> ResidentLLMManager:
                 memory_recovery_timeout_seconds=_read_float_environment(
                     "COMFY_MODAL_LLM_MEMORY_RECOVERY_TIMEOUT_SECONDS",
                     _DEFAULT_MEMORY_RECOVERY_TIMEOUT_SECONDS,
+                ),
+                execution_target=execution_target,
+                device_name=(
+                    "cuda (SSH Docker)"
+                    if execution_target == "ssh_docker"
+                    else "cuda"
                 ),
             )
         return _RESIDENT_MANAGER

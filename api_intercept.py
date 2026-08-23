@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from aiohttp import web
 
@@ -87,7 +87,6 @@ _LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
         MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
     }
 )
-_SSH_CAPABILITY_REFRESH_SECONDS = 5 * 60
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
@@ -125,6 +124,8 @@ _SPECULATIVE_PREWARM_PAYLOAD_FIELDS = frozenset(
         "component_id",
         "prompt_id",
         "modal_gpu",
+        "execution_provider",
+        "execution_environment_id",
         "remote_worker_affinity_group",
         "remote_local_gap_pool",
         "subgraph_prompt",
@@ -408,35 +409,24 @@ def _configured_ssh_hosts(settings: ModalSyncSettings) -> tuple[SshHostConfig, .
 
 
 def _schedulable_ssh_hosts(settings: ModalSyncSettings) -> tuple[SshHostConfig, ...]:
-    """Refresh stale enabled hosts concurrently before cost-aware scheduling."""
+    """Probe every enabled host immediately before cost-aware scheduling."""
     hosts = _configured_ssh_hosts(settings)
     registry = _ssh_host_registry(settings)
     if registry is None:
         return hosts
-    now = time.time()
-    stale_hosts = [host for host in hosts if _ssh_host_probe_is_stale(host, now)]
-    if not stale_hosts:
+    probe_hosts = [host for host in hosts if host.enabled and not host.draining]
+    if not probe_hosts:
         return hosts
 
-    with ThreadPoolExecutor(max_workers=min(8, len(stale_hosts))) as executor:
+    with ThreadPoolExecutor(max_workers=min(8, len(probe_hosts))) as executor:
         refreshed = {
             host.environment_id: future.result()
             for host, future in (
                 (host, executor.submit(_refresh_ssh_host, host, registry))
-                for host in stale_hosts
+                for host in probe_hosts
             )
         }
     return tuple(refreshed.get(host.environment_id, host) for host in hosts)
-
-
-def _ssh_host_probe_is_stale(host: SshHostConfig, now: float) -> bool:
-    """Return whether an enabled host needs a fresh capability/health probe."""
-    if not host.enabled or host.draining:
-        return False
-    capabilities = host.capabilities
-    if capabilities is None or capabilities.probed_at_epoch is None:
-        return True
-    return now - capabilities.probed_at_epoch > _SSH_CAPABILITY_REFRESH_SECONDS
 
 
 def _refresh_ssh_host(
@@ -471,21 +461,6 @@ def _refresh_ssh_host(
                 health=EnvironmentHealth.UNAVAILABLE,
                 last_error=str(exc),
             )
-
-
-def _component_minimum_vram_bytes(
-    component: RemoteComponentPlan,
-    prompt: Mapping[str, Any],
-    preferences: WorkflowExecutionPreferences,
-    settings: ModalSyncSettings,
-) -> int:
-    """Return the conservative GPU VRAM floor for one remote component."""
-    return _component_memory_estimate(
-        component,
-        prompt,
-        preferences,
-        settings,
-    ).minimum_vram_bytes
 
 
 def _prompt_llm_model_references(prompt: Mapping[str, Any]) -> tuple[str, ...]:
@@ -605,6 +580,30 @@ def _component_required_provider(
             and getattr(profile, "backend", "") == "llama_cpp_server"
         ):
             return ExecutionProvider.SSH_DOCKER
+    return None
+
+
+def _prompt_node_required_provider(
+    prompt_node: Mapping[str, Any],
+) -> ExecutionProvider | None:
+    """Return the provider required by one curated node backend, when known."""
+    if str(prompt_node.get("class_type") or "") != "ModalLLM":
+        return None
+    inputs = prompt_node.get("inputs")
+    if not isinstance(inputs, Mapping):
+        return None
+    model_reference = inputs.get("model_profile")
+    if not isinstance(model_reference, str) or not model_reference.strip():
+        return None
+
+    from .llm_profiles import get_llm_profile
+
+    try:
+        profile = get_llm_profile(model_reference.strip())
+    except ValueError:
+        return None
+    if profile.backend == "llama_cpp_server":
+        return ExecutionProvider.SSH_DOCKER
     return None
 
 
@@ -781,7 +780,24 @@ def _plan_component_execution_assignments(
 ) -> dict[str, ExecutionAssignment]:
     """Assign each component to Modal or one compatible self-hosted environment."""
     preferences = WorkflowExecutionPreferences.from_workflow(workflow)
+    resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
     if preferences.policy is ExecutionPolicy.MODAL:
+        incompatible_component_ids = [
+            component.representative_node_id
+            for component in components
+            if _component_required_provider(
+                component,
+                prompt,
+                resolved_llm_profiles,
+            )
+            is ExecutionProvider.SSH_DOCKER
+        ]
+        if incompatible_component_ids:
+            raise ModalPromptValidationError(
+                "Modal-only execution cannot run SSH-only component(s) "
+                f"{incompatible_component_ids}. Select Automatic or Self-hosted "
+                "execution for the workflow."
+            )
         modal_state = _modal_environment_state(settings)
         return {
             component.representative_node_id: ExecutionAssignment(
@@ -806,7 +822,6 @@ def _plan_component_execution_assignments(
     scheduler = CostAwareEnvironmentScheduler()
     history = _execution_history(settings)
     environment_ids = [environment.environment_id for environment in environments]
-    resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
     assignments: dict[str, ExecutionAssignment] = {}
     for component in components:
         component_signature = _component_execution_signature(component, prompt)
@@ -2315,6 +2330,53 @@ def _remote_output_is_list(
     return bool(output_is_list[output_index])
 
 
+def _remote_group_dependency_edges(
+    prompt: Mapping[str, Any],
+    remote_node_ids: set[str],
+    group_for_node: Callable[[str], str],
+) -> dict[str, set[str]]:
+    """Return current coarse dependency edges for a remote-node grouping."""
+    dependency_edges: dict[str, set[str]] = defaultdict(set)
+    for downstream_node_id in remote_node_ids:
+        downstream_node = prompt.get(downstream_node_id)
+        if not isinstance(downstream_node, Mapping):
+            continue
+        downstream_group = group_for_node(downstream_node_id)
+        for input_value in (downstream_node.get("inputs") or {}).values():
+            if not _is_link(input_value):
+                continue
+            upstream_node_id = str(input_value[0])
+            if upstream_node_id not in remote_node_ids:
+                continue
+            upstream_group = group_for_node(upstream_node_id)
+            if upstream_group != downstream_group:
+                dependency_edges[upstream_group].add(downstream_group)
+    return dependency_edges
+
+
+def _has_alternate_group_path(
+    dependency_edges: Mapping[str, set[str]],
+    start_group: str,
+    target_group: str,
+) -> bool:
+    """Return whether a non-direct path connects two coarse graph groups."""
+    pending = [
+        downstream_group
+        for downstream_group in dependency_edges.get(start_group, set())
+        if downstream_group != target_group
+    ]
+    visited: set[str] = set()
+    while pending:
+        current_group = pending.pop()
+        if current_group == target_group:
+            return True
+        if current_group in visited:
+            continue
+        visited.add(current_group)
+        pending.extend(dependency_edges.get(current_group, set()))
+    return False
+
+
 def _remote_component_partition_groups(
     prompt: dict[str, Any],
     remote_node_ids: set[str],
@@ -2324,6 +2386,11 @@ def _remote_component_partition_groups(
     """Return component groups after merging remote nodes across costly boundaries."""
     parent: dict[str, str] = {node_id: node_id for node_id in remote_node_ids}
     downstream_remote_node_ids_by_node_id: dict[str, set[str]] = defaultdict(set)
+    provider_partitioning_active = any(
+        _prompt_node_required_provider(prompt_node) is not None
+        for node_id in remote_node_ids
+        if isinstance((prompt_node := prompt.get(node_id)), Mapping)
+    )
 
     def find(node_id: str) -> str:
         """Return the canonical union-find representative for one remote node."""
@@ -2336,15 +2403,49 @@ def _remote_component_partition_groups(
             node_id = next_node_id
         return root
 
-    def union(left_node_id: str, right_node_id: str) -> None:
-        """Merge two remote nodes into the same mandatory component."""
+    def union(
+        left_node_id: str,
+        right_node_id: str,
+        *,
+        preserve_coarse_dag: bool | None = None,
+    ) -> bool:
+        """Merge two remote nodes unless doing so creates a coarse dependency cycle."""
         left_root = find(left_node_id)
         right_root = find(right_node_id)
         if left_root == right_root:
-            return
+            return True
+        should_preserve_coarse_dag = (
+            provider_partitioning_active
+            if preserve_coarse_dag is None
+            else preserve_coarse_dag
+        )
+        if should_preserve_coarse_dag:
+            dependency_edges = _remote_group_dependency_edges(
+                prompt,
+                remote_node_ids,
+                find,
+            )
+            creates_cycle = _has_alternate_group_path(
+                dependency_edges,
+                left_root,
+                right_root,
+            ) or _has_alternate_group_path(
+                dependency_edges,
+                right_root,
+                left_root,
+            )
+            if creates_cycle:
+                logger.info(
+                    "Splitting remote nodes %s and %s to preserve an acyclic "
+                    "component graph.",
+                    left_node_id,
+                    right_node_id,
+                )
+                return False
         canonical_root = min(left_root, right_root)
         merged_root = max(left_root, right_root)
         parent[merged_root] = canonical_root
+        return True
 
     for node_id in sorted(remote_node_ids):
         prompt_node = prompt.get(node_id)
@@ -2366,7 +2467,26 @@ def _remote_component_partition_groups(
                 and str(upstream_prompt_node.get("class_type"))
                 == MODAL_MAP_INPUT_NODE_ID
             ):
-                union(node_id, upstream_node_id)
+                union(node_id, upstream_node_id, preserve_coarse_dag=False)
+                continue
+            downstream_provider = _prompt_node_required_provider(prompt_node)
+            upstream_provider = (
+                _prompt_node_required_provider(upstream_prompt_node)
+                if isinstance(upstream_prompt_node, Mapping)
+                else None
+            )
+            if downstream_provider != upstream_provider and (
+                downstream_provider is not None or upstream_provider is not None
+            ):
+                logger.info(
+                    "Splitting remote nodes %s -> %s across provider boundary %s -> %s.",
+                    upstream_node_id,
+                    node_id,
+                    upstream_provider.value if upstream_provider is not None else "any",
+                    downstream_provider.value
+                    if downstream_provider is not None
+                    else "any",
+                )
                 continue
             if _output_supports_parallel_local_materialization(
                 prompt=prompt,
@@ -2415,7 +2535,11 @@ def _remote_component_partition_groups(
             if current_node_id in visited_node_ids:
                 continue
             visited_node_ids.add(current_node_id)
-            union(remote_node_id, current_node_id)
+            union(
+                remote_node_id,
+                current_node_id,
+                preserve_coarse_dag=False,
+            )
             for downstream_node_id in sorted(
                 downstream_remote_node_ids_by_node_id.get(current_node_id, set())
             ):
@@ -3601,8 +3725,9 @@ def _mark_remote_to_remote_session_boundaries(
     prompt: dict[str, Any],
     components: list[RemoteComponentPlan],
     nodes_module: Any,
+    assignments_by_component_id: Mapping[str, ExecutionAssignment],
 ) -> set[str]:
-    """Mark remote edges for bridges and annotate independent local materializers."""
+    """Keep only same-environment remote edges in provider-local session storage."""
     consumers = _build_consumer_map(prompt)
     component_id_by_node_id = {
         node_id: component.representative_node_id
@@ -3622,6 +3747,31 @@ def _mark_remote_to_remote_session_boundaries(
                 if consumer.node_id in component_id_by_node_id
             ]
             if not remote_consumers:
+                continue
+            producer_assignment = assignments_by_component_id[
+                component.representative_node_id
+            ]
+            consumer_component_ids = {
+                component_id_by_node_id[consumer.node_id]
+                for consumer in remote_consumers
+            }
+            cross_environment_consumers = sorted(
+                consumer_component_id
+                for consumer_component_id in consumer_component_ids
+                if assignments_by_component_id[consumer_component_id].environment_id
+                != producer_assignment.environment_id
+            )
+            if cross_environment_consumers:
+                logger.info(
+                    "Materializing remote boundary output through ComfyUI across "
+                    "execution environments source=%s:%d producer=%s environment=%s "
+                    "consumer_components=%s.",
+                    boundary_output.source.node_id,
+                    boundary_output.source.output_index,
+                    component.representative_node_id,
+                    producer_assignment.environment_id,
+                    cross_environment_consumers,
+                )
                 continue
             (
                 non_returning_local_consumers,
@@ -5330,21 +5480,49 @@ def _configure_local_gap_keepalive_payloads(
     keepalive_component_ids: set[str] = set()
     continuation_component_ids: set[str] = set()
     for local_node_id in sandwiched_local_node_ids:
+        upstream_component_ids: set[str] = set()
+        downstream_component_ids: set[str] = set()
         for component_id in remote_component_ids:
             if _component_ancestors_of_local_source(
                 prompt=rewritten_prompt,
                 source_node_id=local_node_id,
                 component_node_id_set={component_id},
             ):
-                keepalive_component_ids.add(component_id)
+                upstream_component_ids.add(component_id)
             if _component_ancestors_of_local_source(
                 prompt=rewritten_prompt,
                 source_node_id=component_id,
                 component_node_id_set={local_node_id},
             ):
-                continuation_component_ids.add(component_id)
+                downstream_component_ids.add(component_id)
+
+        for upstream_component_id in upstream_component_ids:
+            upstream_payload = payloads_by_component_id.get(upstream_component_id)
+            if upstream_payload is None:
+                continue
+            upstream_environment_id = str(
+                upstream_payload.get("execution_environment_id") or ""
+            )
+            if upstream_payload.get("execution_provider") != ExecutionProvider.MODAL.value:
+                continue
+            for downstream_component_id in downstream_component_ids:
+                downstream_payload = payloads_by_component_id.get(
+                    downstream_component_id
+                )
+                if (
+                    downstream_payload is None
+                    or downstream_payload.get("execution_provider")
+                    != ExecutionProvider.MODAL.value
+                    or str(downstream_payload.get("execution_environment_id") or "")
+                    != upstream_environment_id
+                ):
+                    continue
+                keepalive_component_ids.add(upstream_component_id)
+                continuation_component_ids.add(downstream_component_id)
 
     for component_id, embedded_payload in payloads_by_component_id.items():
+        if component_id not in keepalive_component_ids | continuation_component_ids:
+            continue
         payload_fields: dict[str, Any] = {"remote_local_gap_pool": True}
         if component_id in keepalive_component_ids:
             payload_fields["keepalive_after_remote_component"] = True
@@ -5359,7 +5537,7 @@ def _configure_local_gap_keepalive_payloads(
         )
     logger.info(
         "Configured local-gap Modal pool for components=%s keepalive_producers=%s continuations=%s.",
-        sorted(payloads_by_component_id),
+        sorted(keepalive_component_ids | continuation_component_ids),
         sorted(keepalive_component_ids),
         sorted(continuation_component_ids),
     )
@@ -5474,6 +5652,11 @@ def _configure_speculative_affinity_prewarm_payloads(
 
     configured_targets: dict[str, str] = {}
     for component_id, payload in payloads_by_component_id.items():
+        if payload.get("execution_provider") != ExecutionProvider.MODAL.value:
+            continue
+        execution_environment_id = str(
+            payload.get("execution_environment_id") or ""
+        )
         affinity_group = (
             str(payload.get("remote_worker_affinity_group") or "comfy").strip().lower()
         )
@@ -5485,6 +5668,17 @@ def _configure_speculative_affinity_prewarm_payloads(
                 descendant_id
                 for descendant_id in descendant_distances
                 if descendant_id in payloads_by_component_id
+                and payloads_by_component_id[descendant_id].get(
+                    "execution_provider"
+                )
+                == ExecutionProvider.MODAL.value
+                and str(
+                    payloads_by_component_id[descendant_id].get(
+                        "execution_environment_id"
+                    )
+                    or ""
+                )
+                == execution_environment_id
                 and str(
                     payloads_by_component_id[descendant_id].get(
                         "remote_worker_affinity_group"
@@ -5577,10 +5771,23 @@ def rewrite_prompt_for_modal(
         expanded_remote_node_ids,
         resolved_nodes_module,
     )
+    validate_remote_component_transport_compatibility(
+        prompt=rewritten_prompt,
+        components=components,
+        nodes_module=resolved_nodes_module,
+    )
+
+    assignments_by_component_id = _plan_component_execution_assignments(
+        components=components,
+        prompt=rewritten_prompt,
+        workflow=workflow,
+        settings=resolved_settings,
+    )
     session_component_ids = _mark_remote_to_remote_session_boundaries(
         rewritten_prompt,
         components,
         resolved_nodes_module,
+        assignments_by_component_id,
     )
     prompt_id = (extra_data or {}).get("prompt_id")
     remote_sessions_by_component_id = {
@@ -5594,48 +5801,8 @@ def rewrite_prompt_for_modal(
     }
     if remote_sessions_by_component_id:
         logger.info(
-            "Enabled Modal-backed remote references for components=%s.",
+            "Enabled environment-local remote references for components=%s.",
             sorted(remote_sessions_by_component_id),
-        )
-    validate_remote_component_transport_compatibility(
-        prompt=rewritten_prompt,
-        components=components,
-        nodes_module=resolved_nodes_module,
-    )
-
-    assignments_by_component_id = _plan_component_execution_assignments(
-        components=components,
-        prompt=rewritten_prompt,
-        workflow=workflow,
-        settings=resolved_settings,
-    )
-    if session_component_ids:
-        preferences = WorkflowExecutionPreferences.from_workflow(workflow)
-        session_components = [
-            component
-            for component in components
-            if component.representative_node_id in session_component_ids
-        ]
-        anchor_component = max(
-            session_components,
-            key=lambda component: _component_minimum_vram_bytes(
-                component,
-                rewritten_prompt,
-                preferences,
-                resolved_settings,
-            ),
-        )
-        anchor_assignment = assignments_by_component_id[
-            anchor_component.representative_node_id
-        ]
-        for component in session_components:
-            assignments_by_component_id[
-                component.representative_node_id
-            ] = anchor_assignment
-        logger.info(
-            "Co-located remote-session components=%s on environment=%s.",
-            sorted(session_component_ids),
-            anchor_assignment.environment_id,
         )
     summary.execution_assignments_by_representative = dict(assignments_by_component_id)
 
@@ -6784,7 +6951,7 @@ def setup_modal_queue_route(
                 )
 
             if "prompt" in json_data:
-                emit_setup_status("Preparing Modal workflow")
+                emit_setup_status("Preparing remote workflow")
                 rewrite_started_at = time.perf_counter()
                 rewritten_prompt, summary = await rewrite_prompt_for_modal_async(
                     prompt=json_data["prompt"],
@@ -6866,7 +7033,7 @@ def setup_modal_queue_route(
                     node_ids=remote_node_ids,
                     modal_gpu=request_settings.modal_gpu,
                     component_node_ids_by_representative=summary.component_node_ids_by_representative,
-                    status_message="Submitting Modal workflow",
+                    status_message="Submitting remote workflow",
                 )
             response = await _queue_prompt_json(
                 prompt_server,

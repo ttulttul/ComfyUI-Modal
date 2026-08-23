@@ -2503,6 +2503,22 @@ def test_modal_llm_node_routes_between_local_and_remote_runtimes(
     ]
 
 
+def test_resident_manager_reports_ssh_docker_execution_target(
+    modal_llm_runtime_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A self-hosted CUDA worker must not identify its inference as Modal."""
+    monkeypatch.setenv("COMFY_MODAL_LLM_EXECUTION_TARGET", "ssh_docker")
+    monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setattr(modal_llm_runtime_module, "_RESIDENT_MANAGER", None)
+
+    manager = modal_llm_runtime_module.get_resident_llm_manager()
+
+    assert manager.execution_target == "ssh_docker"
+    assert manager.device_name == "cuda (SSH Docker)"
+
+
 def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
     remote_modal_app_module: Any,
     monkeypatch: pytest.MonkeyPatch,

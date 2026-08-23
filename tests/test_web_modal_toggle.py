@@ -37,10 +37,10 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert 'class="modal-status-gpu" hidden' in source
     assert "gpuText.textContent = activeState.modalGpu ?? \"\";" in source
     assert "font-size: 10px;" in source
-    assert "Syncing graph with Modal" in source
+    assert "Preparing remote workflow" in source
     assert "Waiting for Modal startup" in source
-    assert "Receiving Modal outputs" in source
-    assert "Modal workflow running on" in source
+    assert "Receiving remote outputs" in source
+    assert "Remote workflow running on" in source
     assert "setGlobalStatusBatchProgress(promptId, value, maxValue)" in source
     assert "batchValue: state.batchValue ?? null," in source
     assert "batchMax: state.batchMax ?? null," in source
@@ -58,8 +58,8 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "nodeCount: promptRemoteNodeCount(promptId, nodeCount)," in source
     assert "hasRemoteExecutionStarted: false" in source
     assert "Waiting for Modal container" in source
-    assert "Starting Modal component" in source
-    assert "Cancelling Modal workflow" in source
+    assert "Starting remote component" in source
+    assert "Cancelling remote workflow" in source
     assert "function promptActiveNodeIsLive(promptId)" in source
 
 
@@ -282,7 +282,7 @@ def test_global_modal_status_badge_supports_setup_and_finalizing_details() -> No
     assert "if (detail.phase === STATE_FINALIZING) {" in source
     assert "dot.style.background = FINALIZING_BORDER_COLOR;" in source
     assert "READY_BORDER_COLOR" not in source
-    assert 'text.textContent = activeState.statusMessage ?? "Receiving Modal outputs";' in source
+    assert 'text.textContent = activeState.statusMessage ?? "Receiving remote outputs";' in source
 
 
 def test_global_modal_status_badge_polls_and_renders_active_containers() -> None:

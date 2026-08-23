@@ -356,21 +356,35 @@ def test_remote_environment_routes_save_and_probe_hosts(
     assert registry.get_host("gpu-one").capabilities == capabilities
 
 
-def test_scheduler_refreshes_stale_ssh_capabilities_before_placement(
+def test_scheduler_refreshes_recent_ssh_capabilities_before_placement(
     api_intercept_module: Any,
     remote_hosts_module: Any,
     execution_environments_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Automatic placement should not trust stale persisted host health forever."""
+    """Automatic placement must not trust even recently persisted free VRAM."""
     registry = remote_hosts_module.RemoteHostRegistry.for_user_directory(tmp_path)
+    previous_capabilities = execution_environments_module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=60 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        probed_at_epoch=2_000_000_000.0,
+    )
     registry.replace_hosts(
         [
             remote_hosts_module.SshHostConfig(
                 environment_id="freshened",
                 display_name="Freshened",
                 ssh_target="freshened",
+                capabilities=previous_capabilities,
+                health=execution_environments_module.EnvironmentHealth.READY,
             )
         ]
     )
@@ -405,6 +419,170 @@ def test_scheduler_refreshes_stale_ssh_capabilities_before_placement(
 
     assert hosts[0].health.value == "ready"
     assert hosts[0].capabilities == capabilities
+
+
+def test_remote_partition_preserves_dag_around_ssh_only_llm(
+    api_intercept_module: Any,
+) -> None:
+    """Provider boundaries must not be undone by a coarse fanout cycle."""
+    prompt = {
+        "1": {"class_type": "RemoteImage", "inputs": {}},
+        "2": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["1", 0]},
+        },
+        "3": {
+            "class_type": "ModalLLM",
+            "inputs": {
+                "image": ["2", 0],
+                "model_profile": "huihui-qwen3.8-27b-abliterated-q2-k-gguf",
+            },
+        },
+        "4": {
+            "class_type": "RemoteImageConsumer",
+            "inputs": {"image": ["1", 0], "prompt": ["3", 0]},
+        },
+    }
+    fake_nodes_module = SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "RemoteImage": _FakeRemoteImageNode,
+            "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
+            "ModalLLM": _FakeTextNode,
+        },
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+
+    component_groups = api_intercept_module._remote_component_partition_groups(
+        prompt,
+        set(prompt),
+        api_intercept_module._build_consumer_map(prompt),
+        fake_nodes_module,
+    )
+    components = api_intercept_module._component_topological_order(
+        prompt,
+        component_groups,
+    )
+
+    assert components == [["1", "2"], ["3"], ["4"]]
+    assert api_intercept_module._component_execution_stages(
+        prompt,
+        component_groups,
+    ) == [["1"], ["3"], ["4"]]
+
+
+def test_modal_only_policy_rejects_ssh_only_llm_backend(
+    api_intercept_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A provider-specific backend must not be dispatched to Modal by policy."""
+    component = api_intercept_module.RemoteComponentPlan(
+        node_ids=["257"],
+        representative_node_id="257",
+        boundary_inputs=[],
+        boundary_outputs=[],
+        execute_node_ids=["257"],
+        contains_output_node=False,
+    )
+
+    with pytest.raises(
+        api_intercept_module.ModalPromptValidationError,
+        match="Modal-only execution cannot run SSH-only component",
+    ):
+        api_intercept_module._plan_component_execution_assignments(
+            components=[component],
+            prompt={
+                "257": {
+                    "class_type": "ModalLLM",
+                    "inputs": {
+                        "model_profile": (
+                            "huihui-qwen3.8-27b-abliterated-q2-k-gguf"
+                        )
+                    },
+                }
+            },
+            workflow={"extra": {"remote_execution": {"policy": "modal"}}},
+            settings=SimpleNamespace(
+                modal_gpu="H200",
+                max_containers=1,
+                local_storage_root=tmp_path,
+            ),
+        )
+
+
+def test_cross_provider_boundary_uses_transport_instead_of_remote_session(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+) -> None:
+    """Session-backed references must never cross provider storage boundaries."""
+    source = api_intercept_module.LinkedOutputRef("1", 0)
+    boundary_output = api_intercept_module.BoundaryOutputSpec(
+        proxy_output_name="remote_output_0",
+        source=source,
+        io_type="IMAGE",
+        is_list=False,
+    )
+    producer = api_intercept_module.RemoteComponentPlan(
+        node_ids=["1"],
+        representative_node_id="1",
+        boundary_inputs=[],
+        boundary_outputs=[boundary_output],
+        execute_node_ids=["1"],
+        contains_output_node=False,
+    )
+    consumer = api_intercept_module.RemoteComponentPlan(
+        node_ids=["2"],
+        representative_node_id="2",
+        boundary_inputs=[
+            api_intercept_module.BoundaryInputSpec(
+                proxy_input_name="remote_input_0",
+                source=source,
+                io_type="IMAGE",
+                targets=[api_intercept_module.InputTarget("2", "image")],
+            )
+        ],
+        boundary_outputs=[],
+        execute_node_ids=["2"],
+        contains_output_node=False,
+    )
+    assignment_type = execution_environments_module.ExecutionAssignment
+    provider_type = execution_environments_module.ExecutionProvider
+
+    session_component_ids = (
+        api_intercept_module._mark_remote_to_remote_session_boundaries(
+            {
+                "1": {"class_type": "RemoteImage", "inputs": {}},
+                "2": {
+                    "class_type": "RemoteImageConsumer",
+                    "inputs": {"image": ["1", 0]},
+                },
+            },
+            [producer, consumer],
+            SimpleNamespace(
+                NODE_CLASS_MAPPINGS={
+                    "RemoteImage": _FakeRemoteImageNode,
+                    "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
+                }
+            ),
+            {
+                "1": assignment_type(
+                    "modal:H200",
+                    provider_type.MODAL,
+                    None,
+                    0.0,
+                ),
+                "2": assignment_type(
+                    "lambda",
+                    provider_type.SSH_DOCKER,
+                    0.0,
+                    0.0,
+                ),
+            },
+        )
+    )
+
+    assert session_component_ids == set()
+    assert boundary_output.session_output is False
+    assert boundary_output.session_consumer_node_ids == []
 
 
 def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
@@ -3580,6 +3758,8 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
                     "component_id": "spec-a",
                     "prompt_id": "prompt-spec",
                     "modal_gpu": "RTX-PRO-6000",
+                    "execution_provider": "modal",
+                    "execution_environment_id": "modal:RTX-PRO-6000",
                     "remote_worker_affinity_group": "llm",
                     "subgraph_prompt": {"1": {"class_type": "ModalLLM", "inputs": {}}},
                 }
@@ -3593,6 +3773,8 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
                     "component_id": "spec-b",
                     "prompt_id": "prompt-spec",
                     "modal_gpu": "RTX-PRO-6000",
+                    "execution_provider": "modal",
+                    "execution_environment_id": "modal:RTX-PRO-6000",
                     "remote_worker_affinity_group": "comfy",
                     "remote_local_gap_pool": True,
                     "snapshot_profile_key": "loader-profile:abc",
@@ -3617,6 +3799,8 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
                     "component_id": "spec-c",
                     "prompt_id": "prompt-spec",
                     "modal_gpu": "RTX-PRO-6000",
+                    "execution_provider": "modal",
+                    "execution_environment_id": "modal:RTX-PRO-6000",
                     "remote_worker_affinity_group": "llm",
                     "subgraph_prompt": {"3": {"class_type": "ModalLLM", "inputs": {}}},
                 },
@@ -3647,6 +3831,54 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
     assert second_target["component_id"] == "spec-c"
     assert second_target["remote_worker_affinity_group"] == "llm"
     assert "speculative_remote_prewarm_target" not in third_payload
+
+
+def test_planner_does_not_bridge_local_gap_keepalive_across_providers(
+    api_intercept_module: Any,
+) -> None:
+    """A Modal producer must not retain a slot for an SSH continuation."""
+    rewritten_prompt = {
+        "modal-producer": {
+            "class_type": "ModalProxy",
+            "inputs": {
+                "original_node_data": {
+                    "component_id": "modal-producer",
+                    "execution_provider": "modal",
+                    "execution_environment_id": "modal:H200",
+                }
+            },
+        },
+        "local-gap": {
+            "class_type": "PreviewAny",
+            "inputs": {"source": ["modal-producer", 0]},
+        },
+        "ssh-consumer": {
+            "class_type": "ModalProxy",
+            "inputs": {
+                "source": ["local-gap", 0],
+                "original_node_data": {
+                    "component_id": "ssh-consumer",
+                    "execution_provider": "ssh_docker",
+                    "execution_environment_id": "lambda",
+                },
+            },
+        },
+    }
+
+    api_intercept_module._configure_local_gap_keepalive_payloads(
+        rewritten_prompt=rewritten_prompt,
+        remote_component_ids=["modal-producer", "ssh-consumer"],
+        sandwiched_local_node_ids={"local-gap"},
+    )
+
+    for component_id in ("modal-producer", "ssh-consumer"):
+        payload = api_intercept_module.registered_proxy_execution_payload(
+            component_id,
+            rewritten_prompt[component_id]["inputs"]["original_node_data"],
+        )
+        assert "remote_local_gap_pool" not in payload
+        assert "keepalive_after_remote_component" not in payload
+        assert "stop_local_gap_keepalive_before_remote_component" not in payload
 
 
 def test_rewrite_keeps_unmapped_remote_siblings_without_local_reentry_together(
