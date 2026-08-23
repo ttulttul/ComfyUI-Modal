@@ -153,6 +153,8 @@ Worker environment secrets are administrator-managed: the optional **Remote Dock
 
 Vast.ai capacity is declared per workflow. Add one or more disconnected **Vast.ai Lease Configuration** nodes to the graph — each declares a named capacity profile (GPU count, per-GPU VRAM, TFLOPS, RAM, disk, reliability, duration, maximum hourly price, and idle retention) and acts as an independent candidate pool for the scheduler. Configuration nodes need no graph connections and are never placed remotely themselves. Then set the workflow provider policy to **Vast.ai only** or **Automatic**.
 
+Marketplace searches for the distinct effective resource profiles in one plan run in parallel, with a maximum of eight concurrent requests. Successful results, including an empty result, are cached in the ComfyUI process for 60 minutes and shared across workflow submissions. Lease selection and acquisition remain ordered so later components can reuse capacity rented by earlier components. Restart ComfyUI to clear the in-memory cache; a rental availability race automatically forces one fresh marketplace search.
+
 At queue time the planner raises each pool's VRAM and RAM floors to whatever the workflow's models actually require, queries current on-demand offers, revalidates every hard constraint locally, and ranks compatible offers by incremental cost — an existing managed lease gets credit for retention time already paid for. The default idle retention is 24 hours, after which an in-instance watchdog destroys the idle lease.
 
 Set credentials and the worker image in the ComfyUI process environment. Neither value is written to workflows, the lease registry, API responses, or logs:

@@ -435,7 +435,10 @@ class VastLeaseManager:
                         offer.offer_id,
                     )
             if search_attempt == 0:
-                offers = await self.api_client.search_offers(profile)
+                offers = await self.api_client.search_offers(
+                    profile,
+                    force_refresh=True,
+                )
         raise VastOfferUnavailableError(
             f"Compatible Vast.ai offers disappeared before profile "
             f"{profile.profile_name!r} could be rented."

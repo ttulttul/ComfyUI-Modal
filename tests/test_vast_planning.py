@@ -68,6 +68,14 @@ def test_vast_only_policy_quotes_acquires_and_stamps_concrete_environment(
             calls.append(("quote", (profiles, requirements)))
             return quote
 
+        def prefetch_offers_sync(
+            self,
+            profiles: Any,
+            requirements: Any,
+        ) -> None:
+            """Record the planner's marketplace warmup before selection."""
+            calls.append(("prefetch", (profiles, requirements)))
+
         def scheduling_state(self, selected_quote: Any) -> Any:
             """Expose a compatible zero-cost virtual Vast environment."""
             assert selected_quote is quote
@@ -135,4 +143,9 @@ def test_vast_only_policy_quotes_acquires_and_stamps_concrete_environment(
     assert assignment.provider is module.ExecutionProvider.VAST
     assert assignment.environment_id == "vast:90:9001"
     assert assignment.predicted_cost_usd == 3.25
-    assert [call[0] for call in calls] == ["service", "quote", "acquire"]
+    assert [call[0] for call in calls] == [
+        "service",
+        "prefetch",
+        "quote",
+        "acquire",
+    ]

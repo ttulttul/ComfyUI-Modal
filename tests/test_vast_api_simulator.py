@@ -114,6 +114,55 @@ def test_simulator_enforces_capacity_price_and_location_filters(
     asyncio.run(scenario())
 
 
+def test_offer_search_cache_retains_empty_results_until_ttl_and_can_refresh(
+    vast_api_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """Successful empty searches should be shared, expire, and support bypass."""
+
+    async def scenario() -> None:
+        """Exercise a shared cache across the short-lived clients used per prompt."""
+        now = [100.0]
+        state = vast_simulator_module.VastSimulatorState()
+        cache = vast_api_module.VastOfferSearchCache(monotonic=lambda: now[0])
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            profile = vast_models_module.VastResourceProfile(
+                profile_id="unavailable",
+                profile_name="unavailable",
+                maximum_hourly_cost_usd=0.01,
+            )
+            first_client = vast_api_module.VastApiClient(
+                state.api_key,
+                base_url=base_url,
+                offer_cache=cache,
+                offer_cache_ttl_seconds=3600.0,
+            )
+            second_client = vast_api_module.VastApiClient(
+                state.api_key,
+                base_url=base_url,
+                offer_cache=cache,
+                offer_cache_ttl_seconds=3600.0,
+            )
+
+            assert await first_client.search_offers(profile) == ()
+            assert await second_client.search_offers(profile) == ()
+            assert _offer_search_count(state) == 1
+
+            assert (
+                await second_client.search_offers(profile, force_refresh=True) == ()
+            )
+            assert _offer_search_count(state) == 2
+
+            now[0] += 3601.0
+            assert await first_client.search_offers(profile) == ()
+            assert _offer_search_count(state) == 3
+
+    asyncio.run(scenario())
+
+
 def test_offer_disappearance_is_classified_without_secret_echo(
     vast_api_module: Any,
     vast_models_module: Any,
@@ -180,3 +229,11 @@ def test_client_rejects_non_loopback_plain_http(vast_api_module: Any) -> None:
             "key",
             base_url="http://example.invalid",
         )
+
+
+def _offer_search_count(state: Any) -> int:
+    """Return the number of marketplace search requests seen by the simulator."""
+    return sum(
+        request["method"] == "POST" and request["path"] == "/api/v0/bundles/"
+        for request in state.request_log
+    )

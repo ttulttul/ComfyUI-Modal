@@ -71,7 +71,7 @@ from .sync_engine import (
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
 from .ssh_docker import SshDockerController, SshDockerVolumeBackend
 from .vast_config_node import extract_vast_profiles
-from .vast_service import VastProfileQuote, VastService
+from .vast_service import VastProfileQuote, VastSearchRequirements, VastService
 from .vast_api import VastApiClient
 from .vast_leases import VastLeaseRegistry
 
@@ -1034,14 +1034,15 @@ def _plan_component_execution_assignments(
 
     scheduler = CostAwareEnvironmentScheduler()
     history = _execution_history(settings)
-    assignments: dict[str, ExecutionAssignment] = {}
+    component_signatures: dict[str, str] = {}
+    component_memory_estimates: dict[str, ComponentMemoryEstimate] = {}
+    component_required_providers: dict[str, ExecutionProvider | None] = {}
     for component in components:
-        environments = [
-            host.scheduling_state() for host in ssh_hosts_by_id.values()
-        ]
-        if modal_state is not None:
-            environments.append(modal_state)
-        component_signature = _component_execution_signature(component, prompt)
+        component_id = component.representative_node_id
+        component_signatures[component_id] = _component_execution_signature(
+            component,
+            prompt,
+        )
         memory_estimate = _component_memory_estimate(
             component,
             prompt,
@@ -1049,16 +1050,51 @@ def _plan_component_execution_assignments(
             settings,
             resolved_llm_profiles,
         )
+        component_memory_estimates[component_id] = memory_estimate
+        component_required_providers[component_id] = _component_required_provider(
+            component,
+            prompt,
+            resolved_llm_profiles,
+        )
         if memory_estimate.model_asset_count:
             logger.info(
                 "Estimated remote component=%s memory floor vram_gib=%.2f ram_gib=%.2f "
                 "from model_assets=%d largest_model_gib=%.2f.",
-                component.representative_node_id,
+                component_id,
                 memory_estimate.minimum_vram_bytes / 1024**3,
                 memory_estimate.minimum_ram_bytes / 1024**3,
                 memory_estimate.model_asset_count,
                 memory_estimate.largest_model_bytes / 1024**3,
             )
+    if vast_service is not None:
+        try:
+            vast_service.prefetch_offers_sync(
+                vast_profiles,
+                tuple(
+                    VastSearchRequirements(
+                        minimum_vram_bytes=memory_estimate.minimum_vram_bytes,
+                        minimum_ram_bytes=memory_estimate.minimum_ram_bytes,
+                    )
+                    for memory_estimate in component_memory_estimates.values()
+                ),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            if preferences.policy is ExecutionPolicy.VAST:
+                raise ModalPromptValidationError(str(exc)) from exc
+            logger.warning(
+                "Unable to prefetch Vast.ai marketplace offers: %s",
+                exc,
+            )
+    assignments: dict[str, ExecutionAssignment] = {}
+    for component in components:
+        component_id = component.representative_node_id
+        environments = [
+            host.scheduling_state() for host in ssh_hosts_by_id.values()
+        ]
+        if modal_state is not None:
+            environments.append(modal_state)
+        component_signature = component_signatures[component_id]
+        memory_estimate = component_memory_estimates[component_id]
         vast_quote: VastProfileQuote | None = None
         if vast_service is not None:
             try:
@@ -1086,11 +1122,7 @@ def _plan_component_execution_assignments(
             if history is not None
             else {}
         )
-        component_required_provider = _component_required_provider(
-            component,
-            prompt,
-            resolved_llm_profiles,
-        )
+        component_required_provider = component_required_providers[component_id]
         if preferences.policy is ExecutionPolicy.VAST:
             if component_required_provider is ExecutionProvider.SSH_DOCKER:
                 raise ModalPromptValidationError(

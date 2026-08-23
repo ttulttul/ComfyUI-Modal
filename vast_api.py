@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import aiohttp
 
@@ -32,6 +36,8 @@ else:  # pragma: no cover - direct simulator and debugging imports.
 logger = logging.getLogger(__name__)
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _RETRIABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+VAST_OFFER_CACHE_TTL_SECONDS = 60.0 * 60.0
+_VAST_OFFER_CACHE_MAX_ENTRIES = 256
 
 
 class VastApiError(RuntimeError):
@@ -48,6 +54,79 @@ class VastOfferUnavailableError(VastApiError):
 
 class VastInstanceNotFoundError(VastApiError):
     """Raised when a managed Vast instance no longer exists."""
+
+
+@dataclass(frozen=True)
+class _VastOfferCacheEntry:
+    """Retain one normalized marketplace result until its monotonic deadline."""
+
+    offers: tuple[VastOffer, ...]
+    expires_at_monotonic: float
+
+
+class VastOfferSearchCache:
+    """Provide a bounded process-local cache for Vast marketplace searches."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = _VAST_OFFER_CACHE_MAX_ENTRIES,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Configure cache capacity and an injectable monotonic clock."""
+        if isinstance(max_entries, bool) or max_entries <= 0:
+            raise ValueError("Vast offer cache max_entries must be positive.")
+        self._max_entries = max_entries
+        self._monotonic = monotonic
+        self._entries: dict[str, _VastOfferCacheEntry] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> tuple[VastOffer, ...] | None:
+        """Return one unexpired cached result, including an empty result."""
+        now = self._monotonic()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at_monotonic <= now:
+                self._entries.pop(key, None)
+                return None
+            return entry.offers
+
+    def put(
+        self,
+        key: str,
+        offers: tuple[VastOffer, ...],
+        *,
+        ttl_seconds: float,
+    ) -> None:
+        """Cache one successful search while bounding retained query variants."""
+        if ttl_seconds <= 0:
+            return
+        now = self._monotonic()
+        with self._lock:
+            expired_keys = [
+                cached_key
+                for cached_key, entry in self._entries.items()
+                if entry.expires_at_monotonic <= now
+            ]
+            for expired_key in expired_keys:
+                self._entries.pop(expired_key, None)
+            while len(self._entries) >= self._max_entries:
+                oldest_key = min(
+                    self._entries,
+                    key=lambda cached_key: self._entries[
+                        cached_key
+                    ].expires_at_monotonic,
+                )
+                self._entries.pop(oldest_key, None)
+            self._entries[key] = _VastOfferCacheEntry(
+                offers=offers,
+                expires_at_monotonic=now + ttl_seconds,
+            )
+
+
+_SHARED_VAST_OFFER_SEARCH_CACHE = VastOfferSearchCache()
 
 
 @dataclass(frozen=True)
@@ -68,6 +147,8 @@ class VastApiClient:
         request_timeout_seconds: float = 30.0,
         retry_attempts: int = 3,
         session: aiohttp.ClientSession | None = None,
+        offer_cache: VastOfferSearchCache | None = None,
+        offer_cache_ttl_seconds: float = VAST_OFFER_CACHE_TTL_SECONDS,
     ) -> None:
         """Configure one client using an injected or internally managed session."""
         normalized_key = api_key.strip()
@@ -82,11 +163,23 @@ class VastApiClient:
             raise ValueError("request_timeout_seconds must be positive.")
         if retry_attempts <= 0:
             raise ValueError("retry_attempts must be positive.")
+        if (
+            not math.isfinite(offer_cache_ttl_seconds)
+            or offer_cache_ttl_seconds < 0
+        ):
+            raise ValueError(
+                "Vast offer cache TTL must be finite and non-negative."
+            )
         self._api_key = normalized_key
         self._base_url = normalized_base_url
         self._request_timeout_seconds = request_timeout_seconds
         self._retry_attempts = retry_attempts
         self._session = session
+        self._offer_cache = offer_cache or _SHARED_VAST_OFFER_SEARCH_CACHE
+        self._offer_cache_ttl_seconds = offer_cache_ttl_seconds
+        self._offer_cache_namespace = hashlib.sha256(
+            f"{normalized_base_url}\0{normalized_key}".encode("utf-8")
+        ).hexdigest()
 
     async def verify_credentials(self) -> dict[str, Any]:
         """Return a small non-secret account summary after validating the API key."""
@@ -101,12 +194,24 @@ class VastApiClient:
         profile: VastResourceProfile,
         *,
         limit: int = 25,
+        force_refresh: bool = False,
     ) -> tuple[VastOffer, ...]:
         """Return locally revalidated compatible offers in best-price order."""
+        search_payload = profile.search_payload(limit=limit)
+        cache_key = self._offer_cache_key(search_payload)
+        if not force_refresh:
+            cached_offers = self._offer_cache.get(cache_key)
+            if cached_offers is not None:
+                logger.debug(
+                    "Using cached Vast marketplace result profile=%s offers=%d.",
+                    profile.profile_name,
+                    len(cached_offers),
+                )
+                return cached_offers
         payload = await self._request_json(
             "POST",
             "/api/v0/bundles/",
-            json_payload=profile.search_payload(limit=limit),
+            json_payload=search_payload,
         )
         raw_offers = payload.get("offers")
         if isinstance(raw_offers, Mapping):
@@ -122,8 +227,27 @@ class VastApiClient:
                 if isinstance(offer, Mapping)
             )
         except ValueError as exc:
-            raise VastApiError("Vast offer search returned a malformed offer.") from exc
-        return compatible_offers(offers, profile)
+            raise VastApiError(
+                "Vast offer search returned a malformed offer."
+            ) from exc
+        compatible = compatible_offers(offers, profile)
+        self._offer_cache.put(
+            cache_key,
+            compatible,
+            ttl_seconds=self._offer_cache_ttl_seconds,
+        )
+        return compatible
+
+    def _offer_cache_key(self, search_payload: Mapping[str, Any]) -> str:
+        """Return a credential-isolated identity for one effective search."""
+        canonical_payload = json.dumps(
+            search_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(
+            f"{self._offer_cache_namespace}\0{canonical_payload}".encode("utf-8")
+        ).hexdigest()
 
     async def create_instance(
         self,
@@ -369,10 +493,12 @@ def _positive_id(instance_id: int) -> int:
 
 
 __all__ = [
+    "VAST_OFFER_CACHE_TTL_SECONDS",
     "VastApiClient",
     "VastApiError",
     "VastAuthenticationError",
     "VastCreateResult",
     "VastInstanceNotFoundError",
     "VastOfferUnavailableError",
+    "VastOfferSearchCache",
 ]

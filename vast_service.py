@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -59,6 +60,7 @@ logger = logging.getLogger(__name__)
 VAST_API_KEY_ENV = "VAST_API_KEY"
 VAST_API_BASE_URL_ENV = "COMFY_MODAL_VAST_API_BASE_URL"
 VAST_SSH_IDENTITY_FILE_ENV = "COMFY_MODAL_VAST_SSH_IDENTITY_FILE"
+VAST_OFFER_PREFETCH_CONCURRENCY = 8
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,14 @@ class VastProfileQuote:
         if self.offer is None:
             raise RuntimeError("Vast quote has neither an offer nor a lease.")
         return self.offer.hourly_cost_usd
+
+
+@dataclass(frozen=True)
+class VastSearchRequirements:
+    """Describe component memory floors that affect a marketplace search."""
+
+    minimum_vram_bytes: int
+    minimum_ram_bytes: int
 
 
 class VastService:
@@ -203,6 +213,91 @@ class VastService:
             + "; ".join(errors)
         )
 
+    async def prefetch_offers(
+        self,
+        profiles: Sequence[VastResourceProfile],
+        requirements: Sequence[VastSearchRequirements],
+    ) -> None:
+        """Populate cached effective-profile searches with bounded parallelism."""
+        if not profiles or not requirements:
+            return
+        pending_profiles = self._distinct_marketplace_profiles(
+            profiles,
+            requirements,
+        )
+        if not pending_profiles:
+            return
+        logger.info(
+            "Prefetching %d unique Vast marketplace search(es) in parallel for "
+            "%d component requirement set(s).",
+            len(pending_profiles),
+            len(requirements),
+        )
+        results = await self._search_offer_profiles_in_parallel(pending_profiles)
+        cancelled = next(
+            (
+                result
+                for result in results
+                if isinstance(result, asyncio.CancelledError)
+            ),
+            None,
+        )
+        if cancelled is not None:
+            raise cancelled
+        failure_count = sum(
+            isinstance(result, (OSError, RuntimeError, ValueError))
+            for result in results
+        )
+        logger.info(
+            "Completed Vast marketplace prefetch searches=%d successful=%d "
+            "failed=%d.",
+            len(results),
+            len(results) - failure_count,
+            failure_count,
+        )
+
+    def _distinct_marketplace_profiles(
+        self,
+        profiles: Sequence[VastResourceProfile],
+        requirements: Sequence[VastSearchRequirements],
+    ) -> tuple[VastResourceProfile, ...]:
+        """Return deduplicated effective profiles without reusable leases."""
+        unique_profiles: dict[str, VastResourceProfile] = {}
+        for requirement in requirements:
+            for profile in profiles:
+                adjusted_profile = _profile_for_requirements(
+                    profile,
+                    requirement.minimum_vram_bytes,
+                    requirement.minimum_ram_bytes,
+                )
+                if self._existing_lease(adjusted_profile) is not None:
+                    continue
+                query_key = json.dumps(
+                    adjusted_profile.search_payload(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                unique_profiles.setdefault(query_key, adjusted_profile)
+        return tuple(unique_profiles.values())
+
+    async def _search_offer_profiles_in_parallel(
+        self,
+        profiles: Sequence[VastResourceProfile],
+    ) -> tuple[object, ...]:
+        """Search effective profiles in batches that respect the API bound."""
+        results: list[object] = []
+        for offset in range(0, len(profiles), VAST_OFFER_PREFETCH_CONCURRENCY):
+            batch = profiles[
+                offset : offset + VAST_OFFER_PREFETCH_CONCURRENCY
+            ]
+            results.extend(
+                await asyncio.gather(
+                    *(self.api_client.search_offers(profile) for profile in batch),
+                    return_exceptions=True,
+                )
+            )
+        return tuple(results)
+
     async def _quote_profile(
         self,
         profile: VastResourceProfile,
@@ -256,6 +351,14 @@ class VastService:
     def quote_best_profile_sync(self, *args: object, **kwargs: object) -> VastProfileQuote:
         """Synchronously quote a profile from ComfyUI's queue worker thread."""
         return asyncio.run(self.quote_best_profile(*args, **kwargs))  # type: ignore[arg-type]
+
+    def prefetch_offers_sync(
+        self,
+        profiles: Sequence[VastResourceProfile],
+        requirements: Sequence[VastSearchRequirements],
+    ) -> None:
+        """Synchronously prefetch searches from ComfyUI's queue worker thread."""
+        asyncio.run(self.prefetch_offers(profiles, requirements))
 
     def acquire_sync(self, quote: VastProfileQuote) -> VastLeaseRecord:
         """Synchronously acquire a quote from ComfyUI's queue worker thread."""
@@ -405,5 +508,6 @@ __all__ = [
     "VAST_API_KEY_ENV",
     "VAST_SSH_IDENTITY_FILE_ENV",
     "VastProfileQuote",
+    "VastSearchRequirements",
     "VastService",
 ]

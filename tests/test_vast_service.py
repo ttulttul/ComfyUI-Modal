@@ -106,3 +106,64 @@ def test_from_environment_requires_credential_before_other_setup(
         assert "VAST_API_KEY" in str(exc)
     else:
         raise AssertionError("Missing Vast credential was accepted.")
+
+
+def test_prefetch_deduplicates_effective_profiles_and_searches_in_parallel(
+    vast_models_module: Any,
+    vast_runtime_module: Any,
+    vast_service_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Planning should concurrently warm only distinct marketplace queries."""
+
+    class DelayedApiClient:
+        """Record overlapping searches without making network requests."""
+
+        def __init__(self) -> None:
+            """Initialize concurrency counters and searched VRAM floors."""
+            self.active = 0
+            self.peak = 0
+            self.minimum_gpu_ram_mb: list[int] = []
+
+        async def search_offers(self, profile: Any) -> tuple[Any, ...]:
+            """Hold the event loop briefly so independent searches overlap."""
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.minimum_gpu_ram_mb.append(profile.minimum_gpu_ram_mb)
+            await asyncio.sleep(0.02)
+            self.active -= 1
+            return ()
+
+    async def scenario() -> None:
+        """Prefetch repeated low floors and one raised floor."""
+        api_client = DelayedApiClient()
+        service = vast_service_module.VastService(
+            settings=SimpleNamespace(app_name="test-owner"),
+            repo_root=tmp_path,
+            user_directory=tmp_path,
+            api_client=api_client,
+            runtime_configuration=vast_runtime_module.VastRuntimeConfiguration(
+                image="example.invalid/comfy-worker:test",
+                runtime_fingerprint="b" * 64,
+            ),
+            registry=vast_service_module.VastLeaseRegistry.for_user_directory(
+                tmp_path
+            ),
+        )
+        profile = vast_models_module.VastResourceProfile(
+            profile_id="parallel",
+            profile_name="parallel",
+            minimum_gpu_ram_mb=48 * 1024,
+        )
+        requirements = (
+            vast_service_module.VastSearchRequirements(0, 0),
+            vast_service_module.VastSearchRequirements(16 * 1024**3, 0),
+            vast_service_module.VastSearchRequirements(80 * 1024**3, 0),
+        )
+
+        await service.prefetch_offers((profile,), requirements)
+
+        assert sorted(api_client.minimum_gpu_ram_mb) == [48 * 1024, 80 * 1024]
+        assert api_client.peak == 2
+
+    asyncio.run(scenario())
