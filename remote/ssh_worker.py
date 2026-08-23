@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - remote image imports ``remote`` top-le
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKER_SOCKET_PATH = Path("/run/comfy-remote/worker.sock")
+DEFAULT_STORAGE_ROOT = Path("/storage")
 
 
 class SshWorkerError(RuntimeError):
@@ -244,6 +245,52 @@ def runtime_info() -> dict[str, Any]:
     }
 
 
+def stage_profiles(
+    model_references: list[str],
+    storage_root: Path = DEFAULT_STORAGE_ROOT,
+) -> list[dict[str, Any]]:
+    """Resolve and stage immutable LLM profiles in the worker's storage volume."""
+    try:
+        from ..llm_staging import resolve_and_stage_model_references
+    except ImportError:  # pragma: no cover - remote image imports top-level modules.
+        from llm_staging import resolve_and_stage_model_references
+
+    def emit_progress(progress: Any) -> None:
+        """Write one JSON-line progress event for the SSH controller."""
+        print(
+            json.dumps(
+                {
+                    "kind": "progress",
+                    "stage": progress.stage,
+                    "message": progress.message,
+                    "value": progress.value,
+                    "max": progress.maximum,
+                    "unit": progress.unit,
+                    "indeterminate": progress.indeterminate,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    results = resolve_and_stage_model_references(
+        model_references,
+        storage_root,
+        progress_callback=emit_progress,
+    )
+    result_payload = [result.to_dict() for result in results]
+    print(
+        json.dumps(
+            {"kind": "result", "results": result_payload},
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return result_payload
+
+
 def _copy_request_frames(source: BinaryIO, destination: socket.socket) -> None:
     """Copy exactly one request command and its optional input frame."""
     first_frame = read_frame(source)
@@ -290,12 +337,27 @@ def _required_string(payload: Mapping[str, Any], key: str) -> str:
 def _argument_parser() -> argparse.ArgumentParser:
     """Return the worker command-line parser."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("serve", "client", "runtime-info"))
+    parser.add_argument(
+        "command",
+        choices=("serve", "client", "runtime-info", "stage-profiles"),
+    )
     parser.add_argument(
         "--socket",
         type=Path,
         default=DEFAULT_WORKER_SOCKET_PATH,
         help="Unix socket shared by the worker server and docker-exec relay.",
+    )
+    parser.add_argument(
+        "--model-reference",
+        action="append",
+        default=[],
+        help="Curated profile or Hugging Face model reference to stage.",
+    )
+    parser.add_argument(
+        "--storage-root",
+        type=Path,
+        default=DEFAULT_STORAGE_ROOT,
+        help="Persistent worker storage root.",
     )
     return parser
 
@@ -309,6 +371,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if arguments.command == "client":
         return relay_client(arguments.socket)
+    if arguments.command == "stage-profiles":
+        if not arguments.model_reference:
+            raise ValueError("stage-profiles requires at least one --model-reference.")
+        stage_profiles(arguments.model_reference, arguments.storage_root)
+        return 0
     print(json.dumps(runtime_info(), sort_keys=True))
     return 0
 

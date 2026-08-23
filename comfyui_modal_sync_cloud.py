@@ -65,15 +65,11 @@ from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
     remote_runtime_packages as _comfyui_runtime_packages,
     select_remote_torch_build as _select_remote_torch_build,
 )
-from llm_profiles import get_llm_profile, load_llm_profiles  # noqa: E402
 from llm_recovery import (  # noqa: E402
     LLM_FORCE_VLLM_THROUGHPUT_PAYLOAD_KEY,
     is_llm_memory_recovery_exhausted,
 )
-from llm_resolver import resolve_model_profile  # noqa: E402
-from llm_staging import (
-    stage_model_profile,
-)  # noqa: E402 - paths are bootstrapped above.
+from llm_staging import resolve_and_stage_model_references  # noqa: E402
 from durable_state import (  # noqa: E402 - paths are bootstrapped above.
     DurableObjectCommitBatch,
     DurableObjectRef,
@@ -7831,80 +7827,25 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             progress_callback: Callable[[dict[str, Any]], None] | None = None,
         ) -> list[dict[str, Any]]:
             """Resolve and stage profiles while optionally publishing progress."""
-            results: list[dict[str, Any]] = []
-            curated_profiles = load_llm_profiles()
-            for model_reference in model_references:
-                if progress_callback is not None:
-                    progress_callback(
+            staged_profiles = resolve_and_stage_model_references(
+                model_references,
+                settings.remote_storage_root,
+                progress_callback=(
+                    lambda progress: progress_callback(
                         {
-                            "stage": "resolve",
-                            "message": f"Inspecting {model_reference}",
-                            "value": 0.0,
-                            "max": 1.0,
-                            "indeterminate": True,
+                            "stage": progress.stage,
+                            "message": progress.message,
+                            "value": progress.value,
+                            "max": progress.maximum,
+                            "unit": progress.unit,
+                            "indeterminate": progress.indeterminate,
                         }
                     )
-                resolve_started_at = time.perf_counter()
-                if model_reference in curated_profiles:
-                    profile = curated_profiles[model_reference]
-                    manifest_path = None
-                    manifest_created = False
-                    security_scan_complete = True
-                elif model_reference.startswith("hf-"):
-                    profile = get_llm_profile(
-                        model_reference,
-                        storage_root=settings.remote_storage_root,
-                    )
-                    manifest_path = None
-                    manifest_created = False
-                    security_scan_complete = True
-                else:
-                    resolved = resolve_model_profile(
-                        model_reference,
-                        settings.remote_storage_root,
-                    )
-                    profile = resolved.profile
-                    manifest_path = resolved.manifest_path
-                    manifest_created = resolved.manifest_created
-                    security_scan_complete = resolved.security_scan_complete
-                resolve_elapsed_seconds = time.perf_counter() - resolve_started_at
-                result = stage_model_profile(
-                    profile.profile_id,
-                    settings.remote_storage_root,
-                    profile=profile,
-                    progress_callback=(
-                        lambda progress: progress_callback(
-                            {
-                                "stage": progress.stage,
-                                "message": progress.message,
-                                "value": progress.value,
-                                "max": progress.maximum,
-                                "unit": progress.unit,
-                                "indeterminate": progress.indeterminate,
-                            }
-                        )
-                        if progress_callback is not None
-                        else None
-                    ),
-                )
-                results.append(
-                    {
-                        "requested_reference": model_reference,
-                        "profile_id": result.profile_id,
-                        "repository": result.repository,
-                        "revision": result.revision,
-                        "backend": profile.backend,
-                        "quantization_method": profile.quantization_method,
-                        "artifact_bytes": profile.artifact_bytes,
-                        "manifest_path": manifest_path,
-                        "manifest_created": manifest_created,
-                        "security_scan_complete": security_scan_complete,
-                        "path": result.path,
-                        "downloaded": result.downloaded,
-                        "resolve_elapsed_seconds": resolve_elapsed_seconds,
-                        "elapsed_seconds": result.elapsed_seconds,
-                    }
-                )
+                    if progress_callback is not None
+                    else None
+                ),
+            )
+            results = [profile.to_dict() for profile in staged_profiles]
             if any(
                 result["downloaded"]
                 or result["manifest_created"]

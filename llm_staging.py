@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 if __package__:
-    from .llm_profiles import LLMModelProfile, get_llm_profile
+    from .llm_profiles import LLMModelProfile, get_llm_profile, load_llm_profiles
 else:  # pragma: no cover - the stable cloud entrypoint imports top-level modules.
-    from llm_profiles import LLMModelProfile, get_llm_profile
+    from llm_profiles import LLMModelProfile, get_llm_profile, load_llm_profiles
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,30 @@ class LLMStagingProgress:
 
 
 StagingProgressCallback = Callable[[LLMStagingProgress], None]
+
+
+@dataclass(frozen=True)
+class ResolvedStagedModelProfile:
+    """Describe one resolved immutable profile and its staged snapshot."""
+
+    requested_reference: str
+    profile_id: str
+    repository: str
+    revision: str
+    backend: str
+    quantization_method: str
+    artifact_bytes: int
+    manifest_path: str | None
+    manifest_created: bool
+    security_scan_complete: bool
+    path: str
+    downloaded: bool
+    resolve_elapsed_seconds: float
+    elapsed_seconds: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return JSON-compatible staging metadata."""
+        return asdict(self)
 
 
 def _snapshot_tqdm_class(
@@ -346,10 +370,90 @@ def stage_model_profile(
     return result
 
 
+def _resolve_profile_for_staging(
+    model_reference: str,
+    storage_root: str | Path,
+) -> tuple[LLMModelProfile, str | None, bool, bool]:
+    """Resolve one curated, generated, or Hugging Face model reference."""
+    curated_profiles = load_llm_profiles()
+    if model_reference in curated_profiles:
+        return curated_profiles[model_reference], None, False, True
+    if model_reference.startswith("hf-"):
+        return (
+            get_llm_profile(model_reference, storage_root=storage_root),
+            None,
+            False,
+            True,
+        )
+    if __package__:
+        from .llm_resolver import resolve_model_profile
+    else:  # pragma: no cover - stable cloud entrypoint imports top-level modules.
+        from llm_resolver import resolve_model_profile
+
+    resolved = resolve_model_profile(model_reference, storage_root)
+    return (
+        resolved.profile,
+        resolved.manifest_path,
+        resolved.manifest_created,
+        resolved.security_scan_complete,
+    )
+
+
+def resolve_and_stage_model_references(
+    model_references: list[str],
+    storage_root: str | Path,
+    *,
+    progress_callback: StagingProgressCallback | None = None,
+) -> list[ResolvedStagedModelProfile]:
+    """Resolve and stage model references on any CPU-backed remote worker."""
+    results: list[ResolvedStagedModelProfile] = []
+    for model_reference in model_references:
+        if progress_callback is not None:
+            progress_callback(
+                LLMStagingProgress(
+                    stage="resolve",
+                    message=f"Inspecting {model_reference}",
+                    indeterminate=True,
+                )
+            )
+        resolve_started_at = time.perf_counter()
+        profile, manifest_path, manifest_created, scan_complete = (
+            _resolve_profile_for_staging(model_reference, storage_root)
+        )
+        resolve_elapsed_seconds = time.perf_counter() - resolve_started_at
+        staged = stage_model_profile(
+            profile.profile_id,
+            storage_root,
+            profile=profile,
+            progress_callback=progress_callback,
+        )
+        results.append(
+            ResolvedStagedModelProfile(
+                requested_reference=model_reference,
+                profile_id=staged.profile_id,
+                repository=staged.repository,
+                revision=staged.revision,
+                backend=profile.backend,
+                quantization_method=profile.quantization_method,
+                artifact_bytes=profile.artifact_bytes,
+                manifest_path=manifest_path,
+                manifest_created=manifest_created,
+                security_scan_complete=scan_complete,
+                path=staged.path,
+                downloaded=staged.downloaded,
+                resolve_elapsed_seconds=resolve_elapsed_seconds,
+                elapsed_seconds=staged.elapsed_seconds,
+            )
+        )
+    return results
+
+
 __all__ = [
-    "StagedModelSnapshot",
     "LLMStagingProgress",
+    "ResolvedStagedModelProfile",
+    "StagedModelSnapshot",
     "is_model_snapshot_staged",
     "model_snapshot_path",
+    "resolve_and_stage_model_references",
     "stage_model_profile",
 ]

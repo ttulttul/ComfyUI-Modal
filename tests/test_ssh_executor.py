@@ -111,3 +111,74 @@ def test_ssh_transport_failure_restarts_worker_and_retries_once(
     assert result == b"serialized"
     assert attempts == 2
     assert stopped == [2]
+
+
+def test_ssh_dispatch_stages_and_rewrites_hugging_face_model_reference(
+    ssh_executor_module: Any,
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """SSH workers should execute immutable generated profiles, not raw model IDs."""
+    requested_model = "owner/model"
+    generated_profile = "hf-" + "a" * 64
+    payload = {
+        "component_id": "llm",
+        "subgraph_prompt": {
+            "llm": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": requested_model},
+            }
+        },
+    }
+    manager = SimpleNamespace(
+        controller=SimpleNamespace(host=SimpleNamespace(environment_id="lambda"))
+    )
+    spec = SimpleNamespace(worker_index=0, container_name="worker")
+    client = ssh_executor_module.SshDockerExecutorClient(
+        registry=SimpleNamespace(),
+        repo_root=tmp_path,
+        settings=SimpleNamespace(comfyui_root=tmp_path, app_name="app"),
+    )
+    stage_calls: list[list[str]] = []
+
+    def stage(*_args: Any) -> list[dict[str, Any]]:
+        """Return one generated immutable SSH profile."""
+        model_references = _args[-1]
+        stage_calls.append(model_references)
+        return [
+            {
+                "requested_reference": requested_model,
+                "profile_id": generated_profile,
+                "revision": "7" * 40,
+            }
+        ]
+
+    def invoke(_manager: Any, _spec: Any, rewritten: Any, _inputs: bytes) -> Any:
+        """Assert that only the generated profile reaches the worker executor."""
+        assert (
+            rewritten["subgraph_prompt"]["llm"]["inputs"]["model_profile"]
+            == generated_profile
+        )
+        return iter(({"kind": "result", "outputs": b"serialized"},))
+
+    with ssh_executor_module._STAGED_SSH_PROFILES_LOCK:
+        ssh_executor_module._STAGED_SSH_PROFILE_RESULTS.clear()
+    monkeypatch.setattr(client, "_runtime", lambda _payload: (manager, spec))
+    monkeypatch.setattr(client, "_run_profile_stager", stage)
+    monkeypatch.setattr(client, "_invoke_stream", invoke)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_consume_remote_payload_stream",
+        lambda _payload, stream: next(stream)["outputs"],
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_materialize_remote_execution_result",
+        lambda response, settings: response,
+    )
+
+    result = client._consume_stream(payload, b"inputs")
+
+    assert result == b"serialized"
+    assert stage_calls == [[requested_model]]

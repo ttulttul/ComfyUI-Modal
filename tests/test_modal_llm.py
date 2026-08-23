@@ -826,6 +826,53 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     )
 
 
+def test_provider_neutral_stager_resolves_and_stages_model_reference(
+    llm_staging_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Modal and SSH staging should share one immutable resolution implementation."""
+    profile = SimpleNamespace(
+        profile_id="hf-" + "c" * 64,
+        repository="owner/model",
+        revision="9" * 40,
+        backend="vllm",
+        quantization_method="compressed-tensors",
+        artifact_bytes=12 * 1024**3,
+    )
+    staged = llm_staging_module.StagedModelSnapshot(
+        profile_id=profile.profile_id,
+        repository=profile.repository,
+        revision=profile.revision,
+        path=str(tmp_path / "snapshot"),
+        downloaded=True,
+        elapsed_seconds=3.0,
+    )
+    progress: list[Any] = []
+    monkeypatch.setattr(
+        llm_staging_module,
+        "_resolve_profile_for_staging",
+        lambda _reference, _root: (profile, "/storage/manifest.json", True, True),
+    )
+    monkeypatch.setattr(
+        llm_staging_module,
+        "stage_model_profile",
+        lambda *_args, **_kwargs: staged,
+    )
+
+    results = llm_staging_module.resolve_and_stage_model_references(
+        ["owner/model"],
+        tmp_path,
+        progress_callback=progress.append,
+    )
+
+    assert results[0].requested_reference == "owner/model"
+    assert results[0].profile_id == profile.profile_id
+    assert results[0].manifest_created is True
+    assert results[0].downloaded is True
+    assert progress[0].stage == "resolve"
+
+
 def test_weight_snapshot_is_shared_across_runtime_profiles(
     llm_staging_module: Any,
     tmp_path: Path,

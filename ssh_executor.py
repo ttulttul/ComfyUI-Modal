@@ -13,6 +13,10 @@ from typing import Any
 
 if __package__:
     from .durable_state import stable_remote_invocation_id
+    from .llm_profiles import (
+        llm_model_references_from_payload,
+        rewrite_llm_model_references,
+    )
     from .remote_hosts import RemoteHostRegistry
     from .remote_protocol import (
         RemoteFrameKind,
@@ -28,6 +32,10 @@ if __package__:
     from .ssh_runtime import SshRuntimeManager, SshRuntimeSpec
 else:  # pragma: no cover - top-level remote imports.
     from durable_state import stable_remote_invocation_id
+    from llm_profiles import (
+        llm_model_references_from_payload,
+        rewrite_llm_model_references,
+    )
     from remote_hosts import RemoteHostRegistry
     from remote_protocol import (
         RemoteFrameKind,
@@ -43,6 +51,8 @@ else:  # pragma: no cover - top-level remote imports.
     from ssh_runtime import SshRuntimeManager, SshRuntimeSpec
 
 logger = logging.getLogger(__name__)
+_STAGED_SSH_PROFILES_LOCK = threading.Lock()
+_STAGED_SSH_PROFILE_RESULTS: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 class SshRemoteInvocationError(RuntimeError):
@@ -157,6 +167,7 @@ class SshDockerExecutorClient:
         for attempt in range(1, 3):
             manager, spec = self._runtime(payload)
             try:
+                self._ensure_llm_profiles_staged(manager, spec, payload)
                 stream = self._invoke_stream(manager, spec, payload, inputs_payload)
                 response = _consume_remote_payload_stream(payload, stream)
                 break
@@ -192,6 +203,163 @@ class SshDockerExecutorClient:
             response,
             settings=self.settings or get_settings(),
         )
+
+    def _ensure_llm_profiles_staged(
+        self,
+        manager: SshRuntimeManager,
+        spec: SshRuntimeSpec,
+        payload: dict[str, Any],
+    ) -> None:
+        """Resolve, stage, and rewrite LLM model references on one SSH host."""
+        model_references = llm_model_references_from_payload(payload)
+        if not model_references:
+            return
+        environment_id = manager.controller.host.environment_id
+        with _STAGED_SSH_PROFILES_LOCK:
+            missing_references = [
+                reference
+                for reference in model_references
+                if (environment_id, reference) not in _STAGED_SSH_PROFILE_RESULTS
+            ]
+            if missing_references:
+                stage_results = self._run_profile_stager(
+                    manager,
+                    spec,
+                    payload,
+                    missing_references,
+                )
+                self._cache_staged_profiles(
+                    environment_id,
+                    missing_references,
+                    stage_results,
+                )
+            resolved_results = {
+                reference: _STAGED_SSH_PROFILE_RESULTS[(environment_id, reference)]
+                for reference in model_references
+            }
+        rewrite_llm_model_references(
+            payload,
+            {
+                reference: str(result["profile_id"])
+                for reference, result in resolved_results.items()
+            },
+        )
+        logger.info(
+            "SSH LLM models are resolved and staged environment=%s component=%s profiles=%s.",
+            environment_id,
+            payload.get("component_id"),
+            sorted(str(result["profile_id"]) for result in resolved_results.values()),
+        )
+
+    def _run_profile_stager(
+        self,
+        manager: SshRuntimeManager,
+        spec: SshRuntimeSpec,
+        payload: dict[str, Any],
+        model_references: list[str],
+    ) -> list[dict[str, Any]]:
+        """Run the CPU model stager inside one persistent SSH worker container."""
+        from .remote.modal_app import (
+            _emit_local_llm_staging_progress,
+            _emit_local_remote_startup_status,
+        )
+
+        _emit_local_remote_startup_status(
+            payload,
+            phase="llm_staging",
+            status_message="Inspecting and staging LLM on the SSH host",
+        )
+        arguments = [
+            "exec",
+            spec.container_name,
+            "python",
+            "-m",
+            "remote.ssh_worker",
+            "stage-profiles",
+        ]
+        for model_reference in model_references:
+            arguments.extend(("--model-reference", model_reference))
+        process = manager.controller.docker_popen(tuple(arguments))
+        results = self._consume_stager_output(
+            process,
+            payload,
+            _emit_local_llm_staging_progress,
+        )
+        downloaded_gib = sum(
+            float(result.get("artifact_bytes") or 0) / 1024**3
+            for result in results
+            if result.get("downloaded")
+        )
+        _emit_local_remote_startup_status(
+            payload,
+            phase="llm_staged",
+            status_message=(
+                f"SSH LLM staging complete ({downloaded_gib:.1f} GiB downloaded)"
+            ),
+        )
+        return results
+
+    def _consume_stager_output(
+        self,
+        process: subprocess.Popen[bytes],
+        payload: dict[str, Any],
+        progress_callback: Any,
+    ) -> list[dict[str, Any]]:
+        """Consume JSON-line progress and the terminal SSH staging result."""
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            raise SshRemoteInvocationError("SSH model stager did not expose output streams.")
+        stderr_chunks: list[bytes] = []
+        stderr_thread = threading.Thread(
+            target=_collect_bounded_stream,
+            args=(process.stderr, stderr_chunks),
+            daemon=True,
+        )
+        stderr_thread.start()
+        results: list[dict[str, Any]] | None = None
+        for raw_line in process.stdout:
+            try:
+                event = decode_json_payload(raw_line)
+            except (RemoteProtocolError, UnicodeDecodeError) as exc:
+                process.terminate()
+                raise SshRemoteInvocationError(
+                    "SSH model stager returned invalid progress JSON."
+                ) from exc
+            if event.get("kind") == "progress":
+                progress_callback(payload, event)
+            elif event.get("kind") == "result" and isinstance(event.get("results"), list):
+                results = [dict(result) for result in event["results"] if isinstance(result, Mapping)]
+        returncode = process.wait()
+        stderr_thread.join(timeout=1.0)
+        if returncode != 0 or results is None:
+            diagnostics = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+            raise SshRemoteInvocationError(
+                f"SSH model staging failed: {diagnostics or 'no result returned'}"
+            )
+        return results
+
+    def _cache_staged_profiles(
+        self,
+        environment_id: str,
+        requested_references: list[str],
+        stage_results: list[dict[str, Any]],
+    ) -> None:
+        """Validate and cache SSH staging results by request and immutable ID."""
+        confirmed_references: set[str] = set()
+        for result in stage_results:
+            requested_reference = str(result.get("requested_reference") or "")
+            profile_id = str(result.get("profile_id") or "")
+            revision = str(result.get("revision") or "")
+            if not requested_reference or not profile_id or not revision:
+                continue
+            _STAGED_SSH_PROFILE_RESULTS[(environment_id, requested_reference)] = result
+            _STAGED_SSH_PROFILE_RESULTS[(environment_id, profile_id)] = result
+            confirmed_references.add(requested_reference)
+        missing_results = set(requested_references) - confirmed_references
+        if missing_results:
+            raise SshRemoteInvocationError(
+                f"SSH model stager did not confirm models {sorted(missing_results)}."
+            )
 
     def _invoke_stream(
         self,
@@ -310,6 +478,14 @@ class SshDockerExecutorClient:
             "remote.ssh_worker",
             "client",
         )
+
+
+def _collect_bounded_stream(stream: Any, chunks: list[bytes]) -> None:
+    """Drain a diagnostic stream while retaining at most its recent output."""
+    while chunk := stream.read(65536):
+        chunks.append(chunk)
+        if sum(len(value) for value in chunks) > 1024 * 1024:
+            del chunks[:-8]
 
 
 class _BytesReader:

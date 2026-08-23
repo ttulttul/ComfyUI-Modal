@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -45,6 +46,49 @@ def test_worker_execution_state_registers_and_cancels(ssh_worker_module: Any) ->
     assert cancellation.is_set()
     state.unregister("RIV_test")
     assert state.cancel("RIV_test") is False
+
+
+def test_worker_stage_profiles_streams_progress_and_result(
+    ssh_worker_module: Any,
+    llm_staging_module: Any,
+    monkeypatch: Any,
+    capsys: Any,
+    tmp_path: Path,
+) -> None:
+    """The SSH staging command should expose machine-readable progress and metadata."""
+
+    def stage(model_references: list[str], storage_root: Path, **kwargs: Any) -> Any:
+        """Emit one progress update and return one immutable profile result."""
+        assert model_references == ["owner/model"]
+        assert storage_root == tmp_path
+        kwargs["progress_callback"](
+            SimpleNamespace(
+                stage="download",
+                message="Fetching files",
+                value=1,
+                maximum=2,
+                unit="files",
+                indeterminate=False,
+            )
+        )
+        return [
+            SimpleNamespace(
+                to_dict=lambda: {
+                    "requested_reference": "owner/model",
+                    "profile_id": "hf-" + "b" * 64,
+                    "revision": "8" * 40,
+                }
+            )
+        ]
+
+    monkeypatch.setattr(llm_staging_module, "resolve_and_stage_model_references", stage)
+
+    results = ssh_worker_module.stage_profiles(["owner/model"], tmp_path)
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]["kind"] == "progress"
+    assert events[0]["max"] == 2
+    assert events[1] == {"kind": "result", "results": results}
 
 
 def test_worker_request_relay_preserves_framed_binary_payload(
