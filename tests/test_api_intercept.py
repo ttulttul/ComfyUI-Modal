@@ -567,6 +567,103 @@ def test_automatic_policy_rejects_zero_cost_host_for_oversized_model(
     assert assignments["6"].environment_id == "modal:H200"
 
 
+def test_planner_resolves_hugging_face_metadata_before_cost_ranking(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+    remote_hosts_module: Any,
+    llm_resolver_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Raw Hugging Face IDs must expose their VRAM floor before SSH placement."""
+    module = execution_environments_module
+    capabilities = module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=128 * 1024**3,
+        available_ram_bytes=120 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        gpus=(module.GpuCapability("GPU-4090", "RTX 4090", 24 * 1024**3),),
+        probed_at_epoch=2_000_000_000.0,
+    )
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="lambda",
+        display_name="Lambda 4090",
+        ssh_target="lambda",
+        cost_usd_per_second=0.0,
+        capabilities=capabilities,
+        health=module.EnvironmentHealth.READY,
+    )
+    component = api_intercept_module.RemoteComponentPlan(
+        node_ids=["257"],
+        representative_node_id="257",
+        boundary_inputs=[],
+        boundary_outputs=[],
+        execute_node_ids=["257"],
+        contains_output_node=False,
+    )
+    prompt = {
+        "257": {
+            "class_type": "ModalLLM",
+            "inputs": {"model_profile": "owner/large-model"},
+        }
+    }
+    workflow = {
+        "extra": {
+            "remote_execution": {
+                "policy": "automatic",
+                "auto_place": True,
+            }
+        }
+    }
+    profile = SimpleNamespace(
+        profile_id="hf-" + "d" * 64,
+        artifact_bytes=55_563_006_216,
+        estimated_vram_gb=67.9,
+    )
+    resolved_references: list[str] = []
+
+    def resolve(model_reference: str, storage_root: Path) -> Any:
+        """Return deterministic metadata without downloading model weights."""
+        assert storage_root == tmp_path
+        resolved_references.append(model_reference)
+        return SimpleNamespace(profile=profile)
+
+    settings = SimpleNamespace(
+        modal_gpu="H200",
+        max_containers=1,
+        comfyui_root=None,
+        local_storage_root=tmp_path,
+    )
+    monkeypatch.setattr(llm_resolver_module, "resolve_model_profile", resolve)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_schedulable_ssh_hosts",
+        lambda _settings: (host,),
+    )
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_execution_history",
+        lambda _settings: None,
+    )
+
+    assignments = api_intercept_module._plan_component_execution_assignments(
+        components=[component],
+        prompt=prompt,
+        workflow=workflow,
+        settings=settings,
+    )
+
+    assert resolved_references == ["owner/large-model"]
+    assert assignments["257"].provider is module.ExecutionProvider.MODAL
+    assert assignments["257"].environment_id == "modal:H200"
+    assert "requires at least 67.90 GiB GPU VRAM" in assignments["257"].reasons
+
+
 def test_planner_keeps_unmarked_llm_local_between_remote_text_nodes(
     api_intercept_module: Any,
 ) -> None:

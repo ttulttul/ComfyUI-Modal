@@ -53,6 +53,11 @@ else:  # pragma: no cover - top-level remote imports.
 logger = logging.getLogger(__name__)
 _STAGED_SSH_PROFILES_LOCK = threading.Lock()
 _STAGED_SSH_PROFILE_RESULTS: dict[tuple[str, str], dict[str, Any]] = {}
+_ACTIVE_SSH_STAGERS_LOCK = threading.Lock()
+_ACTIVE_SSH_STAGERS: dict[
+    str,
+    tuple[SshRuntimeManager, SshRuntimeSpec],
+] = {}
 
 
 class SshRemoteInvocationError(RuntimeError):
@@ -111,6 +116,20 @@ class SshDockerExecutorClient:
         invocation_id: str,
     ) -> bool:
         """Request cancellation of one active invocation on its assigned worker."""
+        with _ACTIVE_SSH_STAGERS_LOCK:
+            active_stager = _ACTIVE_SSH_STAGERS.get(invocation_id)
+        if active_stager is not None:
+            active_manager, active_spec = active_stager
+            stopped = active_manager.stop_worker(active_spec.worker_index)
+            logger.info(
+                "Stopped SSH worker to cancel active model staging invocation=%s "
+                "environment=%s worker_index=%d stopped=%s.",
+                invocation_id,
+                active_manager.controller.host.environment_id,
+                active_spec.worker_index,
+                stopped,
+            )
+            return stopped
         manager, spec = self._runtime(payload)
         request = encode_json_frame(
             RemoteFrameKind.CANCEL,
@@ -280,11 +299,18 @@ class SshDockerExecutorClient:
         for model_reference in model_references:
             arguments.extend(("--model-reference", model_reference))
         process = manager.controller.docker_popen(tuple(arguments))
-        results = self._consume_stager_output(
-            process,
-            payload,
-            _emit_local_llm_staging_progress,
-        )
+        invocation_id = str(payload["invocation_id"])
+        with _ACTIVE_SSH_STAGERS_LOCK:
+            _ACTIVE_SSH_STAGERS[invocation_id] = (manager, spec)
+        try:
+            results = self._consume_stager_output(
+                process,
+                payload,
+                _emit_local_llm_staging_progress,
+            )
+        finally:
+            with _ACTIVE_SSH_STAGERS_LOCK:
+                _ACTIVE_SSH_STAGERS.pop(invocation_id, None)
         downloaded_gib = sum(
             float(result.get("artifact_bytes") or 0) / 1024**3
             for result in results

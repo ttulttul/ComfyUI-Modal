@@ -486,17 +486,66 @@ def _component_minimum_vram_bytes(
     ).minimum_vram_bytes
 
 
-def _component_profile_minimum_vram_bytes(
+def _prompt_llm_model_references(prompt: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return every fixed Modal LLM model reference in a prompt."""
+    references: set[str] = set()
+    for prompt_node in prompt.values():
+        if not isinstance(prompt_node, Mapping):
+            continue
+        if str(prompt_node.get("class_type") or "") != "ModalLLM":
+            continue
+        inputs = prompt_node.get("inputs")
+        if not isinstance(inputs, Mapping):
+            continue
+        model_reference = inputs.get("model_profile")
+        if isinstance(model_reference, str) and model_reference.strip():
+            references.add(model_reference.strip())
+    return tuple(sorted(references))
+
+
+def _resolve_prompt_llm_profiles(
+    prompt: Mapping[str, Any],
+    settings: ModalSyncSettings,
+) -> dict[str, Any]:
+    """Resolve LLM metadata before environment admission and cost ranking."""
+    from .llm_profiles import get_llm_profile
+    from .llm_resolver import resolve_model_profile
+
+    storage_root = Path(
+        getattr(settings, "local_storage_root", "/tmp/comfyui-modal-sync-storage")
+    )
+    profiles: dict[str, Any] = {}
+    for model_reference in _prompt_llm_model_references(prompt):
+        try:
+            profile = get_llm_profile(model_reference, storage_root=storage_root)
+        except ValueError as profile_error:
+            if model_reference.startswith("hf-"):
+                raise ModalPromptValidationError(str(profile_error)) from profile_error
+            try:
+                profile = resolve_model_profile(model_reference, storage_root).profile
+            except ValueError as resolution_error:
+                raise ModalPromptValidationError(str(resolution_error)) from resolution_error
+        profiles[model_reference] = profile
+        logger.info(
+            "Resolved planner LLM profile model=%s profile=%s weights_gib=%.2f "
+            "estimated_vram_gib=%.2f.",
+            model_reference,
+            profile.profile_id,
+            profile.artifact_bytes / 1024**3,
+            profile.estimated_vram_gb,
+        )
+    return profiles
+
+
+def _component_profile_memory_estimate(
     component: RemoteComponentPlan,
     prompt: Mapping[str, Any],
     preferences: WorkflowExecutionPreferences,
-) -> int:
-    """Estimate a component VRAM floor from workflow and LLM profile metadata."""
+    resolved_profiles: Mapping[str, Any],
+) -> ComponentMemoryEstimate:
+    """Estimate a component's RAM and VRAM floors from resolved LLM profiles."""
     minimum_vram_bytes = preferences.minimum_vram_bytes
-    try:
-        from .llm_profiles import get_llm_profile
-    except ImportError:
-        return minimum_vram_bytes
+    profiles: dict[str, Any] = {}
     for node_id in component.node_ids:
         prompt_node = prompt.get(node_id)
         if not isinstance(prompt_node, Mapping):
@@ -509,15 +558,23 @@ def _component_profile_minimum_vram_bytes(
         model_profile = inputs.get("model_profile")
         if not isinstance(model_profile, str) or not model_profile.strip():
             continue
-        try:
-            profile = get_llm_profile(model_profile.strip())
-        except (KeyError, ValueError):
+        profile = resolved_profiles.get(model_profile.strip())
+        if profile is None:
             continue
+        profiles[profile.profile_id] = profile
         minimum_vram_bytes = max(
             minimum_vram_bytes,
             int(max(0.0, profile.estimated_vram_gb) * 1024**3),
         )
-    return minimum_vram_bytes
+    artifact_sizes = [int(profile.artifact_bytes) for profile in profiles.values()]
+    return ComponentMemoryEstimate(
+        minimum_vram_bytes=minimum_vram_bytes,
+        minimum_ram_bytes=(sum(artifact_sizes) + _MODEL_RAM_HEADROOM_BYTES)
+        if artifact_sizes
+        else 0,
+        model_asset_count=len(artifact_sizes),
+        largest_model_bytes=max(artifact_sizes, default=0),
+    )
 
 
 def _iter_prompt_string_values(value: object) -> Iterator[str]:
@@ -591,12 +648,16 @@ def _component_memory_estimate(
     prompt: Mapping[str, Any],
     preferences: WorkflowExecutionPreferences,
     settings: ModalSyncSettings,
+    resolved_llm_profiles: Mapping[str, Any] | None = None,
 ) -> ComponentMemoryEstimate:
     """Infer conservative RAM and VRAM floors from resident model weight sizes."""
-    profile_vram_bytes = _component_profile_minimum_vram_bytes(
+    profile_estimate = _component_profile_memory_estimate(
         component,
         prompt,
         preferences,
+        resolved_llm_profiles
+        if resolved_llm_profiles is not None
+        else _resolve_prompt_llm_profiles(prompt, settings),
     )
     primary_sizes, additive_sizes = _component_model_asset_sizes(
         component,
@@ -605,10 +666,7 @@ def _component_memory_estimate(
     )
     all_sizes = primary_sizes + additive_sizes
     if not all_sizes:
-        return ComponentMemoryEstimate(
-            minimum_vram_bytes=profile_vram_bytes,
-            minimum_ram_bytes=0,
-        )
+        return profile_estimate
 
     primary_peak_bytes = max(primary_sizes or all_sizes)
     additive_bytes = sum(additive_sizes) if primary_sizes else 0
@@ -618,10 +676,19 @@ def _component_memory_estimate(
         + _MODEL_VRAM_HEADROOM_BYTES
     )
     return ComponentMemoryEstimate(
-        minimum_vram_bytes=max(profile_vram_bytes, model_vram_bytes),
-        minimum_ram_bytes=resident_weight_bytes + _MODEL_RAM_HEADROOM_BYTES,
-        model_asset_count=len(all_sizes),
-        largest_model_bytes=max(all_sizes),
+        minimum_vram_bytes=max(
+            profile_estimate.minimum_vram_bytes,
+            model_vram_bytes,
+        ),
+        minimum_ram_bytes=max(
+            profile_estimate.minimum_ram_bytes,
+            resident_weight_bytes + _MODEL_RAM_HEADROOM_BYTES,
+        ),
+        model_asset_count=len(all_sizes) + profile_estimate.model_asset_count,
+        largest_model_bytes=max(
+            max(all_sizes),
+            profile_estimate.largest_model_bytes,
+        ),
     )
 
 
@@ -708,6 +775,7 @@ def _plan_component_execution_assignments(
     scheduler = CostAwareEnvironmentScheduler()
     history = _execution_history(settings)
     environment_ids = [environment.environment_id for environment in environments]
+    resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
     assignments: dict[str, ExecutionAssignment] = {}
     for component in components:
         component_signature = _component_execution_signature(component, prompt)
@@ -721,6 +789,7 @@ def _plan_component_execution_assignments(
             prompt,
             preferences,
             settings,
+            resolved_llm_profiles,
         )
         if memory_estimate.model_asset_count:
             logger.info(

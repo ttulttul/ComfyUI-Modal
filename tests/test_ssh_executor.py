@@ -182,3 +182,32 @@ def test_ssh_dispatch_stages_and_rewrites_hugging_face_model_reference(
 
     assert result == b"serialized"
     assert stage_calls == [[requested_model]]
+
+
+def test_ssh_cancel_stops_worker_during_model_staging(
+    ssh_executor_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Cancellation must stop a worker whose CPU stager is still downloading."""
+    stopped: list[int] = []
+    manager = SimpleNamespace(
+        controller=SimpleNamespace(host=SimpleNamespace(environment_id="lambda")),
+        stop_worker=lambda worker_index: stopped.append(worker_index) or True,
+    )
+    spec = SimpleNamespace(worker_index=3)
+    invocation_id = "RIV_staging"
+    client = ssh_executor_module.SshDockerExecutorClient(
+        registry=SimpleNamespace(),
+        repo_root=tmp_path,
+        settings=SimpleNamespace(comfyui_root=tmp_path, app_name="app"),
+    )
+    with ssh_executor_module._ACTIVE_SSH_STAGERS_LOCK:
+        ssh_executor_module._ACTIVE_SSH_STAGERS[invocation_id] = (manager, spec)
+    try:
+        cancelled = client.cancel({}, invocation_id)
+    finally:
+        with ssh_executor_module._ACTIVE_SSH_STAGERS_LOCK:
+            ssh_executor_module._ACTIVE_SSH_STAGERS.pop(invocation_id, None)
+
+    assert cancelled is True
+    assert stopped == [3]
