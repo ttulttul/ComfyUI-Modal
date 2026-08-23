@@ -102,3 +102,22 @@ def test_parser_allows_push_without_explicit_tag() -> None:
 
     assert arguments.push is True
     assert arguments.tag is None
+
+
+def test_docker_build_targets_vast_x86_64_platform() -> None:
+    """Apple Silicon builders must produce the architecture used by Vast workers."""
+    module = _module()
+
+    command = module._docker_build_command(
+        "ghcr.io/example/worker:v1",
+        "runtime-fingerprint",
+    )
+
+    assert command[:5] == (
+        "docker",
+        "build",
+        "--pull",
+        "--platform",
+        "linux/amd64",
+    )
+    assert "comfy.remote.runtime-fingerprint=runtime-fingerprint" in command

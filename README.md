@@ -164,7 +164,7 @@ Build the shared SSH/Vast worker image locally, push it to a registry, and use t
 uv run python scripts/build_vast_worker_image.py --push
 ```
 
-`--tag` is optional. When omitted, its effective default is `ghcr.io/<owner>/comfy-modal-worker:v<version>`: the builder reads `<version>` from `project.version` and `<owner>` from the GitHub Repository URL in `pyproject.toml`. Use `--owner` or `--tag-template` to change those derived defaults, or pass `--tag` to supply the complete image tag explicitly.
+The builder always targets `linux/amd64`, including when it runs on an Apple Silicon Mac, because Vast GPU hosts and the pinned CUDA/vLLM wheels are x86_64. Docker Desktop uses its cross-architecture emulation for the build. `--tag` is optional. When omitted, its effective default is `ghcr.io/<owner>/comfy-modal-worker:v<version>`: the builder reads `<version>` from `project.version` and `<owner>` from the GitHub Repository URL in `pyproject.toml`. Use `--owner` or `--tag-template` to change those derived defaults, or pass `--tag` to supply the complete image tag explicitly.
 
 Open **Settings → Remote Execution: Vast.ai leases** to verify the credential, inspect hourly price, activity, and idle deadlines, and destroy expired or idle leases. Manual destruction rechecks the live instance's ownership label and refuses to destroy active work. The same controls are available at `/remote/vast/status`, `/remote/vast/verify`, `/remote/vast/reap`, and `/remote/vast/destroy`.
 

@@ -25,6 +25,7 @@ from ssh_runtime import export_worker_image_context
 logger = logging.getLogger(__name__)
 
 DEFAULT_TAG_TEMPLATE = "ghcr.io/{owner}/comfy-modal-worker:v{version}"
+VAST_WORKER_PLATFORM = "linux/amd64"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -213,6 +214,22 @@ def _run(command: Sequence[str], *, input_payload: bytes | None = None) -> str:
     return completed.stdout.decode("utf-8", errors="replace").strip()
 
 
+def _docker_build_command(image_tag: str, runtime_fingerprint: str) -> tuple[str, ...]:
+    """Return the architecture-pinned Docker command for a Vast worker image."""
+    return (
+        "docker",
+        "build",
+        "--pull",
+        "--platform",
+        VAST_WORKER_PLATFORM,
+        "--label",
+        f"comfy.remote.runtime-fingerprint={runtime_fingerprint}",
+        "-t",
+        image_tag,
+        "-",
+    )
+
+
 def build_image(
     tag: str,
     *,
@@ -257,16 +274,7 @@ def build_image(
         len(context),
     )
     _run(
-        (
-            "docker",
-            "build",
-            "--pull",
-            "--label",
-            f"comfy.remote.runtime-fingerprint={identity.fingerprint}",
-            "-t",
-            image_tag,
-            "-",
-        ),
+        _docker_build_command(image_tag, identity.fingerprint),
         input_payload=context,
     )
     if not push:
