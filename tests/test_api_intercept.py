@@ -1818,6 +1818,14 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
         component_execution_stages=[["1"]],
         estimated_max_parallel_requests=1,
         max_parallel_requests_upper_bound=1,
+        execution_assignments_by_representative={
+            "1": api_intercept_module.ExecutionAssignment(
+                environment_id="modal:B300",
+                provider=api_intercept_module.ExecutionProvider.MODAL,
+                predicted_cost_usd=0.01,
+                predicted_completion_seconds=10.0,
+            )
+        },
     )
     observed_rewrite_settings: list[Any] = []
 
@@ -1860,6 +1868,79 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
         api_intercept_module.MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY
     ] == "prompt-queue-warmup"
     assert len(prompt_server.prompt_queue.items) == 1
+
+
+def test_configured_non_modal_plan_omits_modal_status_gpu(
+    api_intercept_module: Any,
+) -> None:
+    """Vast-only and SSH-only plans must not activate Modal status polling."""
+    summary = api_intercept_module.RewriteSummary(
+        execution_assignments_by_representative={
+            "vast-component": api_intercept_module.ExecutionAssignment(
+                environment_id="vast:instance-1",
+                provider=api_intercept_module.ExecutionProvider.VAST,
+                predicted_cost_usd=0.01,
+                predicted_completion_seconds=20.0,
+                configuration_id="vast-config",
+            ),
+            "ssh-component": api_intercept_module.ExecutionAssignment(
+                environment_id="ssh-host",
+                provider=api_intercept_module.ExecutionProvider.SSH_DOCKER,
+                predicted_cost_usd=0.0,
+                predicted_completion_seconds=15.0,
+                configuration_id="ssh-config",
+            ),
+        },
+        remote_configurations=[
+            {
+                "configuration_id": "vast-config",
+                "provider": "vast",
+                "display_name": "Vast pool",
+            },
+            {
+                "configuration_id": "ssh-config",
+                "provider": "ssh_docker",
+                "display_name": "SSH host",
+            },
+        ],
+    )
+
+    assert api_intercept_module._selected_modal_gpus(summary, "B300") == []
+    assert api_intercept_module._prompt_uses_remote_execution_configurator(
+        {
+            "99": {
+                "class_type": "RemoteExecutionConfigurator",
+                "inputs": {},
+            }
+        }
+    )
+
+
+def test_configured_modal_plan_reports_only_selected_modal_gpus(
+    api_intercept_module: Any,
+) -> None:
+    """Status metadata should come from selected configurations, not legacy GPU state."""
+    summary = api_intercept_module.RewriteSummary(
+        execution_assignments_by_representative={
+            "modal-component": api_intercept_module.ExecutionAssignment(
+                environment_id="modal:modal-config:H200",
+                provider=api_intercept_module.ExecutionProvider.MODAL,
+                predicted_cost_usd=0.01,
+                predicted_completion_seconds=10.0,
+                configuration_id="modal-config",
+            )
+        },
+        remote_configurations=[
+            {
+                "configuration_id": "modal-config",
+                "provider": "modal",
+                "display_name": "Modal H200",
+                "gpu_type": "H200",
+            }
+        ],
+    )
+
+    assert api_intercept_module._selected_modal_gpus(summary, "B300") == ["H200"]
 
 
 def test_modal_prompt_rewrite_keeps_event_loop_responsive(

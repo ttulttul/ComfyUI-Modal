@@ -71,6 +71,7 @@ from .sync_engine import (
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
 from .remote_configuration_nodes import (
     REMOTE_CONFIGURATION_NODE_IDS,
+    REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
     compile_remote_configuration_set,
 )
 from .remote_configurations import (
@@ -7550,6 +7551,47 @@ def _execution_assignments_payload(
     }
 
 
+def _prompt_uses_remote_execution_configurator(prompt: Mapping[str, Any]) -> bool:
+    """Return whether the serialized prompt opts into workflow-scoped capacity."""
+    return any(
+        isinstance(prompt_node, Mapping)
+        and str(prompt_node.get("class_type") or "")
+        == REMOTE_EXECUTION_CONFIGURATOR_NODE_ID
+        for prompt_node in prompt.values()
+    )
+
+
+def _selected_modal_gpus(
+    summary: RewriteSummary,
+    legacy_modal_gpu: str,
+) -> list[str]:
+    """Return distinct Modal GPUs selected by the completed execution plan."""
+    modal_assignments = [
+        assignment
+        for assignment in summary.execution_assignments_by_representative.values()
+        if assignment.provider is ExecutionProvider.MODAL
+    ]
+    if not modal_assignments:
+        return []
+    configured_gpus = {
+        str(configuration.get("configuration_id") or ""): str(
+            configuration.get("gpu_type") or ""
+        )
+        for configuration in summary.remote_configurations
+        if configuration.get("provider") == ExecutionProvider.MODAL.value
+        and configuration.get("configuration_id")
+        and configuration.get("gpu_type")
+    }
+    selected_gpus = {
+        configured_gpus.get(str(assignment.configuration_id or ""), "")
+        for assignment in modal_assignments
+    }
+    selected_gpus.discard("")
+    if not selected_gpus:
+        selected_gpus.add(legacy_modal_gpu)
+    return sorted(selected_gpus)
+
+
 async def _queue_prompt_json(
     prompt_server: Any,
     json_data: dict[str, Any],
@@ -8390,7 +8432,14 @@ def setup_modal_queue_route(
                 request_settings.modal_gpu,
                 prompt_id,
             )
-            request_modal_gpu = request_settings.modal_gpu
+            status_modal_gpu = (
+                None
+                if _prompt_uses_remote_execution_configurator(
+                    json_data.get("prompt", {})
+                )
+                else request_settings.modal_gpu
+            )
+            request_modal_gpu = status_modal_gpu
 
             def emit_setup_status(
                 message: str,
@@ -8404,7 +8453,7 @@ def setup_modal_queue_route(
                     client_id=client_id,
                     prompt_id=prompt_id,
                     node_ids=remote_node_ids,
-                    modal_gpu=request_settings.modal_gpu,
+                    modal_gpu=status_modal_gpu,
                     component_node_ids_by_representative=(
                         summary.component_node_ids_by_representative or None
                     ),
@@ -8424,6 +8473,16 @@ def setup_modal_queue_route(
                     extra_data=json_data.get("extra_data"),
                     status_callback=emit_setup_status,
                 )
+                selected_modal_gpus = _selected_modal_gpus(
+                    summary,
+                    request_settings.modal_gpu,
+                )
+                status_modal_gpu = (
+                    selected_modal_gpus[0]
+                    if len(selected_modal_gpus) == 1
+                    else None
+                )
+                request_modal_gpu = status_modal_gpu
                 logger.info(
                     "Modal prompt rewrite finished in %.3fs for %d remote nodes across %d components.",
                     time.perf_counter() - rewrite_started_at,
@@ -8481,7 +8540,7 @@ def setup_modal_queue_route(
                     client_id=client_id,
                     prompt_id=prompt_id,
                     node_ids=remote_node_ids,
-                    modal_gpu=request_settings.modal_gpu,
+                    modal_gpu=status_modal_gpu,
                     component_node_ids_by_representative=summary.component_node_ids_by_representative,
                     status_message="Submitting remote workflow",
                 )
@@ -8490,7 +8549,8 @@ def setup_modal_queue_route(
                 json_data,
                 modal_response_payload=(
                     {
-                        "modal_gpu": request_settings.modal_gpu,
+                        "modal_gpu": status_modal_gpu,
+                        "remote_execution_modal_gpus": selected_modal_gpus,
                         "modal_remote_node_ids": list(summary.remote_node_ids),
                         "modal_sandwiched_local_node_ids": list(
                             summary.sandwiched_local_node_ids

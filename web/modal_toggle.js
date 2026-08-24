@@ -729,11 +729,67 @@ function currentGlobalStatus() {
 
 /**
  * Return whether active workflow state should poll Modal for container status.
- * @param {{ phase?: string } | null} activeState
+ * @param {{ phase?: string, modalGpu?: string | null } | null} activeState
  * @returns {boolean}
  */
 function shouldPollModalContainerStatus(activeState) {
-  return Boolean(activeState && activeState.phase !== STATE_ERROR);
+  return Boolean(
+    activeState && activeState.phase !== STATE_ERROR && activeState.modalGpu,
+  );
+}
+
+/**
+ * Return a provider-aware message while planned remote capacity starts.
+ * @param {Iterable<string>} providers
+ * @returns {string}
+ */
+function remoteCapacityWaitingMessage(providers) {
+  const providerSet = new Set(Array.from(providers, (provider) => String(provider)));
+  if (providerSet.size !== 1) {
+    return "Waiting for remote capacity";
+  }
+  if (providerSet.has("modal")) {
+    return "Waiting for Modal startup";
+  }
+  if (providerSet.has("vast")) {
+    return "Waiting for Vast.ai instance";
+  }
+  if (providerSet.has("ssh_docker")) {
+    return "Waiting for self-hosted worker";
+  }
+  return "Waiting for remote capacity";
+}
+
+/**
+ * Return one compact provider and environment label for the global status pill.
+ * @param {Record<string, any>} assignment
+ * @param {Map<string, Record<string, any>>} configurationsById
+ * @param {string | null} fallbackModalGpu
+ * @returns {string}
+ */
+function remoteExecutionEnvironmentLabel(
+  assignment,
+  configurationsById,
+  fallbackModalGpu,
+) {
+  if (assignment?.provider === "modal") {
+    const configuration = configurationsById.get(
+      String(assignment?.configuration_id ?? ""),
+    );
+    const modalGpu = configuration?.gpu_type ?? fallbackModalGpu;
+    return modalGpu ? `Modal ${modalGpu}` : "Modal";
+  }
+  if (assignment?.provider === "vast") {
+    const destination = String(
+      assignment?.execution_location ?? assignment?.environment_id ?? "capacity",
+    );
+    return `Vast.ai ${destination}`;
+  }
+  return String(
+    assignment?.execution_location ??
+      assignment?.environment_id ??
+      "self-hosted",
+  );
 }
 
 /**
@@ -1261,10 +1317,20 @@ function refreshGlobalStatusElement() {
   element.dataset.modalGpu = activeState.modalGpu ?? "";
   gpuText.textContent = activeState.modalGpu ?? "";
   gpuText.hidden = !activeState.modalGpu;
-  syncModalContainerStatusPolling(activeState);
-  renderModalCostEstimate(costText);
-  renderModalHourlyBilling(billingText, activeState);
-  renderModalContainerStatuses(containerText);
+  if (activeState.modalGpu) {
+    syncModalContainerStatusPolling(activeState);
+    renderModalCostEstimate(costText);
+    renderModalHourlyBilling(billingText, activeState);
+    renderModalContainerStatuses(containerText);
+  } else {
+    stopModalContainerStatusPolling();
+    for (const modalOnlyElement of [costText, billingText, containerText]) {
+      if (modalOnlyElement) {
+        modalOnlyElement.textContent = "";
+        modalOnlyElement.hidden = true;
+      }
+    }
+  }
 
   if (activeState.phase === STATE_SETUP) {
     element.style.borderColor = "rgba(245, 158, 11, 0.55)";
@@ -4618,7 +4684,12 @@ function handleModalStatus(event) {
   if (!promptState) {
     return;
   }
-  const modalGpu = MODAL_GPU_TYPES.includes(detail.modal_gpu) ? detail.modal_gpu : null;
+  const executionProvider = String(detail.execution_provider ?? "").trim();
+  const modalGpu =
+    (!executionProvider || executionProvider === "modal") &&
+    MODAL_GPU_TYPES.includes(detail.modal_gpu)
+      ? detail.modal_gpu
+      : null;
   if (modalGpu) {
     promptState.modalGpu = modalGpu;
   }
@@ -4673,7 +4744,15 @@ function handleModalStatus(event) {
       return;
     }
     setGlobalStatusPhase(promptId, STATE_STARTING, nodeIds.length, {
-      message: detail.status_message ?? "Starting Modal component",
+      message:
+        detail.status_message ??
+        (executionProvider === "vast"
+          ? "Starting Vast.ai component"
+          : executionProvider === "ssh_docker"
+            ? "Starting self-hosted component"
+            : executionProvider === "modal"
+              ? "Starting Modal component"
+              : "Starting remote component"),
       current: detail.status_current ?? null,
       total: detail.status_total ?? null,
       modalGpu,
@@ -4726,7 +4805,15 @@ function handleModalStatus(event) {
       setGlobalStatusPhase(promptId, EXECUTION_PHASE, nodeIds.length, { modalGpu });
     } else {
       setGlobalStatusPhase(promptId, STATE_WAITING, nodeIds.length, {
-        message: detail.status_message ?? "Waiting for Modal container",
+        message:
+          detail.status_message ??
+          (executionProvider === "vast"
+            ? "Waiting for Vast.ai capacity"
+            : executionProvider === "ssh_docker"
+              ? "Waiting for self-hosted capacity"
+              : executionProvider === "modal"
+                ? "Waiting for Modal container"
+                : "Waiting for remote capacity"),
         modalGpu,
       });
     }
@@ -4943,11 +5030,17 @@ function handleExecutionPhase(event, phase) {
     return;
   }
   if (phase === EXECUTION_PHASE) {
+    const plannedProviders = Array.from(
+      promptState.executionAssignmentsByRepresentative.values(),
+      (assignment) => assignment?.provider,
+    ).filter(Boolean);
     setGlobalStatusPhase(
       promptId,
       promptState.hasRemoteExecutionStarted ? EXECUTION_PHASE : STATE_WAITING,
       componentNodeIds.length,
-      promptState.hasRemoteExecutionStarted ? null : { message: "Waiting for Modal container" },
+      promptState.hasRemoteExecutionStarted
+        ? null
+        : { message: remoteCapacityWaitingMessage(plannedProviders) },
     );
     setNodesPhase(componentNodeIds, STATE_READY, promptId, detail.exception_message);
     return;
@@ -5122,7 +5215,7 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds, modalGpu = null) {
   dispatchSyntheticApiEvent("status", statusPayload(1));
   dispatchSyntheticApiEvent("notification", {
     id: promptId,
-    value: "Waiting for a machine on Modal.",
+    value: "Waiting for remote capacity.",
   });
   dispatchSyntheticApiEvent("execution_start", {
     prompt_id: promptId,
@@ -5152,7 +5245,7 @@ function endSyntheticExecutionUi(promptId, failed = false, failureMessage = null
   }
   dispatchSyntheticApiEvent("notification", {
     id: promptId,
-    value: "Modal setup finished.",
+    value: "Remote setup finished.",
   });
   dispatchSyntheticApiEvent("status", statusPayload(0));
   if (failed) {
@@ -5233,6 +5326,10 @@ function patchQueuePrompt() {
     const { output: prompt, workflow } = data;
     stampModalGpuOnWorkflow(workflow);
     const modalGpu = selectedModalGpu(workflow);
+    const usesConfiguredCapacity = Object.values(prompt ?? {}).some(
+      (promptNode) => promptNode?.class_type === "RemoteExecutionConfigurator",
+    );
+    const initialModalGpu = usesConfiguredCapacity ? null : modalGpu;
     const promptId = createPromptId();
     clearPromptTerminal(promptId);
     clearSupersededCancellingPrompts(promptId);
@@ -5243,7 +5340,7 @@ function patchQueuePrompt() {
     if (remoteNodeIds.length > 0) {
       if (!queuedBehindActiveModal) {
         setNodesPhase(remoteNodeIds, STATE_SETUP, promptId);
-        beginSyntheticExecutionUi(promptId, remoteNodeIds, modalGpu);
+        beginSyntheticExecutionUi(promptId, remoteNodeIds, initialModalGpu);
       }
     }
 
@@ -5291,21 +5388,46 @@ function patchQueuePrompt() {
         : [];
       setSandwichedLocalNodeIds(sandwichedLocalNodeIds);
       if (remoteNodeIds.length > 0) {
-        const acceptedModalGpu = MODAL_GPU_TYPES.includes(responsePayload.modal_gpu)
-          ? responsePayload.modal_gpu
-          : modalGpu;
         const executionAssignmentsByRepresentative =
           responsePayload.remote_execution_assignments ?? {};
         const executionAssignments = Object.values(executionAssignmentsByRepresentative);
-        const usesSshExecution = executionAssignments.some(
-          (assignment) => assignment?.provider === "ssh_docker",
+        const selectedModalGpus = Array.isArray(
+          responsePayload.remote_execution_modal_gpus,
+        )
+          ? responsePayload.remote_execution_modal_gpus.filter((value) =>
+              MODAL_GPU_TYPES.includes(value),
+            )
+          : [];
+        const configurationsById = new Map(
+          (responsePayload.remote_execution_configurations ?? []).map(
+            (configuration) => [String(configuration?.configuration_id ?? ""), configuration],
+          ),
+        );
+        const usesModalExecution = executionAssignments.some(
+          (assignment) => assignment?.provider === "modal",
+        );
+        const acceptedModalGpu = usesModalExecution
+          ? selectedModalGpus.length === 1
+            ? selectedModalGpus[0]
+            : MODAL_GPU_TYPES.includes(responsePayload.modal_gpu)
+              ? responsePayload.modal_gpu
+              : usesConfiguredCapacity
+                ? null
+                : modalGpu
+          : null;
+        const selectedProviders = new Set(
+          executionAssignments
+            .map((assignment) => String(assignment?.provider ?? ""))
+            .filter(Boolean),
         );
         const executionEnvironmentLabels = Array.from(
           new Set(
             executionAssignments.map((assignment) =>
-              assignment?.provider === "modal"
-                ? `Modal ${acceptedModalGpu}`
-                : String(assignment?.environment_id ?? "self-hosted"),
+              remoteExecutionEnvironmentLabel(
+                assignment,
+                configurationsById,
+                acceptedModalGpu,
+              ),
             ),
           ),
         );
@@ -5323,22 +5445,16 @@ function patchQueuePrompt() {
         if (!promptState) {
           return responsePayload;
         }
+        promptState.modalGpu = acceptedModalGpu;
         promptState.executionLabel = executionEnvironmentLabels.join(" + ") || null;
         const acceptedRemoteNodeIds =
           promptState.remoteNodeIds.length > 0 ? promptState.remoteNodeIds : remoteNodeIds;
         if (!isPromptQueuedBehindActiveModal(promptId)) {
           endSyntheticExecutionUi(promptId);
-          if (usesSshExecution) {
-            setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
-              message: "Waiting for self-hosted worker",
-              modalGpu: null,
-            });
-          } else {
-            setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
-              message: "Waiting for Modal startup",
-              modalGpu: acceptedModalGpu,
-            });
-          }
+          setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {
+            message: remoteCapacityWaitingMessage(selectedProviders),
+            modalGpu: usesModalExecution ? acceptedModalGpu : null,
+          });
           setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);
         }
       }

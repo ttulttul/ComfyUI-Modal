@@ -26,7 +26,7 @@ def test_synthetic_execution_events_match_comfyui_execution_shapes() -> None:
     assert "timestamp: nowMs()," in source
     assert 'dispatchSyntheticApiEvent("executing", displayNode);' in source
     assert 'dispatchSyntheticApiEvent("notification", {' in source
-    assert "Waiting for a machine on Modal." in source
+    assert "Waiting for remote capacity." in source
 
 
 def test_global_modal_status_badge_is_installed() -> None:
@@ -362,7 +362,7 @@ def test_queue_success_marks_all_remote_nodes_ready_before_component_execution()
     assert "if (!promptState) {\n          return responsePayload;\n        }" in source
     assert "endSyntheticExecutionUi(promptId);" in source
     assert 'setGlobalStatusPhase(promptId, STATE_WAITING, acceptedRemoteNodeIds.length, {' in source
-    assert 'message: "Waiting for Modal startup",' in source
+    assert "message: remoteCapacityWaitingMessage(selectedProviders)," in source
     assert "setNodesPhase(acceptedRemoteNodeIds, STATE_READY, promptId);" in source
 
 

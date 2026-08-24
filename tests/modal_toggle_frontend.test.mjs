@@ -72,6 +72,8 @@ const transformedSource = `${[
   "  drawModalNodeDecoration,",
   "  updateVueExecutionLocation,",
   "  currentGlobalStatus,",
+  "  shouldPollModalContainerStatus,",
+  "  remoteCapacityWaitingMessage,",
   "  formatIterationRate,",
   "  fadeNodeProgress,",
   "  markPromptQueuedBehindActiveModal,",
@@ -815,6 +817,7 @@ modalToggle.handleModalStatus({
     prompt_id: "prompt-container-wait",
     phase: "executing",
     node_ids: ["24"],
+    execution_provider: "modal",
   },
 });
 assert.equal(modalToggle.currentGlobalStatus()?.phase, "waiting");
@@ -1182,6 +1185,103 @@ const fastPromptResponse = await globalThis.__modalApiStub.queuePrompt(0, {
 assert.equal(fastPromptResponse.modal_gpu, "B300");
 assert.equal(modalToggle.modalNodeStates.has("80"), false);
 assert.deepEqual(Array.from(modalToggle.modalSandwichedLocalNodeIds), ["174"]);
+
+resetFrontendState();
+globalThis.__modalApiStub.__modalQueuePromptPatched = false;
+globalThis.__modalApiStub.clientId = "client-vast-only";
+let releaseVastOnlyResponse;
+globalThis.__modalApiStub.fetchApi = async (_route, options) => {
+  const requestBody = JSON.parse(options.body);
+  return await new Promise((resolve) => {
+    releaseVastOnlyResponse = () =>
+      resolve({
+        status: 200,
+        async json() {
+          return {
+            prompt_id: requestBody.prompt_id,
+            modal_remote_node_ids: ["80"],
+            modal_components: [
+              { representative_node_id: "80", node_ids: ["80"] },
+            ],
+            modal_gpu: null,
+            remote_execution_modal_gpus: [],
+            remote_execution_assignments: {
+              "80": {
+                provider: "vast",
+                environment_id: "vast:instance-1",
+                execution_location: "vast.example",
+                configuration_id: "90",
+                node_ids: ["80"],
+              },
+            },
+          };
+        },
+      });
+  });
+};
+modalToggle.patchQueuePrompt();
+const vastOnlyPrompt = globalThis.__modalApiStub.queuePrompt(0, {
+  output: {
+    "80": { class_type: "KSampler", inputs: {} },
+    "90": { class_type: "VastRemoteConfiguration", inputs: {} },
+    "99": {
+      class_type: "RemoteExecutionConfigurator",
+      inputs: { "configurations.configuration_0": ["90", 0] },
+    },
+  },
+  workflow: {
+    nodes: [{ id: 80, properties: { is_modal_remote: true } }],
+  },
+});
+await Promise.resolve();
+assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, null);
+assert.equal(
+  modalToggle.shouldPollModalContainerStatus(modalToggle.currentGlobalStatus()),
+  false,
+);
+assert.equal(
+  modalToggle.remoteCapacityWaitingMessage(["vast"]),
+  "Waiting for Vast.ai instance",
+);
+assert.equal(
+  modalToggle.remoteCapacityWaitingMessage(["ssh_docker"]),
+  "Waiting for self-hosted worker",
+);
+assert.equal(
+  modalToggle.remoteCapacityWaitingMessage(["vast", "ssh_docker"]),
+  "Waiting for remote capacity",
+);
+releaseVastOnlyResponse();
+await vastOnlyPrompt;
+assert.equal(modalToggle.currentGlobalStatus()?.statusMessage, "Waiting for Vast.ai instance");
+assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, null);
+assert.equal(
+  modalToggle.shouldPollModalContainerStatus(modalToggle.currentGlobalStatus()),
+  false,
+);
+
+resetFrontendState();
+modalToggle.registerPromptComponents("prompt-vast-runtime", ["81"], [
+  { representative_node_id: "81", node_ids: ["81"] },
+]);
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-vast-runtime",
+    phase: "starting",
+    node_ids: ["81"],
+    execution_provider: "vast",
+    modal_gpu: "RTX-PRO-6000",
+  },
+});
+assert.equal(
+  modalToggle.currentGlobalStatus()?.statusMessage,
+  "Starting Vast.ai component",
+);
+assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, null);
+assert.equal(
+  modalToggle.shouldPollModalContainerStatus(modalToggle.currentGlobalStatus()),
+  false,
+);
 
 class MenuNode {}
 const menuNode = new MenuNode();
