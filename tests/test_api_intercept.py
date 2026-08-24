@@ -5817,6 +5817,12 @@ def test_emit_modal_status_targets_prompt_client(
         active_node_id="5",
         active_node_class_type="KSampler",
         active_node_role="sampling",
+        remote_execution_assignments={
+            "4": {"provider": "vast", "node_ids": ["4", "5"]}
+        },
+        remote_execution_configurations=[
+            {"configuration_id": "vast-big", "display_name": "Vast Big"}
+        ],
     )
 
     assert prompt_server.messages == [
@@ -5835,6 +5841,15 @@ def test_emit_modal_status_targets_prompt_client(
                     {
                         "representative_node_id": "4",
                         "node_ids": ["4", "5"],
+                    }
+                ],
+                "remote_execution_assignments": {
+                    "4": {"provider": "vast", "node_ids": ["4", "5"]}
+                },
+                "remote_execution_configurations": [
+                    {
+                        "configuration_id": "vast-big",
+                        "display_name": "Vast Big",
                     }
                 ],
             },
@@ -5858,6 +5873,15 @@ def test_emit_modal_status_targets_prompt_client(
                     {
                         "representative_node_id": "4",
                         "node_ids": ["4", "5"],
+                    }
+                ],
+                "remote_execution_assignments": {
+                    "4": {"provider": "vast", "node_ids": ["4", "5"]}
+                },
+                "remote_execution_configurations": [
+                    {
+                        "configuration_id": "vast-big",
+                        "display_name": "Vast Big",
                     }
                 ],
             },

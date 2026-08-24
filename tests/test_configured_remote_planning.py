@@ -235,6 +235,9 @@ def test_vast_capacity_is_quoted_globally_and_acquired_only_after_assignment(
         prompt=prompt,
         workflow={"extra": {"remote_execution": {"policy": "automatic"}}},
         settings=settings_module.get_settings(),
+        plan_callback=lambda assignments, configurations: events.append(
+            ("plan", assignments, configurations)
+        ),
     )
 
     acquisitions = [event for event in events if event[0] == "acquire"]
@@ -243,6 +246,17 @@ def test_vast_capacity_is_quoted_globally_and_acquired_only_after_assignment(
         ("acquire", "vast-broad", 1),
         ("acquire", "vast-premium", 0),
     ]
+    plan_event_index = next(
+        index for index, event in enumerate(events) if event[0] == "plan"
+    )
+    first_acquisition_index = next(
+        index for index, event in enumerate(events) if event[0] == "acquire"
+    )
+    assert plan_event_index < first_acquisition_index
+    early_assignments = events[plan_event_index][1]
+    assert set(early_assignments) == {"1", "2", "3"}
+    assert all(assignment["node_ids"] for assignment in early_assignments.values())
+    assert len(events[plan_event_index][2]) == 2
     assert len(plan.vast_leases_by_environment) == 3
     assert len({assignment.environment_id for assignment in plan.assignments.values()}) == 3
     assert {assignment.configuration_id for assignment in plan.assignments.values()} == {

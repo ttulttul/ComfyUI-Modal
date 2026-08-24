@@ -70,15 +70,17 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert "function serializedRemoteConfiguratorNodeId(prompt)" in source
     assert "function mountRemoteExecutionConfiguratorPanel(node)" in source
     assert "function registerPromptConfigurator(promptId, configuratorNodeId)" in source
+    assert "function registerRemoteConfiguratorPlan(promptId, assignments, configurations)" in source
     assert "function renderRemoteConfiguratorStatus(panel, state)" in source
     assert "function renderRemoteConfiguratorPlan(panel, assignments, configurations)" in source
-    assert 'node.addDOMWidget(\n    "remote_execution_plan"' in source
+    assert 'widget = node.addDOMWidget(\n      "remote_execution_plan"' in source
     assert "serialize: false" in source
     assert "getMinHeight: () => panel.minHeight" in source
     assert 'class="remote-configurator-table"' in source
     assert "responsePayload.remote_execution_assignments" in source
     assert "responsePayload.remote_execution_configurations" in source
     assert "responsePayload.remote_execution_configurator_node_id" in source
+    assert "detail.remote_execution_assignments" in source
     assert "refreshRemoteConfiguratorPanelForPrompt(promptId);" in source
     assert "setRemoteConfiguratorTerminalStatus(promptId, STATE_COMPLETE);" in source
     assert "const configuratorPanel = remoteConfiguratorPanel(" in source

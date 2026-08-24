@@ -1895,6 +1895,8 @@ function ensurePromptState(promptId) {
       executionAssignmentsByRepresentative: new Map(),
       executionAssignmentByMember: new Map(),
       configuratorNodeId: null,
+      remoteExecutionPlanAssignments: {},
+      remoteExecutionConfigurations: [],
       descendantNodeIdsByAncestor: new Map(),
       laneNodeIdsByLane: new Map(),
       activeNodeId: null,
@@ -3235,7 +3237,7 @@ function remoteConfiguratorPanel(configuratorNodeId) {
     return null;
   }
   const existing = remoteConfiguratorPanels.get(safeNodeId);
-  if (existing?.root?.isConnected) {
+  if (existing) {
     return existing;
   }
   const node = allWorkflowNodes().find(
@@ -3393,12 +3395,62 @@ function registerPromptConfigurator(promptId, configuratorNodeId) {
   const isNewPrompt = panel.promptId !== promptId;
   panel.promptId = promptId;
   if (isNewPrompt) {
-    renderRemoteConfiguratorPlan(panel, {}, []);
+    renderRemoteConfiguratorPlan(
+      panel,
+      promptState.remoteExecutionPlanAssignments,
+      promptState.remoteExecutionConfigurations,
+    );
     renderRemoteConfiguratorStatus(panel, {
       phase: STATE_SETUP,
       statusMessage: "Preparing remote workflow",
     });
   }
+}
+
+/**
+ * Retain and render one provider-neutral plan independently of queue completion.
+ * @param {string} promptId
+ * @param {Record<string, Record<string, any>>} assignments
+ * @param {Array<Record<string, any>>} configurations
+ */
+function registerRemoteConfiguratorPlan(promptId, assignments, configurations) {
+  const promptState = ensurePromptState(promptId);
+  if (!promptState) {
+    return;
+  }
+  promptState.remoteExecutionPlanAssignments = { ...(assignments ?? {}) };
+  promptState.remoteExecutionConfigurations = [...(configurations ?? [])];
+  registerPromptExecutionAssignments(promptId, assignments ?? {});
+  const panel = remoteConfiguratorPanel(promptState.configuratorNodeId);
+  if (!panel) {
+    return;
+  }
+  panel.promptId = promptId;
+  renderRemoteConfiguratorPlan(
+    panel,
+    promptState.remoteExecutionPlanAssignments,
+    promptState.remoteExecutionConfigurations,
+  );
+}
+
+/** Restore the newest retained prompt onto a newly mounted configurator panel. */
+function restoreRemoteConfiguratorPanel(panel) {
+  const nodeIdentifier = nodeId(panel?.node);
+  const candidates = Array.from(modalPromptStates.entries())
+    .filter(([, state]) => state?.configuratorNodeId === nodeIdentifier)
+    .sort(([, left], [, right]) => Number(right?.startedAt ?? 0) - Number(left?.startedAt ?? 0));
+  const newest = candidates[0];
+  if (!newest) {
+    return;
+  }
+  const [promptId, promptState] = newest;
+  panel.promptId = promptId;
+  renderRemoteConfiguratorPlan(
+    panel,
+    promptState.remoteExecutionPlanAssignments,
+    promptState.remoteExecutionConfigurations,
+  );
+  renderRemoteConfiguratorStatus(panel, modalGlobalStatusStates.get(promptId) ?? {});
 }
 
 /**
@@ -3434,15 +3486,15 @@ function setRemoteConfiguratorTerminalStatus(promptId, phase, message = null) {
  * @param {LGraphNode} node
  */
 function mountRemoteExecutionConfiguratorPanel(node) {
+  const safeNodeId = nodeId(node);
   if (
     !isRemoteExecutionConfiguratorNode(node) ||
-    node.__remoteConfiguratorPanelMounted ||
+    (node.__remoteConfiguratorPanelMounted && remoteConfiguratorPanels.has(safeNodeId)) ||
     typeof node.addDOMWidget !== "function" ||
     typeof document === "undefined"
   ) {
     return;
   }
-  node.__remoteConfiguratorPanelMounted = true;
   const root = document.createElement("div");
   root.className = "comfy-remote-configurator-panel";
   root.innerHTML = `
@@ -3473,22 +3525,33 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     table: root.querySelector(".remote-configurator-table"),
     tableBody: root.querySelector("tbody"),
   };
-  const widget = node.addDOMWidget(
-    "remote_execution_plan",
-    "remote-execution-plan",
-    root,
-    {
-      serialize: false,
-      hideOnZoom: false,
-      getMinHeight: () => panel.minHeight,
-    },
-  );
-  widget.serialize = false;
+  let widget;
+  try {
+    widget = node.addDOMWidget(
+      "remote_execution_plan",
+      "remote-execution-plan",
+      root,
+      {
+        serialize: false,
+        hideOnZoom: false,
+        getMinHeight: () => panel.minHeight,
+      },
+    );
+  } catch (error) {
+    node.__remoteConfiguratorPanelMounted = false;
+    console.warn("Unable to mount the remote execution configurator panel.", error);
+    return;
+  }
+  if (widget) {
+    widget.serialize = false;
+  }
   node.setSize?.([
     Math.max(Number(node.size?.[0]) || 0, 500),
     Math.max(Number(node.size?.[1]) || 0, panel.minHeight),
   ]);
-  remoteConfiguratorPanels.set(nodeId(node), panel);
+  remoteConfiguratorPanels.set(safeNodeId, panel);
+  node.__remoteConfiguratorPanelMounted = true;
+  restoreRemoteConfiguratorPanel(panel);
   const originalOnRemoved = node.onRemoved;
   node.onRemoved = function onRemoved() {
     remoteConfiguratorPanels.delete(nodeId(this));
@@ -4995,6 +5058,13 @@ function handleModalStatus(event) {
   if (detail.configurator_node_id) {
     registerPromptConfigurator(promptId, detail.configurator_node_id);
   }
+  if (detail.remote_execution_assignments) {
+    registerRemoteConfiguratorPlan(
+      promptId,
+      detail.remote_execution_assignments,
+      detail.remote_execution_configurations ?? [],
+    );
+  }
   const executionProvider = String(detail.execution_provider ?? "").trim();
   const modalGpu =
     (!executionProvider || executionProvider === "modal") &&
@@ -5771,9 +5841,8 @@ function patchQueuePrompt() {
         if (resolvedRemoteNodeIds.length > 0 || resolvedComponents.length > 0) {
           registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);
         }
-        registerPromptExecutionAssignments(promptId, executionAssignmentsByRepresentative);
-        renderRemoteConfiguratorPlan(
-          remoteConfiguratorPanel(acceptedConfiguratorNodeId),
+        registerRemoteConfiguratorPlan(
+          promptId,
           executionAssignmentsByRepresentative,
           responsePayload.remote_execution_configurations ?? [],
         );

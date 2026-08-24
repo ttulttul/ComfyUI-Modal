@@ -89,6 +89,9 @@ from .vast_leases import VastLeaseRegistry
 
 logger = logging.getLogger(__name__)
 SetupStatusCallback = Callable[[str, int | None, int | None], None]
+ExecutionPlanStatusCallback = Callable[
+    [dict[str, dict[str, Any]], list[dict[str, Any]]], None
+]
 
 _ROUTE_REGISTERED = False
 _MODAL_UI_EVENT_RETENTION_SECONDS = 2 * 60 * 60
@@ -1285,6 +1288,7 @@ def _plan_component_execution(
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
     status_callback: SetupStatusCallback | None = None,
+    plan_callback: ExecutionPlanStatusCallback | None = None,
 ) -> ComponentExecutionPlan:
     """Plan through connected configurations or synthesize the legacy behavior."""
     try:
@@ -1308,6 +1312,7 @@ def _plan_component_execution(
         settings=settings,
         configuration_set=configuration_set,
         status_callback=status_callback,
+        plan_callback=plan_callback,
     )
 
 
@@ -1319,6 +1324,7 @@ def _plan_configured_component_execution(
     settings: ModalSyncSettings,
     configuration_set: RemoteConfigurationSet,
     status_callback: SetupStatusCallback | None = None,
+    plan_callback: ExecutionPlanStatusCallback | None = None,
 ) -> ComponentExecutionPlan:
     """Resolve and prepare a capacity-aware plan from connected configurations."""
     configurations_by_id = {
@@ -1372,6 +1378,12 @@ def _plan_configured_component_execution(
     except NoCompatibleExecutionEnvironmentError as exc:
         raise ModalPromptValidationError(str(exc)) from exc
 
+    if plan_callback is not None:
+        plan_callback(
+            _planned_execution_assignments_payload(assignments, components),
+            configuration_set.to_safe_list(),
+        )
+
     vast_leases = _prepare_selected_vast_capacity(
         assignments=assignments,
         configuration_set=configuration_set,
@@ -1388,6 +1400,30 @@ def _plan_configured_component_execution(
         vast_service=vast_service,
         vast_leases_by_environment=vast_leases,
     )
+
+
+def _planned_execution_assignments_payload(
+    assignments: Mapping[str, ExecutionAssignment],
+    components: Sequence[RemoteComponentPlan],
+) -> dict[str, dict[str, Any]]:
+    """Serialize scheduler choices before provider capacity is acquired."""
+    component_nodes = {
+        component.representative_node_id: list(component.node_ids)
+        for component in components
+    }
+    return {
+        component_id: {
+            "provider": assignment.provider.value,
+            "environment_id": assignment.environment_id,
+            "configuration_id": assignment.configuration_id,
+            "node_ids": component_nodes.get(component_id, [component_id]),
+            "predicted_cost_usd": assignment.predicted_cost_usd,
+            "predicted_completion_seconds": assignment.predicted_completion_seconds,
+            "worker_index": assignment.capacity_slot_index,
+            "reasons": list(assignment.reasons),
+        }
+        for component_id, assignment in sorted(assignments.items())
+    }
 
 
 def _probe_configured_ssh_hosts(
@@ -1970,6 +2006,8 @@ def _emit_modal_status(
     status_message: str | None = None,
     status_current: int | None = None,
     status_total: int | None = None,
+    remote_execution_assignments: Mapping[str, Mapping[str, Any]] | None = None,
+    remote_execution_configurations: Sequence[Mapping[str, Any]] | None = None,
 ) -> None:
     """Send a Modal execution status event to the active websocket client."""
     if client_id is None:
@@ -2011,6 +2049,14 @@ def _emit_modal_status(
         payload["status_current"] = int(status_current)
     if status_total is not None:
         payload["status_total"] = int(status_total)
+    if remote_execution_assignments is not None:
+        payload["remote_execution_assignments"] = copy.deepcopy(
+            dict(remote_execution_assignments)
+        )
+    if remote_execution_configurations is not None:
+        payload["remote_execution_configurations"] = copy.deepcopy(
+            list(remote_execution_configurations)
+        )
 
     record_modal_ui_event("modal_status", payload, client_id)
     prompt_server.send_sync("modal_status", payload, client_id)
@@ -7013,6 +7059,7 @@ def rewrite_prompt_for_modal(
     nodes_module: Any | None = None,
     extra_data: dict[str, Any] | None = None,
     status_callback: SetupStatusCallback | None = None,
+    plan_callback: ExecutionPlanStatusCallback | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Rewrite connected remote components into Modal proxy nodes."""
     resolved_settings = settings or get_settings()
@@ -7071,6 +7118,7 @@ def rewrite_prompt_for_modal(
         workflow=workflow,
         settings=resolved_settings,
         status_callback=status_callback,
+        plan_callback=plan_callback,
     )
     assignments_by_component_id = execution_plan.assignments
     if execution_plan.configuration_set is not None:
@@ -7546,6 +7594,7 @@ async def rewrite_prompt_for_modal_async(
     nodes_module: Any | None = None,
     extra_data: dict[str, Any] | None = None,
     status_callback: SetupStatusCallback | None = None,
+    plan_callback: ExecutionPlanStatusCallback | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Prepare one Modal prompt without blocking ComfyUI's event loop."""
     return await asyncio.to_thread(
@@ -7557,6 +7606,7 @@ async def rewrite_prompt_for_modal_async(
         nodes_module=nodes_module,
         extra_data=extra_data,
         status_callback=status_callback,
+        plan_callback=plan_callback,
     )
 
 
@@ -8664,6 +8714,29 @@ def setup_modal_queue_route(
                     status_total=total,
                 )
 
+            def emit_execution_plan(
+                assignments: dict[str, dict[str, Any]],
+                configurations: list[dict[str, Any]],
+            ) -> None:
+                """Publish scheduler choices before capacity acquisition can block."""
+                component_nodes = {
+                    component_id: list(assignment.get("node_ids", []))
+                    for component_id, assignment in assignments.items()
+                }
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="setup",
+                    client_id=client_id,
+                    prompt_id=prompt_id,
+                    node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
+                    modal_gpu=status_modal_gpu,
+                    component_node_ids_by_representative=component_nodes,
+                    status_message="Remote execution plan ready",
+                    remote_execution_assignments=assignments,
+                    remote_execution_configurations=configurations,
+                )
+
             if "prompt" in json_data:
                 emit_setup_status("Preparing remote workflow")
                 rewrite_started_at = time.perf_counter()
@@ -8674,6 +8747,7 @@ def setup_modal_queue_route(
                     settings=request_settings,
                     extra_data=json_data.get("extra_data"),
                     status_callback=emit_setup_status,
+                    plan_callback=emit_execution_plan,
                 )
                 selected_modal_gpus = _selected_modal_gpus(
                     summary,

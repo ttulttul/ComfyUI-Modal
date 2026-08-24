@@ -34,7 +34,12 @@ if __package__:
     )
     from .vast_models import VastInstance, VastOffer, VastResourceProfile
     from .vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
-    from .vast_ssh import VastSshRunner, VastSshVolumeBackend, vast_connection_from_lease
+    from .vast_ssh import (
+        VastSshError,
+        VastSshRunner,
+        VastSshVolumeBackend,
+        vast_connection_from_lease,
+    )
 else:  # pragma: no cover - direct debugging imports.
     from execution_environments import (
         EnvironmentCapabilities,
@@ -58,7 +63,12 @@ else:  # pragma: no cover - direct debugging imports.
     )
     from vast_models import VastInstance, VastOffer, VastResourceProfile
     from vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
-    from vast_ssh import VastSshRunner, VastSshVolumeBackend, vast_connection_from_lease
+    from vast_ssh import (
+        VastSshError,
+        VastSshRunner,
+        VastSshVolumeBackend,
+        vast_connection_from_lease,
+    )
 
 logger = logging.getLogger(__name__)
 VAST_API_KEY_ENV = "VAST_API_KEY"
@@ -535,12 +545,31 @@ class VastService:
 
     def _initialize_runtime(self, lease: VastLeaseRecord) -> None:
         """Require the pinned worker and publish its initial idle fail-safe state."""
+        logger.info(
+            "Initializing Vast worker instance_id=%d environment=%s.",
+            lease.instance_id,
+            lease.environment_id,
+        )
         runtime = VastRuntimeManager(
             runner=self._runner(lease),
             configuration=self.runtime_configuration,
         )
-        runtime.ensure_worker()
-        runtime.update_watchdog(lease)
+        try:
+            runtime.ensure_worker()
+            runtime.update_watchdog(lease)
+        except (TimeoutError, VastSshError, ValueError) as exc:
+            logger.error(
+                "Vast worker initialization failed instance_id=%d environment=%s: %s",
+                lease.instance_id,
+                lease.environment_id,
+                exc,
+            )
+            raise
+        logger.info(
+            "Vast worker initialization completed instance_id=%d environment=%s.",
+            lease.instance_id,
+            lease.environment_id,
+        )
 
     def _existing_lease(self, profile: VastResourceProfile) -> VastLeaseRecord | None:
         """Return the oldest ready lease with an exact profile/runtime identity."""

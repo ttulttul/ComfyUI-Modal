@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -121,3 +122,52 @@ def test_runtime_manager_rejects_image_fingerprint_drift(
 
     with pytest.raises(Exception, match="fingerprint mismatch"):
         manager.ensure_worker()
+
+
+def test_runtime_manager_logs_changed_ssh_readiness_diagnostics(
+    vast_runtime_module: Any,
+    caplog: Any,
+) -> None:
+    """SSH startup failures should be visible before the readiness timeout."""
+
+    class FailingRunner:
+        """Raise the same provider handshake diagnostic on each probe."""
+
+        def run(self, argv: Any, **kwargs: Any) -> FakeResult:
+            """Simulate Vast closing SSH during key exchange."""
+            del argv, kwargs
+            raise vast_runtime_module.VastSshError(
+                "kex_exchange_identification: Connection closed by remote host"
+            )
+
+    current_time = [0.0]
+
+    def advance(seconds: float) -> None:
+        """Advance the deterministic monotonic readiness clock."""
+        current_time[0] += seconds
+
+    manager = vast_runtime_module.VastRuntimeManager(
+        runner=FailingRunner(),
+        configuration=vast_runtime_module.VastRuntimeConfiguration(
+            image="worker",
+            runtime_fingerprint="a" * 64,
+            startup_timeout_seconds=2.0,
+            readiness_poll_seconds=1.0,
+        ),
+        monotonic=lambda: current_time[0],
+        sleep=advance,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(TimeoutError, match="Connection closed by remote host"):
+            manager.ensure_worker()
+
+    readiness_messages = [
+        record.message
+        for record in caplog.records
+        if "Vast worker readiness probe" in record.message
+    ]
+    assert readiness_messages == [
+        "Vast worker readiness probe attempt=1 failed: "
+        "kex_exchange_identification: Connection closed by remote host"
+    ]

@@ -31,6 +31,77 @@ globalThis.CustomEvent = class CustomEvent {
     this.detail = init.detail;
   }
 };
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.children = [];
+    this.dataset = {};
+    this.style = {};
+    this.hidden = false;
+    this.textContent = "";
+    this.title = "";
+    this.isConnected = false;
+    this.elementsBySelector = new Map();
+  }
+
+  set innerHTML(_value) {
+    for (const selector of [
+      ".modal-status-dot",
+      ".modal-status-text",
+      ".modal-status-gpu",
+      ".modal-status-cost",
+      ".modal-status-billing",
+      ".modal-status-containers",
+      ".remote-configurator-status-text",
+      ".remote-configurator-progress",
+      ".remote-configurator-progress-fill",
+      ".remote-configurator-progress-value",
+      ".remote-configurator-empty",
+      ".remote-configurator-table",
+      "tbody",
+    ]) {
+      this.elementsBySelector.set(selector, new FakeElement(selector));
+    }
+  }
+
+  querySelector(selector) {
+    return this.elementsBySelector.get(selector) ?? null;
+  }
+
+  append(...children) {
+    this.children.push(...children);
+  }
+
+  appendChild(child) {
+    this.children.push(child);
+    return child;
+  }
+
+  replaceChildren(...children) {
+    this.children = [...children];
+  }
+}
+const fakeBody = new FakeElement("body");
+fakeBody.appendChild = (child) => {
+  child.isConnected = true;
+  fakeBody.children.push(child);
+  return child;
+};
+globalThis.document = {
+  body: fakeBody,
+  head: new FakeElement("head"),
+  visibilityState: "visible",
+  createElement(tagName) {
+    return new FakeElement(tagName);
+  },
+  addEventListener() {},
+  getElementById() {
+    return null;
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
 
 const sourcePath = path.join(repoRoot, "web", "modal_toggle.js");
 const originalSource = await readFile(sourcePath, "utf8");
@@ -43,6 +114,9 @@ const transformedSource = `${[
   "  ensurePromptState,",
   "  registerPromptComponents,",
   "  registerPromptExecutionAssignments,",
+  "  registerPromptConfigurator,",
+  "  registerRemoteConfiguratorPlan,",
+  "  mountRemoteExecutionConfiguratorPanel,",
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
   "  handleModalStatus,",
@@ -88,6 +162,7 @@ const transformedSource = `${[
   "  modalQueuedPromptIds,",
   "  modalSandwichedLocalNodeIds,",
   "  modalRemoteDescendantNodeIdsByAncestor,",
+  "  remoteConfiguratorPanels,",
   "  STATE_SETUP,",
   "  STATE_STARTING,",
   "  STATE_READY,",
@@ -121,6 +196,7 @@ function resetFrontendState() {
   modalToggle.modalSandwichedLocalNodeIds.clear();
   modalToggle.modalRemoteDescendantNodeIdsByAncestor.clear();
   modalToggle.modalGlobalStatusStates.clear();
+  modalToggle.remoteConfiguratorPanels.clear();
 }
 
 resetFrontendState();
@@ -1371,4 +1447,65 @@ assert.equal(
     (option) => modalToggle.MODAL_GPU_TYPES.includes(option?.content),
   ),
   false,
+);
+
+resetFrontendState();
+const configuratorGraph = {
+  nodes: [],
+  setDirtyCanvas() {},
+};
+globalThis.__modalAppStub.rootGraph = configuratorGraph;
+modalToggle.registerPromptConfigurator("plan-before-capacity", "381");
+modalToggle.registerRemoteConfiguratorPlan(
+  "plan-before-capacity",
+  {
+    "14": {
+      provider: "vast",
+      environment_id: "vast:profile:slot-0",
+      configuration_id: "vast-big",
+      node_ids: ["14", "15"],
+      predicted_cost_usd: 0.031,
+      predicted_completion_seconds: 120,
+    },
+  },
+  [{ configuration_id: "vast-big", display_name: "Vast Big" }],
+);
+const lateConfiguratorNode = {
+  id: 381,
+  comfyClass: "RemoteExecutionConfigurator",
+  __remoteConfiguratorPanelMounted: true,
+  size: [300, 100],
+  graph: configuratorGraph,
+  addDOMWidget(_name, _type, root) {
+    this.panelRoot = root;
+    return {};
+  },
+  setSize(size) {
+    this.size = size;
+  },
+};
+configuratorGraph.nodes.push(lateConfiguratorNode);
+modalToggle.mountRemoteExecutionConfiguratorPanel(lateConfiguratorNode);
+const retainedPanel = modalToggle.remoteConfiguratorPanels.get("381");
+assert.ok(retainedPanel, "a stale mount flag must not prevent a retry");
+assert.equal(retainedPanel.promptId, "plan-before-capacity");
+assert.equal(retainedPanel.tableBody.children.length, 1);
+assert.equal(retainedPanel.table.hidden, false);
+assert.equal(retainedPanel.emptyText.hidden, true);
+assert.equal(retainedPanel.root.isConnected, false);
+
+modalToggle.handleModalStatus({
+  detail: {
+    phase: "setup",
+    prompt_id: "plan-before-capacity",
+    node_ids: ["14", "15"],
+    configurator_node_id: "381",
+    status_message: "Acquiring Vast capacity",
+  },
+});
+assert.equal(retainedPanel.statusText.textContent, "Acquiring Vast capacity");
+assert.equal(
+  modalToggle.remoteConfiguratorPanels.get("381"),
+  retainedPanel,
+  "a detached panel should retain prompt state instead of being remounted",
 );

@@ -59,7 +59,22 @@ def _ensure_import_paths() -> None:
         av_subtitles_stream_module.SubtitleStream = type("SubtitleStream", (), {})
         av_video_module = types.ModuleType("av.video")
         av_video_reformatter_module = types.ModuleType("av.video.reformatter")
-        av_video_reformatter_module.ColorRange = type("ColorRange", (), {})
+        av_video_reformatter_module.ColorPrimaries = type(
+            "ColorPrimaries", (), {"BT2020": 9, "BT709": 1}
+        )
+        av_video_reformatter_module.ColorRange = type(
+            "ColorRange", (), {"JPEG": 2, "MPEG": 1}
+        )
+        av_video_reformatter_module.ColorTrc = type(
+            "ColorTrc",
+            (),
+            {
+                "ARIB_STD_B67": 18,
+                "BT709": 1,
+                "IEC61966_2_1": 13,
+                "SMPTE2084": 16,
+            },
+        )
 
         sys.modules["av"] = av_module
         sys.modules["av.container"] = av_container_module

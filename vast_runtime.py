@@ -140,13 +140,18 @@ class VastRuntimeManager:
     runner: VastSshRunner
     configuration: VastRuntimeConfiguration
     clock: Callable[[], float] = time.time
+    monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
 
     def ensure_worker(self) -> dict[str, Any]:
         """Wait for the supervised worker socket and exact runtime fingerprint."""
-        deadline = time.monotonic() + self.configuration.startup_timeout_seconds
+        started_at = self.monotonic()
+        deadline = started_at + self.configuration.startup_timeout_seconds
         last_error: str | None = None
-        while time.monotonic() < deadline:
+        last_logged_error: str | None = None
+        attempt = 0
+        while self.monotonic() < deadline:
+            attempt += 1
             try:
                 info = self.runtime_info()
             except (VastSshError, ValueError) as exc:
@@ -160,9 +165,21 @@ class VastRuntimeManager:
                         f"{actual_fingerprint[:12] or 'empty'}."
                     )
                 if bool(info.get("worker_socket_ready")):
+                    logger.info(
+                        "Vast worker became ready after %d probe attempts (%.1fs).",
+                        attempt,
+                        self.monotonic() - started_at,
+                    )
                     return info
                 self._start_supervisor()
                 last_error = "worker socket is not ready"
+            if last_error != last_logged_error:
+                logger.warning(
+                    "Vast worker readiness probe attempt=%d failed: %s",
+                    attempt,
+                    last_error,
+                )
+                last_logged_error = last_error
             self.sleep(self.configuration.readiness_poll_seconds)
         raise TimeoutError(
             "Vast worker did not become ready within "
