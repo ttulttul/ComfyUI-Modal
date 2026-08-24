@@ -229,7 +229,9 @@ def test_cancel_click_shows_immediate_modal_cancelling_feedback() -> None:
     source = _modal_toggle_source()
 
     assert "function patchInterruptFeedback()" in source
-    assert "api.fetchApi = function modalFetchApi(resource, options) {" in source
+    assert "api.fetchApi = async function modalFetchApi(resource, options) {" in source
+    assert "MODAL_CANCEL_PREPARATION_ROUTE" in source
+    assert 'body: JSON.stringify({ prompt_id: promptId })' in source
     assert "function promptIdsFromInterruptRequest(resource, options)" in source
     assert 'route.includes("/interrupt")' in source
     assert "function markPromptCancellationRequested(promptId)" in source

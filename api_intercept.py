@@ -64,6 +64,7 @@ from .sync_engine import (
     MODEL_FILE_EXTENSIONS,
     ModalAssetSyncEngine,
     ModalVolumeBackend,
+    SyncCancelledError,
     SyncedAsset,
     modal,
     resolve_model_path,
@@ -100,6 +101,9 @@ _MODAL_UI_EVENTS_LOCK = threading.Lock()
 _MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
 _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_installed"
 _REMOTE_PREPARATION_PROMPTS_ATTR = "__comfy_modal_remote_preparation_prompts"
+_REMOTE_PREPARATION_CANCELLATIONS_ATTR = (
+    "__comfy_modal_remote_preparation_cancellations"
+)
 _REMOTE_PREPARATION_LOCK_ATTR = "__comfy_modal_remote_preparation_lock"
 _REMOTE_TOGGLE_WIDGET_NAME = "Run Remotely"
 _LEGACY_REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
@@ -7060,8 +7064,11 @@ def rewrite_prompt_for_modal(
     extra_data: dict[str, Any] | None = None,
     status_callback: SetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Rewrite connected remote components into Modal proxy nodes."""
+    if cancellation_check is not None and cancellation_check():
+        raise SyncCancelledError("Remote workflow preparation was cancelled.")
     resolved_settings = settings or get_settings()
     remote_node_ids = requested_remote_node_ids(
         prompt=prompt,
@@ -7255,9 +7262,9 @@ def rewrite_prompt_for_modal(
                     "Vast.ai assignment has no active controller service."
                 )
             lease = vast_leases_by_environment[assignment.environment_id]
-            sync_engines_by_environment[assignment.environment_id] = (
-                vast_service.sync_engine(lease)
-            )
+            vast_sync_engine = vast_service.sync_engine(lease)
+            vast_sync_engine.cancellation_check = cancellation_check
+            sync_engines_by_environment[assignment.environment_id] = vast_sync_engine
             continue
         host = ssh_hosts_by_id.get(assignment.environment_id)
         if host is None:
@@ -7595,6 +7602,7 @@ async def rewrite_prompt_for_modal_async(
     extra_data: dict[str, Any] | None = None,
     status_callback: SetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Prepare one Modal prompt without blocking ComfyUI's event loop."""
     return await asyncio.to_thread(
@@ -7607,6 +7615,7 @@ async def rewrite_prompt_for_modal_async(
         extra_data=extra_data,
         status_callback=status_callback,
         plan_callback=plan_callback,
+        cancellation_check=cancellation_check,
     )
 
 
@@ -7821,6 +7830,13 @@ def _delete_modal_volume_route_path(route_path: str) -> str:
     return f"{route_path.rstrip('/')}/delete_volume"
 
 
+def _cancel_preparation_route_path(route_path: str) -> str:
+    """Return the sibling route used to cancel queue-time remote preparation."""
+    if route_path.endswith("/queue_prompt"):
+        return f"{route_path.removesuffix('/queue_prompt')}/cancel_preparation"
+    return f"{route_path.rstrip('/')}/cancel_preparation"
+
+
 def _remote_environments_route_path(route_path: str) -> str:
     """Return the provider-neutral environment management route."""
     del route_path
@@ -7995,8 +8011,14 @@ def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
         return
 
     preparation_prompts: dict[str, tuple[Any, ...]] = {}
+    preparation_cancellations: dict[str, threading.Event] = {}
     preparation_lock = threading.RLock()
     setattr(prompt_queue, _REMOTE_PREPARATION_PROMPTS_ATTR, preparation_prompts)
+    setattr(
+        prompt_queue,
+        _REMOTE_PREPARATION_CANCELLATIONS_ATTR,
+        preparation_cancellations,
+    )
     setattr(prompt_queue, _REMOTE_PREPARATION_LOCK_ATTR, preparation_lock)
 
     def preparation_items() -> list[tuple[Any, ...]]:
@@ -8092,6 +8114,7 @@ def _set_remote_preparation(
     prompt_id: str,
     prompt: Mapping[str, Any],
     extra_data: Mapping[str, Any],
+    cancellation_event: threading.Event | None = None,
 ) -> bool:
     """Register one pre-queue remote workflow and publish its active queue state."""
     prompt_queue = getattr(prompt_server, "prompt_queue", None)
@@ -8108,6 +8131,13 @@ def _set_remote_preparation(
             [],
             {},
         )
+        cancellations = getattr(
+            prompt_queue,
+            _REMOTE_PREPARATION_CANCELLATIONS_ATTR,
+            None,
+        )
+        if isinstance(cancellations, dict) and cancellation_event is not None:
+            cancellations[prompt_id] = cancellation_event
     queue_updated = getattr(prompt_server, "queue_updated", None)
     if callable(queue_updated):
         queue_updated()
@@ -8123,6 +8153,13 @@ def _clear_remote_preparation(prompt_server: Any, prompt_id: str) -> None:
         return
     with preparation_lock:
         removed = preparations.pop(prompt_id, None)
+        cancellations = getattr(
+            prompt_queue,
+            _REMOTE_PREPARATION_CANCELLATIONS_ATTR,
+            None,
+        )
+        if isinstance(cancellations, dict):
+            cancellations.pop(prompt_id, None)
     if removed is not None:
         queue_updated = getattr(prompt_server, "queue_updated", None)
         if callable(queue_updated):
@@ -8171,6 +8208,9 @@ def setup_modal_queue_route(
     delete_volume_route_path = _delete_modal_volume_route_path(
         resolved_settings.route_path
     )
+    cancel_preparation_route_path = _cancel_preparation_route_path(
+        resolved_settings.route_path
+    )
     remote_environments_route_path = _remote_environments_route_path(
         resolved_settings.route_path
     )
@@ -8189,6 +8229,28 @@ def setup_modal_queue_route(
     remote_host_registry = _ssh_host_registry(resolved_settings)
     vast_registry = _vast_registry(resolved_settings)
     _install_modal_interrupt_queue_bridge(prompt_server)
+
+    @prompt_server.routes.post(cancel_preparation_route_path)
+    async def cancel_remote_preparation(request: web.Request) -> web.Response:
+        """Cancel one prompt while it is still preparing remote execution."""
+        payload = await request.json()
+        prompt_id = str(payload.get("prompt_id") or "").strip()
+        prompt_queue = getattr(prompt_server, "prompt_queue", None)
+        cancellations = getattr(
+            prompt_queue,
+            _REMOTE_PREPARATION_CANCELLATIONS_ATTR,
+            None,
+        )
+        cancellation_event = (
+            cancellations.get(prompt_id)
+            if isinstance(cancellations, dict) and prompt_id
+            else None
+        )
+        if cancellation_event is None:
+            return web.json_response({"cancelled": False, "prompt_id": prompt_id})
+        cancellation_event.set()
+        logger.info("Cancelled remote preparation for prompt %s.", prompt_id)
+        return web.json_response({"cancelled": True, "prompt_id": prompt_id})
 
     if hasattr(prompt_server.routes, "get"):
 
@@ -8616,6 +8678,7 @@ def setup_modal_queue_route(
         request_modal_gpu: str | None = None
         summary = RewriteSummary()
         preparation_prompt_id: str | None = None
+        preparation_cancellation = threading.Event()
         configurator_node_id: str | None = None
         try:
             request_started_at = time.perf_counter()
@@ -8668,6 +8731,7 @@ def setup_modal_queue_route(
                     prompt_id=prompt_id,
                     prompt=json_data.get("prompt", {}),
                     extra_data=json_data.get("extra_data", {}),
+                    cancellation_event=preparation_cancellation,
                 ):
                     preparation_prompt_id = prompt_id
 
@@ -8698,6 +8762,10 @@ def setup_modal_queue_route(
                 total: int | None = None,
             ) -> None:
                 """Forward one queue-time Modal setup update into the websocket stream."""
+                if preparation_cancellation.is_set():
+                    raise SyncCancelledError(
+                        "Remote workflow preparation was cancelled."
+                    )
                 _emit_modal_status(
                     prompt_server=prompt_server,
                     phase="setup",
@@ -8748,6 +8816,7 @@ def setup_modal_queue_route(
                     extra_data=json_data.get("extra_data"),
                     status_callback=emit_setup_status,
                     plan_callback=emit_execution_plan,
+                    cancellation_check=preparation_cancellation.is_set,
                 )
                 selected_modal_gpus = _selected_modal_gpus(
                     summary,
@@ -8862,6 +8931,27 @@ def setup_modal_queue_route(
                 time.perf_counter() - request_started_at,
             )
             return response
+        except SyncCancelledError as exc:
+            logger.info("Remote workflow preparation cancelled: %s", exc)
+            if json_data is not None:
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="execution_interrupted",
+                    client_id=str(json_data.get("client_id"))
+                    if json_data.get("client_id")
+                    else None,
+                    prompt_id=str(json_data.get("prompt_id"))
+                    if json_data.get("prompt_id")
+                    else None,
+                    node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
+                    modal_gpu=request_modal_gpu,
+                    status_message=str(exc),
+                )
+            return web.json_response(
+                {"error": str(exc), "node_errors": [], "cancelled": True},
+                status=409,
+            )
         except FileNotFoundError as exc:
             logger.exception("Modal asset sync failed.")
             if json_data is not None:

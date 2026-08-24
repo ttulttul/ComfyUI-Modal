@@ -10,6 +10,8 @@ import types
 from typing import Any
 import zipfile
 
+import pytest
+
 
 def test_sync_file_deduplicates_by_hash(
     settings_module: Any,
@@ -1722,3 +1724,72 @@ def test_modal_volume_backend_applies_shared_rate_limit_backoff_across_calls(
     assert backend._record_shared_rate_limit_backoff() == 0.25
     assert backend.exists("/hashes/second.done") is True
     assert 0.25 in sleep_calls
+
+
+def test_cancellable_backend_interruption_becomes_sync_cancellation(
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """An interrupted transport should stop queue-time sync without indexing it."""
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"model")
+
+    class CancellableVolume:
+        """Expose an upload that reports prompt cancellation."""
+
+        def exists(self, remote_path: str) -> bool:
+            """Report empty storage."""
+            del remote_path
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            """Reject the non-cancellable path."""
+            del local_path, remote_path
+            raise AssertionError("cancellable upload path was not used")
+
+        def put_file_cancellable(
+            self,
+            local_path: Path,
+            remote_path: str,
+            *,
+            cancellation_check: Any,
+        ) -> None:
+            """Report that the active transport was interrupted."""
+            del local_path, remote_path
+            raise InterruptedError("cancelled")
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            """Accept protocol-required byte writes."""
+            del payload, remote_path
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="vast",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=CancellableVolume(),
+        settings=settings,
+        cancellation_check=lambda: False,
+    )
+
+    with pytest.raises(sync_engine_module.SyncCancelledError, match="cancelled"):
+        engine._sync_content_addressed_file(
+            local_path=asset_path,
+            remote_path="assets/model.safetensors",
+            sync_key="test-key",
+            source_description=str(asset_path),
+        )

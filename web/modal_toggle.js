@@ -11,6 +11,10 @@ const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/prog
 const MODAL_CONTAINER_STATUS_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/container_status");
 const MODAL_DELETE_CACHES_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_caches");
 const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_volume");
+const MODAL_CANCEL_PREPARATION_ROUTE = MODAL_ROUTE.replace(
+  /\/queue_prompt$/,
+  "/cancel_preparation",
+);
 const COMFY_QUEUE_ROUTE = "/queue";
 const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
@@ -1592,12 +1596,24 @@ function patchInterruptFeedback() {
     return;
   }
   const originalFetchApi = api.fetchApi;
-  api.fetchApi = function modalFetchApi(resource, options) {
+  api.fetchApi = async function modalFetchApi(resource, options) {
     const promptIds = promptIdsFromInterruptRequest(resource, options);
     for (const promptId of promptIds) {
       markPromptCancellationRequested(promptId);
     }
-    return originalFetchApi.apply(this, arguments);
+    if (promptIds.length > 0) {
+      await Promise.all(promptIds.map(async (promptId) => {
+        try {
+          await originalFetchApi.call(this, MODAL_CANCEL_PREPARATION_ROUTE, {
+            method: "POST",
+            body: JSON.stringify({ prompt_id: promptId }),
+          });
+        } catch (error) {
+          console.warn(`Unable to cancel remote preparation for prompt ${promptId}.`, error);
+        }
+      }));
+    }
+    return originalFetchApi.call(this, resource, options);
   };
   api.__modalInterruptFeedbackPatched = true;
 }

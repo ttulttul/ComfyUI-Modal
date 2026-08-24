@@ -129,6 +129,52 @@ def test_manager_recovers_offer_race_then_reuses_persisted_lease(
     asyncio.run(scenario())
 
 
+def test_manager_adopts_legacy_lease_for_unchanged_worker_image(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """Controller fingerprint drift should not rent again for the same worker image."""
+
+    async def scenario() -> None:
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            registry = vast_leases_module.VastLeaseRegistry.for_user_directory(tmp_path)
+            client = vast_api_module.VastApiClient(state.api_key, base_url=base_url)
+            profile = _profile(vast_models_module)
+            first_manager = vast_leases_module.VastLeaseManager(
+                api_client=client,
+                registry=registry,
+                owner_id="comfy-owner",
+                runtime_fingerprint="a" * 64,
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+            first = await first_manager.ensure_lease(profile)
+            second_manager = vast_leases_module.VastLeaseManager(
+                api_client=client,
+                registry=registry,
+                owner_id="comfy-owner",
+                runtime_fingerprint="b" * 64,
+                worker_image="ghcr.io/example/worker@sha256:same",
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+
+            second = await second_manager.ensure_lease(profile)
+
+            assert second.instance_id == first.instance_id
+            assert second.runtime_fingerprint == "b" * 64
+            assert second.worker_image == "ghcr.io/example/worker@sha256:same"
+            assert len(state.instances) == 1
+
+    asyncio.run(scenario())
+
+
 def test_active_work_suspends_idle_destruction_and_finish_resets_deadline(
     tmp_path: Any,
     vast_api_module: Any,

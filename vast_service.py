@@ -163,6 +163,7 @@ class VastService:
             runtime_fingerprint=runtime_configuration.runtime_fingerprint,
             launch_spec_factory=runtime_configuration.launch_spec,
             startup_timeout_seconds=runtime_configuration.startup_timeout_seconds,
+            worker_image=runtime_configuration.image,
         )
 
     @classmethod
@@ -614,7 +615,7 @@ class VastService:
             if lease.owner_id == self.settings.app_name
             and lease.profile_id == profile.profile_id
             and lease.profile_fingerprint == fingerprint
-            and lease.runtime_fingerprint == self.runtime_configuration.runtime_fingerprint
+            and lease.worker_image in {None, self.runtime_configuration.image}
             and lease.ready_for_work
         ]
         return min(matches, key=lambda lease: lease.created_at_epoch, default=None)

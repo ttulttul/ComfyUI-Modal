@@ -22,6 +22,7 @@ from .settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
 SyncStatusCallback = Callable[[str, int | None, int | None], None]
+CancellationCheck = Callable[[], bool]
 
 _SYNC_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".gguf", ".pt", ".vae"})
 MODEL_FILE_EXTENSIONS = frozenset(
@@ -179,6 +180,39 @@ class HuggingFaceMaterializingBackend(Protocol):
         token: str | None,
     ) -> bool:
         """Materialize one immutable file and report whether it succeeded."""
+
+
+@runtime_checkable
+class CancellableVolumeBackend(Protocol):
+    """Optional backend capability for interruptible file uploads."""
+
+    def put_file_cancellable(
+        self,
+        local_path: Path,
+        remote_path: str,
+        *,
+        cancellation_check: CancellationCheck,
+    ) -> None:
+        """Upload a file while cooperatively observing cancellation."""
+
+
+@runtime_checkable
+class CancellableHuggingFaceMaterializingBackend(Protocol):
+    """Optional backend capability for interruptible remote downloads."""
+
+    def materialize_huggingface_file_cancellable(
+        self,
+        source: HuggingFaceAssetSource,
+        remote_path: str,
+        *,
+        token: str | None,
+        cancellation_check: CancellationCheck,
+    ) -> bool:
+        """Materialize one immutable file while observing cancellation."""
+
+
+class SyncCancelledError(RuntimeError):
+    """Raised when queue-time asset preparation is cancelled."""
 
 
 class SyncIndexBackend(Protocol):
@@ -561,6 +595,7 @@ class ModalAssetSyncEngine:
     sync_index: SyncIndexBackend | None = None
     huggingface_asset_registry: HuggingFaceAssetRegistry | None = None
     huggingface_asset_discovery: HuggingFaceAssetDiscovery | None = None
+    cancellation_check: CancellationCheck | None = None
     _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
     _hash_cache_dirty: bool = field(init=False, default=False)
@@ -617,6 +652,7 @@ class ModalAssetSyncEngine:
         total_items: int | None = None,
     ) -> SyncedAsset:
         """Sync a file into content-addressable remote storage."""
+        self._raise_if_cancelled()
         source_path = local_path.expanduser().absolute()
         if not source_path.is_file():
             raise FileNotFoundError(f"Asset not found: {source_path}")
@@ -668,6 +704,7 @@ class ModalAssetSyncEngine:
         request_cache: AssetSyncRequestCache | None = None,
     ) -> tuple[dict[str, Any], list[SyncedAsset]]:
         """Rewrite file-like prompt inputs to mirrored storage paths."""
+        self._raise_if_cancelled()
         synced_assets: list[SyncedAsset] = []
         sync_started_at = time.perf_counter()
         logger.info("Scanning prompt inputs for syncable assets.")
@@ -676,6 +713,7 @@ class ModalAssetSyncEngine:
 
         def rewrite(value: Any) -> Any:
             nonlocal syncable_asset_index
+            self._raise_if_cancelled()
             if isinstance(value, str):
                 maybe_path = self._resolve_model_path(value)
                 if maybe_path is not None:
@@ -898,6 +936,7 @@ class ModalAssetSyncEngine:
         huggingface_source: HuggingFaceAssetSource | None = None,
     ) -> _ContentAddressedSyncResult:
         """Upload one deterministic file only when its digest is absent from the sync index."""
+        self._raise_if_cancelled()
         existing_record = self._lookup_sync_record(sync_key)
         if existing_record is not None:
             indexed_remote_path = str(existing_record["remote_path"])
@@ -926,11 +965,32 @@ class ModalAssetSyncEngine:
                 status_current,
                 status_total,
             )
-            if self.volume.materialize_huggingface_file(
-                huggingface_source,
-                remote_path,
-                token=os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"),
+            token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+            if (
+                self.cancellation_check is not None
+                and isinstance(
+                    self.volume,
+                    CancellableHuggingFaceMaterializingBackend,
+                )
             ):
+                try:
+                    materialized = self.volume.materialize_huggingface_file_cancellable(
+                        huggingface_source,
+                        remote_path,
+                        token=token,
+                        cancellation_check=self.cancellation_check,
+                    )
+                except InterruptedError as exc:
+                    raise SyncCancelledError(
+                        "Remote workflow preparation was cancelled."
+                    ) from exc
+            else:
+                materialized = self.volume.materialize_huggingface_file(
+                    huggingface_source,
+                    remote_path,
+                    token=token,
+                )
+            if materialized:
                 self._store_sync_record(
                     sync_key=sync_key,
                     remote_path=remote_path,
@@ -955,7 +1015,22 @@ class ModalAssetSyncEngine:
             status_current,
             status_total,
         )
-        self.volume.put_file(local_path, remote_path)
+        if self.cancellation_check is not None and isinstance(
+            self.volume,
+            CancellableVolumeBackend,
+        ):
+            try:
+                self.volume.put_file_cancellable(
+                    local_path,
+                    remote_path,
+                    cancellation_check=self.cancellation_check,
+                )
+            except InterruptedError as exc:
+                raise SyncCancelledError(
+                    "Remote workflow preparation was cancelled."
+                ) from exc
+        else:
+            self.volume.put_file(local_path, remote_path)
         self._store_sync_record(
             sync_key=sync_key,
             remote_path=remote_path,
@@ -1292,6 +1367,7 @@ class ModalAssetSyncEngine:
 
     def _hash_file(self, path: Path) -> str:
         """Compute the SHA256 digest for a file."""
+        self._raise_if_cancelled()
         resolved_path = path.resolve()
         stat_result = resolved_path.stat()
         cache_key = str(resolved_path)
@@ -1307,6 +1383,7 @@ class ModalAssetSyncEngine:
         digest = hashlib.sha256()
         with resolved_path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                self._raise_if_cancelled()
                 digest.update(chunk)
         sha256 = digest.hexdigest()
         self._hash_cache[cache_key] = {
@@ -1317,6 +1394,11 @@ class ModalAssetSyncEngine:
         }
         self._mark_hash_cache_dirty()
         return sha256
+
+    def _raise_if_cancelled(self) -> None:
+        """Abort queue-time synchronization when its prompt was cancelled."""
+        if self.cancellation_check is not None and self.cancellation_check():
+            raise SyncCancelledError("Remote workflow preparation was cancelled.")
 
     def _hash_directory(self, path: Path) -> str:
         """Compute a stable SHA256 digest for a directory tree."""

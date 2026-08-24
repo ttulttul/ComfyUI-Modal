@@ -27,6 +27,7 @@ class FakeRunner:
         input_file: Path | None = None,
         timeout_seconds: float | None = None,
         check: bool = True,
+        cancellation_check: Any | None = None,
     ) -> Any:
         """Record one command and infer test/atomic-write behavior."""
         arguments = tuple(remote_argv)
@@ -37,6 +38,7 @@ class FakeRunner:
                 "input_file": input_file,
                 "timeout": timeout_seconds,
                 "check": check,
+                "cancellation_check": cancellation_check,
             }
         )
         if arguments[:2] == ("test", "-f"):
@@ -47,7 +49,9 @@ class FakeRunner:
             )
         if arguments[:2] == ("python", "-c"):
             self.existing.add(arguments[-1])
-        if arguments[:3] == ("python", "-m", "remote.huggingface_materializer"):
+        if arguments[:2] == ("python", "/storage/runtime-tools") or (
+            len(arguments) == 2 and arguments[1].endswith(".pyz")
+        ):
             request = __import__("json").loads(input_payload or b"{}")
             self.existing.add(f"/storage/{request['remote_path']}")
         return self.module.VastSshCommandResult(stdout=b"", stderr=b"", returncode=0)
@@ -344,11 +348,92 @@ def test_huggingface_materialization_keeps_token_out_of_command_arguments(
     materialize_call = next(
         call
         for call in runner.calls
-        if call["argv"][:3] == ("python", "-m", "remote.huggingface_materializer")
+        if len(call["argv"]) == 2
+        and call["argv"][0] == "python"
+        and call["argv"][-1].endswith(".pyz")
     )
     assert "hf_private_token" not in " ".join(materialize_call["argv"])
     assert b"hf_private_token" in materialize_call["input"]
     assert backend.exists("assets/model.safetensors") is True
+
+
+def test_materializer_bundle_is_self_contained_and_executable(
+    vast_ssh_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The uploaded zipapp should load without worker-image package sources."""
+    bundle_path = tmp_path / "materializer.pyz"
+    bundle = vast_ssh_module._huggingface_materializer_bundle()
+    bundle_path.write_bytes(bundle)
+
+    assert vast_ssh_module._huggingface_materializer_bundle() == bundle
+
+    completed = subprocess.run(
+        [sys.executable, str(bundle_path)],
+        input=b"{}",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert b"No module named" not in completed.stderr
+    assert b"source must be an object" in completed.stderr
+
+
+def test_runner_terminates_active_ssh_process_when_cancelled(
+    tmp_path: Path,
+    vast_ssh_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Prompt cancellation should terminate an in-flight OpenSSH subprocess."""
+    runner = vast_ssh_module.VastSshRunner(
+        vast_ssh_module.VastSshConnection(
+            host="ssh.example.invalid",
+            port=22,
+            known_hosts_path=(tmp_path / "known-hosts").resolve(),
+        )
+    )
+
+    class FakeProcess:
+        """Represent a running SSH process that only exits after termination."""
+
+        returncode = -15
+
+        def __init__(self) -> None:
+            """Track termination calls."""
+            self.terminated = False
+
+        def terminate(self) -> None:
+            """Record graceful process termination."""
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Return the terminated status immediately."""
+            del timeout
+            return self.returncode
+
+        def kill(self) -> None:
+            """Fail if graceful termination unexpectedly needs escalation."""
+            raise AssertionError("kill should not be needed")
+
+        def communicate(self, **kwargs: Any) -> tuple[bytes, bytes]:
+            """Remain active until the cancellation check fires."""
+            del kwargs
+            raise subprocess.TimeoutExpired("ssh", 0.25)
+
+    process = FakeProcess()
+    monkeypatch.setattr(
+        vast_ssh_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    checks = iter((False, True))
+
+    with pytest.raises(vast_ssh_module.VastSshCancelledError, match="cancelled"):
+        runner.run(("python", "worker.py"), cancellation_check=lambda: next(checks))
+
+    assert process.terminated is True
 
 
 @pytest.mark.parametrize("path", ["../secret", "a/../../secret", ".", ""])

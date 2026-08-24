@@ -60,6 +60,8 @@ def test_launch_spec_starts_worker_and_watchdog_without_exporting_api_key(
     assert "\nCOMFY_VAST_ENV\n" in payload["onstart"]
     assert "\n COMFY_VAST_ENV\n" not in payload["onstart"]
     assert payload["env"]["COMFY_MODAL_LLM_EXECUTION_TARGET"] == "vast"
+    assert "COMFY_MODAL_RUNTIME_FINGERPRINT" not in payload["env"]
+    assert "COMFY_MODAL_RUNTIME_FINGERPRINT" not in payload["onstart"]
 
 
 def test_configuration_requires_explicit_published_image(
@@ -122,6 +124,31 @@ def test_runtime_manager_rejects_image_fingerprint_drift(
 
     with pytest.raises(Exception, match="fingerprint mismatch"):
         manager.ensure_worker()
+
+
+def test_runtime_manager_accepts_same_protocol_fingerprint_drift(
+    vast_runtime_module: Any,
+) -> None:
+    """Controller-only source changes may reuse the same protocol-compatible image."""
+    manager = vast_runtime_module.VastRuntimeManager(
+        runner=FakeRunner(
+            [
+                {
+                    "protocol_version": vast_runtime_module.REMOTE_PROTOCOL_VERSION,
+                    "runtime_fingerprint": "b" * 64,
+                    "worker_socket_ready": True,
+                }
+            ]
+        ),
+        configuration=vast_runtime_module.VastRuntimeConfiguration(
+            image="worker",
+            runtime_fingerprint="a" * 64,
+        ),
+    )
+
+    info = manager.ensure_worker()
+
+    assert info["worker_socket_ready"] is True
 
 
 def test_runtime_manager_logs_changed_ssh_readiness_diagnostics(

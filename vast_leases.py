@@ -79,6 +79,7 @@ class VastLeaseRecord:
     active_invocations: int = 0
     draining: bool = False
     last_error: str | None = None
+    worker_image: str | None = None
 
     def __post_init__(self) -> None:
         """Validate ownership, lifecycle, and scheduling fields."""
@@ -111,6 +112,8 @@ class VastLeaseRecord:
             raise ValueError("Vast lease label does not match its owner identity.")
         if self.ssh_port is not None and self.ssh_port <= 0:
             raise ValueError("ssh_port must be positive when present.")
+        if self.worker_image is not None and not self.worker_image.strip():
+            raise ValueError("worker_image must be non-empty when present.")
 
     @property
     def environment_id(self) -> str:
@@ -162,6 +165,9 @@ class VastLeaseRecord:
             active_invocations=int(payload.get("active_invocations", 0)),
             draining=bool(payload.get("draining", False)),
             last_error=(str(payload["last_error"]) if payload.get("last_error") else None),
+            worker_image=(
+                str(payload["worker_image"]) if payload.get("worker_image") else None
+            ),
         )
 
 
@@ -328,6 +334,7 @@ class VastLeaseManager:
         ],
         startup_timeout_seconds: float = 900.0,
         clock: Callable[[], float] = time.time,
+        worker_image: str | None = None,
     ) -> None:
         """Configure acquisition, persistence, and lifecycle dependencies."""
         if not owner_id.strip():
@@ -343,6 +350,7 @@ class VastLeaseManager:
         self.launch_spec_factory = launch_spec_factory
         self.startup_timeout_seconds = startup_timeout_seconds
         self.clock = clock
+        self.worker_image = worker_image.strip() if worker_image is not None else None
         self._profile_locks_guard = threading.Lock()
         self._profile_locks: dict[str, asyncio.Lock] = {}
 
@@ -389,7 +397,16 @@ class VastLeaseManager:
             if lease.owner_id == self.owner_id
             and lease.profile_id == slot_profile_id
             and lease.profile_fingerprint == fingerprint
-            and lease.runtime_fingerprint == self.runtime_fingerprint
+            and (
+                (
+                    self.worker_image is None
+                    and lease.runtime_fingerprint == self.runtime_fingerprint
+                )
+                or (
+                    self.worker_image is not None
+                    and lease.worker_image in {None, self.worker_image}
+                )
+            )
             and not lease.draining
         ]
         for lease in sorted(candidates, key=lambda item: item.created_at_epoch):
@@ -406,6 +423,19 @@ class VastLeaseManager:
                     status_callback=status_callback,
                 )
             refreshed = self._refresh_record(lease, instance)
+            if refreshed.runtime_fingerprint != self.runtime_fingerprint:
+                logger.info(
+                    "Adopting compatible Vast lease instance_id=%d from runtime=%s "
+                    "to runtime=%s for unchanged worker image.",
+                    refreshed.instance_id,
+                    refreshed.runtime_fingerprint[:12],
+                    self.runtime_fingerprint[:12],
+                )
+                refreshed = replace(
+                    refreshed,
+                    runtime_fingerprint=self.runtime_fingerprint,
+                    worker_image=self.worker_image,
+                )
             self.registry.upsert(refreshed)
             if refreshed.ready_for_work:
                 logger.info(
@@ -486,6 +516,7 @@ class VastLeaseManager:
             profile_name=profile.profile_name,
             profile_fingerprint=vast_profile_fingerprint(profile),
             runtime_fingerprint=self.runtime_fingerprint,
+            worker_image=self.worker_image,
             label=label,
             actual_status="loading",
             ssh_host=None,

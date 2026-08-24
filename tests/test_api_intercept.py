@@ -5933,6 +5933,18 @@ def test_container_status_route_is_queue_route_sibling(api_intercept_module: Any
     assert api_intercept_module._container_status_route_path("/modal/queue_prompt") == (
         "/modal/container_status"
     )
+
+
+def test_cancel_preparation_route_is_queue_route_sibling(
+    api_intercept_module: Any,
+) -> None:
+    """Queue-time cancellation should use a stable sibling route."""
+    assert api_intercept_module._cancel_preparation_route_path(
+        "/modal/queue_prompt"
+    ) == "/modal/cancel_preparation"
+    assert api_intercept_module._cancel_preparation_route_path(
+        "/custom/modal"
+    ) == "/custom/modal/cancel_preparation"
     assert api_intercept_module._container_status_route_path("/custom/modal") == (
         "/custom/modal/container_status"
     )
@@ -6241,6 +6253,41 @@ def test_remote_preparation_bridge_clears_failed_submission(
 
     assert prompt_queue.get_tasks_remaining() == 0
     assert prompt_queue.get_current_queue_volatile() == ([], [])
+
+
+def test_remote_preparation_bridge_tracks_prompt_cancellation(
+    api_intercept_module: Any,
+) -> None:
+    """Queue-time work should expose a prompt-scoped cancellation event."""
+
+    class FakePromptQueue:
+        """Provide the queue method required by the bridge."""
+
+        def get_current_queue(self) -> tuple[list[Any], list[Any]]:
+            """Return no native work."""
+            return [], []
+
+    prompt_queue = FakePromptQueue()
+    prompt_server = SimpleNamespace(prompt_queue=prompt_queue)
+    cancellation_event = api_intercept_module.threading.Event()
+    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+
+    assert api_intercept_module._set_remote_preparation(
+        prompt_server,
+        prompt_id="prompt-cancel",
+        prompt={},
+        extra_data={},
+        cancellation_event=cancellation_event,
+    )
+    cancellations = getattr(
+        prompt_queue,
+        api_intercept_module._REMOTE_PREPARATION_CANCELLATIONS_ATTR,
+    )
+    assert cancellations["prompt-cancel"] is cancellation_event
+
+    api_intercept_module._clear_remote_preparation(prompt_server, "prompt-cancel")
+
+    assert "prompt-cancel" not in cancellations
 
 
 def test_selected_vast_capacity_streams_setup_status(

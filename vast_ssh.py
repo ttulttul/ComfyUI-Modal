@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -9,7 +10,9 @@ import random
 import shlex
 import subprocess
 import time
+import zipfile
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Callable, Sequence
 
@@ -74,6 +77,10 @@ except (OSError, ValueError):
 
 class VastSshError(RuntimeError):
     """Raised when a direct Vast SSH or filesystem operation fails."""
+
+
+class VastSshCancelledError(VastSshError):
+    """Raised when the caller cancels an active direct SSH command."""
 
 
 @dataclass(frozen=True)
@@ -223,6 +230,7 @@ class VastSshRunner:
         input_file: Path | None = None,
         timeout_seconds: float | None = None,
         check: bool = True,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> VastSshCommandResult:
         """Execute one command with bounded transient transport retries."""
         resolved_input_file = _resolved_input_file(input_payload, input_file)
@@ -233,6 +241,7 @@ class VastSshRunner:
                 input_payload=input_payload,
                 input_file=resolved_input_file,
                 timeout_seconds=timeout_seconds,
+                cancellation_check=cancellation_check,
             )
             if _is_transient_ssh_transport_failure(result):
                 if attempt >= self.retry_attempts:
@@ -253,6 +262,8 @@ class VastSshRunner:
                     result.stderr_text.strip() or result.stdout_text.strip(),
                 )
                 self.sleep(delay_seconds)
+                if cancellation_check is not None and cancellation_check():
+                    raise VastSshCancelledError("Vast SSH command was cancelled.")
                 continue
             logger.debug(
                 "Finished Vast SSH command host=%s command=%s returncode=%d "
@@ -275,6 +286,7 @@ class VastSshRunner:
         input_payload: bytes | None,
         input_file: Path | None,
         timeout_seconds: float | None,
+        cancellation_check: Callable[[], bool] | None,
     ) -> VastSshCommandResult:
         """Execute one OpenSSH subprocess attempt, reopening streamed input files."""
         try:
@@ -284,6 +296,7 @@ class VastSshRunner:
                     input_payload=input_payload,
                     input_handle=None,
                     timeout_seconds=timeout_seconds,
+                    cancellation_check=cancellation_check,
                 )
             else:
                 with input_file.open("rb") as input_handle:
@@ -292,6 +305,7 @@ class VastSshRunner:
                         input_payload=None,
                         input_handle=input_handle,
                         timeout_seconds=timeout_seconds,
+                        cancellation_check=cancellation_check,
                     )
         except FileNotFoundError as exc:
             raise VastSshError(
@@ -338,6 +352,7 @@ class VastSshRunner:
         input_payload: bytes | None,
         input_handle: BinaryIO | None,
         timeout_seconds: float | None,
+        cancellation_check: Callable[[], bool] | None,
     ) -> subprocess.CompletedProcess[bytes]:
         """Run OpenSSH with either a small byte payload or a streamed file handle."""
         timeout = (
@@ -345,6 +360,14 @@ class VastSshRunner:
             if timeout_seconds is None
             else timeout_seconds
         )
+        if cancellation_check is not None:
+            return self._run_cancellable_subprocess(
+                remote_argv,
+                input_payload=input_payload,
+                input_handle=input_handle,
+                timeout_seconds=timeout,
+                cancellation_check=cancellation_check,
+            )
         if input_handle is not None:
             return subprocess.run(
                 self.command(remote_argv),
@@ -362,6 +385,59 @@ class VastSshRunner:
             check=False,
             timeout=timeout,
         )
+
+    def _run_cancellable_subprocess(
+        self,
+        remote_argv: Sequence[str],
+        *,
+        input_payload: bytes | None,
+        input_handle: BinaryIO | None,
+        timeout_seconds: float,
+        cancellation_check: Callable[[], bool],
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run OpenSSH while promptly terminating it when cancellation is requested."""
+        if cancellation_check():
+            raise VastSshCancelledError("Vast SSH command was cancelled.")
+        process = subprocess.Popen(
+            self.command(remote_argv),
+            stdin=input_handle if input_handle is not None else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        started_at = time.monotonic()
+        payload = input_payload
+        while True:
+            if cancellation_check():
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise VastSshCancelledError("Vast SSH command was cancelled.")
+            remaining = timeout_seconds - (time.monotonic() - started_at)
+            if remaining <= 0:
+                process.kill()
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(
+                    self.command(remote_argv),
+                    timeout_seconds,
+                    output=stdout,
+                    stderr=stderr,
+                )
+            try:
+                stdout, stderr = process.communicate(
+                    input=payload,
+                    timeout=min(0.25, remaining),
+                )
+                return subprocess.CompletedProcess(
+                    args=self.command(remote_argv),
+                    returncode=process.returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            except subprocess.TimeoutExpired:
+                payload = None
 
     def popen(self, remote_argv: Sequence[str]) -> subprocess.Popen[bytes]:
         """Start one streaming direct SSH command."""
@@ -387,6 +463,7 @@ class VastSshVolumeBackend:
     runner: VastSshRunner
     storage_root: PurePosixPath = DEFAULT_VAST_STORAGE_ROOT
     _exists_cache: dict[str, bool] = field(default_factory=dict)
+    _materializer_path: PurePosixPath | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         """Require an absolute non-root storage location."""
@@ -429,6 +506,36 @@ class VastSshVolumeBackend:
         )
         self._exists_cache[normalized] = True
 
+    def put_file_cancellable(
+        self,
+        local_path: Path,
+        remote_path: str,
+        *,
+        cancellation_check: Callable[[], bool],
+    ) -> None:
+        """Stream one file while terminating OpenSSH promptly on cancellation."""
+        resolved_path = local_path.expanduser().resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Asset not found: {resolved_path}")
+        size_bytes = resolved_path.stat().st_size
+        normalized = _validated_storage_path(remote_path)
+        try:
+            self.runner.run(
+                (
+                    "python",
+                    "-c",
+                    _ATOMIC_STDIN_WRITER,
+                    str(size_bytes),
+                    str(self.storage_root / normalized),
+                ),
+                input_file=resolved_path,
+                timeout_seconds=max(60.0, size_bytes / (4 * 1024 * 1024)),
+                cancellation_check=cancellation_check,
+            )
+        except VastSshCancelledError as exc:
+            raise InterruptedError("Vast file upload was cancelled.") from exc
+        self._exists_cache[normalized] = True
+
     def put_bytes(self, payload: bytes, remote_path: str) -> None:
         """Atomically upload bytes under the storage root."""
         self._put_payload(payload, remote_path)
@@ -452,6 +559,22 @@ class VastSshVolumeBackend:
         token: str | None,
     ) -> bool:
         """Ask the Vast worker to fetch and verify one immutable Hugging Face file."""
+        return self.materialize_huggingface_file_cancellable(
+            source,
+            remote_path,
+            token=token,
+            cancellation_check=lambda: False,
+        )
+
+    def materialize_huggingface_file_cancellable(
+        self,
+        source: HuggingFaceAssetSource,
+        remote_path: str,
+        *,
+        token: str | None,
+        cancellation_check: Callable[[], bool],
+    ) -> bool:
+        """Run the current materializer bundle and allow prompt cancellation."""
         normalized = _validated_storage_path(remote_path)
         request_payload = json.dumps(
             {
@@ -464,11 +587,17 @@ class VastSshVolumeBackend:
         ).encode("utf-8")
         timeout_seconds = max(900.0, source.size_bytes / (2 * 1024 * 1024))
         try:
+            materializer_path = self._ensure_materializer_bundle(
+                cancellation_check=cancellation_check,
+            )
             self.runner.run(
-                ("python", "-m", "remote.huggingface_materializer"),
+                ("python", str(materializer_path)),
                 input_payload=request_payload,
                 timeout_seconds=timeout_seconds,
+                cancellation_check=cancellation_check,
             )
+        except VastSshCancelledError as exc:
+            raise InterruptedError("Vast Hugging Face download was cancelled.") from exc
         except VastSshError as exc:
             logger.warning(
                 "Vast Hugging Face materialization failed for %s; falling back to SSH upload: %s",
@@ -478,6 +607,60 @@ class VastSshVolumeBackend:
             return False
         self._exists_cache[normalized] = True
         return True
+
+    def _ensure_materializer_bundle(
+        self,
+        *,
+        cancellation_check: Callable[[], bool],
+    ) -> PurePosixPath:
+        """Upload a tiny current-source zipapp independent of the worker image version."""
+        if self._materializer_path is not None:
+            return self._materializer_path
+        payload = _huggingface_materializer_bundle()
+        digest = hashlib.sha256(payload).hexdigest()
+        relative_path = f"runtime-tools/huggingface-materializer-{digest}.pyz"
+        normalized = _validated_storage_path(relative_path)
+        target = self.storage_root / normalized
+        if not self.exists(normalized):
+            self.runner.run(
+                (
+                    "python",
+                    "-c",
+                    _ATOMIC_STDIN_WRITER,
+                    str(len(payload)),
+                    str(target),
+                ),
+                input_payload=payload,
+                timeout_seconds=60.0,
+                cancellation_check=cancellation_check,
+            )
+            self._exists_cache[normalized] = True
+        self._materializer_path = target
+        return target
+
+
+def _huggingface_materializer_bundle() -> bytes:
+    """Build an executable zip containing the current verified-download implementation."""
+    repo_root = Path(__file__).resolve().parent
+    members = {
+        "__main__.py": (
+            b"from remote.huggingface_materializer import main\n"
+            b"raise SystemExit(main())\n"
+        ),
+        "remote/__init__.py": b"",
+        "remote/huggingface_materializer.py": (
+            repo_root / "remote" / "huggingface_materializer.py"
+        ).read_bytes(),
+        "huggingface_assets.py": (repo_root / "huggingface_assets.py").read_bytes(),
+    }
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member_name, member_payload in members.items():
+            member = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            member.external_attr = 0o644 << 16
+            archive.writestr(member, member_payload)
+    return output.getvalue()
 
 
 def vast_connection_from_lease(
@@ -517,6 +700,7 @@ def _validated_storage_path(remote_path: str) -> str:
 __all__ = [
     "DEFAULT_VAST_STORAGE_ROOT",
     "VastSshCommandResult",
+    "VastSshCancelledError",
     "VastSshConnection",
     "VastSshError",
     "VastSshRunner",
