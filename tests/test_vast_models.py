@@ -150,4 +150,3 @@ def test_launch_payload_uses_direct_ssh_and_fail_fast(
     assert payload["cancel_unavail"] is True
     assert payload["target_state"] == "running"
     assert "price" not in payload
-
