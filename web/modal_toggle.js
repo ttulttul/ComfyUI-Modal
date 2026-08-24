@@ -1913,6 +1913,7 @@ function ensurePromptState(promptId) {
       configuratorNodeId: null,
       remoteExecutionPlanAssignments: {},
       remoteExecutionConfigurations: [],
+      remoteEnvironmentStatuses: new Map(),
       descendantNodeIdsByAncestor: new Map(),
       laneNodeIdsByLane: new Map(),
       activeNodeId: null,
@@ -3325,6 +3326,128 @@ function renderRemoteConfiguratorStatus(panel, state) {
 }
 
 /**
+ * Return one stable row per concrete environment in a placement plan.
+ * @param {Record<string, Record<string, any>>} assignments
+ * @param {Array<Record<string, any>>} configurations
+ * @returns {Array<{ environmentId: string, label: string }>}
+ */
+function remoteConfiguratorEnvironmentEntries(assignments, configurations) {
+  const configurationById = new Map(
+    (configurations ?? []).map((configuration) => [
+      String(configuration?.configuration_id ?? ""),
+      configuration,
+    ]),
+  );
+  const entries = new Map();
+  for (const assignment of Object.values(assignments ?? {})) {
+    const environmentId = String(assignment?.environment_id ?? "").trim();
+    if (!environmentId || entries.has(environmentId)) {
+      continue;
+    }
+    const configurationId = String(assignment?.configuration_id ?? "");
+    const configuration = configurationById.get(configurationId);
+    const configurationName = String(configuration?.display_name ?? configurationId).trim();
+    const environmentLabel = remoteExecutionEnvironmentLabel(
+      assignment,
+      configurationById,
+      configuration?.gpu_type ?? null,
+    );
+    entries.set(environmentId, {
+      environmentId,
+      label: configurationName
+        ? `${configurationName} · ${environmentLabel}`
+        : environmentLabel,
+    });
+  }
+  return Array.from(entries.values());
+}
+
+/**
+ * Create one environment-local status row for the Configurator panel.
+ * @param {string} environmentId
+ * @param {string} label
+ * @returns {Record<string, any>}
+ */
+function createRemoteConfiguratorEnvironmentRow(environmentId, label) {
+  const root = document.createElement("div");
+  root.className = "remote-configurator-environment";
+  const heading = document.createElement("div");
+  heading.className = "remote-configurator-environment-heading";
+  const dot = document.createElement("span");
+  dot.className = "remote-configurator-environment-dot";
+  const labelElement = document.createElement("span");
+  labelElement.className = "remote-configurator-environment-label";
+  labelElement.textContent = label || environmentId;
+  const statusText = document.createElement("span");
+  statusText.className = "remote-configurator-environment-status";
+  statusText.textContent = "Waiting";
+  heading.append(dot, labelElement, statusText);
+  const progress = document.createElement("div");
+  progress.className = "remote-configurator-environment-progress";
+  const progressFill = document.createElement("span");
+  progressFill.className = "remote-configurator-environment-progress-fill";
+  const progressValue = document.createElement("span");
+  progressValue.className = "remote-configurator-environment-progress-value";
+  progress.append(progressFill, progressValue);
+  root.append(heading, progress);
+  return {
+    environmentId,
+    root,
+    label: labelElement,
+    statusText,
+    progress,
+    progressFill,
+    progressValue,
+  };
+}
+
+/**
+ * Render status for one remote environment without affecting another lane.
+ * @param {Record<string, any>} row
+ * @param {Record<string, any>} state
+ */
+function renderRemoteConfiguratorEnvironmentStatus(row, state) {
+  if (!row) {
+    return;
+  }
+  const phase = String(state?.phase ?? "idle");
+  row.root.dataset.phase = phase;
+  row.statusText.textContent = remoteConfiguratorStatusMessage(state);
+  const total = Math.max(0, Number(state?.statusTotal ?? 0));
+  const current = Math.max(0, Math.min(total, Number(state?.statusCurrent ?? 0)));
+  row.progress.hidden = total <= 1;
+  row.progressFill.style.width = total > 1 ? `${(current / total) * 100}%` : "0%";
+  row.progressValue.textContent = total > 1
+    ? `${Math.round(current)}/${Math.round(total)}`
+    : "";
+}
+
+/**
+ * Rebuild the independent environment rows for a placement plan.
+ * @param {Record<string, any>} panel
+ * @param {Record<string, Record<string, any>>} assignments
+ * @param {Array<Record<string, any>>} configurations
+ */
+function renderRemoteConfiguratorEnvironments(panel, assignments, configurations) {
+  if (!panel) {
+    return;
+  }
+  const promptState = modalPromptStates.get(String(panel.promptId ?? ""));
+  panel.environmentRows.clear();
+  panel.environments.replaceChildren();
+  for (const entry of remoteConfiguratorEnvironmentEntries(assignments, configurations)) {
+    const row = createRemoteConfiguratorEnvironmentRow(entry.environmentId, entry.label);
+    panel.environmentRows.set(entry.environmentId, row);
+    panel.environments.appendChild(row.root);
+    renderRemoteConfiguratorEnvironmentStatus(
+      row,
+      promptState?.remoteEnvironmentStatuses.get(entry.environmentId) ?? {},
+    );
+  }
+  panel.environments.hidden = panel.environmentRows.size === 0;
+}
+
+/**
  * Render the completed provider-neutral placement plan as a node-local table.
  * @param {Record<string, any>} panel
  * @param {Record<string, Record<string, any>>} assignments
@@ -3344,6 +3467,7 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
     String(left).localeCompare(String(right), undefined, { numeric: true }),
   );
   panel.tableBody.replaceChildren();
+  renderRemoteConfiguratorEnvironments(panel, assignments, configurations);
   rows.forEach(([representativeNodeId, assignment], index) => {
     const row = document.createElement("tr");
     const componentCell = document.createElement("td");
@@ -3382,7 +3506,8 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
   });
   panel.emptyText.hidden = rows.length > 0;
   panel.table.hidden = rows.length === 0;
-  panel.minHeight = 118 + Math.max(1, rows.length) * 31;
+  panel.minHeight =
+    118 + Math.max(1, rows.length) * 31 + panel.environmentRows.size * 52;
   const currentWidth = Number(panel.node.size?.[0]) || 0;
   const currentHeight = Number(panel.node.size?.[1]) || 0;
   panel.node.setSize?.([
@@ -3406,6 +3531,14 @@ function registerPromptConfigurator(promptId, configuratorNodeId) {
   promptState.configuratorNodeId = safeNodeId;
   const panel = remoteConfiguratorPanel(safeNodeId);
   if (!panel) {
+    return;
+  }
+  const currentPromptState = modalPromptStates.get(String(panel.promptId ?? ""));
+  if (
+    panel.promptId &&
+    panel.promptId !== promptId &&
+    Number(currentPromptState?.startedAt ?? 0) > Number(promptState.startedAt ?? 0)
+  ) {
     return;
   }
   const isNewPrompt = panel.promptId !== promptId;
@@ -3438,15 +3571,59 @@ function registerRemoteConfiguratorPlan(promptId, assignments, configurations) {
   promptState.remoteExecutionConfigurations = [...(configurations ?? [])];
   registerPromptExecutionAssignments(promptId, assignments ?? {});
   const panel = remoteConfiguratorPanel(promptState.configuratorNodeId);
-  if (!panel) {
+  if (!panel || panel.promptId !== promptId) {
     return;
   }
-  panel.promptId = promptId;
   renderRemoteConfiguratorPlan(
     panel,
     promptState.remoteExecutionPlanAssignments,
     promptState.remoteExecutionConfigurations,
   );
+}
+
+/**
+ * Store and render one environment's latest status independently of its peers.
+ * @param {string} promptId
+ * @param {Record<string, any>} detail
+ */
+function updateRemoteConfiguratorEnvironmentStatus(promptId, detail) {
+  const environmentId = String(detail?.execution_environment_id ?? "").trim();
+  const promptState = modalPromptStates.get(promptId);
+  if (!environmentId || !promptState) {
+    return;
+  }
+  const existing = promptState.remoteEnvironmentStatuses.get(environmentId) ?? {};
+  const state = {
+    phase: String(detail?.phase ?? existing.phase ?? STATE_SETUP),
+    statusMessage:
+      detail?.status_message ?? detail?.message ?? detail?.stage ?? existing.statusMessage ?? null,
+    statusCurrent:
+      detail?.status_current ?? detail?.value ?? existing.statusCurrent ?? null,
+    statusTotal: detail?.status_total ?? detail?.max ?? existing.statusTotal ?? null,
+    updatedAt: nowMs(),
+  };
+  promptState.remoteEnvironmentStatuses.set(environmentId, state);
+  const panel = remoteConfiguratorPanel(promptState.configuratorNodeId);
+  if (!panel || panel.promptId !== promptId) {
+    return;
+  }
+  let row = panel.environmentRows.get(environmentId);
+  if (!row) {
+    const location = String(detail?.execution_location ?? "").trim();
+    row = createRemoteConfiguratorEnvironmentRow(
+      environmentId,
+      location ? `${environmentId} · ${location}` : environmentId,
+    );
+    panel.environmentRows.set(environmentId, row);
+    panel.environments.appendChild(row.root);
+    panel.environments.hidden = false;
+    panel.minHeight += 52;
+    panel.node.setSize?.([
+      Math.max(Number(panel.node.size?.[0]) || 0, 500),
+      Math.max(Number(panel.node.size?.[1]) || 0, panel.minHeight),
+    ]);
+  }
+  renderRemoteConfiguratorEnvironmentStatus(row, state);
 }
 
 /** Restore the newest retained prompt onto a newly mounted configurator panel. */
@@ -3494,7 +3671,11 @@ function setRemoteConfiguratorTerminalStatus(promptId, phase, message = null) {
   if (!panel || panel.promptId !== promptId) {
     return;
   }
-  renderRemoteConfiguratorStatus(panel, { phase, statusMessage: message });
+  const terminalState = { phase, statusMessage: message };
+  renderRemoteConfiguratorStatus(panel, terminalState);
+  for (const row of panel.environmentRows.values()) {
+    renderRemoteConfiguratorEnvironmentStatus(row, terminalState);
+  }
 }
 
 /**
@@ -3545,6 +3726,7 @@ function mountRemoteExecutionConfiguratorPanel(node) {
       <span class="remote-configurator-progress-fill"></span>
       <span class="remote-configurator-progress-value"></span>
     </div>
+    <div class="remote-configurator-environments" hidden></div>
     <div class="remote-configurator-plan-title">Execution plan</div>
     <div class="remote-configurator-empty">The selected environments will appear here after planning.</div>
     <table class="remote-configurator-table" hidden>
@@ -3560,6 +3742,8 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     progress: root.querySelector(".remote-configurator-progress"),
     progressFill: root.querySelector(".remote-configurator-progress-fill"),
     progressValue: root.querySelector(".remote-configurator-progress-value"),
+    environments: root.querySelector(".remote-configurator-environments"),
+    environmentRows: new Map(),
     emptyText: root.querySelector(".remote-configurator-empty"),
     table: root.querySelector(".remote-configurator-table"),
     tableBody: root.querySelector("tbody"),
@@ -5104,6 +5288,7 @@ function handleModalStatus(event) {
       detail.remote_execution_configurations ?? [],
     );
   }
+  updateRemoteConfiguratorEnvironmentStatus(promptId, detail);
   const executionProvider = String(detail.execution_provider ?? "").trim();
   const modalGpu =
     (!executionProvider || executionProvider === "modal") &&
@@ -5322,6 +5507,13 @@ function handleModalProgress(event) {
     promptState.hasRemoteExecutionStarted = true;
   }
   updateNodeExecutionLocation(promptId, progressNodeId, detail);
+  updateRemoteConfiguratorEnvironmentStatus(promptId, {
+    ...detail,
+    phase: detail.pre_gpu ? STATE_STARTING : EXECUTION_PHASE,
+    status_message: detail.message ?? detail.stage ?? "Remote component is running",
+    status_current: detail.value,
+    status_total: detail.max,
+  });
   const componentNodeIds = resolveComponentNodeIds(promptId, progressNodeId);
   const readyNodeIds = (componentNodeIds ?? []).filter((nodeIdValue) => nodeIdValue !== progressNodeId);
   promptState.hasStreamedProgress = true;
@@ -6190,6 +6382,103 @@ function installGlobalStatusStyles() {
       inset: 0 5px 0 auto;
       color: #f8fafc;
       font: 650 9px/12px ui-monospace, SFMono-Regular, monospace;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    }
+
+    .remote-configurator-environments {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .remote-configurator-environment {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px 7px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 7px;
+      background: rgba(2, 6, 23, 0.42);
+    }
+
+    .remote-configurator-environment-heading {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .remote-configurator-environment-dot {
+      width: 6px;
+      height: 6px;
+      flex: 0 0 auto;
+      border-radius: 999px;
+      background: #64748b;
+    }
+
+    .remote-configurator-environment[data-phase="setup"] .remote-configurator-environment-dot,
+    .remote-configurator-environment[data-phase="waiting"] .remote-configurator-environment-dot {
+      background: #f59e0b;
+    }
+
+    .remote-configurator-environment[data-phase="starting"] .remote-configurator-environment-dot {
+      background: #eab308;
+    }
+
+    .remote-configurator-environment[data-phase="executing"] .remote-configurator-environment-dot {
+      background: #a855f7;
+    }
+
+    .remote-configurator-environment[data-phase="complete"] .remote-configurator-environment-dot {
+      background: #22c55e;
+    }
+
+    .remote-configurator-environment[data-phase="error"] .remote-configurator-environment-dot,
+    .remote-configurator-environment[data-phase="cancelling"] .remote-configurator-environment-dot {
+      background: #ef4444;
+    }
+
+    .remote-configurator-environment-label {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+      color: #e2e8f0;
+      font-weight: 650;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-environment-status {
+      max-width: 55%;
+      overflow: hidden;
+      color: #94a3b8;
+      font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-environment-progress {
+      position: relative;
+      height: 10px;
+      overflow: hidden;
+      border-radius: 5px;
+      background: rgba(15, 23, 42, 0.94);
+    }
+
+    .remote-configurator-environment-progress-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 0;
+      background: linear-gradient(90deg, #3b82f6, #a855f7);
+      transition: width 160ms ease-out;
+    }
+
+    .remote-configurator-environment-progress-value {
+      position: absolute;
+      inset: 0 4px 0 auto;
+      color: #f8fafc;
+      font: 650 8px/10px ui-monospace, SFMono-Regular, monospace;
       text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
     }
 

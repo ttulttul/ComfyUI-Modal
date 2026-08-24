@@ -5817,6 +5817,7 @@ def test_emit_modal_status_targets_prompt_client(
         active_node_id="5",
         active_node_class_type="KSampler",
         active_node_role="sampling",
+        execution_environment_id="vast:48602895",
         remote_execution_assignments={
             "4": {"provider": "vast", "node_ids": ["4", "5"]}
         },
@@ -5837,6 +5838,7 @@ def test_emit_modal_status_targets_prompt_client(
                 "active_node_id": "5",
                 "active_node_class_type": "KSampler",
                 "active_node_role": "sampling",
+                "execution_environment_id": "vast:48602895",
                 "components": [
                     {
                         "representative_node_id": "4",
@@ -5869,6 +5871,7 @@ def test_emit_modal_status_targets_prompt_client(
                 "active_node_id": "5",
                 "active_node_class_type": "KSampler",
                 "active_node_role": "sampling",
+                "execution_environment_id": "vast:48602895",
                 "components": [
                     {
                         "representative_node_id": "4",
@@ -5887,6 +5890,31 @@ def test_emit_modal_status_targets_prompt_client(
             },
             "updated_at": replay_events[0]["updated_at"],
         }
+    ]
+
+
+def test_environment_setup_status_callback_preserves_environment_identity(
+    api_intercept_module: Any,
+) -> None:
+    """Environment setup updates should also retain prompt-wide progress."""
+    prompt_updates: list[tuple[str, int | None, int | None]] = []
+    environment_updates: list[tuple[str, str, int | None, int | None]] = []
+    callback = api_intercept_module._environment_setup_status_callback(
+        "vast:48602895",
+        lambda message, current, total: prompt_updates.append(
+            (message, current, total)
+        ),
+        lambda environment_id, message, current, total: environment_updates.append(
+            (environment_id, message, current, total)
+        ),
+    )
+
+    assert callback is not None
+    callback("Uploading asset", 3, 10)
+
+    assert prompt_updates == [("Uploading asset", 3, 10)]
+    assert environment_updates == [
+        ("vast:48602895", "Uploading asset", 3, 10)
     ]
 
 

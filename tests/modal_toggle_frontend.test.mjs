@@ -56,6 +56,7 @@ class FakeElement {
       ".remote-configurator-progress",
       ".remote-configurator-progress-fill",
       ".remote-configurator-progress-value",
+      ".remote-configurator-environments",
       ".remote-configurator-empty",
       ".remote-configurator-table",
       "tbody",
@@ -121,6 +122,7 @@ const transformedSource = `${[
   "  registerPromptExecutionAssignments,",
   "  registerPromptConfigurator,",
   "  registerRemoteConfiguratorPlan,",
+  "  updateRemoteConfiguratorEnvironmentStatus,",
   "  mountRemoteExecutionConfiguratorPanel,",
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
@@ -1511,8 +1513,19 @@ modalToggle.registerRemoteConfiguratorPlan(
       predicted_cost_usd: 0.031,
       predicted_completion_seconds: 120,
     },
+    "24": {
+      provider: "modal",
+      environment_id: "modal:lambda",
+      configuration_id: "lambda",
+      node_ids: ["24"],
+      predicted_cost_usd: 0,
+      predicted_completion_seconds: 60,
+    },
   },
-  [{ configuration_id: "vast-big", display_name: "Vast Big" }],
+  [
+    { configuration_id: "vast-big", display_name: "Vast Big" },
+    { configuration_id: "lambda", display_name: "Lambda", gpu_type: "L40S" },
+  ],
 );
 const stalePanelRoot = new FakeElement("div");
 const stalePanelWidget = {
@@ -1552,7 +1565,8 @@ assert.equal(stalePanelWidget.wasUnregistered, true);
 assert.equal(lateConfiguratorNode.widgets.length, 1);
 assert.equal(lateConfiguratorNode.widgets[0].element, retainedPanel.root);
 assert.equal(retainedPanel.promptId, "plan-before-capacity");
-assert.equal(retainedPanel.tableBody.children.length, 1);
+assert.equal(retainedPanel.tableBody.children.length, 2);
+assert.equal(retainedPanel.environmentRows.size, 2);
 assert.equal(retainedPanel.table.hidden, false);
 assert.equal(retainedPanel.emptyText.hidden, true);
 assert.equal(retainedPanel.root.isConnected, false);
@@ -1572,3 +1586,44 @@ assert.equal(
   retainedPanel,
   "a detached panel should retain prompt state instead of being remounted",
 );
+
+modalToggle.handleModalStatus({
+  detail: {
+    phase: "setup",
+    prompt_id: "plan-before-capacity",
+    node_ids: ["14", "15"],
+    configurator_node_id: "381",
+    execution_environment_id: "vast:profile:slot-0",
+    status_message: "Uploading Vast assets",
+    status_current: 3,
+    status_total: 10,
+  },
+});
+modalToggle.handleModalStatus({
+  detail: {
+    phase: "starting",
+    prompt_id: "plan-before-capacity",
+    node_ids: ["24"],
+    configurator_node_id: "381",
+    execution_environment_id: "modal:lambda",
+    status_message: "Starting Lambda",
+    status_current: 1,
+    status_total: 4,
+  },
+});
+const vastEnvironmentRow = retainedPanel.environmentRows.get("vast:profile:slot-0");
+const modalEnvironmentRow = retainedPanel.environmentRows.get("modal:lambda");
+assert.equal(vastEnvironmentRow.statusText.textContent, "Uploading Vast assets");
+assert.equal(vastEnvironmentRow.progressValue.textContent, "3/10");
+assert.equal(vastEnvironmentRow.progressFill.style.width, "30%");
+assert.equal(modalEnvironmentRow.statusText.textContent, "Starting Lambda");
+assert.equal(modalEnvironmentRow.progressValue.textContent, "1/4");
+assert.equal(modalEnvironmentRow.progressFill.style.width, "25%");
+
+modalToggle.registerPromptConfigurator("newer-prompt", "381");
+modalToggle.modalPromptStates.get("plan-before-capacity").startedAt = 1;
+modalToggle.modalPromptStates.get("newer-prompt").startedAt = 2;
+modalToggle.registerPromptConfigurator("newer-prompt", "381");
+assert.equal(retainedPanel.promptId, "newer-prompt");
+modalToggle.registerPromptConfigurator("plan-before-capacity", "381");
+assert.equal(retainedPanel.promptId, "newer-prompt");

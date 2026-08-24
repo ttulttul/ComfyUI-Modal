@@ -90,6 +90,9 @@ from .vast_leases import VastLeaseRegistry
 
 logger = logging.getLogger(__name__)
 SetupStatusCallback = Callable[[str, int | None, int | None], None]
+EnvironmentSetupStatusCallback = Callable[
+    [str, str, int | None, int | None], None
+]
 ExecutionPlanStatusCallback = Callable[
     [dict[str, dict[str, Any]], list[dict[str, Any]]], None
 ]
@@ -1396,6 +1399,11 @@ def _plan_configured_component_execution(
         vast_service=vast_service,
         status_callback=status_callback,
     )
+    if plan_callback is not None and vast_leases:
+        plan_callback(
+            _planned_execution_assignments_payload(assignments, components),
+            configuration_set.to_safe_list(),
+        )
     return ComponentExecutionPlan(
         assignments=assignments,
         configuration_set=configuration_set,
@@ -2010,6 +2018,7 @@ def _emit_modal_status(
     status_message: str | None = None,
     status_current: int | None = None,
     status_total: int | None = None,
+    execution_environment_id: str | None = None,
     remote_execution_assignments: Mapping[str, Mapping[str, Any]] | None = None,
     remote_execution_configurations: Sequence[Mapping[str, Any]] | None = None,
 ) -> None:
@@ -2053,6 +2062,8 @@ def _emit_modal_status(
         payload["status_current"] = int(status_current)
     if status_total is not None:
         payload["status_total"] = int(status_total)
+    if execution_environment_id is not None:
+        payload["execution_environment_id"] = execution_environment_id
     if remote_execution_assignments is not None:
         payload["remote_execution_assignments"] = copy.deepcopy(
             dict(remote_execution_assignments)
@@ -7055,6 +7066,29 @@ def _configure_speculative_affinity_prewarm_payloads(
         )
 
 
+def _environment_setup_status_callback(
+    environment_id: str,
+    status_callback: SetupStatusCallback | None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None,
+) -> SetupStatusCallback | None:
+    """Return a setup callback that updates prompt-wide and environment UI."""
+    if status_callback is None and environment_status_callback is None:
+        return None
+
+    def emit_status(
+        message: str,
+        current: int | None,
+        total: int | None,
+    ) -> None:
+        """Forward one setup update with its concrete execution environment."""
+        if status_callback is not None:
+            status_callback(message, current, total)
+        if environment_status_callback is not None:
+            environment_status_callback(environment_id, message, current, total)
+
+    return emit_status
+
+
 def rewrite_prompt_for_modal(
     prompt: dict[str, Any],
     workflow: dict[str, Any] | None,
@@ -7063,6 +7097,7 @@ def rewrite_prompt_for_modal(
     nodes_module: Any | None = None,
     extra_data: dict[str, Any] | None = None,
     status_callback: SetupStatusCallback | None = None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
     cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
@@ -7287,7 +7322,11 @@ def rewrite_prompt_for_modal(
             summary.custom_nodes_bundles_by_environment[
                 environment_id
             ] = environment_sync_engine.sync_custom_nodes_directory(
-                status_callback=status_callback,
+                status_callback=_environment_setup_status_callback(
+                    environment_id,
+                    status_callback,
+                    environment_status_callback,
+                ),
             )
         modal_bundle = next(
             (
@@ -7331,7 +7370,11 @@ def rewrite_prompt_for_modal(
             request_cache=request_asset_caches_by_environment[
                 assignment.environment_id
             ],
-            status_callback=status_callback,
+            status_callback=_environment_setup_status_callback(
+                assignment.environment_id,
+                status_callback,
+                environment_status_callback,
+            ),
         )
         synced_component_prompts[component.representative_node_id] = component_prompt
         synced_assets_by_component_id[component.representative_node_id] = list(
@@ -7601,6 +7644,7 @@ async def rewrite_prompt_for_modal_async(
     nodes_module: Any | None = None,
     extra_data: dict[str, Any] | None = None,
     status_callback: SetupStatusCallback | None = None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
     cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
@@ -7614,6 +7658,7 @@ async def rewrite_prompt_for_modal_async(
         nodes_module=nodes_module,
         extra_data=extra_data,
         status_callback=status_callback,
+        environment_status_callback=environment_status_callback,
         plan_callback=plan_callback,
         cancellation_check=cancellation_check,
     )
@@ -8805,6 +8850,34 @@ def setup_modal_queue_route(
                     remote_execution_configurations=configurations,
                 )
 
+            def emit_environment_setup_status(
+                environment_id: str,
+                message: str,
+                current: int | None = None,
+                total: int | None = None,
+            ) -> None:
+                """Publish setup progress for one concrete remote environment."""
+                if preparation_cancellation.is_set():
+                    raise SyncCancelledError(
+                        "Remote workflow preparation was cancelled."
+                    )
+                _emit_modal_status(
+                    prompt_server=prompt_server,
+                    phase="setup",
+                    client_id=client_id,
+                    prompt_id=prompt_id,
+                    node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
+                    modal_gpu=status_modal_gpu,
+                    component_node_ids_by_representative=(
+                        summary.component_node_ids_by_representative or None
+                    ),
+                    status_message=message,
+                    status_current=current,
+                    status_total=total,
+                    execution_environment_id=environment_id,
+                )
+
             if "prompt" in json_data:
                 emit_setup_status("Preparing remote workflow")
                 rewrite_started_at = time.perf_counter()
@@ -8815,6 +8888,7 @@ def setup_modal_queue_route(
                     settings=request_settings,
                     extra_data=json_data.get("extra_data"),
                     status_callback=emit_setup_status,
+                    environment_status_callback=emit_environment_setup_status,
                     plan_callback=emit_execution_plan,
                     cancellation_check=preparation_cancellation.is_set,
                 )
