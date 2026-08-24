@@ -33,9 +33,9 @@ def test_local_apple_extra_matches_validated_model_runtime(
     )
 
     marker = "sys_platform == 'darwin' and platform_machine == 'arm64'"
+    assert "huggingface-hub==1.28.0" in project_metadata["project"]["dependencies"]
     assert project_metadata["project"]["optional-dependencies"]["local-apple"] == [
         f"hf-xet==1.6.0; {marker}",
-        f"huggingface-hub==1.28.0; {marker}",
         f"{local_llm_runtime_module.LOCAL_MLX_DSPARK_SPEC}; {marker}",
         f"{local_llm_runtime_module.LOCAL_MLX_VLM_SPEC}; {marker}",
         f"psutil>=7,<8; {marker}",

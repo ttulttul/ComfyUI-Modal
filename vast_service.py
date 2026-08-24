@@ -19,6 +19,7 @@ if __package__:
         ExecutionProvider,
         GpuCapability,
     )
+    from .huggingface_assets import HuggingFaceAssetRegistry
     from .runtime_environment import build_remote_runtime_identity
     from .settings import ModalSyncSettings, discover_comfyui_user_directory
     from .sync_engine import ModalAssetSyncEngine
@@ -41,6 +42,7 @@ else:  # pragma: no cover - direct debugging imports.
         ExecutionProvider,
         GpuCapability,
     )
+    from huggingface_assets import HuggingFaceAssetRegistry
     from runtime_environment import build_remote_runtime_identity
     from settings import ModalSyncSettings, discover_comfyui_user_directory
     from sync_engine import ModalAssetSyncEngine
@@ -495,6 +497,9 @@ class VastService:
                 storage_root=self.runtime_configuration.remote_storage_root,
             ),
             settings=vast_settings,
+            huggingface_asset_registry=(
+                HuggingFaceAssetRegistry.for_user_directory(self.user_directory)
+            ),
         )
 
     def executor(self) -> VastExecutorClient:

@@ -14,14 +14,15 @@ import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
+from .huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
 from .settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
 SyncStatusCallback = Callable[[str, int | None, int | None], None]
 
-_SYNC_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".pt", ".vae"})
+_SYNC_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".gguf", ".pt", ".vae"})
 MODEL_FILE_EXTENSIONS = frozenset(
     {
         ".bin",
@@ -122,6 +123,21 @@ def _format_asset_upload_status(
     return f"Uploading asset to {destination}: {asset_name}"
 
 
+def _format_huggingface_download_status(
+    asset_name: str,
+    *,
+    item_index: int | None,
+    total_items: int | None,
+) -> str:
+    """Return one queue-time status for direct Hugging Face acquisition on Vast."""
+    if item_index is not None and total_items is not None and total_items > 1:
+        return (
+            f"Downloading asset {item_index}/{total_items} from Hugging Face on "
+            f"Vast.ai: {asset_name}"
+        )
+    return f"Downloading asset from Hugging Face on Vast.ai: {asset_name}"
+
+
 class VolumeBackend(Protocol):
     """Minimal storage interface needed by the sync engine."""
 
@@ -133,6 +149,20 @@ class VolumeBackend(Protocol):
 
     def put_bytes(self, payload: bytes, remote_path: str) -> None:
         """Upload raw bytes into the remote storage backend."""
+
+
+@runtime_checkable
+class HuggingFaceMaterializingBackend(Protocol):
+    """Optional backend capability for direct verified Hugging Face acquisition."""
+
+    def materialize_huggingface_file(
+        self,
+        source: HuggingFaceAssetSource,
+        remote_path: str,
+        *,
+        token: str | None,
+    ) -> bool:
+        """Materialize one immutable file and report whether it succeeded."""
 
 
 class SyncIndexBackend(Protocol):
@@ -513,6 +543,7 @@ class ModalAssetSyncEngine:
     volume: VolumeBackend
     settings: ModalSyncSettings
     sync_index: SyncIndexBackend | None = None
+    huggingface_asset_registry: HuggingFaceAssetRegistry | None = None
     _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
     _hash_cache_dirty: bool = field(init=False, default=False)
@@ -575,6 +606,10 @@ class ModalAssetSyncEngine:
 
         sha256 = self._hash_file(resolved_path)
         proposed_remote_path = f"{remote_folder.rstrip('/')}/{sha256}_{resolved_path.name}"
+        huggingface_source = self._huggingface_source_for_asset(
+            resolved_path,
+            sha256=sha256,
+        )
         sync_result = self._sync_content_addressed_file(
             local_path=resolved_path,
             remote_path=proposed_remote_path,
@@ -589,6 +624,7 @@ class ModalAssetSyncEngine:
             ),
             status_current=item_index,
             status_total=total_items,
+            huggingface_source=huggingface_source,
         )
 
         return SyncedAsset(
@@ -833,6 +869,7 @@ class ModalAssetSyncEngine:
         upload_status_message: str | None = None,
         status_current: int | None = None,
         status_total: int | None = None,
+        huggingface_source: HuggingFaceAssetSource | None = None,
     ) -> _ContentAddressedSyncResult:
         """Upload one deterministic file only when its digest is absent from the sync index."""
         existing_record = self._lookup_sync_record(sync_key)
@@ -849,6 +886,39 @@ class ModalAssetSyncEngine:
             )
 
         logger.info("Syncing %s to %s", source_description, remote_path)
+        if (
+            huggingface_source is not None
+            and isinstance(self.volume, HuggingFaceMaterializingBackend)
+        ):
+            _emit_sync_status(
+                status_callback,
+                _format_huggingface_download_status(
+                    local_path.name,
+                    item_index=status_current,
+                    total_items=status_total,
+                ),
+                status_current,
+                status_total,
+            )
+            if self.volume.materialize_huggingface_file(
+                huggingface_source,
+                remote_path,
+                token=os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"),
+            ):
+                self._store_sync_record(
+                    sync_key=sync_key,
+                    remote_path=remote_path,
+                    source_description=huggingface_source.display_reference,
+                )
+                logger.info(
+                    "Materialized %s directly from Hugging Face at %s.",
+                    huggingface_source.display_reference,
+                    remote_path,
+                )
+                return _ContentAddressedSyncResult(
+                    remote_path=remote_path,
+                    uploaded=True,
+                )
         _emit_sync_status(
             status_callback,
             upload_status_message
@@ -866,6 +936,33 @@ class ModalAssetSyncEngine:
             source_description=source_description,
         )
         return _ContentAddressedSyncResult(remote_path=remote_path, uploaded=True)
+
+    def _huggingface_source_for_asset(
+        self,
+        local_path: Path,
+        *,
+        sha256: str,
+    ) -> HuggingFaceAssetSource | None:
+        """Return matching provenance when this engine can materialize it remotely."""
+        if self.huggingface_asset_registry is None or not isinstance(
+            self.volume,
+            HuggingFaceMaterializingBackend,
+        ):
+            return None
+        source = self.huggingface_asset_registry.get(sha256)
+        if source is None:
+            return None
+        actual_size = local_path.stat().st_size
+        if actual_size != source.size_bytes:
+            logger.warning(
+                "Ignoring Hugging Face provenance for %s because registered size %d "
+                "does not match local size %d.",
+                local_path,
+                source.size_bytes,
+                actual_size,
+            )
+            return None
+        return source
 
     def _sync_custom_nodes_archives_parallel(
         self,

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.11",
+    "huggingface-hub==1.28.0",
     "keyring>=25.6,<26",
 ]
 classifiers = [
@@ -15,7 +16,6 @@ classifiers = [
 [project.optional-dependencies]
 local-apple = [
     "hf-xet==1.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "huggingface-hub==1.28.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-dspark==0.13.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-vlm==0.6.15; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "psutil>=7,<8; sys_platform == 'darwin' and platform_machine == 'arm64'",

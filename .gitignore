@@ -12,6 +12,7 @@
 !/durable_state.py
 !/execution_environments.py
 !/execution_history.py
+!/huggingface_assets.py
 !/instance_identity.py
 !/llm_profiles.json
 !/llm_profiles.py

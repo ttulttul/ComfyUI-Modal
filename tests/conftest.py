@@ -209,6 +209,20 @@ def vast_ssh_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def huggingface_assets_module(extension_package: object) -> object:
+    """Return persistent Hugging Face asset provenance helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.huggingface_assets")
+
+
+@pytest.fixture(scope="session")
+def huggingface_materializer_module(extension_package: object) -> object:
+    """Return the remote Hugging Face file materializer."""
+    return importlib.import_module(
+        f"{PACKAGE_NAME}.remote.huggingface_materializer"
+    )
+
+
+@pytest.fixture(scope="session")
 def vast_runtime_module(extension_package: object) -> object:
     """Return direct Vast worker runtime management."""
     return importlib.import_module(f"{PACKAGE_NAME}.vast_runtime")
