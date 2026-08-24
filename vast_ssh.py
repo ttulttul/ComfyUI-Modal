@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Sequence
+from typing import BinaryIO, Callable, Sequence
 
 if __package__:
     from .huggingface_assets import HuggingFaceAssetSource
@@ -21,17 +22,54 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VAST_SSH_CONNECT_TIMEOUT_SECONDS = 15
 DEFAULT_VAST_SSH_COMMAND_TIMEOUT_SECONDS = 120.0
+DEFAULT_VAST_SSH_RETRY_ATTEMPTS = 4
+DEFAULT_VAST_SSH_RETRY_BASE_DELAY_SECONDS = 0.5
+DEFAULT_VAST_SSH_RETRY_MAX_DELAY_SECONDS = 4.0
 DEFAULT_VAST_STORAGE_ROOT = PurePosixPath("/storage")
-_ATOMIC_STDIN_WRITER = (
-    "import os,pathlib,shutil,sys,tempfile;"
-    "target=pathlib.Path(sys.argv[1]);"
-    "target.parent.mkdir(parents=True,exist_ok=True);"
-    "fd,name=tempfile.mkstemp(prefix='.'+target.name+'.',suffix='.tmp',dir=target.parent);"
-    "f=os.fdopen(fd,'wb',buffering=0);"
-    "shutil.copyfileobj(sys.stdin.buffer,f,length=1048576);"
-    "f.flush();os.fsync(f.fileno());f.close();"
-    "os.chmod(name,0o600);os.replace(name,target)"
+_TRANSIENT_SSH_TRANSPORT_DIAGNOSTICS = (
+    "connection closed by",
+    "connection reset by",
+    "connection refused",
+    "connection timed out",
+    "kex_exchange_identification:",
+    "network is unreachable",
+    "no route to host",
+    "operation timed out",
+    "remote host has disconnected",
+    "ssh_exchange_identification:",
 )
+_ATOMIC_STDIN_WRITER = """\
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+
+expected_size = int(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+target.parent.mkdir(parents=True, exist_ok=True)
+fd, name = tempfile.mkstemp(
+    prefix=f".{target.name}.",
+    suffix=".tmp",
+    dir=target.parent,
+)
+try:
+    with os.fdopen(fd, "wb", buffering=0) as output:
+        shutil.copyfileobj(sys.stdin.buffer, output, length=1048576)
+        actual_size = output.tell()
+        if actual_size != expected_size:
+            raise ValueError(
+                f"Incomplete SSH upload: expected {expected_size} bytes, "
+                f"received {actual_size}."
+            )
+        output.flush()
+        os.fsync(output.fileno())
+    os.chmod(name, 0o600)
+    os.replace(name, target)
+except (OSError, ValueError):
+    pathlib.Path(name).unlink(missing_ok=True)
+    raise
+"""
 
 
 class VastSshError(RuntimeError):
@@ -92,6 +130,29 @@ class VastSshCommandResult:
         return self.stderr.decode("utf-8", errors="replace")
 
 
+def _is_transient_ssh_transport_failure(result: VastSshCommandResult) -> bool:
+    """Return whether OpenSSH reports a retryable connection-level failure."""
+    if result.returncode != 255:
+        return False
+    diagnostic = f"{result.stderr_text}\n{result.stdout_text}".casefold()
+    return any(
+        marker in diagnostic for marker in _TRANSIENT_SSH_TRANSPORT_DIAGNOSTICS
+    )
+
+
+def _resolved_input_file(
+    input_payload: bytes | None,
+    input_file: Path | None,
+) -> Path | None:
+    """Validate mutually exclusive SSH input sources and resolve a file source."""
+    if input_payload is not None and input_file is not None:
+        raise ValueError("Vast SSH input_payload and input_file are mutually exclusive.")
+    resolved = input_file.expanduser().resolve() if input_file is not None else None
+    if resolved is not None and not resolved.is_file():
+        raise FileNotFoundError(f"Vast SSH input file not found: {resolved}")
+    return resolved
+
+
 @dataclass
 class VastSshRunner:
     """Run argv-safe commands inside one Vast instance container."""
@@ -99,12 +160,24 @@ class VastSshRunner:
     connection: VastSshConnection
     connect_timeout_seconds: int = DEFAULT_VAST_SSH_CONNECT_TIMEOUT_SECONDS
     command_timeout_seconds: float = DEFAULT_VAST_SSH_COMMAND_TIMEOUT_SECONDS
+    retry_attempts: int = DEFAULT_VAST_SSH_RETRY_ATTEMPTS
+    retry_base_delay_seconds: float = DEFAULT_VAST_SSH_RETRY_BASE_DELAY_SECONDS
+    retry_max_delay_seconds: float = DEFAULT_VAST_SSH_RETRY_MAX_DELAY_SECONDS
     ssh_binary: str = "ssh"
+    sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+    random_unit: Callable[[], float] = field(default=random.random, repr=False)
 
     def __post_init__(self) -> None:
         """Create the dedicated trust store without weakening global SSH policy."""
         if self.connect_timeout_seconds <= 0 or self.command_timeout_seconds <= 0:
             raise ValueError("Vast SSH timeouts must be positive.")
+        if isinstance(self.retry_attempts, bool) or self.retry_attempts <= 0:
+            raise ValueError("Vast SSH retry attempts must be positive.")
+        if (
+            self.retry_base_delay_seconds <= 0
+            or self.retry_max_delay_seconds < self.retry_base_delay_seconds
+        ):
+            raise ValueError("Vast SSH retry delays must be positive and ordered.")
         try:
             self.connection.known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
             self.connection.known_hosts_path.touch(mode=0o600, exist_ok=True)
@@ -151,17 +224,61 @@ class VastSshRunner:
         timeout_seconds: float | None = None,
         check: bool = True,
     ) -> VastSshCommandResult:
-        """Execute one command through the system SSH client."""
-        if input_payload is not None and input_file is not None:
-            raise ValueError("Vast SSH input_payload and input_file are mutually exclusive.")
-        resolved_input_file = (
-            input_file.expanduser().resolve() if input_file is not None else None
-        )
-        if resolved_input_file is not None and not resolved_input_file.is_file():
-            raise FileNotFoundError(f"Vast SSH input file not found: {resolved_input_file}")
+        """Execute one command with bounded transient transport retries."""
+        resolved_input_file = _resolved_input_file(input_payload, input_file)
         started_at = time.monotonic()
+        for attempt in range(1, self.retry_attempts + 1):
+            result = self._run_attempt(
+                remote_argv,
+                input_payload=input_payload,
+                input_file=resolved_input_file,
+                timeout_seconds=timeout_seconds,
+            )
+            if _is_transient_ssh_transport_failure(result):
+                if attempt >= self.retry_attempts:
+                    raise self._command_error(
+                        remote_argv,
+                        result,
+                        suffix=f" after {attempt} transport attempts",
+                    )
+                delay_seconds = self._retry_delay_seconds(attempt)
+                logger.warning(
+                    "Retrying transient Vast SSH transport failure host=%s "
+                    "command=%s attempt=%d/%d delay_seconds=%.2f diagnostic=%s",
+                    self.connection.host,
+                    remote_argv[0],
+                    attempt,
+                    self.retry_attempts,
+                    delay_seconds,
+                    result.stderr_text.strip() or result.stdout_text.strip(),
+                )
+                self.sleep(delay_seconds)
+                continue
+            logger.debug(
+                "Finished Vast SSH command host=%s command=%s returncode=%d "
+                "attempts=%d elapsed_seconds=%.3f.",
+                self.connection.host,
+                remote_argv[0],
+                result.returncode,
+                attempt,
+                time.monotonic() - started_at,
+            )
+            if check and result.returncode != 0:
+                raise self._command_error(remote_argv, result)
+            return result
+        raise RuntimeError("Vast SSH retry loop ended without a result.")
+
+    def _run_attempt(
+        self,
+        remote_argv: Sequence[str],
+        *,
+        input_payload: bytes | None,
+        input_file: Path | None,
+        timeout_seconds: float | None,
+    ) -> VastSshCommandResult:
+        """Execute one OpenSSH subprocess attempt, reopening streamed input files."""
         try:
-            if resolved_input_file is None:
+            if input_file is None:
                 completed = self._run_subprocess(
                     remote_argv,
                     input_payload=input_payload,
@@ -169,7 +286,7 @@ class VastSshRunner:
                     timeout_seconds=timeout_seconds,
                 )
             else:
-                with resolved_input_file.open("rb") as input_handle:
+                with input_file.open("rb") as input_handle:
                     completed = self._run_subprocess(
                         remote_argv,
                         input_payload=None,
@@ -185,25 +302,34 @@ class VastSshRunner:
                 f"SSH command to Vast instance {self.connection.host!r} timed out "
                 f"after {exc.timeout} seconds."
             ) from exc
-        result = VastSshCommandResult(
+        return VastSshCommandResult(
             stdout=completed.stdout,
             stderr=completed.stderr,
             returncode=completed.returncode,
         )
-        logger.debug(
-            "Finished Vast SSH command host=%s command=%s returncode=%d elapsed_seconds=%.3f.",
-            self.connection.host,
-            remote_argv[0],
-            result.returncode,
-            time.monotonic() - started_at,
+
+    def _retry_delay_seconds(self, failed_attempt: int) -> float:
+        """Return exponential retry delay with bounded per-attempt jitter."""
+        base_delay = min(
+            self.retry_max_delay_seconds,
+            self.retry_base_delay_seconds * (2 ** (failed_attempt - 1)),
         )
-        if check and result.returncode != 0:
-            detail = result.stderr_text.strip() or result.stdout_text.strip()
-            raise VastSshError(
-                f"Vast SSH command {remote_argv[0]!r} failed with exit status "
-                f"{result.returncode}: {detail or 'no diagnostic output'}"
-            )
-        return result
+        jitter_unit = min(1.0, max(0.0, float(self.random_unit())))
+        return base_delay * (0.75 + (0.5 * jitter_unit))
+
+    @staticmethod
+    def _command_error(
+        remote_argv: Sequence[str],
+        result: VastSshCommandResult,
+        *,
+        suffix: str = "",
+    ) -> VastSshError:
+        """Build one bounded, actionable SSH command failure."""
+        detail = result.stderr_text.strip() or result.stdout_text.strip()
+        return VastSshError(
+            f"Vast SSH command {remote_argv[0]!r} failed with exit status "
+            f"{result.returncode}{suffix}: {detail or 'no diagnostic output'}"
+        )
 
     def _run_subprocess(
         self,
@@ -287,12 +413,19 @@ class VastSshVolumeBackend:
         resolved_path = local_path.expanduser().resolve()
         if not resolved_path.is_file():
             raise FileNotFoundError(f"Asset not found: {resolved_path}")
+        size_bytes = resolved_path.stat().st_size
         normalized = _validated_storage_path(remote_path)
         target = str(self.storage_root / normalized)
         self.runner.run(
-            ("python", "-c", _ATOMIC_STDIN_WRITER, target),
+            (
+                "python",
+                "-c",
+                _ATOMIC_STDIN_WRITER,
+                str(size_bytes),
+                target,
+            ),
             input_file=resolved_path,
-            timeout_seconds=max(60.0, resolved_path.stat().st_size / (4 * 1024 * 1024)),
+            timeout_seconds=max(60.0, size_bytes / (4 * 1024 * 1024)),
         )
         self._exists_cache[normalized] = True
 
@@ -305,7 +438,7 @@ class VastSshVolumeBackend:
         normalized = _validated_storage_path(remote_path)
         target = str(self.storage_root / normalized)
         self.runner.run(
-            ("python", "-c", _ATOMIC_STDIN_WRITER, target),
+            ("python", "-c", _ATOMIC_STDIN_WRITER, str(len(payload)), target),
             input_payload=payload,
             timeout_seconds=max(60.0, len(payload) / (4 * 1024 * 1024)),
         )

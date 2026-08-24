@@ -171,6 +171,8 @@ At queue time the planner raises **Any** or lower VRAM and RAM floors to whateve
 
 Vast startup uses every available lifecycle field instead of relying only on `actual_status`. Legitimate image-download and loading states retain the full configured readiness window, while an instance that continuously reports no lifecycle state, provider message, or SSH host fails after a two-minute grace period. The unusable managed rental is then destroyed, and the exact provider/setup failure remains visible in ComfyUI's error report and the **Remote Execution Configurator** panel.
 
+Direct Vast SSH operations tolerate bounded connection-level closures, resets, and handshake interruptions with jittered exponential retries. Authentication rejection and deterministic remote-command failures remain immediate. Streamed uploads reopen the local source from byte zero on every attempt, and the remote atomic writer verifies the expected byte count before publishing, so a killed connection cannot leave a truncated file at the content-addressed destination.
+
 Set credentials and the worker image in the ComfyUI process environment. Neither value is written to workflows, the lease registry, API responses, or logs:
 
 ```bash
