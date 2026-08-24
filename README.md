@@ -230,6 +230,8 @@ Active remote nodes show a small progress panel with per-bar `it/s` rates (LLM n
 
 Remote planning and capacity acquisition count as active queue work even though they happen before the rewritten prompt enters ComfyUI's native execution queue. During Vast startup, the canvas receives readable updates for rental, worker-image download, SSH readiness, and runtime initialization. A provider-side terminal image-pull failure is reported immediately rather than appearing as an empty queue until the startup timeout expires.
 
+For workflows using a **Remote Execution Configurator**, that node is also the primary planning surface. Its non-serialized panel updates out of band while the queue request is still preparing capacity, then displays the completed component-to-environment plan with configuration names, concrete targets, predicted completion time, and predicted cost. The panel remains visible after execution so the last plan can be inspected without waiting for the configurator's normal workflow output. Legacy workflows without a configurator continue to use the global status pill.
+
 While a Modal workflow is active, the global status pill lists this instance's active containers, an estimated accumulated GPU cost with the current burn rate (based on Modal's published GPU prices; excludes CPU, memory, storage, credits, and reservations), and — where the workspace plan allows billing-report access — Modal's actual metered app cost at hourly resolution.
 
 Cancelling a local prompt propagates a targeted interrupt to the active remote work. If the back-end is slow to observe it, the local prompt is released after a grace period while remote cleanup continues.

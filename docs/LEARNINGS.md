@@ -2,6 +2,10 @@
 
 - The pinned vLLM wheel is large enough that pip's default five resumptions and 15-second socket timeout can be exhausted by an unstable connection during an SSH/Vast worker build. Give the accelerator-wheel layer an extended timeout and bounded resume budget while leaving earlier package layers unchanged so Docker can reuse their successful cache entries.
 
+## 2026-08-24
+
+- A configuration node's ordinary output is the wrong transport for queue-time planning UX because ComfyUI does not execute the node until its normal scheduler reaches it. Keep planning authoritative in the queue route, carry the serialized configurator node id in replayable websocket status, and render a non-serialized DOM widget directly on that node. Populate the final assignment table from the accepted queue response and retain it after prompt cleanup so setup progress and placement remain inspectable out of band.
+
 ## 2026-08-23
 
 - Remote capacity acquisition happens before the rewritten prompt enters ComfyUI's native queue, so a one-shot frontend event is not enough to represent liveness. Register prompt preparation in a server-side bridge that augments `get_current_queue`, `get_current_queue_volatile`, and `get_tasks_remaining`, deduplicate it when the native prompt arrives, and publish queue updates on both registration and cleanup.

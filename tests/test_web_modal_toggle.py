@@ -63,6 +63,28 @@ def test_global_modal_status_badge_is_installed() -> None:
     assert "function promptActiveNodeIsLive(promptId)" in source
 
 
+def test_configurator_renders_out_of_band_plan_and_status() -> None:
+    """Configured workflows should expose planning before normal node execution."""
+    source = _modal_toggle_source()
+
+    assert "function serializedRemoteConfiguratorNodeId(prompt)" in source
+    assert "function mountRemoteExecutionConfiguratorPanel(node)" in source
+    assert "function registerPromptConfigurator(promptId, configuratorNodeId)" in source
+    assert "function renderRemoteConfiguratorStatus(panel, state)" in source
+    assert "function renderRemoteConfiguratorPlan(panel, assignments, configurations)" in source
+    assert 'node.addDOMWidget(\n    "remote_execution_plan"' in source
+    assert "serialize: false" in source
+    assert "getMinHeight: () => panel.minHeight" in source
+    assert 'class="remote-configurator-table"' in source
+    assert "responsePayload.remote_execution_assignments" in source
+    assert "responsePayload.remote_execution_configurations" in source
+    assert "responsePayload.remote_execution_configurator_node_id" in source
+    assert "refreshRemoteConfiguratorPanelForPrompt(promptId);" in source
+    assert "setRemoteConfiguratorTerminalStatus(promptId, STATE_COMPLETE);" in source
+    assert "const configuratorPanel = remoteConfiguratorPanel(" in source
+    assert 'element.style.display = "none";' in source
+
+
 def test_frontend_defaults_modal_gpu_to_rtx_pro_6000() -> None:
     """Unsaved workflows should receive the requested RTX GPU default."""
     source = _modal_toggle_source()

@@ -1960,6 +1960,7 @@ def _emit_modal_status(
     client_id: str | None,
     prompt_id: str | None,
     node_ids: list[str],
+    configurator_node_id: str | None = None,
     modal_gpu: str | None = None,
     component_node_ids_by_representative: dict[str, list[str]] | None = None,
     active_node_id: str | None = None,
@@ -1984,6 +1985,8 @@ def _emit_modal_status(
     }
     if modal_gpu is not None:
         payload["modal_gpu"] = modal_gpu
+    if configurator_node_id is not None:
+        payload["configurator_node_id"] = configurator_node_id
     if component_node_ids_by_representative:
         payload["components"] = [
             {
@@ -7604,12 +7607,21 @@ def _execution_assignments_payload(
 
 def _prompt_uses_remote_execution_configurator(prompt: Mapping[str, Any]) -> bool:
     """Return whether the serialized prompt opts into workflow-scoped capacity."""
-    return any(
-        isinstance(prompt_node, Mapping)
+    return _remote_execution_configurator_node_id(prompt) is not None
+
+
+def _remote_execution_configurator_node_id(
+    prompt: Mapping[str, Any],
+) -> str | None:
+    """Return the serialized identity of the workflow's sole configurator node."""
+    configurator_node_ids = [
+        str(node_id)
+        for node_id, prompt_node in prompt.items()
+        if isinstance(prompt_node, Mapping)
         and str(prompt_node.get("class_type") or "")
         == REMOTE_EXECUTION_CONFIGURATOR_NODE_ID
-        for prompt_node in prompt.values()
-    )
+    ]
+    return configurator_node_ids[0] if len(configurator_node_ids) == 1 else None
 
 
 def _selected_modal_gpus(
@@ -8554,6 +8566,7 @@ def setup_modal_queue_route(
         request_modal_gpu: str | None = None
         summary = RewriteSummary()
         preparation_prompt_id: str | None = None
+        configurator_node_id: str | None = None
         try:
             request_started_at = time.perf_counter()
             json_data = await request.json()
@@ -8578,6 +8591,9 @@ def setup_modal_queue_route(
                     workflow=workflow,
                     settings=resolved_settings,
                 )
+            )
+            configurator_node_id = _remote_execution_configurator_node_id(
+                json_data.get("prompt", {})
             )
             if "prompt" in json_data and not remote_node_ids:
                 logger.info(
@@ -8638,6 +8654,7 @@ def setup_modal_queue_route(
                     client_id=client_id,
                     prompt_id=prompt_id,
                     node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
                     modal_gpu=status_modal_gpu,
                     component_node_ids_by_representative=(
                         summary.component_node_ids_by_representative or None
@@ -8725,6 +8742,7 @@ def setup_modal_queue_route(
                     client_id=client_id,
                     prompt_id=prompt_id,
                     node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
                     modal_gpu=status_modal_gpu,
                     component_node_ids_by_representative=summary.component_node_ids_by_representative,
                     status_message="Submitting remote workflow",
@@ -8735,6 +8753,7 @@ def setup_modal_queue_route(
                 modal_response_payload=(
                     {
                         "modal_gpu": status_modal_gpu,
+                        "remote_execution_configurator_node_id": configurator_node_id,
                         "remote_execution_modal_gpus": selected_modal_gpus,
                         "modal_remote_node_ids": list(summary.remote_node_ids),
                         "modal_sandwiched_local_node_ids": list(
@@ -8782,6 +8801,7 @@ def setup_modal_queue_route(
                     if json_data.get("prompt_id")
                     else None,
                     node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
                     modal_gpu=request_modal_gpu,
                     error_message=str(exc),
                 )
@@ -8799,6 +8819,7 @@ def setup_modal_queue_route(
                     if json_data.get("prompt_id")
                     else None,
                     node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
                     modal_gpu=request_modal_gpu,
                     error_message=str(exc),
                 )
@@ -8816,6 +8837,7 @@ def setup_modal_queue_route(
                     if json_data.get("prompt_id")
                     else None,
                     node_ids=remote_node_ids,
+                    configurator_node_id=configurator_node_id,
                     modal_gpu=request_modal_gpu,
                     error_message=str(exc),
                 )

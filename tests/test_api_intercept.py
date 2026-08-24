@@ -1916,6 +1916,33 @@ def test_configured_non_modal_plan_omits_modal_status_gpu(
     )
 
 
+def test_remote_execution_configurator_identity_is_preserved(
+    api_intercept_module: Any,
+) -> None:
+    """Queue-time UI events should address the exact serialized configurator node."""
+    prompt = {
+        "12": {"class_type": "KSampler", "inputs": {}},
+        "99": {
+            "class_type": "RemoteExecutionConfigurator",
+            "inputs": {"configurations.configuration_0": ["20", 0]},
+        },
+    }
+
+    assert (
+        api_intercept_module._remote_execution_configurator_node_id(prompt)
+        == "99"
+    )
+    assert api_intercept_module._remote_execution_configurator_node_id(
+        {
+            **prompt,
+            "100": {
+                "class_type": "RemoteExecutionConfigurator",
+                "inputs": {},
+            },
+        }
+    ) is None
+
+
 def test_configured_modal_plan_reports_only_selected_modal_gpus(
     api_intercept_module: Any,
 ) -> None:
@@ -5784,6 +5811,7 @@ def test_emit_modal_status_targets_prompt_client(
         client_id="client-1",
         prompt_id="prompt-1",
         node_ids=["4", "5"],
+        configurator_node_id="99",
         modal_gpu="B300",
         component_node_ids_by_representative={"4": ["4", "5"]},
         active_node_id="5",
@@ -5798,6 +5826,7 @@ def test_emit_modal_status_targets_prompt_client(
                 "phase": "executing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["4", "5"],
+                "configurator_node_id": "99",
                 "modal_gpu": "B300",
                 "active_node_id": "5",
                 "active_node_class_type": "KSampler",
@@ -5820,6 +5849,7 @@ def test_emit_modal_status_targets_prompt_client(
                 "phase": "executing",
                 "prompt_id": "prompt-1",
                 "node_ids": ["4", "5"],
+                "configurator_node_id": "99",
                 "modal_gpu": "B300",
                 "active_node_id": "5",
                 "active_node_class_type": "KSampler",

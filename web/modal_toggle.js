@@ -110,6 +110,7 @@ const modalRemoteDescendantNodeIdsByAncestor = new Map();
 const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 const remoteLocationIconImages = new Map();
+const remoteConfiguratorPanels = new Map();
 
 let animationFrameHandle = null;
 let modalLastAnimationRedrawAt = 0;
@@ -1287,6 +1288,17 @@ function refreshGlobalStatusElement() {
     return;
   }
 
+  const promptState = modalPromptStates.get(String(activeState.promptId ?? ""));
+  const configuratorPanel = remoteConfiguratorPanel(promptState?.configuratorNodeId);
+  if (configuratorPanel) {
+    element.style.display = "none";
+    element.dataset.phase = activeState.phase;
+    element.dataset.modalGpu = activeState.modalGpu ?? "";
+    stopModalContainerStatusPolling();
+    renderRemoteConfiguratorStatus(configuratorPanel, activeState);
+    return;
+  }
+
   const dot = element.querySelector(".modal-status-dot");
   const text = element.querySelector(".modal-status-text");
   const gpuText = element.querySelector(".modal-status-gpu");
@@ -1443,6 +1455,7 @@ function setGlobalStatusPhase(promptId, phase, nodeCount, details = null) {
       existingState?.executionLabel ?? promptState?.executionLabel ?? null,
     updatedAt: nowMs(),
   });
+  refreshRemoteConfiguratorPanelForPrompt(promptId);
   refreshGlobalStatusElement();
 }
 
@@ -1478,6 +1491,7 @@ function setGlobalStatusBatchProgress(promptId, value, maxValue) {
       null,
     updatedAt: nowMs(),
   });
+  refreshRemoteConfiguratorPanelForPrompt(promptId);
   refreshGlobalStatusElement();
 }
 
@@ -1880,6 +1894,7 @@ function ensurePromptState(promptId) {
       componentLabelByMember: new Map(),
       executionAssignmentsByRepresentative: new Map(),
       executionAssignmentByMember: new Map(),
+      configuratorNodeId: null,
       descendantNodeIdsByAncestor: new Map(),
       laneNodeIdsByLane: new Map(),
       activeNodeId: null,
@@ -3186,6 +3201,299 @@ function allWorkflowNodes() {
   };
   visitGraph(graph);
   return nodes;
+}
+
+/**
+ * Return whether one live graph node is the workflow capacity configurator.
+ * @param {LGraphNode | null | undefined} node
+ * @returns {boolean}
+ */
+function isRemoteExecutionConfiguratorNode(node) {
+  return String(node?.comfyClass ?? node?.type ?? "") === "RemoteExecutionConfigurator";
+}
+
+/**
+ * Return the configurator node id from one serialized API prompt.
+ * @param {Record<string, any>} prompt
+ * @returns {string | null}
+ */
+function serializedRemoteConfiguratorNodeId(prompt) {
+  const matches = Object.entries(prompt ?? {}).filter(
+    ([, promptNode]) => promptNode?.class_type === "RemoteExecutionConfigurator",
+  );
+  return matches.length === 1 ? String(matches[0][0]) : null;
+}
+
+/**
+ * Resolve and lazily mount the configurator panel for one serialized node id.
+ * @param {string | null | undefined} configuratorNodeId
+ * @returns {Record<string, any> | null}
+ */
+function remoteConfiguratorPanel(configuratorNodeId) {
+  const safeNodeId = String(configuratorNodeId ?? "");
+  if (!safeNodeId) {
+    return null;
+  }
+  const existing = remoteConfiguratorPanels.get(safeNodeId);
+  if (existing?.root?.isConnected) {
+    return existing;
+  }
+  const node = allWorkflowNodes().find(
+    (candidate) => nodeId(candidate) === safeNodeId && isRemoteExecutionConfiguratorNode(candidate),
+  );
+  if (!node) {
+    return null;
+  }
+  mountRemoteExecutionConfiguratorPanel(node);
+  return remoteConfiguratorPanels.get(safeNodeId) ?? null;
+}
+
+/**
+ * Return a compact status sentence for the configurator panel.
+ * @param {Record<string, any>} state
+ * @returns {string}
+ */
+function remoteConfiguratorStatusMessage(state) {
+  if (state?.statusMessage) {
+    return String(state.statusMessage);
+  }
+  if (state?.phase === STATE_SETUP) {
+    return "Preparing remote workflow";
+  }
+  if (state?.phase === STATE_STARTING) {
+    return "Starting remote capacity";
+  }
+  if (state?.phase === STATE_WAITING) {
+    return "Waiting for remote capacity";
+  }
+  if (state?.phase === EXECUTION_PHASE) {
+    return "Remote workflow is running";
+  }
+  if (state?.phase === STATE_FINALIZING) {
+    return "Receiving remote outputs";
+  }
+  if (state?.phase === STATE_CANCELLING) {
+    return "Cancelling remote workflow";
+  }
+  if (state?.phase === STATE_ERROR) {
+    return "Remote workflow failed";
+  }
+  if (state?.phase === STATE_COMPLETE) {
+    return "Remote workflow complete";
+  }
+  return "Ready to plan remote execution";
+}
+
+/**
+ * Update one mounted configurator's status without changing its placement table.
+ * @param {Record<string, any>} panel
+ * @param {Record<string, any>} state
+ */
+function renderRemoteConfiguratorStatus(panel, state) {
+  if (!panel) {
+    return;
+  }
+  const phase = String(state?.phase ?? "idle");
+  panel.root.dataset.phase = phase;
+  panel.statusText.textContent = remoteConfiguratorStatusMessage(state);
+  const total = Math.max(0, Number(state?.statusTotal ?? state?.batchMax ?? 0));
+  const current = Math.max(
+    0,
+    Math.min(total, Number(state?.statusCurrent ?? state?.batchValue ?? 0)),
+  );
+  panel.progress.hidden = total <= 1;
+  panel.progressFill.style.width = total > 1 ? `${(current / total) * 100}%` : "0%";
+  panel.progressValue.textContent = total > 1 ? `${Math.round(current)}/${Math.round(total)}` : "";
+}
+
+/**
+ * Render the completed provider-neutral placement plan as a node-local table.
+ * @param {Record<string, any>} panel
+ * @param {Record<string, Record<string, any>>} assignments
+ * @param {Array<Record<string, any>>} configurations
+ */
+function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
+  if (!panel) {
+    return;
+  }
+  const configurationById = new Map(
+    (configurations ?? []).map((configuration) => [
+      String(configuration?.configuration_id ?? ""),
+      configuration,
+    ]),
+  );
+  const rows = Object.entries(assignments ?? {}).sort(([left], [right]) =>
+    String(left).localeCompare(String(right), undefined, { numeric: true }),
+  );
+  panel.tableBody.replaceChildren();
+  rows.forEach(([representativeNodeId, assignment], index) => {
+    const row = document.createElement("tr");
+    const componentCell = document.createElement("td");
+    const targetCell = document.createElement("td");
+    const estimateCell = document.createElement("td");
+    const nodeIds = Array.isArray(assignment?.node_ids)
+      ? assignment.node_ids.map((value) => String(value))
+      : [String(representativeNodeId)];
+    componentCell.textContent = `Component ${index + 1}`;
+    componentCell.title = `Nodes ${nodeIds.join(", ")}`;
+    const configurationId = String(assignment?.configuration_id ?? "");
+    const configuration = configurationById.get(configurationId);
+    const configurationName = String(configuration?.display_name ?? configurationId).trim();
+    const environmentLabel = remoteExecutionEnvironmentLabel(
+      assignment,
+      configurationById,
+      configuration?.gpu_type ?? null,
+    );
+    targetCell.textContent = configurationName
+      ? `${configurationName} · ${environmentLabel}`
+      : environmentLabel;
+    const predictedCost = assignment?.predicted_cost_usd == null
+      ? Number.NaN
+      : Number(assignment.predicted_cost_usd);
+    const predictedSeconds = Number(assignment?.predicted_completion_seconds);
+    const estimateParts = [];
+    if (Number.isFinite(predictedSeconds) && predictedSeconds > 0) {
+      estimateParts.push(`${Math.round(predictedSeconds)}s`);
+    }
+    if (Number.isFinite(predictedCost) && predictedCost >= 0) {
+      estimateParts.push(`$${predictedCost.toFixed(4)}`);
+    }
+    estimateCell.textContent = estimateParts.join(" · ") || "—";
+    row.append(componentCell, targetCell, estimateCell);
+    panel.tableBody.appendChild(row);
+  });
+  panel.emptyText.hidden = rows.length > 0;
+  panel.table.hidden = rows.length === 0;
+  panel.minHeight = 118 + Math.max(1, rows.length) * 31;
+  const currentWidth = Number(panel.node.size?.[0]) || 0;
+  const currentHeight = Number(panel.node.size?.[1]) || 0;
+  panel.node.setSize?.([
+    Math.max(currentWidth, 500),
+    Math.max(currentHeight, panel.minHeight),
+  ]);
+  panel.node.graph?.setDirtyCanvas?.(true, true);
+}
+
+/**
+ * Associate one prompt with its configurator and reset the out-of-band display.
+ * @param {string} promptId
+ * @param {string | null | undefined} configuratorNodeId
+ */
+function registerPromptConfigurator(promptId, configuratorNodeId) {
+  const safeNodeId = String(configuratorNodeId ?? "");
+  const promptState = ensurePromptState(promptId);
+  if (!promptState || !safeNodeId) {
+    return;
+  }
+  promptState.configuratorNodeId = safeNodeId;
+  const panel = remoteConfiguratorPanel(safeNodeId);
+  if (!panel) {
+    return;
+  }
+  const isNewPrompt = panel.promptId !== promptId;
+  panel.promptId = promptId;
+  if (isNewPrompt) {
+    renderRemoteConfiguratorPlan(panel, {}, []);
+    renderRemoteConfiguratorStatus(panel, {
+      phase: STATE_SETUP,
+      statusMessage: "Preparing remote workflow",
+    });
+  }
+}
+
+/**
+ * Refresh the node-local status from the same durable state used by the global pill.
+ * @param {string} promptId
+ */
+function refreshRemoteConfiguratorPanelForPrompt(promptId) {
+  const promptState = modalPromptStates.get(promptId);
+  const panel = remoteConfiguratorPanel(promptState?.configuratorNodeId);
+  if (!panel || panel.promptId !== promptId) {
+    return;
+  }
+  renderRemoteConfiguratorStatus(panel, modalGlobalStatusStates.get(promptId) ?? {});
+}
+
+/**
+ * Preserve a terminal outcome on the configurator after prompt state is cleaned up.
+ * @param {string} promptId
+ * @param {string} phase
+ * @param {string | null} message
+ */
+function setRemoteConfiguratorTerminalStatus(promptId, phase, message = null) {
+  const promptState = modalPromptStates.get(promptId);
+  const panel = remoteConfiguratorPanel(promptState?.configuratorNodeId);
+  if (!panel || panel.promptId !== promptId) {
+    return;
+  }
+  renderRemoteConfiguratorStatus(panel, { phase, statusMessage: message });
+}
+
+/**
+ * Mount the non-serialized planning and status surface on the configurator node.
+ * @param {LGraphNode} node
+ */
+function mountRemoteExecutionConfiguratorPanel(node) {
+  if (
+    !isRemoteExecutionConfiguratorNode(node) ||
+    node.__remoteConfiguratorPanelMounted ||
+    typeof node.addDOMWidget !== "function" ||
+    typeof document === "undefined"
+  ) {
+    return;
+  }
+  node.__remoteConfiguratorPanelMounted = true;
+  const root = document.createElement("div");
+  root.className = "comfy-remote-configurator-panel";
+  root.innerHTML = `
+    <div class="remote-configurator-status">
+      <span class="remote-configurator-dot"></span>
+      <span class="remote-configurator-status-text">Ready to plan remote execution</span>
+    </div>
+    <div class="remote-configurator-progress" hidden>
+      <span class="remote-configurator-progress-fill"></span>
+      <span class="remote-configurator-progress-value"></span>
+    </div>
+    <div class="remote-configurator-plan-title">Execution plan</div>
+    <div class="remote-configurator-empty">The selected environments will appear here after planning.</div>
+    <table class="remote-configurator-table" hidden>
+      <thead><tr><th>Component</th><th>Target</th><th>Estimate</th></tr></thead>
+      <tbody></tbody>
+    </table>`;
+  const panel = {
+    node,
+    root,
+    promptId: null,
+    minHeight: 149,
+    statusText: root.querySelector(".remote-configurator-status-text"),
+    progress: root.querySelector(".remote-configurator-progress"),
+    progressFill: root.querySelector(".remote-configurator-progress-fill"),
+    progressValue: root.querySelector(".remote-configurator-progress-value"),
+    emptyText: root.querySelector(".remote-configurator-empty"),
+    table: root.querySelector(".remote-configurator-table"),
+    tableBody: root.querySelector("tbody"),
+  };
+  const widget = node.addDOMWidget(
+    "remote_execution_plan",
+    "remote-execution-plan",
+    root,
+    {
+      serialize: false,
+      hideOnZoom: false,
+      getMinHeight: () => panel.minHeight,
+    },
+  );
+  widget.serialize = false;
+  node.setSize?.([
+    Math.max(Number(node.size?.[0]) || 0, 500),
+    Math.max(Number(node.size?.[1]) || 0, panel.minHeight),
+  ]);
+  remoteConfiguratorPanels.set(nodeId(node), panel);
+  const originalOnRemoved = node.onRemoved;
+  node.onRemoved = function onRemoved() {
+    remoteConfiguratorPanels.delete(nodeId(this));
+    return originalOnRemoved?.apply(this, arguments);
+  };
 }
 
 /**
@@ -4684,6 +4992,9 @@ function handleModalStatus(event) {
   if (!promptState) {
     return;
   }
+  if (detail.configurator_node_id) {
+    registerPromptConfigurator(promptId, detail.configurator_node_id);
+  }
   const executionProvider = String(detail.execution_provider ?? "").trim();
   const modalGpu =
     (!executionProvider || executionProvider === "modal") &&
@@ -5279,13 +5590,24 @@ function registerExecutionListeners() {
     handleExecutionPhase(event, STATE_COMPLETE);
   });
   api.addEventListener("execution_error", (event) => {
-    const promptId = String(eventDetail(event).prompt_id ?? "");
+    const detail = eventDetail(event);
+    const promptId = String(detail.prompt_id ?? "");
+    setRemoteConfiguratorTerminalStatus(
+      promptId,
+      STATE_ERROR,
+      detail.exception_message ?? "Remote workflow failed",
+    );
     endSyntheticExecutionUi(promptId, true);
     handleExecutionPhase(event, STATE_ERROR);
     markPromptTerminal(promptId, STATE_ERROR);
   });
   api.addEventListener("execution_interrupted", (event) => {
     const promptId = String(eventDetail(event).prompt_id ?? "");
+    setRemoteConfiguratorTerminalStatus(
+      promptId,
+      STATE_ERROR,
+      "Remote workflow interrupted",
+    );
     markPromptTerminal(promptId, "execution_interrupted");
     endSyntheticExecutionUi(promptId);
     handlePromptInterruption(promptId);
@@ -5296,6 +5618,7 @@ function registerExecutionListeners() {
     if (!promptId) {
       return;
     }
+    setRemoteConfiguratorTerminalStatus(promptId, STATE_COMPLETE);
     markPromptTerminal(promptId, "execution_success");
     endSyntheticExecutionUi(promptId);
     clearGlobalStatusPhase(promptId);
@@ -5326,15 +5649,17 @@ function patchQueuePrompt() {
     const { output: prompt, workflow } = data;
     stampModalGpuOnWorkflow(workflow);
     const modalGpu = selectedModalGpu(workflow);
-    const usesConfiguredCapacity = Object.values(prompt ?? {}).some(
-      (promptNode) => promptNode?.class_type === "RemoteExecutionConfigurator",
-    );
+    const configuratorNodeId = serializedRemoteConfiguratorNodeId(prompt);
+    const usesConfiguredCapacity = Boolean(configuratorNodeId);
     const initialModalGpu = usesConfiguredCapacity ? null : modalGpu;
     const promptId = createPromptId();
     clearPromptTerminal(promptId);
     clearSupersededCancellingPrompts(promptId);
     const remoteNodeIds = effectiveRemoteNodeIds(prompt, workflow);
     registerPromptComponents(promptId, remoteNodeIds, []);
+    if (configuratorNodeId) {
+      registerPromptConfigurator(promptId, configuratorNodeId);
+    }
     const queuedBehindActiveModal =
       remoteNodeIds.length > 0 && markPromptQueuedBehindActiveModal(promptId);
     if (remoteNodeIds.length > 0) {
@@ -5381,6 +5706,12 @@ function patchQueuePrompt() {
       }
 
       const responsePayload = await response.json();
+      const acceptedConfiguratorNodeId = String(
+        responsePayload.remote_execution_configurator_node_id ?? configuratorNodeId ?? "",
+      );
+      if (acceptedConfiguratorNodeId) {
+        registerPromptConfigurator(promptId, acceptedConfiguratorNodeId);
+      }
       const sandwichedLocalNodeIds = Array.isArray(
         responsePayload.modal_sandwiched_local_node_ids,
       )
@@ -5441,6 +5772,11 @@ function patchQueuePrompt() {
           registerPromptComponents(promptId, resolvedRemoteNodeIds, resolvedComponents);
         }
         registerPromptExecutionAssignments(promptId, executionAssignmentsByRepresentative);
+        renderRemoteConfiguratorPlan(
+          remoteConfiguratorPanel(acceptedConfiguratorNodeId),
+          executionAssignmentsByRepresentative,
+          responsePayload.remote_execution_configurations ?? [],
+        );
         const promptState = ensurePromptState(promptId);
         if (!promptState) {
           return responsePayload;
@@ -5464,6 +5800,11 @@ function patchQueuePrompt() {
       clearPromptQueued(promptId);
       endSyntheticExecutionUi(promptId, true, queueErrorMessage(error));
       markQueueFailure(remoteNodeIds, promptId, error);
+      setRemoteConfiguratorTerminalStatus(
+        promptId,
+        STATE_ERROR,
+        queueErrorMessage(error),
+      );
       throw error;
     }
   };
@@ -5656,6 +5997,143 @@ function installGlobalStatusStyles() {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+
+    .comfy-remote-configurator-panel {
+      display: flex;
+      width: 100%;
+      min-width: 0;
+      flex-direction: column;
+      gap: 8px;
+      box-sizing: border-box;
+      padding: 9px 10px 11px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      border-radius: 9px;
+      background: rgba(15, 23, 42, 0.9);
+      color: #e2e8f0;
+      font: 11px/1.3 ui-sans-serif, system-ui, sans-serif;
+      pointer-events: none;
+    }
+
+    .remote-configurator-status {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 7px;
+      font-weight: 650;
+    }
+
+    .remote-configurator-dot {
+      width: 8px;
+      height: 8px;
+      flex: 0 0 auto;
+      border-radius: 999px;
+      background: #1d9bf0;
+      box-shadow: 0 0 0 4px rgba(29, 155, 240, 0.14);
+    }
+
+    .comfy-remote-configurator-panel[data-phase="setup"] .remote-configurator-dot,
+    .comfy-remote-configurator-panel[data-phase="waiting"] .remote-configurator-dot {
+      background: #f59e0b;
+      box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+    }
+
+    .comfy-remote-configurator-panel[data-phase="starting"] .remote-configurator-dot {
+      background: #eab308;
+      box-shadow: 0 0 0 4px rgba(234, 179, 8, 0.16);
+    }
+
+    .comfy-remote-configurator-panel[data-phase="executing"] .remote-configurator-dot {
+      background: #a855f7;
+      box-shadow: 0 0 0 4px rgba(168, 85, 247, 0.16);
+    }
+
+    .comfy-remote-configurator-panel[data-phase="complete"] .remote-configurator-dot {
+      background: #22c55e;
+      box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.16);
+    }
+
+    .comfy-remote-configurator-panel[data-phase="error"] .remote-configurator-dot,
+    .comfy-remote-configurator-panel[data-phase="cancelling"] .remote-configurator-dot {
+      background: #ef4444;
+      box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.16);
+    }
+
+    .remote-configurator-status-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-progress {
+      position: relative;
+      height: 12px;
+      overflow: hidden;
+      border-radius: 6px;
+      background: rgba(2, 6, 23, 0.78);
+    }
+
+    .remote-configurator-progress-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 0;
+      background: linear-gradient(90deg, #f59e0b, #eab308);
+      transition: width 160ms ease-out;
+    }
+
+    .remote-configurator-progress-value {
+      position: absolute;
+      inset: 0 5px 0 auto;
+      color: #f8fafc;
+      font: 650 9px/12px ui-monospace, SFMono-Regular, monospace;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    }
+
+    .remote-configurator-plan-title {
+      color: #94a3b8;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .remote-configurator-empty {
+      color: #94a3b8;
+      font-size: 10px;
+    }
+
+    .remote-configurator-table {
+      width: 100%;
+      table-layout: fixed;
+      border-collapse: collapse;
+    }
+
+    .remote-configurator-table th,
+    .remote-configurator-table td {
+      overflow: hidden;
+      padding: 5px 6px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+      text-align: left;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-table th {
+      color: #94a3b8;
+      font-size: 9px;
+      font-weight: 650;
+    }
+
+    .remote-configurator-table th:first-child,
+    .remote-configurator-table td:first-child {
+      width: 22%;
+    }
+
+    .remote-configurator-table th:last-child,
+    .remote-configurator-table td:last-child {
+      width: 20%;
+      text-align: right;
+    }
   `;
   document.head.appendChild(style);
 }
@@ -5677,6 +6155,7 @@ app.registerExtension({
 
   async nodeCreated(node) {
     decorateNode(node);
+    mountRemoteExecutionConfiguratorPanel(node);
   },
 
   async loadedGraphNode(node) {
@@ -5686,6 +6165,7 @@ app.registerExtension({
   async afterConfigureGraph() {
     for (const node of allWorkflowNodes()) {
       synchronizeRemoteFlagFromWidget(node);
+      mountRemoteExecutionConfiguratorPanel(node);
     }
     rebuildRemoteDescendantIndex();
     refreshNodeDecorations();
