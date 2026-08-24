@@ -5180,9 +5180,16 @@ function handleModalStatus(event) {
   }
 
   if (detail.phase === STATE_ERROR) {
+    const errorMessage = String(
+      detail.error_message ?? detail.status_message ?? "Remote workflow failed",
+    );
     clearPromptQueued(promptId);
-    endSyntheticExecutionUi(promptId, true);
-    setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length, { modalGpu });
+    endSyntheticExecutionUi(promptId, true, errorMessage);
+    setGlobalStatusPhase(promptId, STATE_ERROR, nodeIds.length, {
+      message: errorMessage,
+      modalGpu,
+    });
+    setRemoteConfiguratorTerminalStatus(promptId, STATE_ERROR, errorMessage);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
     clearPromptRemoteNodeVisuals(promptId);
     markPromptTerminal(promptId, STATE_ERROR);

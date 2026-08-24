@@ -405,6 +405,11 @@ def test_queue_failure_preserves_server_validation_detail() -> None:
         'failureMessage || "Modal queue request failed before prompt execution started."'
         in source
     )
+    assert "endSyntheticExecutionUi(promptId, true, errorMessage);" in source
+    assert (
+        "setRemoteConfiguratorTerminalStatus(promptId, STATE_ERROR, errorMessage);"
+        in source
+    )
 
 
 def test_completed_remote_nodes_clear_stale_global_status_entries() -> None:

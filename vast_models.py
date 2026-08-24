@@ -369,6 +369,19 @@ class VastInstance:
         )
 
     @property
+    def lifecycle_status(self) -> str:
+        """Return the most informative provider lifecycle state available."""
+        for candidate in (
+            self.actual_status,
+            self.current_state,
+            self.intended_status,
+        ):
+            normalized = str(candidate or "").strip()
+            if normalized and normalized.casefold() != "unknown":
+                return normalized
+        return "unknown"
+
+    @property
     def terminal_failure(self) -> bool:
         """Return whether provider state proves startup cannot continue."""
         terminal_states = {"destroyed", "error", "exited"}

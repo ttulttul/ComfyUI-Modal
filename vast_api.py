@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _RETRIABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 VAST_OFFER_CACHE_TTL_SECONDS = 60.0 * 60.0
+VAST_UNKNOWN_INSTANCE_STATE_TIMEOUT_SECONDS = 120.0
 _VAST_OFFER_CACHE_MAX_ENTRIES = 256
 
 
@@ -54,6 +55,38 @@ class VastOfferUnavailableError(VastApiError):
 
 class VastInstanceNotFoundError(VastApiError):
     """Raised when a managed Vast instance no longer exists."""
+
+
+def _provider_status_detail(instance: VastInstance) -> str:
+    """Return a safe provider-status suffix for a readiness failure."""
+    if not instance.status_message:
+        return ""
+    return f" Provider status: {instance.status_message}."
+
+
+def _track_unobservable_instance(
+    instance: VastInstance,
+    *,
+    now: float,
+    started_at: float | None,
+    timeout_seconds: float,
+) -> float | None:
+    """Track and reject a continuously blank Vast instance contract."""
+    has_observable_state = (
+        instance.lifecycle_status != "unknown"
+        or bool(instance.status_message)
+        or bool(instance.ssh_host)
+    )
+    if has_observable_state:
+        return None
+    unknown_started_at = now if started_at is None else started_at
+    unknown_elapsed = now - unknown_started_at
+    if unknown_elapsed >= timeout_seconds:
+        raise VastApiError(
+            f"Vast instance {instance.instance_id} reported no lifecycle state "
+            f"or SSH endpoint for {unknown_elapsed:.0f}s."
+        )
+    return unknown_started_at
 
 
 @dataclass(frozen=True)
@@ -336,14 +369,25 @@ class VastApiClient:
         *,
         timeout_seconds: float,
         poll_interval_seconds: float = 10.0,
+        unknown_state_timeout_seconds: float = (
+            VAST_UNKNOWN_INSTANCE_STATE_TIMEOUT_SECONDS
+        ),
         status_callback: Callable[[VastInstance], None] | None = None,
     ) -> VastInstance:
         """Poll until one instance exposes a running SSH endpoint."""
-        if timeout_seconds <= 0 or poll_interval_seconds <= 0:
-            raise ValueError("Vast readiness timeout and poll interval must be positive.")
+        if (
+            timeout_seconds <= 0
+            or poll_interval_seconds <= 0
+            or unknown_state_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "Vast readiness timeout, poll interval, and unknown-state timeout "
+                "must be positive."
+            )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         last_instance: VastInstance | None = None
+        unknown_state_started_at: float | None = None
         while loop.time() < deadline:
             last_instance = await self.show_instance(instance_id)
             if status_callback is not None:
@@ -351,21 +395,32 @@ class VastApiClient:
             if last_instance.ready_for_ssh:
                 return last_instance
             if last_instance.terminal_failure:
-                provider_detail = (
-                    f" Provider status: {last_instance.status_message}."
-                    if last_instance.status_message
-                    else ""
-                )
                 raise VastApiError(
                     f"Vast instance {instance_id} entered terminal state "
                     f"{last_instance.actual_status!r} before SSH was ready."
-                    f"{provider_detail}"
+                    f"{_provider_status_detail(last_instance)}"
                 )
-            await asyncio.sleep(min(poll_interval_seconds, max(0.0, deadline - loop.time())))
-        last_status = last_instance.actual_status if last_instance is not None else "unknown"
+            unknown_state_started_at = _track_unobservable_instance(
+                last_instance,
+                now=loop.time(),
+                started_at=unknown_state_started_at,
+                timeout_seconds=unknown_state_timeout_seconds,
+            )
+            await asyncio.sleep(
+                min(poll_interval_seconds, max(0.0, deadline - loop.time()))
+            )
+        last_status = (
+            last_instance.lifecycle_status
+            if last_instance is not None
+            else "unknown"
+        )
+        provider_detail = (
+            _provider_status_detail(last_instance) if last_instance is not None else ""
+        )
         raise TimeoutError(
             f"Vast instance {instance_id} did not become SSH-ready within "
             f"{timeout_seconds:.0f}s; last status was {last_status!r}."
+            f"{provider_detail}"
         )
 
     async def _request_json(

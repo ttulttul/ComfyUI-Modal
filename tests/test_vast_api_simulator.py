@@ -143,6 +143,47 @@ def test_client_fails_fast_when_vast_reports_stopped_image_pull(
     asyncio.run(scenario())
 
 
+def test_client_fails_early_when_vast_reports_no_observable_state(
+    vast_api_module: Any,
+    vast_models_module: Any,
+) -> None:
+    """A blank provider contract should not consume the full readiness timeout."""
+
+    async def scenario() -> None:
+        """Poll a continuously blank instance record through its shorter grace period."""
+        client = vast_api_module.VastApiClient("test-key", retry_attempts=1)
+
+        async def show_instance(_instance_id: int) -> Any:
+            """Return the incomplete record observed in the live Vast failure."""
+            return vast_models_module.VastInstance.from_api(
+                {
+                    "id": 48597015,
+                    "actual_status": None,
+                    "intended_status": None,
+                    "cur_state": None,
+                    "status_msg": None,
+                    "num_gpus": 0,
+                    "gpu_ram": 0,
+                    "cpu_ram": 0,
+                }
+            )
+
+        client.show_instance = show_instance
+
+        with pytest.raises(
+            vast_api_module.VastApiError,
+            match="reported no lifecycle state or SSH endpoint",
+        ):
+            await client.wait_until_ready(
+                48597015,
+                timeout_seconds=1.0,
+                poll_interval_seconds=0.005,
+                unknown_state_timeout_seconds=0.01,
+            )
+
+    asyncio.run(scenario())
+
+
 def test_simulator_enforces_capacity_price_and_location_filters(
     vast_api_module: Any,
     vast_models_module: Any,

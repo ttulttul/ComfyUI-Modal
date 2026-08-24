@@ -87,9 +87,9 @@ def _vast_startup_status_message(instance: VastInstance) -> str:
         return f"{instance_label} is downloading the worker image (layer complete)"
     if any(word in provider_message for word in ("download", "pull", "extract")):
         return f"{instance_label} is downloading the worker image"
-    if instance.actual_status.casefold() == "running":
+    if instance.lifecycle_status.casefold() == "running":
         return f"{instance_label} is waiting for SSH access"
-    return f"{instance_label} is starting ({instance.actual_status})"
+    return f"{instance_label} is starting ({instance.lifecycle_status})"
 
 
 @dataclass(frozen=True)

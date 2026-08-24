@@ -202,3 +202,24 @@ def test_instance_normalizes_provider_progress_and_terminal_state(
     assert "\n" not in instance.status_message
     assert len(instance.status_message) == 240
     assert instance.terminal_failure is True
+
+
+def test_instance_falls_back_from_unknown_actual_status(
+    vast_models_module: Any,
+) -> None:
+    """Provider progress should use current state when actual status is absent."""
+    instance = vast_models_module.VastInstance.from_api(
+        {
+            "id": 43,
+            "actual_status": None,
+            "intended_status": "running",
+            "cur_state": "loading",
+            "status_msg": "allocating host capacity",
+            "num_gpus": 1,
+            "gpu_ram": 96 * 1024,
+            "cpu_ram": 128 * 1024,
+        }
+    )
+
+    assert instance.actual_status == "unknown"
+    assert instance.lifecycle_status == "loading"

@@ -169,6 +169,8 @@ Marketplace searches for the distinct effective resource profiles in one plan ru
 
 At queue time the planner raises **Any** or lower VRAM and RAM floors to whatever the workflow's models actually require, queries current on-demand offers, and revalidates every enabled constraint locally. Cross-provider selection compares Vast's effective hourly compute price over the predicted execution time; configured idle retention is tracked as a separate billing estimate and does not make Vast appear more expensive than Modal or SSH during placement. Numeric memory constraints use GiB, matching the existing scheduler and Vast offer-capacity calculations. Vast's marketed GPU names do not always equal their reported capacity exactly; for example, a reported 95.x GiB card does not satisfy a literal 96 GiB floor. The default idle retention is 24 hours, after which an in-instance watchdog destroys the idle lease.
 
+Vast startup uses every available lifecycle field instead of relying only on `actual_status`. Legitimate image-download and loading states retain the full configured readiness window, while an instance that continuously reports no lifecycle state, provider message, or SSH host fails after a two-minute grace period. The unusable managed rental is then destroyed, and the exact provider/setup failure remains visible in ComfyUI's error report and the **Remote Execution Configurator** panel.
+
 Set credentials and the worker image in the ComfyUI process environment. Neither value is written to workflows, the lease registry, API responses, or logs:
 
 ```bash

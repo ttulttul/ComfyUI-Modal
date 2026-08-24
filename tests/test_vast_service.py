@@ -138,6 +138,28 @@ def test_startup_status_translates_vast_image_progress(
     assert "4c7d45f7c63c" not in message
 
 
+def test_startup_status_uses_current_state_when_actual_status_is_unknown(
+    vast_models_module: Any,
+    vast_service_module: Any,
+) -> None:
+    """Missing actual status should not render a misleading unknown state."""
+    instance = vast_models_module.VastInstance.from_api(
+        {
+            "id": 48597015,
+            "actual_status": None,
+            "intended_status": "running",
+            "cur_state": "loading",
+            "num_gpus": 1,
+            "gpu_ram": 96 * 1024,
+            "cpu_ram": 128 * 1024,
+        }
+    )
+
+    assert vast_service_module._vast_startup_status_message(instance) == (
+        "Vast.ai instance 48597015 is starting (loading)"
+    )
+
+
 def test_prefetch_deduplicates_effective_profiles_and_searches_in_parallel(
     vast_models_module: Any,
     vast_runtime_module: Any,

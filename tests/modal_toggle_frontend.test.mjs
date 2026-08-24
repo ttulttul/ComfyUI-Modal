@@ -1236,6 +1236,37 @@ modalToggle.handleModalProgress({
 assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, "B300");
 
 resetFrontendState();
+const syntheticErrorEvents = [];
+globalThis.__modalApiStub.dispatchEvent = (event) => syntheticErrorEvents.push(event);
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-setup-error",
+    phase: "setup",
+    node_ids: ["11"],
+    status_message: "Starting Vast.ai capacity",
+  },
+});
+modalToggle.handleModalStatus({
+  detail: {
+    prompt_id: "prompt-setup-error",
+    phase: "error",
+    node_ids: ["11"],
+    error_message:
+      "Vast instance 48597015 did not become SSH-ready within 900s; " +
+      "last status was 'unknown'.",
+  },
+});
+const syntheticExecutionError = syntheticErrorEvents.find(
+  (event) => event.type === "execution_error",
+);
+assert.equal(
+  syntheticExecutionError?.detail?.exception_message,
+  "Vast instance 48597015 did not become SSH-ready within 900s; " +
+    "last status was 'unknown'.",
+);
+globalThis.__modalApiStub.dispatchEvent = () => {};
+
+resetFrontendState();
 globalThis.__modalApiStub.__modalQueuePromptPatched = false;
 globalThis.__modalApiStub.clientId = "client-fast";
 globalThis.__modalApiStub.fetchApi = async (_route, options) => {
