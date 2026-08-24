@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
+import pytest
+
 from aiohttp import web
 
 
@@ -195,3 +197,70 @@ def test_prefetch_deduplicates_effective_profiles_and_searches_in_parallel(
         assert api_client.peak == 2
 
     asyncio.run(scenario())
+
+
+def test_acquire_destroys_lease_when_worker_initialization_fails(
+    vast_service_module: Any,
+) -> None:
+    """An SSH-unusable rental must be drained instead of reused next run."""
+
+    class FakeRegistry:
+        """Record that the unusable lease was marked before destruction."""
+
+        def __init__(self) -> None:
+            """Initialize the updated instance list."""
+            self.updated_instance_ids: list[int] = []
+
+        def update(self, instance_id: int, updater: Any) -> None:
+            """Record the update without requiring a complete lease fixture."""
+            del updater
+            self.updated_instance_ids.append(instance_id)
+
+    class FakeLeaseManager:
+        """Return and destroy one deterministic unusable rental."""
+
+        def __init__(self, lease: Any) -> None:
+            """Retain the fake lease and destruction log."""
+            self.lease = lease
+            self.destroyed_instance_ids: list[int] = []
+
+        async def ensure_lease(self, profile: Any, **kwargs: Any) -> Any:
+            """Return the selected lease without provider calls."""
+            del profile, kwargs
+            return self.lease
+
+        async def destroy_owned_lease(self, instance_id: int) -> bool:
+            """Record cleanup of the unusable capacity."""
+            self.destroyed_instance_ids.append(instance_id)
+            return True
+
+    lease = SimpleNamespace(instance_id=42, environment_id="vast:test:42")
+    lease_manager = FakeLeaseManager(lease)
+    registry = FakeRegistry()
+    service = object.__new__(vast_service_module.VastService)
+    service.lease_manager = lease_manager
+    service.registry = registry
+
+    def fail_runtime(_lease: Any) -> None:
+        """Simulate the observed provider SSH key-exchange failure."""
+        raise vast_service_module.VastSshError(
+            "kex_exchange_identification: Connection closed by remote host"
+        )
+
+    service._initialize_runtime = fail_runtime
+    messages: list[str] = []
+
+    with pytest.raises(
+        vast_service_module.VastSshError,
+        match="Connection closed by remote host",
+    ):
+        asyncio.run(
+            service.acquire(
+                SimpleNamespace(profile=SimpleNamespace()),
+                status_callback=messages.append,
+            )
+        )
+
+    assert registry.updated_instance_ids == [42]
+    assert lease_manager.destroyed_instance_ids == [42]
+    assert messages[-1] == "Vast.ai worker initialization failed"

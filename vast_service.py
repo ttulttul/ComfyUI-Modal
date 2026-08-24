@@ -412,10 +412,44 @@ class VastService:
         )
         if status_callback is not None:
             status_callback("Initializing Vast.ai worker")
-        await asyncio.to_thread(self._initialize_runtime, lease)
+        try:
+            await asyncio.to_thread(self._initialize_runtime, lease)
+        except (TimeoutError, VastSshError, ValueError) as exc:
+            if status_callback is not None:
+                status_callback("Vast.ai worker initialization failed")
+            await self._discard_failed_runtime_lease(lease, str(exc))
+            raise
         if status_callback is not None:
             status_callback("Vast.ai worker is ready")
         return lease
+
+    async def _discard_failed_runtime_lease(
+        self,
+        lease: VastLeaseRecord,
+        error_message: str,
+    ) -> None:
+        """Drain and destroy capacity that never produced a usable worker."""
+        self.registry.update(
+            lease.instance_id,
+            lambda current: replace(
+                current,
+                draining=True,
+                last_error=error_message,
+            ),
+        )
+        try:
+            await self.lease_manager.destroy_owned_lease(lease.instance_id)
+        except (RuntimeError, ValueError, VastApiError) as cleanup_error:
+            logger.warning(
+                "Unable to destroy unusable Vast worker instance_id=%d: %s",
+                lease.instance_id,
+                cleanup_error,
+            )
+            return
+        logger.info(
+            "Destroyed unusable Vast worker instance_id=%d after initialization failure.",
+            lease.instance_id,
+        )
 
     def quote_best_profile_sync(self, *args: object, **kwargs: object) -> VastProfileQuote:
         """Synchronously quote a profile from ComfyUI's queue worker thread."""
