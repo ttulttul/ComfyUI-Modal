@@ -86,6 +86,9 @@ def test_client_search_create_poll_manage_and_destroy_lifecycle(
             await client.set_instance_state(created.instance_id, "running")
             await client.destroy_instance(created.instance_id)
 
+            with pytest.raises(vast_api_module.VastInstanceNotFoundError):
+                await client.show_instance(created.instance_id)
+
             assert await client.list_instances() == ()
             assert state.destroyed_instance_ids == [created.instance_id]
             assert all("Authorization" not in entry for entry in state.request_log)

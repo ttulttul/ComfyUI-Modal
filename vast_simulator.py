@@ -243,7 +243,7 @@ class VastApiSimulator:
         self.state.record(request)
         instance = self._instance(request)
         if instance is None:
-            return web.json_response({"error": "Instance not found"}, status=404)
+            return web.json_response({"instances": None})
         instance["_poll_count"] = int(instance.get("_poll_count", 0)) + 1
         if (
             instance["actual_status"] == "loading"

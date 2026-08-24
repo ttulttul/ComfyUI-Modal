@@ -312,6 +312,10 @@ class VastApiClient:
             "GET", f"/api/v0/instances/{_positive_id(instance_id)}/"
         )
         raw_instance = payload.get("instances")
+        if raw_instance is None:
+            raise VastInstanceNotFoundError(
+                f"Vast instance {instance_id} does not exist."
+            )
         if not isinstance(raw_instance, Mapping):
             raise VastApiError("Vast show-instance returned an invalid instance field.")
         try:
