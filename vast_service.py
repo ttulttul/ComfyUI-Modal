@@ -65,7 +65,7 @@ VAST_OFFER_PREFETCH_CONCURRENCY = 8
 
 @dataclass(frozen=True)
 class VastProfileQuote:
-    """Describe the least incremental-cost profile for one component."""
+    """Describe the least effective-hourly-price profile for one component."""
 
     profile: VastResourceProfile
     offer: VastOffer | None
@@ -82,6 +82,11 @@ class VastProfileQuote:
         if self.offer is None:
             raise RuntimeError("Vast quote has neither an offer nor a lease.")
         return self.offer.hourly_cost_usd
+
+    @property
+    def predicted_retention_cost_usd(self) -> float:
+        """Return the incremental bill estimate including configured retention."""
+        return self.retention_seconds_charged / 3600.0 * self.hourly_cost_usd
 
 
 @dataclass(frozen=True)
@@ -202,7 +207,6 @@ class VastService:
             return min(
                 candidates,
                 key=lambda quote: (
-                    quote.predicted_incremental_cost_usd,
                     quote.hourly_cost_usd,
                     quote.profile.profile_id,
                 ),
@@ -303,16 +307,16 @@ class VastService:
         profile: VastResourceProfile,
         predicted_execution_seconds: float,
     ) -> VastProfileQuote:
-        """Quote one profile, recognizing already-paid idle lease coverage."""
+        """Quote compute at its hourly rate while tracking retention separately."""
         existing = self._existing_lease(profile)
         if existing is not None:
-            incremental_cost = self.lease_manager.incremental_retention_cost_usd(
+            retention_cost = self.lease_manager.incremental_retention_cost_usd(
                 profile,
                 existing_lease=existing,
                 predicted_execution_seconds=predicted_execution_seconds,
             )
             charged_seconds = (
-                incremental_cost / existing.hourly_cost_usd * 3600.0
+                retention_cost / existing.hourly_cost_usd * 3600.0
                 if existing.hourly_cost_usd > 0
                 else 0.0
             )
@@ -320,7 +324,11 @@ class VastService:
                 profile=profile,
                 offer=None,
                 existing_lease=existing,
-                predicted_incremental_cost_usd=incremental_cost,
+                predicted_incremental_cost_usd=(
+                    predicted_execution_seconds
+                    / 3600.0
+                    * existing.hourly_cost_usd
+                ),
                 retention_seconds_charged=charged_seconds,
                 predicted_execution_seconds=predicted_execution_seconds,
             )
@@ -336,7 +344,7 @@ class VastService:
             offer=offer,
             existing_lease=None,
             predicted_incremental_cost_usd=(
-                charged_seconds / 3600.0 * offer.hourly_cost_usd
+                predicted_execution_seconds / 3600.0 * offer.hourly_cost_usd
             ),
             retention_seconds_charged=charged_seconds,
             predicted_execution_seconds=predicted_execution_seconds,
@@ -378,10 +386,7 @@ class VastService:
             provider=ExecutionProvider.VAST,
             enabled=True,
             health=EnvironmentHealth.READY,
-            cost_usd_per_second=(
-                quote.predicted_incremental_cost_usd
-                / max(1.0, quote.predicted_execution_seconds)
-            ),
+            cost_usd_per_second=quote.hourly_cost_usd / 3600.0,
             capabilities=EnvironmentCapabilities(
                 architecture="x86_64",
                 operating_system="linux",

@@ -29,7 +29,7 @@ async def _running_app(app: web.Application) -> AsyncIterator[str]:
         await runner.cleanup()
 
 
-def test_quote_raises_memory_floors_and_prices_retention(
+def test_quote_raises_memory_floors_and_compares_effective_hourly_price(
     vast_api_module: Any,
     vast_models_module: Any,
     vast_runtime_module: Any,
@@ -37,7 +37,7 @@ def test_quote_raises_memory_floors_and_prices_retention(
     vast_simulator_module: Any,
     tmp_path: Path,
 ) -> None:
-    """A quote should select the cheapest offer after inferred memory and cooldown."""
+    """Scheduling should exclude retention cost while still exposing its estimate."""
 
     async def scenario() -> None:
         """Exercise the production client and service against the simulator."""
@@ -80,10 +80,12 @@ def test_quote_raises_memory_floors_and_prices_retention(
             assert quote.offer.offer_id == 1002
             assert quote.profile.minimum_gpu_ram_mb == 40 * 1024
             assert quote.profile.minimum_cpu_ram_mb == 96 * 1024
-            assert quote.predicted_incremental_cost_usd == (
+            assert quote.predicted_incremental_cost_usd == 120 / 3600 * 0.74
+            assert quote.predicted_retention_cost_usd == (
                 (24 * 3600 + 120) / 3600 * 0.74
             )
             assert scheduling_state.provider.value == "vast"
+            assert scheduling_state.cost_usd_per_second == 0.74 / 3600
             assert scheduling_state.capabilities.maximum_vram_bytes == 48 * 1024**3
 
     asyncio.run(scenario())
