@@ -3482,6 +3482,28 @@ function setRemoteConfiguratorTerminalStatus(promptId, phase, message = null) {
 }
 
 /**
+ * Remove Configurator DOM widgets left behind by an older extension module.
+ * @param {LGraphNode} node
+ */
+function removeStaleRemoteConfiguratorWidgets(node) {
+  const staleWidgets = (node.widgets ?? []).filter(
+    (widget) => String(widget?.name ?? "") === "remote_execution_plan",
+  );
+  for (const widget of staleWidgets) {
+    widget?.element?.remove?.();
+    if (typeof node.removeWidget === "function") {
+      node.removeWidget(widget);
+      continue;
+    }
+    widget?.onRemove?.();
+    const widgetIndex = node.widgets?.indexOf(widget) ?? -1;
+    if (widgetIndex >= 0) {
+      node.widgets.splice(widgetIndex, 1);
+    }
+  }
+}
+
+/**
  * Mount the non-serialized planning and status surface on the configurator node.
  * @param {LGraphNode} node
  */
@@ -3495,6 +3517,7 @@ function mountRemoteExecutionConfiguratorPanel(node) {
   ) {
     return;
   }
+  removeStaleRemoteConfiguratorWidgets(node);
   const root = document.createElement("div");
   root.className = "comfy-remote-configurator-panel";
   root.innerHTML = `

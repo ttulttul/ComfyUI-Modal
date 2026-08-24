@@ -80,6 +80,11 @@ class FakeElement {
   replaceChildren(...children) {
     this.children = [...children];
   }
+
+  remove() {
+    this.removed = true;
+    this.isConnected = false;
+  }
 }
 const fakeBody = new FakeElement("body");
 fakeBody.appendChild = (child) => {
@@ -1470,15 +1475,30 @@ modalToggle.registerRemoteConfiguratorPlan(
   },
   [{ configuration_id: "vast-big", display_name: "Vast Big" }],
 );
+const stalePanelRoot = new FakeElement("div");
+const stalePanelWidget = {
+  name: "remote_execution_plan",
+  element: stalePanelRoot,
+  onRemove() {
+    this.wasUnregistered = true;
+  },
+};
 const lateConfiguratorNode = {
   id: 381,
   comfyClass: "RemoteExecutionConfigurator",
   __remoteConfiguratorPanelMounted: true,
   size: [300, 100],
   graph: configuratorGraph,
-  addDOMWidget(_name, _type, root) {
+  widgets: [stalePanelWidget],
+  addDOMWidget(name, _type, root) {
     this.panelRoot = root;
-    return {};
+    const widget = { name, element: root };
+    this.widgets.push(widget);
+    return widget;
+  },
+  removeWidget(widget) {
+    widget.onRemove?.();
+    this.widgets.splice(this.widgets.indexOf(widget), 1);
   },
   setSize(size) {
     this.size = size;
@@ -1488,6 +1508,10 @@ configuratorGraph.nodes.push(lateConfiguratorNode);
 modalToggle.mountRemoteExecutionConfiguratorPanel(lateConfiguratorNode);
 const retainedPanel = modalToggle.remoteConfiguratorPanels.get("381");
 assert.ok(retainedPanel, "a stale mount flag must not prevent a retry");
+assert.equal(stalePanelRoot.removed, true);
+assert.equal(stalePanelWidget.wasUnregistered, true);
+assert.equal(lateConfiguratorNode.widgets.length, 1);
+assert.equal(lateConfiguratorNode.widgets[0].element, retainedPanel.root);
 assert.equal(retainedPanel.promptId, "plan-before-capacity");
 assert.equal(retainedPanel.tableBody.children.length, 1);
 assert.equal(retainedPanel.table.hidden, false);

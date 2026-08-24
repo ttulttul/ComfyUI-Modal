@@ -69,6 +69,7 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
 
     assert "function serializedRemoteConfiguratorNodeId(prompt)" in source
     assert "function mountRemoteExecutionConfiguratorPanel(node)" in source
+    assert "function removeStaleRemoteConfiguratorWidgets(node)" in source
     assert "function registerPromptConfigurator(promptId, configuratorNodeId)" in source
     assert "function registerRemoteConfiguratorPlan(promptId, assignments, configurations)" in source
     assert "function renderRemoteConfiguratorStatus(panel, state)" in source
