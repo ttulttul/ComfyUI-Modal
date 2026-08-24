@@ -2,6 +2,11 @@
 
 - The pinned vLLM wheel is large enough that pip's default five resumptions and 15-second socket timeout can be exhausted by an unstable connection during an SSH/Vast worker build. Give the accelerator-wheel layer an extended timeout and bounded resume budget while leaving earlier package layers unchanged so Docker can reuse their successful cache entries.
 
+## 2026-08-23
+
+- Remote capacity acquisition happens before the rewritten prompt enters ComfyUI's native queue, so a one-shot frontend event is not enough to represent liveness. Register prompt preparation in a server-side bridge that augments `get_current_queue`, `get_current_queue_volatile`, and `get_tasks_remaining`, deduplicate it when the native prompt arrives, and publish queue updates on both registration and cleanup.
+- Vast can report a failed private-image pull as `actual_status=loading` even though `cur_state` and `intended_status` are both `stopped`. Preserve those provider fields, surface bounded status messages during every readiness poll, and treat the stopped/stopped combination as terminal instead of waiting for the full startup timeout.
+
 ## 2026-08-22
 
 - Current free VRAM is conservative only if the planner distinguishes unknown GPU consumers from its own idle warm workers. Compare normal placement with an optimistic total-capacity placement; recycle only the labeled idle worker selected by the cost model, then re-probe actual free memory before admission. A running worker is idle only when `docker top` shows neither an execution relay nor a model-staging process.

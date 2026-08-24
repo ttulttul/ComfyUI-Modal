@@ -9,7 +9,7 @@ import math
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 if __package__:
     from .execution_environments import (
@@ -30,7 +30,7 @@ if __package__:
         VastLeaseRegistry,
         vast_profile_fingerprint,
     )
-    from .vast_models import VastOffer, VastResourceProfile
+    from .vast_models import VastInstance, VastOffer, VastResourceProfile
     from .vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
     from .vast_ssh import VastSshRunner, VastSshVolumeBackend, vast_connection_from_lease
 else:  # pragma: no cover - direct debugging imports.
@@ -52,7 +52,7 @@ else:  # pragma: no cover - direct debugging imports.
         VastLeaseRegistry,
         vast_profile_fingerprint,
     )
-    from vast_models import VastOffer, VastResourceProfile
+    from vast_models import VastInstance, VastOffer, VastResourceProfile
     from vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
     from vast_ssh import VastSshRunner, VastSshVolumeBackend, vast_connection_from_lease
 
@@ -61,6 +61,21 @@ VAST_API_KEY_ENV = "VAST_API_KEY"
 VAST_API_BASE_URL_ENV = "COMFY_MODAL_VAST_API_BASE_URL"
 VAST_SSH_IDENTITY_FILE_ENV = "COMFY_MODAL_VAST_SSH_IDENTITY_FILE"
 VAST_OFFER_PREFETCH_CONCURRENCY = 8
+
+
+def _vast_startup_status_message(instance: VastInstance) -> str:
+    """Translate one provider lifecycle record into stable user-facing progress."""
+    provider_message = (instance.status_message or "").casefold()
+    instance_label = f"Vast.ai instance {instance.instance_id}"
+    if "unauthorized" in provider_message or "denied" in provider_message:
+        return f"{instance_label} could not download the worker image"
+    if "download complete" in provider_message:
+        return f"{instance_label} is downloading the worker image (layer complete)"
+    if any(word in provider_message for word in ("download", "pull", "extract")):
+        return f"{instance_label} is downloading the worker image"
+    if instance.actual_status.casefold() == "running":
+        return f"{instance_label} is waiting for SSH access"
+    return f"{instance_label} is starting ({instance.actual_status})"
 
 
 @dataclass(frozen=True)
@@ -355,10 +370,29 @@ class VastService:
         quote: VastProfileQuote,
         *,
         slot: int = 0,
+        status_callback: Callable[[str], None] | None = None,
     ) -> VastLeaseRecord:
         """Reuse or rent the selected quoted profile capacity slot."""
-        lease = await self.lease_manager.ensure_lease(quote.profile, slot=slot)
+        if status_callback is not None:
+            status_callback("Requesting Vast.ai capacity")
+
+        def emit_instance_status(instance: VastInstance) -> None:
+            """Forward normalized provider progress when a caller is listening."""
+            if status_callback is not None:
+                status_callback(_vast_startup_status_message(instance))
+
+        lease = await self.lease_manager.ensure_lease(
+            quote.profile,
+            slot=slot,
+            status_callback=(
+                emit_instance_status if status_callback is not None else None
+            ),
+        )
+        if status_callback is not None:
+            status_callback("Initializing Vast.ai worker")
         await asyncio.to_thread(self._initialize_runtime, lease)
+        if status_callback is not None:
+            status_callback("Vast.ai worker is ready")
         return lease
 
     def quote_best_profile_sync(self, *args: object, **kwargs: object) -> VastProfileQuote:
@@ -378,9 +412,16 @@ class VastService:
         quote: VastProfileQuote,
         *,
         slot: int = 0,
+        status_callback: Callable[[str], None] | None = None,
     ) -> VastLeaseRecord:
         """Synchronously acquire a quote slot from ComfyUI's queue worker thread."""
-        return asyncio.run(self.acquire(quote, slot=slot))
+        return asyncio.run(
+            self.acquire(
+                quote,
+                slot=slot,
+                status_callback=status_callback,
+            )
+        )
 
     def scheduling_state(self, quote: VastProfileQuote) -> EnvironmentSchedulingState:
         """Expose a quote to the provider-neutral cost scheduler."""

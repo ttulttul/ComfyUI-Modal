@@ -61,15 +61,23 @@ def test_client_search_create_poll_manage_and_destroy_lifecycle(
                 environment={},
             )
             created = await client.create_instance(offers[0].offer_id, launch)
+            startup_states: list[tuple[str, str | None]] = []
             instance = await client.wait_until_ready(
                 created.instance_id,
                 timeout_seconds=2.0,
                 poll_interval_seconds=0.01,
+                status_callback=lambda current: startup_states.append(
+                    (current.actual_status, current.status_message)
+                ),
             )
 
             assert instance.ready_for_ssh is True
             assert instance.ssh_host is not None
             assert instance.ssh_port is not None
+            assert startup_states == [
+                ("loading", "worker-layer: Download complete"),
+                ("running", "Worker ready"),
+            ]
             listed = await client.list_instances()
             assert [item.instance_id for item in listed] == [created.instance_id]
 
@@ -82,6 +90,55 @@ def test_client_search_create_poll_manage_and_destroy_lifecycle(
             assert state.destroyed_instance_ids == [created.instance_id]
             assert all("Authorization" not in entry for entry in state.request_log)
             assert "instance-secret" not in repr(state.request_log)
+
+    asyncio.run(scenario())
+
+
+def test_client_fails_fast_when_vast_reports_stopped_image_pull(
+    vast_api_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """A rejected worker image must not look like loading until the full timeout."""
+
+    async def scenario() -> None:
+        """Create an instance, inject Vast's registry failure state, and poll once."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=999)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            client = vast_api_module.VastApiClient(
+                state.api_key,
+                base_url=base_url,
+                retry_attempts=1,
+            )
+            profile = vast_models_module.VastResourceProfile(
+                profile_id="private-image",
+                profile_name="private-image",
+            )
+            offer = (await client.search_offers(profile))[0]
+            launch = vast_models_module.VastInstanceLaunchSpec(
+                image="ghcr.io/example/private-worker:latest",
+                disk_gb=200,
+                label="managed-private-image",
+                onstart="start",
+                environment={},
+            )
+            created = await client.create_instance(offer.offer_id, launch)
+            raw_instance = state.instances[created.instance_id]
+            raw_instance["intended_status"] = "stopped"
+            raw_instance["cur_state"] = "stopped"
+            raw_instance["status_msg"] = "unauthorized: authentication required"
+
+            with pytest.raises(
+                vast_api_module.VastApiError,
+                match="unauthorized: authentication required",
+            ):
+                await client.wait_until_ready(
+                    created.instance_id,
+                    timeout_seconds=60.0,
+                    poll_interval_seconds=10.0,
+                )
 
     asyncio.run(scenario())
 

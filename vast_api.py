@@ -336,6 +336,7 @@ class VastApiClient:
         *,
         timeout_seconds: float,
         poll_interval_seconds: float = 10.0,
+        status_callback: Callable[[VastInstance], None] | None = None,
     ) -> VastInstance:
         """Poll until one instance exposes a running SSH endpoint."""
         if timeout_seconds <= 0 or poll_interval_seconds <= 0:
@@ -345,12 +346,20 @@ class VastApiClient:
         last_instance: VastInstance | None = None
         while loop.time() < deadline:
             last_instance = await self.show_instance(instance_id)
+            if status_callback is not None:
+                status_callback(last_instance)
             if last_instance.ready_for_ssh:
                 return last_instance
-            if last_instance.actual_status in {"error", "exited", "destroyed"}:
+            if last_instance.terminal_failure:
+                provider_detail = (
+                    f" Provider status: {last_instance.status_message}."
+                    if last_instance.status_message
+                    else ""
+                )
                 raise VastApiError(
                     f"Vast instance {instance_id} entered terminal state "
                     f"{last_instance.actual_status!r} before SSH was ready."
+                    f"{provider_detail}"
                 )
             await asyncio.sleep(min(poll_interval_seconds, max(0.0, deadline - loop.time())))
         last_status = last_instance.actual_status if last_instance is not None else "unknown"

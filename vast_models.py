@@ -326,6 +326,8 @@ class VastInstance:
     instance_id: int
     actual_status: str
     intended_status: str | None
+    current_state: str | None
+    status_message: str | None
     label: str | None
     ssh_host: str | None
     ssh_port: int | None
@@ -342,6 +344,8 @@ class VastInstance:
             instance_id=_required_int(payload, "id"),
             actual_status=str(payload.get("actual_status") or "unknown").strip(),
             intended_status=_optional_string(payload.get("intended_status")),
+            current_state=_optional_string(payload.get("cur_state")),
+            status_message=_bounded_status_string(payload.get("status_msg")),
             label=_optional_string(payload.get("label")),
             ssh_host=_optional_string(payload.get("ssh_host")),
             ssh_port=_optional_int(payload.get("ssh_port"), "ssh_port"),
@@ -363,6 +367,18 @@ class VastInstance:
             and self.ssh_port is not None
             and self.ssh_port > 0
         )
+
+    @property
+    def terminal_failure(self) -> bool:
+        """Return whether provider state proves startup cannot continue."""
+        terminal_states = {"destroyed", "error", "exited"}
+        if self.actual_status.casefold() in terminal_states:
+            return True
+        current_state = (self.current_state or "").casefold()
+        intended_status = (self.intended_status or "").casefold()
+        if current_state in terminal_states:
+            return True
+        return current_state == "stopped" and intended_status == "stopped"
 
 
 @dataclass(frozen=True)
@@ -495,6 +511,14 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _bounded_status_string(value: Any) -> str | None:
+    """Return one single-line provider status suitable for logs and errors."""
+    normalized = _optional_string(value)
+    if normalized is None:
+        return None
+    return " ".join(normalized.split())[:240]
 
 
 def _require_positive_int(value: int, field_name: str) -> None:

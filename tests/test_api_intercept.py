@@ -6087,3 +6087,183 @@ def test_modal_interrupt_queue_bridge_exposes_active_remote_prompts(
 
     assert queued == ["queued"]
     assert [item[1] for item in running] == ["prompt-1"]
+
+
+def test_remote_preparation_bridge_exposes_work_to_all_queue_views(
+    api_intercept_module: Any,
+) -> None:
+    """Capacity acquisition should look active before the rewritten prompt is queued."""
+
+    class FakePromptQueue:
+        """Minimal native queue with every state method used by ComfyUI."""
+
+        def __init__(self) -> None:
+            """Initialize an empty native queue."""
+            self.running: list[tuple[Any, ...]] = []
+            self.queued: list[tuple[Any, ...]] = []
+
+        def get_current_queue(self) -> tuple[list[Any], list[Any]]:
+            """Return stable native queue state."""
+            return list(self.running), list(self.queued)
+
+        def get_current_queue_volatile(self) -> tuple[list[Any], list[Any]]:
+            """Return volatile native queue state."""
+            return list(self.running), list(self.queued)
+
+        def get_tasks_remaining(self) -> int:
+            """Count native running and pending prompts."""
+            return len(self.running) + len(self.queued)
+
+    prompt_queue = FakePromptQueue()
+    queue_update_counts: list[int] = []
+    prompt_server = SimpleNamespace(
+        prompt_queue=prompt_queue,
+        queue_updated=lambda: queue_update_counts.append(
+            prompt_queue.get_tasks_remaining()
+        ),
+    )
+    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+
+    registered = api_intercept_module._set_remote_preparation(
+        prompt_server,
+        prompt_id="prompt-preparing",
+        prompt={"1": {"class_type": "RemoteImage", "inputs": {}}},
+        extra_data={"client_id": "client-1"},
+    )
+
+    assert registered is True
+    assert prompt_queue.get_tasks_remaining() == 1
+    assert [item[1] for item in prompt_queue.get_current_queue()[0]] == [
+        "prompt-preparing"
+    ]
+    assert [item[1] for item in prompt_queue.get_current_queue_volatile()[0]] == [
+        "prompt-preparing"
+    ]
+
+    prompt_queue.queued.append((1, "prompt-preparing", {}, {}, []))
+    assert prompt_queue.get_tasks_remaining() == 1
+    assert [item[1] for item in prompt_queue.get_current_queue_volatile()[0]] == []
+
+    api_intercept_module._clear_remote_preparation(
+        prompt_server,
+        "prompt-preparing",
+    )
+
+    assert prompt_queue.get_tasks_remaining() == 1
+    assert queue_update_counts == [1, 1]
+
+
+def test_remote_preparation_bridge_clears_failed_submission(
+    api_intercept_module: Any,
+) -> None:
+    """A rejected pre-queue prompt must not leave phantom active queue work."""
+
+    class FakePromptQueue:
+        """Minimal empty queue used to exercise preparation cleanup."""
+
+        def get_current_queue_volatile(self) -> tuple[list[Any], list[Any]]:
+            """Return empty native queue state."""
+            return [], []
+
+        def get_tasks_remaining(self) -> int:
+            """Return the empty native queue count."""
+            return 0
+
+    prompt_queue = FakePromptQueue()
+    prompt_server = SimpleNamespace(
+        prompt_queue=prompt_queue,
+        queue_updated=lambda: None,
+    )
+    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+    assert api_intercept_module._set_remote_preparation(
+        prompt_server,
+        prompt_id="prompt-failed",
+        prompt={},
+        extra_data={},
+    )
+    assert prompt_queue.get_tasks_remaining() == 1
+
+    api_intercept_module._clear_remote_preparation(prompt_server, "prompt-failed")
+
+    assert prompt_queue.get_tasks_remaining() == 0
+    assert prompt_queue.get_current_queue_volatile() == ([], [])
+
+
+def test_selected_vast_capacity_streams_setup_status(
+    api_intercept_module: Any,
+    vast_models_module: Any,
+) -> None:
+    """Queue-time Vast acquisition should stream provider progress into the UI."""
+    profile = vast_models_module.VastResourceProfile(
+        profile_id="vast-config",
+        profile_name="Vast-pool",
+        maximum_instances=1,
+    )
+    configuration = api_intercept_module.VastRemoteConfiguration(
+        configuration_id="vast-config",
+        display_name="Vast-pool",
+        profile=profile,
+    )
+    configuration_set = api_intercept_module.RemoteConfigurationSet(
+        configurations=(configuration,)
+    )
+    assignments = {
+        "component-1": api_intercept_module.ExecutionAssignment(
+            environment_id=profile.environment_id,
+            provider=api_intercept_module.ExecutionProvider.VAST,
+            predicted_cost_usd=0.02,
+            predicted_completion_seconds=30.0,
+            configuration_id="vast-config",
+            capacity_slot_index=0,
+        )
+    }
+    requirements = {
+        "component-1": api_intercept_module.ComponentResourceRequirements(
+            estimated_execution_seconds=30.0
+        )
+    }
+    quote = SimpleNamespace(
+        profile=profile,
+        predicted_incremental_cost_usd=0.02,
+    )
+    status_events: list[tuple[str, int | None, int | None]] = []
+
+    class FakeVastService:
+        """Emit representative readiness phases without renting an instance."""
+
+        def acquire_sync(
+            self,
+            selected_quote: Any,
+            *,
+            slot: int,
+            status_callback: Any,
+        ) -> Any:
+            """Emit image and runtime phases before returning a fake lease."""
+            assert selected_quote is quote
+            assert slot == 0
+            status_callback("Vast.ai instance 42 is downloading the worker image")
+            status_callback("Initializing Vast.ai worker")
+            return SimpleNamespace(
+                environment_id="vast:vast-config:42",
+                idle_retention_seconds=3600.0,
+            )
+
+    leases = api_intercept_module._prepare_selected_vast_capacity(
+        assignments=assignments,
+        configuration_set=configuration_set,
+        requirements_by_component=requirements,
+        vast_quotes={("component-1", "vast-config"): quote},
+        vast_service=FakeVastService(),
+        status_callback=lambda message, current, total: status_events.append(
+            (message, current, total)
+        ),
+    )
+
+    assert list(leases) == ["vast:vast-config:42"]
+    assert status_events == [
+        ("Acquiring Vast.ai capacity 1 of 1", 0, 1),
+        ("Vast.ai instance 42 is downloading the worker image", 0, 1),
+        ("Initializing Vast.ai worker", 0, 1),
+        ("Vast.ai capacity 1 of 1 is ready", 1, 1),
+    ]
+    assert assignments["component-1"].environment_id == "vast:vast-config:42"

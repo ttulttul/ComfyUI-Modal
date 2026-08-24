@@ -217,6 +217,7 @@ class VastApiSimulator:
             "actual_status": "loading",
             "intended_status": "running",
             "cur_state": "loading",
+            "status_msg": "worker-layer: Download complete",
             "next_state": "running",
             "label": body.get("label"),
             "image_uuid": body.get("image"),
@@ -250,6 +251,7 @@ class VastApiSimulator:
         ):
             instance["actual_status"] = "running"
             instance["cur_state"] = "running"
+            instance["status_msg"] = "Worker ready"
         return web.json_response({"instances": _public_instance(instance)})
 
     async def list_instances(self, request: web.Request) -> web.Response:

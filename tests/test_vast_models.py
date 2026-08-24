@@ -178,3 +178,27 @@ def test_launch_payload_uses_direct_ssh_and_fail_fast(
     assert payload["cancel_unavail"] is True
     assert payload["target_state"] == "running"
     assert "price" not in payload
+
+
+def test_instance_normalizes_provider_progress_and_terminal_state(
+    vast_models_module: Any,
+) -> None:
+    """Vast's stopped image-pull state should be bounded, readable, and terminal."""
+    instance = vast_models_module.VastInstance.from_api(
+        {
+            "id": 42,
+            "actual_status": "loading",
+            "intended_status": "stopped",
+            "cur_state": "stopped",
+            "status_msg": " unauthorized:\n authentication required " + "x" * 300,
+            "num_gpus": 1,
+            "gpu_ram": 48 * 1024,
+            "cpu_ram": 96 * 1024,
+        }
+    )
+
+    assert instance.current_state == "stopped"
+    assert instance.status_message is not None
+    assert "\n" not in instance.status_message
+    assert len(instance.status_message) == 240
+    assert instance.terminal_failure is True

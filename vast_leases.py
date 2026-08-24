@@ -49,6 +49,7 @@ VAST_LEASE_REGISTRY_VERSION = 1
 VAST_LEASE_REGISTRY_FILENAME = "vast-leases.json"
 VAST_MANAGED_LABEL_PREFIX = "comfy-modal-vast"
 _SAFE_LABEL_PART_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
+VastInstanceStatusCallback = Callable[[VastInstance], None]
 
 
 @dataclass(frozen=True)
@@ -350,6 +351,7 @@ class VastLeaseManager:
         profile: VastResourceProfile,
         *,
         slot: int = 0,
+        status_callback: VastInstanceStatusCallback | None = None,
     ) -> VastLeaseRecord:
         """Reuse or rent one compatible SSH-ready lease for a profile slot."""
         if slot < 0 or slot >= profile.maximum_instances:
@@ -359,15 +361,25 @@ class VastLeaseManager:
             )
         slot_profile_id = _slot_profile_id(profile.profile_id, slot)
         async with self._profile_lock(slot_profile_id):
-            existing = await self._reusable_lease(profile, slot_profile_id)
+            existing = await self._reusable_lease(
+                profile,
+                slot_profile_id,
+                status_callback=status_callback,
+            )
             if existing is not None:
                 return existing
-            return await self._rent_lease(profile, slot_profile_id)
+            return await self._rent_lease(
+                profile,
+                slot_profile_id,
+                status_callback=status_callback,
+            )
 
     async def _reusable_lease(
         self,
         profile: VastResourceProfile,
         slot_profile_id: str,
+        *,
+        status_callback: VastInstanceStatusCallback | None,
     ) -> VastLeaseRecord | None:
         """Return one matching live lease after refreshing its API state."""
         fingerprint = vast_profile_fingerprint(profile)
@@ -391,6 +403,7 @@ class VastLeaseManager:
                 instance = await self.api_client.wait_until_ready(
                     lease.instance_id,
                     timeout_seconds=self.startup_timeout_seconds,
+                    status_callback=status_callback,
                 )
             refreshed = self._refresh_record(lease, instance)
             self.registry.upsert(refreshed)
@@ -409,6 +422,8 @@ class VastLeaseManager:
         self,
         profile: VastResourceProfile,
         slot_profile_id: str,
+        *,
+        status_callback: VastInstanceStatusCallback | None,
     ) -> VastLeaseRecord:
         """Search, rent, and persist the first still-available compatible offer."""
         offers = await self.api_client.search_offers(profile)
@@ -426,6 +441,7 @@ class VastLeaseManager:
                         profile,
                         slot_profile_id,
                         offer,
+                        status_callback=status_callback,
                     )
                 except VastOfferUnavailableError:
                     unavailable_offer_ids.append(offer.offer_id)
@@ -449,6 +465,8 @@ class VastLeaseManager:
         profile: VastResourceProfile,
         slot_profile_id: str,
         offer: VastOffer,
+        *,
+        status_callback: VastInstanceStatusCallback | None,
     ) -> VastLeaseRecord:
         """Create, wait for, and persist one selected offer."""
         label = vast_managed_label(
@@ -487,6 +505,7 @@ class VastLeaseManager:
             instance = await self.api_client.wait_until_ready(
                 created.instance_id,
                 timeout_seconds=self.startup_timeout_seconds,
+                status_callback=status_callback,
             )
         except (TimeoutError, VastApiError) as exc:
             failed = replace(provisional, last_error=str(exc))

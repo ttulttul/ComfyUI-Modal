@@ -228,6 +228,8 @@ Subgraph containers inherit a derived summary decoration (marked with a `Σ` bad
 
 Active remote nodes show a small progress panel with per-bar `it/s` rates (LLM nodes show `tok/s`, token counts, and TTFT). When a prompt is scheduled across more than one remote environment, the panel also names where each component is running — the Modal container id or the SSH host name. Preview images and UI payloads from remote nodes stream back into the local session while the component is still running, and progress state is reconciled against queue history when the browser regains focus so cancelled prompts do not leave stale bars behind.
 
+Remote planning and capacity acquisition count as active queue work even though they happen before the rewritten prompt enters ComfyUI's native execution queue. During Vast startup, the canvas receives readable updates for rental, worker-image download, SSH readiness, and runtime initialization. A provider-side terminal image-pull failure is reported immediately rather than appearing as an empty queue until the startup timeout expires.
+
 While a Modal workflow is active, the global status pill lists this instance's active containers, an estimated accumulated GPU cost with the current burn rate (based on Modal's published GPU prices; excludes CPU, memory, storage, credits, and reservations), and — where the workspace plan allows billing-report access — Modal's actual metered app cost at hourly resolution.
 
 Cancelling a local prompt propagates a targeted interrupt to the active remote work. If the back-end is slow to observe it, the local prompt is released after a grace period while remote cleanup continues.

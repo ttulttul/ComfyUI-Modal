@@ -88,6 +88,7 @@ from .vast_api import VastApiClient
 from .vast_leases import VastLeaseRegistry
 
 logger = logging.getLogger(__name__)
+SetupStatusCallback = Callable[[str, int | None, int | None], None]
 
 _ROUTE_REGISTERED = False
 _MODAL_UI_EVENT_RETENTION_SECONDS = 2 * 60 * 60
@@ -95,6 +96,8 @@ _MODAL_UI_EVENT_LIMIT_PER_CLIENT = 512
 _MODAL_UI_EVENTS_LOCK = threading.Lock()
 _MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
 _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_installed"
+_REMOTE_PREPARATION_PROMPTS_ATTR = "__comfy_modal_remote_preparation_prompts"
+_REMOTE_PREPARATION_LOCK_ATTR = "__comfy_modal_remote_preparation_lock"
 _REMOTE_TOGGLE_WIDGET_NAME = "Run Remotely"
 _LEGACY_REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
 _LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
@@ -1039,6 +1042,7 @@ def _plan_component_execution_assignments(
     prompt: Mapping[str, Any],
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
+    status_callback: SetupStatusCallback | None = None,
 ) -> dict[str, ExecutionAssignment]:
     """Assign components across Modal, SSH Docker, and workflow-declared Vast pools."""
     preferences = WorkflowExecutionPreferences.from_workflow(workflow)
@@ -1237,7 +1241,17 @@ def _plan_component_execution_assignments(
                     "Vast.ai was selected without a current marketplace quote."
                 )
             try:
-                lease = vast_service.acquire_sync(vast_quote)
+                if status_callback is None:
+                    lease = vast_service.acquire_sync(vast_quote)
+                else:
+                    lease = vast_service.acquire_sync(
+                        vast_quote,
+                        status_callback=lambda message: status_callback(
+                            message,
+                            None,
+                            None,
+                        ),
+                    )
             except (OSError, RuntimeError, ValueError) as exc:
                 raise ModalPromptValidationError(
                     f"Unable to acquire Vast.ai capacity: {exc}"
@@ -1270,6 +1284,7 @@ def _plan_component_execution(
     prompt: Mapping[str, Any],
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
+    status_callback: SetupStatusCallback | None = None,
 ) -> ComponentExecutionPlan:
     """Plan through connected configurations or synthesize the legacy behavior."""
     try:
@@ -1283,6 +1298,7 @@ def _plan_component_execution(
                 prompt=prompt,
                 workflow=workflow,
                 settings=settings,
+                status_callback=status_callback,
             )
         )
     return _plan_configured_component_execution(
@@ -1291,6 +1307,7 @@ def _plan_component_execution(
         workflow=workflow,
         settings=settings,
         configuration_set=configuration_set,
+        status_callback=status_callback,
     )
 
 
@@ -1301,6 +1318,7 @@ def _plan_configured_component_execution(
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
     configuration_set: RemoteConfigurationSet,
+    status_callback: SetupStatusCallback | None = None,
 ) -> ComponentExecutionPlan:
     """Resolve and prepare a capacity-aware plan from connected configurations."""
     configurations_by_id = {
@@ -1360,6 +1378,7 @@ def _plan_configured_component_execution(
         requirements_by_component=requirements_by_component,
         vast_quotes=vast_quotes,
         vast_service=vast_service,
+        status_callback=status_callback,
     )
     return ComponentExecutionPlan(
         assignments=assignments,
@@ -1650,6 +1669,7 @@ def _prepare_selected_vast_capacity(
     requirements_by_component: Mapping[str, ComponentResourceRequirements],
     vast_quotes: Mapping[tuple[str, str], VastProfileQuote],
     vast_service: VastService | None,
+    status_callback: SetupStatusCallback | None = None,
 ) -> dict[str, Any]:
     """Acquire only Vast slots selected by the completed provider-neutral plan."""
     selected_slots: dict[tuple[str, int], list[str]] = defaultdict(list)
@@ -1676,7 +1696,12 @@ def _prepare_selected_vast_capacity(
         if isinstance(configuration, VastRemoteConfiguration)
     }
     leases_by_environment: dict[str, Any] = {}
-    for (configuration_id, slot_index), component_ids in sorted(selected_slots.items()):
+    ordered_slots = sorted(selected_slots.items())
+    total_slots = len(ordered_slots)
+    for slot_number, ((configuration_id, slot_index), component_ids) in enumerate(
+        ordered_slots,
+        start=1,
+    ):
         configuration = configurations_by_id[configuration_id]
         quote = _quote_selected_vast_slot(
             configuration=configuration,
@@ -1686,12 +1711,37 @@ def _prepare_selected_vast_capacity(
             vast_service=vast_service,
         )
         try:
-            lease = vast_service.acquire_sync(quote, slot=slot_index)
+            if status_callback is not None:
+                status_callback(
+                    f"Acquiring Vast.ai capacity {slot_number} of {total_slots}",
+                    slot_number - 1,
+                    total_slots,
+                )
+            if status_callback is None:
+                lease = vast_service.acquire_sync(quote, slot=slot_index)
+            else:
+                lease = vast_service.acquire_sync(
+                    quote,
+                    slot=slot_index,
+                    status_callback=(
+                        lambda message, current=slot_number - 1: status_callback(
+                            message,
+                            current,
+                            total_slots,
+                        )
+                    ),
+                )
         except (OSError, RuntimeError, ValueError) as exc:
             raise ModalPromptValidationError(
                 f"Unable to acquire Vast.ai capacity for configuration "
                 f"{configuration.display_name!r} slot {slot_index}: {exc}"
             ) from exc
+        if status_callback is not None:
+            status_callback(
+                f"Vast.ai capacity {slot_number} of {total_slots} is ready",
+                slot_number,
+                total_slots,
+            )
         leases_by_environment[lease.environment_id] = lease
         cost_share = quote.predicted_incremental_cost_usd / len(component_ids)
         for component_id in component_ids:
@@ -6959,7 +7009,7 @@ def rewrite_prompt_for_modal(
     settings: ModalSyncSettings | None = None,
     nodes_module: Any | None = None,
     extra_data: dict[str, Any] | None = None,
-    status_callback: Any | None = None,
+    status_callback: SetupStatusCallback | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Rewrite connected remote components into Modal proxy nodes."""
     resolved_settings = settings or get_settings()
@@ -7017,6 +7067,7 @@ def rewrite_prompt_for_modal(
         prompt=rewritten_prompt,
         workflow=workflow,
         settings=resolved_settings,
+        status_callback=status_callback,
     )
     assignments_by_component_id = execution_plan.assignments
     if execution_plan.configuration_set is not None:
@@ -7491,7 +7542,7 @@ async def rewrite_prompt_for_modal_async(
     settings: ModalSyncSettings | None = None,
     nodes_module: Any | None = None,
     extra_data: dict[str, Any] | None = None,
-    status_callback: Any | None = None,
+    status_callback: SetupStatusCallback | None = None,
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Prepare one Modal prompt without blocking ComfyUI's event loop."""
     return await asyncio.to_thread(
@@ -7856,7 +7907,7 @@ async def delete_modal_volume(settings: ModalSyncSettings) -> dict[str, Any]:
 
 
 def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
-    """Expose active Modal prompts to ComfyUI's targeted interrupt route."""
+    """Expose active remote work through every ComfyUI queue-state view."""
     prompt_queue = getattr(prompt_server, "prompt_queue", None)
     if prompt_queue is None or getattr(
         prompt_queue, _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR, False
@@ -7864,30 +7915,156 @@ def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
         return
 
     original_get_current_queue = getattr(prompt_queue, "get_current_queue", None)
-    if not callable(original_get_current_queue):
+    original_get_current_queue_volatile = getattr(
+        prompt_queue, "get_current_queue_volatile", None
+    )
+    original_get_tasks_remaining = getattr(prompt_queue, "get_tasks_remaining", None)
+    if not any(
+        callable(method)
+        for method in (
+            original_get_current_queue,
+            original_get_current_queue_volatile,
+            original_get_tasks_remaining,
+        )
+    ):
         logger.debug(
-            "Prompt queue does not expose get_current_queue(); skipping Modal interrupt bridge."
+            "Prompt queue does not expose queue-state methods; skipping remote queue bridge."
         )
         return
 
-    def modal_get_current_queue() -> tuple[list[Any], Any]:
-        """Return ComfyUI's current queue plus synthetic active Modal prompt entries."""
-        running, queued = original_get_current_queue()
-        running_items = list(running)
-        running_prompt_ids = {str(item[1]) for item in running_items if len(item) > 1}
-        try:
-            from .remote.modal_app import active_remote_modal_prompt_ids
-        except ImportError:
-            return running_items, queued
+    preparation_prompts: dict[str, tuple[Any, ...]] = {}
+    preparation_lock = threading.RLock()
+    setattr(prompt_queue, _REMOTE_PREPARATION_PROMPTS_ATTR, preparation_prompts)
+    setattr(prompt_queue, _REMOTE_PREPARATION_LOCK_ATTR, preparation_lock)
 
-        active_prompt_ids = active_remote_modal_prompt_ids()
-        for prompt_id in sorted(active_prompt_ids - running_prompt_ids):
-            running_items.append((0, prompt_id, {}, {}, [], {}))
+    def preparation_items() -> list[tuple[Any, ...]]:
+        """Return a stable snapshot of prompts still preparing remote capacity."""
+        with preparation_lock:
+            return list(preparation_prompts.values())
+
+    def append_missing_preparations(
+        running: Iterable[Any],
+        queued: Iterable[Any],
+    ) -> tuple[list[Any], Any]:
+        """Add preparation entries that are not already in ComfyUI's native queue."""
+        running_items = list(running)
+        queued_items = list(queued)
+        native_prompt_ids = _queue_item_prompt_ids((*running_items, *queued_items))
+        running_items.extend(
+            item
+            for item in preparation_items()
+            if str(item[1]) not in native_prompt_ids
+        )
         return running_items, queued
 
-    setattr(prompt_queue, "get_current_queue", modal_get_current_queue)
+    if callable(original_get_current_queue):
+
+        def remote_get_current_queue() -> tuple[list[Any], Any]:
+            """Return native work plus preparation and active remote prompt entries."""
+            running, queued = original_get_current_queue()
+            running_items, queued = append_missing_preparations(running, queued)
+            running_prompt_ids = _queue_item_prompt_ids(running_items)
+            try:
+                from .remote.modal_app import active_remote_modal_prompt_ids
+            except ImportError:
+                return running_items, queued
+
+            for prompt_id in sorted(
+                active_remote_modal_prompt_ids() - running_prompt_ids
+            ):
+                running_items.append((0, prompt_id, {}, {}, [], {}))
+            return running_items, queued
+
+        setattr(prompt_queue, "get_current_queue", remote_get_current_queue)
+
+    if callable(original_get_current_queue_volatile):
+
+        def remote_get_current_queue_volatile() -> tuple[list[Any], Any]:
+            """Include remote preparation in ComfyUI's public `/queue` response."""
+            running, queued = original_get_current_queue_volatile()
+            return append_missing_preparations(running, queued)
+
+        setattr(
+            prompt_queue,
+            "get_current_queue_volatile",
+            remote_get_current_queue_volatile,
+        )
+
+    if callable(original_get_tasks_remaining):
+
+        def remote_get_tasks_remaining() -> int:
+            """Count remote preparation as work in websocket queue status."""
+            remaining = int(original_get_tasks_remaining())
+            native_prompt_ids: set[str] = set()
+            native_queue_method = (
+                original_get_current_queue_volatile
+                if callable(original_get_current_queue_volatile)
+                else original_get_current_queue
+            )
+            if callable(native_queue_method):
+                running, queued = native_queue_method()
+                native_prompt_ids = _queue_item_prompt_ids((*running, *queued))
+            return remaining + sum(
+                str(item[1]) not in native_prompt_ids
+                for item in preparation_items()
+            )
+
+        setattr(prompt_queue, "get_tasks_remaining", remote_get_tasks_remaining)
+
     setattr(prompt_queue, _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR, True)
-    logger.info("Installed Modal targeted interrupt bridge on ComfyUI prompt queue.")
+    logger.info("Installed remote preparation bridge on ComfyUI prompt queue.")
+
+
+def _queue_item_prompt_ids(items: Iterable[Any]) -> set[str]:
+    """Return prompt IDs from well-formed native or synthetic queue items."""
+    return {
+        str(item[1])
+        for item in items
+        if isinstance(item, (list, tuple)) and len(item) > 1
+    }
+
+
+def _set_remote_preparation(
+    prompt_server: Any,
+    *,
+    prompt_id: str,
+    prompt: Mapping[str, Any],
+    extra_data: Mapping[str, Any],
+) -> bool:
+    """Register one pre-queue remote workflow and publish its active queue state."""
+    prompt_queue = getattr(prompt_server, "prompt_queue", None)
+    preparations = getattr(prompt_queue, _REMOTE_PREPARATION_PROMPTS_ATTR, None)
+    preparation_lock = getattr(prompt_queue, _REMOTE_PREPARATION_LOCK_ATTR, None)
+    if not isinstance(preparations, dict) or preparation_lock is None:
+        return False
+    with preparation_lock:
+        preparations[prompt_id] = (
+            0,
+            prompt_id,
+            copy.deepcopy(dict(prompt)),
+            copy.deepcopy(dict(extra_data)),
+            [],
+            {},
+        )
+    queue_updated = getattr(prompt_server, "queue_updated", None)
+    if callable(queue_updated):
+        queue_updated()
+    return True
+
+
+def _clear_remote_preparation(prompt_server: Any, prompt_id: str) -> None:
+    """Remove one pre-queue remote workflow and publish the resulting queue state."""
+    prompt_queue = getattr(prompt_server, "prompt_queue", None)
+    preparations = getattr(prompt_queue, _REMOTE_PREPARATION_PROMPTS_ATTR, None)
+    preparation_lock = getattr(prompt_queue, _REMOTE_PREPARATION_LOCK_ATTR, None)
+    if not isinstance(preparations, dict) or preparation_lock is None:
+        return
+    with preparation_lock:
+        removed = preparations.pop(prompt_id, None)
+    if removed is not None:
+        queue_updated = getattr(prompt_server, "queue_updated", None)
+        if callable(queue_updated):
+            queue_updated()
 
 
 def setup_modal_queue_route(
@@ -8376,6 +8553,7 @@ def setup_modal_queue_route(
         remote_node_ids: list[str] = []
         request_modal_gpu: str | None = None
         summary = RewriteSummary()
+        preparation_prompt_id: str | None = None
         try:
             request_started_at = time.perf_counter()
             json_data = await request.json()
@@ -8419,6 +8597,13 @@ def setup_modal_queue_route(
                     "Attached prompt-scoped Modal execution metadata prompt_id=%s.",
                     prompt_id,
                 )
+                if _set_remote_preparation(
+                    prompt_server,
+                    prompt_id=prompt_id,
+                    prompt=json_data.get("prompt", {}),
+                    extra_data=json_data.get("extra_data", {}),
+                ):
+                    preparation_prompt_id = prompt_id
 
             try:
                 request_settings = settings_for_modal_gpu(
@@ -8635,6 +8820,9 @@ def setup_modal_queue_route(
                     error_message=str(exc),
                 )
             return web.json_response({"error": str(exc), "node_errors": []}, status=500)
+        finally:
+            if preparation_prompt_id is not None:
+                _clear_remote_preparation(prompt_server, preparation_prompt_id)
 
     _ROUTE_REGISTERED = True
     logger.info(

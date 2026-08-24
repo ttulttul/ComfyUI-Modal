@@ -110,6 +110,32 @@ def test_from_environment_requires_credential_before_other_setup(
         raise AssertionError("Missing Vast credential was accepted.")
 
 
+def test_startup_status_translates_vast_image_progress(
+    vast_models_module: Any,
+    vast_service_module: Any,
+) -> None:
+    """Provider layer messages should become useful workflow status without hashes."""
+    instance = vast_models_module.VastInstance.from_api(
+        {
+            "id": 48534708,
+            "actual_status": "loading",
+            "intended_status": "running",
+            "cur_state": "running",
+            "status_msg": "4c7d45f7c63c: Download complete",
+            "num_gpus": 1,
+            "gpu_ram": 48 * 1024,
+            "cpu_ram": 96 * 1024,
+        }
+    )
+
+    message = vast_service_module._vast_startup_status_message(instance)
+
+    assert message == (
+        "Vast.ai instance 48534708 is downloading the worker image (layer complete)"
+    )
+    assert "4c7d45f7c63c" not in message
+
+
 def test_prefetch_deduplicates_effective_profiles_and_searches_in_parallel(
     vast_models_module: Any,
     vast_runtime_module: Any,
