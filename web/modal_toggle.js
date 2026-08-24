@@ -6274,5 +6274,6 @@ app.registerExtension({
     rebuildRemoteDescendantIndex();
     refreshNodeDecorations();
     selectedModalGpu();
+    refreshModalUiAfterVisibilityChange();
   },
 });

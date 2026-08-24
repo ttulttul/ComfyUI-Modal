@@ -803,3 +803,4 @@ def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
     assert "handleModalProgress({ detail: payload });" in source
     assert 'document.addEventListener("visibilitychange"' in source
     assert 'window.addEventListener("focus", refreshModalUiAfterVisibilityChange);' in source
+    assert "selectedModalGpu();\n    refreshModalUiAfterVisibilityChange();" in source
