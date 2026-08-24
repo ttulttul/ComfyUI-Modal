@@ -1256,13 +1256,21 @@ modalToggle.handleModalStatus({
       "last status was 'unknown'.",
   },
 });
-const syntheticExecutionError = syntheticErrorEvents.find(
-  (event) => event.type === "execution_error",
-);
+const syntheticSetupFailure = syntheticErrorEvents
+  .filter(
+    (event) =>
+      event.type === "notification" &&
+      event.detail?.id === "prompt-setup-error",
+  )
+  .at(-1);
 assert.equal(
-  syntheticExecutionError?.detail?.exception_message,
+  syntheticSetupFailure?.detail?.value,
   "Vast instance 48597015 did not become SSH-ready within 900s; " +
     "last status was 'unknown'.",
+);
+assert.equal(
+  syntheticErrorEvents.some((event) => event.type === "execution_error"),
+  false,
 );
 globalThis.__modalApiStub.dispatchEvent = () => {};
 

@@ -18,15 +18,15 @@ def test_synthetic_status_event_matches_comfyui_status_shape() -> None:
     assert 'dispatchSyntheticApiEvent("status", statusPayload(0));' in source
 
 
-def test_synthetic_execution_events_match_comfyui_execution_shapes() -> None:
-    """Synthetic execution events should mirror ComfyUI's websocket adapter payloads."""
+def test_synthetic_preparation_events_avoid_native_node_execution() -> None:
+    """Preparation should refresh queue state without starting ComfyUI's watchdog."""
     source = _modal_toggle_source()
 
-    assert 'dispatchSyntheticApiEvent("execution_start", {' in source
-    assert "timestamp: nowMs()," in source
-    assert 'dispatchSyntheticApiEvent("executing", displayNode);' in source
     assert 'dispatchSyntheticApiEvent("notification", {' in source
     assert "Waiting for remote capacity." in source
+    assert 'dispatchSyntheticApiEvent("execution_start"' not in source
+    assert 'dispatchSyntheticApiEvent("executing"' not in source
+    assert 'dispatchSyntheticApiEvent("execution_error"' not in source
 
 
 def test_global_modal_status_badge_is_installed() -> None:
@@ -394,7 +394,7 @@ def test_queue_success_marks_all_remote_nodes_ready_before_component_execution()
 
 
 def test_queue_failure_preserves_server_validation_detail() -> None:
-    """Synthetic ComfyUI errors should show the planner's actionable rejection."""
+    """Queue failures should preserve detail without faking a node execution error."""
     source = _modal_toggle_source()
 
     assert "function queueErrorMessage(error)" in source
@@ -403,11 +403,8 @@ def test_queue_failure_preserves_server_validation_detail() -> None:
         "endSyntheticExecutionUi(promptId, true, queueErrorMessage(error));"
         in source
     )
-    assert (
-        'failureMessage || "Modal queue request failed before prompt execution started."'
-        in source
-    )
     assert "endSyntheticExecutionUi(promptId, true, errorMessage);" in source
+    assert 'dispatchSyntheticApiEvent("execution_error"' not in source
     assert (
         "setRemoteConfiguratorTerminalStatus(promptId, STATE_ERROR, errorMessage);"
         in source

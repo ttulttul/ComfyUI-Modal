@@ -5625,7 +5625,12 @@ function statusPayload(queueRemaining) {
 }
 
 /**
- * Start a synthetic running state so ComfyUI shows active execution while the Modal route is still preparing.
+ * Start a synthetic queue state while the Modal route is still preparing.
+ *
+ * Preparation is not node execution. Native `execution_start` and `executing`
+ * events start ComfyUI's execution watchdog and can make a long asset download
+ * look like a stalled or failed node. The backend queue bridge exposes the
+ * prompt through `/queue`; the status event asks ComfyUI to refresh that view.
  * @param {string} promptId
  * @param {string[]} remoteNodeIds
  * @param {string | null} modalGpu
@@ -5636,19 +5641,13 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds, modalGpu = null) {
   }
   clearPromptTerminal(promptId);
 
-  const displayNode = remoteNodeIds[0];
-  syntheticPromptUiStates.set(promptId, { displayNode });
+  syntheticPromptUiStates.set(promptId, {});
   setGlobalStatusPhase(promptId, STATE_SETUP, remoteNodeIds.length, { modalGpu });
   dispatchSyntheticApiEvent("status", statusPayload(1));
   dispatchSyntheticApiEvent("notification", {
     id: promptId,
     value: "Waiting for remote capacity.",
   });
-  dispatchSyntheticApiEvent("execution_start", {
-    prompt_id: promptId,
-    timestamp: nowMs(),
-  });
-  dispatchSyntheticApiEvent("executing", displayNode);
 }
 
 /**
@@ -5658,8 +5657,7 @@ function beginSyntheticExecutionUi(promptId, remoteNodeIds, modalGpu = null) {
  * @param {string | null} failureMessage
  */
 function endSyntheticExecutionUi(promptId, failed = false, failureMessage = null) {
-  const syntheticState = syntheticPromptUiStates.get(promptId);
-  if (!syntheticState) {
+  if (!syntheticPromptUiStates.has(promptId)) {
     return;
   }
 
@@ -5672,23 +5670,14 @@ function endSyntheticExecutionUi(promptId, failed = false, failureMessage = null
   }
   dispatchSyntheticApiEvent("notification", {
     id: promptId,
-    value: "Remote setup finished.",
+    value:
+      failed && failureMessage
+        ? failureMessage
+        : failed
+          ? "Remote setup failed."
+          : "Remote setup finished.",
   });
   dispatchSyntheticApiEvent("status", statusPayload(0));
-  if (failed) {
-    dispatchSyntheticApiEvent("execution_error", {
-      prompt_id: promptId,
-      node_id: syntheticState.displayNode,
-      node_type: "ModalRemoteComponent",
-      executed: [],
-      exception_message:
-        failureMessage || "Modal queue request failed before prompt execution started.",
-      exception_type: "ModalQueueError",
-      traceback: [],
-      current_inputs: [],
-      current_outputs: [],
-    });
-  }
 }
 
 /**
