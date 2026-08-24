@@ -294,6 +294,117 @@ def test_vast_sync_materializes_registered_huggingface_asset_before_upload(
     ]
 
 
+def test_vast_sync_automatically_discovers_huggingface_asset(
+    settings_module: Any,
+    sync_engine_module: Any,
+    huggingface_assets_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Vast sync should discover provenance without a user-run registration command."""
+    asset_path = tmp_path / "automatic.safetensors"
+    asset_path.write_bytes(b"automatically-discovered")
+    source = huggingface_assets_module.HuggingFaceAssetSource(
+        repo_id="owner/automatic",
+        revision="9" * 40,
+        filename="automatic.safetensors",
+        sha256=huggingface_assets_module.sha256_file(asset_path),
+        size_bytes=asset_path.stat().st_size,
+    )
+    statuses: list[str] = []
+    discoveries: list[tuple[Path, str]] = []
+
+    class DiscoveringVolume:
+        """Accept direct Hub materialization and reject local upload use."""
+
+        def exists(self, remote_path: str) -> bool:
+            """Report no preexisting remote asset."""
+            del remote_path
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            """Fail if automatic discovery unexpectedly falls back to upload."""
+            raise AssertionError(f"Unexpected upload of {local_path} to {remote_path}")
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            """Accept protocol metadata writes."""
+            del payload, remote_path
+
+        def materialize_huggingface_file(
+            self,
+            registered_source: Any,
+            remote_path: str,
+            *,
+            token: str | None,
+        ) -> bool:
+            """Accept the automatically discovered immutable source."""
+            del remote_path, token
+            assert registered_source == source
+            return True
+
+    class FakeDiscovery:
+        """Return an automatically verified source for the local asset."""
+
+        def discover(self, local_path: Path, *, sha256: str) -> Any:
+            """Record discovery and return the expected source."""
+            discoveries.append((local_path, sha256))
+            return source
+
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="vast",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=DiscoveringVolume(),
+        settings=settings,
+        huggingface_asset_registry=huggingface_assets_module.HuggingFaceAssetRegistry(
+            tmp_path / "empty-registry.json"
+        ),
+        huggingface_asset_discovery=FakeDiscovery(),
+    )
+
+    engine.sync_file(
+        asset_path,
+        status_callback=lambda message, current, total: statuses.append(message),
+    )
+
+    assert discoveries == [(asset_path, source.sha256)]
+    assert statuses == [
+        "Identifying Hugging Face source for Vast.ai: automatic.safetensors",
+        "Downloading asset from Hugging Face on Vast.ai: automatic.safetensors",
+    ]
+
+
+def test_resolve_model_path_preserves_huggingface_cache_symlink(
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Model resolution must retain a cache symlink long enough for provenance discovery."""
+    cached_file = tmp_path / "cache" / "model.safetensors"
+    cached_file.parent.mkdir()
+    cached_file.write_bytes(b"cached")
+    linked_file = tmp_path / "models" / "model.safetensors"
+    linked_file.parent.mkdir()
+    linked_file.symlink_to(cached_file)
+
+    resolved = sync_engine_module.resolve_model_path(str(linked_file))
+
+    assert resolved == linked_file
+    assert resolved.resolve() == cached_file
+
+
 def test_vast_sync_falls_back_to_upload_after_huggingface_failure(
     settings_module: Any,
     sync_engine_module: Any,

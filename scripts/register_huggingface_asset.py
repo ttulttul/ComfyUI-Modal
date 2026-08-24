@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,10 @@ from huggingface_assets import (  # noqa: E402
     HuggingFaceAssetRegistry,
     HuggingFaceAssetSource,
     sha256_file,
+)
+from huggingface_discovery import (  # noqa: E402
+    HuggingFaceAssetHint,
+    resolve_huggingface_asset_hint,
 )
 from settings import discover_comfyui_user_directory, get_settings  # noqa: E402
 
@@ -45,23 +49,6 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _field(value: object, name: str) -> object | None:
-    """Read one field from a Hugging Face object or test mapping."""
-    if isinstance(value, Mapping):
-        return value.get(name)
-    return getattr(value, name, None)
-
-
-def _sibling_lfs_sha256(sibling: object) -> str | None:
-    """Return the raw content SHA-256 advertised for one Hub LFS/Xet file."""
-    lfs = _field(sibling, "lfs")
-    if lfs is None:
-        return None
-    value = _field(lfs, "sha256") or _field(lfs, "oid")
-    normalized = str(value or "").strip().lower()
-    return normalized or None
-
-
 def resolve_huggingface_asset_source(
     local_path: Path,
     *,
@@ -74,55 +61,24 @@ def resolve_huggingface_asset_source(
     resolved_path = local_path.expanduser().resolve()
     if not resolved_path.is_file():
         raise FileNotFoundError(f"Local model asset not found: {resolved_path}")
-    model_info = api.model_info(
-        repo_id,
-        revision=revision,
-        files_metadata=True,
-    )
-    exact_revision = str(_field(model_info, "sha") or "").strip().lower()
-    siblings = _field(model_info, "siblings")
-    if not isinstance(siblings, Sequence):
-        raise ValueError(f"Hugging Face repository {repo_id!r} returned no file metadata.")
-    sibling = next(
-        (
-            item
-            for item in siblings
-            if str(_field(item, "rfilename") or "") == filename
-        ),
-        None,
-    )
-    if sibling is None:
-        raise ValueError(
-            f"Hugging Face repository {repo_id!r} has no file {filename!r} at "
-            f"revision {revision!r}."
-        )
     local_sha256 = sha256_file(resolved_path)
-    remote_sha256 = _sibling_lfs_sha256(sibling)
-    if remote_sha256 is None:
-        raise ValueError(
-            f"Hugging Face file {repo_id}/{filename} does not expose an LFS/Xet "
-            "content SHA-256 and cannot be registered safely."
-        )
-    if remote_sha256 != local_sha256:
-        raise ValueError(
-            "Local file SHA-256 does not match Hugging Face metadata: "
-            f"local={local_sha256} remote={remote_sha256}."
-        )
-    remote_size_value = _field(sibling, "size") or _field(_field(sibling, "lfs"), "size")
-    remote_size = int(remote_size_value or 0)
-    local_size = resolved_path.stat().st_size
-    if remote_size != local_size:
-        raise ValueError(
-            "Local file size does not match Hugging Face metadata: "
-            f"local={local_size} remote={remote_size}."
-        )
-    return HuggingFaceAssetSource(
-        repo_id=repo_id,
-        revision=exact_revision,
-        filename=filename,
+    source = resolve_huggingface_asset_hint(
+        HuggingFaceAssetHint(
+            repo_id=repo_id,
+            revision=revision,
+            filename=filename,
+            evidence="manual diagnostic override",
+        ),
         sha256=local_sha256,
-        size_bytes=local_size,
+        size_bytes=resolved_path.stat().st_size,
+        api=api,
     )
+    if source is None:
+        raise ValueError(
+            "Local file does not match Hugging Face metadata for "
+            f"{repo_id}/{filename} at revision {revision!r}."
+        )
+    return source
 
 
 def _registry(explicit_path: Path | None) -> HuggingFaceAssetRegistry:

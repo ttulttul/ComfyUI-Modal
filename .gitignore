@@ -13,6 +13,7 @@
 !/execution_environments.py
 !/execution_history.py
 !/huggingface_assets.py
+!/huggingface_discovery.py
 !/instance_identity.py
 !/llm_profiles.json
 !/llm_profiles.py

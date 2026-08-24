@@ -301,18 +301,13 @@ The sync engine looks for node inputs that resolve to model files ending in `.sa
 
 Assets are content-addressed and uploaded once: repeated references across nodes and components share one hash and upload decision, and unchanged files are skipped on later runs. In local mode, a local mirror stands in for remote storage.
 
-For Vast.ai, a single-file model can instead be downloaded directly from Hugging Face over the rented instance's data-center connection. Register the association once from the source checkout:
+For Vast.ai, a single-file model can instead be downloaded directly from Hugging Face over the rented instance's data-center connection. This is automatic for models installed through ComfyUI Manager, files or symlinks in the standard Hugging Face cache, Hugging Face Git checkouts, browser downloads that retain their source URL, and safetensors that embed an official Hub source URL. These sources are treated only as candidates: Modal-Sync resolves the revision to an exact 40-character commit and requires the Hub's LFS/Xet SHA-256 and size to match the local bytes before persisting the learned mapping below `<ComfyUI user directory>/comfyui-modal/huggingface-assets.json`.
 
-```bash
-COMFYUI_ROOT=/path/to/ComfyUI \
-  uv run python scripts/register_huggingface_asset.py \
-  /path/to/model.safetensors owner/model weights/model.safetensors \
-  --revision main
-```
+Future Vast cache misses use `huggingface_hub` with `hf-xet` and high-performance mode inside the worker, verify the downloaded size and SHA-256 again, then atomically publish the file under the same content-addressed `/storage/assets/...` path used by ordinary sync. The configurator panel reports both automatic source identification and the Hugging Face download while preparation is active. Because Hugging Face does not provide a global reverse lookup from an arbitrary digest to every repository path, an originless file simply falls back to the normal streamed SSH upload. No user action is required.
 
-Registration resolves the branch or tag to an exact 40-character commit, requires the Hub's LFS/Xet SHA-256 and size to match the local file, and stores only that immutable provenance below `<ComfyUI user directory>/comfyui-modal/huggingface-assets.json`. Hugging Face does not provide a global reverse lookup from an arbitrary digest to every repository path, so existing files need this one-time repository association. Future Vast cache misses use `huggingface_hub` with `hf-xet` and high-performance mode inside the worker, verify the downloaded size and SHA-256 again, then atomically publish the file under the same content-addressed `/storage/assets/...` path used by ordinary sync. The configurator panel reports the Hugging Face download while preparation is active.
+The `scripts/register_huggingface_asset.py` utility remains available as a diagnostic override for a file whose installation metadata was removed. It is not part of normal model installation or workflow use.
 
-Public files need no token. For private or gated files, set `HF_TOKEN` in the local ComfyUI process. Modal-Sync sends it only through the protected SSH standard input of the transient materializer; it is not stored in the workflow, registry, Vast launch environment, command arguments, or logs. If Hugging Face is unavailable, authorization fails, or verification rejects the downloaded bytes, preparation reports the fallback and streams the local file through SSH without buffering the complete model in ComfyUI memory.
+Public files need no token. For private or gated files, set `HF_TOKEN` in the local ComfyUI process. Modal-Sync uses it for metadata verification and sends it only through the protected SSH standard input of the transient materializer; it is not stored in the workflow, registry, Vast launch environment, command arguments, or logs. If Hugging Face is unavailable, authorization fails, or verification rejects the downloaded bytes, preparation reports the fallback and streams the local file through SSH without buffering the complete model in ComfyUI memory.
 
 The worker-side materializer is part of the versioned runtime source. Rebuild and publish the SSH/Vast worker image after upgrading before expecting an already configured Vast deployment to use this path.
 

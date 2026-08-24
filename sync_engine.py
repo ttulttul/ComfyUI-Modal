@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 from .huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
+from .huggingface_discovery import HuggingFaceAssetDiscovery
 from .settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ def resolve_model_path(
     if path.suffix.lower() not in extensions:
         return None
     if path.is_file():
-        return path.resolve()
+        return path.absolute()
     if os.path.isabs(value):
         return None
 
@@ -89,12 +90,12 @@ def resolve_model_path(
         for folder_name in folder_paths.folder_names_and_paths:
             full_path = folder_paths.get_full_path(folder_name, value)
             if full_path is not None:
-                return Path(full_path).resolve()
+                return Path(full_path).absolute()
 
     if comfyui_root is not None:
         candidate = comfyui_root / value
         if candidate.is_file():
-            return candidate.resolve()
+            return candidate.absolute()
     return None
 
 
@@ -136,6 +137,21 @@ def _format_huggingface_download_status(
             f"Vast.ai: {asset_name}"
         )
     return f"Downloading asset from Hugging Face on Vast.ai: {asset_name}"
+
+
+def _format_huggingface_discovery_status(
+    asset_name: str,
+    *,
+    item_index: int | None,
+    total_items: int | None,
+) -> str:
+    """Return one queue-time status for automatic Hugging Face source discovery."""
+    if item_index is not None and total_items is not None and total_items > 1:
+        return (
+            f"Identifying Hugging Face source {item_index}/{total_items} for "
+            f"Vast.ai: {asset_name}"
+        )
+    return f"Identifying Hugging Face source for Vast.ai: {asset_name}"
 
 
 class VolumeBackend(Protocol):
@@ -216,9 +232,9 @@ class AssetSyncRequestCache:
     def synced_assets(self) -> tuple[SyncedAsset, ...]:
         """Return unique sync results in request planning order."""
         return tuple(
-            self._assets_by_path[path]
+            self._assets_by_path[path.resolve()]
             for path in self.planned_paths
-            if path in self._assets_by_path
+            if path.resolve() in self._assets_by_path
         )
 
 
@@ -544,6 +560,7 @@ class ModalAssetSyncEngine:
     settings: ModalSyncSettings
     sync_index: SyncIndexBackend | None = None
     huggingface_asset_registry: HuggingFaceAssetRegistry | None = None
+    huggingface_asset_discovery: HuggingFaceAssetDiscovery | None = None
     _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
     _hash_cache_dirty: bool = field(init=False, default=False)
@@ -600,24 +617,33 @@ class ModalAssetSyncEngine:
         total_items: int | None = None,
     ) -> SyncedAsset:
         """Sync a file into content-addressable remote storage."""
-        resolved_path = local_path.expanduser().resolve()
-        if not resolved_path.is_file():
-            raise FileNotFoundError(f"Asset not found: {resolved_path}")
+        source_path = local_path.expanduser().absolute()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Asset not found: {source_path}")
+        resolved_path = source_path.resolve()
 
         sha256 = self._hash_file(resolved_path)
-        proposed_remote_path = f"{remote_folder.rstrip('/')}/{sha256}_{resolved_path.name}"
-        huggingface_source = self._huggingface_source_for_asset(
-            resolved_path,
-            sha256=sha256,
+        proposed_remote_path = f"{remote_folder.rstrip('/')}/{sha256}_{source_path.name}"
+        sync_key = self._asset_sync_index_key(sha256)
+        huggingface_source = (
+            self._huggingface_source_for_asset(
+                source_path,
+                sha256=sha256,
+                status_callback=status_callback,
+                item_index=item_index,
+                total_items=total_items,
+            )
+            if self._lookup_sync_record(sync_key) is None
+            else None
         )
         sync_result = self._sync_content_addressed_file(
-            local_path=resolved_path,
+            local_path=source_path,
             remote_path=proposed_remote_path,
-            sync_key=self._asset_sync_index_key(sha256),
-            source_description=str(resolved_path),
+            sync_key=sync_key,
+            source_description=str(source_path),
             status_callback=status_callback,
             upload_status_message=_format_asset_upload_status(
-                resolved_path.name,
+                source_path.name,
                 item_index=item_index,
                 total_items=total_items,
                 destination=self._destination_label(),
@@ -628,7 +654,7 @@ class ModalAssetSyncEngine:
         )
 
         return SyncedAsset(
-            local_path=resolved_path,
+            local_path=source_path,
             remote_path=sync_result.remote_path,
             sha256=sha256,
             uploaded=sync_result.uploaded,
@@ -693,11 +719,11 @@ class ModalAssetSyncEngine:
         prompt_input_values: Iterable[Any],
     ) -> AssetSyncRequestCache:
         """Plan unique syncable assets for one queued prompt in stable encounter order."""
-        unique_paths: dict[Path, None] = {}
+        unique_paths: dict[Path, Path] = {}
         for prompt_input_value in prompt_input_values:
             for local_path in self._collect_syncable_asset_paths(prompt_input_value):
-                unique_paths.setdefault(local_path.resolve(), None)
-        return AssetSyncRequestCache(planned_paths=tuple(unique_paths))
+                unique_paths.setdefault(local_path.resolve(), local_path.absolute())
+        return AssetSyncRequestCache(planned_paths=tuple(unique_paths.values()))
 
     def sync_custom_nodes_directory(
         self,
@@ -942,14 +968,33 @@ class ModalAssetSyncEngine:
         local_path: Path,
         *,
         sha256: str,
+        status_callback: SyncStatusCallback | None,
+        item_index: int | None,
+        total_items: int | None,
     ) -> HuggingFaceAssetSource | None:
-        """Return matching provenance when this engine can materialize it remotely."""
-        if self.huggingface_asset_registry is None or not isinstance(
-            self.volume,
-            HuggingFaceMaterializingBackend,
-        ):
+        """Return registered or automatically discovered immutable provenance."""
+        if not isinstance(self.volume, HuggingFaceMaterializingBackend):
             return None
-        source = self.huggingface_asset_registry.get(sha256)
+        source = (
+            self.huggingface_asset_registry.get(sha256)
+            if self.huggingface_asset_registry is not None
+            else None
+        )
+        if source is None and self.huggingface_asset_discovery is not None:
+            _emit_sync_status(
+                status_callback,
+                _format_huggingface_discovery_status(
+                    local_path.name,
+                    item_index=item_index,
+                    total_items=total_items,
+                ),
+                item_index,
+                total_items,
+            )
+            source = self.huggingface_asset_discovery.discover(
+                local_path,
+                sha256=sha256,
+            )
         if source is None:
             return None
         actual_size = local_path.stat().st_size

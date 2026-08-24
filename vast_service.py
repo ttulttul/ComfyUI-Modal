@@ -20,6 +20,7 @@ if __package__:
         GpuCapability,
     )
     from .huggingface_assets import HuggingFaceAssetRegistry
+    from .huggingface_discovery import HuggingFaceAssetDiscovery
     from .runtime_environment import build_remote_runtime_identity
     from .settings import ModalSyncSettings, discover_comfyui_user_directory
     from .sync_engine import ModalAssetSyncEngine
@@ -43,6 +44,7 @@ else:  # pragma: no cover - direct debugging imports.
         GpuCapability,
     )
     from huggingface_assets import HuggingFaceAssetRegistry
+    from huggingface_discovery import HuggingFaceAssetDiscovery
     from runtime_environment import build_remote_runtime_identity
     from settings import ModalSyncSettings, discover_comfyui_user_directory
     from sync_engine import ModalAssetSyncEngine
@@ -136,6 +138,14 @@ class VastService:
         self.runtime_configuration = runtime_configuration
         self.registry = registry
         self.identity_file = identity_file
+        self.huggingface_asset_registry = (
+            HuggingFaceAssetRegistry.for_user_directory(self.user_directory)
+        )
+        self.huggingface_asset_discovery = HuggingFaceAssetDiscovery(
+            registry=self.huggingface_asset_registry,
+            user_directory=self.user_directory,
+            comfyui_root=getattr(settings, "comfyui_root", None),
+        )
         self.lease_manager = VastLeaseManager(
             api_client=api_client,
             registry=registry,
@@ -497,9 +507,8 @@ class VastService:
                 storage_root=self.runtime_configuration.remote_storage_root,
             ),
             settings=vast_settings,
-            huggingface_asset_registry=(
-                HuggingFaceAssetRegistry.for_user_directory(self.user_directory)
-            ),
+            huggingface_asset_registry=self.huggingface_asset_registry,
+            huggingface_asset_discovery=self.huggingface_asset_discovery,
         )
 
     def executor(self) -> VastExecutorClient:
