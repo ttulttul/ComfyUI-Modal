@@ -1276,6 +1276,20 @@ def _execution_location_for_assignment(
     return _ssh_hostname(host.ssh_target) if host is not None else assignment.environment_id
 
 
+def _vast_provider_metadata(lease: Any) -> dict[str, Any]:
+    """Return credential-free lease details for execution and local status output."""
+    return {
+        "vast_instance_id": lease.instance_id,
+        "vast_profile_id": lease.profile_id,
+        "vast_profile_name": lease.profile_name,
+        "vast_gpu_name": lease.gpu_name,
+        "vast_gpu_count": lease.gpu_count,
+        "vast_gpu_ram_mb": lease.gpu_ram_mb,
+        "vast_hourly_cost_usd": lease.hourly_cost_usd,
+        "vast_idle_retention_seconds": lease.idle_retention_seconds,
+    }
+
+
 def _ensure_remote_sync_backend(
     settings: ModalSyncSettings,
     sync_engine: ModalAssetSyncEngine,
@@ -6671,14 +6685,9 @@ def rewrite_prompt_for_modal(
                 vast_leases_by_environment,
             ),
             (
-                {
-                    "vast_instance_id": vast_leases_by_environment[
-                        assignment.environment_id
-                    ].instance_id,
-                    "vast_idle_retention_seconds": vast_leases_by_environment[
-                        assignment.environment_id
-                    ].idle_retention_seconds,
-                }
+                _vast_provider_metadata(
+                    vast_leases_by_environment[assignment.environment_id]
+                )
                 if assignment.provider is ExecutionProvider.VAST
                 else None
             ),

@@ -28,28 +28,26 @@ class VastResourceProfile:
 
     profile_id: str
     profile_name: str
-    gpu_count: int = 1
-    minimum_gpu_ram_mb: int = 24 * 1024
-    minimum_total_flops: float = 0.0
-    minimum_cpu_ram_mb: int = 64 * 1024
-    minimum_cpu_cores: float = 8.0
+    gpu_count: int | None = None
+    minimum_gpu_ram_mb: int | None = None
+    minimum_total_flops: float | None = None
+    minimum_cpu_ram_mb: int | None = None
+    minimum_cpu_cores: float | None = None
     allocated_disk_gb: float = 200.0
-    maximum_hourly_cost_usd: float = 1.0
+    maximum_hourly_cost_usd: float | None = None
     idle_retention_seconds: float = VAST_DEFAULT_IDLE_RETENTION_HOURS * 3600
-    minimum_offer_duration_seconds: float = (
-        VAST_DEFAULT_MINIMUM_OFFER_DURATION_DAYS * 86400
-    )
-    minimum_reliability: float = 0.99
-    minimum_dlperf: float = 0.0
-    minimum_download_mb_per_second: float = 100.0
+    minimum_offer_duration_seconds: float | None = None
+    minimum_reliability: float | None = None
+    minimum_dlperf: float | None = None
+    minimum_download_mb_per_second: float | None = None
     minimum_cuda_version: float = 13.0
-    verified_only: bool = True
+    verified_only: bool = False
     allowed_geolocations: tuple[str, ...] = ()
     maximum_instances: int = 1
     rental_type: VastRentalType = VastRentalType.ON_DEMAND
 
     def __post_init__(self) -> None:
-        """Reject malformed or economically unsafe profile values."""
+        """Reject malformed profile values before querying the marketplace."""
         if not self.profile_id.strip():
             raise ValueError("Vast profile_id must not be empty.")
         if not _PROFILE_NAME_PATTERN.fullmatch(self.profile_name):
@@ -57,9 +55,18 @@ class VastResourceProfile:
                 "Vast profile_name must contain letters, digits, dots, underscores, "
                 "or hyphens and be at most 63 characters."
             )
-        _require_positive_int(self.gpu_count, "gpu_count")
-        _require_non_negative_int(self.minimum_gpu_ram_mb, "minimum_gpu_ram_mb")
-        _require_non_negative_int(self.minimum_cpu_ram_mb, "minimum_cpu_ram_mb")
+        if self.gpu_count is not None:
+            _require_positive_int(self.gpu_count, "gpu_count")
+        if self.minimum_gpu_ram_mb is not None:
+            _require_non_negative_int(
+                self.minimum_gpu_ram_mb,
+                "minimum_gpu_ram_mb",
+            )
+        if self.minimum_cpu_ram_mb is not None:
+            _require_non_negative_int(
+                self.minimum_cpu_ram_mb,
+                "minimum_cpu_ram_mb",
+            )
         _require_positive_int(self.maximum_instances, "maximum_instances")
         for field_name, value in (
             ("minimum_total_flops", self.minimum_total_flops),
@@ -75,13 +82,18 @@ class VastResourceProfile:
             ),
             ("minimum_cuda_version", self.minimum_cuda_version),
         ):
-            _require_finite_non_negative(value, field_name)
+            if value is not None:
+                _require_finite_non_negative(value, field_name)
         if self.allocated_disk_gb <= 0:
             raise ValueError("allocated_disk_gb must be positive.")
-        if self.maximum_hourly_cost_usd <= 0:
+        if (
+            self.maximum_hourly_cost_usd is not None
+            and self.maximum_hourly_cost_usd <= 0
+        ):
             raise ValueError("maximum_hourly_cost_usd must be positive.")
-        if not math.isfinite(self.minimum_reliability) or not (
-            0.0 <= self.minimum_reliability <= 1.0
+        if self.minimum_reliability is not None and (
+            not math.isfinite(self.minimum_reliability)
+            or not 0.0 <= self.minimum_reliability <= 1.0
         ):
             raise ValueError("minimum_reliability must be between 0 and 1.")
         if any(
@@ -112,23 +124,33 @@ class VastResourceProfile:
             "cpu_arch": {"eq": "amd64"},
             "gpu_frac": {"eq": 1.0},
             "gpu_display_active": {"eq": False},
-            "num_gpus": {"eq": self.gpu_count},
-            "gpu_ram": {"gte": self.minimum_gpu_ram_mb},
-            "cpu_ram": {"gte": self.minimum_cpu_ram_mb},
-            "cpu_cores_effective": {"gte": self.minimum_cpu_cores},
             "disk_space": {"gte": self.allocated_disk_gb},
             "allocated_storage": self.allocated_disk_gb,
-            "duration": {"gte": self.minimum_offer_duration_seconds},
-            "reliability": {"gte": self.minimum_reliability},
-            "inet_down": {"gte": self.minimum_download_mb_per_second},
             "cuda_max_good": {"gte": self.minimum_cuda_version},
             "direct_port_count": {"gte": 1},
-            "dph_total": {"lte": self.maximum_hourly_cost_usd},
             "order": [["dph_total", "asc"]],
         }
-        if self.minimum_total_flops:
+        if self.gpu_count is not None:
+            payload["num_gpus"] = {"eq": self.gpu_count}
+        if self.minimum_gpu_ram_mb is not None:
+            payload["gpu_ram"] = {"gte": self.minimum_gpu_ram_mb}
+        if self.minimum_cpu_ram_mb is not None:
+            payload["cpu_ram"] = {"gte": self.minimum_cpu_ram_mb}
+        if self.minimum_cpu_cores is not None:
+            payload["cpu_cores_effective"] = {"gte": self.minimum_cpu_cores}
+        if self.minimum_offer_duration_seconds is not None:
+            payload["duration"] = {"gte": self.minimum_offer_duration_seconds}
+        if self.minimum_reliability is not None:
+            payload["reliability"] = {"gte": self.minimum_reliability}
+        if self.minimum_download_mb_per_second is not None:
+            payload["inet_down"] = {
+                "gte": self.minimum_download_mb_per_second
+            }
+        if self.maximum_hourly_cost_usd is not None:
+            payload["dph_total"] = {"lte": self.maximum_hourly_cost_usd}
+        if self.minimum_total_flops is not None:
             payload["total_flops"] = {"gte": self.minimum_total_flops}
-        if self.minimum_dlperf:
+        if self.minimum_dlperf is not None:
             payload["dlperf"] = {"gte": self.minimum_dlperf}
         if self.verified_only:
             payload["verified"] = {"eq": True}
@@ -215,21 +237,28 @@ class VastOffer:
     def incompatibility_reason(self, profile: VastResourceProfile) -> str | None:
         """Return the first unmet hard constraint, if any."""
         checks: Sequence[tuple[bool, str]] = (
-            (self.num_gpus == profile.gpu_count, "GPU count does not match"),
             (
-                self.gpu_ram_mb >= profile.minimum_gpu_ram_mb,
+                profile.gpu_count is None or self.num_gpus == profile.gpu_count,
+                "GPU count does not match",
+            ),
+            (
+                profile.minimum_gpu_ram_mb is None
+                or self.gpu_ram_mb >= profile.minimum_gpu_ram_mb,
                 "insufficient GPU RAM",
             ),
             (
-                self.total_flops >= profile.minimum_total_flops,
+                profile.minimum_total_flops is None
+                or self.total_flops >= profile.minimum_total_flops,
                 "insufficient total TFLOPS",
             ),
             (
-                self.cpu_ram_mb >= profile.minimum_cpu_ram_mb,
+                profile.minimum_cpu_ram_mb is None
+                or self.cpu_ram_mb >= profile.minimum_cpu_ram_mb,
                 "insufficient CPU RAM",
             ),
             (
-                self.cpu_cores_effective >= profile.minimum_cpu_cores,
+                profile.minimum_cpu_cores is None
+                or self.cpu_cores_effective >= profile.minimum_cpu_cores,
                 "insufficient effective CPU cores",
             ),
             (
@@ -237,16 +266,23 @@ class VastOffer:
                 "insufficient disk space",
             ),
             (
-                self.duration_seconds >= profile.minimum_offer_duration_seconds,
+                profile.minimum_offer_duration_seconds is None
+                or self.duration_seconds >= profile.minimum_offer_duration_seconds,
                 "insufficient offer duration",
             ),
             (
-                self.reliability >= profile.minimum_reliability,
+                profile.minimum_reliability is None
+                or self.reliability >= profile.minimum_reliability,
                 "insufficient reliability",
             ),
-            (self.dlperf >= profile.minimum_dlperf, "insufficient DLPerf"),
             (
-                self.download_mb_per_second
+                profile.minimum_dlperf is None
+                or self.dlperf >= profile.minimum_dlperf,
+                "insufficient DLPerf",
+            ),
+            (
+                profile.minimum_download_mb_per_second is None
+                or self.download_mb_per_second
                 >= profile.minimum_download_mb_per_second,
                 "insufficient download bandwidth",
             ),
@@ -256,7 +292,8 @@ class VastOffer:
             ),
             (self.direct_port_count >= 1, "no direct SSH port is available"),
             (
-                self.hourly_cost_usd <= profile.maximum_hourly_cost_usd,
+                profile.maximum_hourly_cost_usd is None
+                or self.hourly_cost_usd <= profile.maximum_hourly_cost_usd,
                 "hourly price exceeds profile maximum",
             ),
         )

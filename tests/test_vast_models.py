@@ -37,6 +37,34 @@ def test_profile_builds_documented_hard_filter_payload(
     assert profile.environment_id == "vast:17"
 
 
+def test_any_profile_omits_every_optional_marketplace_filter(
+    vast_models_module: Any,
+) -> None:
+    """None-backed Any selectors should produce the broadest safe search."""
+    profile = vast_models_module.VastResourceProfile(
+        profile_id="any",
+        profile_name="any",
+    )
+
+    payload = profile.search_payload()
+
+    assert set(payload) == {
+        "limit",
+        "type",
+        "rentable",
+        "rented",
+        "gpu_arch",
+        "cpu_arch",
+        "gpu_frac",
+        "gpu_display_active",
+        "disk_space",
+        "allocated_storage",
+        "cuda_max_good",
+        "direct_port_count",
+        "order",
+    }
+
+
 def test_offer_ranking_is_price_first_and_deterministic(
     vast_models_module: Any,
 ) -> None:

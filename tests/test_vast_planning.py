@@ -149,3 +149,32 @@ def test_vast_only_policy_quotes_acquires_and_stamps_concrete_environment(
         "quote",
         "acquire",
     ]
+
+
+def test_vast_provider_metadata_exposes_safe_markdown_fields(
+    api_intercept_module: Any,
+) -> None:
+    """Proxy payloads should carry the non-secret GPU details used by STRING output."""
+    metadata = api_intercept_module._vast_provider_metadata(
+        SimpleNamespace(
+            instance_id=9001,
+            profile_id="17",
+            profile_name="broad",
+            gpu_name="H200 NVL",
+            gpu_count=1,
+            gpu_ram_mb=143771,
+            hourly_cost_usd=3.88,
+            idle_retention_seconds=3600,
+        )
+    )
+
+    assert metadata == {
+        "vast_instance_id": 9001,
+        "vast_profile_id": "17",
+        "vast_profile_name": "broad",
+        "vast_gpu_name": "H200 NVL",
+        "vast_gpu_count": 1,
+        "vast_gpu_ram_mb": 143771,
+        "vast_hourly_cost_usd": 3.88,
+        "vast_idle_retention_seconds": 3600,
+    }

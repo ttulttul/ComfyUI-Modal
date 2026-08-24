@@ -385,7 +385,10 @@ class VastService:
             capabilities=EnvironmentCapabilities(
                 architecture="x86_64",
                 operating_system="linux",
-                cpu_count=max(1, math.ceil(quote.profile.minimum_cpu_cores)),
+                cpu_count=max(
+                    1,
+                    math.ceil(quote.profile.minimum_cpu_cores or 1.0),
+                ),
                 total_ram_bytes=cpu_ram_mb * 1024**2,
                 available_ram_bytes=None,
                 available_disk_bytes=int(quote.profile.allocated_disk_gb * 1024**3),
@@ -492,15 +495,26 @@ def _profile_for_requirements(
     """Raise workflow profile memory floors to inferred component requirements."""
     return replace(
         profile,
-        minimum_gpu_ram_mb=max(
+        minimum_gpu_ram_mb=_raised_memory_floor_mb(
             profile.minimum_gpu_ram_mb,
-            math.ceil(minimum_vram_bytes / 1024**2),
+            minimum_vram_bytes,
         ),
-        minimum_cpu_ram_mb=max(
+        minimum_cpu_ram_mb=_raised_memory_floor_mb(
             profile.minimum_cpu_ram_mb,
-            math.ceil(minimum_ram_bytes / 1024**2),
+            minimum_ram_bytes,
         ),
     )
+
+
+def _raised_memory_floor_mb(
+    configured_floor_mb: int | None,
+    inferred_floor_bytes: int,
+) -> int | None:
+    """Apply an inferred requirement while preserving an unconstrained zero."""
+    inferred_floor_mb = math.ceil(inferred_floor_bytes / 1024**2)
+    if configured_floor_mb is None and inferred_floor_mb == 0:
+        return None
+    return max(configured_floor_mb or 0, inferred_floor_mb)
 
 
 __all__ = [

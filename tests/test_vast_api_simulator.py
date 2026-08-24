@@ -52,7 +52,7 @@ def test_client_search_create_poll_manage_and_destroy_lifecycle(
             offers = await client.search_offers(profile)
 
             assert account == {"id": 42, "credit": 100.0}
-            assert [offer.offer_id for offer in offers] == [1001, 1002]
+            assert [offer.offer_id for offer in offers] == [1001, 1002, 1003]
             launch = vast_models_module.VastInstanceLaunchSpec(
                 image="ghcr.io/example/worker:latest",
                 disk_gb=profile.allocated_disk_gb,
