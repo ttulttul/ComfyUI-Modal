@@ -39,6 +39,7 @@ REMOTE_EXECUTION_CONFIGURATOR_NODE_ID = "RemoteExecutionConfigurator"
 MODAL_REMOTE_CONFIGURATION_NODE_ID = "ModalRemoteConfiguration"
 VAST_REMOTE_CONFIGURATION_NODE_ID = "VastRemoteConfiguration"
 SSH_REMOTE_CONFIGURATION_NODE_ID = "SshRemoteConfiguration"
+REMOTE_CONFIGURATION_INPUT_GROUP = "configurations"
 REMOTE_CONFIGURATION_INPUT_PREFIX = "configuration_"
 REMOTE_CONFIGURATION_MAX_INPUTS = 32
 
@@ -245,7 +246,7 @@ class RemoteExecutionConfigurator(io.ComfyNode):
             ),
             inputs=[
                 io.Autogrow.Input(
-                    "configurations",
+                    REMOTE_CONFIGURATION_INPUT_GROUP,
                     template=configuration_template,
                 )
             ],
@@ -358,14 +359,7 @@ def compile_remote_configuration_set(
         raise ValueError(
             f"Remote Execution Configurator {configurator_id!r} has invalid inputs."
         )
-    connected_inputs = sorted(
-        (
-            (str(input_name), input_value)
-            for input_name, input_value in raw_inputs.items()
-            if str(input_name).startswith(REMOTE_CONFIGURATION_INPUT_PREFIX)
-        ),
-        key=lambda item: _configuration_input_sort_key(item[0]),
-    )
+    connected_inputs = _serialized_configuration_inputs(raw_inputs)
     if not connected_inputs:
         raise ValueError(
             "Remote Execution Configurator requires at least one connected "
@@ -401,6 +395,56 @@ def compile_remote_configuration_set(
             )
         )
     return RemoteConfigurationSet(tuple(configurations))
+
+
+def _serialized_configuration_inputs(
+    raw_inputs: Mapping[str, Any],
+) -> list[tuple[str, Any]]:
+    """Return Autogrow links from serialized or reconstructed input shapes."""
+    flattened_prefix = (
+        f"{REMOTE_CONFIGURATION_INPUT_GROUP}."
+        f"{REMOTE_CONFIGURATION_INPUT_PREFIX}"
+    )
+    candidates: list[tuple[str, str, Any]] = []
+    for raw_name, value in raw_inputs.items():
+        input_name = str(raw_name)
+        if input_name.startswith(flattened_prefix):
+            leaf_name = input_name.removeprefix(
+                f"{REMOTE_CONFIGURATION_INPUT_GROUP}."
+            )
+            candidates.append((leaf_name, input_name, value))
+            continue
+        if input_name.startswith(REMOTE_CONFIGURATION_INPUT_PREFIX):
+            candidates.append((input_name, input_name, value))
+            continue
+        if (
+            input_name == REMOTE_CONFIGURATION_INPUT_GROUP
+            and isinstance(value, Mapping)
+        ):
+            for nested_name, nested_value in value.items():
+                leaf_name = str(nested_name)
+                if not leaf_name.startswith(REMOTE_CONFIGURATION_INPUT_PREFIX):
+                    continue
+                candidates.append(
+                    (
+                        leaf_name,
+                        f"{REMOTE_CONFIGURATION_INPUT_GROUP}.{leaf_name}",
+                        nested_value,
+                    )
+                )
+
+    leaf_names = [leaf_name for leaf_name, _, _ in candidates]
+    if len(leaf_names) != len(set(leaf_names)):
+        raise ValueError(
+            "Remote Execution Configurator contains duplicate Autogrow input slots."
+        )
+    return [
+        (input_name, value)
+        for _, input_name, value in sorted(
+            candidates,
+            key=lambda item: _configuration_input_sort_key(item[0]),
+        )
+    ]
 
 
 def _configuration_link_source(input_name: str, value: Any) -> str:
@@ -474,6 +518,7 @@ __all__ = [
     "MODAL_REMOTE_CONFIGURATION_NODE_ID",
     "ModalConfiguration",
     "REMOTE_CONFIGURATION_IO_TYPE",
+    "REMOTE_CONFIGURATION_INPUT_GROUP",
     "REMOTE_CONFIGURATION_NODE_IDS",
     "REMOTE_CONFIGURATION_SET_IO_TYPE",
     "REMOTE_EXECUTION_CONFIGURATOR_NODE_ID",

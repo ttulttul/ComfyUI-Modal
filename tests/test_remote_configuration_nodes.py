@@ -80,10 +80,10 @@ def test_compiler_builds_two_modal_and_two_vast_configurations(
         "99": {
             "class_type": module.REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
             "inputs": {
-                "configuration_3": ["21", 0],
-                "configuration_1": ["11", 0],
-                "configuration_0": ["10", 0],
-                "configuration_2": ["20", 0],
+                "configurations.configuration_3": ["21", 0],
+                "configurations.configuration_1": ["11", 0],
+                "configurations.configuration_0": ["10", 0],
+                "configurations.configuration_2": ["20", 0],
             },
         },
     }
@@ -102,6 +102,46 @@ def test_compiler_builds_two_modal_and_two_vast_configurations(
         configuration.capacity_limit
         for configuration in configuration_set.configurations
     ] == [1, 2, 3, 2]
+
+
+def test_compiler_accepts_reconstructed_autogrow_input_mapping(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """The runtime-style nested mapping should compile like queue-time paths."""
+    module = remote_configuration_nodes_module
+    prompt = {
+        "10": {
+            "class_type": module.MODAL_REMOTE_CONFIGURATION_NODE_ID,
+            "inputs": {
+                "configuration_name": "modal-t4",
+                "gpu_type": "T4",
+            },
+        },
+        "11": {
+            "class_type": module.MODAL_REMOTE_CONFIGURATION_NODE_ID,
+            "inputs": {
+                "configuration_name": "modal-h200",
+                "gpu_type": "H200",
+            },
+        },
+        "99": {
+            "class_type": module.REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
+            "inputs": {
+                "configurations": {
+                    "configuration_0": ["10", 0],
+                    "configuration_1": ["11", 0],
+                }
+            },
+        },
+    }
+
+    configuration_set = module.compile_remote_configuration_set(prompt)
+
+    assert configuration_set is not None
+    assert [
+        configuration.display_name
+        for configuration in configuration_set.configurations
+    ] == ["modal-t4", "modal-h200"]
 
 
 def test_compiler_builds_workflow_declared_ssh_host_without_credentials(
