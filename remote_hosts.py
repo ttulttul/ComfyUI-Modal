@@ -137,6 +137,7 @@ class SshHostConfig:
                 )
             ),
             capabilities=capabilities,
+            unavailable_reason=self.last_error,
             tags=self.tags,
             maximum_workers=self.maximum_workers,
         )

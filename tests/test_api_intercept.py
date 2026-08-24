@@ -185,6 +185,10 @@ def test_auto_placement_selects_every_eligible_prompt_node(
         "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
         "3": {"class_type": "ModalEndpointChat", "inputs": {}},
         "4": {"class_type": "VastAILeaseConfiguration", "inputs": {}},
+        "5": {"class_type": "ModalRemoteConfiguration", "inputs": {}},
+        "6": {"class_type": "VastRemoteConfiguration", "inputs": {}},
+        "7": {"class_type": "SshRemoteConfiguration", "inputs": {}},
+        "8": {"class_type": "RemoteExecutionConfigurator", "inputs": {}},
     }
     workflow = {
         "extra": {

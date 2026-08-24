@@ -119,6 +119,18 @@ def execution_environments_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def remote_configurations_module(extension_package: object) -> object:
+    """Return workflow-declared remote configuration models."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote_configurations")
+
+
+@pytest.fixture(scope="session")
+def remote_configuration_nodes_module(extension_package: object) -> object:
+    """Return the workflow remote configuration v3 nodes and compiler."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote_configuration_nodes")
+
+
+@pytest.fixture(scope="session")
 def execution_history_module(extension_package: object) -> object:
     """Return the persistent remote execution timing history module."""
     return importlib.import_module(f"{PACKAGE_NAME}.execution_history")

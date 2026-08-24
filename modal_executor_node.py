@@ -169,12 +169,12 @@ class RemoteExecutorRouterClient:
 
         settings = get_settings()
         user_directory = discover_comfyui_user_directory(settings)
-        if user_directory is None:
-            raise RuntimeError(
-                "SSH execution requires a persistent ComfyUI user directory."
-            )
         return SshDockerExecutorClient(
-            registry=RemoteHostRegistry.for_user_directory(user_directory),
+            registry=(
+                RemoteHostRegistry.for_user_directory(user_directory)
+                if user_directory is not None
+                else None
+            ),
             repo_root=Path(__file__).resolve().parent,
             settings=settings,
         )

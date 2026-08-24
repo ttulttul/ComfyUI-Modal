@@ -3,7 +3,8 @@ import { PromptExecutionError, api } from "../../scripts/api.js";
 import { openRemoteEnvironmentManager } from "./remote_environments.js";
 
 const REMOTE_PROPERTY = "is_modal_remote";
-const REMOTE_WIDGET_NAME = "Run on Modal";
+const REMOTE_WIDGET_NAME = "Run Remotely";
+const LEGACY_REMOTE_WIDGET_NAME = "Run on Modal";
 const MODAL_ROUTE = "/modal/queue_prompt";
 const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
 const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/progress_state");
@@ -13,7 +14,14 @@ const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delet
 const COMFY_QUEUE_ROUTE = "/queue";
 const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
-const LOCAL_MODAL_NODE_IDS = new Set(["ModalEndpointChat", "VastAILeaseConfiguration"]);
+const LOCAL_MODAL_NODE_IDS = new Set([
+  "ModalEndpointChat",
+  "VastAILeaseConfiguration",
+  "ModalRemoteConfiguration",
+  "VastRemoteConfiguration",
+  "SshRemoteConfiguration",
+  "RemoteExecutionConfigurator",
+]);
 const WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal";
 const WORKFLOW_MODAL_GPU_KEY = "gpu";
 const WORKFLOW_REMOTE_CONFIG_KEY = "remote_execution";
@@ -2908,11 +2916,24 @@ function effectiveRemoteNodeIds(prompt, workflow) {
  * @returns {boolean}
  */
 function serializedRemoteFlag(node) {
-  const namedWidgetValue = node?.widgets_values_named?.[REMOTE_WIDGET_NAME];
+  const namedWidgetValue =
+    node?.widgets_values_named?.[REMOTE_WIDGET_NAME]
+    ?? node?.widgets_values_named?.[LEGACY_REMOTE_WIDGET_NAME];
   if (typeof namedWidgetValue === "boolean") {
     return namedWidgetValue;
   }
   return Boolean(node?.properties?.[REMOTE_PROPERTY]);
+}
+
+/** Return whether the live workflow uses connected configuration capacity. */
+function usesRemoteExecutionConfigurator() {
+  return Boolean(
+    findSomethingInAllSubgraphs((graph) =>
+      (graph?.nodes ?? []).find(
+        (node) => String(node?.comfyClass ?? node?.type ?? "") === "RemoteExecutionConfigurator",
+      ),
+    ),
+  );
 }
 
 /**
@@ -3401,6 +3422,7 @@ function installModalContextMenu(nodeType, nodeData) {
         : "Disable on Upstream Nodes";
     if (!targetOptions.some((option) => option?.content === "Remote Execution")) {
       const executionPreferences = selectedExecutionPreferences();
+      const configuredCapacity = usesRemoteExecutionConfigurator();
       const executionPolicyLabel =
         EXECUTION_POLICIES.find(([value]) => value === executionPreferences.policy)?.[1]
         ?? executionPreferences.policy;
@@ -3409,15 +3431,22 @@ function installModalContextMenu(nodeType, nodeData) {
         has_submenu: true,
         submenu: {
           options: [
-            {
-              content: `Provider policy (${executionPolicyLabel})`,
-              disabled: true,
-            },
-            ...EXECUTION_POLICIES.map(([value, label]) => ({
-              content: label,
-              checked: executionPreferences.policy === value,
-              callback: () => setExecutionPreferences({ policy: value }),
-            })),
+            ...(configuredCapacity
+              ? [{
+                content: "Providers and capacity come from Remote Execution Configurator",
+                disabled: true,
+              }]
+              : [
+                {
+                  content: `Legacy provider policy (${executionPolicyLabel})`,
+                  disabled: true,
+                },
+                ...EXECUTION_POLICIES.map(([value, label]) => ({
+                  content: label,
+                  checked: executionPreferences.policy === value,
+                  callback: () => setExecutionPreferences({ policy: value }),
+                })),
+              ]),
             null,
             {
               content: "Automatically place eligible nodes",
@@ -3440,23 +3469,28 @@ function installModalContextMenu(nodeType, nodeData) {
         },
       });
     }
-    if (!targetOptions.some((option) => option?.content === "Modal")) {
+    if (!targetOptions.some((option) => option?.content === "Remote Execution Tools")) {
       const currentModalGpu = selectedModalGpu();
+      const configuredCapacity = usesRemoteExecutionConfigurator();
       targetOptions.push(null, {
-        content: "Modal",
+        content: "Remote Execution Tools",
         has_submenu: true,
         submenu: {
           options: [
-            {
-              content: `GPU (${currentModalGpu})`,
-              disabled: true,
-            },
-            ...MODAL_GPU_TYPES.map((modalGpu) => ({
-              content: modalGpu,
-              checked: modalGpu === currentModalGpu,
-              callback: () => setSelectedModalGpu(modalGpu),
-            })),
-            null,
+            ...(configuredCapacity
+              ? []
+              : [
+                {
+                  content: `Legacy Modal GPU (${currentModalGpu})`,
+                  disabled: true,
+                },
+                ...MODAL_GPU_TYPES.map((modalGpu) => ({
+                  content: modalGpu,
+                  checked: modalGpu === currentModalGpu,
+                  callback: () => setSelectedModalGpu(modalGpu),
+                })),
+                null,
+              ]),
             {
               content: enableUpstreamMenuItemLabel,
               callback: () => {

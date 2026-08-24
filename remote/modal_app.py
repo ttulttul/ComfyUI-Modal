@@ -2,7 +2,7 @@
 
 import asyncio
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -187,9 +187,15 @@ def _settings_for_payload(payload: Mapping[str, Any]) -> ModalSyncSettings:
     """Resolve settings with the workflow-selected GPU carried by one payload."""
     settings = get_settings()
     modal_gpu = payload.get("modal_gpu")
-    if modal_gpu is None:
+    if modal_gpu is not None:
+        settings = settings_for_modal_gpu(settings, modal_gpu)
+    raw_max_containers = payload.get("modal_max_containers")
+    if raw_max_containers is None:
         return settings
-    return settings_for_modal_gpu(settings, modal_gpu)
+    max_containers = int(raw_max_containers)
+    if max_containers <= 0:
+        raise ValueError("modal_max_containers must be positive.")
+    return replace(settings, max_containers=max_containers)
 
 
 @contextmanager

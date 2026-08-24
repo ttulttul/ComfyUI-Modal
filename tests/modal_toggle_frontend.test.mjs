@@ -1195,7 +1195,7 @@ const remoteExecutionMenu = menuOptions.find(
   (option) => option?.content === "Remote Execution",
 );
 const providerPolicyHeading = remoteExecutionMenu.submenu.options.find(
-  (option) => option?.content === "Provider policy (Modal only)",
+  (option) => option?.content === "Legacy provider policy (Modal only)",
 );
 assert.equal(providerPolicyHeading.disabled, true);
 assert.equal(providerPolicyHeading.has_submenu, undefined);
@@ -1217,9 +1217,11 @@ vastPolicyOption.callback();
 assert.equal(workflowGraph.extra.remote_execution.policy, "vast");
 assert.equal(workflowGraph.changeCount, 2);
 
-const modalMenu = menuOptions.find((option) => option?.content === "Modal");
+const modalMenu = menuOptions.find(
+  (option) => option?.content === "Remote Execution Tools",
+);
 const gpuHeading = modalMenu.submenu.options.find(
-  (option) => option?.content === "GPU (B300)",
+  (option) => option?.content === "Legacy Modal GPU (B300)",
 );
 assert.equal(gpuHeading.disabled, true);
 assert.equal(gpuHeading.has_submenu, undefined);
@@ -1236,3 +1238,37 @@ assert.equal(
 modalMenu.submenu.options.find((option) => option?.content === "L40S").callback();
 assert.equal(workflowGraph.extra.comfy_modal.gpu, "L40S");
 assert.equal(workflowGraph.changeCount, 3);
+
+const configuratorNode = { id: 102, comfyClass: "RemoteExecutionConfigurator" };
+workflowGraph.nodes.push(configuratorNode);
+class ConfiguredMenuNode {}
+const configuredMenuNode = new ConfiguredMenuNode();
+configuredMenuNode.id = 103;
+configuredMenuNode.graph = workflowGraph;
+workflowGraph.nodes.push(configuredMenuNode);
+modalToggle.installModalContextMenu(ConfiguredMenuNode, { name: "KSampler" });
+const configuredMenuOptions = [];
+configuredMenuNode.getExtraMenuOptions(null, configuredMenuOptions);
+const configuredRemoteMenu = configuredMenuOptions.find(
+  (option) => option?.content === "Remote Execution",
+);
+assert.equal(
+  configuredRemoteMenu.submenu.options[0].content,
+  "Providers and capacity come from Remote Execution Configurator",
+);
+assert.equal(configuredRemoteMenu.submenu.options[0].disabled, true);
+assert.equal(
+  configuredRemoteMenu.submenu.options.some(
+    (option) => option?.content === "Modal only",
+  ),
+  false,
+);
+const configuredToolsMenu = configuredMenuOptions.find(
+  (option) => option?.content === "Remote Execution Tools",
+);
+assert.equal(
+  configuredToolsMenu.submenu.options.some(
+    (option) => modalToggle.MODAL_GPU_TYPES.includes(option?.content),
+  ),
+  false,
+);

@@ -17,7 +17,7 @@ if __package__:
         llm_model_references_from_payload,
         rewrite_llm_model_references,
     )
-    from .remote_hosts import RemoteHostRegistry
+    from .remote_hosts import RemoteHostRegistry, SshHostConfig
     from .remote_protocol import (
         RemoteFrameKind,
         RemoteProtocolError,
@@ -36,7 +36,7 @@ else:  # pragma: no cover - top-level remote imports.
         llm_model_references_from_payload,
         rewrite_llm_model_references,
     )
-    from remote_hosts import RemoteHostRegistry
+    from remote_hosts import RemoteHostRegistry, SshHostConfig
     from remote_protocol import (
         RemoteFrameKind,
         RemoteProtocolError,
@@ -72,7 +72,7 @@ class SshRemoteTransportError(SshRemoteInvocationError):
 class SshDockerExecutorClient:
     """Execute serialized ComfyUI components on one configured SSH host."""
 
-    registry: RemoteHostRegistry
+    registry: RemoteHostRegistry | None
     repo_root: Path
     settings: ModalSyncSettings | None = None
 
@@ -479,7 +479,26 @@ class SshDockerExecutorClient:
             raise SshRemoteInvocationError(
                 "SSH execution payload is missing execution_environment_id."
             )
-        host = self.registry.get_host(environment_id)
+        raw_host = payload.get("ssh_host_config")
+        if isinstance(raw_host, Mapping):
+            try:
+                host = SshHostConfig.from_dict(raw_host)
+            except (TypeError, ValueError) as exc:
+                raise SshRemoteInvocationError(
+                    "SSH execution payload contains an invalid workflow host "
+                    f"configuration: {exc}"
+                ) from exc
+            if host.environment_id != environment_id:
+                raise SshRemoteInvocationError(
+                    "SSH execution payload environment identity does not match its "
+                    "workflow host configuration."
+                )
+        else:
+            if self.registry is None:
+                raise SshRemoteInvocationError(
+                    "Legacy SSH execution requires a persistent host registry."
+                )
+            host = self.registry.get_host(environment_id)
         if not host.enabled or host.draining:
             raise SshRemoteInvocationError(
                 f"SSH execution environment {environment_id!r} is not accepting work."

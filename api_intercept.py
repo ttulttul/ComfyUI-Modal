@@ -69,6 +69,17 @@ from .sync_engine import (
     resolve_model_path,
 )
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
+from .remote_configuration_nodes import (
+    REMOTE_CONFIGURATION_NODE_IDS,
+    compile_remote_configuration_set,
+)
+from .remote_configurations import (
+    ModalRemoteConfiguration,
+    RemoteConfiguration,
+    RemoteConfigurationSet,
+    SshRemoteConfiguration,
+    VastRemoteConfiguration,
+)
 from .ssh_docker import SshDockerController, SshDockerVolumeBackend
 from .vast_config_node import extract_vast_profiles
 from .vast_service import VastProfileQuote, VastSearchRequirements, VastService
@@ -83,11 +94,13 @@ _MODAL_UI_EVENT_LIMIT_PER_CLIENT = 512
 _MODAL_UI_EVENTS_LOCK = threading.Lock()
 _MODAL_UI_EVENTS_BY_CLIENT: dict[str, deque[dict[str, Any]]] = {}
 _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR = "__comfy_modal_interrupt_queue_bridge_installed"
-_REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
+_REMOTE_TOGGLE_WIDGET_NAME = "Run Remotely"
+_LEGACY_REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
 _LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
     {
         "ModalEndpointChat",
         "VastAILeaseConfiguration",
+        *REMOTE_CONFIGURATION_NODE_IDS,
         MODAL_ARTIFACT_FINALIZER_NODE_ID,
         MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
         MODAL_MAP_INPUT_NODE_ID,
@@ -289,6 +302,24 @@ class RewriteSummary:
     custom_nodes_bundles_by_environment: dict[str, SyncedAsset | None] = field(
         default_factory=dict
     )
+    remote_configurations: list[dict[str, Any]] = field(default_factory=list)
+    execution_locations_by_environment: dict[str, str] = field(
+        default_factory=dict
+    )
+
+
+@dataclass
+class ComponentExecutionPlan:
+    """Hold assignments and prepared provider state for one prompt rewrite."""
+
+    assignments: dict[str, ExecutionAssignment]
+    configuration_set: RemoteConfigurationSet | None = None
+    configurations_by_id: dict[str, RemoteConfiguration] = field(
+        default_factory=dict
+    )
+    ssh_hosts_by_id: dict[str, SshHostConfig] = field(default_factory=dict)
+    vast_service: VastService | None = None
+    vast_leases_by_environment: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -400,6 +431,24 @@ def _modal_environment_state(settings: ModalSyncSettings) -> EnvironmentScheduli
         cost_usd_per_second=_MODAL_GPU_COST_USD_PER_SECOND.get(modal_gpu),
         capabilities=capabilities,
         maximum_workers=settings.max_containers or 1,
+    )
+
+
+def _modal_configuration_environment_state(
+    configuration: ModalRemoteConfiguration,
+    settings: ModalSyncSettings,
+) -> EnvironmentSchedulingState:
+    """Return one scheduler state for a workflow-declared Modal capacity pool."""
+    selected_settings = settings_for_modal_gpu(settings, configuration.gpu_type)
+    base_state = _modal_environment_state(selected_settings)
+    return replace(
+        base_state,
+        environment_id=(
+            f"modal:{configuration.configuration_id}:{configuration.gpu_type}"
+        ),
+        configuration_id=configuration.configuration_id,
+        display_name=configuration.display_name,
+        maximum_workers=configuration.instance_count,
     )
 
 
@@ -832,6 +881,34 @@ def _reprobe_reclaimed_ssh_host(
     )
 
 
+def _probe_workflow_ssh_configuration(
+    configuration: SshRemoteConfiguration,
+) -> SshHostConfig:
+    """Probe one workflow-declared SSH host without mutating the global registry."""
+    host = configuration.host
+    try:
+        capabilities = SshDockerController(host).probe_capabilities()
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Workflow SSH environment probe failed configuration=%s environment=%s: %s",
+            configuration.display_name,
+            host.environment_id,
+            exc,
+        )
+        return replace(
+            host,
+            capabilities=None,
+            health=EnvironmentHealth.UNAVAILABLE,
+            last_error=str(exc),
+        )
+    return replace(
+        host,
+        capabilities=capabilities,
+        health=EnvironmentHealth.READY,
+        last_error=None,
+    )
+
+
 def _optional_scheduler_choice(
     scheduler: CostAwareEnvironmentScheduler,
     environments: list[EnvironmentSchedulingState],
@@ -1186,6 +1263,486 @@ def _plan_component_execution_assignments(
     return assignments
 
 
+def _plan_component_execution(
+    *,
+    components: list[RemoteComponentPlan],
+    prompt: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+    settings: ModalSyncSettings,
+) -> ComponentExecutionPlan:
+    """Plan through connected configurations or synthesize the legacy behavior."""
+    try:
+        configuration_set = compile_remote_configuration_set(prompt)
+    except (TypeError, ValueError) as exc:
+        raise ModalPromptValidationError(str(exc)) from exc
+    if configuration_set is None:
+        return ComponentExecutionPlan(
+            assignments=_plan_component_execution_assignments(
+                components=components,
+                prompt=prompt,
+                workflow=workflow,
+                settings=settings,
+            )
+        )
+    return _plan_configured_component_execution(
+        components=components,
+        prompt=prompt,
+        workflow=workflow,
+        settings=settings,
+        configuration_set=configuration_set,
+    )
+
+
+def _plan_configured_component_execution(
+    *,
+    components: list[RemoteComponentPlan],
+    prompt: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+    settings: ModalSyncSettings,
+    configuration_set: RemoteConfigurationSet,
+) -> ComponentExecutionPlan:
+    """Resolve and prepare a capacity-aware plan from connected configurations."""
+    configurations_by_id = {
+        configuration.configuration_id: configuration
+        for configuration in configuration_set.configurations
+    }
+    ssh_hosts_by_id = _probe_configured_ssh_hosts(configuration_set)
+    vast_service, vast_unavailable_reason = _configured_vast_service(
+        configuration_set,
+        settings,
+    )
+    requirements_by_component = _configured_component_requirements(
+        components=components,
+        prompt=prompt,
+        workflow=workflow,
+        settings=settings,
+    )
+    _prefetch_configured_vast_offers(
+        configuration_set=configuration_set,
+        requirements_by_component=requirements_by_component,
+        vast_service=vast_service,
+    )
+    environments_by_component, vast_quotes = _configured_candidate_environments(
+        configuration_set=configuration_set,
+        requirements_by_component=requirements_by_component,
+        settings=settings,
+        ssh_hosts_by_id=ssh_hosts_by_id,
+        vast_service=vast_service,
+        vast_unavailable_reason=vast_unavailable_reason,
+    )
+    _apply_historical_execution_estimates(
+        components=components,
+        environments_by_component=environments_by_component,
+        requirements_by_component=requirements_by_component,
+        prompt=prompt,
+        settings=settings,
+    )
+    execution_stages = _component_execution_stages(
+        dict(prompt),
+        {
+            component.representative_node_id: set(component.node_ids)
+            for component in components
+        },
+    )
+    try:
+        assignments = CostAwareEnvironmentScheduler().plan(
+            execution_stages=execution_stages,
+            environments_by_component=environments_by_component,
+            requirements_by_component=requirements_by_component,
+        )
+    except NoCompatibleExecutionEnvironmentError as exc:
+        raise ModalPromptValidationError(str(exc)) from exc
+
+    vast_leases = _prepare_selected_vast_capacity(
+        assignments=assignments,
+        configuration_set=configuration_set,
+        requirements_by_component=requirements_by_component,
+        vast_quotes=vast_quotes,
+        vast_service=vast_service,
+    )
+    return ComponentExecutionPlan(
+        assignments=assignments,
+        configuration_set=configuration_set,
+        configurations_by_id=configurations_by_id,
+        ssh_hosts_by_id=ssh_hosts_by_id,
+        vast_service=vast_service,
+        vast_leases_by_environment=vast_leases,
+    )
+
+
+def _probe_configured_ssh_hosts(
+    configuration_set: RemoteConfigurationSet,
+) -> dict[str, SshHostConfig]:
+    """Probe all workflow-declared SSH hosts concurrently."""
+    ssh_configurations = [
+        configuration
+        for configuration in configuration_set.configurations
+        if isinstance(configuration, SshRemoteConfiguration)
+    ]
+    if not ssh_configurations:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(8, len(ssh_configurations))) as executor:
+        probed_hosts = {
+            configuration.configuration_id: future.result()
+            for configuration, future in (
+                (
+                    configuration,
+                    executor.submit(
+                        _probe_workflow_ssh_configuration,
+                        configuration,
+                    ),
+                )
+                for configuration in ssh_configurations
+            )
+        }
+    return probed_hosts
+
+
+def _configured_vast_service(
+    configuration_set: RemoteConfigurationSet,
+    settings: ModalSyncSettings,
+) -> tuple[VastService | None, str | None]:
+    """Construct one Vast service only when the connected graph requests it."""
+    vast_configured = any(
+        isinstance(configuration, VastRemoteConfiguration)
+        for configuration in configuration_set.configurations
+    )
+    if not vast_configured:
+        return None, None
+    try:
+        return (
+            VastService.from_environment(
+                settings,
+                repo_root=Path(__file__).resolve().parent,
+            ),
+            None,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        has_fallback_provider = any(
+            not isinstance(configuration, VastRemoteConfiguration)
+            for configuration in configuration_set.configurations
+        )
+        if not has_fallback_provider:
+            raise ModalPromptValidationError(str(exc)) from exc
+        logger.warning(
+            "Skipping unavailable workflow Vast.ai capacity because another "
+            "configured provider can be planned: %s",
+            exc,
+        )
+        return None, str(exc)
+
+
+def _configured_component_requirements(
+    *,
+    components: list[RemoteComponentPlan],
+    prompt: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+    settings: ModalSyncSettings,
+) -> dict[str, ComponentResourceRequirements]:
+    """Build provider-neutral requirements for every remote component."""
+    preferences = WorkflowExecutionPreferences.from_workflow(workflow)
+    resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
+    requirements: dict[str, ComponentResourceRequirements] = {}
+    for component in components:
+        memory_estimate = _component_memory_estimate(
+            component,
+            prompt,
+            preferences,
+            settings,
+            resolved_llm_profiles,
+        )
+        component_id = component.representative_node_id
+        requirements[component_id] = ComponentResourceRequirements(
+            minimum_vram_bytes=memory_estimate.minimum_vram_bytes,
+            minimum_ram_bytes=memory_estimate.minimum_ram_bytes,
+            gpu_required=True,
+            architecture="x86_64",
+            estimated_execution_seconds=60.0,
+            preferred_environment_ids=preferences.preferred_environment_ids,
+            required_provider=_component_required_provider(
+                component,
+                prompt,
+                resolved_llm_profiles,
+            ),
+        )
+    return requirements
+
+
+def _configured_candidate_environments(
+    *,
+    configuration_set: RemoteConfigurationSet,
+    requirements_by_component: Mapping[str, ComponentResourceRequirements],
+    settings: ModalSyncSettings,
+    ssh_hosts_by_id: Mapping[str, SshHostConfig],
+    vast_service: VastService | None,
+    vast_unavailable_reason: str | None,
+) -> tuple[
+    dict[str, list[EnvironmentSchedulingState]],
+    dict[tuple[str, str], VastProfileQuote],
+]:
+    """Resolve candidate pool states for every component without acquiring capacity."""
+    candidates: dict[str, list[EnvironmentSchedulingState]] = {
+        component_id: [] for component_id in requirements_by_component
+    }
+    vast_quotes: dict[tuple[str, str], VastProfileQuote] = {}
+    for component_id, requirements in requirements_by_component.items():
+        for configuration in configuration_set.configurations:
+            state, quote = _configured_candidate_environment(
+                configuration=configuration,
+                requirements=requirements,
+                settings=settings,
+                ssh_hosts_by_id=ssh_hosts_by_id,
+                vast_service=vast_service,
+                vast_unavailable_reason=vast_unavailable_reason,
+            )
+            if state is not None:
+                candidates[component_id].append(state)
+            if quote is not None:
+                vast_quotes[(component_id, configuration.configuration_id)] = quote
+    return candidates, vast_quotes
+
+
+def _prefetch_configured_vast_offers(
+    *,
+    configuration_set: RemoteConfigurationSet,
+    requirements_by_component: Mapping[str, ComponentResourceRequirements],
+    vast_service: VastService | None,
+) -> None:
+    """Warm distinct Vast searches in parallel before deterministic planning."""
+    if vast_service is None:
+        return
+    profiles = [
+        configuration.profile
+        for configuration in configuration_set.configurations
+        if isinstance(configuration, VastRemoteConfiguration)
+    ]
+    prefetch = getattr(vast_service, "prefetch_offers_sync", None)
+    if not callable(prefetch):
+        return
+    try:
+        prefetch(
+            profiles,
+            tuple(
+                VastSearchRequirements(
+                    minimum_vram_bytes=requirements.minimum_vram_bytes,
+                    minimum_ram_bytes=requirements.minimum_ram_bytes,
+                )
+                for requirements in requirements_by_component.values()
+            ),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Unable to prefetch configured Vast.ai marketplace offers: %s",
+            exc,
+        )
+
+
+def _configured_candidate_environment(
+    *,
+    configuration: RemoteConfiguration,
+    requirements: ComponentResourceRequirements,
+    settings: ModalSyncSettings,
+    ssh_hosts_by_id: Mapping[str, SshHostConfig],
+    vast_service: VastService | None,
+    vast_unavailable_reason: str | None,
+) -> tuple[EnvironmentSchedulingState | None, VastProfileQuote | None]:
+    """Resolve one configuration as a candidate for one component."""
+    if isinstance(configuration, ModalRemoteConfiguration):
+        return _modal_configuration_environment_state(configuration, settings), None
+    if isinstance(configuration, SshRemoteConfiguration):
+        host = ssh_hosts_by_id[configuration.configuration_id]
+        return replace(
+            host.scheduling_state(),
+            configuration_id=configuration.configuration_id,
+            display_name=configuration.display_name,
+        ), None
+    if not isinstance(configuration, VastRemoteConfiguration):
+        raise TypeError(
+            f"Unsupported remote configuration type {type(configuration).__name__}."
+        )
+    if vast_service is None:
+        return EnvironmentSchedulingState(
+            environment_id=f"vast:{configuration.configuration_id}",
+            provider=ExecutionProvider.VAST,
+            enabled=True,
+            health=EnvironmentHealth.UNAVAILABLE,
+            cost_usd_per_second=None,
+            capabilities=None,
+            configuration_id=configuration.configuration_id,
+            display_name=configuration.display_name,
+            unavailable_reason=(
+                vast_unavailable_reason
+                or "Vast.ai controller is unavailable."
+            ),
+            maximum_workers=configuration.capacity_limit,
+        ), None
+    try:
+        quote = vast_service.quote_best_profile_sync(
+            [configuration.profile],
+            minimum_vram_bytes=requirements.minimum_vram_bytes,
+            minimum_ram_bytes=requirements.minimum_ram_bytes,
+            predicted_execution_seconds=requirements.estimated_execution_seconds,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Vast configuration has no candidate configuration=%s: %s",
+            configuration.display_name,
+            exc,
+        )
+        return EnvironmentSchedulingState(
+            environment_id=f"vast:{configuration.configuration_id}",
+            provider=ExecutionProvider.VAST,
+            enabled=True,
+            health=EnvironmentHealth.UNAVAILABLE,
+            cost_usd_per_second=None,
+            capabilities=None,
+            configuration_id=configuration.configuration_id,
+            display_name=configuration.display_name,
+            unavailable_reason=str(exc),
+            maximum_workers=configuration.capacity_limit,
+        ), None
+    state = vast_service.scheduling_state(quote)
+    return replace(
+        state,
+        environment_id=f"vast:{configuration.configuration_id}",
+        configuration_id=configuration.configuration_id,
+        display_name=configuration.display_name,
+        maximum_workers=configuration.capacity_limit,
+    ), quote
+
+
+def _apply_historical_execution_estimates(
+    *,
+    components: list[RemoteComponentPlan],
+    environments_by_component: Mapping[str, list[EnvironmentSchedulingState]],
+    requirements_by_component: dict[str, ComponentResourceRequirements],
+    prompt: Mapping[str, Any],
+    settings: ModalSyncSettings,
+) -> None:
+    """Add environment-specific historical timing estimates in place."""
+    history = _execution_history(settings)
+    if history is None:
+        return
+    for component in components:
+        component_id = component.representative_node_id
+        environment_ids = [
+            environment.environment_id
+            for environment in environments_by_component.get(component_id, [])
+        ]
+        estimates = history.estimates(
+            _component_execution_signature(component, prompt),
+            environment_ids,
+        )
+        requirements_by_component[component_id] = replace(
+            requirements_by_component[component_id],
+            estimated_execution_seconds_by_environment={
+                environment_id: estimate.execution_seconds
+                for environment_id, estimate in estimates.items()
+            },
+        )
+
+
+def _prepare_selected_vast_capacity(
+    *,
+    assignments: dict[str, ExecutionAssignment],
+    configuration_set: RemoteConfigurationSet,
+    requirements_by_component: Mapping[str, ComponentResourceRequirements],
+    vast_quotes: Mapping[tuple[str, str], VastProfileQuote],
+    vast_service: VastService | None,
+) -> dict[str, Any]:
+    """Acquire only Vast slots selected by the completed provider-neutral plan."""
+    selected_slots: dict[tuple[str, int], list[str]] = defaultdict(list)
+    for component_id, assignment in assignments.items():
+        if assignment.provider is not ExecutionProvider.VAST:
+            continue
+        if assignment.configuration_id is None:
+            raise ModalPromptValidationError(
+                "Vast assignment is missing its configuration identity."
+            )
+        selected_slots[
+            (assignment.configuration_id, assignment.capacity_slot_index)
+        ].append(component_id)
+    if not selected_slots:
+        return {}
+    if vast_service is None:
+        raise ModalPromptValidationError(
+            "Vast capacity was selected without an initialized Vast service."
+        )
+
+    configurations_by_id = {
+        configuration.configuration_id: configuration
+        for configuration in configuration_set.configurations
+        if isinstance(configuration, VastRemoteConfiguration)
+    }
+    leases_by_environment: dict[str, Any] = {}
+    for (configuration_id, slot_index), component_ids in sorted(selected_slots.items()):
+        configuration = configurations_by_id[configuration_id]
+        quote = _quote_selected_vast_slot(
+            configuration=configuration,
+            component_ids=component_ids,
+            requirements_by_component=requirements_by_component,
+            vast_quotes=vast_quotes,
+            vast_service=vast_service,
+        )
+        try:
+            lease = vast_service.acquire_sync(quote, slot=slot_index)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ModalPromptValidationError(
+                f"Unable to acquire Vast.ai capacity for configuration "
+                f"{configuration.display_name!r} slot {slot_index}: {exc}"
+            ) from exc
+        leases_by_environment[lease.environment_id] = lease
+        cost_share = quote.predicted_incremental_cost_usd / len(component_ids)
+        for component_id in component_ids:
+            assignment = assignments[component_id]
+            assignments[component_id] = replace(
+                assignment,
+                environment_id=lease.environment_id,
+                predicted_cost_usd=cost_share,
+                reasons=assignment.reasons
+                + (
+                    f"Vast profile {configuration.display_name}",
+                    f"Vast capacity slot {slot_index}",
+                ),
+            )
+    return leases_by_environment
+
+
+def _quote_selected_vast_slot(
+    *,
+    configuration: VastRemoteConfiguration,
+    component_ids: list[str],
+    requirements_by_component: Mapping[str, ComponentResourceRequirements],
+    vast_quotes: Mapping[tuple[str, str], VastProfileQuote],
+    vast_service: VastService,
+) -> VastProfileQuote:
+    """Quote aggregate slot requirements immediately before acquisition."""
+    minimum_vram_bytes = max(
+        requirements_by_component[component_id].minimum_vram_bytes
+        for component_id in component_ids
+    )
+    minimum_ram_bytes = max(
+        requirements_by_component[component_id].minimum_ram_bytes
+        for component_id in component_ids
+    )
+    predicted_execution_seconds = sum(
+        requirements_by_component[component_id].estimated_execution_seconds
+        for component_id in component_ids
+    )
+    if len(component_ids) == 1:
+        existing_quote = vast_quotes.get(
+            (component_ids[0], configuration.configuration_id)
+        )
+        if existing_quote is not None:
+            return existing_quote
+    return vast_service.quote_best_profile_sync(
+        [configuration.profile],
+        minimum_vram_bytes=minimum_vram_bytes,
+        minimum_ram_bytes=minimum_ram_bytes,
+        predicted_execution_seconds=predicted_execution_seconds,
+    )
+
+
 def _ssh_sync_engine(
     *,
     host: SshHostConfig,
@@ -1288,6 +1845,44 @@ def _vast_provider_metadata(lease: Any) -> dict[str, Any]:
         "vast_hourly_cost_usd": lease.hourly_cost_usd,
         "vast_idle_retention_seconds": lease.idle_retention_seconds,
     }
+
+
+def _configured_provider_metadata(
+    *,
+    execution_plan: ComponentExecutionPlan,
+    assignment: ExecutionAssignment,
+    vast_leases_by_environment: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return safe provider metadata needed to execute one prepared assignment."""
+    if assignment.provider is ExecutionProvider.VAST:
+        return _vast_provider_metadata(
+            vast_leases_by_environment[assignment.environment_id]
+        )
+    configuration_id = assignment.configuration_id
+    if configuration_id is None:
+        return None
+    configuration = execution_plan.configurations_by_id.get(configuration_id)
+    if isinstance(configuration, ModalRemoteConfiguration):
+        return {
+            "remote_configuration_id": configuration.configuration_id,
+            "remote_configuration_name": configuration.display_name,
+            "modal_gpu": configuration.gpu_type,
+            "modal_max_containers": configuration.instance_count,
+        }
+    if isinstance(configuration, SshRemoteConfiguration):
+        host = execution_plan.ssh_hosts_by_id[configuration.configuration_id]
+        portable_host = replace(
+            host,
+            capabilities=None,
+            health=EnvironmentHealth.UNKNOWN,
+            last_error=None,
+        )
+        return {
+            "remote_configuration_id": configuration.configuration_id,
+            "remote_configuration_name": configuration.display_name,
+            "ssh_host_config": portable_host.to_dict(),
+        }
+    return None
 
 
 def _ensure_remote_sync_backend(
@@ -2314,6 +2909,10 @@ def _workflow_node_remote_enabled(node: Mapping[str, Any], marker: str) -> bool:
     named_widget_values = node.get("widgets_values_named")
     if isinstance(named_widget_values, Mapping):
         visible_toggle_value = named_widget_values.get(_REMOTE_TOGGLE_WIDGET_NAME)
+        if not isinstance(visible_toggle_value, bool):
+            visible_toggle_value = named_widget_values.get(
+                _LEGACY_REMOTE_TOGGLE_WIDGET_NAME
+            )
         if isinstance(visible_toggle_value, bool):
             return visible_toggle_value
 
@@ -6370,7 +6969,7 @@ def rewrite_prompt_for_modal(
     )
     summary = RewriteSummary(remote_node_ids=sorted(remote_node_ids))
     logger.info(
-        "Found %d workflow nodes marked for Modal execution.", len(remote_node_ids)
+        "Found %d workflow nodes marked for remote execution.", len(remote_node_ids)
     )
 
     if not remote_node_ids:
@@ -6397,7 +6996,8 @@ def rewrite_prompt_for_modal(
     )
     if summary.sandwiched_local_node_ids:
         logger.warning(
-            "Detected local nodes sandwiched between remote graph regions; these nodes may force additional Modal phases: %s",
+            "Detected local nodes sandwiched between remote graph regions; "
+            "these nodes may force additional remote phases: %s",
             summary.sandwiched_local_node_ids,
         )
     components = _build_component_plans(
@@ -6411,12 +7011,27 @@ def rewrite_prompt_for_modal(
         nodes_module=resolved_nodes_module,
     )
 
-    assignments_by_component_id = _plan_component_execution_assignments(
+    execution_plan = _plan_component_execution(
         components=components,
         prompt=rewritten_prompt,
         workflow=workflow,
         settings=resolved_settings,
     )
+    assignments_by_component_id = execution_plan.assignments
+    if execution_plan.configuration_set is not None:
+        summary.remote_configurations = (
+            execution_plan.configuration_set.to_safe_list()
+        )
+    for assignment in assignments_by_component_id.values():
+        execution_location = _execution_location_for_assignment(
+            assignment,
+            execution_plan.ssh_hosts_by_id,
+            execution_plan.vast_leases_by_environment,
+        )
+        if execution_location:
+            summary.execution_locations_by_environment[
+                assignment.environment_id
+            ] = execution_location
     session_component_ids = _mark_remote_to_remote_session_boundaries(
         rewritten_prompt,
         components,
@@ -6440,9 +7055,11 @@ def rewrite_prompt_for_modal(
         )
     summary.execution_assignments_by_representative = dict(assignments_by_component_id)
 
-    vast_service: VastService | None = None
-    vast_leases_by_environment: dict[str, Any] = {}
-    if any(
+    vast_service = execution_plan.vast_service
+    vast_leases_by_environment = dict(
+        execution_plan.vast_leases_by_environment
+    )
+    if vast_service is None and any(
         assignment.provider is ExecutionProvider.VAST
         for assignment in assignments_by_component_id.values()
     ):
@@ -6464,9 +7081,12 @@ def rewrite_prompt_for_modal(
             ) from exc
 
     sync_engines_by_environment: dict[str, ModalAssetSyncEngine] = {}
-    ssh_hosts_by_id = {
-        host.environment_id: host for host in _configured_ssh_hosts(resolved_settings)
-    }
+    ssh_hosts_by_id = dict(execution_plan.ssh_hosts_by_id)
+    if not ssh_hosts_by_id:
+        ssh_hosts_by_id = {
+            host.environment_id: host
+            for host in _configured_ssh_hosts(resolved_settings)
+        }
     session_environment_ids = {
         assignments_by_component_id[component_id].environment_id
         for component_id in session_component_ids
@@ -6477,6 +7097,21 @@ def rewrite_prompt_for_modal(
         assignment = assignments_by_component_id[component_id]
         if assignment.provider is ExecutionProvider.MODAL:
             summary.execution_worker_indices_by_representative[component_id] = 0
+            continue
+        if assignment.provider is ExecutionProvider.VAST:
+            summary.execution_worker_indices_by_representative[component_id] = 0
+            continue
+        if execution_plan.configuration_set is not None:
+            summary.execution_worker_indices_by_representative[component_id] = (
+                assignment.capacity_slot_index
+            )
+            logger.info(
+                "Assigned workflow-configured remote component=%s environment=%s "
+                "worker_index=%d.",
+                component_id,
+                assignment.environment_id,
+                assignment.capacity_slot_index,
+            )
             continue
         host = ssh_hosts_by_id.get(assignment.environment_id)
         maximum_workers = max(1, host.maximum_workers if host is not None else 1)
@@ -6684,12 +7319,10 @@ def rewrite_prompt_for_modal(
                 ssh_hosts_by_id,
                 vast_leases_by_environment,
             ),
-            (
-                _vast_provider_metadata(
-                    vast_leases_by_environment[assignment.environment_id]
-                )
-                if assignment.provider is ExecutionProvider.VAST
-                else None
+            _configured_provider_metadata(
+                execution_plan=execution_plan,
+                assignment=assignment,
+                vast_leases_by_environment=vast_leases_by_environment,
             ),
         )
         implicitly_mapped_output_sources = _implicitly_mapped_boundary_output_sources(
@@ -6810,7 +7443,16 @@ def rewrite_prompt_for_modal(
         mapped_proxy_component_ids,
         mapped_component_weight=1,
     )
-    if resolved_settings.max_containers is not None:
+    if execution_plan.configuration_set is not None:
+        configured_capacity = sum(
+            configuration.capacity_limit
+            for configuration in execution_plan.configuration_set.configurations
+        )
+        summary.max_parallel_requests_upper_bound = min(
+            summary.estimated_max_parallel_requests,
+            configured_capacity,
+        )
+    elif resolved_settings.max_containers is not None:
         summary.max_parallel_requests_upper_bound = min(
             summary.estimated_max_parallel_requests,
             resolved_settings.max_containers,
@@ -6884,10 +7526,12 @@ def _execution_assignments_payload(
         component_id: {
             "provider": assignment.provider.value,
             "environment_id": assignment.environment_id,
+            "configuration_id": assignment.configuration_id,
             "execution_location": _execution_location_for_assignment(
-                assignment,
-                ssh_hosts_by_id,
-                vast_leases_by_environment,
+                assignment, ssh_hosts_by_id, vast_leases_by_environment
+            )
+            or summary.execution_locations_by_environment.get(
+                assignment.environment_id
             ),
             "node_ids": list(
                 summary.component_node_ids_by_representative.get(component_id, [])
@@ -7824,7 +8468,8 @@ def setup_modal_queue_route(
                     "assignments": _execution_assignments_payload(
                         summary,
                         request_settings,
-                    )
+                    ),
+                    "configurations": list(summary.remote_configurations),
                 }
                 if summary.custom_nodes_bundle is not None:
                     json_data["extra_data"]["modal"][
@@ -7856,6 +8501,9 @@ def setup_modal_queue_route(
                         "remote_execution_assignments": _execution_assignments_payload(
                             summary,
                             request_settings,
+                        ),
+                        "remote_execution_configurations": list(
+                            summary.remote_configurations
                         ),
                         "modal_components": [
                             {

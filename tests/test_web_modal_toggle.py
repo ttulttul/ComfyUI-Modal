@@ -74,10 +74,12 @@ def test_endpoint_chat_node_is_not_offered_nested_modal_execution() -> None:
     """The local endpoint client should not be wrapped in another Modal execution island."""
     source = _modal_toggle_source()
 
-    assert (
-        'const LOCAL_MODAL_NODE_IDS = new Set(["ModalEndpointChat", '
-        '"VastAILeaseConfiguration"]);'
-    ) in source
+    assert '"ModalEndpointChat"' in source
+    assert '"VastAILeaseConfiguration"' in source
+    assert '"ModalRemoteConfiguration"' in source
+    assert '"VastRemoteConfiguration"' in source
+    assert '"SshRemoteConfiguration"' in source
+    assert '"RemoteExecutionConfigurator"' in source
     assert "!LOCAL_MODAL_NODE_IDS.has(String(node.comfyClass))" in source
     assert "!LOCAL_MODAL_NODE_IDS.has(String(nodeData.name))" in source
 
@@ -623,7 +625,9 @@ def test_modal_context_menu_can_expand_required_upstream_nodes() -> None:
     assert 'const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\\/queue_prompt$/, "/delete_volume");' in source
     assert "async beforeRegisterNodeDef(nodeType, nodeData)" in source
     assert "installModalContextMenu(nodeType, nodeData);" in source
-    assert 'content: "Modal"' in source
+    assert 'content: "Remote Execution Tools"' in source
+    assert 'const REMOTE_WIDGET_NAME = "Run Remotely";' in source
+    assert 'const LEGACY_REMOTE_WIDGET_NAME = "Run on Modal";' in source
     assert "has_submenu: true" in source
     assert "submenu: {" in source
     assert '"Enable on Upstream Nodes"' in source

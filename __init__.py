@@ -52,6 +52,12 @@ try:
         ModalMapInput,
         ModalUniversalExecutor,
     )
+    from .remote_configuration_nodes import (
+        ModalConfiguration,
+        RemoteExecutionConfigurator,
+        SshConfiguration,
+        VastConfiguration,
+    )
     from .vast_config_node import VastAILeaseConfiguration
 except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy imports.
     ComfyExtension = object  # type: ignore[assignment]
@@ -61,6 +67,10 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     ModalEndpointChat = None  # type: ignore[assignment]
     ModalLLM = None  # type: ignore[assignment]
     ModalUniversalExecutor = None  # type: ignore[assignment]
+    ModalConfiguration = None  # type: ignore[assignment]
+    RemoteExecutionConfigurator = None  # type: ignore[assignment]
+    SshConfiguration = None  # type: ignore[assignment]
+    VastConfiguration = None  # type: ignore[assignment]
     VastAILeaseConfiguration = None  # type: ignore[assignment]
 
     class ComfyModalSyncExtension:  # type: ignore[no-redef]
@@ -86,6 +96,10 @@ else:
                 ModalArtifactFinalizer,
                 ModalEndpointChat,
                 ModalLLM,
+                ModalConfiguration,
+                VastConfiguration,
+                SshConfiguration,
+                RemoteExecutionConfigurator,
                 VastAILeaseConfiguration,
             ]
 
@@ -101,7 +115,11 @@ __all__ = [
     "ModalEndpointChat",
     "ModalLLM",
     "ModalMapInput",
+    "ModalConfiguration",
     "ModalUniversalExecutor",
+    "RemoteExecutionConfigurator",
+    "SshConfiguration",
+    "VastConfiguration",
     "VastAILeaseConfiguration",
     "WEB_DIRECTORY",
     "comfy_entrypoint",

@@ -350,9 +350,14 @@ class VastService:
             predicted_execution_seconds=predicted_execution_seconds,
         )
 
-    async def acquire(self, quote: VastProfileQuote) -> VastLeaseRecord:
-        """Reuse or rent the selected quoted profile."""
-        lease = await self.lease_manager.ensure_lease(quote.profile)
+    async def acquire(
+        self,
+        quote: VastProfileQuote,
+        *,
+        slot: int = 0,
+    ) -> VastLeaseRecord:
+        """Reuse or rent the selected quoted profile capacity slot."""
+        lease = await self.lease_manager.ensure_lease(quote.profile, slot=slot)
         await asyncio.to_thread(self._initialize_runtime, lease)
         return lease
 
@@ -368,9 +373,14 @@ class VastService:
         """Synchronously prefetch searches from ComfyUI's queue worker thread."""
         asyncio.run(self.prefetch_offers(profiles, requirements))
 
-    def acquire_sync(self, quote: VastProfileQuote) -> VastLeaseRecord:
-        """Synchronously acquire a quote from ComfyUI's queue worker thread."""
-        return asyncio.run(self.acquire(quote))
+    def acquire_sync(
+        self,
+        quote: VastProfileQuote,
+        *,
+        slot: int = 0,
+    ) -> VastLeaseRecord:
+        """Synchronously acquire a quote slot from ComfyUI's queue worker thread."""
+        return asyncio.run(self.acquire(quote, slot=slot))
 
     def scheduling_state(self, quote: VastProfileQuote) -> EnvironmentSchedulingState:
         """Expose a quote to the provider-neutral cost scheduler."""

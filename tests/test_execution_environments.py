@@ -202,3 +202,99 @@ def test_scheduler_honors_required_provider(
     )
 
     assert assignment.environment_id == "lambda"
+
+
+def test_batch_planner_spreads_parallel_components_across_capacity_slots(
+    execution_environments_module: Any,
+) -> None:
+    """Parallel work should use another pool when waiting costs more than execution."""
+    module = execution_environments_module
+    cheap = _environment(module, "cheap", vram_gb=80, cost=0.001)
+    cheap = module.EnvironmentSchedulingState(
+        **{
+            **cheap.__dict__,
+            "configuration_id": "cheap-pool",
+            "display_name": "Cheap pool",
+            "maximum_workers": 1,
+        }
+    )
+    fast = _environment(module, "fast", vram_gb=80, cost=0.002)
+    fast = module.EnvironmentSchedulingState(
+        **{
+            **fast.__dict__,
+            "configuration_id": "fast-pool",
+            "display_name": "Fast pool",
+            "maximum_workers": 1,
+        }
+    )
+    requirements = {
+        component_id: module.ComponentResourceRequirements(
+            estimated_execution_seconds=10
+        )
+        for component_id in ("a", "b")
+    }
+
+    assignments = module.CostAwareEnvironmentScheduler().plan(
+        execution_stages=[["a", "b"]],
+        environments_by_component={
+            "a": [cheap, fast],
+            "b": [cheap, fast],
+        },
+        requirements_by_component=requirements,
+    )
+
+    assert assignments["a"].environment_id == "cheap"
+    assert assignments["b"].environment_id == "fast"
+    assert assignments["a"].capacity_slot_index == 0
+    assert assignments["b"].capacity_slot_index == 0
+
+
+def test_batch_planner_reuses_capacity_across_sequential_stages(
+    execution_environments_module: Any,
+) -> None:
+    """A capacity limit is concurrent and must not cap total assigned components."""
+    module = execution_environments_module
+    environment = _environment(module, "one-slot", vram_gb=80, cost=0.001)
+    requirements = {
+        component_id: module.ComponentResourceRequirements(
+            estimated_execution_seconds=10
+        )
+        for component_id in ("a", "b")
+    }
+
+    assignments = module.CostAwareEnvironmentScheduler().plan(
+        execution_stages=[["a"], ["b"]],
+        environments_by_component={"a": [environment], "b": [environment]},
+        requirements_by_component=requirements,
+    )
+
+    assert assignments["a"].environment_id == "one-slot"
+    assert assignments["b"].environment_id == "one-slot"
+    assert assignments["a"].capacity_slot_index == 0
+    assert assignments["b"].capacity_slot_index == 0
+    assert assignments["a"].predicted_completion_seconds == pytest.approx(10)
+    assert assignments["b"].predicted_completion_seconds == pytest.approx(20)
+
+
+def test_scheduler_rejects_fully_active_environment(
+    execution_environments_module: Any,
+) -> None:
+    """Live active-worker state should participate in admission."""
+    module = execution_environments_module
+    environment = _environment(module, "busy", vram_gb=80, cost=0.001)
+    environment = module.EnvironmentSchedulingState(
+        **{
+            **environment.__dict__,
+            "active_workers": 1,
+            "maximum_workers": 1,
+        }
+    )
+
+    with pytest.raises(
+        module.NoCompatibleExecutionEnvironmentError,
+        match="all worker capacity is active",
+    ):
+        module.CostAwareEnvironmentScheduler().choose(
+            [environment],
+            module.ComponentResourceRequirements(),
+        )

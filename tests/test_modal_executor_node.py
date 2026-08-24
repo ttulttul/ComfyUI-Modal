@@ -7349,6 +7349,11 @@ def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
     assert remote_modal_app_module._settings_for_payload(
         {"modal_gpu": "L40S"}
     ).modal_gpu == "L40S"
+    configured_settings = remote_modal_app_module._settings_for_payload(
+        {"modal_gpu": "H200", "modal_max_containers": 3}
+    )
+    assert configured_settings.modal_gpu == "H200"
+    assert configured_settings.max_containers == 3
     assert remote_modal_app_module._modal_deploy_cache_key(
         {"modal_gpu": "A100"}
     )[0] == "comfy-modal-sync"

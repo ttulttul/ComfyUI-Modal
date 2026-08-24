@@ -28,6 +28,8 @@
 !/modal_sdk.py
 !/output_artifacts.py
 !/remote_hosts.py
+!/remote_configuration_nodes.py
+!/remote_configurations.py
 !/remote_protocol.py
 !/runtime_environment.py
 !/serialization.py

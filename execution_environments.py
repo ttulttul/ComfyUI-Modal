@@ -214,6 +214,9 @@ class EnvironmentSchedulingState:
     health: EnvironmentHealth
     cost_usd_per_second: float | None
     capabilities: EnvironmentCapabilities | None
+    configuration_id: str | None = None
+    display_name: str | None = None
+    unavailable_reason: str | None = None
     tags: frozenset[str] = frozenset()
     active_workers: int = 0
     maximum_workers: int = 1
@@ -231,6 +234,8 @@ class ExecutionAssignment:
     predicted_cost_usd: float | None
     predicted_completion_seconds: float
     reasons: tuple[str, ...] = ()
+    configuration_id: str | None = None
+    capacity_slot_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -377,6 +382,143 @@ class CostAwareEnvironmentScheduler:
             )
         return min(candidates, key=lambda candidate: candidate[0])[1]
 
+    def plan(
+        self,
+        *,
+        execution_stages: Sequence[Sequence[str]],
+        environments_by_component: Mapping[
+            str,
+            Sequence[EnvironmentSchedulingState],
+        ],
+        requirements_by_component: Mapping[str, ComponentResourceRequirements],
+    ) -> dict[str, ExecutionAssignment]:
+        """Assign a staged component DAG while honoring pool capacity limits."""
+        slot_available_at: dict[tuple[str, int], float] = {}
+        assignments: dict[str, ExecutionAssignment] = {}
+        stage_ready_at = 0.0
+
+        for stage in execution_stages:
+            stage_completion_times: list[float] = []
+            for component_id in sorted(str(value) for value in stage):
+                requirements = requirements_by_component.get(component_id)
+                if requirements is None:
+                    raise ValueError(
+                        f"Remote component {component_id!r} has no resource "
+                        "requirements."
+                    )
+                environments = environments_by_component.get(component_id, ())
+                candidates: list[tuple[tuple[Any, ...], ExecutionAssignment]] = []
+                rejection_reasons: list[str] = []
+                for environment in environments:
+                    rejection = self._incompatibility_reason(
+                        environment,
+                        requirements,
+                    )
+                    if rejection is not None:
+                        rejection_reasons.append(
+                            f"{environment.display_name or environment.environment_id}: "
+                            f"{rejection}"
+                        )
+                        continue
+                    for slot_index in range(environment.maximum_workers):
+                        slot_key = (environment.environment_id, slot_index)
+                        slot_delay = max(
+                            0.0,
+                            slot_available_at.get(slot_key, stage_ready_at)
+                            - stage_ready_at,
+                        )
+                        slot_environment = EnvironmentSchedulingState(
+                            environment_id=environment.environment_id,
+                            provider=environment.provider,
+                            enabled=environment.enabled,
+                            health=environment.health,
+                            cost_usd_per_second=environment.cost_usd_per_second,
+                            capabilities=environment.capabilities,
+                            configuration_id=environment.configuration_id,
+                            display_name=environment.display_name,
+                            unavailable_reason=environment.unavailable_reason,
+                            tags=environment.tags,
+                            active_workers=0,
+                            maximum_workers=1,
+                            queue_delay_seconds=(
+                                environment.queue_delay_seconds + slot_delay
+                            ),
+                            cold_start_seconds=(
+                                environment.cold_start_seconds
+                                if slot_key not in slot_available_at
+                                else 0.0
+                            ),
+                            cached_artifact_keys=environment.cached_artifact_keys,
+                        )
+                        assignment = self.choose([slot_environment], requirements)
+                        absolute_completion = (
+                            stage_ready_at
+                            + assignment.predicted_completion_seconds
+                        )
+                        configuration_id = (
+                            environment.configuration_id
+                            or environment.environment_id
+                        )
+                        assignment = ExecutionAssignment(
+                            environment_id=assignment.environment_id,
+                            provider=assignment.provider,
+                            predicted_cost_usd=assignment.predicted_cost_usd,
+                            predicted_completion_seconds=absolute_completion,
+                            reasons=assignment.reasons
+                            + (
+                                "configuration "
+                                f"{environment.display_name or configuration_id}",
+                                f"capacity slot {slot_index}",
+                            ),
+                            configuration_id=configuration_id,
+                            capacity_slot_index=slot_index,
+                        )
+                        preferred_rank = self._preferred_rank(
+                            environment.environment_id,
+                            requirements.preferred_environment_ids,
+                        )
+                        unknown_cost_rank = (
+                            1 if assignment.predicted_cost_usd is None else 0
+                        )
+                        cost_rank = (
+                            assignment.predicted_cost_usd
+                            if assignment.predicted_cost_usd is not None
+                            else math.inf
+                        )
+                        candidates.append(
+                            (
+                                (
+                                    preferred_rank,
+                                    unknown_cost_rank,
+                                    cost_rank,
+                                    absolute_completion,
+                                    environment.environment_id,
+                                    slot_index,
+                                ),
+                                assignment,
+                            )
+                        )
+                if not candidates:
+                    details = (
+                        "; ".join(rejection_reasons)
+                        or "no environments are configured"
+                    )
+                    raise NoCompatibleExecutionEnvironmentError(
+                        "No compatible remote execution environment is available "
+                        f"for component {component_id!r}: {details}."
+                    )
+                assignment = min(candidates, key=lambda candidate: candidate[0])[1]
+                assignments[component_id] = assignment
+                slot_available_at[
+                    (assignment.environment_id, assignment.capacity_slot_index)
+                ] = assignment.predicted_completion_seconds
+                stage_completion_times.append(
+                    assignment.predicted_completion_seconds
+                )
+            if stage_completion_times:
+                stage_ready_at = max(stage_completion_times)
+        return assignments
+
     def _incompatibility_reason(
         self,
         environment: EnvironmentSchedulingState,
@@ -394,9 +536,13 @@ class CostAwareEnvironmentScheduler:
             EnvironmentHealth.READY,
             EnvironmentHealth.DEGRADED,
         }:
+            if environment.unavailable_reason:
+                return environment.unavailable_reason
             return f"health is {environment.health.value}"
         if environment.maximum_workers <= 0:
             return "worker limit is zero"
+        if environment.active_workers >= environment.maximum_workers:
+            return "all worker capacity is active"
         capabilities = environment.capabilities
         if capabilities is None:
             return "capabilities have not been probed"

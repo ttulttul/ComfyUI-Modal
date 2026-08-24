@@ -7,6 +7,61 @@ from types import SimpleNamespace
 from typing import Any
 
 
+def test_runtime_uses_workflow_host_snapshot_without_global_registry(
+    ssh_executor_module: Any,
+    remote_hosts_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A queued workflow host should be sufficient to prepare its assigned worker."""
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="workflow-host",
+        display_name="Workflow host",
+        ssh_target="workflow-host",
+        maximum_workers=2,
+    )
+    observed: dict[str, Any] = {}
+
+    class FakeController:
+        """Capture the rehydrated workflow host."""
+
+        def __init__(self, configured_host: Any) -> None:
+            """Record the host passed to the controller."""
+            observed["host"] = configured_host
+
+    class FakeManager:
+        """Capture the requested worker slot."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            """Record construction arguments."""
+            observed["manager"] = kwargs
+
+        def ensure_worker(self, worker_index: int) -> Any:
+            """Return a deterministic worker specification."""
+            observed["worker_index"] = worker_index
+            return SimpleNamespace(worker_index=worker_index)
+
+    monkeypatch.setattr(ssh_executor_module, "SshDockerController", FakeController)
+    monkeypatch.setattr(ssh_executor_module, "SshRuntimeManager", FakeManager)
+    client = ssh_executor_module.SshDockerExecutorClient(
+        registry=None,
+        repo_root=tmp_path,
+        settings=SimpleNamespace(),
+    )
+
+    _manager, spec = client._runtime(
+        {
+            "execution_environment_id": "workflow-host",
+            "execution_worker_index": 1,
+            "ssh_host_config": host.to_dict(),
+        }
+    )
+
+    assert observed["host"] == host
+    assert observed["worker_index"] == 1
+    assert spec.worker_index == 1
+
+
 def test_ssh_stream_materializes_remote_output_artifacts(
     ssh_executor_module: Any,
     remote_modal_app_module: Any,

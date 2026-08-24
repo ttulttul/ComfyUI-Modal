@@ -39,7 +39,7 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 
 ## Highlights
 
-- A `Run on Modal` node toggle (the remote marker), workflow-level provider policy, and optional fully automatic node placement
+- A `Run Remotely` node toggle, workflow-scoped provider capacity, and optional fully automatic node placement
 - Three interchangeable back-ends — Modal, self-hosted SSH hosts, and Vast.ai — behind one shared planner and transport layer
 - Capability- and cost-aware scheduling: the planner checks VRAM/RAM requirements against each candidate and picks the lowest predicted total cost
 - Automatic sync of referenced model files and, optionally, your `custom_nodes/` packages
@@ -89,17 +89,23 @@ export COMFY_MODAL_EXECUTION_MODE=remote
 
 ## Execution Back-Ends
 
-### Workflow Provider Policy
+### Workflow Capacity Configuration
 
-Provider policy is stored under `workflow.extra.remote_execution` and travels with the workflow:
+New workflows declare every available remote capacity pool explicitly:
 
-- **Modal only** — the default for existing workflows; preserves the original Modal-only behavior.
-- **Self-hosted only** — requires a ready, compatible SSH host and fails before queueing when none is available.
-- **Vast.ai only** — requires at least one Vast configuration node, a process-level API key, and a published worker image; fails before asset sync when no current offer meets the resource and price limits.
-- **Automatic** — considers ready SSH hosts, the selected Modal GPU, and any workflow-declared Vast pools; rejects hard incompatibilities (insufficient VRAM, provider-specific requirements), then prefers the lowest predicted incremental cost with deterministic tie-breaking.
-- **Automatically place eligible nodes** — lets the planner select remote nodes itself instead of requiring per-node toggles. Leave it off to keep manual component boundaries.
+1. Add a **Remote Execution Configurator** node.
+2. Add any number of **Modal Configuration**, **Vast.ai Configuration**, and **SSH Configuration** nodes.
+3. Connect each provider node's `REMOTE_CONFIGURATION` output to the configurator's growing input group.
 
-To change the policy from a node, right-click an eligible node and open **Remote Execution**. ComfyUI Nodes 2.0 lists **Modal only**, **Self-hosted only**, **Vast.ai only**, and **Automatic** directly below the disabled **Provider policy (current choice)** heading because its extension-menu adapter supports only one submenu level.
+The connected graph is authoritative. Connecting only Modal configurations produces a Modal-only plan; connecting several providers lets the planner choose among all of them. Each configuration has its own name and capacity limit, so one workflow can offer several Modal GPU types, several independent Vast marketplace searches, and several SSH hosts at the same time.
+
+Capacity limits are concurrency ceilings, not eager provisioning requests. Modal containers scale as work needs them, Vast instances are quoted during planning and rented only for selected slots, and SSH worker containers are prepared lazily on the declared host. Sequential components can reuse one slot; parallel components consume distinct slots or wait when that is cheaper than another environment.
+
+The planner compiles configuration inputs before ordinary ComfyUI node execution, resolves the complete component DAG, and assigns every component before it performs a billable Vast acquisition. Hard provider, VRAM, RAM, and architecture constraints are applied before cost ranking. The `REMOTE_CONFIGURATION_SET` output is also available to local graph consumers for inspection.
+
+**Automatically place eligible nodes** remains an independent workflow option. Leave it off to mark component boundaries with `Run Remotely`, or enable it from the **Remote Execution** menu to let the planner select eligible nodes.
+
+Workflows saved before the configurator was introduced continue to use their saved provider policy, workflow Modal GPU, disconnected Vast lease nodes, and installation-wide SSH registry. When a configurator is present, those legacy capacity sources are not added to the new plan.
 
 ### Modal
 
@@ -122,11 +128,13 @@ Every key in the collection is available to remote custom nodes through `os.envi
 
 Each ComfyUI installation gets its own persistent Modal app name, derived from an identity file in the ComfyUI user directory, so multiple installations do not collide. Set `COMFY_MODAL_APP_NAME` to share or externally manage a deployment.
 
-The Modal GPU is chosen per workflow from the `Modal` → `GPU` context menu (new workflows default to `RTX-PRO-6000`), and each GPU target gets its own deployed app. First-run auto-deploy is enabled by default and also replaces stale or incompatible deployments; after upgrading this node pack, redeploy once (or leave `COMFY_MODAL_AUTO_DEPLOY=true`) so remote workers pick up the new code. Warm containers reuse loaded models across compatible requests and scale down to zero after an idle window (`COMFY_MODAL_SCALEDOWN_WINDOW`, default 600 seconds).
+Each **Modal Configuration** selects a GPU type and maximum concurrent container count. Every GPU target gets its own deployed app, so several configurations can contribute different Modal GPU types to the same plan. First-run auto-deploy is enabled by default and also replaces stale or incompatible deployments; after upgrading this node pack, redeploy once (or leave `COMFY_MODAL_AUTO_DEPLOY=true`) so remote workers pick up the new code. Warm containers reuse loaded models across compatible requests and scale down to zero after an idle window (`COMFY_MODAL_SCALEDOWN_WINDOW`, default 600 seconds).
 
 ### Self-Hosted SSH Hosts
 
-Self-hosted execution runs the same workers on machines you control, reached over SSH and managed through Docker. Open **Settings → Remote Execution: SSH environments**, or right-click an eligible node and choose **Remote Execution → Manage SSH hosts…**, then add hosts using an SSH destination or alias that already works from the account running ComfyUI. The extension deliberately stores no passwords or private-key paths — authentication, jump hosts, ports, and key selection stay in your normal SSH agent and `~/.ssh/config`.
+Self-hosted execution runs the same workers on machines you control, reached over SSH and managed through Docker. Add one **SSH Configuration** per machine and connect it to the configurator. The extension deliberately stores no passwords or private-key paths — authentication, jump hosts, ports, and key selection stay in your normal SSH agent and `~/.ssh/config`.
+
+The installation-wide **Settings → Remote Execution: SSH environments** manager remains available for legacy workflows and host preflight. New configured workflows carry their own credential-free SSH destination and scheduling snapshot, so their execution does not depend on mutating that global registry.
 
 Parallel components assigned to the same SSH worker slot share one lifecycle operation. If two launchers race for the deterministic container name, the loser adopts the correctly labeled, fingerprint-matching worker that won the race; containers without the configured environment ownership label are never removed automatically.
 
@@ -153,9 +161,9 @@ Worker environment secrets are administrator-managed: the optional **Remote Dock
 
 ### Vast.ai
 
-Vast.ai capacity is declared per workflow. Add one or more **Vast.ai Lease Configuration** nodes to the graph — each declares a named capacity profile and acts as an independent candidate pool for the scheduler. Marketplace selectors default to the explicit value **Any**, so a new profile starts broad and the user can add GPU-count, per-GPU VRAM, TFLOPS, RAM, reliability, duration, price, verification, location, or network constraints one at a time. Disk allocation, idle retention, and the maximum number of managed instances remain required launch/lifecycle controls. **Any** hourly price removes the hard spending ceiling; offers are still ranked by price, but a Vast-only workflow may rent an expensive offer when no cheaper capacity exists.
+Vast.ai capacity is declared with one or more **Vast.ai Configuration** nodes connected to the configurator. Each node declares an independent named marketplace search and maximum instance count. Marketplace selectors default to the explicit value **Any**, so a new profile starts broad and the user can add GPU-count, per-GPU VRAM, TFLOPS, RAM, reliability, duration, price, verification, location, or network constraints one at a time. Disk allocation, idle retention, and the maximum number of managed instances remain required launch/lifecycle controls. **Any** hourly price removes the hard spending ceiling; offers are still ranked by price, but a Vast-only workflow may rent an expensive offer when no cheaper capacity exists.
 
-The node remains local and is preserved without an input connection. Its **STRING** output contains queue-time Markdown describing the Vast GPU type, per-instance GPU count, VRAM, hourly price, instance count, and component count actually selected for that profile. Connect it to a Markdown-capable preview node to see the placement decision; if Automatic chose Modal or self-hosted execution instead, the text explicitly says that no Vast.ai node type was selected.
+The typed node remains local and travels to the planner only through its configurator connection. The older disconnected **Vast.ai Lease Configuration** node and its Markdown selection output remain supported for legacy workflows.
 
 Marketplace searches for the distinct effective resource profiles in one plan run in parallel, with a maximum of eight concurrent requests. Successful results, including an empty result, are cached in the ComfyUI process for 60 minutes and shared across workflow submissions. Lease selection and acquisition remain ordered so later components can reuse capacity rented by earlier components. Restart ComfyUI to clear the in-memory cache; a rental availability race automatically forces one fresh marketplace search.
 
@@ -194,7 +202,7 @@ Completed components record execution timings per environment and workload signa
 
 Build the workflow normally — Modal-Sync does not replace standard nodes; it adds remote execution controls to the existing graph. Good remote candidates consume large model files, perform expensive tensor work, and exchange values that can cross the local/remote boundary.
 
-1. Enable `Run on Modal` on each node that should belong to the remote region.
+1. Enable `Run Remotely` on each node that should belong to the remote region.
 2. Confirm the node shows the blue remote-execution border.
 3. Queue the workflow using ComfyUI's normal queue action.
 
@@ -281,7 +289,7 @@ Authentication is resolved in this order:
 
 Automatically created tokens go directly to the OS vault (Keychain on macOS, the native `keyring` backend elsewhere) and are never written into the workflow, settings, or logs. In RBAC-enabled workspaces, vault-backed tokens are authorized for the node's `environment` setting (default `main`) before use. A headless installation without a secure keyring must supply both environment variables instead.
 
-For credential safety, the node accepts only HTTPS `modal.direct` origins, refuses redirects, and has no `Run on Modal` toggle of its own.
+For credential safety, the node accepts only HTTPS `modal.direct` origins, refuses redirects, and has no `Run Remotely` toggle of its own.
 
 ## Asset And Custom Node Sync
 
@@ -337,7 +345,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_VAST_API_BASE_URL` | Vast.ai production API | Override for the local API simulator; non-loopback values must be HTTPS. |
 | `COMFY_MODAL_VAST_SSH_IDENTITY_FILE` | SSH default identity | Absolute private-key path when the Vast account does not use the default SSH identity. |
 
-SSH host settings (destinations, cost, worker limits, VRAM reserve, tags) live in the **Settings → Remote Execution: SSH environments** panel rather than environment variables.
+New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve, tags) live in **SSH Configuration** nodes. The **Settings → Remote Execution: SSH environments** panel remains the legacy installation-wide registry and preflight interface.
 
 ### Modal State Stores
 
