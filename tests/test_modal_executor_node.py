@@ -890,6 +890,100 @@ def test_scheduler_list_proxy_wraps_singleton_image_tensor(
     assert tuple(scheduler_items[0].shape) == (1, 8, 6, 3)
 
 
+def test_transportable_singleton_list_reaches_scalar_remote_consumer_as_item(
+    modal_executor_module: Any,
+) -> None:
+    """A cached singleton list output should enter the next remote proxy as a scalar."""
+    fake_nodes_module = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={},
+        NODE_DISPLAY_NAME_MAPPINGS={},
+    )
+    producer_proxy_id = (
+        modal_executor_module.ensure_modal_component_proxy_node_registered(
+            output_types=("INT",),
+            output_names=("seed",),
+            output_is_list=(True,),
+            nodes_module=fake_nodes_module,
+            is_output_node=False,
+        )
+    )
+    consumer_proxy_id = (
+        modal_executor_module.ensure_modal_component_proxy_node_registered(
+            output_types=("STRING",),
+            output_names=("result",),
+            output_is_list=(False,),
+            nodes_module=fake_nodes_module,
+            is_output_node=False,
+        )
+    )
+    producer_proxy = fake_nodes_module.NODE_CLASS_MAPPINGS[producer_proxy_id]
+    consumer_proxy = fake_nodes_module.NODE_CLASS_MAPPINGS[consumer_proxy_id]
+    observed_consumer_inputs: list[Any] = []
+
+    class FakeClient:
+        """Return a singleton seed list and record the downstream normalized input."""
+
+        async def execute_payload_async(
+            self,
+            payload: dict[str, Any],
+            kwargs: dict[str, Any],
+        ) -> tuple[Any, ...]:
+            """Model the two remote components around ComfyUI's output cache."""
+            if payload["component_id"] == "producer":
+                assert kwargs == {}
+                return ([123],)
+            observed_consumer_inputs.append(kwargs["remote_input_0"])
+            return (f"seed:{int(kwargs['remote_input_0'])}",)
+
+    modal_executor_module.set_remote_executor_client_factory(lambda: FakeClient())
+    try:
+        producer_result = asyncio.run(
+            producer_proxy.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "component_id": "producer",
+                    "boundary_outputs": [
+                        {
+                            "proxy_output_name": "seed",
+                            "node_id": "325",
+                            "output_index": 0,
+                            "io_type": "INT",
+                            "is_list": True,
+                        }
+                    ],
+                },
+                unique_id="producer",
+            )
+        )
+        cached_scheduler_items: list[Any] = []
+        cached_scheduler_items.extend(producer_result.result[0])
+        consumer_result = asyncio.run(
+            consumer_proxy.execute(
+                original_node_data={
+                    "payload_kind": "subgraph",
+                    "component_id": "consumer",
+                    "boundary_outputs": [
+                        {
+                            "proxy_output_name": "result",
+                            "node_id": "372",
+                            "output_index": 0,
+                            "io_type": "STRING",
+                            "is_list": False,
+                        }
+                    ],
+                },
+                remote_input_0=cached_scheduler_items,
+                unique_id="consumer",
+            )
+        )
+    finally:
+        modal_executor_module.set_remote_executor_client_factory(None)
+
+    assert cached_scheduler_items == [123]
+    assert observed_consumer_inputs == [123]
+    assert consumer_result.result == ("seed:123",)
+
+
 def test_component_proxy_emits_completion_token_after_remote_execution(
     modal_executor_module: Any,
 ) -> None:

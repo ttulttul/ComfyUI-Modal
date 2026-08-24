@@ -827,6 +827,70 @@ def test_cross_provider_boundary_uses_transport_instead_of_remote_session(
     assert boundary_output.session_consumer_node_ids == []
 
 
+def test_transportable_list_boundary_preserves_scheduler_items(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+) -> None:
+    """Keep a same-host list output in ComfyUI instead of one bridge token."""
+    source = api_intercept_module.LinkedOutputRef("1", 0)
+    boundary_output = api_intercept_module.BoundaryOutputSpec(
+        proxy_output_name="seed_list",
+        source=source,
+        io_type="INT",
+        is_list=True,
+    )
+    producer = api_intercept_module.RemoteComponentPlan(
+        node_ids=["1"],
+        representative_node_id="1",
+        boundary_inputs=[],
+        boundary_outputs=[boundary_output],
+        execute_node_ids=["1"],
+        contains_output_node=False,
+    )
+    consumer = api_intercept_module.RemoteComponentPlan(
+        node_ids=["2"],
+        representative_node_id="2",
+        boundary_inputs=[
+            api_intercept_module.BoundaryInputSpec(
+                proxy_input_name="seed",
+                source=source,
+                io_type="INT",
+                targets=[api_intercept_module.InputTarget("2", "seed")],
+            )
+        ],
+        boundary_outputs=[],
+        execute_node_ids=["2"],
+        contains_output_node=False,
+    )
+    assignment_type = execution_environments_module.ExecutionAssignment
+    provider_type = execution_environments_module.ExecutionProvider
+    lambda_assignment = assignment_type(
+        "lambda",
+        provider_type.SSH_DOCKER,
+        0.0,
+        0.0,
+    )
+
+    session_component_ids = (
+        api_intercept_module._mark_remote_to_remote_session_boundaries(
+            {
+                "1": {"class_type": "NextSeeds", "inputs": {}},
+                "2": {
+                    "class_type": "NextSeeds",
+                    "inputs": {"seed": ["1", 0]},
+                },
+            },
+            [producer, consumer],
+            SimpleNamespace(NODE_CLASS_MAPPINGS={}),
+            {"1": lambda_assignment, "2": lambda_assignment},
+        )
+    )
+
+    assert session_component_ids == set()
+    assert boundary_output.session_output is False
+    assert boundary_output.session_consumer_node_ids == []
+
+
 def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
     api_intercept_module: Any,
     remote_hosts_module: Any,

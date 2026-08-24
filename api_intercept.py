@@ -4396,6 +4396,20 @@ def _mark_remote_to_remote_session_boundaries(
                     boundary_output.source.output_index,
                 )
                 continue
+            if boundary_output.is_list and _is_transportable_output_type(
+                boundary_output.io_type
+            ):
+                logger.info(
+                    "Materializing transportable list boundary output through ComfyUI "
+                    "to preserve scheduler item semantics source=%s:%d io_type=%s "
+                    "producer_component=%s consumer_components=%s.",
+                    boundary_output.source.node_id,
+                    boundary_output.source.output_index,
+                    boundary_output.io_type,
+                    component.representative_node_id,
+                    sorted(consumer_component_ids),
+                )
+                continue
             boundary_output.session_output = True
             boundary_output.session_consumer_node_ids = sorted(
                 {consumer.node_id for consumer in remote_consumers}

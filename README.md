@@ -62,6 +62,8 @@ Remote execution is component-based: contiguous groups of marked nodes become *r
 
 Values crossing the local/remote boundary must be transportable. Supported types are `IMAGE`, `VIDEO`, `AUDIO`, `MASK`, `LATENT`, `SIGMAS`, `INT`, `FLOAT`, `BOOLEAN`, and `STRING`. Runtime objects such as `MODEL`, `CONDITIONING`, `CLIP`, and `VAE` cannot cross the boundary; Modal-Sync either expands the remote component so they are produced remotely, or fails queue-time validation with a boundary error.
 
+List-valued transportable outputs cross through ComfyUI normally, even when both components use the same remote environment. This preserves ComfyUI's `OUTPUT_IS_LIST` item mapping and cache behavior; provider-local session bridges remain reserved for values whose scalar/list identity is unchanged by replacing the value with one bridge reference.
+
 When one component's output feeds another remote component, the value stays on the remote side as a small durable reference instead of round-tripping through the local machine; local consumers of the same value receive it through an asynchronous download that never blocks the remote continuation.
 
 ## Installation
