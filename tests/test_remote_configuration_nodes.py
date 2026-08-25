@@ -84,7 +84,19 @@ def test_compiler_collects_r2_storage_without_treating_it_as_capacity(
     storage = configuration_set.storage_configurations[0]
     assert storage.storage_provider == "cloudflare_r2"
     assert storage.credential_id == "opaque-reference"
-    assert "credential" not in str(storage.to_safe_dict()).casefold()
+    safe_storage = storage.to_safe_dict()
+    assert safe_storage == {
+        "configuration_id": "20",
+        "display_name": "shared-r2",
+        "configuration_kind": "storage",
+        "storage_provider": "cloudflare_r2",
+        "account_id": "a" * 32,
+        "bucket": "comfy-models",
+        "jurisdiction": "eu",
+        "key_prefix": "comfy-modal-cache/v1/blobs/sha256",
+        "write_back_mode": "async",
+    }
+    assert "credential" not in str(safe_storage).casefold()
 
 
 def test_configurator_rejects_storage_without_capacity(

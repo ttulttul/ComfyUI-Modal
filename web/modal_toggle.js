@@ -3526,6 +3526,115 @@ function renderRemoteConfiguratorEnvironments(panel, assignments, configurations
   panel.environments.hidden = panel.environmentRows.size === 0;
 }
 
+/** Return a readable storage provider label. */
+function remoteStorageProviderLabel(provider) {
+  if (provider === "cloudflare_r2") {
+    return "Cloudflare R2";
+  }
+  return String(provider || "Storage backend")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+/** Return a readable R2 jurisdiction label. */
+function remoteStorageJurisdictionLabel(jurisdiction) {
+  const labels = {
+    default: "Default",
+    eu: "European Union (EU)",
+    fedramp: "FedRAMP",
+    us: "United States (US)",
+  };
+  const normalized = String(jurisdiction || "default").toLowerCase();
+  return labels[normalized] ?? normalized.toUpperCase();
+}
+
+/** Return a readable backing-cache policy label. */
+function remoteStorageWriteBackLabel(mode) {
+  const labels = {
+    async: "Async write-back",
+    sync: "Synchronous write-back",
+    off: "Read-only",
+  };
+  const normalized = String(mode || "").toLowerCase();
+  return labels[normalized] ?? (normalized || "Configured");
+}
+
+/**
+ * Normalize safe storage configuration metadata for the Configurator panel.
+ * @param {Array<Record<string, any>>} configurations
+ * @returns {Array<{ name: string, provider: string, details: Array<{ label: string, value: string }> }>}
+ */
+function remoteConfiguratorStorageEntries(configurations) {
+  return (configurations ?? [])
+    .filter(
+      (configuration) =>
+        configuration?.configuration_kind === "storage" || configuration?.storage_provider,
+    )
+    .map((configuration) => {
+      const provider = String(configuration?.storage_provider ?? "");
+      const details = [];
+      if (provider === "cloudflare_r2") {
+        details.push(
+          { label: "Bucket", value: String(configuration?.bucket ?? "—") },
+          {
+            label: "Jurisdiction",
+            value: remoteStorageJurisdictionLabel(configuration?.jurisdiction),
+          },
+          {
+            label: "Cache policy",
+            value: remoteStorageWriteBackLabel(configuration?.write_back_mode),
+          },
+        );
+        const keyPrefix = String(configuration?.key_prefix ?? "").trim();
+        if (keyPrefix) {
+          details.push({ label: "Key prefix", value: keyPrefix });
+        }
+      }
+      return {
+        name: String(configuration?.display_name ?? "Storage backend").trim(),
+        provider: remoteStorageProviderLabel(provider),
+        details,
+      };
+    });
+}
+
+/** Render connected storage backends beneath the execution plan. */
+function renderRemoteConfiguratorStorage(panel, configurations) {
+  const entries = remoteConfiguratorStorageEntries(configurations);
+  panel.storageList.replaceChildren();
+  for (const entry of entries) {
+    const card = document.createElement("div");
+    card.className = "remote-configurator-storage-card";
+    const heading = document.createElement("div");
+    heading.className = "remote-configurator-storage-heading";
+    const name = document.createElement("span");
+    name.className = "remote-configurator-storage-name";
+    name.textContent = entry.name;
+    const provider = document.createElement("span");
+    provider.className = "remote-configurator-storage-provider";
+    provider.textContent = entry.provider;
+    heading.append(name, provider);
+    card.appendChild(heading);
+    if (entry.details.length > 0) {
+      const details = document.createElement("dl");
+      details.className = "remote-configurator-storage-details";
+      for (const detail of entry.details) {
+        const label = document.createElement("dt");
+        label.textContent = detail.label;
+        const value = document.createElement("dd");
+        value.textContent = detail.value;
+        details.append(label, value);
+      }
+      card.appendChild(details);
+    }
+    panel.storageList.appendChild(card);
+  }
+  panel.storage.hidden = entries.length === 0;
+  panel.storageHeight = entries.length === 0
+    ? 0
+    : 24 + entries.reduce((height, entry) => height + 34 + entry.details.length * 17, 0);
+}
+
 /**
  * Render the completed provider-neutral placement plan as a node-local table.
  * @param {Record<string, any>} panel
@@ -3547,6 +3656,7 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
   );
   panel.tableBody.replaceChildren();
   renderRemoteConfiguratorEnvironments(panel, assignments, configurations);
+  renderRemoteConfiguratorStorage(panel, configurations);
   rows.forEach(([representativeNodeId, assignment], index) => {
     const row = document.createElement("tr");
     const componentCell = document.createElement("td");
@@ -3586,7 +3696,10 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
   panel.emptyText.hidden = rows.length > 0;
   panel.table.hidden = rows.length === 0;
   panel.minHeight =
-    118 + Math.max(1, rows.length) * 31 + panel.environmentRows.size * 52;
+    118 +
+    Math.max(1, rows.length) * 31 +
+    panel.environmentRows.size * 52 +
+    panel.storageHeight;
   const currentWidth = Number(panel.node.size?.[0]) || 0;
   const currentHeight = Number(panel.node.size?.[1]) || 0;
   panel.node.setSize?.([
@@ -3842,12 +3955,17 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     <table class="remote-configurator-table" hidden>
       <thead><tr><th>Component</th><th>Target</th><th>Estimate</th></tr></thead>
       <tbody></tbody>
-    </table>`;
+    </table>
+    <div class="remote-configurator-storage" hidden>
+      <div class="remote-configurator-storage-title">Storage backends</div>
+      <div class="remote-configurator-storage-list"></div>
+    </div>`;
   const panel = {
     node,
     root,
     promptId: null,
     minHeight: 149,
+    storageHeight: 0,
     statusText: root.querySelector(".remote-configurator-status-text"),
     progress: root.querySelector(".remote-configurator-progress"),
     progressFill: root.querySelector(".remote-configurator-progress-fill"),
@@ -3857,6 +3975,8 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     emptyText: root.querySelector(".remote-configurator-empty"),
     table: root.querySelector(".remote-configurator-table"),
     tableBody: root.querySelector("tbody"),
+    storage: root.querySelector(".remote-configurator-storage"),
+    storageList: root.querySelector(".remote-configurator-storage-list"),
   };
   let widget;
   try {
@@ -6636,6 +6756,88 @@ function installGlobalStatusStyles() {
     .remote-configurator-table td:last-child {
       width: 20%;
       text-align: right;
+    }
+
+    .remote-configurator-storage {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 6px;
+      padding-top: 2px;
+    }
+
+    .remote-configurator-storage[hidden] {
+      display: none;
+    }
+
+    .remote-configurator-storage-title {
+      color: #94a3b8;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .remote-configurator-storage-list {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .remote-configurator-storage-card {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 6px;
+      padding: 7px 8px;
+      border: 1px solid rgba(56, 189, 248, 0.22);
+      border-radius: 7px;
+      background: rgba(14, 116, 144, 0.09);
+    }
+
+    .remote-configurator-storage-heading {
+      display: flex;
+      min-width: 0;
+      align-items: baseline;
+      gap: 7px;
+    }
+
+    .remote-configurator-storage-name {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+      color: #e2e8f0;
+      font-weight: 650;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-storage-provider {
+      flex: 0 0 auto;
+      color: #38bdf8;
+      font-size: 9px;
+    }
+
+    .remote-configurator-storage-details {
+      display: grid;
+      min-width: 0;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: 3px 9px;
+      margin: 0;
+    }
+
+    .remote-configurator-storage-details dt {
+      color: #64748b;
+      font-size: 9px;
+    }
+
+    .remote-configurator-storage-details dd {
+      min-width: 0;
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: #cbd5e1;
+      font: 9px/1.35 ui-monospace, SFMono-Regular, monospace;
     }
   `;
   document.head.appendChild(style);

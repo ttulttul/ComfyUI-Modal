@@ -74,6 +74,8 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert "function registerRemoteConfiguratorPlan(promptId, assignments, configurations)" in source
     assert "function renderRemoteConfiguratorStatus(panel, state)" in source
     assert "function renderRemoteConfiguratorEnvironments(panel, assignments, configurations)" in source
+    assert "function remoteConfiguratorStorageEntries(configurations)" in source
+    assert "function renderRemoteConfiguratorStorage(panel, configurations)" in source
     assert "function updateRemoteConfiguratorEnvironmentStatus(promptId, detail)" in source
     assert 'statusMessage: "Waiting for Vast.ai setup"' in source
     assert 'statusMessage: "Waiting for remote preparation"' in source
@@ -86,6 +88,17 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert "getMinHeight: () => panel.minHeight" in source
     assert 'class="remote-configurator-table"' in source
     assert 'class="remote-configurator-environments"' in source
+    assert 'class="remote-configurator-storage"' in source
+    assert "Storage backends" in source
+    assert 'label: "Bucket"' in source
+    assert 'label: "Jurisdiction"' in source
+    assert 'label: "Cache policy"' in source
+    assert 'label: "Key prefix"' in source
+    assert 'return "Cloudflare R2";' in source
+    assert "renderRemoteConfiguratorStorage(panel, configurations);" in source
+    assert source.index('class="remote-configurator-table"') < source.index(
+        'class="remote-configurator-storage"'
+    )
     assert "responsePayload.remote_execution_assignments" in source
     assert "responsePayload.remote_execution_configurations" in source
     assert "responsePayload.remote_execution_configurator_node_id" in source

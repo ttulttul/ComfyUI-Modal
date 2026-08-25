@@ -59,6 +59,8 @@ class FakeElement {
       ".remote-configurator-environments",
       ".remote-configurator-empty",
       ".remote-configurator-table",
+      ".remote-configurator-storage",
+      ".remote-configurator-storage-list",
       "tbody",
     ]) {
       this.elementsBySelector.set(selector, new FakeElement(selector));
@@ -126,6 +128,7 @@ const transformedSource = `${[
   "  historyPromptTerminalOutcome,",
   "  clearRefocusCompletedPrompt,",
   "  mountRemoteExecutionConfiguratorPanel,",
+  "  remoteConfiguratorStorageEntries,",
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
   "  handleModalStatus,",
@@ -1527,6 +1530,16 @@ modalToggle.registerRemoteConfiguratorPlan(
   [
     { configuration_id: "vast-big", display_name: "Vast Big" },
     { configuration_id: "lambda", display_name: "Lambda", gpu_type: "L40S" },
+    {
+      configuration_id: "shared-r2",
+      configuration_kind: "storage",
+      display_name: "Shared model cache",
+      storage_provider: "cloudflare_r2",
+      bucket: "comfy-models",
+      jurisdiction: "eu",
+      key_prefix: "comfy-modal-cache/v1/blobs/sha256",
+      write_back_mode: "async",
+    },
   ],
 );
 const stalePanelRoot = new FakeElement("div");
@@ -1571,6 +1584,27 @@ assert.equal(retainedPanel.tableBody.children.length, 2);
 assert.equal(retainedPanel.environmentRows.size, 2);
 assert.equal(retainedPanel.table.hidden, false);
 assert.equal(retainedPanel.emptyText.hidden, true);
+assert.equal(retainedPanel.storage.hidden, false);
+assert.equal(retainedPanel.storageList.children.length, 1);
+const storageCard = retainedPanel.storageList.children[0];
+assert.deepEqual(
+  storageCard.children[0].children.map((child) => child.textContent),
+  ["Shared model cache", "Cloudflare R2"],
+);
+assert.deepEqual(
+  storageCard.children[1].children.map((child) => child.textContent),
+  [
+    "Bucket",
+    "comfy-models",
+    "Jurisdiction",
+    "European Union (EU)",
+    "Cache policy",
+    "Async write-back",
+    "Key prefix",
+    "comfy-modal-cache/v1/blobs/sha256",
+  ],
+);
+assert.deepEqual(modalToggle.remoteConfiguratorStorageEntries([]), []);
 assert.equal(retainedPanel.root.isConnected, false);
 
 modalToggle.handleModalStatus({
