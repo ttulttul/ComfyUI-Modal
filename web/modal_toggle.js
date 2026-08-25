@@ -78,7 +78,15 @@ const REMOTE_LOCATION_ICON_SOURCES = {
   ssh_docker: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 73 73"><rect x="1" y="1" width="71" height="71" rx="14" fill="#fff" stroke="#000" stroke-width="2"/><path d="M60.24 17.02H12.66A1.66 1.66 0 0 0 11 18.68v8.26h50.9v-8.26a1.66 1.66 0 0 0-1.66-1.66Zm-17.2 7.18a2.21 2.21 0 1 1 0-4.43 2.21 2.21 0 0 1 0 4.43Zm6.03 0a2.21 2.21 0 1 1 0-4.43 2.21 2.21 0 0 1 0 4.43Zm6.03 0a2.21 2.21 0 1 1 0-4.43 2.21 2.21 0 0 1 0 4.43ZM11 30.26v23.83c0 .92.74 1.66 1.66 1.66h47.58c.92 0 1.66-.74 1.66-1.66V30.26H11Zm23.41 14.01-5.44 4.62a1.66 1.66 0 0 1-2.15-2.53l3.95-3.35-3.95-3.36a1.66 1.66 0 1 1 2.15-2.53l5.44 4.62a1.66 1.66 0 0 1 0 2.53ZM45 49.29h-6.55a1.66 1.66 0 1 1 0-3.32H45a1.66 1.66 0 1 1 0 3.32Z"/></svg>',
   )}`,
+  vast: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 54.3 46.28"><path fill="#fff" d="M45.46.04l-12.43,25.42-7.71,16.46c-.16.47-.49.84-.94,1.06-.44.22-.95.25-1.42.09-.47-.16-.85-.49-1.07-.94L4.1,5.73l3.34-1.63,17.08,34.94,1.67-3.56L8.84,0,0,4.32l19.14,39.15c.58,1.18,1.58,2.06,2.82,2.49,1.24.42,2.58.34,3.76-.24.25-.12.5-.27.73-.44.3-.22.56-.53.74-.91.5-1.04,1.81-3.74,1.87-3.85L46.86,4.14l3.34,1.63-17.8,36.4c-.22.44-.59.78-1.07.94-.47.16-.97.13-1.42-.09-.02,0-.04-.03-.06-.04l-1.3,2.78s.01,0,.02.01c.68.34,1.42.5,2.16.5.54,0,1.08-.09,1.6-.27,1.24-.43,2.24-1.31,2.82-2.49L54.3,4.36,45.46.04Z"/></svg>',
+  )}`,
 };
+const REMOTE_LOCATION_ICON_ASPECT_RATIOS = Object.freeze({
+  modal: 368 / 192,
+  ssh_docker: 1,
+  vast: 54.3 / 46.28,
+});
 
 const STATE_SETUP = "setup";
 const STATE_STARTING = "starting";
@@ -380,6 +388,37 @@ function remoteLocationIcon(provider) {
     remoteLocationIconImages.set(safeProvider, icon);
   }
   return remoteLocationIconImages.get(safeProvider) ?? null;
+}
+
+/**
+ * Draw a provider icon in the column immediately before a progress bar.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string | null | undefined} provider
+ * @param {number} columnX
+ * @param {number} centerY
+ * @param {number} columnWidth
+ * @param {number} barHeight
+ * @param {number} scale
+ */
+function drawProgressProviderIcon(
+  ctx,
+  provider,
+  columnX,
+  centerY,
+  columnWidth,
+  barHeight,
+  scale,
+) {
+  const safeProvider = String(provider ?? "");
+  const icon = remoteLocationIcon(safeProvider);
+  if (!icon?.complete || !icon.naturalWidth || typeof ctx.drawImage !== "function") {
+    return;
+  }
+  const iconHeight = Math.max(0, Math.min(10 / scale, barHeight - 2 / scale));
+  const aspectRatio = REMOTE_LOCATION_ICON_ASPECT_RATIOS[safeProvider] ?? 1;
+  const iconWidth = Math.min(columnWidth - 4 / scale, iconHeight * aspectRatio);
+  const iconX = columnX + (columnWidth - iconWidth) / 2;
+  ctx.drawImage(icon, iconX, centerY - iconHeight / 2, iconWidth, iconHeight);
 }
 
 /**
@@ -2935,6 +2974,7 @@ function setNodeProgress(nodeIdValue, promptId, value, maxValue, metadata = {}) 
       stage: String(metadata.stage ?? ""),
       message: String(metadata.message ?? ""),
       unit: String(metadata.unit ?? ""),
+      provider: String(metadata.execution_provider ?? existingProgress?.provider ?? ""),
       indeterminate: Boolean(metadata.indeterminate),
       preGpu: Boolean(metadata.pre_gpu),
       elapsedSeconds: Number.isFinite(Number(metadata.elapsed_seconds))
@@ -2967,8 +3007,18 @@ function setNodeProgress(nodeIdValue, promptId, value, maxValue, metadata = {}) 
  * @param {number} maxValue
  * @param {number | null | undefined} itemIndex
  * @param {boolean} setupOnly
+ * @param {Record<string, unknown>} metadata
  */
-function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false) {
+function setNodeProgressLane(
+  nodeIdValue,
+  promptId,
+  laneId,
+  value,
+  maxValue,
+  itemIndex,
+  setupOnly = false,
+  metadata = {},
+) {
   const safeLaneId = String(laneId ?? "");
   if (!safeLaneId) {
     return;
@@ -3009,6 +3059,10 @@ function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, ite
       itemIndex: Number.isFinite(Number(itemIndex)) ? Number(itemIndex) : null,
       updatedAt,
       setupOnly: Boolean(setupOnly),
+      unit: String(metadata.unit ?? existingLaneProgress?.unit ?? ""),
+      provider: String(
+        metadata.execution_provider ?? existingLaneProgress?.provider ?? "",
+      ),
       iterationRate: setupOnly
         ? null
         : progressIterationRate(
@@ -4743,6 +4797,11 @@ function getRemoteVisualState(node) {
     progress: progressState,
     batchProgress: batchProgressState?.promptId === state.promptId ? batchProgressState : null,
     progressLanes,
+    executionProvider:
+      executionAssignment?.provider ??
+      progressState?.provider ??
+      progressLanes.find((laneProgress) => laneProgress.provider)?.provider ??
+      null,
     scheduledEnvironmentCount: promptState?.scheduledEnvironmentCount ?? 0,
     executionLocation: executionAssignment?.location
       ? {
@@ -5425,7 +5484,16 @@ function drawModalNodeDecoration(node, ctx) {
     hasAggregateProgress || hasVisibleLaneProgress || hasBatchBadge;
   const headerHeight = hasProgressContent ? 16 / scale : 0;
   const hasIterationRateLabels = hasAggregateProgress || hasLaneProgress;
-  const progressBarWidth = barWidth;
+  const aggregateProvider = state?.progress?.provider || state?.executionProvider || null;
+  const hasProgressProviderIcon = [
+    aggregateProvider,
+    ...visibleLaneProgress.map(
+      (laneProgress) => laneProgress.provider || state?.executionProvider || null,
+    ),
+  ].some((provider) => Boolean(REMOTE_LOCATION_ICON_SOURCES[String(provider ?? "")]));
+  const progressIconColumnWidth = hasProgressProviderIcon ? 24 / scale : 0;
+  const progressBarX = -borderWidth + progressIconColumnWidth;
+  const progressBarWidth = Math.max(0, barWidth - progressIconColumnWidth);
   const laneBlockHeight = hasVisibleLaneProgress
     ? visibleLaneProgress.length * laneHeight + (visibleLaneProgress.length - 1) * laneGap
     : 0;
@@ -5540,14 +5608,23 @@ function drawModalNodeDecoration(node, ctx) {
         : Math.max(0, Math.min(1, laneProgress.value / laneProgress.max));
       const laneWidth = Math.max(0, progressBarWidth * laneRatio);
       ctx.fillStyle = "rgba(15, 23, 42, 0.66)";
-      ctx.fillRect(-borderWidth, laneY, progressBarWidth, laneHeight);
+      ctx.fillRect(progressBarX, laneY, progressBarWidth, laneHeight);
       const laneColor = laneColors[laneIndex % laneColors.length];
       if (laneProgress.setupOnly) {
         ctx.fillStyle = laneColor.replace("0.94)", `${0.28 + elapsedPulse * 0.22})`);
       } else {
         ctx.fillStyle = laneColor;
       }
-      ctx.fillRect(-borderWidth, laneY, laneWidth, laneHeight);
+      ctx.fillRect(progressBarX, laneY, laneWidth, laneHeight);
+      drawProgressProviderIcon(
+        ctx,
+        laneProgress.provider || state?.executionProvider,
+        -borderWidth,
+        laneY + laneHeight / 2,
+        progressIconColumnWidth,
+        laneHeight,
+        scale,
+      );
       if (!laneProgress.setupOnly) {
         drawIterationRateOverlay(
           ctx,
@@ -5568,16 +5645,25 @@ function drawModalNodeDecoration(node, ctx) {
     const progressWidth = Math.max(0, progressBarWidth * progressRatio);
     const aggregateY = hasVisibleLaneProgress ? barY + laneBlockHeight + laneGap : barY;
     ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-    ctx.fillRect(-borderWidth, aggregateY, progressBarWidth, aggregateHeight);
+    ctx.fillRect(progressBarX, aggregateY, progressBarWidth, aggregateHeight);
     ctx.fillStyle = "rgba(216, 180, 254, 0.92)";
     if (state.progress.indeterminate) {
       const pulseWidth = Math.max(progressBarWidth * 0.18, 12 / scale);
       const travelWidth = Math.max(0, progressBarWidth - pulseWidth);
-      const pulseX = -borderWidth + ((elapsed * 0.65) % 1) * travelWidth;
+      const pulseX = progressBarX + ((elapsed * 0.65) % 1) * travelWidth;
       ctx.fillRect(pulseX, aggregateY, pulseWidth, aggregateHeight);
     } else {
-      ctx.fillRect(-borderWidth, aggregateY, progressWidth, aggregateHeight);
+      ctx.fillRect(progressBarX, aggregateY, progressWidth, aggregateHeight);
     }
+    drawProgressProviderIcon(
+      ctx,
+      aggregateProvider,
+      -borderWidth,
+      aggregateY + aggregateHeight / 2,
+      progressIconColumnWidth,
+      aggregateHeight,
+      scale,
+    );
     drawIterationRateOverlay(
       ctx,
       state.progress.iterationRate,
@@ -6019,6 +6105,7 @@ function handleModalProgress(event) {
       Number(detail.max ?? 1),
       detail.item_index,
       Boolean(detail.setup_only),
+      detail,
     );
     return;
   }

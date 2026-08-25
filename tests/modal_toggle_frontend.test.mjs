@@ -31,6 +31,15 @@ globalThis.CustomEvent = class CustomEvent {
     this.detail = init.detail;
   }
 };
+globalThis.Image = class Image {
+  constructor() {
+    this.complete = true;
+    this.naturalWidth = 1;
+    this.src = "";
+  }
+
+  addEventListener() {}
+};
 class FakeElement {
   constructor(tagName) {
     this.tagName = tagName;
@@ -160,6 +169,7 @@ const transformedSource = `${[
   "  stampModalGpuOnWorkflow,",
   "  installModalContextMenu,",
   "  MODAL_GPU_TYPES,",
+  "  REMOTE_LOCATION_ICON_SOURCES,",
   "  clearPromptRemoteStates,",
   "  getRemoteVisualState,",
   "  rebuildRemoteDescendantIndex,",
@@ -296,16 +306,25 @@ modalToggle.registerPromptComponents("prompt-decoration", ["176"], [
     node_ids: ["176"],
   },
 ]);
+modalToggle.registerPromptExecutionAssignments("prompt-decoration", {
+  "176": {
+    provider: "modal",
+    environment_id: "modal:H100",
+    node_ids: ["176"],
+  },
+});
 modalToggle.handleModalProgress({
   detail: {
     prompt_id: "prompt-decoration",
     node_id: "176",
     value: 2,
     max: 10,
+    execution_provider: "modal",
   },
 });
 modalToggle.decorateNode(remoteProgressNode);
 const progressPanelStrokeStyles = [];
+const progressProviderIcons = [];
 const progressCanvasContext = {
   globalAlpha: 1,
   save() {},
@@ -315,6 +334,9 @@ const progressCanvasContext = {
   arc() {},
   fill() {},
   fillRect() {},
+  drawImage(image, x, y, width, height) {
+    progressProviderIcons.push({ src: image.src, x, y, width, height });
+  },
   fillText() {},
   measureText(text) {
     return { width: String(text).length * 6 };
@@ -325,6 +347,16 @@ const progressCanvasContext = {
 };
 assert.doesNotThrow(() => remoteProgressNode.onDrawForeground(progressCanvasContext));
 assert.match(progressPanelStrokeStyles.at(-1), /^rgba\(168, 85, 247, 0\.44/);
+assert.equal(progressProviderIcons.length, 1);
+assert.match(decodeURIComponent(progressProviderIcons[0].src), /viewBox="0 0 368 192"/);
+assert.match(
+  decodeURIComponent(modalToggle.REMOTE_LOCATION_ICON_SOURCES.vast),
+  /viewBox="0 0 54\.3 46\.28"/,
+);
+assert.doesNotMatch(
+  decodeURIComponent(modalToggle.REMOTE_LOCATION_ICON_SOURCES.vast),
+  /viewBox="0 0 173\.64 46\.28"/,
+);
 
 resetFrontendState();
 const mixedLocationNode = {
@@ -420,6 +452,7 @@ const mixedLocationCanvasContext = {
   arc() {},
   fill() {},
   fillRect() {},
+  drawImage() {},
   stroke() {},
   fillText(text) {
     mixedLocationLabels.push(String(text));
@@ -655,6 +688,13 @@ modalToggle.registerPromptComponents("prompt-lane-rate", ["21"], [
     node_ids: ["21"],
   },
 ]);
+modalToggle.registerPromptExecutionAssignments("prompt-lane-rate", {
+  "21": {
+    provider: "ssh_docker",
+    environment_id: "ssh-one",
+    node_ids: ["21"],
+  },
+});
 for (const [laneId, value] of [["0", 1], ["1", 2]]) {
   modalToggle.handleModalProgress({
     detail: {
@@ -663,6 +703,7 @@ for (const [laneId, value] of [["0", 1], ["1", 2]]) {
       value,
       max: 10,
       lane_id: laneId,
+      execution_provider: "ssh_docker",
     },
   });
 }
@@ -675,11 +716,28 @@ for (const [laneId, value] of [["0", 3], ["1", 6]]) {
       value,
       max: 10,
       lane_id: laneId,
+      execution_provider: "ssh_docker",
     },
   });
 }
 assert.equal(modalToggle.modalNodeProgressLanes.get("21")?.lanes.get("0")?.iterationRate, 2);
 assert.equal(modalToggle.modalNodeProgressLanes.get("21")?.lanes.get("1")?.iterationRate, 4);
+const laneProviderIcons = [];
+modalToggle.drawModalNodeDecoration(
+  { id: 21, properties: { is_modal_remote: true }, size: [160, 80] },
+  {
+    ...progressCanvasContext,
+    drawImage(image, x, y, width, height) {
+      laneProviderIcons.push({ src: image.src, x, y, width, height });
+    },
+  },
+);
+assert.equal(laneProviderIcons.length, 2);
+assert.equal(
+  laneProviderIcons.every(({ src }) =>
+    decodeURIComponent(src).includes('viewBox="0 0 73 73"')),
+  true,
+);
 Date.now = originalDateNow;
 
 resetFrontendState();

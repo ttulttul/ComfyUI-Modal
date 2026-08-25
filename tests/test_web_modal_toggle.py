@@ -495,6 +495,9 @@ def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
     assert "Number(state?.scheduledEnvironmentCount ?? 0) > 1" in source
     assert "fitCanvasText(ctx, label, availableTextWidth)" in source
     assert "REMOTE_LOCATION_ICON_SOURCES" in source
+    assert 'viewBox="0 0 54.3 46.28"' in source
+    assert 'viewBox="0 0 173.64 46.28"' not in source
+    assert "function drawProgressProviderIcon(" in source
     assert "function handleModalProgress(event)" in source
     assert "if (detail.aggregate_only) {" in source
     assert "setNodeBatchProgress(" in source
@@ -510,7 +513,8 @@ def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
     assert "if (state.progress.indeterminate) {" in source
     assert "preGpu: Boolean(metadata.pre_gpu)" in source
     assert "state.phase === STATE_STARTING && state.progress.preGpu" in source
-    assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false)" in source
+    assert "function setNodeProgressLane(" in source
+    assert "metadata = {}," in source
     assert "function clearNodeProgressLane(nodeIdValue, promptId, laneId)" in source
     assert "function clearNodeProgress(nodeIdValue, promptId)" in source
     assert "fadeNodeProgress(nodeIdValue, promptId);" in source
@@ -518,7 +522,8 @@ def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
     assert "function formatIterationRate(iterationRate, unit = null)" in source
     assert "function drawIterationRateOverlay(" in source
     assert 'ctx.fillStyle = "rgba(0, 0, 0, 0.9)";' in source
-    assert "const progressBarWidth = barWidth;" in source
+    assert "const progressIconColumnWidth = hasProgressProviderIcon ? 24 / scale : 0;" in source
+    assert "const progressBarWidth = Math.max(0, barWidth - progressIconColumnWidth);" in source
     assert "iterationRateColumnWidth" not in source
     assert ": progressIterationRate(" in source
     assert "laneProgress.iterationRate," in source
@@ -625,7 +630,8 @@ def test_mapped_lane_setup_events_render_placeholder_lane_bars() -> None:
     """Lane setup events should render translucent placeholder bars before real node progress arrives."""
     source = _modal_toggle_source()
 
-    assert "function setNodeProgressLane(nodeIdValue, promptId, laneId, value, maxValue, itemIndex, setupOnly = false)" in source
+    assert "function setNodeProgressLane(" in source
+    assert "provider: String(" in source
     assert "setupOnly: Boolean(setupOnly)," in source
     assert "Boolean(detail.setup_only)," in source
     assert "const hasSetupLaneProgress = setupProgressLanes.length > 0;" in source
