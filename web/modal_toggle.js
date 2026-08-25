@@ -3875,8 +3875,163 @@ function renderRemoteConfiguratorStorage(panel, configurations) {
     : 24 + entries.reduce((height, entry) => height + 34 + entry.details.length * 17, 0);
 }
 
+/** Return compact GPU-memory and RAM capacity labels for one target. */
+function remoteConfiguratorHardwareLabels(hardware) {
+  const gpuCount = Math.max(0, Number(hardware?.gpu_count ?? 0));
+  const perDeviceBytes = Math.max(
+    0,
+    Number(hardware?.gpu_memory_bytes_per_device ?? 0),
+  );
+  const totalGpuBytes = Math.max(
+    0,
+    Number(hardware?.gpu_memory_bytes_total ?? 0),
+  );
+  const memoryKind = String(hardware?.gpu_memory_kind ?? "GPU memory");
+  const labels = [];
+  if (perDeviceBytes > 0) {
+    const perDevice = remoteStorageSizeLabel(perDeviceBytes);
+    if (gpuCount > 1) {
+      const total = remoteStorageSizeLabel(totalGpuBytes || perDeviceBytes * gpuCount);
+      labels.push(`${gpuCount} × ${perDevice} ${memoryKind} · ${total} total`);
+    } else {
+      labels.push(`${perDevice} ${memoryKind}`);
+    }
+  } else {
+    labels.push("GPU memory unavailable");
+  }
+  const ramBytes = Math.max(0, Number(hardware?.ram_bytes ?? 0));
+  const ramCapacityLabel = String(hardware?.ram_capacity_label ?? "").trim();
+  labels.push(
+    ramBytes > 0
+      ? `${remoteStorageSizeLabel(ramBytes)} RAM`
+      : `RAM ${ramCapacityLabel || "unavailable"}`,
+  );
+  return labels;
+}
+
+/** Return target groups with stable component labels for a placement plan. */
+function remoteConfiguratorTargetGroups(assignments, configurations) {
+  const configurationById = new Map(
+    (configurations ?? []).map((configuration) => [
+      String(configuration?.configuration_id ?? ""),
+      configuration,
+    ]),
+  );
+  const sortedAssignments = Object.entries(assignments ?? {}).sort(([left], [right]) =>
+    String(left).localeCompare(String(right), undefined, { numeric: true }),
+  );
+  const groups = new Map();
+  sortedAssignments.forEach(([representativeNodeId, assignment], index) => {
+    const configurationId = String(assignment?.configuration_id ?? "");
+    const configuration = configurationById.get(configurationId);
+    const environmentId = String(assignment?.environment_id ?? "").trim();
+    const environmentLabel = remoteExecutionEnvironmentLabel(
+      assignment,
+      configurationById,
+      configuration?.gpu_type ?? null,
+    );
+    const targetKey = environmentId || `${assignment?.provider ?? "remote"}:${configurationId}`;
+    let group = groups.get(targetKey);
+    if (!group) {
+      const configurationName = String(
+        configuration?.display_name ?? configurationId,
+      ).trim();
+      group = {
+        targetKey,
+        targetName: configurationName || environmentLabel,
+        environmentLabel,
+        hardware: assignment?.hardware ?? null,
+        components: [],
+      };
+      groups.set(targetKey, group);
+    } else if (!group.hardware && assignment?.hardware) {
+      group.hardware = assignment.hardware;
+    }
+    const nodeIds = Array.isArray(assignment?.node_ids)
+      ? assignment.node_ids.map((value) => String(value))
+      : [String(representativeNodeId)];
+    group.components.push({
+      representativeNodeId: String(representativeNodeId),
+      label: `Component ${index + 1}`,
+      nodeIds,
+      assignment,
+    });
+  });
+  return Array.from(groups.values()).sort((left, right) =>
+    `${left.targetName}:${left.targetKey}`.localeCompare(
+      `${right.targetName}:${right.targetKey}`,
+      undefined,
+      { numeric: true },
+    ),
+  );
+}
+
+/** Return a compact time and cost estimate for one component assignment. */
+function remoteConfiguratorComponentEstimate(assignment) {
+  const predictedCost = assignment?.predicted_cost_usd == null
+    ? Number.NaN
+    : Number(assignment.predicted_cost_usd);
+  const predictedSeconds = Number(assignment?.predicted_completion_seconds);
+  const parts = [];
+  if (Number.isFinite(predictedSeconds) && predictedSeconds > 0) {
+    parts.push(`${Math.round(predictedSeconds)}s`);
+  }
+  if (Number.isFinite(predictedCost) && predictedCost >= 0) {
+    parts.push(`$${predictedCost.toFixed(4)}`);
+  }
+  return parts.join(" · ") || "—";
+}
+
+/** Render one target section and its assigned components. */
+function createRemoteConfiguratorTargetSection(group) {
+  const section = document.createElement("section");
+  section.className = "remote-configurator-target";
+  const heading = document.createElement("div");
+  heading.className = "remote-configurator-target-heading";
+  const title = document.createElement("span");
+  title.className = "remote-configurator-target-name";
+  title.textContent = group.targetName;
+  const machine = document.createElement("span");
+  machine.className = "remote-configurator-target-machine";
+  machine.textContent = String(group.hardware?.machine_type ?? "Unknown GPU");
+  heading.append(title, machine);
+  const location = document.createElement("div");
+  location.className = "remote-configurator-target-location";
+  location.textContent = group.environmentLabel;
+  const capacities = document.createElement("div");
+  capacities.className = "remote-configurator-target-capacities";
+  for (const capacityLabel of remoteConfiguratorHardwareLabels(group.hardware)) {
+    const capacity = document.createElement("span");
+    capacity.textContent = capacityLabel;
+    capacities.appendChild(capacity);
+  }
+  const componentList = document.createElement("div");
+  componentList.className = "remote-configurator-components";
+  for (const component of group.components) {
+    const row = document.createElement("div");
+    row.className = "remote-configurator-component";
+    const identity = document.createElement("div");
+    identity.className = "remote-configurator-component-identity";
+    const label = document.createElement("span");
+    label.className = "remote-configurator-component-label";
+    label.textContent = component.label;
+    const nodes = document.createElement("span");
+    nodes.className = "remote-configurator-component-nodes";
+    nodes.textContent = `Nodes ${component.nodeIds.map((nodeIdValue) => `#${nodeIdValue}`).join(", ")}`;
+    nodes.title = nodes.textContent;
+    identity.append(label, nodes);
+    const estimate = document.createElement("span");
+    estimate.className = "remote-configurator-component-estimate";
+    estimate.textContent = remoteConfiguratorComponentEstimate(component.assignment);
+    row.append(identity, estimate);
+    componentList.appendChild(row);
+  }
+  section.append(heading, location, capacities, componentList);
+  return section;
+}
+
 /**
- * Render the completed provider-neutral placement plan as a node-local table.
+ * Render the completed provider-neutral placement plan grouped by target.
  * @param {Record<string, any>} panel
  * @param {Record<string, Record<string, any>>} assignments
  * @param {Array<Record<string, any>>} configurations
@@ -3885,67 +4040,31 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
   if (!panel) {
     return;
   }
-  const configurationById = new Map(
-    (configurations ?? []).map((configuration) => [
-      String(configuration?.configuration_id ?? ""),
-      configuration,
-    ]),
-  );
   panel.assignments = assignments ?? {};
   panel.configurations = configurations ?? [];
-  const rows = Object.entries(assignments ?? {}).sort(([left], [right]) =>
-    String(left).localeCompare(String(right), undefined, { numeric: true }),
-  );
-  panel.tableBody.replaceChildren();
+  const groups = remoteConfiguratorTargetGroups(assignments, configurations);
+  panel.targets.replaceChildren();
   renderRemoteConfiguratorEnvironments(panel, assignments, configurations);
   renderRemoteConfiguratorStorage(panel, configurations);
-  rows.forEach(([representativeNodeId, assignment], index) => {
-    const row = document.createElement("tr");
-    const componentCell = document.createElement("td");
-    const targetCell = document.createElement("td");
-    const estimateCell = document.createElement("td");
-    const nodeIds = Array.isArray(assignment?.node_ids)
-      ? assignment.node_ids.map((value) => String(value))
-      : [String(representativeNodeId)];
-    componentCell.textContent = `Component ${index + 1}`;
-    componentCell.title = `Nodes ${nodeIds.join(", ")}`;
-    const configurationId = String(assignment?.configuration_id ?? "");
-    const configuration = configurationById.get(configurationId);
-    const configurationName = String(configuration?.display_name ?? configurationId).trim();
-    const environmentLabel = remoteExecutionEnvironmentLabel(
-      assignment,
-      configurationById,
-      configuration?.gpu_type ?? null,
-    );
-    targetCell.textContent = configurationName
-      ? `${configurationName} · ${environmentLabel}`
-      : environmentLabel;
-    const predictedCost = assignment?.predicted_cost_usd == null
-      ? Number.NaN
-      : Number(assignment.predicted_cost_usd);
-    const predictedSeconds = Number(assignment?.predicted_completion_seconds);
-    const estimateParts = [];
-    if (Number.isFinite(predictedSeconds) && predictedSeconds > 0) {
-      estimateParts.push(`${Math.round(predictedSeconds)}s`);
-    }
-    if (Number.isFinite(predictedCost) && predictedCost >= 0) {
-      estimateParts.push(`$${predictedCost.toFixed(4)}`);
-    }
-    estimateCell.textContent = estimateParts.join(" · ") || "—";
-    row.append(componentCell, targetCell, estimateCell);
-    panel.tableBody.appendChild(row);
-  });
-  panel.emptyText.hidden = rows.length > 0;
-  panel.table.hidden = rows.length === 0;
+  for (const group of groups) {
+    panel.targets.appendChild(createRemoteConfiguratorTargetSection(group));
+  }
+  panel.emptyText.hidden = groups.length > 0;
+  panel.targets.hidden = groups.length === 0;
+  const componentCount = groups.reduce(
+    (count, group) => count + group.components.length,
+    0,
+  );
+  const planHeight = groups.length * 78 + componentCount * 35;
   panel.minHeight =
     118 +
-    Math.max(1, rows.length) * 31 +
+    Math.max(31, planHeight) +
     panel.environmentRows.size * 52 +
     panel.storageHeight;
   const currentWidth = Number(panel.node.size?.[0]) || 0;
   const currentHeight = Number(panel.node.size?.[1]) || 0;
   panel.node.setSize?.([
-    Math.max(currentWidth, 500),
+    Math.max(currentWidth, 540),
     Math.max(currentHeight, panel.minHeight),
   ]);
   panel.node.graph?.setDirtyCanvas?.(true, true);
@@ -4194,10 +4313,7 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     <div class="remote-configurator-environments" hidden></div>
     <div class="remote-configurator-plan-title">Execution plan</div>
     <div class="remote-configurator-empty">The selected environments will appear here after planning.</div>
-    <table class="remote-configurator-table" hidden>
-      <thead><tr><th>Component</th><th>Target</th><th>Estimate</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div class="remote-configurator-targets" hidden></div>
     <div class="remote-configurator-storage" hidden>
       <div class="remote-configurator-storage-header">
         <div class="remote-configurator-storage-title">Storage backends</div>
@@ -4224,8 +4340,7 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     environments: root.querySelector(".remote-configurator-environments"),
     environmentRows: new Map(),
     emptyText: root.querySelector(".remote-configurator-empty"),
-    table: root.querySelector(".remote-configurator-table"),
-    tableBody: root.querySelector("tbody"),
+    targets: root.querySelector(".remote-configurator-targets"),
     storage: root.querySelector(".remote-configurator-storage"),
     storageList: root.querySelector(".remote-configurator-storage-list"),
     storageReload: root.querySelector(".remote-configurator-storage-reload"),
@@ -7016,37 +7131,125 @@ function installGlobalStatusStyles() {
       font-size: 10px;
     }
 
-    .remote-configurator-table {
-      width: 100%;
-      table-layout: fixed;
-      border-collapse: collapse;
+    .remote-configurator-targets {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 7px;
     }
 
-    .remote-configurator-table th,
-    .remote-configurator-table td {
+    .remote-configurator-targets[hidden] {
+      display: none;
+    }
+
+    .remote-configurator-target {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 5px;
+      padding: 7px;
+      border: 1px solid rgba(96, 165, 250, 0.28);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.64);
+    }
+
+    .remote-configurator-target-heading {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .remote-configurator-target-name {
+      min-width: 0;
       overflow: hidden;
-      padding: 5px 6px;
-      border-bottom: 1px solid rgba(148, 163, 184, 0.16);
-      text-align: left;
+      color: #e2e8f0;
+      font-size: 11px;
+      font-weight: 700;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
 
-    .remote-configurator-table th {
+    .remote-configurator-target-machine {
+      flex: 0 1 auto;
+      overflow: hidden;
+      padding: 2px 5px;
+      border: 1px solid rgba(96, 165, 250, 0.3);
+      border-radius: 999px;
+      color: #bfdbfe;
+      background: rgba(30, 64, 175, 0.2);
+      font: 650 9px/1.2 ui-monospace, SFMono-Regular, monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-target-location {
+      overflow: hidden;
       color: #94a3b8;
       font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-target-capacities {
+      display: flex;
+      min-width: 0;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .remote-configurator-target-capacities span {
+      padding: 2px 5px;
+      border-radius: 4px;
+      color: #cbd5e1;
+      background: rgba(51, 65, 85, 0.62);
+      font: 600 9px/1.25 ui-monospace, SFMono-Regular, monospace;
+    }
+
+    .remote-configurator-components {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      border-top: 1px solid rgba(148, 163, 184, 0.14);
+    }
+
+    .remote-configurator-component {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 1px 1px;
+    }
+
+    .remote-configurator-component-identity {
+      display: flex;
+      min-width: 0;
+      flex: 1 1 auto;
+      align-items: baseline;
+      gap: 6px;
+    }
+
+    .remote-configurator-component-label {
+      flex: 0 0 auto;
+      color: #e2e8f0;
+      font-size: 10px;
       font-weight: 650;
     }
 
-    .remote-configurator-table th:first-child,
-    .remote-configurator-table td:first-child {
-      width: 22%;
+    .remote-configurator-component-nodes {
+      min-width: 0;
+      overflow: hidden;
+      color: #94a3b8;
+      font: 500 9px/1.25 ui-monospace, SFMono-Regular, monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
-    .remote-configurator-table th:last-child,
-    .remote-configurator-table td:last-child {
-      width: 20%;
-      text-align: right;
+    .remote-configurator-component-estimate {
+      flex: 0 0 auto;
+      color: #cbd5e1;
+      font: 600 9px/1.25 ui-monospace, SFMono-Regular, monospace;
+      white-space: nowrap;
     }
 
     .remote-configurator-storage {

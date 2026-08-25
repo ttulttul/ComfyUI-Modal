@@ -68,12 +68,11 @@ class FakeElement {
       ".remote-configurator-progress-value",
       ".remote-configurator-environments",
       ".remote-configurator-empty",
-      ".remote-configurator-table",
+      ".remote-configurator-targets",
       ".remote-configurator-storage",
       ".remote-configurator-storage-list",
       ".remote-configurator-storage-reload",
       ".remote-configurator-storage-refresh-status",
-      "tbody",
     ]) {
       this.elementsBySelector.set(selector, new FakeElement(selector));
     }
@@ -1611,6 +1610,14 @@ modalToggle.registerRemoteConfiguratorPlan(
       node_ids: ["14", "15"],
       predicted_cost_usd: 0.031,
       predicted_completion_seconds: 120,
+      hardware: {
+        machine_type: "RTX 4090",
+        gpu_count: 1,
+        gpu_memory_kind: "VRAM",
+        gpu_memory_bytes_per_device: 24 * 1024 ** 3,
+        gpu_memory_bytes_total: 24 * 1024 ** 3,
+        ram_bytes: 64 * 1024 ** 3,
+      },
     },
     "24": {
       provider: "modal",
@@ -1619,6 +1626,14 @@ modalToggle.registerRemoteConfiguratorPlan(
       node_ids: ["24"],
       predicted_cost_usd: 0,
       predicted_completion_seconds: 60,
+      hardware: {
+        machine_type: "L40S",
+        gpu_count: 1,
+        gpu_memory_kind: "VRAM",
+        gpu_memory_bytes_per_device: 48 * 1024 ** 3,
+        gpu_memory_bytes_total: 48 * 1024 ** 3,
+        ram_capacity_label: "Provider managed",
+      },
     },
   },
   [
@@ -1676,10 +1691,39 @@ assert.equal(stalePanelWidget.wasUnregistered, true);
 assert.equal(lateConfiguratorNode.widgets.length, 1);
 assert.equal(lateConfiguratorNode.widgets[0].element, retainedPanel.root);
 assert.equal(retainedPanel.promptId, "plan-before-capacity");
-assert.equal(retainedPanel.tableBody.children.length, 2);
+assert.equal(retainedPanel.targets.children.length, 2);
 assert.equal(retainedPanel.environmentRows.size, 2);
-assert.equal(retainedPanel.table.hidden, false);
+assert.equal(retainedPanel.targets.hidden, false);
 assert.equal(retainedPanel.emptyText.hidden, true);
+const [lambdaTarget, vastTarget] = retainedPanel.targets.children;
+assert.deepEqual(
+  lambdaTarget.children[0].children.map((child) => child.textContent),
+  ["Lambda", "L40S"],
+);
+assert.deepEqual(
+  lambdaTarget.children[2].children.map((child) => child.textContent),
+  ["48.0 GiB VRAM", "RAM Provider managed"],
+);
+assert.deepEqual(
+  lambdaTarget.children[3].children[0].children[0].children.map(
+    (child) => child.textContent,
+  ),
+  ["Component 2", "Nodes #24"],
+);
+assert.deepEqual(
+  vastTarget.children[0].children.map((child) => child.textContent),
+  ["Vast Big", "RTX 4090"],
+);
+assert.deepEqual(
+  vastTarget.children[2].children.map((child) => child.textContent),
+  ["24.0 GiB VRAM", "64.0 GiB RAM"],
+);
+assert.deepEqual(
+  vastTarget.children[3].children[0].children[0].children.map(
+    (child) => child.textContent,
+  ),
+  ["Component 1", "Nodes #14, #15"],
+);
 assert.equal(retainedPanel.storage.hidden, false);
 assert.equal(retainedPanel.storageList.children.length, 1);
 assert.equal(typeof retainedPanel.storageReload.listeners.get("click"), "function");

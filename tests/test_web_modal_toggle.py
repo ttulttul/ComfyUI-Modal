@@ -86,7 +86,14 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert 'widget = node.addDOMWidget(\n      "remote_execution_plan"' in source
     assert "serialize: false" in source
     assert "getMinHeight: () => panel.minHeight" in source
-    assert 'class="remote-configurator-table"' in source
+    assert 'class="remote-configurator-targets"' in source
+    assert "function remoteConfiguratorTargetGroups(assignments, configurations)" in source
+    assert "function remoteConfiguratorHardwareLabels(hardware)" in source
+    assert "function createRemoteConfiguratorTargetSection(group)" in source
+    assert 'machine.className = "remote-configurator-target-machine";' in source
+    assert 'label.className = "remote-configurator-component-label";' in source
+    assert "hardware?.gpu_memory_bytes_per_device" in source
+    assert "hardware?.ram_capacity_label" in source
     assert 'class="remote-configurator-environments"' in source
     assert 'class="remote-configurator-storage"' in source
     assert "Storage backends" in source
@@ -102,7 +109,7 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert 'return "Cloudflare R2";' in source
     assert 'return "Unavailable";' in source
     assert "renderRemoteConfiguratorStorage(panel, configurations);" in source
-    assert source.index('class="remote-configurator-table"') < source.index(
+    assert source.index('class="remote-configurator-targets"') < source.index(
         'class="remote-configurator-storage"'
     )
     assert "responsePayload.remote_execution_assignments" in source

@@ -436,6 +436,115 @@ _MODAL_GPU_COST_USD_PER_SECOND: dict[str, float] = {
     "B200+": 0.001736,
     "B300": 0.001972,
 }
+_HBM_GPU_NAME_MARKERS = ("A100", "H100", "H200", "B200", "B300")
+
+
+def _gpu_memory_kind(machine_type: str) -> str:
+    """Return the best-known GPU memory technology for a machine label."""
+    normalized = machine_type.upper().replace(" ", "-")
+    return (
+        "HBM"
+        if any(marker in normalized for marker in _HBM_GPU_NAME_MARKERS)
+        else "VRAM"
+    )
+
+
+def _hardware_payload(
+    *,
+    machine_type: str,
+    gpu_count: int,
+    gpu_memory_bytes_per_device: int,
+    gpu_memory_bytes_total: int,
+    ram_bytes: int = 0,
+    ram_available_bytes: int | None = None,
+    ram_capacity_label: str | None = None,
+) -> dict[str, Any]:
+    """Return compact credential-free target hardware metadata."""
+    payload: dict[str, Any] = {
+        "machine_type": machine_type or "Unknown GPU",
+        "gpu_count": max(0, gpu_count),
+        "gpu_memory_kind": _gpu_memory_kind(machine_type),
+        "gpu_memory_bytes_per_device": max(0, gpu_memory_bytes_per_device),
+        "gpu_memory_bytes_total": max(0, gpu_memory_bytes_total),
+    }
+    if ram_bytes > 0:
+        payload["ram_bytes"] = ram_bytes
+    if ram_available_bytes is not None and ram_available_bytes >= 0:
+        payload["ram_available_bytes"] = ram_available_bytes
+    if ram_capacity_label:
+        payload["ram_capacity_label"] = ram_capacity_label
+    return payload
+
+
+def _capabilities_hardware_payload(
+    capabilities: EnvironmentCapabilities | None,
+) -> dict[str, Any] | None:
+    """Summarize a probed host's GPUs and system memory for the UI."""
+    if capabilities is None:
+        return None
+    gpu_names = tuple(dict.fromkeys(gpu.name for gpu in capabilities.gpus))
+    machine_type = " + ".join(gpu_names) if gpu_names else "CPU-only"
+    total_gpu_memory = sum(gpu.total_vram_bytes for gpu in capabilities.gpus)
+    per_device_memory = max(
+        (gpu.total_vram_bytes for gpu in capabilities.gpus),
+        default=0,
+    )
+    return _hardware_payload(
+        machine_type=machine_type,
+        gpu_count=len(capabilities.gpus),
+        gpu_memory_bytes_per_device=per_device_memory,
+        gpu_memory_bytes_total=total_gpu_memory,
+        ram_bytes=capabilities.total_ram_bytes,
+        ram_available_bytes=capabilities.available_ram_bytes,
+    )
+
+
+def _modal_hardware_payload(gpu_type: str) -> dict[str, Any]:
+    """Summarize known Modal GPU capacity without guessing dynamic host RAM."""
+    gpu_memory_bytes = int(_MODAL_GPU_VRAM_GB.get(gpu_type, 0.0) * 1024**3)
+    return _hardware_payload(
+        machine_type=gpu_type,
+        gpu_count=1,
+        gpu_memory_bytes_per_device=gpu_memory_bytes,
+        gpu_memory_bytes_total=gpu_memory_bytes,
+        ram_capacity_label="Provider managed",
+    )
+
+
+def _vast_hardware_payload(resource: Any) -> dict[str, Any]:
+    """Summarize a Vast offer or lease using its advertised capacities."""
+    gpu_count = max(
+        0,
+        int(
+            getattr(resource, "gpu_count", None)
+            or getattr(resource, "num_gpus", 0)
+            or 0
+        ),
+    )
+    per_device_memory = max(
+        0,
+        int(getattr(resource, "gpu_ram_mb", 0) or 0) * 1024**2,
+    )
+    advertised_total_mb = int(
+        getattr(resource, "gpu_total_ram_mb", 0) or 0
+    )
+    total_gpu_memory = (
+        advertised_total_mb * 1024**2
+        if advertised_total_mb > 0
+        else per_device_memory * max(gpu_count, 1)
+    )
+    return _hardware_payload(
+        machine_type=str(
+            getattr(resource, "gpu_name", "Unknown GPU") or "Unknown GPU"
+        ),
+        gpu_count=gpu_count,
+        gpu_memory_bytes_per_device=per_device_memory,
+        gpu_memory_bytes_total=total_gpu_memory,
+        ram_bytes=max(
+            0,
+            int(getattr(resource, "cpu_ram_mb", 0) or 0) * 1024**2,
+        ),
+    )
 
 
 def _modal_environment_state(settings: ModalSyncSettings) -> EnvironmentSchedulingState:
@@ -1442,7 +1551,13 @@ def _plan_configured_component_execution(
     safe_configurations = _safe_remote_configuration_payload(configuration_set)
     if plan_callback is not None:
         plan_callback(
-            _planned_execution_assignments_payload(assignments, components),
+            _planned_execution_assignments_payload(
+                assignments,
+                components,
+                configurations_by_id=configurations_by_id,
+                ssh_hosts_by_id=ssh_hosts_by_id,
+                vast_quotes=vast_quotes,
+            ),
             safe_configurations,
         )
 
@@ -1457,7 +1572,14 @@ def _plan_configured_component_execution(
     )
     if plan_callback is not None and vast_leases:
         plan_callback(
-            _planned_execution_assignments_payload(assignments, components),
+            _planned_execution_assignments_payload(
+                assignments,
+                components,
+                configurations_by_id=configurations_by_id,
+                ssh_hosts_by_id=ssh_hosts_by_id,
+                vast_quotes=vast_quotes,
+                vast_leases_by_environment=vast_leases,
+            ),
             safe_configurations,
         )
     return ComponentExecutionPlan(
@@ -1557,6 +1679,11 @@ def _r2_storage_from_usage_payload(
 def _planned_execution_assignments_payload(
     assignments: Mapping[str, ExecutionAssignment],
     components: Sequence[RemoteComponentPlan],
+    *,
+    configurations_by_id: Mapping[str, Any] | None = None,
+    ssh_hosts_by_id: Mapping[str, SshHostConfig] | None = None,
+    vast_quotes: Mapping[tuple[str, str], VastProfileQuote] | None = None,
+    vast_leases_by_environment: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Serialize scheduler choices before provider capacity is acquired."""
     component_nodes = {
@@ -1573,9 +1700,76 @@ def _planned_execution_assignments_payload(
             "predicted_completion_seconds": assignment.predicted_completion_seconds,
             "worker_index": assignment.capacity_slot_index,
             "reasons": list(assignment.reasons),
+            "hardware": _assignment_hardware_payload(
+                component_id=component_id,
+                assignment=assignment,
+                configurations_by_id=configurations_by_id or {},
+                ssh_hosts_by_id=ssh_hosts_by_id or {},
+                vast_quotes=vast_quotes or {},
+                vast_leases_by_environment=vast_leases_by_environment or {},
+            ),
         }
         for component_id, assignment in sorted(assignments.items())
     }
+
+
+def _configuration_field(configuration: Any, field_name: str) -> Any:
+    """Read one field from a configuration model or safe mapping."""
+    if isinstance(configuration, Mapping):
+        return configuration.get(field_name)
+    return getattr(configuration, field_name, None)
+
+
+def _configuration_host(configuration: Any) -> SshHostConfig | None:
+    """Return a workflow SSH host from a model or safe configuration mapping."""
+    host = _configuration_field(configuration, "host")
+    if isinstance(host, SshHostConfig):
+        return host
+    if isinstance(host, Mapping):
+        try:
+            return SshHostConfig.from_dict(host)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _assignment_hardware_payload(
+    *,
+    component_id: str,
+    assignment: ExecutionAssignment,
+    configurations_by_id: Mapping[str, Any],
+    ssh_hosts_by_id: Mapping[str, SshHostConfig],
+    vast_quotes: Mapping[tuple[str, str], VastProfileQuote],
+    vast_leases_by_environment: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the best hardware identity known for one planned assignment."""
+    configuration_id = str(assignment.configuration_id or "")
+    configuration = configurations_by_id.get(configuration_id)
+    if assignment.provider is ExecutionProvider.MODAL:
+        gpu_type = str(
+            _configuration_field(configuration, "gpu_type")
+            or assignment.environment_id.rsplit(":", 1)[-1]
+        )
+        return _modal_hardware_payload(gpu_type)
+    if assignment.provider is ExecutionProvider.SSH_DOCKER:
+        host = ssh_hosts_by_id.get(configuration_id) or _configuration_host(
+            configuration
+        )
+        return _capabilities_hardware_payload(
+            host.capabilities if host is not None else None
+        )
+    lease = vast_leases_by_environment.get(assignment.environment_id)
+    if lease is not None:
+        return _vast_hardware_payload(lease)
+    quote = vast_quotes.get((component_id, configuration_id))
+    if quote is None:
+        return None
+    resource = getattr(quote, "existing_lease", None) or getattr(
+        quote,
+        "offer",
+        None,
+    )
+    return _vast_hardware_payload(resource) if resource is not None else None
 
 
 def _probe_configured_ssh_hosts(
@@ -8117,6 +8311,10 @@ def _execution_assignments_payload(
             }
         except ValueError as exc:
             logger.warning("Unable to load Vast lease labels for UI status: %s", exc)
+    configurations_by_id = {
+        str(configuration.get("configuration_id") or ""): configuration
+        for configuration in summary.remote_configurations
+    }
     return {
         component_id: {
             "provider": assignment.provider.value,
@@ -8138,6 +8336,14 @@ def _execution_assignments_payload(
                 0,
             ),
             "reasons": list(assignment.reasons),
+            "hardware": _assignment_hardware_payload(
+                component_id=component_id,
+                assignment=assignment,
+                configurations_by_id=configurations_by_id,
+                ssh_hosts_by_id=ssh_hosts_by_id,
+                vast_quotes={},
+                vast_leases_by_environment=vast_leases_by_environment,
+            ),
         }
         for component_id, assignment in sorted(
             summary.execution_assignments_by_representative.items()

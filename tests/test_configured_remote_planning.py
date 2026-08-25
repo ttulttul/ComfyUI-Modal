@@ -108,11 +108,15 @@ def test_connected_modal_configurations_replace_global_single_gpu_choice(
         },
     }
 
+    plan_events: list[dict[str, dict[str, Any]]] = []
     plan = api._plan_component_execution(
         components=[_component(api, "1"), _component(api, "2")],
         prompt=prompt,
         workflow={"extra": {"remote_execution": {"policy": "modal"}}},
         settings=settings_module.get_settings(),
+        plan_callback=lambda assignments, _configurations: plan_events.append(
+            assignments
+        ),
     )
 
     assert plan.configuration_set is not None
@@ -123,6 +127,26 @@ def test_connected_modal_configurations_replace_global_single_gpu_choice(
     assert {assignment.environment_id for assignment in plan.assignments.values()} == {
         "modal:10:T4",
         "modal:11:H200",
+    }
+    hardware_by_machine = {
+        assignment["hardware"]["machine_type"]: assignment["hardware"]
+        for assignment in plan_events[-1].values()
+    }
+    assert hardware_by_machine["T4"] == {
+        "machine_type": "T4",
+        "gpu_count": 1,
+        "gpu_memory_kind": "VRAM",
+        "gpu_memory_bytes_per_device": 16 * 1024**3,
+        "gpu_memory_bytes_total": 16 * 1024**3,
+        "ram_capacity_label": "Provider managed",
+    }
+    assert hardware_by_machine["H200"] == {
+        "machine_type": "H200",
+        "gpu_count": 1,
+        "gpu_memory_kind": "HBM",
+        "gpu_memory_bytes_per_device": 141 * 1024**3,
+        "gpu_memory_bytes_total": 141 * 1024**3,
+        "ram_capacity_label": "Provider managed",
     }
 
 
@@ -159,6 +183,14 @@ def test_vast_capacity_is_quoted_globally_and_acquired_only_after_assignment(
             cost = 0.01 if profile.profile_name == "vast-broad" else 0.02
             return SimpleNamespace(
                 profile=profile,
+                offer=SimpleNamespace(
+                    gpu_name=f"{profile.profile_name} GPU",
+                    num_gpus=1,
+                    gpu_ram_mb=96 * 1024,
+                    gpu_total_ram_mb=96 * 1024,
+                    cpu_ram_mb=192 * 1024,
+                ),
+                existing_lease=None,
                 predicted_incremental_cost_usd=cost,
                 predicted_execution_seconds=requirements[
                     "predicted_execution_seconds"
@@ -202,6 +234,7 @@ def test_vast_capacity_is_quoted_globally_and_acquired_only_after_assignment(
                 gpu_name="Configured GPU",
                 gpu_count=1,
                 gpu_ram_mb=96 * 1024,
+                cpu_ram_mb=192 * 1024,
                 hourly_cost_usd=1.0,
                 idle_retention_seconds=24 * 3600,
             )
@@ -258,7 +291,28 @@ def test_vast_capacity_is_quoted_globally_and_acquired_only_after_assignment(
     early_assignments = events[plan_event_index][1]
     assert set(early_assignments) == {"1", "2", "3"}
     assert all(assignment["node_ids"] for assignment in early_assignments.values())
+    assert all(
+        assignment["hardware"]["gpu_memory_bytes_total"] == 96 * 1024**3
+        for assignment in early_assignments.values()
+    )
+    assert all(
+        assignment["hardware"]["ram_bytes"] == 192 * 1024**3
+        for assignment in early_assignments.values()
+    )
     assert len(events[plan_event_index][2]) == 2
+    final_assignments = [event for event in events if event[0] == "plan"][-1][1]
+    assert all(
+        assignment["hardware"]
+        == {
+            "machine_type": "Configured GPU",
+            "gpu_count": 1,
+            "gpu_memory_kind": "VRAM",
+            "gpu_memory_bytes_per_device": 96 * 1024**3,
+            "gpu_memory_bytes_total": 96 * 1024**3,
+            "ram_bytes": 192 * 1024**3,
+        }
+        for assignment in final_assignments.values()
+    )
     assert len(plan.vast_leases_by_environment) == 3
     assert len({assignment.environment_id for assignment in plan.assignments.values()}) == 3
     assert {assignment.configuration_id for assignment in plan.assignments.values()} == {
@@ -306,11 +360,15 @@ def test_workflow_ssh_configuration_is_probed_and_carried_into_execution_metadat
         },
     }
 
+    plan_events: list[dict[str, dict[str, Any]]] = []
     plan = api._plan_component_execution(
         components=[_component(api, "1")],
         prompt=prompt,
         workflow={"extra": {"remote_execution": {"policy": "modal"}}},
         settings=settings_module.get_settings(),
+        plan_callback=lambda assignments, _configurations: plan_events.append(
+            assignments
+        ),
     )
     assignment = plan.assignments["1"]
     metadata = api._configured_provider_metadata(
@@ -338,6 +396,15 @@ def test_workflow_ssh_configuration_is_probed_and_carried_into_execution_metadat
         "nvidia_container_runtime"
     ] is True
     assert metadata["ssh_host_config"]["health"] == "unknown"
+    assert plan_events[-1]["1"]["hardware"] == {
+        "machine_type": "SSH GPU",
+        "gpu_count": 1,
+        "gpu_memory_kind": "VRAM",
+        "gpu_memory_bytes_per_device": 96 * 1024**3,
+        "gpu_memory_bytes_total": 96 * 1024**3,
+        "ram_bytes": 128 * 1024**3,
+        "ram_available_bytes": 128 * 1024**3,
+    }
 
 
 def test_queued_workflow_uses_nameplate_capacity_of_occupied_ssh_host(
