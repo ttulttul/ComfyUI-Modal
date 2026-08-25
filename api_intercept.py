@@ -1300,6 +1300,7 @@ def _plan_component_execution(
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
     status_callback: SetupStatusCallback | None = None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
 ) -> ComponentExecutionPlan:
     """Plan through connected configurations or synthesize the legacy behavior."""
@@ -1324,6 +1325,7 @@ def _plan_component_execution(
         settings=settings,
         configuration_set=configuration_set,
         status_callback=status_callback,
+        environment_status_callback=environment_status_callback,
         plan_callback=plan_callback,
     )
 
@@ -1336,6 +1338,7 @@ def _plan_configured_component_execution(
     settings: ModalSyncSettings,
     configuration_set: RemoteConfigurationSet,
     status_callback: SetupStatusCallback | None = None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
 ) -> ComponentExecutionPlan:
     """Resolve and prepare a capacity-aware plan from connected configurations."""
@@ -1403,6 +1406,7 @@ def _plan_configured_component_execution(
         vast_quotes=vast_quotes,
         vast_service=vast_service,
         status_callback=status_callback,
+        environment_status_callback=environment_status_callback,
     )
     if plan_callback is not None and vast_leases:
         plan_callback(
@@ -1723,6 +1727,7 @@ def _prepare_selected_vast_capacity(
     vast_quotes: Mapping[tuple[str, str], VastProfileQuote],
     vast_service: VastService | None,
     status_callback: SetupStatusCallback | None = None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None = None,
 ) -> dict[str, Any]:
     """Acquire only Vast slots selected by the completed provider-neutral plan."""
     selected_slots: dict[tuple[str, int], list[str]] = defaultdict(list)
@@ -1756,6 +1761,7 @@ def _prepare_selected_vast_capacity(
         start=1,
     ):
         configuration = configurations_by_id[configuration_id]
+        planned_environment_id = assignments[component_ids[0]].environment_id
         quote = _quote_selected_vast_slot(
             configuration=configuration,
             component_ids=component_ids,
@@ -1764,23 +1770,29 @@ def _prepare_selected_vast_capacity(
             vast_service=vast_service,
         )
         try:
-            if status_callback is not None:
-                status_callback(
-                    f"Acquiring Vast.ai capacity {slot_number} of {total_slots}",
-                    slot_number - 1,
-                    total_slots,
-                )
-            if status_callback is None:
+            _emit_vast_capacity_status(
+                environment_id=planned_environment_id,
+                message=f"Acquiring Vast.ai capacity {slot_number} of {total_slots}",
+                current=slot_number - 1,
+                total=total_slots,
+                status_callback=status_callback,
+                environment_status_callback=environment_status_callback,
+            )
+            if status_callback is None and environment_status_callback is None:
                 lease = vast_service.acquire_sync(quote, slot=slot_index)
             else:
                 lease = vast_service.acquire_sync(
                     quote,
                     slot=slot_index,
                     status_callback=(
-                        lambda message, current=slot_number - 1: status_callback(
-                            message,
-                            current,
-                            total_slots,
+                        lambda message, environment_id=planned_environment_id,
+                        current=slot_number - 1: _emit_vast_capacity_status(
+                            environment_id=environment_id,
+                            message=message,
+                            current=current,
+                            total=total_slots,
+                            status_callback=status_callback,
+                            environment_status_callback=environment_status_callback,
                         )
                     ),
                 )
@@ -1789,12 +1801,6 @@ def _prepare_selected_vast_capacity(
                 f"Unable to acquire Vast.ai capacity for configuration "
                 f"{configuration.display_name!r} slot {slot_index}: {exc}"
             ) from exc
-        if status_callback is not None:
-            status_callback(
-                f"Vast.ai capacity {slot_number} of {total_slots} is ready",
-                slot_number,
-                total_slots,
-            )
         leases_by_environment[lease.environment_id] = lease
         cost_share = quote.predicted_incremental_cost_usd / len(component_ids)
         for component_id in component_ids:
@@ -1809,7 +1815,38 @@ def _prepare_selected_vast_capacity(
                     f"Vast capacity slot {slot_index}",
                 ),
             )
+        _emit_vast_capacity_status(
+            environment_id=lease.environment_id,
+            message=f"Vast.ai capacity {slot_number} of {total_slots} is ready",
+            environment_message="Ready to plan remote execution",
+            current=slot_number,
+            total=total_slots,
+            status_callback=status_callback,
+            environment_status_callback=environment_status_callback,
+        )
     return leases_by_environment
+
+
+def _emit_vast_capacity_status(
+    *,
+    environment_id: str,
+    message: str,
+    environment_message: str | None = None,
+    current: int,
+    total: int,
+    status_callback: SetupStatusCallback | None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None,
+) -> None:
+    """Publish one Vast setup update at prompt and environment scopes."""
+    if status_callback is not None:
+        status_callback(message, current, total)
+    if environment_status_callback is not None:
+        environment_status_callback(
+            environment_id,
+            environment_message or message,
+            None,
+            None,
+        )
 
 
 def _quote_selected_vast_slot(
@@ -7198,6 +7235,7 @@ def rewrite_prompt_for_modal(
         workflow=workflow,
         settings=resolved_settings,
         status_callback=status_callback,
+        environment_status_callback=environment_status_callback,
         plan_callback=plan_callback,
     )
     assignments_by_component_id = execution_plan.assignments

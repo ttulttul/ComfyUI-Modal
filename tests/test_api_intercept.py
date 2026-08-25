@@ -6426,6 +6426,9 @@ def test_selected_vast_capacity_streams_setup_status(
         predicted_incremental_cost_usd=0.02,
     )
     status_events: list[tuple[str, int | None, int | None]] = []
+    environment_status_events: list[
+        tuple[str, str, int | None, int | None]
+    ] = []
 
     class FakeVastService:
         """Emit representative readiness phases without renting an instance."""
@@ -6456,6 +6459,13 @@ def test_selected_vast_capacity_streams_setup_status(
         status_callback=lambda message, current, total: status_events.append(
             (message, current, total)
         ),
+        environment_status_callback=(
+            lambda environment_id, message, current, total: (
+                environment_status_events.append(
+                    (environment_id, message, current, total)
+                )
+            )
+        ),
     )
 
     assert list(leases) == ["vast:vast-config:42"]
@@ -6464,5 +6474,21 @@ def test_selected_vast_capacity_streams_setup_status(
         ("Vast.ai instance 42 is downloading the worker image", 0, 1),
         ("Initializing Vast.ai worker", 0, 1),
         ("Vast.ai capacity 1 of 1 is ready", 1, 1),
+    ]
+    assert environment_status_events == [
+        ("vast:vast-config", "Acquiring Vast.ai capacity 1 of 1", None, None),
+        (
+            "vast:vast-config",
+            "Vast.ai instance 42 is downloading the worker image",
+            None,
+            None,
+        ),
+        ("vast:vast-config", "Initializing Vast.ai worker", None, None),
+        (
+            "vast:vast-config:42",
+            "Ready to plan remote execution",
+            None,
+            None,
+        ),
     ]
     assert assignments["component-1"].environment_id == "vast:vast-config:42"

@@ -3397,7 +3397,7 @@ function renderRemoteConfiguratorStatus(panel, state) {
  * Return one stable row per concrete environment in a placement plan.
  * @param {Record<string, Record<string, any>>} assignments
  * @param {Array<Record<string, any>>} configurations
- * @returns {Array<{ environmentId: string, label: string }>}
+ * @returns {Array<{ environmentId: string, label: string, initialState: Record<string, any> }>}
  */
 function remoteConfiguratorEnvironmentEntries(assignments, configurations) {
   const configurationById = new Map(
@@ -3415,6 +3415,8 @@ function remoteConfiguratorEnvironmentEntries(assignments, configurations) {
     const configurationId = String(assignment?.configuration_id ?? "");
     const configuration = configurationById.get(configurationId);
     const configurationName = String(configuration?.display_name ?? configurationId).trim();
+    const awaitingCapacity =
+      assignment?.provider === "vast" && environmentId === `vast:${configurationId}`;
     const environmentLabel = remoteExecutionEnvironmentLabel(
       assignment,
       configurationById,
@@ -3425,6 +3427,12 @@ function remoteConfiguratorEnvironmentEntries(assignments, configurations) {
       label: configurationName
         ? `${configurationName} · ${environmentLabel}`
         : environmentLabel,
+      initialState: awaitingCapacity
+        ? {
+            phase: STATE_SETUP,
+            statusMessage: "Waiting for Vast.ai setup",
+          }
+        : {},
     });
   }
   return Array.from(entries.values());
@@ -3509,7 +3517,7 @@ function renderRemoteConfiguratorEnvironments(panel, assignments, configurations
     panel.environments.appendChild(row.root);
     renderRemoteConfiguratorEnvironmentStatus(
       row,
-      promptState?.remoteEnvironmentStatuses.get(entry.environmentId) ?? {},
+      promptState?.remoteEnvironmentStatuses.get(entry.environmentId) ?? entry.initialState,
     );
   }
   panel.environments.hidden = panel.environmentRows.size === 0;
