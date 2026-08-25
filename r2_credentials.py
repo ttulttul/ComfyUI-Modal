@@ -11,10 +11,10 @@ import keyring
 from keyring.errors import KeyringError
 
 if __package__:
-    from .r2_cache import R2CacheConfiguration
+    from .r2_cache import R2CacheClient, R2CacheConfiguration, R2CacheError
     from .remote_configurations import R2StorageBackingConfiguration
 else:  # pragma: no cover - direct ComfyUI loading fallback.
-    from r2_cache import R2CacheConfiguration
+    from r2_cache import R2CacheClient, R2CacheConfiguration, R2CacheError
     from remote_configurations import R2StorageBackingConfiguration
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ class PasswordStore(Protocol):
 
 @dataclass(frozen=True)
 class R2CredentialRecord:
-    """Hold one bucket-scoped R2 credential returned by Cloudflare."""
+    """Hold one user-created bucket-scoped R2 S3 credential."""
 
     account_id: str
     bucket: str
@@ -169,17 +169,18 @@ class R2CredentialStore:
         record = self.load(storage.credential_id)
         if record is None:
             raise R2CredentialError(
-                f"Cloudflare Login has not completed for R2 configuration "
+                f"R2 API credentials have not been saved for configuration "
                 f"{storage.display_name!r}."
             )
         if record.account_id != storage.account_id or record.bucket != storage.bucket:
             raise R2CredentialError(
-                "The R2 node account or bucket changed after Login; use Login again "
-                "to issue a matching bucket-scoped credential."
+                "The R2 node account or bucket changed after credentials were saved; "
+                "import credentials for the configured bucket again."
             )
         if record.jurisdiction != storage.jurisdiction:
             raise R2CredentialError(
-                "The R2 node jurisdiction changed after Login; use Login again."
+                "The R2 node jurisdiction changed after credentials were saved; "
+                "import the credentials again."
             )
         return record.as_cache_configuration(storage)
 
@@ -194,6 +195,19 @@ class R2CredentialStore:
             "bucket": record.bucket,
             "jurisdiction": record.jurisdiction,
         }
+
+
+def validate_r2_credentials(record: R2CredentialRecord) -> None:
+    """Verify imported S3 credentials against their exact configured R2 bucket."""
+    try:
+        R2CacheClient(record.as_cache_configuration()).validate_bucket_access()
+    except (R2CacheError, RuntimeError, ValueError) as exc:
+        raise R2CredentialError(str(exc)) from exc
+    logger.info(
+        "Validated imported Cloudflare R2 credentials account=%s bucket=%s.",
+        record.account_id,
+        record.bucket,
+    )
 
 
 def _validated_credential_id(credential_id: str) -> str:
@@ -211,4 +225,5 @@ __all__ = [
     "R2CredentialRecord",
     "R2CredentialStore",
     "R2_KEYRING_SERVICE",
+    "validate_r2_credentials",
 ]

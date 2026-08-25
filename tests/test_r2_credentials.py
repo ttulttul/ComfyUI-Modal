@@ -95,6 +95,6 @@ def test_keyring_record_must_match_workflow_bucket(
     try:
         store.cache_configuration(storage)
     except r2_credentials_module.R2CredentialError as error:
-        assert "changed after Login" in str(error)
+        assert "changed after credentials were saved" in str(error)
     else:
         raise AssertionError("Expected a mismatched R2 credential to be rejected.")

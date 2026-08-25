@@ -20,6 +20,7 @@ class FakeS3Client:
         self.pending_sizes: dict[str, int] = {}
         self.aborted_upload_ids: list[str] = []
         self.fail_upload_part_signing = False
+        self.fail_bucket_validation = False
 
     def head_object(self, **kwargs: Any) -> dict[str, int]:
         """Return an exact stored size or an S3-compatible 404."""
@@ -34,6 +35,13 @@ class FakeS3Client:
                 "HeadObject",
             )
         return {"ContentLength": self.objects[key]}
+
+    def list_objects_v2(self, **kwargs: Any) -> dict[str, list[Any]]:
+        """Accept a bounded bucket-access validation request."""
+        self.calls.append(("list_objects_v2", kwargs))
+        if self.fail_bucket_validation:
+            raise ValueError("provider diagnostic containing secret-key")
+        return {"Contents": []}
 
     def generate_presigned_url(self, operation: str, **kwargs: Any) -> str:
         """Return a deterministic URL on the configured account host."""
@@ -125,6 +133,39 @@ def test_environment_configuration_is_opt_in_and_hides_secrets(
     assert configuration.write_back_mode == "sync"
     assert "controller-access" not in repr(configuration)
     assert "controller-secret" not in repr(configuration)
+
+
+def test_validate_bucket_access_uses_a_bounded_object_listing(
+    r2_cache_module: Any,
+) -> None:
+    """Imported credentials should be checked without reading object contents."""
+    configuration = _configuration(r2_cache_module)
+    fake_s3 = FakeS3Client(r2_cache_module)
+
+    r2_cache_module.R2CacheClient(
+        configuration,
+        s3_client=fake_s3,
+    ).validate_bucket_access()
+
+    assert fake_s3.calls == [
+        ("list_objects_v2", {"Bucket": "bucket", "MaxKeys": 1})
+    ]
+
+
+def test_validate_bucket_access_returns_a_credential_safe_error(
+    r2_cache_module: Any,
+) -> None:
+    """Provider diagnostics must not reflect imported secrets to the browser."""
+    configuration = _configuration(r2_cache_module)
+    fake_s3 = FakeS3Client(r2_cache_module)
+    fake_s3.fail_bucket_validation = True
+    client = r2_cache_module.R2CacheClient(configuration, s3_client=fake_s3)
+
+    with pytest.raises(r2_cache_module.R2CacheError) as captured:
+        client.validate_bucket_access()
+
+    assert "secret-key" not in str(captured.value)
+    assert "configured bucket" in str(captured.value)
 
 
 def test_download_request_requires_an_exact_size_match(r2_cache_module: Any) -> None:

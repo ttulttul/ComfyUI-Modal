@@ -18,4 +18,9 @@ def test_r2_node_login_is_direct_and_non_serialized() -> None:
     assert "window.open(" in source
     assert '"about:blank"' in source
     assert "/remote/storage/r2/oauth/start" in source
+    assert "/remote/storage/r2/credentials" in source
+    assert 'credentialInput("Secret Access Key", "password"' in source
+    assert "validateR2Credentials" not in source
+    assert "secret_access_key: secretAccessKey" in source
+    assert "Add R2 API credentials" in source
     assert "api.queuePrompt" not in source

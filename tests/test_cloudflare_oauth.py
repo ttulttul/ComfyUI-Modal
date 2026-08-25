@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import json
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import pytest
-
-
 class CapturingCredentialStore:
-    """Capture the credential record persisted after OAuth completes."""
+    """Capture credential records persisted after manual import."""
 
     def __init__(self) -> None:
         """Initialize captured writes."""
@@ -22,9 +19,21 @@ class CapturingCredentialStore:
         self.saved.append((credential_id, record))
 
     def load(self, credential_id: str) -> None:
-        """Report that no previous credential needs revocation."""
+        """Report that no credential is currently stored."""
         del credential_id
         return None
+
+
+class JsonRequest:
+    """Provide the JSON request surface used by route helpers."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        """Store one request payload."""
+        self.payload = payload
+
+    async def json(self) -> dict[str, Any]:
+        """Return the stored request payload."""
+        return self.payload
 
 
 def test_authorization_url_uses_public_client_pkce(
@@ -55,66 +64,15 @@ def test_authorization_url_uses_public_client_pkce(
     assert state.credential_id == "opaque-id"
     assert state.bucket == "models"
     assert len(query["code_challenge"][0]) == 43
+    assert query["scope"] == [
+        "account-settings.read workers-r2.write openid"
+    ]
 
 
-def test_r2_token_response_becomes_s3_signing_credentials(
+def test_complete_provisions_bucket_without_attempting_token_creation(
     cloudflare_oauth_module: Any,
 ) -> None:
-    """Cloudflare token ID/value should map to R2's S3 access/secret pair."""
-    calls: list[tuple[str, str, Any]] = []
-
-    class Service(cloudflare_oauth_module.CloudflareR2OAuthService):
-        """Return deterministic Cloudflare API responses."""
-
-        async def _cloudflare_api(
-            self,
-            method: str,
-            path: str,
-            *,
-            access_token: str,
-            headers: Any = None,
-            json_payload: Any = None,
-        ) -> Any:
-            """Capture API calls and return permission/token fixtures."""
-            del access_token, headers
-            calls.append((method, path, json_payload))
-            if path == "/user/tokens/permission_groups":
-                return [{"id": "permission-id", "name": "Workers R2 Storage Bucket Item Write"}]
-            return {"id": "access-key-id", "value": "one-time-token-value"}
-
-    service = Service(
-        cloudflare_oauth_module.CloudflareOAuthConfiguration(client_id="public-client")
-    )
-    state = cloudflare_oauth_module.R2OAuthState(
-        node_id="20",
-        credential_id="opaque-id",
-        bucket="models",
-        jurisdiction="eu",
-        requested_account_id=None,
-        redirect_uri="http://127.0.0.1/callback",
-        code_verifier="verifier",
-    )
-
-    record = asyncio.run(
-        service._create_bucket_credential("oauth-access", "a" * 32, state)
-    )
-
-    assert record.access_key_id == "access-key-id"
-    assert record.secret_access_key == hashlib.sha256(
-        b"one-time-token-value"
-    ).hexdigest()
-    create_payload = calls[-1][2]
-    resources = create_payload["policies"][0]["resources"]
-    assert resources == {
-        f"com.cloudflare.edge.r2.bucket.{'a' * 32}_eu_models": "*"
-    }
-    assert "one-time-token-value" not in str(calls)
-
-
-def test_complete_persists_only_the_r2_credential(
-    cloudflare_oauth_module: Any,
-) -> None:
-    """OAuth completion should finish provisioning before writing the keyring record."""
+    """OAuth completion should stop after bucket provisioning and request import."""
     credential_store = CapturingCredentialStore()
 
     class Service(cloudflare_oauth_module.CloudflareR2OAuthService):
@@ -143,21 +101,6 @@ def test_complete_persists_only_the_r2_credential(
             assert account_id == "a" * 32
             assert state.bucket == "models"
 
-        async def _create_bucket_credential(
-            self,
-            access_token: str,
-            account_id: str,
-            state: Any,
-        ) -> Any:
-            """Return the final bucket-scoped credential."""
-            del access_token, state
-            return cloudflare_oauth_module.R2CredentialRecord(
-                account_id=account_id,
-                bucket="models",
-                access_key_id="access-id",
-                secret_access_key="secret-key",
-            )
-
     service = Service(
         cloudflare_oauth_module.CloudflareOAuthConfiguration(client_id="public-client"),
         credential_store=credential_store,
@@ -177,63 +120,74 @@ def test_complete_persists_only_the_r2_credential(
     )
 
     assert result["account_id"] == "a" * 32
-    assert credential_store.saved[0][0] == "opaque-id"
-    record = credential_store.saved[0][1]
-    assert record.access_key_id == "access-id"
-    assert record.secret_access_key == "secret-key"
+    assert result["credentials_required"] is True
+    assert credential_store.saved == []
 
 
-def test_failed_keyring_write_revokes_new_cloudflare_token(
+def test_import_validates_and_saves_user_created_r2_credentials(
     cloudflare_oauth_module: Any,
+    monkeypatch: Any,
 ) -> None:
-    """A local vault failure must not leave a newly created durable token behind."""
-    revoked_paths: list[str] = []
-
-    class Store:
-        """Reject every secure persistence attempt."""
-
-        def save(self, credential_id: str, record: Any) -> None:
-            """Simulate an unavailable OS credential vault."""
-            del credential_id, record
-            raise cloudflare_oauth_module.R2CredentialError("keyring unavailable")
-
-    class Service(cloudflare_oauth_module.CloudflareR2OAuthService):
-        """Capture cleanup requests without external traffic."""
-
-        async def _cloudflare_api(
-            self,
-            method: str,
-            path: str,
-            *,
-            access_token: str,
-            headers: Any = None,
-            json_payload: Any = None,
-        ) -> dict[str, Any]:
-            """Capture the exact token deletion request."""
-            del headers, json_payload
-            assert method == "DELETE"
-            assert access_token == "oauth-token"
-            revoked_paths.append(path)
-            return {}
-
-    service = Service(
-        cloudflare_oauth_module.CloudflareOAuthConfiguration(client_id="public-client"),
-        credential_store=Store(),
+    """Credential import should verify bucket access before touching the keyring."""
+    store = CapturingCredentialStore()
+    validated: list[Any] = []
+    monkeypatch.setattr(
+        cloudflare_oauth_module,
+        "validate_r2_credentials",
+        validated.append,
     )
-    record = cloudflare_oauth_module.R2CredentialRecord(
-        account_id="a" * 32,
-        bucket="models",
-        access_key_id="new-access-id",
-        secret_access_key="new-secret",
+    request = JsonRequest(
+        {
+            "credential_id": "opaque-id",
+            "account_id": "a" * 32,
+            "bucket": "models",
+            "jurisdiction": "eu",
+            "access_key_id": "manual-access-key",
+            "secret_access_key": "manual-secret-key",
+        }
     )
 
-    with pytest.raises(cloudflare_oauth_module.R2CredentialError):
-        asyncio.run(
-            service._save_credential_or_revoke(
-                "oauth-token",
-                "opaque-id",
-                record,
-            )
-        )
+    response = asyncio.run(
+        cloudflare_oauth_module._import_r2_credentials_response(request, store)
+    )
 
-    assert revoked_paths == ["/user/tokens/new-access-id"]
+    assert response.status == 200
+    assert json.loads(response.text)["connected"] is True
+    assert validated[0].bucket == "models"
+    assert store.saved[0][0] == "opaque-id"
+    assert store.saved[0][1].access_key_id == "manual-access-key"
+    assert "manual-secret-key" not in response.text
+
+
+def test_import_does_not_save_rejected_credentials(
+    cloudflare_oauth_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Rejected S3 credentials must not replace a previously stored credential."""
+    store = CapturingCredentialStore()
+
+    def reject(record: Any) -> None:
+        """Reject the synthetic credential without exposing either key."""
+        del record
+        raise cloudflare_oauth_module.R2CredentialError("Cloudflare rejected access.")
+
+    monkeypatch.setattr(cloudflare_oauth_module, "validate_r2_credentials", reject)
+    request = JsonRequest(
+        {
+            "credential_id": "opaque-id",
+            "account_id": "a" * 32,
+            "bucket": "models",
+            "jurisdiction": "default",
+            "access_key_id": "bad-access-key",
+            "secret_access_key": "bad-secret-key",
+        }
+    )
+
+    response = asyncio.run(
+        cloudflare_oauth_module._import_r2_credentials_response(request, store)
+    )
+
+    assert response.status == 400
+    assert store.saved == []
+    assert "bad-access-key" not in response.text
+    assert "bad-secret-key" not in response.text

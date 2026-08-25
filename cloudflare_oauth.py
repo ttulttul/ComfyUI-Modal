@@ -26,12 +26,14 @@ if __package__:
         R2CredentialError,
         R2CredentialRecord,
         R2CredentialStore,
+        validate_r2_credentials,
     )
 else:  # pragma: no cover - direct ComfyUI loading fallback.
     from r2_credentials import (
         R2CredentialError,
         R2CredentialRecord,
         R2CredentialStore,
+        validate_r2_credentials,
     )
 
 logger = logging.getLogger(__name__)
@@ -44,15 +46,15 @@ CLOUDFLARE_OAUTH_TOKEN_URL = "https://dash.cloudflare.com/oauth2/token"
 CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4"
 R2_OAUTH_START_ROUTE = "/remote/storage/r2/oauth/start"
 R2_OAUTH_CALLBACK_ROUTE = "/remote/storage/r2/oauth/callback"
+R2_CREDENTIAL_IMPORT_ROUTE = "/remote/storage/r2/credentials"
 R2_CREDENTIAL_STATUS_ROUTE = "/remote/storage/r2/status"
 
 DEFAULT_CLOUDFLARE_OAUTH_SCOPES = (
-    "account.read",
-    "api-tokens.write",
-    "workers-r2-storage.write",
+    "account-settings.read",
+    "workers-r2.write",
+    "openid",
 )
 _OAUTH_STATE_TTL_SECONDS = 10 * 60
-_R2_BUCKET_PERMISSION_NAME = "Workers R2 Storage Bucket Item Write"
 _ALLOWED_JURISDICTIONS = frozenset({"default", "eu", "fedramp", "us"})
 _ACCOUNT_ID_PATTERN = re.compile(r"^[a-fA-F0-9]{32}$")
 _BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
@@ -157,7 +159,7 @@ class R2OAuthStateStore:
 
 @dataclass
 class CloudflareR2OAuthService:
-    """Exchange OAuth authorization for one persistent bucket-scoped R2 key."""
+    """Use an OAuth grant to select an account and provision an R2 bucket."""
 
     configuration: CloudflareOAuthConfiguration
     credential_store: R2CredentialStore = field(default_factory=R2CredentialStore)
@@ -205,28 +207,19 @@ class CloudflareR2OAuthService:
         )
         return f"{self.configuration.authorize_url}?{query}"
 
-    async def complete(self, *, state_token: str, code: str) -> dict[str, str]:
-        """Exchange a code, provision R2, and save only the resulting S3 credential."""
+    async def complete(self, *, state_token: str, code: str) -> dict[str, Any]:
+        """Exchange a code and provision R2 before manual S3 credential import."""
         state = self.state_store.consume(_single_line(state_token, "OAuth state"))
-        previous_record = await asyncio.to_thread(
-            self.credential_store.load, state.credential_id
-        )
         access_token = await self._exchange_code(state, code)
         account_id = await self._select_account(access_token, state)
         await self._ensure_bucket(access_token, account_id, state)
-        record = await self._create_bucket_credential(access_token, account_id, state)
-        await self._save_credential_or_revoke(access_token, state.credential_id, record)
-        await self._revoke_replaced_credential(
-            access_token,
-            previous_record,
-            replacement=record,
-        )
         return {
             "node_id": state.node_id,
             "credential_id": state.credential_id,
             "account_id": account_id,
             "bucket": state.bucket,
             "jurisdiction": state.jurisdiction,
+            "credentials_required": True,
         }
 
     async def _exchange_code(self, state: R2OAuthState, code: str) -> str:
@@ -303,100 +296,6 @@ class CloudflareR2OAuthService:
             headers=headers,
             json_payload={"name": state.bucket},
         )
-
-    async def _create_bucket_credential(
-        self,
-        access_token: str,
-        account_id: str,
-        state: R2OAuthState,
-    ) -> R2CredentialRecord:
-        """Create a user token restricted to object access in one exact R2 bucket."""
-        permission_groups = await self._cloudflare_api(
-            "GET", "/user/tokens/permission_groups", access_token=access_token
-        )
-        permission_id = _permission_group_id(
-            permission_groups, _R2_BUCKET_PERMISSION_NAME
-        )
-        resource = (
-            "com.cloudflare.edge.r2.bucket."
-            f"{account_id}_{state.jurisdiction}_{state.bucket}"
-        )
-        result = await self._cloudflare_api(
-            "POST",
-            "/user/tokens",
-            access_token=access_token,
-            json_payload={
-                "name": f"ComfyUI-Modal R2 {state.bucket}",
-                "policies": [
-                    {
-                        "effect": "allow",
-                        "resources": {resource: "*"},
-                        "permission_groups": [{"id": permission_id}],
-                    }
-                ],
-            },
-        )
-        if not isinstance(result, Mapping):
-            raise CloudflareOAuthError("Cloudflare returned an invalid R2 token.")
-        token_id = str(result.get("id") or "").strip()
-        token_value = str(result.get("value") or "").strip()
-        if not token_id or not token_value:
-            raise CloudflareOAuthError(
-                "Cloudflare created an API token without returning its one-time secret."
-            )
-        return R2CredentialRecord(
-            account_id=account_id,
-            bucket=state.bucket,
-            access_key_id=token_id,
-            secret_access_key=hashlib.sha256(token_value.encode("utf-8")).hexdigest(),
-            jurisdiction=state.jurisdiction,
-        )
-
-    async def _save_credential_or_revoke(
-        self,
-        access_token: str,
-        credential_id: str,
-        record: R2CredentialRecord,
-    ) -> None:
-        """Persist a new token or revoke it when the local secure write fails."""
-        try:
-            await asyncio.to_thread(self.credential_store.save, credential_id, record)
-        except R2CredentialError:
-            try:
-                await self._cloudflare_api(
-                    "DELETE",
-                    f"/user/tokens/{record.access_key_id}",
-                    access_token=access_token,
-                )
-            except CloudflareOAuthError as cleanup_error:
-                logger.warning(
-                    "Could not revoke an R2 token after keyring persistence failed: %s",
-                    cleanup_error,
-                )
-            raise
-
-    async def _revoke_replaced_credential(
-        self,
-        access_token: str,
-        previous: R2CredentialRecord | None,
-        *,
-        replacement: R2CredentialRecord,
-    ) -> None:
-        """Best-effort revoke the old user token after a replacement is secured."""
-        if previous is None or previous.access_key_id == replacement.access_key_id:
-            return
-        try:
-            await self._cloudflare_api(
-                "DELETE",
-                f"/user/tokens/{previous.access_key_id}",
-                access_token=access_token,
-            )
-        except CloudflareOAuthError as exc:
-            logger.warning(
-                "Stored the replacement R2 credential but could not revoke the "
-                "previous Cloudflare token ID: %s",
-                exc,
-            )
 
     async def _cloudflare_api(
         self,
@@ -482,7 +381,7 @@ def setup_r2_oauth_routes(
     prompt_server: Any,
     service: CloudflareR2OAuthService | None = None,
 ) -> None:
-    """Register credential-safe R2 Login and status routes on ComfyUI's server."""
+    """Register credential-safe R2 Login, import, and status routes."""
     if not all(
         hasattr(prompt_server.routes, method_name)
         for method_name in ("get", "post")
@@ -513,6 +412,11 @@ def setup_r2_oauth_routes(
     async def complete_r2_oauth(request: web.Request) -> web.Response:
         """Complete Cloudflare Login and notify the opener without exposing secrets."""
         return await _complete_r2_oauth_response(request, resolved_service)
+
+    @prompt_server.routes.post(R2_CREDENTIAL_IMPORT_ROUTE)
+    async def import_r2_credentials(request: web.Request) -> web.Response:
+        """Validate and securely store user-created R2 S3 credentials."""
+        return await _import_r2_credentials_response(request, credential_store)
 
     @prompt_server.routes.get(R2_CREDENTIAL_STATUS_ROUTE)
     async def r2_credential_status(request: web.Request) -> web.Response:
@@ -589,19 +493,46 @@ async def _r2_credential_status_response(
     return web.json_response(status)
 
 
-def _permission_group_id(permission_groups: Any, expected_name: str) -> str:
-    """Return the current permission group ID for one exact Cloudflare name."""
-    if not isinstance(permission_groups, list):
-        raise CloudflareOAuthError("Cloudflare returned invalid permission groups.")
-    for permission_group in permission_groups:
-        if not isinstance(permission_group, Mapping):
-            continue
-        if permission_group.get("name") == expected_name:
-            permission_id = str(permission_group.get("id") or "").strip()
-            if permission_id:
-                return permission_id
-    raise CloudflareOAuthError(
-        f"Cloudflare did not expose the required {expected_name!r} permission."
+async def _import_r2_credentials_response(
+    request: web.Request,
+    credential_store: R2CredentialStore,
+) -> web.Response:
+    """Validate imported S3 credentials before saving them to the OS keyring."""
+    try:
+        payload = await request.json()
+        if not isinstance(payload, Mapping):
+            raise TypeError("Cloudflare R2 credentials must be a JSON object.")
+        record = R2CredentialRecord(
+            account_id=_account_id(str(payload.get("account_id") or "")),
+            bucket=_bucket(str(payload.get("bucket") or "")),
+            access_key_id=_single_line(
+                str(payload.get("access_key_id") or ""), "access key ID"
+            ),
+            secret_access_key=_single_line(
+                str(payload.get("secret_access_key") or ""), "secret access key"
+            ),
+            jurisdiction=_jurisdiction(str(payload.get("jurisdiction") or "default")),
+        )
+        credential_id = _single_line(
+            str(payload.get("credential_id") or ""), "credential ID"
+        )
+        await asyncio.to_thread(validate_r2_credentials, record)
+        await asyncio.to_thread(credential_store.save, credential_id, record)
+    except (
+        R2CredentialError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        logger.warning("Cloudflare R2 credential import failed: %s", exc)
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(
+        {
+            "connected": True,
+            "account_id": record.account_id,
+            "bucket": record.bucket,
+            "jurisdiction": record.jurisdiction,
+        }
     )
 
 
@@ -695,6 +626,7 @@ __all__ = [
     "CloudflareOAuthConfiguration",
     "CloudflareOAuthError",
     "CloudflareR2OAuthService",
+    "R2_CREDENTIAL_IMPORT_ROUTE",
     "R2_CREDENTIAL_STATUS_ROUTE",
     "R2_OAUTH_CALLBACK_ROUTE",
     "R2_OAUTH_START_ROUTE",

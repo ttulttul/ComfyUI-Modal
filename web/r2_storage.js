@@ -3,8 +3,10 @@ import { api } from "../../scripts/api.js";
 
 const R2_NODE_ID = "R2StorageBackingConfiguration";
 const OAUTH_START_ROUTE = "/remote/storage/r2/oauth/start";
+const CREDENTIAL_IMPORT_ROUTE = "/remote/storage/r2/credentials";
 const CREDENTIAL_STATUS_ROUTE = "/remote/storage/r2/status";
 const OAUTH_MESSAGE_TYPE = "comfy-modal-r2-oauth";
+const R2_DASHBOARD_URL = "https://dash.cloudflare.com/?to=/:account/r2/overview";
 const pendingNodes = new Set();
 
 /** Return JSON or raise the server's credential-safe diagnostic. */
@@ -64,6 +66,11 @@ async function refreshCredentialStatus(node) {
     const route = `${CREDENTIAL_STATUS_ROUTE}?credential_id=${encodeURIComponent(credentialId)}`;
     const status = await requestJson(route);
     setLoginState(node, status.connected ? "Cloudflare: Connected" : "Login to Cloudflare");
+    if (node.__r2CredentialsWidget) {
+      node.__r2CredentialsWidget.name = status.connected
+        ? "Replace R2 credentials"
+        : "Add R2 API credentials";
+    }
     if (status.connected) {
       setWidgetValue(node, "account_id", status.account_id ?? "");
       setWidgetValue(node, "bucket", status.bucket ?? "");
@@ -108,6 +115,132 @@ async function startCloudflareLogin(node) {
   }
 }
 
+/** Apply compact inline styling without injecting credential-bearing markup. */
+function applyStyles(element, styles) {
+  Object.assign(element.style, styles);
+  return element;
+}
+
+/** Create one labeled credential input without serializing its value. */
+function credentialInput(labelText, type, autocomplete) {
+  const label = applyStyles(document.createElement("label"), {
+    display: "grid",
+    gap: "0.35rem",
+    fontWeight: "600",
+  });
+  label.append(document.createTextNode(labelText));
+  const input = applyStyles(document.createElement("input"), {
+    boxSizing: "border-box",
+    padding: "0.55rem",
+    width: "100%",
+  });
+  input.type = type;
+  input.autocomplete = autocomplete;
+  input.required = true;
+  label.append(input);
+  return { label, input };
+}
+
+/** Close and destroy one credential dialog, clearing its secret fields first. */
+function destroyCredentialDialog(dialog, ...inputs) {
+  for (const input of inputs) input.value = "";
+  dialog.close();
+  dialog.remove();
+}
+
+/** Submit imported R2 S3 credentials for validation and keyring persistence. */
+async function importR2Credentials(node, accessKeyId, secretAccessKey) {
+  return requestJson(CREDENTIAL_IMPORT_ROUTE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      credential_id: ensureCredentialId(node),
+      account_id: String(widget(node, "account_id")?.value ?? "").trim(),
+      bucket: String(widget(node, "bucket")?.value ?? "").trim(),
+      jurisdiction: String(widget(node, "jurisdiction")?.value ?? "default"),
+      access_key_id: accessKeyId,
+      secret_access_key: secretAccessKey,
+    }),
+  });
+}
+
+/** Show the one-time credential import form after Cloudflare provisions the bucket. */
+function showCredentialDialog(node) {
+  const accountId = String(widget(node, "account_id")?.value ?? "").trim();
+  const bucket = String(widget(node, "bucket")?.value ?? "").trim();
+  if (!accountId || !bucket) {
+    setLoginState(node, "Cloudflare: Login first");
+    return;
+  }
+  const dialog = applyStyles(document.createElement("dialog"), {
+    border: "1px solid #666",
+    borderRadius: "0.6rem",
+    background: "var(--comfy-menu-bg, #222)",
+    color: "inherit",
+    maxWidth: "34rem",
+    padding: "1.25rem",
+  });
+  const form = applyStyles(document.createElement("form"), {
+    display: "grid",
+    gap: "1rem",
+  });
+  const heading = document.createElement("h2");
+  heading.textContent = "Connect Cloudflare R2 credentials";
+  const instructions = document.createElement("p");
+  instructions.textContent = `Create an Object Read & Write API token restricted to “${bucket}”, then paste its one-time S3 credentials below.`;
+  const dashboardLink = document.createElement("a");
+  dashboardLink.href = R2_DASHBOARD_URL;
+  dashboardLink.target = "_blank";
+  dashboardLink.rel = "noopener noreferrer";
+  dashboardLink.textContent = "Open Cloudflare R2 API Tokens";
+  const accessKey = credentialInput("Access Key ID", "text", "off");
+  const secretKey = credentialInput("Secret Access Key", "password", "new-password");
+  const errorText = applyStyles(document.createElement("p"), {
+    color: "#ff8d8d",
+    margin: "0",
+    minHeight: "1.2rem",
+  });
+  const actions = applyStyles(document.createElement("div"), {
+    display: "flex",
+    gap: "0.75rem",
+    justifyContent: "flex-end",
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.textContent = "Validate and save";
+  actions.append(cancel, save);
+  form.append(heading, instructions, dashboardLink, accessKey.label, secretKey.label, errorText, actions);
+  dialog.append(form);
+  document.body.append(dialog);
+  cancel.addEventListener("click", () => destroyCredentialDialog(dialog, accessKey.input, secretKey.input));
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    destroyCredentialDialog(dialog, accessKey.input, secretKey.input);
+  });
+  form.addEventListener("submit", (event) => void submitCredentialDialog(event, node, dialog, accessKey.input, secretKey.input, save, errorText));
+  dialog.showModal();
+  accessKey.input.focus();
+}
+
+/** Validate a credential dialog submission and update only non-secret node state. */
+async function submitCredentialDialog(event, node, dialog, accessKey, secretKey, save, errorText) {
+  event.preventDefault();
+  save.disabled = true;
+  errorText.textContent = "Validating bucket access…";
+  try {
+    await importR2Credentials(node, accessKey.value.trim(), secretKey.value.trim());
+    setLoginState(node, "Cloudflare: Connected");
+    if (node.__r2CredentialsWidget) node.__r2CredentialsWidget.name = "Replace R2 credentials";
+    destroyCredentialDialog(dialog, accessKey, secretKey);
+  } catch (error) {
+    errorText.textContent = String(error?.message ?? error);
+    save.disabled = false;
+  }
+}
+
 /** Attach the non-serialized Login control to one concrete R2 node. */
 function decorateR2Node(node) {
   if (node?.comfyClass !== R2_NODE_ID || node.__r2LoginWidget) return;
@@ -121,6 +254,15 @@ function decorateR2Node(node) {
   );
   loginWidget.serialize = false;
   node.__r2LoginWidget = loginWidget;
+  const credentialsWidget = node.addWidget(
+    "button",
+    "Add R2 API credentials",
+    null,
+    () => showCredentialDialog(node),
+    { serialize: false },
+  );
+  credentialsWidget.serialize = false;
+  node.__r2CredentialsWidget = credentialsWidget;
   void refreshCredentialStatus(node);
 }
 
@@ -139,7 +281,8 @@ function handleOAuthResult(event) {
     setWidgetValue(node, "account_id", String(event.data.account_id ?? ""));
     setWidgetValue(node, "bucket", String(event.data.bucket ?? ""));
     setWidgetValue(node, "jurisdiction", String(event.data.jurisdiction ?? "default"));
-    setLoginState(node, "Cloudflare: Connected");
+    setLoginState(node, "Cloudflare: Bucket ready");
+    showCredentialDialog(node);
   }
   app.graph?.setDirtyCanvas?.(true, true);
 }

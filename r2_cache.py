@@ -393,6 +393,20 @@ class R2CacheClient:
         """Return off, sync, or async write-back behavior."""
         return self.configuration.write_back_mode
 
+    def validate_bucket_access(self) -> None:
+        """Verify that the configured S3 credential can list its target bucket."""
+        assert self.s3_client is not None
+        try:
+            self.s3_client.list_objects_v2(
+                Bucket=self.configuration.bucket,
+                MaxKeys=1,
+            )
+        except _R2_CLIENT_ERRORS as exc:
+            raise R2CacheError(
+                "Cloudflare rejected the R2 credentials or they do not grant "
+                "object access to the configured bucket."
+            ) from exc
+
     def download_request(
         self,
         sha256: str,

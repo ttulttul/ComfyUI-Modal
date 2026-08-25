@@ -374,6 +374,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
     assert ("POST", "/remote/vast/destroy") in routes.handlers
     assert ("POST", "/remote/storage/r2/oauth/start") in routes.handlers
     assert ("GET", "/remote/storage/r2/oauth/callback") in routes.handlers
+    assert ("POST", "/remote/storage/r2/credentials") in routes.handlers
     assert ("GET", "/remote/storage/r2/status") in routes.handlers
     assert registry.get_host("gpu-one").health.value == "ready"
     assert registry.get_host("gpu-one").capabilities == capabilities
