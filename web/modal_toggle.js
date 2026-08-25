@@ -3559,6 +3559,39 @@ function remoteStorageWriteBackLabel(mode) {
   return labels[normalized] ?? (normalized || "Configured");
 }
 
+/** Return a compact binary byte-size label for storage usage. */
+function remoteStorageSizeLabel(value) {
+  const sizeBytes = Number(value);
+  if (!Number.isFinite(sizeBytes) || sizeBytes < 0) {
+    return "Unavailable";
+  }
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let size = sizeBytes;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const fractionDigits = unitIndex === 0 || size >= 100 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(fractionDigits)} ${units[unitIndex]}`;
+}
+
+/** Return bucket usage with an optional object count. */
+function remoteStorageUsageLabel(configuration) {
+  const sizeLabel = remoteStorageSizeLabel(configuration?.storage_usage_bytes);
+  const objectCount = Number(configuration?.storage_object_count);
+  if (
+    sizeLabel === "Unavailable" ||
+    !Number.isInteger(objectCount) ||
+    objectCount < 0
+  ) {
+    return sizeLabel;
+  }
+  return `${sizeLabel} · ${objectCount.toLocaleString()} ${
+    objectCount === 1 ? "object" : "objects"
+  }`;
+}
+
 /**
  * Normalize safe storage configuration metadata for the Configurator panel.
  * @param {Array<Record<string, any>>} configurations
@@ -3576,6 +3609,10 @@ function remoteConfiguratorStorageEntries(configurations) {
       if (provider === "cloudflare_r2") {
         details.push(
           { label: "Bucket", value: String(configuration?.bucket ?? "—") },
+          {
+            label: "Storage used",
+            value: remoteStorageUsageLabel(configuration),
+          },
           {
             label: "Jurisdiction",
             value: remoteStorageJurisdictionLabel(configuration?.jurisdiction),

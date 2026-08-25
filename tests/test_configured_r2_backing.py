@@ -49,3 +49,75 @@ def test_workflow_r2_configuration_resolves_controller_signing_client(
 
     assert client is not None
     assert client.configuration is expected
+
+
+def test_safe_configuration_payload_adds_cached_r2_bucket_usage(
+    api_intercept_module: Any,
+    remote_configurations_module: Any,
+    r2_cache_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Planning metadata should expose bucket usage without exposing credentials."""
+    storage = remote_configurations_module.R2StorageBackingConfiguration(
+        configuration_id="r2-node",
+        display_name="shared-r2",
+        account_id="a" * 32,
+        bucket="models",
+        credential_id="opaque-reference",
+    )
+    capacity = remote_configurations_module.ModalRemoteConfiguration(
+        configuration_id="modal-node",
+        display_name="modal",
+        gpu_type="H200",
+    )
+    configuration_set = remote_configurations_module.RemoteConfigurationSet(
+        (capacity, storage)
+    )
+    expected = r2_cache_module.R2CacheConfiguration(
+        account_id="a" * 32,
+        bucket="models",
+        access_key_id="access-id",
+        secret_access_key="secret-key",
+        endpoint_url=f"https://{'a' * 32}.r2.cloudflarestorage.com",
+    )
+    usage_calls = 0
+
+    class Store:
+        """Resolve the expected credential-bearing configuration."""
+
+        def cache_configuration(self, requested_storage: Any) -> Any:
+            """Require the exact workflow storage object."""
+            assert requested_storage is storage
+            return expected
+
+    class Client:
+        """Return deterministic bucket usage without provider I/O."""
+
+        def __init__(self, configuration: Any) -> None:
+            """Require the resolved credential-bearing configuration."""
+            assert configuration is expected
+
+        def storage_usage(self) -> Any:
+            """Record the provider query and return safe aggregate metrics."""
+            nonlocal usage_calls
+            usage_calls += 1
+            return r2_cache_module.R2StorageUsage(
+                size_bytes=5 * 1024**3,
+                object_count=42,
+            )
+
+    api_intercept_module._R2_STORAGE_USAGE_CACHE.clear()
+    monkeypatch.setattr(api_intercept_module, "R2CredentialStore", Store)
+    monkeypatch.setattr(api_intercept_module, "R2CacheClient", Client)
+
+    first = api_intercept_module._safe_remote_configuration_payload(configuration_set)
+    second = api_intercept_module._safe_remote_configuration_payload(configuration_set)
+
+    safe_storage = next(
+        item for item in first if item["configuration_id"] == "r2-node"
+    )
+    assert safe_storage["storage_usage_bytes"] == 5 * 1024**3
+    assert safe_storage["storage_object_count"] == 42
+    assert "credential" not in str(safe_storage).casefold()
+    assert second == first
+    assert usage_calls == 1

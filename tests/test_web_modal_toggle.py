@@ -91,10 +91,12 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert 'class="remote-configurator-storage"' in source
     assert "Storage backends" in source
     assert 'label: "Bucket"' in source
+    assert 'label: "Storage used"' in source
     assert 'label: "Jurisdiction"' in source
     assert 'label: "Cache policy"' in source
     assert 'label: "Key prefix"' in source
     assert 'return "Cloudflare R2";' in source
+    assert 'return "Unavailable";' in source
     assert "renderRemoteConfiguratorStorage(panel, configurations);" in source
     assert source.index('class="remote-configurator-table"') < source.index(
         'class="remote-configurator-storage"'

@@ -168,6 +168,44 @@ def test_validate_bucket_access_returns_a_credential_safe_error(
     assert "configured bucket" in str(captured.value)
 
 
+def test_storage_usage_sums_every_paginated_object(
+    r2_cache_module: Any,
+) -> None:
+    """Bucket usage should include every object across S3 listing pages."""
+
+    class PaginatedS3Client(FakeS3Client):
+        """Return two deterministic object-listing pages."""
+
+        def list_objects_v2(self, **kwargs: Any) -> dict[str, Any]:
+            """Return the page selected by its continuation token."""
+            self.calls.append(("list_objects_v2", kwargs))
+            if kwargs.get("ContinuationToken") == "page-2":
+                return {
+                    "Contents": [{"Size": 7}],
+                    "IsTruncated": False,
+                }
+            return {
+                "Contents": [{"Size": 11}, {"Size": 13}],
+                "IsTruncated": True,
+                "NextContinuationToken": "page-2",
+            }
+
+    fake_s3 = PaginatedS3Client(r2_cache_module)
+    usage = r2_cache_module.R2CacheClient(
+        _configuration(r2_cache_module),
+        s3_client=fake_s3,
+    ).storage_usage()
+
+    assert usage == r2_cache_module.R2StorageUsage(size_bytes=31, object_count=3)
+    assert fake_s3.calls == [
+        ("list_objects_v2", {"Bucket": "bucket"}),
+        (
+            "list_objects_v2",
+            {"Bucket": "bucket", "ContinuationToken": "page-2"},
+        ),
+    ]
+
+
 def test_download_request_requires_an_exact_size_match(r2_cache_module: Any) -> None:
     """Cache hits should be signed only when their immutable size matches."""
     configuration = _configuration(r2_cache_module)

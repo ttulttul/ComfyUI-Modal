@@ -59,6 +59,14 @@ class R2CacheError(RuntimeError):
     """Raised when the configured R2 cache cannot complete an operation."""
 
 
+@dataclass(frozen=True)
+class R2StorageUsage:
+    """Summarize the current objects stored in one R2 bucket."""
+
+    size_bytes: int
+    object_count: int
+
+
 def _read_bool(value: object, *, name: str) -> bool:
     """Parse one conventional boolean environment value."""
     normalized = str(value).strip().casefold()
@@ -407,6 +415,60 @@ class R2CacheClient:
                 "object access to the configured bucket."
             ) from exc
 
+    def storage_usage(self) -> R2StorageUsage:
+        """Return the exact current object bytes and count for the configured bucket."""
+        assert self.s3_client is not None
+        size_bytes = 0
+        object_count = 0
+        continuation_token: str | None = None
+        while True:
+            request: dict[str, Any] = {"Bucket": self.configuration.bucket}
+            if continuation_token is not None:
+                request["ContinuationToken"] = continuation_token
+            try:
+                response = self.s3_client.list_objects_v2(**request)
+            except _R2_CLIENT_ERRORS as exc:
+                raise R2CacheError(
+                    "Unable to read storage usage for the configured R2 bucket."
+                ) from exc
+            if not isinstance(response, Mapping):
+                raise R2CacheError("R2 returned an invalid storage-usage response.")
+            contents = response.get("Contents", [])
+            if not isinstance(contents, list):
+                raise R2CacheError("R2 returned an invalid storage-usage object list.")
+            for item in contents:
+                if not isinstance(item, Mapping):
+                    raise R2CacheError(
+                        "R2 returned an invalid object in its storage-usage response."
+                    )
+                object_size = item.get("Size")
+                if (
+                    isinstance(object_size, bool)
+                    or not isinstance(object_size, int)
+                    or object_size < 0
+                ):
+                    raise R2CacheError(
+                        "R2 returned an invalid object size in its storage-usage response."
+                    )
+                size_bytes += object_size
+                object_count += 1
+            if not response.get("IsTruncated", False):
+                return R2StorageUsage(
+                    size_bytes=size_bytes,
+                    object_count=object_count,
+                )
+            raw_token = response.get("NextContinuationToken")
+            next_token = str(raw_token or "").strip()
+            if (
+                not next_token
+                or next_token == continuation_token
+                or any(character in next_token for character in ("\x00", "\n", "\r"))
+            ):
+                raise R2CacheError(
+                    "R2 returned an invalid continuation token for storage usage."
+                )
+            continuation_token = next_token
+
     def download_request(
         self,
         sha256: str,
@@ -729,6 +791,7 @@ __all__ = [
     "R2CacheConfiguration",
     "R2CacheError",
     "R2DownloadRequest",
+    "R2StorageUsage",
     "R2UploadPlan",
     "R2UploadResult",
     "R2UploadedPart",

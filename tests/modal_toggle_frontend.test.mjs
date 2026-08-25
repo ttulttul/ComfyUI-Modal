@@ -129,6 +129,8 @@ const transformedSource = `${[
   "  clearRefocusCompletedPrompt,",
   "  mountRemoteExecutionConfiguratorPanel,",
   "  remoteConfiguratorStorageEntries,",
+  "  remoteStorageSizeLabel,",
+  "  remoteStorageUsageLabel,",
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
   "  handleModalStatus,",
@@ -186,6 +188,17 @@ const transformedSource = `${[
 runInThisContext(transformedSource, { filename: sourcePath });
 
 const modalToggle = globalThis.__modalToggleExports;
+
+assert.equal(modalToggle.remoteStorageSizeLabel(0), "0 B");
+assert.equal(modalToggle.remoteStorageSizeLabel(1536), "1.50 KiB");
+assert.equal(modalToggle.remoteStorageSizeLabel(undefined), "Unavailable");
+assert.equal(
+  modalToggle.remoteStorageUsageLabel({
+    storage_usage_bytes: 1024,
+    storage_object_count: 1,
+  }),
+  "1.00 KiB · 1 object",
+);
 
 assert.equal(
   modalToggle.queueErrorMessage({
@@ -1536,6 +1549,8 @@ modalToggle.registerRemoteConfiguratorPlan(
       display_name: "Shared model cache",
       storage_provider: "cloudflare_r2",
       bucket: "comfy-models",
+      storage_usage_bytes: 5 * 1024 ** 3 + 256 * 1024 ** 2,
+      storage_object_count: 42,
       jurisdiction: "eu",
       key_prefix: "comfy-modal-cache/v1/blobs/sha256",
       write_back_mode: "async",
@@ -1596,6 +1611,8 @@ assert.deepEqual(
   [
     "Bucket",
     "comfy-models",
+    "Storage used",
+    "5.25 GiB · 42 objects",
     "Jurisdiction",
     "European Union (EU)",
     "Cache policy",

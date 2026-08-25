@@ -70,7 +70,7 @@ from .sync_engine import (
     resolve_model_path,
 )
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
-from .r2_cache import R2CacheClient
+from .r2_cache import R2CacheClient, R2CacheError, R2StorageUsage
 from .r2_credentials import R2CredentialStore
 from .cloudflare_oauth import setup_r2_oauth_routes
 from .remote_configuration_nodes import (
@@ -114,6 +114,11 @@ _REMOTE_PREPARATION_CANCELLATIONS_ATTR = (
 )
 _REMOTE_PREPARATION_LOCK_ATTR = "__comfy_modal_remote_preparation_lock"
 _REMOTE_ASSET_PREPARATION_MAX_WORKERS = 8
+_R2_STORAGE_USAGE_CACHE_SECONDS = 5 * 60
+_R2_STORAGE_USAGE_CACHE_LOCK = threading.Lock()
+_R2_STORAGE_USAGE_CACHE: dict[
+    tuple[str, str, str], tuple[float, R2StorageUsage]
+] = {}
 _REMOTE_TOGGLE_WIDGET_NAME = "Run Remotely"
 _LEGACY_REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
 _LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
@@ -337,6 +342,7 @@ class ComponentExecutionPlan:
     configurations_by_id: dict[str, RemoteConfiguration] = field(
         default_factory=dict
     )
+    safe_configurations: list[dict[str, Any]] = field(default_factory=list)
     ssh_hosts_by_id: dict[str, SshHostConfig] = field(default_factory=dict)
     vast_service: VastService | None = None
     vast_leases_by_environment: dict[str, Any] = field(default_factory=dict)
@@ -1404,10 +1410,11 @@ def _plan_configured_component_execution(
     except NoCompatibleExecutionEnvironmentError as exc:
         raise ModalPromptValidationError(str(exc)) from exc
 
+    safe_configurations = _safe_remote_configuration_payload(configuration_set)
     if plan_callback is not None:
         plan_callback(
             _planned_execution_assignments_payload(assignments, components),
-            configuration_set.to_safe_list(),
+            safe_configurations,
         )
 
     vast_leases = _prepare_selected_vast_capacity(
@@ -1422,16 +1429,66 @@ def _plan_configured_component_execution(
     if plan_callback is not None and vast_leases:
         plan_callback(
             _planned_execution_assignments_payload(assignments, components),
-            configuration_set.to_safe_list(),
+            safe_configurations,
         )
     return ComponentExecutionPlan(
         assignments=assignments,
         configuration_set=configuration_set,
         configurations_by_id=configurations_by_id,
+        safe_configurations=safe_configurations,
         ssh_hosts_by_id=ssh_hosts_by_id,
         vast_service=vast_service,
         vast_leases_by_environment=vast_leases,
     )
+
+
+def _safe_remote_configuration_payload(
+    configuration_set: RemoteConfigurationSet,
+) -> list[dict[str, Any]]:
+    """Return safe configuration metadata enriched with best-effort storage usage."""
+    payload = configuration_set.to_safe_list()
+    payload_by_id = {
+        str(configuration.get("configuration_id") or ""): configuration
+        for configuration in payload
+    }
+    for storage in configuration_set.storage_configurations:
+        if not isinstance(storage, R2StorageBackingConfiguration):
+            continue
+        usage = _cached_r2_storage_usage(storage)
+        if usage is None:
+            continue
+        safe_storage = payload_by_id.get(storage.configuration_id)
+        if safe_storage is None:
+            continue
+        safe_storage["storage_usage_bytes"] = usage.size_bytes
+        safe_storage["storage_object_count"] = usage.object_count
+    return payload
+
+
+def _cached_r2_storage_usage(
+    storage: R2StorageBackingConfiguration,
+) -> R2StorageUsage | None:
+    """Return cached bucket usage, degrading safely when R2 cannot be queried."""
+    cache_key = (storage.account_id, storage.bucket, storage.jurisdiction)
+    now = time.monotonic()
+    with _R2_STORAGE_USAGE_CACHE_LOCK:
+        cached = _R2_STORAGE_USAGE_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _R2_STORAGE_USAGE_CACHE_SECONDS:
+            return cached[1]
+    try:
+        configuration = R2CredentialStore().cache_configuration(storage)
+        usage = R2CacheClient(configuration).storage_usage()
+    except (R2CacheError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Unable to read R2 storage usage for configuration=%s bucket=%s: %s",
+            storage.configuration_id,
+            storage.bucket,
+            exc,
+        )
+        return None
+    with _R2_STORAGE_USAGE_CACHE_LOCK:
+        _R2_STORAGE_USAGE_CACHE[cache_key] = (now, usage)
+    return usage
 
 
 def _planned_execution_assignments_payload(
@@ -7407,9 +7464,7 @@ def rewrite_prompt_for_modal(
     )
     assignments_by_component_id = execution_plan.assignments
     if execution_plan.configuration_set is not None:
-        summary.remote_configurations = (
-            execution_plan.configuration_set.to_safe_list()
-        )
+        summary.remote_configurations = list(execution_plan.safe_configurations)
     for assignment in assignments_by_component_id.values():
         execution_location = _execution_location_for_assignment(
             assignment,
