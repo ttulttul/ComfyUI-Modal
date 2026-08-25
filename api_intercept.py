@@ -114,6 +114,7 @@ _REMOTE_PREPARATION_CANCELLATIONS_ATTR = (
 )
 _REMOTE_PREPARATION_LOCK_ATTR = "__comfy_modal_remote_preparation_lock"
 _REMOTE_ASSET_PREPARATION_MAX_WORKERS = 8
+_R2_STORAGE_USAGE_ROUTE = "/remote/storage/r2/usage"
 _R2_STORAGE_USAGE_CACHE_SECONDS = 5 * 60
 _R2_STORAGE_USAGE_CACHE_LOCK = threading.Lock()
 _R2_STORAGE_USAGE_CACHE: dict[
@@ -1476,8 +1477,7 @@ def _cached_r2_storage_usage(
         if cached is not None and now - cached[0] < _R2_STORAGE_USAGE_CACHE_SECONDS:
             return cached[1]
     try:
-        configuration = R2CredentialStore().cache_configuration(storage)
-        usage = R2CacheClient(configuration).storage_usage()
+        usage = _refresh_r2_storage_usage(storage)
     except (R2CacheError, RuntimeError, ValueError) as exc:
         logger.warning(
             "Unable to read R2 storage usage for configuration=%s bucket=%s: %s",
@@ -1486,9 +1486,44 @@ def _cached_r2_storage_usage(
             exc,
         )
         return None
-    with _R2_STORAGE_USAGE_CACHE_LOCK:
-        _R2_STORAGE_USAGE_CACHE[cache_key] = (now, usage)
     return usage
+
+
+def _refresh_r2_storage_usage(
+    storage: R2StorageBackingConfiguration,
+) -> R2StorageUsage:
+    """Query current R2 bucket usage and replace the short-lived cache entry."""
+    configuration = R2CredentialStore().cache_configuration(storage)
+    usage = R2CacheClient(configuration).storage_usage()
+    cache_key = (storage.account_id, storage.bucket, storage.jurisdiction)
+    with _R2_STORAGE_USAGE_CACHE_LOCK:
+        _R2_STORAGE_USAGE_CACHE[cache_key] = (time.monotonic(), usage)
+    return usage
+
+
+def _r2_storage_from_usage_payload(
+    payload: Mapping[str, Any],
+) -> R2StorageBackingConfiguration:
+    """Build a validated R2 reference from a same-origin usage refresh request."""
+    configuration_id = str(
+        payload.get("configuration_id") or "r2-storage-refresh"
+    ).strip()
+    return R2StorageBackingConfiguration(
+        configuration_id=configuration_id,
+        display_name=str(payload.get("display_name") or "R2 storage").strip(),
+        account_id=str(payload.get("account_id") or "").strip(),
+        bucket=str(payload.get("bucket") or "").strip(),
+        credential_id=str(payload.get("credential_id") or "").strip(),
+        jurisdiction=str(payload.get("jurisdiction") or "default")
+        .strip()
+        .casefold(),
+        key_prefix=str(
+            payload.get("key_prefix") or "comfy-modal-cache/v1/blobs/sha256"
+        ).strip(),
+        write_back_mode=str(payload.get("write_back_mode") or "async")
+        .strip()
+        .casefold(),
+    )
 
 
 def _planned_execution_assignments_payload(
@@ -8566,6 +8601,35 @@ def setup_modal_queue_route(
     remote_host_registry = _ssh_host_registry(resolved_settings)
     vast_registry = _vast_registry(resolved_settings)
     _install_modal_interrupt_queue_bridge(prompt_server)
+
+    @prompt_server.routes.post(_R2_STORAGE_USAGE_ROUTE)
+    async def refresh_r2_storage_usage(request: web.Request) -> web.Response:
+        """Refresh one configured R2 bucket's safe aggregate storage state."""
+        try:
+            payload = await request.json()
+            if not isinstance(payload, Mapping):
+                raise TypeError("R2 storage usage request must be a JSON object.")
+            storage = _r2_storage_from_usage_payload(payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        try:
+            usage = await asyncio.to_thread(_refresh_r2_storage_usage, storage)
+        except (R2CacheError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "Unable to refresh R2 storage usage configuration=%s bucket=%s: %s",
+                storage.configuration_id,
+                storage.bucket,
+                exc,
+            )
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response(
+            {
+                "configuration_id": storage.configuration_id,
+                "storage_usage_bytes": usage.size_bytes,
+                "storage_object_count": usage.object_count,
+                "refreshed_at": time.time(),
+            }
+        )
 
     @prompt_server.routes.post(cancel_preparation_route_path)
     async def cancel_remote_preparation(request: web.Request) -> web.Response:

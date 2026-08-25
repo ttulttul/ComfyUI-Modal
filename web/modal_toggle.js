@@ -15,6 +15,7 @@ const MODAL_CANCEL_PREPARATION_ROUTE = MODAL_ROUTE.replace(
   /\/queue_prompt$/,
   "/cancel_preparation",
 );
+const R2_STORAGE_USAGE_ROUTE = "/remote/storage/r2/usage";
 const COMFY_QUEUE_ROUTE = "/queue";
 const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
@@ -3595,7 +3596,7 @@ function remoteStorageUsageLabel(configuration) {
 /**
  * Normalize safe storage configuration metadata for the Configurator panel.
  * @param {Array<Record<string, any>>} configurations
- * @returns {Array<{ name: string, provider: string, details: Array<{ label: string, value: string }> }>}
+ * @returns {Array<{ configurationId: string, storageProvider: string, name: string, provider: string, details: Array<{ label: string, value: string }> }>}
  */
 function remoteConfiguratorStorageEntries(configurations) {
   return (configurations ?? [])
@@ -3628,6 +3629,8 @@ function remoteConfiguratorStorageEntries(configurations) {
         }
       }
       return {
+        configurationId: String(configuration?.configuration_id ?? ""),
+        storageProvider: provider,
         name: String(configuration?.display_name ?? "Storage backend").trim(),
         provider: remoteStorageProviderLabel(provider),
         details,
@@ -3635,9 +3638,115 @@ function remoteConfiguratorStorageEntries(configurations) {
     });
 }
 
+/** Return one live storage-configuration node by its serialized configuration id. */
+function remoteStorageConfigurationNode(configurationId) {
+  return allWorkflowNodes().find(
+    (node) =>
+      nodeId(node) === String(configurationId) &&
+      String(node?.comfyClass ?? "") === "R2StorageBackingConfiguration",
+  ) ?? null;
+}
+
+/** Return one serialized widget value from a live graph node. */
+function remoteStorageWidgetValue(node, name, fallback = "") {
+  const target = (node?.widgets ?? []).find((candidate) => candidate?.name === name);
+  return String(target?.value ?? fallback).trim();
+}
+
+/** Request fresh safe state for one configured R2 bucket. */
+async function requestRemoteStorageRefresh(configuration) {
+  const configurationId = String(configuration?.configuration_id ?? "");
+  const node = remoteStorageConfigurationNode(configurationId);
+  const credentialId = remoteStorageWidgetValue(node, "credential_id");
+  if (!node || !credentialId) {
+    throw new Error("The connected R2 configuration has no local credentials.");
+  }
+  const response = await api.fetchApi(R2_STORAGE_USAGE_ROUTE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      configuration_id: configurationId,
+      display_name: String(configuration?.display_name ?? "R2 storage"),
+      account_id: String(configuration?.account_id ?? ""),
+      bucket: String(configuration?.bucket ?? ""),
+      jurisdiction: String(configuration?.jurisdiction ?? "default"),
+      key_prefix: String(configuration?.key_prefix ?? ""),
+      write_back_mode: String(configuration?.write_back_mode ?? "async"),
+      credential_id: credentialId,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || `${response.status} ${response.statusText}`);
+  }
+  return payload;
+}
+
+/** Reload every supported storage backend shown by one Configurator panel. */
+async function refreshRemoteConfiguratorStorage(panel) {
+  const configurations = panel?.configurations ?? [];
+  const refreshable = configurations.filter(
+    (configuration) => configuration?.storage_provider === "cloudflare_r2",
+  );
+  if (!panel || refreshable.length === 0 || panel.storageRefreshInFlight) {
+    return;
+  }
+  panel.storageRefreshInFlight = true;
+  panel.storageReload.disabled = true;
+  panel.storageReload.textContent = "Reloading…";
+  panel.storageRefreshStatus.hidden = false;
+  panel.storageRefreshStatus.dataset.state = "loading";
+  panel.storageRefreshStatus.textContent = "Refreshing storage state";
+  panel.storageRefreshStatus.title = "";
+  try {
+    const refreshed = await Promise.all(
+      refreshable.map((configuration) => requestRemoteStorageRefresh(configuration)),
+    );
+    const refreshedById = new Map(
+      refreshed.map((state) => [String(state?.configuration_id ?? ""), state]),
+    );
+    const updatedConfigurations = configurations.map((configuration) => {
+      const state = refreshedById.get(String(configuration?.configuration_id ?? ""));
+      return state
+        ? {
+            ...configuration,
+            storage_usage_bytes: state.storage_usage_bytes,
+            storage_object_count: state.storage_object_count,
+          }
+        : configuration;
+    });
+    panel.configurations = updatedConfigurations;
+    const promptState = modalPromptStates.get(String(panel.promptId ?? ""));
+    if (promptState) {
+      promptState.remoteExecutionConfigurations = updatedConfigurations;
+    }
+    renderRemoteConfiguratorPlan(panel, panel.assignments, updatedConfigurations);
+    panel.storageRefreshStatus.dataset.state = "success";
+    panel.storageRefreshStatus.textContent = "Updated";
+    panel.storageRefreshStatus.title = "";
+  } catch (error) {
+    panel.storageRefreshStatus.dataset.state = "error";
+    panel.storageRefreshStatus.textContent = "Refresh failed";
+    panel.storageRefreshStatus.title = String(error?.message ?? error);
+  } finally {
+    panel.storageRefreshInFlight = false;
+    panel.storageReload.disabled = false;
+    panel.storageReload.textContent = "Reload";
+  }
+}
+
 /** Render connected storage backends beneath the execution plan. */
 function renderRemoteConfiguratorStorage(panel, configurations) {
   const entries = remoteConfiguratorStorageEntries(configurations);
+  panel.storageReload.hidden = !entries.some(
+    (entry) => entry.storageProvider === "cloudflare_r2",
+  );
+  if (!panel.storageRefreshInFlight) {
+    panel.storageRefreshStatus.hidden = true;
+    panel.storageRefreshStatus.textContent = "";
+    panel.storageRefreshStatus.title = "";
+    panel.storageRefreshStatus.dataset.state = "idle";
+  }
   panel.storageList.replaceChildren();
   for (const entry of entries) {
     const card = document.createElement("div");
@@ -3688,6 +3797,8 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
       configuration,
     ]),
   );
+  panel.assignments = assignments ?? {};
+  panel.configurations = configurations ?? [];
   const rows = Object.entries(assignments ?? {}).sort(([left], [right]) =>
     String(left).localeCompare(String(right), undefined, { numeric: true }),
   );
@@ -3994,7 +4105,13 @@ function mountRemoteExecutionConfiguratorPanel(node) {
       <tbody></tbody>
     </table>
     <div class="remote-configurator-storage" hidden>
-      <div class="remote-configurator-storage-title">Storage backends</div>
+      <div class="remote-configurator-storage-header">
+        <div class="remote-configurator-storage-title">Storage backends</div>
+        <div class="remote-configurator-storage-refresh">
+          <span class="remote-configurator-storage-refresh-status" hidden></span>
+          <button class="remote-configurator-storage-reload" type="button">Reload</button>
+        </div>
+      </div>
       <div class="remote-configurator-storage-list"></div>
     </div>`;
   const panel = {
@@ -4003,6 +4120,9 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     promptId: null,
     minHeight: 149,
     storageHeight: 0,
+    storageRefreshInFlight: false,
+    assignments: {},
+    configurations: [],
     statusText: root.querySelector(".remote-configurator-status-text"),
     progress: root.querySelector(".remote-configurator-progress"),
     progressFill: root.querySelector(".remote-configurator-progress-fill"),
@@ -4014,7 +4134,14 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     tableBody: root.querySelector("tbody"),
     storage: root.querySelector(".remote-configurator-storage"),
     storageList: root.querySelector(".remote-configurator-storage-list"),
+    storageReload: root.querySelector(".remote-configurator-storage-reload"),
+    storageRefreshStatus: root.querySelector(
+      ".remote-configurator-storage-refresh-status",
+    ),
   };
+  panel.storageReload.addEventListener("click", () => {
+    void refreshRemoteConfiguratorStorage(panel);
+  });
   let widget;
   try {
     widget = node.addDOMWidget(
@@ -6813,6 +6940,54 @@ function installGlobalStatusStyles() {
       font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
+    }
+
+    .remote-configurator-storage-header,
+    .remote-configurator-storage-refresh {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .remote-configurator-storage-header {
+      justify-content: space-between;
+    }
+
+    .remote-configurator-storage-refresh-status {
+      overflow: hidden;
+      color: #64748b;
+      font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-storage-refresh-status[data-state="error"] {
+      color: #f87171;
+    }
+
+    .remote-configurator-storage-refresh-status[data-state="success"] {
+      color: #4ade80;
+    }
+
+    .remote-configurator-storage-reload {
+      padding: 2px 7px;
+      border: 1px solid rgba(56, 189, 248, 0.28);
+      border-radius: 5px;
+      background: rgba(14, 116, 144, 0.12);
+      color: #7dd3fc;
+      cursor: pointer;
+      font: 600 9px/1.35 ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .remote-configurator-storage-reload:hover:not(:disabled) {
+      border-color: rgba(56, 189, 248, 0.55);
+      background: rgba(14, 116, 144, 0.24);
+    }
+
+    .remote-configurator-storage-reload:disabled {
+      cursor: wait;
+      opacity: 0.65;
     }
 
     .remote-configurator-storage-list {

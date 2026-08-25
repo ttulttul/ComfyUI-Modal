@@ -90,6 +90,10 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert 'class="remote-configurator-environments"' in source
     assert 'class="remote-configurator-storage"' in source
     assert "Storage backends" in source
+    assert 'class="remote-configurator-storage-reload"' in source
+    assert ">Reload</button>" in source
+    assert 'const R2_STORAGE_USAGE_ROUTE = "/remote/storage/r2/usage";' in source
+    assert "function refreshRemoteConfiguratorStorage(panel)" in source
     assert 'label: "Bucket"' in source
     assert 'label: "Storage used"' in source
     assert 'label: "Jurisdiction"' in source

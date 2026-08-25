@@ -81,6 +81,7 @@ def test_safe_configuration_payload_adds_cached_r2_bucket_usage(
         endpoint_url=f"https://{'a' * 32}.r2.cloudflarestorage.com",
     )
     usage_calls = 0
+    usage_size_bytes = 5 * 1024**3
 
     class Store:
         """Resolve the expected credential-bearing configuration."""
@@ -99,10 +100,10 @@ def test_safe_configuration_payload_adds_cached_r2_bucket_usage(
 
         def storage_usage(self) -> Any:
             """Record the provider query and return safe aggregate metrics."""
-            nonlocal usage_calls
+            nonlocal usage_calls, usage_size_bytes
             usage_calls += 1
             return r2_cache_module.R2StorageUsage(
-                size_bytes=5 * 1024**3,
+                size_bytes=usage_size_bytes,
                 object_count=42,
             )
 
@@ -121,3 +122,13 @@ def test_safe_configuration_payload_adds_cached_r2_bucket_usage(
     assert "credential" not in str(safe_storage).casefold()
     assert second == first
     assert usage_calls == 1
+
+    usage_size_bytes = 6 * 1024**3
+    refreshed = api_intercept_module._refresh_r2_storage_usage(storage)
+    third = api_intercept_module._safe_remote_configuration_payload(configuration_set)
+
+    assert refreshed.size_bytes == 6 * 1024**3
+    assert next(
+        item for item in third if item["configuration_id"] == "r2-node"
+    )["storage_usage_bytes"] == 6 * 1024**3
+    assert usage_calls == 2

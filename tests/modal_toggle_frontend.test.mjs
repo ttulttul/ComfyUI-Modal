@@ -42,6 +42,7 @@ class FakeElement {
     this.title = "";
     this.isConnected = false;
     this.elementsBySelector = new Map();
+    this.listeners = new Map();
   }
 
   set innerHTML(_value) {
@@ -61,6 +62,8 @@ class FakeElement {
       ".remote-configurator-table",
       ".remote-configurator-storage",
       ".remote-configurator-storage-list",
+      ".remote-configurator-storage-reload",
+      ".remote-configurator-storage-refresh-status",
       "tbody",
     ]) {
       this.elementsBySelector.set(selector, new FakeElement(selector));
@@ -82,6 +85,10 @@ class FakeElement {
 
   replaceChildren(...children) {
     this.children = [...children];
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
   }
 
   remove() {
@@ -129,6 +136,7 @@ const transformedSource = `${[
   "  clearRefocusCompletedPrompt,",
   "  mountRemoteExecutionConfiguratorPanel,",
   "  remoteConfiguratorStorageEntries,",
+  "  refreshRemoteConfiguratorStorage,",
   "  remoteStorageSizeLabel,",
   "  remoteStorageUsageLabel,",
   "  resolveComponentNodeIds,",
@@ -1519,6 +1527,12 @@ const configuratorGraph = {
   setDirtyCanvas() {},
 };
 globalThis.__modalAppStub.rootGraph = configuratorGraph;
+const r2StorageNode = {
+  id: 385,
+  comfyClass: "R2StorageBackingConfiguration",
+  widgets: [{ name: "credential_id", value: "opaque-reference" }],
+};
+configuratorGraph.nodes.push(r2StorageNode);
 modalToggle.registerPromptConfigurator("plan-before-capacity", "381");
 modalToggle.registerRemoteConfiguratorPlan(
   "plan-before-capacity",
@@ -1544,7 +1558,7 @@ modalToggle.registerRemoteConfiguratorPlan(
     { configuration_id: "vast-big", display_name: "Vast Big" },
     { configuration_id: "lambda", display_name: "Lambda", gpu_type: "L40S" },
     {
-      configuration_id: "shared-r2",
+      configuration_id: "385",
       configuration_kind: "storage",
       display_name: "Shared model cache",
       storage_provider: "cloudflare_r2",
@@ -1601,6 +1615,7 @@ assert.equal(retainedPanel.table.hidden, false);
 assert.equal(retainedPanel.emptyText.hidden, true);
 assert.equal(retainedPanel.storage.hidden, false);
 assert.equal(retainedPanel.storageList.children.length, 1);
+assert.equal(typeof retainedPanel.storageReload.listeners.get("click"), "function");
 const storageCard = retainedPanel.storageList.children[0];
 assert.deepEqual(
   storageCard.children[0].children.map((child) => child.textContent),
@@ -1622,6 +1637,53 @@ assert.deepEqual(
   ],
 );
 assert.deepEqual(modalToggle.remoteConfiguratorStorageEntries([]), []);
+const storageRefreshRequests = [];
+globalThis.__modalApiStub.fetchApi = async (route, options) => {
+  storageRefreshRequests.push({ route, options });
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    async json() {
+      return {
+        configuration_id: "385",
+        storage_usage_bytes: 6 * 1024 ** 3,
+        storage_object_count: 43,
+      };
+    },
+  };
+};
+await modalToggle.refreshRemoteConfiguratorStorage(retainedPanel);
+assert.equal(storageRefreshRequests.length, 1);
+assert.equal(storageRefreshRequests[0].route, "/remote/storage/r2/usage");
+assert.equal(
+  JSON.parse(storageRefreshRequests[0].options.body).credential_id,
+  "opaque-reference",
+);
+assert.equal(retainedPanel.storageRefreshStatus.textContent, "Updated");
+assert.equal(retainedPanel.storageReload.textContent, "Reload");
+assert.equal(
+  retainedPanel.storageList.children[0].children[1].children[3].textContent,
+  "6.00 GiB · 43 objects",
+);
+globalThis.__modalApiStub.fetchApi = async () => ({
+  ok: false,
+  status: 502,
+  statusText: "Bad Gateway",
+  async json() {
+    return { error: "R2 is temporarily unavailable." };
+  },
+});
+await modalToggle.refreshRemoteConfiguratorStorage(retainedPanel);
+assert.equal(retainedPanel.storageRefreshStatus.textContent, "Refresh failed");
+assert.equal(
+  retainedPanel.storageRefreshStatus.title,
+  "R2 is temporarily unavailable.",
+);
+assert.equal(
+  retainedPanel.storageList.children[0].children[1].children[3].textContent,
+  "6.00 GiB · 43 objects",
+);
 assert.equal(retainedPanel.root.isConnected, false);
 
 modalToggle.handleModalStatus({

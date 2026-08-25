@@ -333,6 +333,14 @@ def test_remote_environment_routes_save_and_probe_hosts(
     monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
     monkeypatch.setattr(
         api_intercept_module,
+        "_refresh_r2_storage_usage",
+        lambda _storage: api_intercept_module.R2StorageUsage(
+            size_bytes=7 * 1024**3,
+            object_count=17,
+        ),
+    )
+    monkeypatch.setattr(
+        api_intercept_module,
         "_get_server_module",
         lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
     )
@@ -365,10 +373,28 @@ def test_remote_environment_routes_save_and_probe_hosts(
     )
     vast_verify = routes.handlers[("POST", "/remote/vast/verify")]
     vast_verify_response = asyncio.run(vast_verify(FakeRequest({})))
+    r2_usage = routes.handlers[("POST", "/remote/storage/r2/usage")]
+    r2_usage_response = asyncio.run(
+        r2_usage(
+            FakeRequest(
+                {
+                    "configuration_id": "385",
+                    "display_name": "Shared R2",
+                    "account_id": "a" * 32,
+                    "bucket": "models",
+                    "credential_id": "opaque-reference",
+                    "jurisdiction": "eu",
+                }
+            )
+        )
+    )
 
     assert update_response.status == 200
     assert probe_response.status == 200
     assert vast_verify_response.status == 400
+    assert r2_usage_response.status == 200
+    assert json.loads(r2_usage_response.text)["storage_usage_bytes"] == 7 * 1024**3
+    assert json.loads(r2_usage_response.text)["storage_object_count"] == 17
     assert ("GET", "/remote/vast/status") in routes.handlers
     assert ("POST", "/remote/vast/reap") in routes.handlers
     assert ("POST", "/remote/vast/destroy") in routes.handlers
@@ -376,6 +402,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
     assert ("GET", "/remote/storage/r2/oauth/callback") in routes.handlers
     assert ("POST", "/remote/storage/r2/credentials") in routes.handlers
     assert ("GET", "/remote/storage/r2/status") in routes.handlers
+    assert ("POST", "/remote/storage/r2/usage") in routes.handlers
     assert registry.get_host("gpu-one").health.value == "ready"
     assert registry.get_host("gpu-one").capabilities == capabilities
 
