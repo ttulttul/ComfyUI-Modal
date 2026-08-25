@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
 
@@ -63,13 +62,13 @@ RemoteConfigurationType = io.Custom(REMOTE_CONFIGURATION_IO_TYPE)
 RemoteConfigurationSetType = io.Custom(REMOTE_CONFIGURATION_SET_IO_TYPE)
 
 
-class StorageBackingConfigurationNode(io.ComfyNode, ABC):
+class StorageBackingConfigurationNode(io.ComfyNode):
     """Base ComfyUI node for workflow-scoped shared storage configuration."""
 
     @classmethod
-    @abstractmethod
     def define_schema(cls) -> io.Schema:
         """Expose one concrete storage provider's non-secret settings."""
+        raise NotImplementedError
 
 
 class R2StorageConfiguration(StorageBackingConfigurationNode):

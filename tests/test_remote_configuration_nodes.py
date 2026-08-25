@@ -46,6 +46,33 @@ def test_configuration_nodes_expose_typed_outputs_and_autogrow_sink(
     )
 
 
+def test_r2_configuration_executes_through_locked_v3_clone(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """R2's concrete v3 node must survive ComfyUI's execution-time class lock."""
+    from comfy_api.internal import make_locked_method_func
+
+    module = remote_configuration_nodes_module
+    node_class = module.R2StorageConfiguration
+    class_clone = node_class.PREPARE_CLASS_CLONE(None)
+    execute = make_locked_method_func(node_class, "execute", class_clone)
+
+    output = execute(
+        configuration_name="shared-r2",
+        account_id="a" * 32,
+        bucket="comfy-models",
+        credential_id="opaque-reference",
+        jurisdiction="eu",
+        write_back_mode="async",
+        key_prefix="comfy-modal-cache/v1/blobs/sha256",
+    )
+
+    assert output.result is not None
+    configuration = output.result[0]
+    assert configuration.configuration_id == "r2-storage"
+    assert configuration.bucket == "comfy-models"
+
+
 def test_compiler_collects_r2_storage_without_treating_it_as_capacity(
     remote_configuration_nodes_module: Any,
 ) -> None:
