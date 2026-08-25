@@ -146,6 +146,18 @@ def remote_configuration_nodes_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def r2_credentials_module(extension_package: object) -> object:
+    """Return secure Cloudflare R2 credential persistence helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.r2_credentials")
+
+
+@pytest.fixture(scope="session")
+def cloudflare_oauth_module(extension_package: object) -> object:
+    """Return Cloudflare OAuth and R2 provisioning helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.cloudflare_oauth")
+
+
+@pytest.fixture(scope="session")
 def execution_history_module(extension_package: object) -> object:
     """Return the persistent remote execution timing history module."""
     return importlib.import_module(f"{PACKAGE_NAME}.execution_history")

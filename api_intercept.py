@@ -71,6 +71,8 @@ from .sync_engine import (
 )
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
 from .r2_cache import R2CacheClient
+from .r2_credentials import R2CredentialStore
+from .cloudflare_oauth import setup_r2_oauth_routes
 from .remote_configuration_nodes import (
     REMOTE_CONFIGURATION_NODE_IDS,
     REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
@@ -80,6 +82,7 @@ from .remote_configurations import (
     ModalRemoteConfiguration,
     RemoteConfiguration,
     RemoteConfigurationSet,
+    R2StorageBackingConfiguration,
     SshRemoteConfiguration,
     VastRemoteConfiguration,
 )
@@ -1338,7 +1341,7 @@ def _plan_configured_component_execution(
     """Resolve and prepare a capacity-aware plan from connected configurations."""
     configurations_by_id = {
         configuration.configuration_id: configuration
-        for configuration in configuration_set.configurations
+        for configuration in configuration_set.capacity_configurations
     }
     ssh_hosts_by_id = _probe_configured_ssh_hosts(configuration_set)
     vast_service, vast_unavailable_reason = _configured_vast_service(
@@ -1475,7 +1478,7 @@ def _configured_vast_service(
     """Construct one Vast service only when the connected graph requests it."""
     vast_configured = any(
         isinstance(configuration, VastRemoteConfiguration)
-        for configuration in configuration_set.configurations
+        for configuration in configuration_set.capacity_configurations
     )
     if not vast_configured:
         return None, None
@@ -1490,7 +1493,7 @@ def _configured_vast_service(
     except (OSError, RuntimeError, ValueError) as exc:
         has_fallback_provider = any(
             not isinstance(configuration, VastRemoteConfiguration)
-            for configuration in configuration_set.configurations
+            for configuration in configuration_set.capacity_configurations
         )
         if not has_fallback_provider:
             raise ModalPromptValidationError(str(exc)) from exc
@@ -1556,7 +1559,7 @@ def _configured_candidate_environments(
     }
     vast_quotes: dict[tuple[str, str], VastProfileQuote] = {}
     for component_id, requirements in requirements_by_component.items():
-        for configuration in configuration_set.configurations:
+        for configuration in configuration_set.capacity_configurations:
             state, quote = _configured_candidate_environment(
                 configuration=configuration,
                 requirements=requirements,
@@ -1848,6 +1851,7 @@ def _ssh_sync_engine(
     *,
     host: SshHostConfig,
     settings: ModalSyncSettings,
+    r2_cache: R2CacheClient | None = None,
 ) -> ModalAssetSyncEngine:
     """Build a content-addressed sync engine for one SSH Docker host."""
     ssh_settings = replace(
@@ -1859,7 +1863,7 @@ def _ssh_sync_engine(
         ).resolve(),
         remote_storage_root="/storage",
     )
-    r2_cache = R2CacheClient.from_environment()
+    resolved_r2_cache = r2_cache or R2CacheClient.from_environment()
     controller = SshDockerController(host)
     materializer_image = SshRuntimeManager(
         controller=controller,
@@ -1874,8 +1878,29 @@ def _ssh_sync_engine(
     return ModalAssetSyncEngine(
         volume=volume,
         settings=ssh_settings,
-        r2_cache=r2_cache,
+        r2_cache=resolved_r2_cache,
     )
+
+
+def _workflow_r2_cache(
+    configuration_set: RemoteConfigurationSet | None,
+) -> R2CacheClient | None:
+    """Resolve the connected R2 backing through its opaque OS-keyring reference."""
+    if configuration_set is None:
+        return None
+    r2_configurations = [
+        configuration
+        for configuration in configuration_set.storage_configurations
+        if isinstance(configuration, R2StorageBackingConfiguration)
+    ]
+    if not r2_configurations:
+        return None
+    storage = r2_configurations[0]
+    try:
+        configuration = R2CredentialStore().cache_configuration(storage)
+    except (RuntimeError, ValueError) as exc:
+        raise ModalPromptValidationError(str(exc)) from exc
+    return R2CacheClient(configuration)
 
 
 def _stamp_execution_assignment(
@@ -7238,6 +7263,17 @@ def rewrite_prompt_for_modal(
                 f"Unable to resolve the acquired Vast.ai lease: {exc}"
             ) from exc
 
+    workflow_r2_cache = (
+        _workflow_r2_cache(execution_plan.configuration_set)
+        if any(
+            assignment.provider is not ExecutionProvider.MODAL
+            for assignment in assignments_by_component_id.values()
+        )
+        else None
+    )
+    if workflow_r2_cache is not None and vast_service is not None:
+        vast_service.r2_cache = workflow_r2_cache
+
     sync_engines_by_environment: dict[str, ModalAssetSyncEngine] = {}
     ssh_hosts_by_id = dict(execution_plan.ssh_hosts_by_id)
     if not ssh_hosts_by_id:
@@ -7322,6 +7358,7 @@ def rewrite_prompt_for_modal(
         sync_engines_by_environment[assignment.environment_id] = _ssh_sync_engine(
             host=host,
             settings=resolved_settings,
+            r2_cache=workflow_r2_cache,
         )
 
     if status_callback is not None:
@@ -7612,7 +7649,7 @@ def rewrite_prompt_for_modal(
     if execution_plan.configuration_set is not None:
         configured_capacity = sum(
             configuration.capacity_limit
-            for configuration in execution_plan.configuration_set.configurations
+            for configuration in execution_plan.configuration_set.capacity_configurations
         )
         summary.max_parallel_requests_upper_bound = min(
             summary.estimated_max_parallel_requests,
@@ -8251,6 +8288,8 @@ def setup_modal_queue_route(
             "PromptServer.instance is not available; skipping route registration."
         )
         return
+
+    setup_r2_oauth_routes(prompt_server)
 
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(
         resolved_settings

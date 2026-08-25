@@ -108,6 +108,7 @@ def test_endpoint_chat_node_is_not_offered_nested_modal_execution() -> None:
     assert '"ModalRemoteConfiguration"' in source
     assert '"VastRemoteConfiguration"' in source
     assert '"SshRemoteConfiguration"' in source
+    assert '"R2StorageBackingConfiguration"' in source
     assert '"RemoteExecutionConfigurator"' in source
     assert "!LOCAL_MODAL_NODE_IDS.has(String(node.comfyClass))" in source
     assert "!LOCAL_MODAL_NODE_IDS.has(String(nodeData.name))" in source

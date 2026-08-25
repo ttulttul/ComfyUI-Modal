@@ -24,6 +24,7 @@ const LOCAL_MODAL_NODE_IDS = new Set([
   "ModalRemoteConfiguration",
   "VastRemoteConfiguration",
   "SshRemoteConfiguration",
+  "R2StorageBackingConfiguration",
   "RemoteExecutionConfigurator",
 ]);
 const WORKFLOW_MODAL_CONFIG_KEY = "comfy_modal";

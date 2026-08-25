@@ -27,6 +27,7 @@ def test_configuration_nodes_expose_typed_outputs_and_autogrow_sink(
         module.ModalConfiguration,
         module.VastConfiguration,
         module.SshConfiguration,
+        module.R2StorageConfiguration,
     ):
         schema = node_class.define_schema()
         assert len(schema.outputs) == 1
@@ -43,6 +44,70 @@ def test_configuration_nodes_expose_typed_outputs_and_autogrow_sink(
         configurator_schema.outputs[0].io_type
         == module.REMOTE_CONFIGURATION_SET_IO_TYPE
     )
+
+
+def test_compiler_collects_r2_storage_without_treating_it_as_capacity(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """R2 should share the configurator socket but remain outside scheduler pools."""
+    module = remote_configuration_nodes_module
+    prompt = {
+        "10": {
+            "class_type": module.VAST_REMOTE_CONFIGURATION_NODE_ID,
+            "inputs": _vast_inputs("vast", 2),
+        },
+        "20": {
+            "class_type": module.R2_STORAGE_CONFIGURATION_NODE_ID,
+            "inputs": {
+                "configuration_name": "shared-r2",
+                "account_id": "a" * 32,
+                "bucket": "comfy-models",
+                "credential_id": "opaque-reference",
+                "jurisdiction": "eu",
+                "write_back_mode": "async",
+            },
+        },
+        "99": {
+            "class_type": module.REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
+            "inputs": {
+                "configuration_0": ["10", 0],
+                "configuration_1": ["20", 0],
+            },
+        },
+    }
+
+    configuration_set = module.compile_remote_configuration_set(prompt)
+
+    assert configuration_set is not None
+    assert len(configuration_set.capacity_configurations) == 1
+    assert len(configuration_set.storage_configurations) == 1
+    storage = configuration_set.storage_configurations[0]
+    assert storage.storage_provider == "cloudflare_r2"
+    assert storage.credential_id == "opaque-reference"
+    assert "credential" not in str(storage.to_safe_dict()).casefold()
+
+
+def test_configurator_rejects_storage_without_capacity(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """A storage backing alone cannot schedule remote execution."""
+    module = remote_configuration_nodes_module
+    prompt = {
+        "20": {
+            "class_type": module.R2_STORAGE_CONFIGURATION_NODE_ID,
+            "inputs": {
+                "account_id": "a" * 32,
+                "bucket": "comfy-models",
+            },
+        },
+        "99": {
+            "class_type": module.REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
+            "inputs": {"configuration_0": ["20", 0]},
+        },
+    }
+
+    with pytest.raises(ValueError, match="capacity configuration"):
+        module.compile_remote_configuration_set(prompt)
 
 
 def test_compiler_builds_two_modal_and_two_vast_configurations(
@@ -308,6 +373,7 @@ def test_extension_registers_all_remote_configuration_nodes(
     assert extension_package.ModalConfiguration is module.ModalConfiguration
     assert extension_package.VastConfiguration is module.VastConfiguration
     assert extension_package.SshConfiguration is module.SshConfiguration
+    assert extension_package.R2StorageConfiguration is module.R2StorageConfiguration
     assert (
         extension_package.RemoteExecutionConfigurator
         is module.RemoteExecutionConfigurator

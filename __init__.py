@@ -54,6 +54,7 @@ try:
     )
     from .remote_configuration_nodes import (
         ModalConfiguration,
+        R2StorageConfiguration,
         RemoteExecutionConfigurator,
         SshConfiguration,
         VastConfiguration,
@@ -68,6 +69,7 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     ModalLLM = None  # type: ignore[assignment]
     ModalUniversalExecutor = None  # type: ignore[assignment]
     ModalConfiguration = None  # type: ignore[assignment]
+    R2StorageConfiguration = None  # type: ignore[assignment]
     RemoteExecutionConfigurator = None  # type: ignore[assignment]
     SshConfiguration = None  # type: ignore[assignment]
     VastConfiguration = None  # type: ignore[assignment]
@@ -99,6 +101,7 @@ else:
                 ModalConfiguration,
                 VastConfiguration,
                 SshConfiguration,
+                R2StorageConfiguration,
                 RemoteExecutionConfigurator,
                 VastAILeaseConfiguration,
             ]
@@ -118,6 +121,7 @@ __all__ = [
     "ModalConfiguration",
     "ModalUniversalExecutor",
     "RemoteExecutionConfigurator",
+    "R2StorageConfiguration",
     "SshConfiguration",
     "VastConfiguration",
     "VastAILeaseConfiguration",

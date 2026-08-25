@@ -1,0 +1,214 @@
+"""Secure controller-side storage for Cloudflare R2 S3 credentials."""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+import keyring
+from keyring.errors import KeyringError
+
+if __package__:
+    from .r2_cache import R2CacheConfiguration
+    from .remote_configurations import R2StorageBackingConfiguration
+else:  # pragma: no cover - direct ComfyUI loading fallback.
+    from r2_cache import R2CacheConfiguration
+    from remote_configurations import R2StorageBackingConfiguration
+
+logger = logging.getLogger(__name__)
+
+R2_KEYRING_SERVICE = "comfyui-modal-sync-cloudflare-r2"
+_CREDENTIAL_SCHEMA_VERSION = 1
+
+
+class R2CredentialError(RuntimeError):
+    """Raised when controller-held R2 credentials cannot be stored or loaded."""
+
+
+class PasswordStore(Protocol):
+    """Describe the keyring methods used by the R2 credential store."""
+
+    def get_password(self, service_name: str, username: str) -> str | None:
+        """Return one stored secret value."""
+
+    def set_password(self, service_name: str, username: str, password: str) -> None:
+        """Persist one secret value."""
+
+    def delete_password(self, service_name: str, username: str) -> None:
+        """Delete one secret value."""
+
+
+@dataclass(frozen=True)
+class R2CredentialRecord:
+    """Hold one bucket-scoped R2 credential returned by Cloudflare."""
+
+    account_id: str
+    bucket: str
+    access_key_id: str = field(repr=False)
+    secret_access_key: str = field(repr=False)
+    jurisdiction: str = "default"
+
+    @property
+    def endpoint_url(self) -> str:
+        """Return the jurisdiction-specific R2 S3 endpoint."""
+        jurisdiction_segment = (
+            "" if self.jurisdiction == "default" else f".{self.jurisdiction}"
+        )
+        return (
+            f"https://{self.account_id}{jurisdiction_segment}."
+            "r2.cloudflarestorage.com"
+        )
+
+    def to_secret_json(self) -> str:
+        """Serialize the record for an operating-system credential vault."""
+        return json.dumps(
+            {
+                "schema_version": _CREDENTIAL_SCHEMA_VERSION,
+                "account_id": self.account_id,
+                "bucket": self.bucket,
+                "access_key_id": self.access_key_id,
+                "secret_access_key": self.secret_access_key,
+                "jurisdiction": self.jurisdiction,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_secret_json(cls, value: str) -> "R2CredentialRecord":
+        """Parse and validate a record retrieved from the credential vault."""
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise R2CredentialError("Stored R2 credentials are not valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise R2CredentialError("Stored R2 credentials must be a JSON object.")
+        if payload.get("schema_version") != _CREDENTIAL_SCHEMA_VERSION:
+            raise R2CredentialError("Stored R2 credentials use an unsupported schema.")
+        record = cls(
+            account_id=str(payload.get("account_id") or "").strip(),
+            bucket=str(payload.get("bucket") or "").strip(),
+            access_key_id=str(payload.get("access_key_id") or "").strip(),
+            secret_access_key=str(payload.get("secret_access_key") or "").strip(),
+            jurisdiction=str(payload.get("jurisdiction") or "default")
+            .strip()
+            .casefold(),
+        )
+        record.as_cache_configuration()
+        return record
+
+    def as_cache_configuration(
+        self,
+        storage: R2StorageBackingConfiguration | None = None,
+    ) -> R2CacheConfiguration:
+        """Build the validated cache configuration used for S3 signing."""
+        return R2CacheConfiguration(
+            account_id=self.account_id,
+            bucket=self.bucket,
+            access_key_id=self.access_key_id,
+            secret_access_key=self.secret_access_key,
+            endpoint_url=self.endpoint_url,
+            key_prefix=(
+                storage.key_prefix
+                if storage is not None
+                else "comfy-modal-cache/v1/blobs/sha256"
+            ),
+            write_back_mode=(storage.write_back_mode if storage is not None else "async"),
+        )
+
+
+@dataclass
+class R2CredentialStore:
+    """Persist R2 credentials in the operating system's secure keyring."""
+
+    password_store: PasswordStore = field(default=keyring, repr=False)
+    service_name: str = R2_KEYRING_SERVICE
+
+    def save(self, credential_id: str, record: R2CredentialRecord) -> None:
+        """Store one record without writing its secret into project files."""
+        normalized_id = _validated_credential_id(credential_id)
+        record.as_cache_configuration()
+        try:
+            self.password_store.set_password(
+                self.service_name,
+                normalized_id,
+                record.to_secret_json(),
+            )
+        except KeyringError as exc:
+            raise R2CredentialError(
+                "The operating-system credential vault could not store Cloudflare "
+                "R2 credentials. Configure a supported keyring backend and try again."
+            ) from exc
+        logger.info(
+            "Stored Cloudflare R2 credentials in the OS keyring "
+            "credential_id=%s account=%s bucket=%s.",
+            normalized_id,
+            record.account_id,
+            record.bucket,
+        )
+
+    def load(self, credential_id: str) -> R2CredentialRecord | None:
+        """Load one record, returning None when Login has not completed."""
+        normalized_id = _validated_credential_id(credential_id)
+        try:
+            value = self.password_store.get_password(self.service_name, normalized_id)
+        except KeyringError as exc:
+            raise R2CredentialError(
+                "The operating-system credential vault could not read Cloudflare "
+                "R2 credentials."
+            ) from exc
+        return None if value is None else R2CredentialRecord.from_secret_json(value)
+
+    def cache_configuration(
+        self,
+        storage: R2StorageBackingConfiguration,
+    ) -> R2CacheConfiguration:
+        """Resolve one workflow reference into credential-bearing cache settings."""
+        record = self.load(storage.credential_id)
+        if record is None:
+            raise R2CredentialError(
+                f"Cloudflare Login has not completed for R2 configuration "
+                f"{storage.display_name!r}."
+            )
+        if record.account_id != storage.account_id or record.bucket != storage.bucket:
+            raise R2CredentialError(
+                "The R2 node account or bucket changed after Login; use Login again "
+                "to issue a matching bucket-scoped credential."
+            )
+        if record.jurisdiction != storage.jurisdiction:
+            raise R2CredentialError(
+                "The R2 node jurisdiction changed after Login; use Login again."
+            )
+        return record.as_cache_configuration(storage)
+
+    def status(self, credential_id: str) -> dict[str, Any]:
+        """Return credential-free connection status for the browser UI."""
+        record = self.load(credential_id)
+        if record is None:
+            return {"connected": False}
+        return {
+            "connected": True,
+            "account_id": record.account_id,
+            "bucket": record.bucket,
+            "jurisdiction": record.jurisdiction,
+        }
+
+
+def _validated_credential_id(credential_id: str) -> str:
+    """Reject empty or control-character-bearing credential references."""
+    normalized_id = str(credential_id).strip()
+    if not normalized_id or any(
+        character in normalized_id for character in ("\x00", "\n", "\r")
+    ):
+        raise ValueError("R2 credential ID must be a non-empty single-line value.")
+    return normalized_id
+
+
+__all__ = [
+    "R2CredentialError",
+    "R2CredentialRecord",
+    "R2CredentialStore",
+    "R2_KEYRING_SERVICE",
+]

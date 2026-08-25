@@ -8,6 +8,7 @@
 
 !/__init__.py
 !/api_intercept.py
+!/cloudflare_oauth.py
 !/comfyui_modal_sync_cloud.py
 !/durable_state.py
 !/execution_environments.py
@@ -34,6 +35,7 @@
 !/remote_configurations.py
 !/remote_protocol.py
 !/r2_cache.py
+!/r2_credentials.py
 !/runtime_environment.py
 !/serialization.py
 !/settings.py

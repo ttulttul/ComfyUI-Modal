@@ -96,9 +96,10 @@ New workflows declare every available remote capacity pool explicitly:
 
 1. Add a **Remote Execution Configurator** node.
 2. Add any number of **Modal Configuration**, **Vast.ai Configuration**, and **SSH Configuration** nodes.
-3. Connect each provider node's `REMOTE_CONFIGURATION` output to the configurator's growing input group.
+3. Optionally add an **R2 Storage Configuration** node to provide shared object storage to Vast.ai and SSH targets.
+4. Connect every capacity and storage node's `REMOTE_CONFIGURATION` output to the configurator's growing input group.
 
-The connected graph is authoritative. Connecting only Modal configurations produces a Modal-only plan; connecting several providers lets the planner choose among all of them. Each configuration has its own name and capacity limit, so one workflow can offer several Modal GPU types, several independent Vast marketplace searches, and several SSH hosts at the same time.
+The connected graph is authoritative. Connecting only Modal configurations produces a Modal-only plan; connecting several providers lets the planner choose among all of them. Each capacity configuration has its own name and limit, so one workflow can offer several Modal GPU types, several independent Vast marketplace searches, and several SSH hosts at the same time. Storage configurations are sibling values in the same configurator but never become scheduler targets or contribute capacity.
 
 Capacity limits are concurrency ceilings, not eager provisioning requests. Modal containers scale as work needs them, Vast instances are quoted during planning and rented only for selected slots, and SSH worker containers are prepared lazily on the declared host. Sequential components can reuse one slot; parallel components consume distinct slots or wait when that is cheaper than another environment.
 
@@ -332,7 +333,21 @@ New local or Hugging Face transfers are written back to R2 by default on a two-w
 
 Permanent R2 access credentials remain only in the local ComfyUI controller. Workers receive expiring, exact-object S3-compatible GET/PUT URLs through protected process standard input; URLs do not enter workflow data, Docker/SSH command arguments, launch environments, or logs. Downloads are SHA-256 and size verified rather than trusting an S3 ETag. Files above the configured single-PUT threshold use multipart upload, which also avoids buffering model files in controller memory.
 
-Create a private R2 bucket and an API token scoped to that bucket, then configure the ComfyUI process:
+For a configured workflow, add **R2 Storage Configuration**, connect it to the same **Remote Execution Configurator** as the Vast.ai or SSH capacity nodes, choose the private bucket name, and select **Login to Cloudflare** directly on the R2 node. Login does not queue or execute the workflow. The browser uses Cloudflare Authorization Code + PKCE, the controller creates or reuses the requested bucket, and it creates a user-owned API token restricted to object access in that exact bucket. The one-time token value is converted to R2's S3 access-key pair and stored in the operating-system credential vault through `keyring`. The workflow contains only the account ID, bucket, jurisdiction, cache policy, and a random opaque credential reference.
+
+Register one public Cloudflare OAuth client for the extension before using the Login button. Configure it for Authorization Code + PKCE, token endpoint authentication `none`, response type `code`, and the callback shown below. Do not create or distribute a client secret for the desktop client. The client must allow the R2-management, account-read, and API-token-write OAuth scopes configured for the process. Cloudflare's scope catalog is evolving; if the scope IDs assigned to the client differ from the defaults, set `COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES` to their exact space-separated IDs.
+
+```bash
+export COMFY_MODAL_CLOUDFLARE_OAUTH_CLIENT_ID='your-public-client-id'
+# Register this exact callback, adjusting the loopback port when needed:
+export COMFY_MODAL_CLOUDFLARE_OAUTH_REDIRECT_URI='http://127.0.0.1:8188/remote/storage/r2/oauth/callback'
+# Defaults shown explicitly; override with the scope IDs on the registered client:
+export COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES='account.read api-tokens.write workers-r2-storage.write'
+```
+
+When ComfyUI is opened through an HTTP loopback URL, the callback is derived automatically if the redirect variable is omitted. A remote, reverse-proxied, or HTTPS installation must set the registered redirect URI explicitly. When the OAuth grant contains more than one Cloudflare account, enter the desired 32-character account ID on the node and select Login again. R2 must already be activated for that account; Cloudflare's first-time checkout remains an interactive dashboard operation.
+
+The environment-only configuration remains supported for legacy workflows and scripts. Create a private R2 bucket and an API token scoped to that bucket, then configure the ComfyUI process:
 
 ```bash
 export COMFY_MODAL_R2_ENABLED=true
@@ -381,6 +396,9 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_R2_URL_TTL_SECONDS` | `21600` | Presigned URL lifetime, from 1 second through R2's 7-day limit. |
 | `COMFY_MODAL_R2_MULTIPART_PART_MIB` | `256` | Multipart upload part size, from 5 MiB through 5 GiB. |
 | `COMFY_MODAL_R2_SINGLE_UPLOAD_MAX_MIB` | `100` | Maximum file size sent with one signed PUT, capped at 5 GiB. |
+| `COMFY_MODAL_CLOUDFLARE_OAUTH_CLIENT_ID` | unset | Public Cloudflare OAuth client ID used by the R2 node Login button. |
+| `COMFY_MODAL_CLOUDFLARE_OAUTH_REDIRECT_URI` | loopback page origin | Exact registered OAuth callback; required for non-loopback ComfyUI URLs. |
+| `COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES` | `account.read api-tokens.write workers-r2-storage.write` | Space- or comma-separated scope IDs configured on the Cloudflare OAuth client. |
 
 ### Modal Deployment
 

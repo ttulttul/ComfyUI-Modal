@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -15,10 +16,12 @@ else:  # pragma: no cover - direct ComfyUI loading fallback.
     from remote_hosts import SshHostConfig
     from vast_models import VastResourceProfile
 
+_R2_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+
 
 @dataclass(frozen=True)
-class RemoteConfiguration(ABC):
-    """Describe one workflow-declared pool of remote execution capacity."""
+class RemoteExecutionConfiguration(ABC):
+    """Describe one workflow-declared remote-execution configuration value."""
 
     configuration_id: str
     display_name: str
@@ -26,9 +29,20 @@ class RemoteConfiguration(ABC):
     def __post_init__(self) -> None:
         """Reject ambiguous identities before provider discovery begins."""
         if not self.configuration_id.strip():
-            raise ValueError("Remote configuration_id must not be empty.")
+            raise ValueError("Remote execution configuration_id must not be empty.")
         if not self.display_name.strip():
-            raise ValueError("Remote configuration display_name must not be empty.")
+            raise ValueError(
+                "Remote execution configuration display_name must not be empty."
+            )
+
+    @abstractmethod
+    def to_safe_dict(self) -> dict[str, Any]:
+        """Return credential-free workflow and diagnostic metadata."""
+
+
+@dataclass(frozen=True)
+class RemoteConfiguration(RemoteExecutionConfiguration, ABC):
+    """Describe one workflow-declared pool of remote execution capacity."""
 
     @property
     @abstractmethod
@@ -40,9 +54,67 @@ class RemoteConfiguration(ABC):
     def capacity_limit(self) -> int:
         """Return the maximum concurrent worker capacity contributed by this pool."""
 
+@dataclass(frozen=True)
+class StorageBackingConfiguration(RemoteExecutionConfiguration, ABC):
+    """Describe storage shared by one or more remote execution targets."""
+
+    @property
     @abstractmethod
+    def storage_provider(self) -> str:
+        """Return the stable storage-provider identifier."""
+
+
+@dataclass(frozen=True)
+class R2StorageBackingConfiguration(StorageBackingConfiguration):
+    """Reference controller-held credentials for one Cloudflare R2 bucket."""
+
+    account_id: str
+    bucket: str
+    credential_id: str
+    jurisdiction: str = "default"
+    key_prefix: str = "comfy-modal-cache/v1/blobs/sha256"
+    write_back_mode: str = "async"
+
+    def __post_init__(self) -> None:
+        """Validate non-secret R2 workflow metadata."""
+        super().__post_init__()
+        if len(self.account_id) != 32 or any(
+            character not in "0123456789abcdefABCDEF" for character in self.account_id
+        ):
+            raise ValueError(
+                "Cloudflare R2 account ID must be 32 hexadecimal characters; "
+                "use Login on the R2 Storage Configuration node."
+            )
+        if not _R2_BUCKET_PATTERN.fullmatch(self.bucket):
+            raise ValueError(
+                "Cloudflare R2 bucket must contain 3-63 lowercase letters, digits, "
+                "or hyphens and begin and end with a letter or digit."
+            )
+        if not self.credential_id.strip():
+            raise ValueError("Cloudflare R2 credential_id must not be empty.")
+        if self.jurisdiction not in {"default", "eu", "fedramp", "us"}:
+            raise ValueError("Cloudflare R2 jurisdiction is not supported.")
+        if self.write_back_mode not in {"async", "off", "sync"}:
+            raise ValueError("Cloudflare R2 write-back mode is not supported.")
+
+    @property
+    def storage_provider(self) -> str:
+        """Return the Cloudflare R2 provider identifier."""
+        return "cloudflare_r2"
+
     def to_safe_dict(self) -> dict[str, Any]:
-        """Return credential-free workflow and diagnostic metadata."""
+        """Return R2 metadata without controller credentials."""
+        return {
+            "configuration_id": self.configuration_id,
+            "display_name": self.display_name,
+            "configuration_kind": "storage",
+            "storage_provider": self.storage_provider,
+            "account_id": self.account_id,
+            "bucket": self.bucket,
+            "jurisdiction": self.jurisdiction,
+            "key_prefix": self.key_prefix,
+            "write_back_mode": self.write_back_mode,
+        }
 
 
 @dataclass(frozen=True)
@@ -162,9 +234,9 @@ class SshRemoteConfiguration(RemoteConfiguration):
 
 @dataclass(frozen=True)
 class RemoteConfigurationSet:
-    """Hold the complete authoritative remote capacity declaration for a workflow."""
+    """Hold the authoritative capacity and storage declaration for a workflow."""
 
-    configurations: tuple[RemoteConfiguration, ...]
+    configurations: tuple[RemoteExecutionConfiguration, ...]
 
     def __post_init__(self) -> None:
         """Require at least one uniquely identified and named configuration."""
@@ -183,6 +255,14 @@ class RemoteConfigurationSet:
         ]
         if len(normalized_names) != len(set(normalized_names)):
             raise ValueError("Remote configuration names must be unique.")
+        if not any(
+            isinstance(configuration, RemoteConfiguration)
+            for configuration in self.configurations
+        ):
+            raise ValueError(
+                "Remote Execution Configurator requires at least one Modal, Vast.ai, "
+                "or SSH capacity configuration."
+            )
         modal_gpu_types = [
             configuration.gpu_type
             for configuration in self.configurations
@@ -201,6 +281,34 @@ class RemoteConfigurationSet:
             raise ValueError(
                 "Each SSH destination may appear in only one remote configuration."
             )
+        storage_providers = [
+            configuration.storage_provider
+            for configuration in self.configurations
+            if isinstance(configuration, StorageBackingConfiguration)
+        ]
+        if len(storage_providers) != len(set(storage_providers)):
+            raise ValueError(
+                "Each storage provider may appear only once in a Remote Execution "
+                "Configurator."
+            )
+
+    @property
+    def capacity_configurations(self) -> tuple[RemoteConfiguration, ...]:
+        """Return only configurations that contribute execution capacity."""
+        return tuple(
+            configuration
+            for configuration in self.configurations
+            if isinstance(configuration, RemoteConfiguration)
+        )
+
+    @property
+    def storage_configurations(self) -> tuple[StorageBackingConfiguration, ...]:
+        """Return only shared storage backing configurations."""
+        return tuple(
+            configuration
+            for configuration in self.configurations
+            if isinstance(configuration, StorageBackingConfiguration)
+        )
 
     def to_safe_list(self) -> list[dict[str, Any]]:
         """Return ordered credential-free configuration metadata."""
@@ -214,6 +322,9 @@ __all__ = [
     "ModalRemoteConfiguration",
     "RemoteConfiguration",
     "RemoteConfigurationSet",
+    "RemoteExecutionConfiguration",
+    "R2StorageBackingConfiguration",
     "SshRemoteConfiguration",
+    "StorageBackingConfiguration",
     "VastRemoteConfiguration",
 ]
