@@ -821,6 +821,17 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
         1.0,
         2.0,
     ]
+    assert [event.stage for event in progress] == [
+        "snapshot_check",
+        "download_preparing",
+        "download",
+        "download",
+        "download",
+        "staged",
+    ]
+    assert {event.model_reference for event in progress} == {
+        "smolvlm2-2.2b-instruct"
+    }
     assert llm_staging_module.is_model_snapshot_staged(
         tmp_path,
         llm_staging_module.get_llm_profile("smolvlm2-2.2b-instruct"),
@@ -935,7 +946,9 @@ def test_provider_neutral_stager_resolves_and_stages_model_reference(
     assert results[0].profile_id == profile.profile_id
     assert results[0].manifest_created is True
     assert results[0].downloaded is True
-    assert progress[0].stage == "resolve"
+    assert progress[0].stage == "metadata"
+    assert progress[0].message == "Inspecting Hugging Face metadata for owner/model"
+    assert progress[0].model_reference == "owner/model"
 
 
 def test_weight_snapshot_is_shared_across_runtime_profiles(
@@ -2675,6 +2688,7 @@ def test_remote_dispatch_streams_cpu_llm_staging_progress(
                 "value": 3,
                 "max": 8,
                 "unit": "files",
+                "model_reference": "owner/model",
             }
             yield {
                 "kind": "result",
@@ -2728,12 +2742,57 @@ def test_remote_dispatch_streams_cpu_llm_staging_progress(
             "value": 3,
             "max": 8,
             "unit": "files",
+            "model_reference": "owner/model",
         }
     ]
     assert (
         payload["subgraph_prompt"]["llm-node"]["inputs"]["model_profile"]
         == "hf-" + "b" * 64
     )
+
+
+def test_llm_staging_progress_targets_the_matching_llm_node(
+    remote_modal_app_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A component representative must not receive an inner LLM staging bar."""
+    observed_progress: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: observed_progress.append(kwargs),
+    )
+    payload = {
+        "prompt_id": "prompt-1",
+        "component_id": "11",
+        "component_node_ids": ["11", "249:263", "289:288"],
+        "extra_data": {"client_id": "client-1"},
+        "subgraph_prompt": {
+            "11": {"class_type": "VAELoader", "inputs": {}},
+            "249:263": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "owner/model"},
+            },
+            "289:288": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": "owner/other-model"},
+            },
+        },
+    }
+
+    remote_modal_app_module._emit_local_llm_staging_progress(
+        payload,
+        {
+            "stage": "metadata",
+            "message": "Inspecting Hugging Face metadata for owner/model",
+            "indeterminate": True,
+            "model_reference": "owner/model",
+        },
+    )
+
+    assert [event["node_id"] for event in observed_progress] == ["249:263"]
+    assert observed_progress[0]["stage"] == "metadata"
+    assert observed_progress[0]["pre_gpu"] is True
 
 
 def test_remote_runtime_registers_deployment_owned_llm_node(

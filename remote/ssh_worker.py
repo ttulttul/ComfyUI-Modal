@@ -268,6 +268,7 @@ def stage_profiles(
                     "max": progress.maximum,
                     "unit": progress.unit,
                     "indeterminate": progress.indeterminate,
+                    "model_reference": progress.model_reference,
                 },
                 separators=(",", ":"),
                 sort_keys=True,

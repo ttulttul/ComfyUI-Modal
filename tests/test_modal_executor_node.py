@@ -6548,7 +6548,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
             ("setup", "Rebuilding Modal app"),
             (
                 "llm_staging",
-                "Inspecting and staging LLM on CPU; no GPU is allocated yet",
+                "Preparing LLM model snapshots on CPU; no GPU is allocated yet",
             ),
             (
                 "llm_staged",

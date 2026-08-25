@@ -7839,6 +7839,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                             "max": progress.maximum,
                             "unit": progress.unit,
                             "indeterminate": progress.indeterminate,
+                            "model_reference": progress.model_reference,
                         }
                     )
                     if progress_callback is not None

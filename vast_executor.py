@@ -303,7 +303,7 @@ class VastExecutorClient:
         _emit_local_remote_startup_status(
             payload,
             phase="llm_staging",
-            status_message="Inspecting and staging LLM on the Vast.ai instance",
+            status_message="Preparing LLM model snapshots on the Vast.ai instance",
         )
         arguments = ["python", "-m", "remote.ssh_worker", "stage-profiles"]
         for reference in model_references:

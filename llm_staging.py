@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -66,6 +66,7 @@ class LLMStagingProgress:
     maximum: float | None = None
     unit: str | None = None
     indeterminate: bool = False
+    model_reference: str | None = None
 
 
 StagingProgressCallback = Callable[[LLMStagingProgress], None]
@@ -280,8 +281,13 @@ def _legacy_snapshot_matches(
 
 
 @contextmanager
-def _snapshot_lease(snapshot_path: Path) -> Iterator[None]:
-    """Serialize a snapshot download and recover an abandoned lease."""
+def _snapshot_lease(
+    snapshot_path: Path,
+    *,
+    progress_callback: StagingProgressCallback | None = None,
+    model_label: str,
+) -> Iterator[None]:
+    """Serialize a snapshot download and report waits for another downloader."""
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     lease_path = snapshot_path.parent / f".{snapshot_path.name}.download.lock"
     timeout_seconds = float(
@@ -293,10 +299,22 @@ def _snapshot_lease(snapshot_path: Path) -> Iterator[None]:
         )
     started_at = time.monotonic()
     acquired = False
+    waiting_reported = False
     while not acquired:
         try:
             descriptor = os.open(lease_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
+            if progress_callback is not None and not waiting_reported:
+                progress_callback(
+                    LLMStagingProgress(
+                        stage="waiting_for_download",
+                        message=(
+                            f"Waiting for another download of {model_label} to finish"
+                        ),
+                        indeterminate=True,
+                    )
+                )
+                waiting_reported = True
             try:
                 lease_age = time.time() - lease_path.stat().st_mtime
             except FileNotFoundError:
@@ -336,6 +354,7 @@ def stage_model_profile(
     profile: LLMModelProfile | None = None,
     snapshot_download: Callable[..., str] | None = None,
     progress_callback: StagingProgressCallback | None = None,
+    model_reference: str | None = None,
 ) -> StagedModelSnapshot:
     """Download one pinned curated or generated snapshot on a CPU worker."""
     profile = profile or get_llm_profile(profile_id, storage_root=storage_root)
@@ -344,8 +363,22 @@ def stage_model_profile(
             f"Stage request id {profile_id!r} does not match profile "
             f"{profile.profile_id!r}."
         )
+    model_label = model_reference or profile.profile_id
+
+    def report(progress: LLMStagingProgress) -> None:
+        """Attach the user-facing model reference to one staging event."""
+        if progress_callback is not None:
+            progress_callback(replace(progress, model_reference=model_label))
+
     snapshot_path = model_snapshot_path(storage_root, profile)
     started_at = time.perf_counter()
+    report(
+        LLMStagingProgress(
+            stage="snapshot_check",
+            message=f"Checking staged snapshot for {model_label}",
+            indeterminate=True,
+        )
+    )
     if is_model_snapshot_staged(storage_root, profile):
         logger.info(
             "Reusing staged Modal LLM profile=%s revision=%s path=%s.",
@@ -353,16 +386,15 @@ def stage_model_profile(
             profile.revision,
             snapshot_path,
         )
-        if progress_callback is not None:
-            progress_callback(
-                LLMStagingProgress(
-                    stage="cached",
-                    message="Model snapshot already staged",
-                    value=1,
-                    maximum=1,
-                    unit="model",
-                )
+        report(
+            LLMStagingProgress(
+                stage="cached",
+                message=f"Using staged snapshot for {model_label}",
+                value=1,
+                maximum=1,
+                unit="model",
             )
+        )
         return StagedModelSnapshot(
             profile_id=profile.profile_id,
             repository=profile.repository,
@@ -372,8 +404,23 @@ def stage_model_profile(
             elapsed_seconds=time.perf_counter() - started_at,
         )
 
-    with _snapshot_lease(snapshot_path):
+    with _snapshot_lease(
+        snapshot_path,
+        progress_callback=report,
+        model_label=model_label,
+    ):
         if is_model_snapshot_staged(storage_root, profile):
+            report(
+                LLMStagingProgress(
+                    stage="cached",
+                    message=(
+                        f"Using snapshot staged by another worker for {model_label}"
+                    ),
+                    value=1,
+                    maximum=1,
+                    unit="model",
+                )
+            )
             return StagedModelSnapshot(
                 profile_id=profile.profile_id,
                 repository=profile.repository,
@@ -388,6 +435,13 @@ def stage_model_profile(
             )
 
             snapshot_download = huggingface_snapshot_download
+        report(
+            LLMStagingProgress(
+                stage="download_preparing",
+                message=f"Preparing download for {model_label}",
+                indeterminate=True,
+            )
+        )
         snapshot_path.mkdir(parents=True, exist_ok=True)
         logger.info(
             "Staging Modal LLM profile=%s repository=%s revision=%s to %s.",
@@ -404,7 +458,7 @@ def stage_model_profile(
             "allow_patterns": _model_allow_patterns(profile),
         }
         if progress_callback is not None:
-            download_options["tqdm_class"] = _snapshot_tqdm_class(progress_callback)
+            download_options["tqdm_class"] = _snapshot_tqdm_class(report)
         resolved_path = Path(snapshot_download(**download_options)).resolve()
         if resolved_path != snapshot_path.resolve():
             raise RuntimeError(
@@ -423,7 +477,7 @@ def stage_model_profile(
             }
             if progress_callback is not None:
                 tokenizer_options["tqdm_class"] = _snapshot_tqdm_class(
-                    progress_callback
+                    report
                 )
             tokenizer_path = Path(snapshot_download(**tokenizer_options)).resolve()
             if tokenizer_path != snapshot_path.resolve():
@@ -438,6 +492,15 @@ def stage_model_profile(
                 "required model or tokenizer artifacts."
             )
         _write_marker(snapshot_path, profile)
+        report(
+            LLMStagingProgress(
+                stage="staged",
+                message=f"Model snapshot ready for {model_label}",
+                value=1,
+                maximum=1,
+                unit="model",
+            )
+        )
     result = StagedModelSnapshot(
         profile_id=profile.profile_id,
         repository=profile.repository,
@@ -489,11 +552,23 @@ def resolve_and_stage_model_references(
     results: list[ResolvedStagedModelProfile] = []
     for model_reference in model_references:
         if progress_callback is not None:
+            is_hugging_face_reference = (
+                "/" in model_reference and not model_reference.startswith("hf-")
+            )
             progress_callback(
                 LLMStagingProgress(
-                    stage="resolve",
-                    message=f"Inspecting {model_reference}",
+                    stage=(
+                        "metadata"
+                        if is_hugging_face_reference
+                        else "profile_resolution"
+                    ),
+                    message=(
+                        f"Inspecting Hugging Face metadata for {model_reference}"
+                        if is_hugging_face_reference
+                        else f"Resolving model profile {model_reference}"
+                    ),
                     indeterminate=True,
+                    model_reference=model_reference,
                 )
             )
         resolve_started_at = time.perf_counter()
@@ -509,6 +584,7 @@ def resolve_and_stage_model_references(
             storage_root,
             profile=profile,
             progress_callback=progress_callback,
+            model_reference=model_reference,
         )
         results.append(
             ResolvedStagedModelProfile(

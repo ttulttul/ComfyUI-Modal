@@ -83,6 +83,7 @@ from ..runtime_environment import (
 )
 from ..llm_profiles import (
     get_llm_profile,
+    llm_model_reference_node_ids_from_payload,
     llm_model_references_from_payload,
     rewrite_llm_model_references,
 )
@@ -6239,7 +6240,7 @@ def _emit_local_llm_staging_progress(
     payload: Mapping[str, Any],
     stage_event: Mapping[str, Any],
 ) -> None:
-    """Render one CPU ModelStager update on the target component's node bar."""
+    """Render one CPU ModelStager update on its actual LLM node bars."""
     prompt_id = (
         str(payload["prompt_id"]) if payload.get("prompt_id") is not None else None
     )
@@ -6249,26 +6250,42 @@ def _emit_local_llm_staging_progress(
         if isinstance(extra_data, Mapping) and extra_data.get("client_id") is not None
         else None
     )
-    component_id = str(payload.get("component_id") or "")
-    if not component_id:
+    node_ids_by_reference = llm_model_reference_node_ids_from_payload(payload)
+    model_reference = str(stage_event.get("model_reference") or "").strip()
+    node_ids = node_ids_by_reference.get(model_reference, ())
+    if not node_ids:
+        node_ids = tuple(
+            sorted(
+                {
+                    node_id
+                    for reference_node_ids in node_ids_by_reference.values()
+                    for node_id in reference_node_ids
+                }
+            )
+        )
+    if not node_ids:
+        component_id = str(payload.get("component_id") or "")
+        node_ids = (component_id,) if component_id else ()
+    if not node_ids:
         return
     maximum = stage_event.get("max")
-    _emit_local_modal_progress(
-        prompt_id=prompt_id,
-        client_id=client_id,
-        node_id=component_id,
-        value=float(stage_event.get("value") or 0.0),
-        max_value=float(maximum) if maximum is not None else 1.0,
-        stage=str(stage_event.get("stage") or "staging"),
-        message=str(stage_event.get("message") or "Staging LLM snapshot"),
-        unit=(
-            str(stage_event["unit"])
-            if stage_event.get("unit") is not None
-            else None
-        ),
-        indeterminate=bool(stage_event.get("indeterminate", False)),
-        pre_gpu=True,
-    )
+    for node_id in node_ids:
+        _emit_local_modal_progress(
+            prompt_id=prompt_id,
+            client_id=client_id,
+            node_id=node_id,
+            value=float(stage_event.get("value") or 0.0),
+            max_value=float(maximum) if maximum is not None else 1.0,
+            stage=str(stage_event.get("stage") or "staging"),
+            message=str(stage_event.get("message") or "Staging LLM snapshot"),
+            unit=(
+                str(stage_event["unit"])
+                if stage_event.get("unit") is not None
+                else None
+            ),
+            indeterminate=bool(stage_event.get("indeterminate", False)),
+            pre_gpu=True,
+        )
 
 
 def _ensure_llm_profiles_staged(
@@ -6294,7 +6311,7 @@ def _ensure_llm_profiles_staged(
                 payload,
                 phase="llm_staging",
                 status_message=(
-                    "Inspecting and staging LLM on CPU; no GPU is allocated yet"
+                    "Preparing LLM model snapshots on CPU; no GPU is allocated yet"
                 ),
             )
             logger.info(

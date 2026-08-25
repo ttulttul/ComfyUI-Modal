@@ -439,6 +439,43 @@ def llm_model_references_from_payload(payload: Mapping[str, Any]) -> tuple[str, 
     return tuple(sorted(model_references))
 
 
+def llm_model_reference_node_ids_from_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    """Map fixed LLM model references to their actual prompt node IDs."""
+    node_ids_by_reference: dict[str, set[str]] = {}
+
+    def visit(value: Any) -> None:
+        """Visit nested prompt containers while retaining each mapping key."""
+        if isinstance(value, Mapping):
+            for raw_node_id, nested_value in value.items():
+                if isinstance(nested_value, Mapping) and (
+                    nested_value.get("class_type") == MODAL_LLM_NODE_ID
+                ):
+                    inputs = nested_value.get("inputs")
+                    model_reference = (
+                        inputs.get("model_profile")
+                        if isinstance(inputs, Mapping)
+                        else None
+                    )
+                    if isinstance(model_reference, str) and model_reference.strip():
+                        node_ids_by_reference.setdefault(
+                            model_reference.strip(),
+                            set(),
+                        ).add(str(raw_node_id))
+                visit(nested_value)
+            return
+        if isinstance(value, list | tuple):
+            for nested_value in value:
+                visit(nested_value)
+
+    visit(payload)
+    return {
+        reference: tuple(sorted(node_ids))
+        for reference, node_ids in sorted(node_ids_by_reference.items())
+    }
+
+
 def rewrite_llm_model_references(
     payload: Mapping[str, Any],
     profile_ids_by_reference: Mapping[str, str],
@@ -507,6 +544,7 @@ __all__ = [
     "get_llm_profile",
     "generated_profile_id",
     "generated_profile_manifest_path",
+    "llm_model_reference_node_ids_from_payload",
     "llm_model_references_from_payload",
     "llm_profile_ids_from_payload",
     "llm_profile_options",

@@ -83,7 +83,7 @@ On 2026-08-19, the harness ran `Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4` on 
 
 ## Progress And Cancellation
 
-Both staging paths pass a custom progress adapter into Hugging Face snapshot download. Local and remote execution emit the same typed stages for profile inspection, input preparation, memory admission, processor/model loading, and token generation. The standard ComfyUI progress bar therefore works locally, while the existing streamed remote event path continues to feed Modal overlays. Work without a real completion fraction remains indeterminate.
+Both staging paths pass a custom progress adapter into Hugging Face snapshot download. Local and remote execution emit the same typed stages for metadata inspection or curated-profile resolution, snapshot lookup, concurrent-download waiting, download preparation and transfer, input preparation, memory admission, processor/model loading, and token generation. Pre-inference staging events carry their model reference so a multi-node remote component renders them on the matching LLM node rather than on its graph representative. The standard ComfyUI progress bar therefore works locally, while the existing streamed remote event path continues to feed Modal overlays. Work without a real completion fraction remains indeterminate.
 
 Each generated token checks ComfyUI's interruption hook through the node progress callback. Remote vLLM also aborts its active async request before propagating cancellation. Final time-to-first-token and throughput are retained in `metadata_json`.
 

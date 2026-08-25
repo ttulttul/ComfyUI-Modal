@@ -69,6 +69,7 @@ def test_worker_stage_profiles_streams_progress_and_result(
                 maximum=2,
                 unit="files",
                 indeterminate=False,
+                model_reference="owner/model",
             )
         )
         return [
@@ -88,6 +89,7 @@ def test_worker_stage_profiles_streams_progress_and_result(
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]["kind"] == "progress"
     assert events[0]["max"] == 2
+    assert events[0]["model_reference"] == "owner/model"
     assert events[1] == {"kind": "result", "results": results}
 
 

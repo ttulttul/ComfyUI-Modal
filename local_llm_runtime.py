@@ -478,6 +478,7 @@ def resolve_and_stage_local_profile(
         storage_root,
         profile=profile,
         progress_callback=_stage_progress_callback(progress_callback),
+        model_reference=normalized_reference,
     )
     return profile
 

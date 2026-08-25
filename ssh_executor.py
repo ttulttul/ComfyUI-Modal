@@ -286,7 +286,7 @@ class SshDockerExecutorClient:
         _emit_local_remote_startup_status(
             payload,
             phase="llm_staging",
-            status_message="Inspecting and staging LLM on the SSH host",
+            status_message="Preparing LLM model snapshots on the SSH host",
         )
         arguments = [
             "exec",
