@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 _REMOTE_REPO_ROOT = Path("/opt/comfy-remote/repo")
 _REMOTE_COMFYUI_ROOT = Path("/opt/comfy-remote/ComfyUI")
 _REMOTE_STORAGE_ROOT = Path("/storage")
+_RUNTIME_IMAGE_REPOSITORY = "comfy-remote"
+_DEPENDENCY_IMAGE_REPOSITORY = "comfy-remote-deps"
 _RUNTIME_LABEL = "comfy.remote.runtime-fingerprint"
 _DEPENDENCY_LABEL = "comfy.remote.dependency-fingerprint"
 _ENVIRONMENT_LABEL = "comfy.remote.environment-id"
@@ -248,6 +250,10 @@ class SshRuntimeManager:
         status_callback: Callable[[str], None] | None = None,
     ) -> None:
         """Build a stable dependency image and apply the current source overlay."""
+        self._remove_stale_runtime_images(
+            spec,
+            status_callback=status_callback,
+        )
         dependency_fingerprint = remote_runtime_dependency_fingerprint(spec.identity)
         dependency_image_tag = self._dependency_image_tag(spec)
         if not self._dependency_image_is_current(spec):
@@ -309,7 +315,95 @@ class SshRuntimeManager:
     def _dependency_image_tag(self, spec: SshRuntimeSpec) -> str:
         """Return the stable local tag for one dependency-only worker base."""
         fingerprint = remote_runtime_dependency_fingerprint(spec.identity)
-        return f"comfy-remote-deps:{fingerprint[:16]}"
+        return f"{_DEPENDENCY_IMAGE_REPOSITORY}:{fingerprint[:16]}"
+
+    def _remove_stale_runtime_images(
+        self,
+        spec: SshRuntimeSpec,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> tuple[str, ...]:
+        """Remove superseded extension-owned image tags that Docker can release."""
+        protected_references = {
+            spec.image_tag,
+            self._dependency_image_tag(spec),
+        }
+        candidates = {
+            *self._managed_image_references(
+                label_name=_RUNTIME_LABEL,
+                repository=_RUNTIME_IMAGE_REPOSITORY,
+            ),
+            *self._managed_image_references(
+                label_name=_DEPENDENCY_LABEL,
+                repository=_DEPENDENCY_IMAGE_REPOSITORY,
+            ),
+        } - protected_references
+        if candidates:
+            _emit_runtime_status(
+                status_callback,
+                f"Reclaiming {len(candidates)} stale SSH worker image(s) "
+                f"environment={self.controller.host.environment_id}",
+            )
+
+        removed: list[str] = []
+        for image_reference in sorted(candidates):
+            result = self.controller.docker(
+                ("image", "rm", image_reference),
+                check=False,
+            )
+            if result.returncode == 0:
+                removed.append(image_reference)
+                logger.info(
+                    "Removed stale SSH worker image environment=%s image=%s.",
+                    self.controller.host.environment_id,
+                    image_reference,
+                )
+                continue
+            logger.info(
+                "Retained stale SSH worker image environment=%s image=%s: %s",
+                self.controller.host.environment_id,
+                image_reference,
+                result.stderr_text.strip() or "Docker still references the image",
+            )
+        return tuple(removed)
+
+    def _managed_image_references(
+        self,
+        *,
+        label_name: str,
+        repository: str,
+    ) -> tuple[str, ...]:
+        """List tagged images owned by this extension in one repository."""
+        result = self.controller.docker(
+            (
+                "image",
+                "ls",
+                "--filter",
+                f"label={label_name}",
+                "--format",
+                "{{.Repository}}:{{.Tag}}",
+            ),
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Could not enumerate managed SSH images environment=%s "
+                "repository=%s: %s",
+                self.controller.host.environment_id,
+                repository,
+                result.stderr_text.strip() or "docker image ls failed",
+            )
+            return ()
+        repository_prefix = f"{repository}:"
+        return tuple(
+            sorted(
+                {
+                    line.strip()
+                    for line in result.stdout_text.splitlines()
+                    if line.strip().startswith(repository_prefix)
+                }
+            )
+        )
 
     def _dependency_image_is_current(self, spec: SshRuntimeSpec) -> bool:
         """Return whether the dependency-only image is retained by Docker."""

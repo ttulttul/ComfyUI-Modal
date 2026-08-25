@@ -96,6 +96,11 @@ def test_worker_build_loads_image_into_the_remote_daemon(
         "remote_runtime_dependency_fingerprint",
         lambda _identity: "cafebabe" * 8,
     )
+    monkeypatch.setattr(
+        manager,
+        "_remove_stale_runtime_images",
+        lambda _spec, status_callback=None: (),
+    )
 
     manager._build_image(spec)
 
@@ -156,10 +161,16 @@ def test_worker_build_reuses_retained_dependency_image(
         "remote_runtime_dependency_fingerprint",
         lambda _identity: "cafebabe" * 8,
     )
+
     def fail_dependency_build() -> bytes:
         """Fail if a retained dependency image is rebuilt."""
         raise AssertionError("dependency context should not be rebuilt")
 
+    monkeypatch.setattr(
+        manager,
+        "_remove_stale_runtime_images",
+        lambda _spec, status_callback=None: (),
+    )
     monkeypatch.setattr(manager, "_dependency_build_context", fail_dependency_build)
     monkeypatch.setattr(
         manager,
@@ -179,6 +190,67 @@ def test_worker_build_reuses_retained_dependency_image(
         "--load",
     )
     assert calls[1][1]["input_payload"] == b"52MB-source-overlay"
+
+
+def test_worker_build_reclaims_only_superseded_managed_images(
+    ssh_runtime_module: Any,
+    ssh_docker_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Disk reclamation must stay inside extension-owned image repositories."""
+    removed_references: list[str] = []
+
+    def docker(arguments: tuple[str, ...], **_kwargs: Any) -> Any:
+        """Return managed image listings and record targeted removals."""
+        if arguments[:2] == ("image", "ls"):
+            label_filter = arguments[3]
+            if label_filter == "label=comfy.remote.runtime-fingerprint":
+                output = "\n".join(
+                    (
+                        "comfy-remote:current",
+                        "comfy-remote:old-source",
+                        "unrelated:keep",
+                    )
+                )
+            else:
+                output = "\n".join(
+                    (
+                        "comfy-remote-deps:current-deps",
+                        "comfy-remote-deps:old-deps",
+                        "comfy-remote:old-source",
+                    )
+                )
+            return ssh_docker_module.SshCommandResult(output.encode(), b"", 0)
+        if arguments[:2] == ("image", "rm"):
+            removed_references.append(arguments[2])
+            return ssh_docker_module.SshCommandResult(b"", b"", 0)
+        raise AssertionError(f"Unexpected Docker arguments: {arguments}")
+
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(
+            host=SimpleNamespace(environment_id="gpu-host"),
+            docker=docker,
+        ),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+    spec = SimpleNamespace(
+        image_tag="comfy-remote:current",
+        identity=SimpleNamespace(fingerprint="source-fingerprint"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_dependency_image_tag",
+        lambda _spec: "comfy-remote-deps:current-deps",
+    )
+
+    removed = manager._remove_stale_runtime_images(spec)
+
+    assert removed == (
+        "comfy-remote-deps:old-deps",
+        "comfy-remote:old-source",
+    )
+    assert removed_references == list(removed)
 
 
 def test_conflicting_worker_launch_adopts_current_managed_winner(
