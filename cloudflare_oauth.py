@@ -52,7 +52,6 @@ R2_CREDENTIAL_STATUS_ROUTE = "/remote/storage/r2/status"
 DEFAULT_CLOUDFLARE_OAUTH_SCOPES = (
     "account-settings.read",
     "workers-r2.write",
-    "openid",
 )
 _OAUTH_STATE_TTL_SECONDS = 10 * 60
 _ALLOWED_JURISDICTIONS = frozenset({"default", "eu", "fedramp", "us"})

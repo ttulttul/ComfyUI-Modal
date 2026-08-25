@@ -64,9 +64,7 @@ def test_authorization_url_uses_public_client_pkce(
     assert state.credential_id == "opaque-id"
     assert state.bucket == "models"
     assert len(query["code_challenge"][0]) == 43
-    assert query["scope"] == [
-        "account-settings.read workers-r2.write openid"
-    ]
+    assert query["scope"] == ["account-settings.read workers-r2.write"]
 
 
 def test_complete_provisions_bucket_without_attempting_token_creation(

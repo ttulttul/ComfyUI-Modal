@@ -335,14 +335,14 @@ Permanent R2 access credentials remain only in the local ComfyUI controller. Wor
 
 For a configured workflow, add **R2 Storage Configuration**, connect it to the same **Remote Execution Configurator** as the Vast.ai or SSH capacity nodes, choose the private bucket name, and select **Login to Cloudflare** directly on the R2 node. Login does not queue or execute the workflow. The browser uses Cloudflare Authorization Code + PKCE, and the controller creates or reuses the requested bucket. Cloudflare does not expose API-token creation to third-party OAuth clients, so the node then opens a secure credential-import dialog. Follow its link to **R2 > Manage R2 API Tokens**, create an **Object Read & Write** token restricted to the configured bucket, and paste the one-time **Access Key ID** and **Secret Access Key** values into the dialog. The controller verifies bucket access before storing the pair in the operating-system credential vault through `keyring`. The workflow contains only the account ID, bucket, jurisdiction, cache policy, and a random opaque credential reference.
 
-Register one public Cloudflare OAuth client for the extension before using the Login button. Configure it for Authorization Code + PKCE, token endpoint authentication `none`, response type `code`, and the callback shown below. Do not create or distribute a client secret for the desktop client. In Cloudflare's friendly-name scope picker, enable **Account Settings Read**, **Workers R2 Storage Write**, and **openid**. Do not enable **Access: Service Tokens Write**; Zero Trust service tokens are unrelated to R2 S3 credentials.
+Register one public Cloudflare OAuth client for the extension before using the Login button. Configure it for Authorization Code + PKCE, token endpoint authentication `none`, response type `code`, and the callback shown below. Do not create or distribute a client secret for the desktop client. In Cloudflare's friendly-name scope picker, enable **Account Settings Read** and **Workers R2 Storage Write**. Do not enable **openid** or **Access: Service Tokens Write**; neither is required for R2 provisioning, and Zero Trust service tokens are unrelated to R2 S3 credentials.
 
 ```bash
 export COMFY_MODAL_CLOUDFLARE_OAUTH_CLIENT_ID='your-public-client-id'
 # Register this exact callback, adjusting the loopback port when needed:
 export COMFY_MODAL_CLOUDFLARE_OAUTH_REDIRECT_URI='http://127.0.0.1:8188/remote/storage/r2/oauth/callback'
 # Defaults shown explicitly; these must match the scopes on the registered client:
-export COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES='account-settings.read workers-r2.write openid'
+export COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES='account-settings.read workers-r2.write'
 ```
 
 When ComfyUI is opened through an HTTP loopback URL, the callback is derived automatically if the redirect variable is omitted. A remote, reverse-proxied, or HTTPS installation must set the registered redirect URI explicitly. When the OAuth grant contains more than one Cloudflare account, enter the desired 32-character account ID on the node and select Login again. R2 must already be activated for that account; Cloudflare's first-time checkout remains an interactive dashboard operation.
@@ -398,7 +398,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_R2_SINGLE_UPLOAD_MAX_MIB` | `100` | Maximum file size sent with one signed PUT, capped at 5 GiB. |
 | `COMFY_MODAL_CLOUDFLARE_OAUTH_CLIENT_ID` | unset | Public Cloudflare OAuth client ID used by the R2 node Login button. |
 | `COMFY_MODAL_CLOUDFLARE_OAUTH_REDIRECT_URI` | loopback page origin | Exact registered OAuth callback; required for non-loopback ComfyUI URLs. |
-| `COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES` | `account-settings.read workers-r2.write openid` | Space- or comma-separated scope IDs configured on the Cloudflare OAuth client. |
+| `COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES` | `account-settings.read workers-r2.write` | Space- or comma-separated scope IDs configured on the Cloudflare OAuth client. |
 
 ### Modal Deployment
 
