@@ -205,3 +205,42 @@ def test_runtime_manager_logs_changed_ssh_readiness_diagnostics(
         "Vast worker readiness probe attempt=1 failed: "
         "kex_exchange_identification: Connection closed by remote host"
     ]
+
+
+def test_runtime_manager_validates_instance_before_ssh_probe(
+    vast_runtime_module: Any,
+) -> None:
+    """A vanished Vast contract must stop readiness before stale SSH is attempted."""
+
+    class RecordingRunner:
+        """Fail the test if worker readiness reaches the SSH transport."""
+
+        def __init__(self) -> None:
+            """Initialize the SSH invocation counter."""
+            self.calls = 0
+
+        def run(self, argv: Any, **kwargs: Any) -> FakeResult:
+            """Record the forbidden SSH call."""
+            del argv, kwargs
+            self.calls += 1
+            return FakeResult({})
+
+    runner = RecordingRunner()
+
+    def reject_missing_instance() -> None:
+        """Simulate Vast removing the contract from the live inventory."""
+        raise RuntimeError("Vast instance no longer exists")
+
+    manager = vast_runtime_module.VastRuntimeManager(
+        runner=runner,
+        configuration=vast_runtime_module.VastRuntimeConfiguration(
+            image="worker",
+            runtime_fingerprint="a" * 64,
+        ),
+        instance_validator=reject_missing_instance,
+    )
+
+    with pytest.raises(RuntimeError, match="no longer exists"):
+        manager.ensure_worker()
+
+    assert runner.calls == 0

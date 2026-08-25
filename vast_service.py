@@ -8,6 +8,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -25,7 +26,7 @@ if __package__:
     from .r2_cache import R2CacheClient
     from .settings import ModalSyncSettings, discover_comfyui_user_directory
     from .sync_engine import ModalAssetSyncEngine
-    from .vast_api import VastApiClient, VastApiError
+    from .vast_api import VastApiClient, VastApiError, VastInstanceNotFoundError
     from .vast_executor import VastExecutorClient
     from .vast_leases import (
         VastLeaseManager,
@@ -55,7 +56,7 @@ else:  # pragma: no cover - direct debugging imports.
     from r2_cache import R2CacheClient
     from settings import ModalSyncSettings, discover_comfyui_user_directory
     from sync_engine import ModalAssetSyncEngine
-    from vast_api import VastApiClient, VastApiError
+    from vast_api import VastApiClient, VastApiError, VastInstanceNotFoundError
     from vast_executor import VastExecutorClient
     from vast_leases import (
         VastLeaseManager,
@@ -77,6 +78,7 @@ VAST_API_KEY_ENV = "VAST_API_KEY"
 VAST_API_BASE_URL_ENV = "COMFY_MODAL_VAST_API_BASE_URL"
 VAST_SSH_IDENTITY_FILE_ENV = "COMFY_MODAL_VAST_SSH_IDENTITY_FILE"
 VAST_OFFER_PREFETCH_CONCURRENCY = 8
+VAST_DISAPPEARED_INSTANCE_REPLACEMENTS = 1
 
 
 def _vast_startup_status_message(instance: VastInstance) -> str:
@@ -409,25 +411,65 @@ class VastService:
             if status_callback is not None:
                 status_callback(_vast_startup_status_message(instance))
 
-        lease = await self.lease_manager.ensure_lease(
+        return await self._acquire_with_replacement(
             quote.profile,
             slot=slot,
-            status_callback=(
+            status_callback=status_callback,
+            instance_status_callback=(
                 emit_instance_status if status_callback is not None else None
             ),
         )
-        if status_callback is not None:
-            status_callback("Initializing Vast.ai worker")
-        try:
-            await asyncio.to_thread(self._initialize_runtime, lease)
-        except (TimeoutError, VastSshError, ValueError) as exc:
+
+    async def _acquire_with_replacement(
+        self,
+        profile: VastResourceProfile,
+        *,
+        slot: int,
+        status_callback: Callable[[str], None] | None,
+        instance_status_callback: Callable[[VastInstance], None] | None,
+    ) -> VastLeaseRecord:
+        """Initialize capacity and replace one provider-disappeared contract."""
+        excluded_offer_ids: set[int] = set()
+        for replacement_attempt in range(
+            VAST_DISAPPEARED_INSTANCE_REPLACEMENTS + 1
+        ):
+            lease = await self.lease_manager.ensure_lease(
+                profile,
+                slot=slot,
+                status_callback=instance_status_callback,
+                excluded_offer_ids=frozenset(excluded_offer_ids),
+            )
             if status_callback is not None:
-                status_callback("Vast.ai worker initialization failed")
-            await self._discard_failed_runtime_lease(lease, str(exc))
-            raise
-        if status_callback is not None:
-            status_callback("Vast.ai worker is ready")
-        return lease
+                status_callback("Initializing Vast.ai worker")
+            try:
+                await asyncio.to_thread(self._initialize_runtime, lease)
+            except VastInstanceNotFoundError:
+                self.registry.remove(lease.instance_id)
+                excluded_offer_ids.add(lease.offer_id)
+                if replacement_attempt >= VAST_DISAPPEARED_INSTANCE_REPLACEMENTS:
+                    if status_callback is not None:
+                        status_callback("Vast.ai worker initialization failed")
+                    raise
+                logger.warning(
+                    "Vast instance disappeared before worker initialization "
+                    "instance_id=%d offer=%d; cold-starting a replacement.",
+                    lease.instance_id,
+                    lease.offer_id,
+                )
+                if status_callback is not None:
+                    status_callback(
+                        "Vast.ai instance disappeared; requesting a replacement"
+                    )
+                continue
+            except (TimeoutError, VastSshError, ValueError) as exc:
+                if status_callback is not None:
+                    status_callback("Vast.ai worker initialization failed")
+                await self._discard_failed_runtime_lease(lease, str(exc))
+                raise
+            if status_callback is not None:
+                status_callback("Vast.ai worker is ready")
+            return lease
+        raise RuntimeError("Vast replacement attempts ended without a lease.")
 
     async def _discard_failed_runtime_lease(
         self,
@@ -594,11 +636,17 @@ class VastService:
         runtime = VastRuntimeManager(
             runner=self._runner(lease),
             configuration=self.runtime_configuration,
+            instance_validator=partial(self._validate_live_instance, lease),
         )
         try:
             runtime.ensure_worker()
             runtime.update_watchdog(lease)
-        except (TimeoutError, VastSshError, ValueError) as exc:
+        except (
+            TimeoutError,
+            VastInstanceNotFoundError,
+            VastSshError,
+            ValueError,
+        ) as exc:
             logger.error(
                 "Vast worker initialization failed instance_id=%d environment=%s: %s",
                 lease.instance_id,
@@ -611,6 +659,10 @@ class VastService:
             lease.instance_id,
             lease.environment_id,
         )
+
+    def _validate_live_instance(self, lease: VastLeaseRecord) -> None:
+        """Require the managed Vast contract to exist before an SSH probe."""
+        asyncio.run(self.api_client.show_instance(lease.instance_id))
 
     def _existing_lease(self, profile: VastResourceProfile) -> VastLeaseRecord | None:
         """Return the oldest ready lease with an exact profile/runtime identity."""

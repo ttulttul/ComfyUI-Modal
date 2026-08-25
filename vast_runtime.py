@@ -140,6 +140,7 @@ class VastRuntimeManager:
 
     runner: VastSshRunner
     configuration: VastRuntimeConfiguration
+    instance_validator: Callable[[], None] | None = None
     clock: Callable[[], float] = time.time
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
@@ -153,6 +154,8 @@ class VastRuntimeManager:
         attempt = 0
         while self.monotonic() < deadline:
             attempt += 1
+            if self.instance_validator is not None:
+                self.instance_validator()
             try:
                 info = self.runtime_info()
             except (VastSshError, ValueError) as exc:

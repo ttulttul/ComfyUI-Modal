@@ -286,3 +286,79 @@ def test_acquire_destroys_lease_when_worker_initialization_fails(
     assert registry.updated_instance_ids == [42]
     assert lease_manager.destroyed_instance_ids == [42]
     assert messages[-1] == "Vast.ai worker initialization failed"
+
+
+def test_acquire_replaces_instance_that_disappears_before_ssh(
+    vast_service_module: Any,
+) -> None:
+    """A missing live contract should cold-start the next marketplace offer."""
+
+    class FakeRegistry:
+        """Record stale contract removal before replacement."""
+
+        def __init__(self) -> None:
+            """Initialize the removed instance log."""
+            self.removed_instance_ids: list[int] = []
+
+        def remove(self, instance_id: int) -> None:
+            """Record removal of a provider-missing lease."""
+            self.removed_instance_ids.append(instance_id)
+
+    class FakeLeaseManager:
+        """Return a vanished lease followed by a fresh replacement."""
+
+        def __init__(self, leases: list[Any]) -> None:
+            """Retain sequenced leases and offer exclusions."""
+            self.leases = leases
+            self.excluded_offer_ids: list[frozenset[int]] = []
+
+        async def ensure_lease(
+            self,
+            profile: Any,
+            *,
+            excluded_offer_ids: frozenset[int],
+            **kwargs: Any,
+        ) -> Any:
+            """Return the next lease while recording rejected offers."""
+            del profile, kwargs
+            self.excluded_offer_ids.append(excluded_offer_ids)
+            return self.leases.pop(0)
+
+    vanished = SimpleNamespace(
+        instance_id=42,
+        offer_id=1001,
+        environment_id="vast:test:42",
+    )
+    replacement = SimpleNamespace(
+        instance_id=43,
+        offer_id=1002,
+        environment_id="vast:test:43",
+    )
+    lease_manager = FakeLeaseManager([vanished, replacement])
+    registry = FakeRegistry()
+    service = object.__new__(vast_service_module.VastService)
+    service.lease_manager = lease_manager
+    service.registry = registry
+
+    def initialize_runtime(lease: Any) -> None:
+        """Report only the first provider contract as missing."""
+        if lease.instance_id == vanished.instance_id:
+            raise vast_service_module.VastInstanceNotFoundError(
+                "Vast instance 42 does not exist."
+            )
+
+    service._initialize_runtime = initialize_runtime
+    messages: list[str] = []
+
+    acquired = asyncio.run(
+        service.acquire(
+            SimpleNamespace(profile=SimpleNamespace()),
+            status_callback=messages.append,
+        )
+    )
+
+    assert acquired is replacement
+    assert registry.removed_instance_ids == [42]
+    assert lease_manager.excluded_offer_ids == [frozenset(), frozenset({1001})]
+    assert "Vast.ai instance disappeared; requesting a replacement" in messages
+    assert messages[-1] == "Vast.ai worker is ready"

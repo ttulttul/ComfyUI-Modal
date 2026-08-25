@@ -360,6 +360,7 @@ class VastLeaseManager:
         *,
         slot: int = 0,
         status_callback: VastInstanceStatusCallback | None = None,
+        excluded_offer_ids: frozenset[int] = frozenset(),
     ) -> VastLeaseRecord:
         """Reuse or rent one compatible SSH-ready lease for a profile slot."""
         if slot < 0 or slot >= profile.maximum_instances:
@@ -380,6 +381,7 @@ class VastLeaseManager:
                 profile,
                 slot_profile_id,
                 status_callback=status_callback,
+                excluded_offer_ids=excluded_offer_ids,
             )
 
     async def _reusable_lease(
@@ -454,6 +456,7 @@ class VastLeaseManager:
         slot_profile_id: str,
         *,
         status_callback: VastInstanceStatusCallback | None,
+        excluded_offer_ids: frozenset[int],
     ) -> VastLeaseRecord:
         """Search, rent, and persist the first still-available compatible offer."""
         offers = await self.api_client.search_offers(profile)
@@ -461,7 +464,7 @@ class VastLeaseManager:
             raise VastApiError(
                 f"No Vast.ai offer satisfies profile {profile.profile_name!r}."
             )
-        unavailable_offer_ids: list[int] = []
+        unavailable_offer_ids = set(excluded_offer_ids)
         for search_attempt in range(2):
             for offer in offers:
                 if offer.offer_id in unavailable_offer_ids:
@@ -473,8 +476,16 @@ class VastLeaseManager:
                         offer,
                         status_callback=status_callback,
                     )
+                except VastInstanceNotFoundError:
+                    unavailable_offer_ids.add(offer.offer_id)
+                    logger.warning(
+                        "Vast instance disappeared during provider startup "
+                        "profile=%s offer=%d; trying next candidate.",
+                        profile.profile_name,
+                        offer.offer_id,
+                    )
                 except VastOfferUnavailableError:
-                    unavailable_offer_ids.append(offer.offer_id)
+                    unavailable_offer_ids.add(offer.offer_id)
                     logger.info(
                         "Vast offer disappeared before rental profile=%s offer=%d; trying next candidate.",
                         profile.profile_name,
@@ -538,6 +549,9 @@ class VastLeaseManager:
                 timeout_seconds=self.startup_timeout_seconds,
                 status_callback=status_callback,
             )
+        except VastInstanceNotFoundError:
+            self.registry.remove(created.instance_id)
+            raise
         except (TimeoutError, VastApiError) as exc:
             failed = replace(provisional, last_error=str(exc))
             self.registry.upsert(failed)

@@ -133,6 +133,124 @@ def test_manager_recovers_offer_race_then_reuses_persisted_lease(
     asyncio.run(scenario())
 
 
+def test_manager_excludes_offer_from_disappeared_instance_replacement(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """A cold replacement must not immediately rent the vanished offer again."""
+
+    async def scenario() -> None:
+        """Exclude the cheapest offer and rent the next compatible candidate."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            manager = vast_leases_module.VastLeaseManager(
+                api_client=vast_api_module.VastApiClient(
+                    state.api_key,
+                    base_url=base_url,
+                ),
+                registry=vast_leases_module.VastLeaseRegistry.for_user_directory(
+                    tmp_path
+                ),
+                owner_id="comfy-owner",
+                runtime_fingerprint=_runtime_fingerprint(),
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+
+            lease = await manager.ensure_lease(
+                _profile(vast_models_module),
+                excluded_offer_ids=frozenset({1001}),
+            )
+
+            assert lease.offer_id == 1002
+            create_requests = [
+                request
+                for request in state.request_log
+                if request["path"].startswith("/api/v0/asks/")
+            ]
+            assert [request["path"] for request in create_requests] == [
+                "/api/v0/asks/1002/"
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_manager_replaces_contract_that_disappears_during_provider_startup(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """A contract lost before SSH readiness should rent the next offer."""
+
+    class DisappearingClient(vast_api_module.VastApiClient):
+        """Remove the first created contract during provider readiness."""
+
+        def __init__(self, *args: Any, state: Any, **kwargs: Any) -> None:
+            """Retain simulator state and initialize the disappearance count."""
+            super().__init__(*args, **kwargs)
+            self.state = state
+            self.readiness_calls = 0
+
+        async def wait_until_ready(
+            self,
+            instance_id: int,
+            **kwargs: Any,
+        ) -> Any:
+            """Lose the first contract and delegate later readiness checks."""
+            self.readiness_calls += 1
+            if self.readiness_calls == 1:
+                self.state.instances.pop(instance_id)
+                raise vast_api_module.VastInstanceNotFoundError(
+                    f"Vast instance {instance_id} does not exist."
+                )
+            return await super().wait_until_ready(instance_id, **kwargs)
+
+    async def scenario() -> None:
+        """Verify cold replacement and stale registry cleanup."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            registry = vast_leases_module.VastLeaseRegistry.for_user_directory(tmp_path)
+            manager = vast_leases_module.VastLeaseManager(
+                api_client=DisappearingClient(
+                    state.api_key,
+                    base_url=base_url,
+                    state=state,
+                ),
+                registry=registry,
+                owner_id="comfy-owner",
+                runtime_fingerprint=_runtime_fingerprint(),
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+
+            lease = await manager.ensure_lease(_profile(vast_models_module))
+
+            assert lease.offer_id == 1002
+            assert [record.instance_id for record in registry.load().leases] == [
+                lease.instance_id
+            ]
+            create_requests = [
+                request
+                for request in state.request_log
+                if request["path"].startswith("/api/v0/asks/")
+            ]
+            assert [request["path"] for request in create_requests] == [
+                "/api/v0/asks/1001/",
+                "/api/v0/asks/1002/",
+            ]
+
+    asyncio.run(scenario())
+
+
 def test_manager_adopts_legacy_lease_for_unchanged_worker_image(
     tmp_path: Any,
     vast_api_module: Any,
