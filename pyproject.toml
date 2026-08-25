@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.11",
+    "boto3>=1.40,<2",
     "huggingface-hub==1.28.0",
     "keyring>=25.6,<26",
+    "requests>=2.32,<3",
 ]
 classifiers = [
     "Operating System :: OS Independent",

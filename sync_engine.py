@@ -18,6 +18,13 @@ from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 from .huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
 from .huggingface_discovery import HuggingFaceAssetDiscovery
+from .r2_cache import (
+    R2CacheClient,
+    R2CacheError,
+    R2DownloadRequest,
+    R2UploadPlan,
+    R2UploadResult,
+)
 from .settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -155,6 +162,21 @@ def _format_huggingface_discovery_status(
     return f"Identifying Hugging Face source for Vast.ai: {asset_name}"
 
 
+def _format_r2_download_status(
+    asset_name: str,
+    *,
+    item_index: int | None,
+    total_items: int | None,
+) -> str:
+    """Return one queue-time status for worker-side Cloudflare R2 acquisition."""
+    if item_index is not None and total_items is not None and total_items > 1:
+        return (
+            f"Downloading asset {item_index}/{total_items} from Cloudflare R2: "
+            f"{asset_name}"
+        )
+    return f"Downloading asset from Cloudflare R2: {asset_name}"
+
+
 class VolumeBackend(Protocol):
     """Minimal storage interface needed by the sync engine."""
 
@@ -209,6 +231,27 @@ class CancellableHuggingFaceMaterializingBackend(Protocol):
         cancellation_check: CancellationCheck,
     ) -> bool:
         """Materialize one immutable file while observing cancellation."""
+
+
+@runtime_checkable
+class R2MaterializingBackend(Protocol):
+    """Optional backend capability for signed R2 downloads and write-back."""
+
+    def materialize_r2_file(
+        self,
+        request: R2DownloadRequest,
+        remote_path: str,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> None:
+        """Download and verify one content-addressed R2 object."""
+
+    def upload_r2_file(
+        self,
+        plan: R2UploadPlan,
+        remote_path: str,
+    ) -> R2UploadResult:
+        """Upload one remote file through a controller-issued signed plan."""
 
 
 class SyncCancelledError(RuntimeError):
@@ -325,6 +368,30 @@ class _ContentAddressedSyncResult:
     uploaded: bool
 
 
+@dataclass(frozen=True)
+class _ContentAddressedSyncSpec:
+    """Collect one file's immutable identity, destination, and progress context."""
+
+    local_path: Path
+    remote_path: str
+    sha256: str
+    sync_key: str
+    source_description: str
+    status_callback: SyncStatusCallback | None
+    upload_status_message: str | None
+    status_current: int | None
+    status_total: int | None
+    huggingface_source: HuggingFaceAssetSource | None
+
+
+@dataclass(frozen=True)
+class _R2MaterializationOutcome:
+    """Return an optional hit and whether failed cached bytes need replacement."""
+
+    result: _ContentAddressedSyncResult | None
+    refresh_required: bool = False
+
+
 def _modal_volume_worker_count() -> int:
     """Return the worker count used for local Modal volume SDK calls."""
     return 4
@@ -336,6 +403,10 @@ def _custom_nodes_sync_worker_count() -> int:
 
 
 _MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=_modal_volume_worker_count())
+_R2_WRITE_BACK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="comfy-r2-writeback",
+)
 
 
 class _ModalSdkCaller:
@@ -595,6 +666,7 @@ class ModalAssetSyncEngine:
     sync_index: SyncIndexBackend | None = None
     huggingface_asset_registry: HuggingFaceAssetRegistry | None = None
     huggingface_asset_discovery: HuggingFaceAssetDiscovery | None = None
+    r2_cache: R2CacheClient | None = None
     cancellation_check: CancellationCheck | None = None
     _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
@@ -604,6 +676,8 @@ class ModalAssetSyncEngine:
     _custom_nodes_sync_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
     _custom_nodes_sync_checked: bool = field(init=False, default=False)
     _custom_nodes_bundle_cache: SyncedAsset | None = field(init=False, default=None)
+    _r2_writeback_futures: list[Future[None]] = field(init=False, default_factory=list)
+    _r2_writeback_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         """Load persistent metadata caches used to avoid repeated hashing work."""
@@ -675,6 +749,7 @@ class ModalAssetSyncEngine:
         sync_result = self._sync_content_addressed_file(
             local_path=source_path,
             remote_path=proposed_remote_path,
+            sha256=sha256,
             sync_key=sync_key,
             source_description=str(source_path),
             status_callback=status_callback,
@@ -902,6 +977,7 @@ class ModalAssetSyncEngine:
         manifest_sync_result = self._sync_content_addressed_file(
             local_path=manifest_path,
             remote_path=remote_path,
+            sha256=self._hash_file(manifest_path),
             sync_key=manifest_sync_key,
             source_description=str(custom_nodes_dir),
             upload_status_message=(
@@ -927,6 +1003,7 @@ class ModalAssetSyncEngine:
         *,
         local_path: Path,
         remote_path: str,
+        sha256: str,
         sync_key: str,
         source_description: str,
         status_callback: SyncStatusCallback | None = None,
@@ -935,85 +1012,211 @@ class ModalAssetSyncEngine:
         status_total: int | None = None,
         huggingface_source: HuggingFaceAssetSource | None = None,
     ) -> _ContentAddressedSyncResult:
-        """Upload one deterministic file only when its digest is absent from the sync index."""
+        """Materialize one deterministic file from the fastest available source."""
         self._raise_if_cancelled()
-        existing_record = self._lookup_sync_record(sync_key)
+        spec = _ContentAddressedSyncSpec(
+            local_path=local_path,
+            remote_path=remote_path,
+            sha256=sha256,
+            sync_key=sync_key,
+            source_description=source_description,
+            status_callback=status_callback,
+            upload_status_message=upload_status_message,
+            status_current=status_current,
+            status_total=status_total,
+            huggingface_source=huggingface_source,
+        )
+        existing_record = self._lookup_sync_record(spec.sync_key)
         if existing_record is not None:
             indexed_remote_path = str(existing_record["remote_path"])
             logger.info(
                 "Reusing mirrored asset at %s because sync index key %s already exists.",
                 indexed_remote_path,
-                sync_key,
+                spec.sync_key,
             )
             return _ContentAddressedSyncResult(
                 remote_path=indexed_remote_path,
                 uploaded=False,
             )
 
-        logger.info("Syncing %s to %s", source_description, remote_path)
-        if (
-            huggingface_source is not None
-            and isinstance(self.volume, HuggingFaceMaterializingBackend)
-        ):
-            _emit_sync_status(
-                status_callback,
-                _format_huggingface_download_status(
-                    local_path.name,
-                    item_index=status_current,
-                    total_items=status_total,
-                ),
-                status_current,
-                status_total,
-            )
-            token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-            if (
-                self.cancellation_check is not None
-                and isinstance(
-                    self.volume,
-                    CancellableHuggingFaceMaterializingBackend,
-                )
-            ):
-                try:
-                    materialized = self.volume.materialize_huggingface_file_cancellable(
-                        huggingface_source,
-                        remote_path,
-                        token=token,
-                        cancellation_check=self.cancellation_check,
-                    )
-                except InterruptedError as exc:
-                    raise SyncCancelledError(
-                        "Remote workflow preparation was cancelled."
-                    ) from exc
-            else:
-                materialized = self.volume.materialize_huggingface_file(
-                    huggingface_source,
-                    remote_path,
-                    token=token,
-                )
-            if materialized:
-                self._store_sync_record(
-                    sync_key=sync_key,
-                    remote_path=remote_path,
-                    source_description=huggingface_source.display_reference,
-                )
-                logger.info(
-                    "Materialized %s directly from Hugging Face at %s.",
-                    huggingface_source.display_reference,
-                    remote_path,
-                )
-                return _ContentAddressedSyncResult(
-                    remote_path=remote_path,
-                    uploaded=True,
-                )
+        size_bytes = spec.local_path.stat().st_size
+        adopted = self._adopt_existing_remote(spec, size_bytes)
+        if adopted is not None:
+            return adopted
+        logger.info("Syncing %s to %s", spec.source_description, spec.remote_path)
+        huggingface_result = self._materialize_huggingface_source(spec, size_bytes)
+        if huggingface_result is not None:
+            return huggingface_result
+        r2_outcome = self._materialize_r2_source(spec, size_bytes)
+        if r2_outcome.result is not None:
+            return r2_outcome.result
+        return self._upload_content_addressed_file(
+            spec,
+            size_bytes,
+            force_r2_writeback=r2_outcome.refresh_required,
+        )
+
+    def _adopt_existing_remote(
+        self,
+        spec: _ContentAddressedSyncSpec,
+        size_bytes: int,
+    ) -> _ContentAddressedSyncResult | None:
+        """Repair a lost local index from an existing persistent remote path."""
+        if not self.volume.exists(spec.remote_path):
+            return None
+        self._store_sync_record(
+            sync_key=spec.sync_key,
+            remote_path=spec.remote_path,
+            source_description=spec.source_description,
+        )
+        self._schedule_r2_writeback(
+            sha256=spec.sha256,
+            size_bytes=size_bytes,
+            remote_path=spec.remote_path,
+        )
+        logger.info("Adopted existing content-addressed remote file at %s.", spec.remote_path)
+        return _ContentAddressedSyncResult(remote_path=spec.remote_path, uploaded=False)
+
+    def _materialize_huggingface_source(
+        self,
+        spec: _ContentAddressedSyncSpec,
+        size_bytes: int,
+    ) -> _ContentAddressedSyncResult | None:
+        """Try an authoritative Hugging Face source before shared cache lookup."""
+        source = spec.huggingface_source
+        if source is None or not isinstance(self.volume, HuggingFaceMaterializingBackend):
+            return None
         _emit_sync_status(
-            status_callback,
-            upload_status_message
+            spec.status_callback,
+            _format_huggingface_download_status(
+                spec.local_path.name,
+                item_index=spec.status_current,
+                total_items=spec.status_total,
+            ),
+            spec.status_current,
+            spec.status_total,
+        )
+        if not self._invoke_huggingface_materializer(source, spec.remote_path):
+            return None
+        self._store_sync_record(
+            sync_key=spec.sync_key,
+            remote_path=spec.remote_path,
+            source_description=source.display_reference,
+        )
+        self._schedule_r2_writeback(
+            sha256=spec.sha256,
+            size_bytes=size_bytes,
+            remote_path=spec.remote_path,
+        )
+        logger.info(
+            "Materialized %s directly from Hugging Face at %s.",
+            source.display_reference,
+            spec.remote_path,
+        )
+        return _ContentAddressedSyncResult(remote_path=spec.remote_path, uploaded=True)
+
+    def _invoke_huggingface_materializer(
+        self,
+        source: HuggingFaceAssetSource,
+        remote_path: str,
+    ) -> bool:
+        """Invoke the available Hub materializer and normalize cancellation."""
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        if self.cancellation_check is None or not isinstance(
+            self.volume,
+            CancellableHuggingFaceMaterializingBackend,
+        ):
+            assert isinstance(self.volume, HuggingFaceMaterializingBackend)
+            return self.volume.materialize_huggingface_file(
+                source,
+                remote_path,
+                token=token,
+            )
+        try:
+            return self.volume.materialize_huggingface_file_cancellable(
+                source,
+                remote_path,
+                token=token,
+                cancellation_check=self.cancellation_check,
+            )
+        except InterruptedError as exc:
+            raise SyncCancelledError("Remote workflow preparation was cancelled.") from exc
+
+    def _materialize_r2_source(
+        self,
+        spec: _ContentAddressedSyncSpec,
+        size_bytes: int,
+    ) -> _R2MaterializationOutcome:
+        """Try one signed worker-side R2 download and preserve upload fallback."""
+        if self.r2_cache is None or not isinstance(self.volume, R2MaterializingBackend):
+            return _R2MaterializationOutcome(result=None)
+        request: R2DownloadRequest | None = None
+        try:
+            request = self.r2_cache.download_request(spec.sha256, size_bytes)
+            if request is None:
+                return _R2MaterializationOutcome(result=None)
+            _emit_sync_status(
+                spec.status_callback,
+                _format_r2_download_status(
+                    spec.local_path.name,
+                    item_index=spec.status_current,
+                    total_items=spec.status_total,
+                ),
+                spec.status_current,
+                spec.status_total,
+            )
+            self.volume.materialize_r2_file(
+                request,
+                spec.remote_path,
+                cancellation_check=self.cancellation_check,
+            )
+        except InterruptedError as exc:
+            raise SyncCancelledError("Remote workflow preparation was cancelled.") from exc
+        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Cloudflare R2 materialization failed for SHA-256 %s; "
+                "falling back to the existing upload path: %s",
+                spec.sha256,
+                exc,
+            )
+            return _R2MaterializationOutcome(
+                result=None,
+                refresh_required=request is not None,
+            )
+        self._store_sync_record(
+            sync_key=spec.sync_key,
+            remote_path=spec.remote_path,
+            source_description=f"Cloudflare R2 SHA-256 {spec.sha256}",
+        )
+        logger.info(
+            "Materialized SHA-256 %s from Cloudflare R2 at %s.",
+            spec.sha256,
+            spec.remote_path,
+        )
+        return _R2MaterializationOutcome(
+            result=_ContentAddressedSyncResult(
+                remote_path=spec.remote_path,
+                uploaded=True,
+            )
+        )
+
+    def _upload_content_addressed_file(
+        self,
+        spec: _ContentAddressedSyncSpec,
+        size_bytes: int,
+        *,
+        force_r2_writeback: bool = False,
+    ) -> _ContentAddressedSyncResult:
+        """Use the established controller-to-worker upload and schedule write-back."""
+        _emit_sync_status(
+            spec.status_callback,
+            spec.upload_status_message
             or (
-                f"Uploading {Path(source_description).name} to "
+                f"Uploading {Path(spec.source_description).name} to "
                 f"{self._destination_label()}"
             ),
-            status_current,
-            status_total,
+            spec.status_current,
+            spec.status_total,
         )
         if self.cancellation_check is not None and isinstance(
             self.volume,
@@ -1021,8 +1224,8 @@ class ModalAssetSyncEngine:
         ):
             try:
                 self.volume.put_file_cancellable(
-                    local_path,
-                    remote_path,
+                    spec.local_path,
+                    spec.remote_path,
                     cancellation_check=self.cancellation_check,
                 )
             except InterruptedError as exc:
@@ -1030,13 +1233,81 @@ class ModalAssetSyncEngine:
                     "Remote workflow preparation was cancelled."
                 ) from exc
         else:
-            self.volume.put_file(local_path, remote_path)
+            self.volume.put_file(spec.local_path, spec.remote_path)
         self._store_sync_record(
-            sync_key=sync_key,
-            remote_path=remote_path,
-            source_description=source_description,
+            sync_key=spec.sync_key,
+            remote_path=spec.remote_path,
+            source_description=spec.source_description,
         )
-        return _ContentAddressedSyncResult(remote_path=remote_path, uploaded=True)
+        self._schedule_r2_writeback(
+            sha256=spec.sha256,
+            size_bytes=size_bytes,
+            remote_path=spec.remote_path,
+            force=force_r2_writeback,
+        )
+        return _ContentAddressedSyncResult(remote_path=spec.remote_path, uploaded=True)
+
+    def _schedule_r2_writeback(
+        self,
+        *,
+        sha256: str,
+        size_bytes: int,
+        remote_path: str,
+        force: bool = False,
+    ) -> None:
+        """Write one remote file into R2 synchronously or on a bounded executor."""
+        if (
+            self.r2_cache is None
+            or self.r2_cache.write_back_mode == "off"
+            or not isinstance(self.volume, R2MaterializingBackend)
+        ):
+            return
+        if self.r2_cache.write_back_mode == "sync":
+            self._write_back_r2_file(sha256, size_bytes, remote_path, force)
+            return
+        future = _R2_WRITE_BACK_EXECUTOR.submit(
+            self._write_back_r2_file,
+            sha256,
+            size_bytes,
+            remote_path,
+            force,
+        )
+        with self._r2_writeback_lock:
+            self._r2_writeback_futures.append(future)
+
+    def _write_back_r2_file(
+        self,
+        sha256: str,
+        size_bytes: int,
+        remote_path: str,
+        force: bool = False,
+    ) -> None:
+        """Upload one worker-resident file to R2 without exposing permanent keys."""
+        if self.r2_cache is None or not isinstance(
+            self.volume,
+            R2MaterializingBackend,
+        ):
+            return
+        plan: R2UploadPlan | None = None
+        try:
+            plan = self.r2_cache.prepare_upload(sha256, size_bytes, force=force)
+            if plan is None:
+                return
+            result = self.volume.upload_r2_file(plan, remote_path)
+            self.r2_cache.complete_upload(plan, result)
+            logger.info("Wrote SHA-256 %s back to Cloudflare R2.", sha256)
+        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            if plan is not None:
+                self.r2_cache.abort_upload(plan)
+            logger.warning("Cloudflare R2 write-back failed for SHA-256 %s: %s", sha256, exc)
+
+    def wait_for_r2_writebacks(self) -> None:
+        """Wait for this engine's currently scheduled R2 writes to finish."""
+        with self._r2_writeback_lock:
+            futures = tuple(self._r2_writeback_futures)
+            self._r2_writeback_futures.clear()
+        for future in futures:
+            future.result()
 
     def _huggingface_source_for_asset(
         self,
@@ -1158,6 +1429,7 @@ class ModalAssetSyncEngine:
         entry_uploaded = self._sync_content_addressed_file(
             local_path=archive_path,
             remote_path=archive_remote_path,
+            sha256=archive_spec.sha256,
             sync_key=self._custom_nodes_entry_sync_index_key(
                 archive_spec.entry_name,
                 archive_spec.sha256,
@@ -1198,6 +1470,7 @@ class ModalAssetSyncEngine:
         sync_result = self._sync_content_addressed_file(
             local_path=asset_spec.local_path,
             remote_path=remote_path,
+            sha256=asset_spec.sha256,
             sync_key=self._custom_nodes_asset_sync_index_key(asset_spec.sha256),
             source_description=str(asset_spec.local_path),
         )

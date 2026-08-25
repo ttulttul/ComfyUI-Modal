@@ -9,17 +9,20 @@ import os
 import random
 import shlex
 import subprocess
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Callable, Sequence
+from typing import Any, BinaryIO, Callable, Mapping, Sequence
 
 if __package__:
     from .huggingface_assets import HuggingFaceAssetSource
+    from .r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
 else:  # pragma: no cover - direct debugging imports.
     from huggingface_assets import HuggingFaceAssetSource
+    from r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
 
 logger = logging.getLogger(__name__)
 
@@ -464,6 +467,12 @@ class VastSshVolumeBackend:
     storage_root: PurePosixPath = DEFAULT_VAST_STORAGE_ROOT
     _exists_cache: dict[str, bool] = field(default_factory=dict)
     _materializer_path: PurePosixPath | None = field(init=False, default=None)
+    _r2_materializer_path: PurePosixPath | None = field(init=False, default=None)
+    _materializer_lock: threading.Lock = field(
+        init=False,
+        default_factory=threading.Lock,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Require an absolute non-root storage location."""
@@ -608,34 +617,126 @@ class VastSshVolumeBackend:
         self._exists_cache[normalized] = True
         return True
 
+    def materialize_r2_file(
+        self,
+        request: R2DownloadRequest,
+        remote_path: str,
+        *,
+        cancellation_check: Callable[[], bool] | None = None,
+    ) -> None:
+        """Download and verify one signed R2 object directly on the Vast host."""
+        normalized = _validated_storage_path(remote_path)
+        active_cancellation_check = cancellation_check or (lambda: False)
+        try:
+            self._run_r2_materializer(
+                {
+                    "operation": "download",
+                    "storage_root": str(self.storage_root),
+                    "remote_path": normalized,
+                    "download": request.to_dict(),
+                },
+                size_bytes=request.size_bytes,
+                cancellation_check=active_cancellation_check,
+            )
+        except VastSshCancelledError as exc:
+            raise InterruptedError("Vast R2 download was cancelled.") from exc
+        self._exists_cache[normalized] = True
+
+    def upload_r2_file(
+        self,
+        plan: R2UploadPlan,
+        remote_path: str,
+    ) -> R2UploadResult:
+        """Upload one Vast-host file through a controller-issued R2 plan."""
+        normalized = _validated_storage_path(remote_path)
+        result = self._run_r2_materializer(
+            {
+                "operation": "upload",
+                "storage_root": str(self.storage_root),
+                "remote_path": normalized,
+                "upload": plan.to_dict(),
+            },
+            size_bytes=plan.size_bytes,
+            cancellation_check=lambda: False,
+        )
+        return R2UploadResult.from_dict(result)
+
+    def _run_r2_materializer(
+        self,
+        request: Mapping[str, Any],
+        *,
+        size_bytes: int,
+        cancellation_check: Callable[[], bool],
+    ) -> Mapping[str, object]:
+        """Run the current R2 materializer with its signed URLs only on stdin."""
+        materializer_path = self._ensure_r2_materializer_bundle(
+            cancellation_check=cancellation_check,
+        )
+        result = self.runner.run(
+            ("python", str(materializer_path)),
+            input_payload=json.dumps(request, sort_keys=True).encode("utf-8"),
+            timeout_seconds=max(900.0, size_bytes / (2 * 1024 * 1024)),
+            cancellation_check=cancellation_check,
+        )
+        try:
+            payload = json.loads(result.stdout_text)
+        except json.JSONDecodeError as exc:
+            raise VastSshError("Vast R2 materializer returned invalid JSON.") from exc
+        if not isinstance(payload, Mapping):
+            raise VastSshError("Vast R2 materializer returned a non-object result.")
+        return payload
+
     def _ensure_materializer_bundle(
         self,
         *,
         cancellation_check: Callable[[], bool],
     ) -> PurePosixPath:
         """Upload a tiny current-source zipapp independent of the worker image version."""
-        if self._materializer_path is not None:
+        with self._materializer_lock:
+            if self._materializer_path is None:
+                self._materializer_path = self._ensure_runtime_bundle(
+                    "huggingface-materializer",
+                    _huggingface_materializer_bundle(),
+                    cancellation_check=cancellation_check,
+                )
             return self._materializer_path
-        payload = _huggingface_materializer_bundle()
+
+    def _ensure_r2_materializer_bundle(
+        self,
+        *,
+        cancellation_check: Callable[[], bool],
+    ) -> PurePosixPath:
+        """Upload the current R2 transfer implementation once per backend."""
+        with self._materializer_lock:
+            if self._r2_materializer_path is None:
+                self._r2_materializer_path = self._ensure_runtime_bundle(
+                    "r2-materializer",
+                    _r2_materializer_bundle(),
+                    cancellation_check=cancellation_check,
+                )
+            return self._r2_materializer_path
+
+    def _ensure_runtime_bundle(
+        self,
+        bundle_name: str,
+        payload: bytes,
+        *,
+        cancellation_check: Callable[[], bool],
+    ) -> PurePosixPath:
+        """Publish one immutable current-source runtime zipapp under storage."""
         digest = hashlib.sha256(payload).hexdigest()
-        relative_path = f"runtime-tools/huggingface-materializer-{digest}.pyz"
-        normalized = _validated_storage_path(relative_path)
+        normalized = _validated_storage_path(
+            f"runtime-tools/{bundle_name}-{digest}.pyz"
+        )
         target = self.storage_root / normalized
         if not self.exists(normalized):
             self.runner.run(
-                (
-                    "python",
-                    "-c",
-                    _ATOMIC_STDIN_WRITER,
-                    str(len(payload)),
-                    str(target),
-                ),
+                ("python", "-c", _ATOMIC_STDIN_WRITER, str(len(payload)), str(target)),
                 input_payload=payload,
                 timeout_seconds=60.0,
                 cancellation_check=cancellation_check,
             )
             self._exists_cache[normalized] = True
-        self._materializer_path = target
         return target
 
 
@@ -652,6 +753,29 @@ def _huggingface_materializer_bundle() -> bytes:
             repo_root / "remote" / "huggingface_materializer.py"
         ).read_bytes(),
         "huggingface_assets.py": (repo_root / "huggingface_assets.py").read_bytes(),
+    }
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member_name, member_payload in members.items():
+            member = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            member.external_attr = 0o644 << 16
+            archive.writestr(member, member_payload)
+    return output.getvalue()
+
+
+def _r2_materializer_bundle() -> bytes:
+    """Build an executable zip containing the current signed R2 materializer."""
+    repo_root = Path(__file__).resolve().parent
+    members = {
+        "__main__.py": (
+            b"from remote.r2_materializer import main\n"
+            b"raise SystemExit(main())\n"
+        ),
+        "remote/__init__.py": b"",
+        "remote/r2_materializer.py": (
+            repo_root / "remote" / "r2_materializer.py"
+        ).read_bytes(),
     }
     output = BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:

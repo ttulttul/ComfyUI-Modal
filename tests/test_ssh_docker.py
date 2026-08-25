@@ -87,7 +87,13 @@ class _FakeRunner:
                 "COMMAND\n" + "\n".join(self.worker_processes) + "\n"
             ).encode()
         elif command[:2] == ("docker", "run"):
-            stdout = b""
+            if command[-2:] == ("-m", "remote.r2_materializer"):
+                operation = json.loads(input_payload or b"{}")["operation"]
+                stdout = json.dumps(
+                    {"parts": []} if operation == "upload" else {"sha256": "a" * 64}
+                ).encode()
+            else:
+                stdout = b""
         else:
             returncode = 1
         result = self.module.SshCommandResult(stdout, b"failed" if returncode else b"", returncode)
@@ -193,6 +199,41 @@ def test_put_file_requires_a_regular_local_file(
 
     with pytest.raises(FileNotFoundError):
         volume.put_file(tmp_path / "missing.bin", "/assets/missing.bin")
+
+
+def test_r2_materialization_keeps_signed_url_in_docker_stdin(
+    ssh_docker_module: Any,
+    remote_hosts_module: Any,
+    r2_cache_module: Any,
+) -> None:
+    """Signed R2 credentials should not appear in SSH or Docker arguments."""
+    runner = _FakeRunner(ssh_docker_module)
+    controller = ssh_docker_module.SshDockerController(
+        _host(remote_hosts_module),
+        runner=runner,
+    )
+    volume = ssh_docker_module.SshDockerVolumeBackend(
+        controller,
+        "safe-volume",
+        materializer_image="comfy-remote:current",
+    )
+    signed_url = (
+        "https://account.r2.cloudflarestorage.com/object?X-Amz-Signature=secret"
+    )
+    request = r2_cache_module.R2DownloadRequest(
+        url=signed_url,
+        allowed_host="account.r2.cloudflarestorage.com",
+        sha256="a" * 64,
+        size_bytes=1024,
+    )
+
+    volume.materialize_r2_file(request, "/assets/model.safetensors")
+
+    command, input_payload = runner.calls[-1]
+    assert command[-2:] == ("-m", "remote.r2_materializer")
+    assert "secret" not in " ".join(command)
+    assert input_payload is not None and b"secret" in input_payload
+    assert volume.exists("/assets/model.safetensors") is True
 
 
 def test_managed_worker_status_and_removal_are_label_scoped(

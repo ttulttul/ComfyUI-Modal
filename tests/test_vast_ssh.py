@@ -54,6 +54,16 @@ class FakeRunner:
         ):
             request = __import__("json").loads(input_payload or b"{}")
             self.existing.add(f"/storage/{request['remote_path']}")
+            stdout = (
+                b'{"parts":[]}'
+                if request.get("operation") == "upload"
+                else b'{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+            )
+            return self.module.VastSshCommandResult(
+                stdout=stdout,
+                stderr=b"",
+                returncode=0,
+            )
         return self.module.VastSshCommandResult(stdout=b"", stderr=b"", returncode=0)
 
 
@@ -354,6 +364,38 @@ def test_huggingface_materialization_keeps_token_out_of_command_arguments(
     )
     assert "hf_private_token" not in " ".join(materialize_call["argv"])
     assert b"hf_private_token" in materialize_call["input"]
+    assert backend.exists("assets/model.safetensors") is True
+
+
+def test_r2_materialization_keeps_signed_url_out_of_ssh_arguments(
+    vast_ssh_module: Any,
+    r2_cache_module: Any,
+) -> None:
+    """Vast transfers should receive temporary R2 URLs only through standard input."""
+    runner = FakeRunner(vast_ssh_module)
+    backend = vast_ssh_module.VastSshVolumeBackend(runner=runner)
+    signed_url = (
+        "https://account.r2.cloudflarestorage.com/object?X-Amz-Signature=secret"
+    )
+    request = r2_cache_module.R2DownloadRequest(
+        url=signed_url,
+        allowed_host="account.r2.cloudflarestorage.com",
+        sha256="a" * 64,
+        size_bytes=1024,
+    )
+
+    backend.materialize_r2_file(request, "assets/model.safetensors")
+
+    materialize_call = next(
+        call
+        for call in runner.calls
+        if len(call["argv"]) == 2
+        and call["argv"][0] == "python"
+        and call["argv"][-1].endswith(".pyz")
+        and b'"operation": "download"' in (call["input"] or b"")
+    )
+    assert "secret" not in " ".join(materialize_call["argv"])
+    assert b"secret" in materialize_call["input"]
     assert backend.exists("assets/model.safetensors") is True
 
 

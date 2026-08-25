@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from aiohttp import web
 
@@ -70,6 +70,7 @@ from .sync_engine import (
     resolve_model_path,
 )
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
+from .r2_cache import R2CacheClient
 from .remote_configuration_nodes import (
     REMOTE_CONFIGURATION_NODE_IDS,
     REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
@@ -83,6 +84,7 @@ from .remote_configurations import (
     VastRemoteConfiguration,
 )
 from .ssh_docker import SshDockerController, SshDockerVolumeBackend
+from .ssh_runtime import SshRuntimeManager
 from .vast_config_node import extract_vast_profiles
 from .vast_service import VastProfileQuote, VastSearchRequirements, VastService
 from .vast_api import VastApiClient
@@ -1857,11 +1859,23 @@ def _ssh_sync_engine(
         ).resolve(),
         remote_storage_root="/storage",
     )
+    r2_cache = R2CacheClient.from_environment()
+    controller = SshDockerController(host)
+    materializer_image = SshRuntimeManager(
+        controller=controller,
+        repo_root=Path(__file__).resolve().parent,
+        settings=settings,
+    ).runtime_spec().image_tag
     volume = SshDockerVolumeBackend(
-        SshDockerController(host),
+        controller,
         host.resolved_storage_volume_name,
+        materializer_image=materializer_image,
     )
-    return ModalAssetSyncEngine(volume=volume, settings=ssh_settings)
+    return ModalAssetSyncEngine(
+        volume=volume,
+        settings=ssh_settings,
+        r2_cache=r2_cache,
+    )
 
 
 def _stamp_execution_assignment(

@@ -173,6 +173,10 @@ def test_worker_context_includes_top_level_comfyui_python_modules(
     comfy_package.mkdir()
     (comfy_package / "__init__.py").write_text("", encoding="utf-8")
     (comfy_package / "data.json").write_text("{}\n", encoding="utf-8")
+    tokenizer_directory = comfy_package / "text_encoders" / "qwen25_tokenizer"
+    tokenizer_directory.mkdir(parents=True)
+    (tokenizer_directory / "merges.txt").write_text("a b\n", encoding="utf-8")
+    (tokenizer_directory / "vocab.json").write_text("{}\n", encoding="utf-8")
 
     manager = ssh_runtime_module.SshRuntimeManager(
         controller=SimpleNamespace(),
@@ -191,9 +195,11 @@ def test_worker_context_includes_top_level_comfyui_python_modules(
         "comfyui/server.py",
         "comfyui/requirements.txt",
         "comfyui/comfy/__init__.py",
+        "comfyui/comfy/data.json",
+        "comfyui/comfy/text_encoders/qwen25_tokenizer/merges.txt",
+        "comfyui/comfy/text_encoders/qwen25_tokenizer/vocab.json",
     }.issubset(archive_paths)
     assert "comfyui/README.md" not in archive_paths
-    assert "comfyui/comfy/data.json" not in archive_paths
 
 
 def test_worker_dockerfile_disables_inherited_base_image_healthcheck(

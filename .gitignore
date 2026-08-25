@@ -33,6 +33,7 @@
 !/remote_configuration_nodes.py
 !/remote_configurations.py
 !/remote_protocol.py
+!/r2_cache.py
 !/runtime_environment.py
 !/serialization.py
 !/settings.py

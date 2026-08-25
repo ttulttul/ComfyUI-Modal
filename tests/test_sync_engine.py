@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -1790,6 +1791,326 @@ def test_cancellable_backend_interruption_becomes_sync_cancellation(
         engine._sync_content_addressed_file(
             local_path=asset_path,
             remote_path="assets/model.safetensors",
+            sha256=hashlib.sha256(asset_path.read_bytes()).hexdigest(),
             sync_key="test-key",
             source_description=str(asset_path),
         )
+
+
+def _r2_sync_settings(settings_module: Any, tmp_path: Path) -> Any:
+    """Return minimal Vast-mode settings for R2 sync behavior tests."""
+    return settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="vast",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+
+
+def test_r2_cache_hit_materializes_without_local_upload(
+    settings_module: Any,
+    sync_engine_module: Any,
+    r2_cache_module: Any,
+    tmp_path: Path,
+) -> None:
+    """An R2 hit should transfer directly to the worker and update its local index."""
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"r2-backed-model")
+    sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+    materializations: list[tuple[Any, str]] = []
+    uploads: list[tuple[Path, str]] = []
+    statuses: list[str] = []
+
+    class R2Volume:
+        """Record remote R2 and fallback transfer operations."""
+
+        def exists(self, remote_path: str) -> bool:
+            """Report an initially empty remote volume."""
+            del remote_path
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            """Record a fallback local upload."""
+            uploads.append((local_path, remote_path))
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            """Accept protocol-required byte uploads."""
+            del payload, remote_path
+
+        def materialize_r2_file(
+            self,
+            request: Any,
+            remote_path: str,
+            *,
+            cancellation_check: Any = None,
+        ) -> None:
+            """Record one direct R2 materialization."""
+            del cancellation_check
+            materializations.append((request, remote_path))
+
+        def upload_r2_file(self, plan: Any, remote_path: str) -> Any:
+            """Reject write-back, which is disabled in this test."""
+            del plan, remote_path
+            raise AssertionError("write-back should be disabled")
+
+    class R2Cache:
+        """Return one deterministic cache hit."""
+
+        write_back_mode = "off"
+
+        def download_request(self, digest: str, size_bytes: int) -> Any:
+            """Return a signed transfer request for the expected digest."""
+            return r2_cache_module.R2DownloadRequest(
+                url="https://account.r2.cloudflarestorage.com/object?secret=1",
+                allowed_host="account.r2.cloudflarestorage.com",
+                sha256=digest,
+                size_bytes=size_bytes,
+            )
+
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=R2Volume(),
+        settings=_r2_sync_settings(settings_module, tmp_path),
+        r2_cache=R2Cache(),
+    )
+
+    result = engine.sync_file(
+        asset_path,
+        status_callback=lambda message, current, total: statuses.append(message),
+    )
+
+    assert result.sha256 == sha256
+    assert result.uploaded is True
+    assert len(materializations) == 1
+    assert uploads == []
+    assert statuses == ["Downloading asset from Cloudflare R2: model.safetensors"]
+
+
+def test_local_upload_writes_back_to_r2_in_sync_mode(
+    settings_module: Any,
+    sync_engine_module: Any,
+    r2_cache_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A cache miss should use the existing upload and then populate R2."""
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"new-model")
+    sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+    remote_uploads: list[str] = []
+    completed_plans: list[Any] = []
+
+    class R2Volume:
+        """Record local worker upload and R2 write-back operations."""
+
+        def exists(self, remote_path: str) -> bool:
+            """Report empty worker storage."""
+            del remote_path
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            """Record the normal local-to-worker upload."""
+            del local_path
+            remote_uploads.append(remote_path)
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            """Accept protocol-required byte uploads."""
+            del payload, remote_path
+
+        def materialize_r2_file(self, *args: Any, **kwargs: Any) -> None:
+            """Reject a materialization on the forced cache miss."""
+            del args, kwargs
+            raise AssertionError("cache miss should not materialize")
+
+        def upload_r2_file(self, plan: Any, remote_path: str) -> Any:
+            """Return a successful single-part upload result."""
+            assert remote_path == remote_uploads[0]
+            return r2_cache_module.R2UploadResult()
+
+    class R2Cache:
+        """Plan and complete one synchronous write-back."""
+
+        write_back_mode = "sync"
+
+        def download_request(self, digest: str, size_bytes: int) -> None:
+            """Report an R2 miss."""
+            del digest, size_bytes
+            return None
+
+        def prepare_upload(
+            self,
+            digest: str,
+            size_bytes: int,
+            *,
+            force: bool = False,
+        ) -> Any:
+            """Return one single-part signed upload plan."""
+            assert force is False
+            return r2_cache_module.R2UploadPlan(
+                key=f"cache/{digest}",
+                sha256=digest,
+                size_bytes=size_bytes,
+                allowed_host="account.r2.cloudflarestorage.com",
+                mode="single",
+                urls=("https://account.r2.cloudflarestorage.com/object?secret=1",),
+            )
+
+        def complete_upload(self, plan: Any, result: Any) -> None:
+            """Record successful controller completion."""
+            assert result == r2_cache_module.R2UploadResult()
+            completed_plans.append(plan)
+
+        def abort_upload(self, plan: Any) -> None:
+            """Reject an abort for a successful write-back."""
+            del plan
+            raise AssertionError("successful write-back should not abort")
+
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=R2Volume(),
+        settings=_r2_sync_settings(settings_module, tmp_path),
+        r2_cache=R2Cache(),
+    )
+
+    result = engine.sync_file(asset_path)
+
+    assert result.sha256 == sha256
+    assert len(remote_uploads) == 1
+    assert len(completed_plans) == 1
+    assert completed_plans[0].sha256 == sha256
+
+
+def test_existing_remote_content_is_adopted_without_reupload(
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A lost local index should be repaired from a persistent remote volume."""
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"already-remote")
+
+    class ExistingVolume:
+        """Expose one already populated content-addressed path."""
+
+        def exists(self, remote_path: str) -> bool:
+            """Report the expected remote file as present."""
+            del remote_path
+            return True
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            """Reject an unnecessary duplicate upload."""
+            del local_path, remote_path
+            raise AssertionError("existing remote file should be adopted")
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            """Accept protocol-required byte uploads."""
+            del payload, remote_path
+
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=ExistingVolume(),
+        settings=_r2_sync_settings(settings_module, tmp_path),
+    )
+
+    first = engine.sync_file(asset_path)
+    second = engine.sync_file(asset_path)
+
+    assert first.uploaded is False
+    assert second.uploaded is False
+    assert first.remote_path == second.remote_path
+
+
+def test_failed_r2_hit_is_replaced_after_fallback_upload(
+    settings_module: Any,
+    sync_engine_module: Any,
+    r2_cache_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A same-size corrupt cache hit should trigger forced write-back after fallback."""
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"healthy-local-model")
+    forced_values: list[bool] = []
+
+    class CorruptR2Volume:
+        """Fail cached materialization, then accept normal upload and replacement."""
+
+        def exists(self, remote_path: str) -> bool:
+            """Report empty worker storage."""
+            del remote_path
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            """Accept the established fallback transfer."""
+            del local_path, remote_path
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            """Accept protocol-required byte uploads."""
+            del payload, remote_path
+
+        def materialize_r2_file(self, *args: Any, **kwargs: Any) -> None:
+            """Emulate a worker-side SHA mismatch."""
+            del args, kwargs
+            raise ValueError("R2 download digest mismatch")
+
+        def upload_r2_file(self, plan: Any, remote_path: str) -> Any:
+            """Accept the forced cache replacement."""
+            del plan, remote_path
+            return r2_cache_module.R2UploadResult()
+
+    class CorruptR2Cache:
+        """Return a hit and record whether replacement bypasses size reuse."""
+
+        write_back_mode = "sync"
+
+        def download_request(self, digest: str, size_bytes: int) -> Any:
+            """Return one apparently valid same-size cache object."""
+            return r2_cache_module.R2DownloadRequest(
+                url="https://account.r2.cloudflarestorage.com/object?secret=1",
+                allowed_host="account.r2.cloudflarestorage.com",
+                sha256=digest,
+                size_bytes=size_bytes,
+            )
+
+        def prepare_upload(
+            self,
+            digest: str,
+            size_bytes: int,
+            *,
+            force: bool = False,
+        ) -> Any:
+            """Record and return one replacement plan."""
+            forced_values.append(force)
+            return r2_cache_module.R2UploadPlan(
+                key=f"cache/{digest}",
+                sha256=digest,
+                size_bytes=size_bytes,
+                allowed_host="account.r2.cloudflarestorage.com",
+                mode="single",
+                urls=("https://account.r2.cloudflarestorage.com/object?secret=2",),
+            )
+
+        def complete_upload(self, plan: Any, result: Any) -> None:
+            """Accept successful forced replacement completion."""
+            del plan, result
+
+        def abort_upload(self, plan: Any) -> None:
+            """Reject an abort in the successful path."""
+            del plan
+            raise AssertionError("replacement should not abort")
+
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=CorruptR2Volume(),
+        settings=_r2_sync_settings(settings_module, tmp_path),
+        r2_cache=CorruptR2Cache(),
+    )
+
+    engine.sync_file(asset_path)
+
+    assert forced_values == [True]

@@ -414,3 +414,28 @@ def test_runtime_identity_ignores_comfyui_directories_outside_image_context(
 
     assert scratch_changed.fingerprint == baseline.fingerprint
     assert runtime_changed.fingerprint != scratch_changed.fingerprint
+
+
+def test_runtime_identity_tracks_comfyui_package_data(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Tokenizer and configuration assets shipped in the image must affect identity."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    tokenizer_directory = comfyui_root / "comfy" / "text_encoders" / "qwen25_tokenizer"
+    repo_root.mkdir()
+    tokenizer_directory.mkdir(parents=True)
+    (repo_root / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+    tokenizer_path = tokenizer_directory / "vocab.json"
+    tokenizer_path.write_text('{"one": 1}\n', encoding="utf-8")
+
+    baseline = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+    tokenizer_path.write_text('{"two": 2}\n', encoding="utf-8")
+    tokenizer_changed = _runtime_identity(
+        runtime_environment_module,
+        repo_root,
+        comfyui_root,
+    )
+
+    assert tokenizer_changed.fingerprint != baseline.fingerprint

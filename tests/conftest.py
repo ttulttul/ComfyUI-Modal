@@ -224,6 +224,18 @@ def vast_ssh_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def r2_cache_module(extension_package: object) -> object:
+    """Return the controller-side Cloudflare R2 cache module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.r2_cache")
+
+
+@pytest.fixture(scope="session")
+def r2_materializer_module(extension_package: object) -> object:
+    """Return the worker-side signed R2 transfer module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.r2_materializer")
+
+
+@pytest.fixture(scope="session")
 def huggingface_assets_module(extension_package: object) -> object:
     """Return persistent Hugging Face asset provenance helpers."""
     return importlib.import_module(f"{PACKAGE_NAME}.huggingface_assets")
@@ -438,3 +450,17 @@ def reset_modal_environment(
     monkeypatch.delenv("COMFY_MODAL_VAST_API_BASE_URL", raising=False)
     monkeypatch.delenv("COMFY_MODAL_VAST_IMAGE", raising=False)
     monkeypatch.delenv("COMFY_MODAL_VAST_SSH_IDENTITY_FILE", raising=False)
+    for r2_name in (
+        "COMFY_MODAL_R2_ENABLED",
+        "COMFY_MODAL_R2_ACCOUNT_ID",
+        "COMFY_MODAL_R2_BUCKET",
+        "COMFY_MODAL_R2_ACCESS_KEY_ID",
+        "COMFY_MODAL_R2_SECRET_ACCESS_KEY",
+        "COMFY_MODAL_R2_ENDPOINT_URL",
+        "COMFY_MODAL_R2_KEY_PREFIX",
+        "COMFY_MODAL_R2_WRITE_BACK",
+        "COMFY_MODAL_R2_URL_TTL_SECONDS",
+        "COMFY_MODAL_R2_MULTIPART_PART_MIB",
+        "COMFY_MODAL_R2_SINGLE_UPLOAD_MAX_MIB",
+    ):
+        monkeypatch.delenv(r2_name, raising=False)

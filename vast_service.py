@@ -22,6 +22,7 @@ if __package__:
     from .huggingface_assets import HuggingFaceAssetRegistry
     from .huggingface_discovery import HuggingFaceAssetDiscovery
     from .runtime_environment import build_remote_runtime_identity
+    from .r2_cache import R2CacheClient
     from .settings import ModalSyncSettings, discover_comfyui_user_directory
     from .sync_engine import ModalAssetSyncEngine
     from .vast_api import VastApiClient, VastApiError
@@ -51,6 +52,7 @@ else:  # pragma: no cover - direct debugging imports.
     from huggingface_assets import HuggingFaceAssetRegistry
     from huggingface_discovery import HuggingFaceAssetDiscovery
     from runtime_environment import build_remote_runtime_identity
+    from r2_cache import R2CacheClient
     from settings import ModalSyncSettings, discover_comfyui_user_directory
     from sync_engine import ModalAssetSyncEngine
     from vast_api import VastApiClient, VastApiError
@@ -139,6 +141,7 @@ class VastService:
         runtime_configuration: VastRuntimeConfiguration,
         registry: VastLeaseRegistry,
         identity_file: Path | None = None,
+        r2_cache: R2CacheClient | None = None,
     ) -> None:
         """Initialize the controller and its persistent lease manager."""
         self.settings = settings
@@ -148,6 +151,7 @@ class VastService:
         self.runtime_configuration = runtime_configuration
         self.registry = registry
         self.identity_file = identity_file
+        self.r2_cache = r2_cache
         self.huggingface_asset_registry = (
             HuggingFaceAssetRegistry.for_user_directory(self.user_directory)
         )
@@ -216,6 +220,7 @@ class VastService:
             runtime_configuration=runtime,
             registry=VastLeaseRegistry.for_user_directory(user_directory),
             identity_file=identity_file,
+            r2_cache=R2CacheClient.from_environment(source),
         )
 
     async def quote_best_profile(
@@ -554,6 +559,7 @@ class VastService:
             settings=vast_settings,
             huggingface_asset_registry=self.huggingface_asset_registry,
             huggingface_asset_discovery=self.huggingface_asset_discovery,
+            r2_cache=self.r2_cache,
         )
 
     def executor(self) -> VastExecutorClient:

@@ -32,6 +32,7 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
   - [Modal LLM](#modal-llm)
   - [Modal Endpoint Chat](#modal-endpoint-chat)
 - [Asset And Custom Node Sync](#asset-and-custom-node-sync)
+  - [Optional Cloudflare R2 Backing Cache](#optional-cloudflare-r2-backing-cache)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -135,6 +136,8 @@ Each **Modal Configuration** selects a GPU type and maximum concurrent container
 Self-hosted execution runs the same workers on machines you control, reached over SSH and managed through Docker. Add one **SSH Configuration** per machine and connect it to the configurator. The extension deliberately stores no passwords or private-key paths — authentication, jump hosts, ports, and key selection stay in your normal SSH agent and `~/.ssh/config`.
 
 The installation-wide **Settings → Remote Execution: SSH environments** manager remains available for legacy workflows and host preflight. New configured workflows carry their own credential-free SSH destination and scheduling snapshot, including the probed GPU capabilities, so their execution does not depend on mutating that global registry. Older queued payloads without a capability snapshot are re-probed before launch. GPU workers are always started with the selected GPU device request; missing GPU/runtime capability is an explicit setup error instead of a silent CPU-only container. The worker image also pins and validates the PyAV API required by the copied ComfyUI source, so a stale video dependency fails during image construction instead of at the first remote node import.
+
+Worker images embed every file beneath ComfyUI's curated runtime package directories, including tokenizer vocabularies, model configuration JSON, SentencePiece data, and other non-Python resources. Those files participate in the runtime fingerprint, so adding or changing required package data automatically replaces a stale SSH worker and is reflected in the next published Vast worker image.
 
 Parallel components assigned to the same SSH worker slot share one lifecycle operation. If two launchers race for the deterministic container name, the loser adopts the correctly labeled, fingerprint-matching worker that won the race; containers without the configured environment ownership label are never removed automatically.
 
@@ -321,6 +324,30 @@ The worker-side materializer is part of the versioned runtime source. Rebuild an
 
 Custom-node sync is enabled by default in remote mode. When enabled, Modal-Sync packages `custom_nodes/` as content-addressed code archives per package, with package-owned model artifacts (`.pth`, `.safetensors`, `.gguf`, `.onnx`) stored separately so a code edit never re-uploads a multi-gigabyte model. Nested virtual environments, caches, compiled artifacts, and logs are excluded. When a synced package has a `requirements.txt`, those requirements are folded into the worker image build (with `-r` includes followed; pip options and constraints ignored).
 
+### Optional Cloudflare R2 Backing Cache
+
+Vast.ai and self-hosted SSH environments can optionally share a Cloudflare R2 bucket as a content-addressed backing cache. On a local sync-index miss, Modal-Sync first adopts an existing file from persistent worker storage, then prefers a verified Hugging Face origin when one is known, then checks R2 by SHA-256 and exact byte size. An R2 hit is downloaded directly over the worker's data-center connection, verified again, and atomically published into `/storage`; an R2 failure falls back to the existing local-to-worker SSH upload.
+
+New local or Hugging Face transfers are written back to R2 by default on a two-worker background executor, so the current workflow does not wait for cache population. Use `COMFY_MODAL_R2_WRITE_BACK=sync` when cache durability must be confirmed before preparation completes, or `off` for read-only use. The cache also covers custom-node archives, manifests, and package-owned model assets. Modal execution does not use R2 because its native persistent volume already supplies the fast shared layer.
+
+Permanent R2 access credentials remain only in the local ComfyUI controller. Workers receive expiring, exact-object S3-compatible GET/PUT URLs through protected process standard input; URLs do not enter workflow data, Docker/SSH command arguments, launch environments, or logs. Downloads are SHA-256 and size verified rather than trusting an S3 ETag. Files above the configured single-PUT threshold use multipart upload, which also avoids buffering model files in controller memory.
+
+Create a private R2 bucket and an API token scoped to that bucket, then configure the ComfyUI process:
+
+```bash
+export COMFY_MODAL_R2_ENABLED=true
+export COMFY_MODAL_R2_ACCOUNT_ID='0123456789abcdef0123456789abcdef'
+export COMFY_MODAL_R2_BUCKET='comfy-model-cache'
+export COMFY_MODAL_R2_ACCESS_KEY_ID='...'
+export COMFY_MODAL_R2_SECRET_ACCESS_KEY='...'
+```
+
+The first ordinary cache miss populates R2 automatically. To seed known files or directories before renting a GPU, run:
+
+```bash
+uv run python scripts/prewarm_r2_cache.py /path/to/models /path/to/custom-file.safetensors
+```
+
 ## Configuration
 
 Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
@@ -343,6 +370,17 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 | `COMFY_MODAL_REMOTE_STORAGE_ROOT` | `/storage` | Mounted storage root inside remote workers. |
 | `COMFY_MODAL_CUSTOM_NODES_ARCHIVE` | `custom_nodes_bundle.zip` | Base archive name used for custom-node bundle paths. |
 | `COMFY_MODAL_SYNC_CUSTOM_NODES` | `false` in local mode, `true` otherwise | Force-enable or disable custom-node bundle sync. |
+| `COMFY_MODAL_R2_ENABLED` | `false` | Enable the shared R2 backing cache for Vast.ai and SSH Docker storage. |
+| `COMFY_MODAL_R2_ACCOUNT_ID` | unset | Cloudflare account ID used to derive the R2 S3 endpoint. |
+| `COMFY_MODAL_R2_BUCKET` | unset | Private R2 bucket containing content-addressed objects. |
+| `COMFY_MODAL_R2_ACCESS_KEY_ID` | unset | Controller-only R2 API-token access key ID. |
+| `COMFY_MODAL_R2_SECRET_ACCESS_KEY` | unset | Controller-only R2 API-token secret access key. |
+| `COMFY_MODAL_R2_ENDPOINT_URL` | account R2 endpoint | Optional credential-free HTTPS S3 endpoint override. |
+| `COMFY_MODAL_R2_KEY_PREFIX` | `comfy-modal-cache/v1/blobs/sha256` | Immutable object-key namespace shared by compatible installations. |
+| `COMFY_MODAL_R2_WRITE_BACK` | `async` | Cache population mode: `async`, `sync`, or `off`. |
+| `COMFY_MODAL_R2_URL_TTL_SECONDS` | `21600` | Presigned URL lifetime, from 1 second through R2's 7-day limit. |
+| `COMFY_MODAL_R2_MULTIPART_PART_MIB` | `256` | Multipart upload part size, from 5 MiB through 5 GiB. |
+| `COMFY_MODAL_R2_SINGLE_UPLOAD_MAX_MIB` | `100` | Maximum file size sent with one signed PUT, capped at 5 GiB. |
 
 ### Modal Deployment
 

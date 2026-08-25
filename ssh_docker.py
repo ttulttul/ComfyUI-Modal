@@ -10,13 +10,15 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 if __package__:
     from .execution_environments import EnvironmentCapabilities, GpuCapability
+    from .r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
     from .remote_hosts import SshHostConfig
 else:  # pragma: no cover - stable remote entrypoints may import modules top-level.
     from execution_environments import EnvironmentCapabilities, GpuCapability
+    from r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
     from remote_hosts import SshHostConfig
 
 logger = logging.getLogger(__name__)
@@ -470,11 +472,20 @@ class SshDockerVolumeBackend:
     controller: SshDockerController
     volume_name: str
     helper_image: str = DEFAULT_VOLUME_HELPER_IMAGE
+    materializer_image: str | None = None
     _exists_cache: dict[str, bool] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate and ensure the configured storage volume."""
         self.volume_name = self.controller.ensure_volume(self.volume_name)
+        if self.materializer_image is not None and (
+            not self.materializer_image.strip()
+            or any(
+                character in self.materializer_image
+                for character in ("\x00", "\n", "\r")
+            )
+        ):
+            raise ValueError("SSH R2 materializer image must be a non-empty single line.")
 
     def exists(self, remote_path: str) -> bool:
         """Return whether one regular file exists in the remote volume."""
@@ -511,6 +522,81 @@ class SshDockerVolumeBackend:
     def put_bytes(self, payload: bytes, remote_path: str) -> None:
         """Upload bytes into the named volume."""
         self._put_payload(payload, remote_path)
+
+    def materialize_r2_file(
+        self,
+        request: R2DownloadRequest,
+        remote_path: str,
+        *,
+        cancellation_check: Callable[[], bool] | None = None,
+    ) -> None:
+        """Download and verify one signed R2 object inside the worker image."""
+        if cancellation_check is not None and cancellation_check():
+            raise InterruptedError("SSH R2 download was cancelled.")
+        normalized_path = _validated_volume_path(remote_path)
+        self._run_r2_materializer(
+            {
+                "operation": "download",
+                "storage_root": "/storage",
+                "remote_path": normalized_path,
+                "download": request.to_dict(),
+            },
+            size_bytes=request.size_bytes,
+        )
+        if cancellation_check is not None and cancellation_check():
+            raise InterruptedError("SSH R2 download was cancelled.")
+        self._exists_cache[normalized_path] = True
+
+    def upload_r2_file(
+        self,
+        plan: R2UploadPlan,
+        remote_path: str,
+    ) -> R2UploadResult:
+        """Upload one named-volume file through a signed R2 transfer plan."""
+        normalized_path = _validated_volume_path(remote_path)
+        result = self._run_r2_materializer(
+            {
+                "operation": "upload",
+                "storage_root": "/storage",
+                "remote_path": normalized_path,
+                "upload": plan.to_dict(),
+            },
+            size_bytes=plan.size_bytes,
+        )
+        return R2UploadResult.from_dict(result)
+
+    def _run_r2_materializer(
+        self,
+        request: Mapping[str, Any],
+        *,
+        size_bytes: int,
+    ) -> Mapping[str, object]:
+        """Run signed transfers with URLs supplied only through protected stdin."""
+        if self.materializer_image is None:
+            raise SshDockerError("SSH R2 backing requires a current worker image.")
+        result = self.controller.docker(
+            (
+                "run",
+                "--rm",
+                "-i",
+                "--entrypoint",
+                "python",
+                "-v",
+                f"{self.volume_name}:/storage",
+                self.materializer_image,
+                "-m",
+                "remote.r2_materializer",
+            ),
+            input_payload=json.dumps(request, sort_keys=True).encode("utf-8"),
+            timeout_seconds=max(900.0, size_bytes / (2 * _MIB)),
+        )
+        try:
+            payload = json.loads(result.stdout_text)
+        except json.JSONDecodeError as exc:
+            raise SshDockerError("SSH R2 materializer returned invalid JSON.") from exc
+        if not isinstance(payload, Mapping):
+            raise SshDockerError("SSH R2 materializer returned a non-object result.")
+        return payload
 
     def _put_payload(self, payload: bytes, remote_path: str) -> None:
         """Atomically stream one payload into the remote named volume."""

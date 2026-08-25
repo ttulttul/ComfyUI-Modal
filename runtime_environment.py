@@ -432,6 +432,7 @@ def _tree_digest(
     included_names: frozenset[str] = frozenset(),
     ignored_top_level_directories: frozenset[str] = frozenset(),
     included_top_level_directories: frozenset[str] | None = None,
+    include_all_files_in_top_level_directories: bool = False,
 ) -> str:
     """Hash the selected files in one directory tree using stable relative paths."""
     if root is None or not root.is_dir():
@@ -458,13 +459,21 @@ def _tree_digest(
         )
         for file_name in sorted(file_names):
             file_path = directory_path / file_name
+            relative_path = file_path.relative_to(resolved_root)
+            inside_included_top_level_directory = bool(
+                include_all_files_in_top_level_directories
+                and included_top_level_directories is not None
+                and relative_path.parts
+                and relative_path.parts[0] in included_top_level_directories
+            )
             if (
-                file_name not in included_names
+                not inside_included_top_level_directory
+                and file_name not in included_names
                 and file_path.suffix.lower() not in included_suffixes
             ):
                 continue
-            relative_path = file_path.relative_to(resolved_root).as_posix()
-            digest.update(relative_path.encode("utf-8"))
+            relative_posix_path = relative_path.as_posix()
+            digest.update(relative_posix_path.encode("utf-8"))
             digest.update(b"\0")
             with file_path.open("rb") as source_file:
                 for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
@@ -567,6 +576,7 @@ def build_remote_runtime_identity(
             included_suffixes=frozenset({".py"}),
             included_names=COMFYUI_RUNTIME_SOURCE_FILES,
             included_top_level_directories=COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
+            include_all_files_in_top_level_directories=True,
         ),
         "runtime_options": _runtime_options(settings),
     }

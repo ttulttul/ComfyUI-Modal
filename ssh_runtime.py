@@ -283,16 +283,13 @@ class SshRuntimeManager:
             if not source_path.is_file():
                 continue
             relative_path = source_path.relative_to(resolved_comfyui_root)
+            if ignored_directory_names.intersection(relative_path.parts):
+                continue
             top_level_name = relative_path.parts[0]
-            if top_level_name in COMFYUI_RUNTIME_SOURCE_DIRECTORIES:
-                if source_path.suffix != ".py":
-                    continue
-            elif (
+            if top_level_name not in COMFYUI_RUNTIME_SOURCE_DIRECTORIES and (
                 source_path.suffix != ".py"
                 and relative_path.as_posix() not in COMFYUI_RUNTIME_SOURCE_FILES
             ):
-                continue
-            if "__pycache__" in relative_path.parts:
                 continue
             yield source_path, f"comfyui/{relative_path.as_posix()}"
 
