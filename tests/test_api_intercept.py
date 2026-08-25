@@ -5921,6 +5921,135 @@ def test_environment_setup_status_callback_preserves_environment_identity(
     ]
 
 
+def test_remote_environment_assets_are_prepared_in_parallel(
+    api_intercept_module: Any,
+) -> None:
+    """Distinct environments should enter asset preparation concurrently."""
+    barrier = threading.Barrier(2)
+    state_lock = threading.Lock()
+    active_environment_count = 0
+    maximum_active_environment_count = 0
+    environment_events: list[tuple[str, str]] = []
+
+    class FakeSyncEngine:
+        """Block custom-node setup until both environment workers are active."""
+
+        def sync_custom_nodes_directory(self, *, status_callback: Any) -> None:
+            """Prove the second environment starts before the first can finish."""
+            nonlocal active_environment_count, maximum_active_environment_count
+            with state_lock:
+                active_environment_count += 1
+                maximum_active_environment_count = max(
+                    maximum_active_environment_count,
+                    active_environment_count,
+                )
+            status_callback("Uploading custom nodes", None, None)
+            try:
+                barrier.wait(timeout=2.0)
+            finally:
+                with state_lock:
+                    active_environment_count -= 1
+
+        def create_request_asset_cache(self, values: Any) -> object:
+            """Consume the environment-local input plan and return a sentinel cache."""
+            tuple(values)
+            return object()
+
+        def sync_prompt_inputs(
+            self,
+            inputs: dict[str, Any],
+            *,
+            status_callback: Any,
+            request_cache: object,
+        ) -> tuple[dict[str, Any], list[Any]]:
+            """Return one prepared prompt after publishing environment-local status."""
+            assert request_cache is not None
+            status_callback("Downloading prompt asset", 1, 1)
+            return inputs, []
+
+    components = [
+        SimpleNamespace(representative_node_id="a", node_ids=["a"]),
+        SimpleNamespace(representative_node_id="b", node_ids=["b"]),
+    ]
+    assignments = {
+        "a": SimpleNamespace(environment_id="vast:big:1"),
+        "b": SimpleNamespace(environment_id="vast:small:2"),
+    }
+    results = api_intercept_module._prepare_remote_environment_assets(
+        components=components,
+        assignments_by_component_id=assignments,
+        sync_engines_by_environment={
+            "vast:big:1": FakeSyncEngine(),
+            "vast:small:2": FakeSyncEngine(),
+        },
+        rewritten_prompt={
+            "a": {"class_type": "VAELoader", "inputs": {"vae": "a.safetensors"}},
+            "b": {"class_type": "VAELoader", "inputs": {"vae": "b.safetensors"}},
+        },
+        sync_custom_nodes=True,
+        status_callback=None,
+        environment_status_callback=(
+            lambda environment_id, message, _current, _total: environment_events.append(
+                (environment_id, message)
+            )
+        ),
+    )
+
+    assert maximum_active_environment_count == 2
+    assert list(results) == ["vast:big:1", "vast:small:2"]
+    assert results["vast:big:1"].component_prompts["a"]["a"]["inputs"] == {
+        "vae": "a.safetensors"
+    }
+    assert results["vast:small:2"].component_prompts["b"]["b"]["inputs"] == {
+        "vae": "b.safetensors"
+    }
+    for environment_id in results:
+        messages = [
+            message
+            for event_environment_id, message in environment_events
+            if event_environment_id == environment_id
+        ]
+        assert messages == [
+            "Preparing remote assets",
+            "Uploading custom nodes",
+            "Downloading prompt asset",
+            "Ready to plan remote execution",
+        ]
+
+
+def test_remote_environment_asset_worker_failures_bubble_up(
+    api_intercept_module: Any,
+) -> None:
+    """A failed environment worker must fail queue preparation with its cause."""
+
+    class FailingSyncEngine:
+        """Fail before prompt assets are considered prepared."""
+
+        def sync_custom_nodes_directory(self, *, status_callback: Any) -> None:
+            """Raise the representative environment-specific setup failure."""
+            status_callback("Uploading custom nodes", None, None)
+            raise OSError("remote storage is unavailable")
+
+    with pytest.raises(OSError, match="remote storage is unavailable"):
+        api_intercept_module._prepare_remote_environment_assets(
+            components=[
+                SimpleNamespace(representative_node_id="a", node_ids=["a"])
+            ],
+            assignments_by_component_id={
+                "a": SimpleNamespace(environment_id="vast:broken:1")
+            },
+            sync_engines_by_environment={
+                "vast:broken:1": FailingSyncEngine()
+            },
+            rewritten_prompt={
+                "a": {"class_type": "VAELoader", "inputs": {}}
+            },
+            sync_custom_nodes=True,
+            status_callback=None,
+            environment_status_callback=lambda *_args: None,
+        )
+
+
 def test_workflow_ssh_metadata_preserves_probed_gpu_capabilities(
     api_intercept_module: Any,
     execution_environments_module: Any,

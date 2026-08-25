@@ -113,6 +113,7 @@ _REMOTE_PREPARATION_CANCELLATIONS_ATTR = (
     "__comfy_modal_remote_preparation_cancellations"
 )
 _REMOTE_PREPARATION_LOCK_ATTR = "__comfy_modal_remote_preparation_lock"
+_REMOTE_ASSET_PREPARATION_MAX_WORKERS = 8
 _REMOTE_TOGGLE_WIDGET_NAME = "Run Remotely"
 _LEGACY_REMOTE_TOGGLE_WIDGET_NAME = "Run on Modal"
 _LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
@@ -339,6 +340,16 @@ class ComponentExecutionPlan:
     ssh_hosts_by_id: dict[str, SshHostConfig] = field(default_factory=dict)
     vast_service: VastService | None = None
     vast_leases_by_environment: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _EnvironmentAssetPreparationResult:
+    """Collect custom-node and prompt-asset results for one environment."""
+
+    environment_id: str
+    custom_nodes_bundle: SyncedAsset | None
+    component_prompts: dict[str, dict[str, Any]]
+    assets_by_component_id: dict[str, list[SyncedAsset]]
 
 
 @dataclass(frozen=True)
@@ -7164,6 +7175,147 @@ def _environment_setup_status_callback(
     return emit_status
 
 
+def _prepare_environment_assets(
+    *,
+    environment_id: str,
+    components: Sequence[RemoteComponentPlan],
+    sync_engine: ModalAssetSyncEngine,
+    engine_lock: threading.Lock,
+    rewritten_prompt: dict[str, Any],
+    sync_custom_nodes: bool,
+    status_callback: SetupStatusCallback | None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None,
+) -> _EnvironmentAssetPreparationResult:
+    """Prepare one environment's custom nodes and prompt assets in order."""
+    started_at = time.perf_counter()
+    logger.info(
+        "Starting remote asset preparation environment=%s components=%d.",
+        environment_id,
+        len(components),
+    )
+    environment_callback = _environment_setup_status_callback(
+        environment_id,
+        status_callback,
+        environment_status_callback,
+    )
+    if environment_callback is not None:
+        environment_callback("Preparing remote assets", None, None)
+    with engine_lock:
+        custom_nodes_bundle = (
+            sync_engine.sync_custom_nodes_directory(
+                status_callback=environment_callback,
+            )
+            if sync_custom_nodes
+            else None
+        )
+        component_prompts, assets_by_component_id = (
+            _sync_environment_prompt_assets(
+                components=components,
+                sync_engine=sync_engine,
+                rewritten_prompt=rewritten_prompt,
+                status_callback=environment_callback,
+            )
+        )
+    if environment_callback is not None:
+        environment_callback("Ready to plan remote execution", None, None)
+    logger.info(
+        "Finished remote asset preparation environment=%s components=%d assets=%d elapsed_seconds=%.3f.",
+        environment_id,
+        len(components),
+        sum(len(assets) for assets in assets_by_component_id.values()),
+        time.perf_counter() - started_at,
+    )
+    return _EnvironmentAssetPreparationResult(
+        environment_id=environment_id,
+        custom_nodes_bundle=custom_nodes_bundle,
+        component_prompts=component_prompts,
+        assets_by_component_id=assets_by_component_id,
+    )
+
+
+def _sync_environment_prompt_assets(
+    *,
+    components: Sequence[RemoteComponentPlan],
+    sync_engine: ModalAssetSyncEngine,
+    rewritten_prompt: dict[str, Any],
+    status_callback: SetupStatusCallback | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[SyncedAsset]]]:
+    """Sync every component assigned to one environment with one request cache."""
+    request_cache = sync_engine.create_request_asset_cache(
+        rewritten_prompt[node_id].get("inputs", {})
+        for component in components
+        for node_id in component.node_ids
+    )
+    component_prompts: dict[str, dict[str, Any]] = {}
+    assets_by_component_id: dict[str, list[SyncedAsset]] = {}
+    for component in components:
+        component_prompt, synced_assets = _sync_component_prompt_inputs(
+            component=component,
+            rewritten_prompt=rewritten_prompt,
+            sync_engine=sync_engine,
+            request_cache=request_cache,
+            status_callback=status_callback,
+        )
+        component_id = component.representative_node_id
+        component_prompts[component_id] = component_prompt
+        assets_by_component_id[component_id] = list(synced_assets)
+    return component_prompts, assets_by_component_id
+
+
+def _prepare_remote_environment_assets(
+    *,
+    components: Sequence[RemoteComponentPlan],
+    assignments_by_component_id: Mapping[str, ExecutionAssignment],
+    sync_engines_by_environment: Mapping[str, ModalAssetSyncEngine],
+    rewritten_prompt: dict[str, Any],
+    sync_custom_nodes: bool,
+    status_callback: SetupStatusCallback | None,
+    environment_status_callback: EnvironmentSetupStatusCallback | None,
+) -> dict[str, _EnvironmentAssetPreparationResult]:
+    """Prepare distinct remote environments concurrently in a bounded pool."""
+    components_by_environment: dict[str, list[RemoteComponentPlan]] = {
+        environment_id: [] for environment_id in sync_engines_by_environment
+    }
+    for component in components:
+        assignment = assignments_by_component_id[component.representative_node_id]
+        components_by_environment[assignment.environment_id].append(component)
+    locks_by_engine: dict[int, threading.Lock] = {}
+    environment_ids = list(components_by_environment)
+    if not environment_ids:
+        return {}
+    max_workers = min(_REMOTE_ASSET_PREPARATION_MAX_WORKERS, len(environment_ids))
+    logger.info(
+        "Preparing remote assets across %d environments with %d workers.",
+        len(environment_ids),
+        max_workers,
+    )
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="comfy-remote-assets",
+    ) as executor:
+        futures_by_environment = {
+            environment_id: executor.submit(
+                _prepare_environment_assets,
+                environment_id=environment_id,
+                components=components_by_environment[environment_id],
+                sync_engine=sync_engines_by_environment[environment_id],
+                engine_lock=locks_by_engine.setdefault(
+                    id(sync_engines_by_environment[environment_id]),
+                    threading.Lock(),
+                ),
+                rewritten_prompt=rewritten_prompt,
+                sync_custom_nodes=sync_custom_nodes,
+                status_callback=status_callback,
+                environment_status_callback=environment_status_callback,
+            )
+            for environment_id in environment_ids
+        }
+        return {
+            environment_id: futures_by_environment[environment_id].result()
+            for environment_id in environment_ids
+        }
+
+
 def rewrite_prompt_for_modal(
     prompt: dict[str, Any],
     workflow: dict[str, Any] | None,
@@ -7402,20 +7554,20 @@ def rewrite_prompt_for_modal(
     if status_callback is not None:
         status_callback("Preparing assets for remote execution", None, None)
 
+    environment_preparations = _prepare_remote_environment_assets(
+        components=components,
+        assignments_by_component_id=assignments_by_component_id,
+        sync_engines_by_environment=sync_engines_by_environment,
+        rewritten_prompt=rewritten_prompt,
+        sync_custom_nodes=resolved_settings.sync_custom_nodes,
+        status_callback=status_callback,
+        environment_status_callback=environment_status_callback,
+    )
     if resolved_settings.sync_custom_nodes:
-        for (
-            environment_id,
-            environment_sync_engine,
-        ) in sync_engines_by_environment.items():
-            summary.custom_nodes_bundles_by_environment[
-                environment_id
-            ] = environment_sync_engine.sync_custom_nodes_directory(
-                status_callback=_environment_setup_status_callback(
-                    environment_id,
-                    status_callback,
-                    environment_status_callback,
-                ),
-            )
+        summary.custom_nodes_bundles_by_environment = {
+            environment_id: preparation.custom_nodes_bundle
+            for environment_id, preparation in environment_preparations.items()
+        }
         modal_bundle = next(
             (
                 summary.custom_nodes_bundles_by_environment[assignment.environment_id]
@@ -7436,39 +7588,19 @@ def rewrite_prompt_for_modal(
 
     synced_component_prompts: dict[str, dict[str, Any]] = {}
     synced_assets_by_component_id: dict[str, list[SyncedAsset]] = {}
-    request_asset_caches_by_environment = {
-        environment_id: environment_sync_engine.create_request_asset_cache(
-            rewritten_prompt[node_id].get("inputs", {})
-            for component in components
-            if assignments_by_component_id[
-                component.representative_node_id
-            ].environment_id
-            == environment_id
-            for node_id in component.node_ids
-        )
-        for environment_id, environment_sync_engine in sync_engines_by_environment.items()
-    }
     for component in components:
         assignment = assignments_by_component_id[component.representative_node_id]
-        component_sync_engine = sync_engines_by_environment[assignment.environment_id]
-        component_prompt, synced_assets = _sync_component_prompt_inputs(
-            component=component,
-            rewritten_prompt=rewritten_prompt,
-            sync_engine=component_sync_engine,
-            request_cache=request_asset_caches_by_environment[
-                assignment.environment_id
-            ],
-            status_callback=_environment_setup_status_callback(
-                assignment.environment_id,
-                status_callback,
-                environment_status_callback,
-            ),
+        preparation = environment_preparations[assignment.environment_id]
+        component_id = component.representative_node_id
+        synced_component_prompts[component_id] = preparation.component_prompts[
+            component_id
+        ]
+        synced_assets_by_component_id[component_id] = (
+            preparation.assets_by_component_id[component_id]
         )
-        synced_component_prompts[component.representative_node_id] = component_prompt
-        synced_assets_by_component_id[component.representative_node_id] = list(
-            synced_assets
+        summary.synced_assets.extend(
+            preparation.assets_by_component_id[component_id]
         )
-        summary.synced_assets.extend(synced_assets)
 
     summary.synced_assets = _deduplicate_synced_assets(summary.synced_assets)
 
