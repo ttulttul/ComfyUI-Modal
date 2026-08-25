@@ -294,6 +294,62 @@ def test_worker_dockerfile_disables_inherited_base_image_healthcheck(
     assert "from av.video.reformatter import ColorPrimaries" in dockerfile
 
 
+def test_worker_dockerfile_exposes_triton_compiler_toolchain(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Generated SSH and Vast images must expose the compiler Triton discovers."""
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "select_remote_torch_build",
+        lambda _gpu: SimpleNamespace(
+            install_layers=(),
+            validation_command=lambda: "true",
+        ),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_apt_packages",
+        lambda: ("build-essential",),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_compiler_validation_command",
+        lambda: "test -x /usr/bin/gcc",
+    )
+    monkeypatch.setattr(ssh_runtime_module, "remote_runtime_packages", lambda: ())
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_packages",
+        lambda _gpu: (),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_validation_command",
+        lambda _gpu: "true",
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "custom_node_runtime_packages",
+        lambda _path: (),
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(
+            modal_gpu="RTX-PRO-6000",
+            custom_nodes_dir=Path("/custom_nodes"),
+        ),
+    )
+    spec = SimpleNamespace(identity=SimpleNamespace(fingerprint="deadbeef"))
+
+    dockerfile = manager._dockerfile(spec)
+
+    assert "apt-get install -y --no-install-recommends build-essential" in dockerfile
+    assert "CC=/usr/bin/gcc CXX=/usr/bin/g++" in dockerfile
+    assert "RUN test -x /usr/bin/gcc" in dockerfile
+
+
 def test_worker_dockerfile_retries_large_accelerator_downloads(
     ssh_runtime_module: Any,
     monkeypatch: Any,

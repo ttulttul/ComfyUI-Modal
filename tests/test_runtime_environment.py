@@ -66,7 +66,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert runtime_environment_module.DEFAULT_MODAL_GPU == "RTX-PRO-6000"
     assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION == 9
     assert runtime_environment_module.REMOTE_PYTHON_VERSION == "3.13"
-    assert apt_packages == ("libgl1", "libglib2.0-0")
+    assert apt_packages == ("build-essential", "libgl1", "libglib2.0-0")
     assert all("==" in requirement for requirement in runtime_packages)
     assert all("==" in requirement for requirement in torch_packages)
     assert len(runtime_packages) == len(set(runtime_packages))
@@ -96,6 +96,17 @@ def test_remote_video_stack_is_pinned_and_validated(
     assert "ColorPrimaries" in command
     assert "Expected PyAV" in command
     assert "18.1.0" in command
+
+
+def test_remote_compiler_toolchain_is_validated(
+    runtime_environment_module: Any,
+) -> None:
+    """Triton workers must retain an explicit compiler after image construction."""
+    command = runtime_environment_module.remote_compiler_validation_command()
+
+    assert "/usr/bin/gcc" in command
+    assert "/usr/bin/g++" in command
+    assert "gcc --version" in command
 
 
 def test_remote_huggingface_stack_is_pinned_and_validated(
@@ -269,7 +280,11 @@ def test_runtime_identity_records_system_packages(
 
     identity = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
 
-    assert identity.manifest["apt_packages"] == ["libgl1", "libglib2.0-0"]
+    assert identity.manifest["apt_packages"] == [
+        "build-essential",
+        "libgl1",
+        "libglib2.0-0",
+    ]
 
 
 def test_runtime_identity_records_universal_torch_and_vllm_build(

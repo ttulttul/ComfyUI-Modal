@@ -41,6 +41,7 @@ REMOTE_NUMPY_SPEC = "numpy==2.3.5"
 REMOTE_OPENCV_SPEC = "opencv-python-headless==4.13.0.92"
 
 _REMOTE_APT_PACKAGES = (
+    "build-essential",
     "libgl1",
     "libglib2.0-0",
 )
@@ -232,6 +233,14 @@ def remote_runtime_validation_command() -> str:
         "print('Validated ComfyUI video stack:', 'PyAV', actual_av)"
     )
     return f"python -c {shlex.quote(validation_script)}"
+
+
+def remote_compiler_validation_command() -> str:
+    """Return a build-time check for Triton's required native compiler toolchain."""
+    return (
+        "test -x /usr/bin/gcc && test -x /usr/bin/g++ && "
+        "/usr/bin/gcc --version"
+    )
 
 
 def remote_huggingface_packages() -> tuple[str, ...]:

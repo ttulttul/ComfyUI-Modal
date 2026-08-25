@@ -25,6 +25,7 @@ if __package__:
         remote_accelerator_packages,
         remote_accelerator_validation_command,
         remote_apt_packages,
+        remote_compiler_validation_command,
         remote_runtime_packages,
         remote_runtime_validation_command,
         select_remote_torch_build,
@@ -43,6 +44,7 @@ else:  # pragma: no cover - remote entrypoint compatibility.
         remote_accelerator_packages,
         remote_accelerator_validation_command,
         remote_apt_packages,
+        remote_compiler_validation_command,
         remote_runtime_packages,
         remote_runtime_validation_command,
         select_remote_torch_build,
@@ -332,7 +334,8 @@ class SshRuntimeManager:
             f"FROM python:{REMOTE_PYTHON_VERSION}-slim-bookworm AS python-runtime",
             f"FROM {REMOTE_LLAMA_CPP_SERVER_IMAGE}",
             "COPY --from=python-runtime /usr/local /usr/local",
-            "ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1",
+            "ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 "
+            "CC=/usr/bin/gcc CXX=/usr/bin/g++",
             _docker_run(
                 "apt-get",
                 "update",
@@ -347,6 +350,7 @@ class SshRuntimeManager:
                 "-rf",
                 "/var/lib/apt/lists/*",
             ),
+            f"RUN {remote_compiler_validation_command()}",
             _pip_install(remote_runtime_packages()),
         ]
         for layer in torch_build.install_layers:
