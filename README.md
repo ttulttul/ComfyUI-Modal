@@ -71,7 +71,7 @@ Values crossing the local/remote boundary must be transportable. Supported types
 
 List-valued transportable outputs cross through ComfyUI normally, even when both components use the same remote environment. This preserves ComfyUI's `OUTPUT_IS_LIST` item mapping and cache behavior; provider-local session bridges remain reserved for values whose scalar/list identity is unchanged by replacing the value with one bridge reference.
 
-When one component's output feeds another remote component, the value stays on the remote side as a small durable reference instead of round-tripping through the local machine; local consumers of the same value receive it through an asynchronous download that never blocks the remote continuation.
+When one component's output feeds only another component on the same remote environment, the value stays on the remote side as a small durable reference instead of round-tripping through the local machine. Modal can also use its shared durable store to download the same value asynchronously for an independent local branch. Vast and SSH workers have provider-local bridge stores, so a transportable output that also feeds a local preview, save, or other local-only branch instead crosses through ComfyUI normally.
 
 ## Installation
 

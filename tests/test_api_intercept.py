@@ -862,6 +862,81 @@ def test_cross_provider_boundary_uses_transport_instead_of_remote_session(
     assert boundary_output.session_consumer_node_ids == []
 
 
+def test_non_modal_boundary_with_local_preview_uses_transport(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+) -> None:
+    """A Vast bridge with a local consumer must not require Modal shared storage."""
+    source = api_intercept_module.LinkedOutputRef("1", 0)
+    boundary_output = api_intercept_module.BoundaryOutputSpec(
+        proxy_output_name="remote_output_0",
+        source=source,
+        io_type="IMAGE",
+        is_list=False,
+    )
+    producer = api_intercept_module.RemoteComponentPlan(
+        node_ids=["1"],
+        representative_node_id="1",
+        boundary_inputs=[],
+        boundary_outputs=[boundary_output],
+        execute_node_ids=["1"],
+        contains_output_node=False,
+    )
+    consumer = api_intercept_module.RemoteComponentPlan(
+        node_ids=["2"],
+        representative_node_id="2",
+        boundary_inputs=[
+            api_intercept_module.BoundaryInputSpec(
+                proxy_input_name="remote_input_0",
+                source=source,
+                io_type="IMAGE",
+                targets=[api_intercept_module.InputTarget("2", "image")],
+            )
+        ],
+        boundary_outputs=[],
+        execute_node_ids=["2"],
+        contains_output_node=False,
+    )
+    assignment_type = execution_environments_module.ExecutionAssignment
+    provider_type = execution_environments_module.ExecutionProvider
+    vast_assignment = assignment_type(
+        "vast:profile:1234",
+        provider_type.VAST,
+        0.0,
+        0.0,
+    )
+
+    session_component_ids = (
+        api_intercept_module._mark_remote_to_remote_session_boundaries(
+            {
+                "1": {"class_type": "RemoteImage", "inputs": {}},
+                "2": {
+                    "class_type": "RemoteImageConsumer",
+                    "inputs": {"image": ["1", 0]},
+                },
+                "3": {
+                    "class_type": "PreviewImage",
+                    "inputs": {"images": ["1", 0]},
+                },
+            },
+            [producer, consumer],
+            SimpleNamespace(
+                NODE_CLASS_MAPPINGS={
+                    "RemoteImage": _FakeRemoteImageNode,
+                    "RemoteImageConsumer": _FakeRemoteImageConsumerNode,
+                    "PreviewImage": _FakePreviewImageNode,
+                }
+            ),
+            {"1": vast_assignment, "2": vast_assignment},
+        )
+    )
+
+    assert session_component_ids == set()
+    assert boundary_output.session_output is False
+    assert boundary_output.session_consumer_node_ids == []
+    assert boundary_output.local_materializer_node_id is None
+
+
 def test_transportable_list_boundary_preserves_scheduler_items(
     api_intercept_module: Any,
     execution_environments_module: Any,

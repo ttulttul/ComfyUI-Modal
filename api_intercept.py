@@ -5390,6 +5390,24 @@ def _mark_remote_to_remote_session_boundaries(
                     boundary_output.source.output_index,
                 )
                 continue
+            if (
+                non_returning_local_consumers
+                and producer_assignment.provider is not ExecutionProvider.MODAL
+            ):
+                logger.info(
+                    "Materializing remote boundary output through ComfyUI because "
+                    "provider-local bridge storage is not accessible to local consumers "
+                    "source=%s:%d provider=%s producer_component=%s local_consumers=%s.",
+                    boundary_output.source.node_id,
+                    boundary_output.source.output_index,
+                    producer_assignment.provider.value,
+                    component.representative_node_id,
+                    [
+                        consumer.node_id
+                        for consumer in non_returning_local_consumers
+                    ],
+                )
+                continue
             if boundary_output.is_list and _is_transportable_output_type(
                 boundary_output.io_type
             ):
@@ -5432,10 +5450,11 @@ def _mark_remote_to_remote_session_boundaries(
                 boundary_output.preview_target_node_ids = []
             session_sources.add(boundary_output.source)
             logger.info(
-                "Keeping remote boundary output in Modal storage source=%s:%d io_type=%s producer_component=%s consumer_components=%s local_materializer=%s local_consumers=%s.",
+                "Keeping remote boundary output in provider-local storage source=%s:%d io_type=%s provider=%s producer_component=%s consumer_components=%s local_materializer=%s local_consumers=%s.",
                 boundary_output.source.node_id,
                 boundary_output.source.output_index,
                 boundary_output.io_type,
+                producer_assignment.provider.value,
                 component.representative_node_id,
                 sorted(
                     {
@@ -5459,7 +5478,7 @@ def _remote_session_component_ids(
     components: list[RemoteComponentPlan],
     session_sources: set[LinkedOutputRef],
 ) -> set[str]:
-    """Return components that produce or consume Modal-backed boundary refs."""
+    """Return components that produce or consume provider-local boundary refs."""
     return {
         component.representative_node_id
         for component in components
