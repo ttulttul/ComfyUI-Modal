@@ -96,6 +96,24 @@ const PROGRESS_FADE_MS = 900;
 const REFOCUS_STALE_PROMPT_GRACE_MS = 30000;
 const MODAL_ANIMATION_FRAME_INTERVAL_MS = 100;
 const ITERATION_RATE_SMOOTHING_FACTOR = 0.35;
+const BYTE_PROGRESS_UNITS = new Set([
+  "b",
+  "byte",
+  "bytes",
+  "b/s",
+  "byte/s",
+  "bytes/s",
+]);
+const BYTE_RATE_UNITS = Object.freeze([
+  "B/s",
+  "KB/s",
+  "MB/s",
+  "GB/s",
+  "TB/s",
+  "PB/s",
+  "EB/s",
+]);
+const BYTE_RATE_SCALE = 1000;
 const CONTAINER_STATUS_FAST_POLL_MS = 1500;
 const CONTAINER_STATUS_STABLE_POLL_MS = 5000;
 const CONTAINER_STATUS_HIDDEN_POLL_MS = 15000;
@@ -287,6 +305,22 @@ function progressIterationRate(previousState, value, maxValue, updatedAt) {
 }
 
 /**
+ * Format raw bytes per second with a compact decimal transfer-rate unit.
+ * @param {number} bytesPerSecond
+ * @returns {string}
+ */
+function formatByteRate(bytesPerSecond) {
+  let scaledRate = bytesPerSecond;
+  let unitIndex = 0;
+  while (scaledRate >= BYTE_RATE_SCALE && unitIndex < BYTE_RATE_UNITS.length - 1) {
+    scaledRate /= BYTE_RATE_SCALE;
+    unitIndex += 1;
+  }
+  const fractionDigits = scaledRate < 10 ? 2 : scaledRate < 100 ? 1 : 0;
+  return `${scaledRate.toFixed(fractionDigits)} ${BYTE_RATE_UNITS[unitIndex]}`;
+}
+
+/**
  * Format a progress rate for the compact label over a node progress bar.
  * @param {number | null | undefined} iterationRate
  * @param {string | null | undefined} unit
@@ -294,9 +328,15 @@ function progressIterationRate(previousState, value, maxValue, updatedAt) {
  */
 function formatIterationRate(iterationRate, unit = null) {
   const safeRate = iterationRate == null ? Number.NaN : Number(iterationRate);
-  const rateUnit = unit === "tokens" ? "tok/s" : "it/s";
+  const normalizedUnit = String(unit ?? "").trim().toLowerCase();
+  const isByteRate = BYTE_PROGRESS_UNITS.has(normalizedUnit);
+  const rateUnit =
+    normalizedUnit === "tokens" ? "tok/s" : isByteRate ? "B/s" : "it/s";
   if (!Number.isFinite(safeRate) || safeRate < 0) {
     return `— ${rateUnit}`;
+  }
+  if (isByteRate) {
+    return formatByteRate(safeRate);
   }
   const fractionDigits = safeRate < 10 ? 2 : safeRate < 100 ? 1 : 0;
   return `${safeRate.toFixed(fractionDigits)} ${rateUnit}`;

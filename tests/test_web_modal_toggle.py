@@ -502,7 +502,10 @@ def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
         "function setNodeProgress(nodeIdValue, promptId, value, maxValue, metadata = {})"
         in source
     )
-    assert 'unit === "tokens" ? "tok/s" : "it/s"' in source
+    assert '"KB/s",' in source
+    assert '"TB/s",' in source
+    assert "function formatByteRate(bytesPerSecond)" in source
+    assert "BYTE_PROGRESS_UNITS.has(normalizedUnit)" in source
     assert "timeToFirstTokenSeconds" in source
     assert "if (state.progress.indeterminate) {" in source
     assert "preGpu: Boolean(metadata.pre_gpu)" in source

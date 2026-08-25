@@ -637,6 +637,15 @@ assert.equal(modalToggle.modalNodeProgress.get("20")?.iterationRate, 2.7);
 assert.equal(modalToggle.formatIterationRate(2.7), "2.70 it/s");
 assert.equal(modalToggle.formatIterationRate(42.34), "42.3 it/s");
 assert.equal(modalToggle.formatIterationRate(null), "— it/s");
+assert.equal(modalToggle.formatIterationRate(875, "B"), "875 B/s");
+assert.equal(modalToggle.formatIterationRate(1_500, "bytes"), "1.50 KB/s");
+assert.equal(modalToggle.formatIterationRate(12_345_678, "byte"), "12.3 MB/s");
+assert.equal(modalToggle.formatIterationRate(1_500_000_000, "B/s"), "1.50 GB/s");
+assert.equal(
+  modalToggle.formatIterationRate(2_500_000_000_000, "bytes/s"),
+  "2.50 TB/s",
+);
+assert.equal(modalToggle.formatIterationRate(null, "bytes"), "— B/s");
 
 progressClockMs = 4_000;
 resetFrontendState();
