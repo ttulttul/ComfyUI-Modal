@@ -123,6 +123,8 @@ const transformedSource = `${[
   "  registerPromptConfigurator,",
   "  registerRemoteConfiguratorPlan,",
   "  updateRemoteConfiguratorEnvironmentStatus,",
+  "  historyPromptTerminalOutcome,",
+  "  clearRefocusCompletedPrompt,",
   "  mountRemoteExecutionConfiguratorPanel,",
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
@@ -1627,3 +1629,33 @@ modalToggle.registerPromptConfigurator("newer-prompt", "381");
 assert.equal(retainedPanel.promptId, "newer-prompt");
 modalToggle.registerPromptConfigurator("plan-before-capacity", "381");
 assert.equal(retainedPanel.promptId, "newer-prompt");
+
+const failedHistoryOutcome = modalToggle.historyPromptTerminalOutcome(
+  {
+    "newer-prompt": {
+      status: {
+        status_str: "error",
+        completed: false,
+        messages: [[
+          "execution_error",
+          { exception_message: "SSH worker has no GPU" },
+        ]],
+      },
+    },
+  },
+  "newer-prompt",
+);
+assert.deepEqual(failedHistoryOutcome, {
+  terminalPhase: "execution_error",
+  displayPhase: "error",
+  message: "SSH worker has no GPU",
+});
+assert.equal(
+  modalToggle.modalPromptStates.get("newer-prompt").configuratorNodeId,
+  "381",
+);
+assert.equal(retainedPanel.promptId, "newer-prompt");
+modalToggle.clearRefocusCompletedPrompt("newer-prompt", failedHistoryOutcome);
+assert.equal(retainedPanel.statusText.textContent, "SSH worker has no GPU");
+assert.equal(retainedPanel.root.dataset.phase, "error");
+assert.equal(modalToggle.modalPromptStates.has("newer-prompt"), false);

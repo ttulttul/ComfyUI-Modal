@@ -86,7 +86,10 @@ def test_conflicting_worker_launch_adopts_current_managed_winner(
         host=SimpleNamespace(
             environment_id="lambda",
             ssh_target="lambda",
-            capabilities=None,
+            capabilities=SimpleNamespace(
+                gpus=(SimpleNamespace(uuid="GPU-one"),),
+                nvidia_container_runtime=True,
+            ),
             docker_env_file=None,
         ),
         docker=docker,
@@ -326,6 +329,27 @@ def test_worker_indices_are_distributed_across_discovered_gpus(
     assert manager._gpu_arguments(0) == ("--gpus", "device=GPU-one")
     assert manager._gpu_arguments(1) == ("--gpus", "device=GPU-two")
     assert manager._gpu_arguments(2) == ("--gpus", "device=GPU-one")
+
+
+def test_worker_launch_refuses_missing_gpu_capabilities(
+    ssh_runtime_module: Any,
+    ssh_docker_module: Any,
+) -> None:
+    """A missing probe must fail instead of silently launching a CPU container."""
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(
+            host=SimpleNamespace(capabilities=None),
+        ),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+
+    try:
+        manager._gpu_arguments(0)
+    except ssh_docker_module.SshDockerError as exc:
+        assert "requires probed GPU capabilities" in str(exc)
+    else:
+        raise AssertionError("Missing GPU capabilities should fail worker launch.")
 
 
 def test_stale_worker_reconciliation_only_replaces_the_same_slot(

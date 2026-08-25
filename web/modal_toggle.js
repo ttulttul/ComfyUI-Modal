@@ -1299,7 +1299,9 @@ function refreshGlobalStatusElement() {
     element.dataset.phase = activeState.phase;
     element.dataset.modalGpu = activeState.modalGpu ?? "";
     stopModalContainerStatusPolling();
-    renderRemoteConfiguratorStatus(configuratorPanel, activeState);
+    if (configuratorPanel.promptId === activeState.promptId) {
+      renderRemoteConfiguratorStatus(configuratorPanel, activeState);
+    }
     return;
   }
 
@@ -1786,19 +1788,74 @@ function promptIdsFromQueuePayload(queuePayload) {
 }
 
 /**
- * Return whether one ComfyUI history response contains a prompt id.
+ * Return the retained ComfyUI history record for one prompt.
  * @param {any} historyPayload
  * @param {string} promptId
- * @returns {boolean}
+ * @returns {Record<string, any> | null}
  */
-function historyPayloadHasPrompt(historyPayload, promptId) {
+function historyPromptRecord(historyPayload, promptId) {
   if (!historyPayload || typeof historyPayload !== "object") {
-    return false;
+    return null;
   }
-  if (Object.prototype.hasOwnProperty.call(historyPayload, promptId)) {
-    return true;
+  const keyedRecord = historyPayload[promptId];
+  if (keyedRecord && typeof keyedRecord === "object") {
+    return keyedRecord;
   }
-  return String(historyPayload.prompt_id ?? "") === promptId;
+  return String(historyPayload.prompt_id ?? "") === promptId ? historyPayload : null;
+}
+
+/**
+ * Resolve a durable terminal phase and message from one ComfyUI history record.
+ * @param {any} historyPayload
+ * @param {string} promptId
+ * @returns {{ terminalPhase: string, displayPhase: string, message: string } | null}
+ */
+function historyPromptTerminalOutcome(historyPayload, promptId) {
+  const record = historyPromptRecord(historyPayload, promptId);
+  if (!record) {
+    return null;
+  }
+  const status = record.status && typeof record.status === "object" ? record.status : {};
+  const messages = Array.isArray(status.messages) ? status.messages : [];
+  for (const messageRecord of [...messages].reverse()) {
+    if (!Array.isArray(messageRecord) || messageRecord.length < 2) {
+      continue;
+    }
+    const eventName = String(messageRecord[0] ?? "");
+    const detail = messageRecord[1] && typeof messageRecord[1] === "object"
+      ? messageRecord[1]
+      : {};
+    if (eventName === "execution_error") {
+      return {
+        terminalPhase: "execution_error",
+        displayPhase: STATE_ERROR,
+        message: String(
+          detail.exception_message ?? detail.error_message ?? "Remote workflow failed",
+        ).trim(),
+      };
+    }
+    if (eventName === "execution_interrupted") {
+      return {
+        terminalPhase: "execution_interrupted",
+        displayPhase: STATE_ERROR,
+        message: String(
+          detail.exception_message ?? detail.error_message ?? "Remote workflow interrupted",
+        ).trim(),
+      };
+    }
+  }
+  if (String(status.status_str ?? "").toLowerCase() === "error") {
+    return {
+      terminalPhase: "execution_error",
+      displayPhase: STATE_ERROR,
+      message: "Remote workflow failed",
+    };
+  }
+  return {
+    terminalPhase: "execution_success",
+    displayPhase: STATE_COMPLETE,
+    message: "Remote workflow complete",
+  };
 }
 
 /**
@@ -1820,10 +1877,15 @@ async function fetchComfyJson(route) {
 /**
  * Clear refocus-stale Modal visuals once ComfyUI reports a prompt has finished.
  * @param {string} promptId
- * @param {string} phase
+ * @param {{ terminalPhase: string, displayPhase: string, message: string }} outcome
  */
-function clearRefocusCompletedPrompt(promptId, phase) {
-  markPromptTerminal(promptId, phase);
+function clearRefocusCompletedPrompt(promptId, outcome) {
+  setRemoteConfiguratorTerminalStatus(
+    promptId,
+    outcome.displayPhase,
+    outcome.message,
+  );
+  markPromptTerminal(promptId, outcome.terminalPhase);
   endSyntheticExecutionUi(promptId);
   clearGlobalStatusPhase(promptId);
   clearPromptRemoteStates(promptId);
@@ -1851,10 +1913,15 @@ async function reconcileModalUiAfterVisibilityChange() {
     const historyPayload = await fetchComfyJson(
       `${COMFY_HISTORY_ROUTE}/${encodeURIComponent(promptId)}`,
     );
-    if (historyPayloadHasPrompt(historyPayload, promptId)) {
-      clearRefocusCompletedPrompt(promptId, "execution_success");
+    const historyOutcome = historyPromptTerminalOutcome(historyPayload, promptId);
+    if (historyOutcome) {
+      clearRefocusCompletedPrompt(promptId, historyOutcome);
     } else if (promptUiStateAgeMs(promptId) > REFOCUS_STALE_PROMPT_GRACE_MS) {
-      clearRefocusCompletedPrompt(promptId, "stale_refocus_cleanup");
+      clearRefocusCompletedPrompt(promptId, {
+        terminalPhase: "stale_refocus_cleanup",
+        displayPhase: STATE_ERROR,
+        message: "Remote workflow is no longer running",
+      });
     }
   }
 }
@@ -3667,7 +3734,11 @@ function refreshRemoteConfiguratorPanelForPrompt(promptId) {
  */
 function setRemoteConfiguratorTerminalStatus(promptId, phase, message = null) {
   const promptState = modalPromptStates.get(promptId);
-  const panel = remoteConfiguratorPanel(promptState?.configuratorNodeId);
+  const panel =
+    remoteConfiguratorPanel(promptState?.configuratorNodeId) ??
+    Array.from(remoteConfiguratorPanels.values()).find(
+      (candidate) => candidate?.promptId === promptId,
+    );
   if (!panel || panel.promptId !== promptId) {
     return;
   }

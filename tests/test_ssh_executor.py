@@ -29,6 +29,11 @@ def test_runtime_uses_workflow_host_snapshot_without_global_registry(
             """Record the host passed to the controller."""
             observed["host"] = configured_host
 
+        def probe_capabilities(self) -> None:
+            """Record the compatibility reprobe for a legacy host snapshot."""
+            observed["probed"] = True
+            return None
+
     class FakeManager:
         """Capture the requested worker slot."""
 
@@ -58,6 +63,7 @@ def test_runtime_uses_workflow_host_snapshot_without_global_registry(
     )
 
     assert observed["host"] == host
+    assert observed["probed"] is True
     assert observed["worker_index"] == 1
     assert spec.worker_index == 1
 

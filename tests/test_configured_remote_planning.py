@@ -322,7 +322,19 @@ def test_workflow_ssh_configuration_is_probed_and_carried_into_execution_metadat
     assert assignment.configuration_id == "lambda"
     assert metadata is not None
     assert metadata["ssh_host_config"]["ssh_target"] == "lambda"
-    assert metadata["ssh_host_config"]["capabilities"] is None
+    assert metadata["ssh_host_config"]["capabilities"]["gpus"] == [
+        {
+            "uuid": "gpu-SSH GPU",
+            "name": "SSH GPU",
+            "total_vram_bytes": 96 * 1024**3,
+            "free_vram_bytes": None,
+            "compute_capability": None,
+            "driver_version": None,
+        }
+    ]
+    assert metadata["ssh_host_config"]["capabilities"][
+        "nvidia_container_runtime"
+    ] is True
     assert metadata["ssh_host_config"]["health"] == "unknown"
 
 

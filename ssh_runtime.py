@@ -443,8 +443,18 @@ class SshRuntimeManager:
     def _gpu_arguments(self, worker_index: int) -> tuple[str, ...]:
         """Return Docker GPU-selection arguments for this worker."""
         capabilities = self.controller.host.capabilities
-        if capabilities is None or not capabilities.gpus:
-            return ()
+        if capabilities is None:
+            raise SshDockerError(
+                "SSH worker launch requires probed GPU capabilities."
+            )
+        if not capabilities.gpus:
+            raise SshDockerError(
+                "SSH worker launch requires at least one discovered NVIDIA GPU."
+            )
+        if not capabilities.nvidia_container_runtime:
+            raise SshDockerError(
+                "SSH worker launch requires the NVIDIA container runtime."
+            )
         gpu = capabilities.gpus[worker_index % len(capabilities.gpus)]
         return ("--gpus", f"device={gpu.uuid}")
 

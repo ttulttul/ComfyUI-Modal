@@ -1972,7 +1972,6 @@ def _configured_provider_metadata(
         host = execution_plan.ssh_hosts_by_id[configuration.configuration_id]
         portable_host = replace(
             host,
-            capabilities=None,
             health=EnvironmentHealth.UNKNOWN,
             last_error=None,
         )

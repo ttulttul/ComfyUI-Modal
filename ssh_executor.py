@@ -7,7 +7,7 @@ import logging
 import subprocess
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -503,9 +503,24 @@ class SshDockerExecutorClient:
             raise SshRemoteInvocationError(
                 f"SSH execution environment {environment_id!r} is not accepting work."
             )
+        controller = SshDockerController(host)
+        if host.capabilities is None:
+            logger.info(
+                "Reprobing SSH execution capabilities missing from the queued host "
+                "snapshot environment=%s.",
+                environment_id,
+            )
+            try:
+                host = replace(host, capabilities=controller.probe_capabilities())
+            except (OSError, SshDockerError, ValueError) as exc:
+                raise SshRemoteInvocationError(
+                    f"Unable to refresh SSH execution capabilities for "
+                    f"{environment_id!r}: {exc}"
+                ) from exc
+            controller = SshDockerController(host)
         resolved_settings = self.settings or get_settings()
         manager = SshRuntimeManager(
-            controller=SshDockerController(host),
+            controller=controller,
             repo_root=self.repo_root,
             settings=resolved_settings,
         )

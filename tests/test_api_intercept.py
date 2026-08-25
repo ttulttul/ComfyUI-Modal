@@ -5918,6 +5918,73 @@ def test_environment_setup_status_callback_preserves_environment_identity(
     ]
 
 
+def test_workflow_ssh_metadata_preserves_probed_gpu_capabilities(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+    remote_configurations_module: Any,
+    remote_hosts_module: Any,
+) -> None:
+    """Queued SSH workers must retain the GPU snapshot used for placement."""
+    environment_module = execution_environments_module
+    capabilities = environment_module.EnvironmentCapabilities(
+        architecture="x86_64",
+        operating_system="linux",
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+        available_ram_bytes=48 * 1024**3,
+        available_disk_bytes=1024**4,
+        docker_version="28.0.0",
+        docker_rootless=False,
+        nvidia_container_runtime=True,
+        gpus=(
+            environment_module.GpuCapability(
+                "GPU-4090",
+                "RTX 4090",
+                24 * 1024**3,
+            ),
+        ),
+    )
+    host = remote_hosts_module.SshHostConfig(
+        environment_id="lambda",
+        display_name="Lambda",
+        ssh_target="lambda",
+        capabilities=capabilities,
+        health=environment_module.EnvironmentHealth.READY,
+        last_error="stale diagnostic",
+    )
+    configuration = remote_configurations_module.SshRemoteConfiguration(
+        configuration_id="lambda",
+        display_name="Lambda",
+        host=host,
+    )
+    assignment = environment_module.ExecutionAssignment(
+        environment_id="lambda",
+        provider=environment_module.ExecutionProvider.SSH_DOCKER,
+        predicted_cost_usd=0.0,
+        predicted_completion_seconds=60.0,
+        configuration_id="lambda",
+    )
+    execution_plan = api_intercept_module.ComponentExecutionPlan(
+        assignments={"367": assignment},
+        configurations_by_id={"lambda": configuration},
+        ssh_hosts_by_id={"lambda": host},
+    )
+
+    metadata = api_intercept_module._configured_provider_metadata(
+        execution_plan=execution_plan,
+        assignment=assignment,
+        vast_leases_by_environment={},
+    )
+
+    assert metadata is not None
+    queued_host = remote_hosts_module.SshHostConfig.from_dict(
+        metadata["ssh_host_config"]
+    )
+    assert queued_host.capabilities == capabilities
+    assert queued_host.health is environment_module.EnvironmentHealth.UNKNOWN
+    assert queued_host.last_error is None
+
+
 def test_modal_ui_event_replay_is_client_scoped(api_intercept_module: Any) -> None:
     """Refocus replay should only return events for the requesting ComfyUI client."""
     api_intercept_module._MODAL_UI_EVENTS_BY_CLIENT.clear()

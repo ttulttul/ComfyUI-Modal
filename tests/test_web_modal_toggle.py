@@ -787,8 +787,9 @@ def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
     assert "for (const laneState of modalNodeProgressLanes.values())" in source
     assert "for (const batchState of modalNodeBatchProgress.values())" in source
     assert "function promptIdsFromQueuePayload(queuePayload)" in source
-    assert "function historyPayloadHasPrompt(historyPayload, promptId)" in source
-    assert "function clearRefocusCompletedPrompt(promptId, phase)" in source
+    assert "function historyPromptTerminalOutcome(historyPayload, promptId)" in source
+    assert "function clearRefocusCompletedPrompt(promptId, outcome)" in source
+    assert "configuratorPanel.promptId === activeState.promptId" in source
     assert "function clearPromptProgressStates(promptId)" in source
     assert "clearPromptProgressStates(promptId);" in source
     assert "stopAnimationLoopIfIdle();" in source
@@ -799,8 +800,8 @@ def test_modal_ui_refreshes_after_visibility_or_focus_returns() -> None:
     assert "fetchComfyJson(COMFY_QUEUE_ROUTE)" in source
     assert "queuedPromptIds.has(promptId)" in source
     assert "`${COMFY_HISTORY_ROUTE}/${encodeURIComponent(promptId)}`" in source
-    assert 'clearRefocusCompletedPrompt(promptId, "execution_success");' in source
-    assert 'clearRefocusCompletedPrompt(promptId, "stale_refocus_cleanup");' in source
+    assert "clearRefocusCompletedPrompt(promptId, historyOutcome);" in source
+    assert 'message: "Remote workflow is no longer running"' in source
     assert ".then(() => reconcileModalUiAfterVisibilityChange())" in source
     assert "handleModalStatus({ detail: payload });" in source
     assert "handleModalProgress({ detail: payload });" in source
