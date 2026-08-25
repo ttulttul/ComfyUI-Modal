@@ -6488,6 +6488,72 @@ def test_remote_preparation_bridge_exposes_work_to_all_queue_views(
     assert queue_update_counts == [1, 1]
 
 
+def test_queued_ssh_environment_ids_reads_earlier_prompt_assignments(
+    api_intercept_module: Any,
+) -> None:
+    """Queue-time planning should recognize SSH hosts owned by earlier prompts."""
+
+    def assignment(provider: str, environment_id: str) -> dict[str, str]:
+        """Return minimal serialized placement metadata."""
+        return {
+            "provider": provider,
+            "environment_id": environment_id,
+        }
+    prompt_server = SimpleNamespace(
+        prompt_queue=SimpleNamespace(
+            get_current_queue=lambda: (
+                [
+                    (
+                        1,
+                        "prompt-running",
+                        {},
+                        {
+                            "remote_execution": {
+                                "assignments": {
+                                    "257": assignment("ssh_docker", "lambda")
+                                }
+                            }
+                        },
+                    )
+                ],
+                [
+                    (
+                        2,
+                        "prompt-current",
+                        {},
+                        {
+                            "remote_execution": {
+                                "assignments": {
+                                    "300": assignment("ssh_docker", "ignored")
+                                }
+                            }
+                        },
+                    ),
+                    (
+                        3,
+                        "prompt-modal",
+                        {},
+                        {
+                            "remote_execution": {
+                                "assignments": {
+                                    "400": assignment("modal", "modal:H100")
+                                }
+                            }
+                        },
+                    ),
+                ],
+            )
+        )
+    )
+
+    environment_ids = api_intercept_module._queued_ssh_environment_ids(
+        prompt_server,
+        excluding_prompt_id="prompt-current",
+    )
+
+    assert environment_ids == frozenset({"lambda"})
+
+
 def test_remote_preparation_bridge_clears_failed_submission(
     api_intercept_module: Any,
 ) -> None:

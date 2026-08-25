@@ -1320,6 +1320,7 @@ def _plan_component_execution(
     status_callback: SetupStatusCallback | None = None,
     environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
+    occupied_environment_ids: frozenset[str] = frozenset(),
 ) -> ComponentExecutionPlan:
     """Plan through connected configurations or synthesize the legacy behavior."""
     try:
@@ -1345,6 +1346,7 @@ def _plan_component_execution(
         status_callback=status_callback,
         environment_status_callback=environment_status_callback,
         plan_callback=plan_callback,
+        occupied_environment_ids=occupied_environment_ids,
     )
 
 
@@ -1358,6 +1360,7 @@ def _plan_configured_component_execution(
     status_callback: SetupStatusCallback | None = None,
     environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
+    occupied_environment_ids: frozenset[str] = frozenset(),
 ) -> ComponentExecutionPlan:
     """Resolve and prepare a capacity-aware plan from connected configurations."""
     configurations_by_id = {
@@ -1387,6 +1390,7 @@ def _plan_configured_component_execution(
         ssh_hosts_by_id=ssh_hosts_by_id,
         vast_service=vast_service,
         vast_unavailable_reason=vast_unavailable_reason,
+        occupied_environment_ids=occupied_environment_ids,
     )
     _apply_historical_execution_estimates(
         components=components,
@@ -1410,6 +1414,15 @@ def _plan_configured_component_execution(
         )
     except NoCompatibleExecutionEnvironmentError as exc:
         raise ModalPromptValidationError(str(exc)) from exc
+
+    for component_id, assignment in tuple(assignments.items()):
+        if assignment.environment_id not in occupied_environment_ids:
+            continue
+        assignments[component_id] = replace(
+            assignment,
+            reasons=assignment.reasons
+            + ("capacity available after the earlier workflow completes",),
+        )
 
     safe_configurations = _safe_remote_configuration_payload(configuration_set)
     if plan_callback is not None:
@@ -1656,6 +1669,7 @@ def _configured_candidate_environments(
     ssh_hosts_by_id: Mapping[str, SshHostConfig],
     vast_service: VastService | None,
     vast_unavailable_reason: str | None,
+    occupied_environment_ids: frozenset[str] = frozenset(),
 ) -> tuple[
     dict[str, list[EnvironmentSchedulingState]],
     dict[tuple[str, str], VastProfileQuote],
@@ -1674,6 +1688,7 @@ def _configured_candidate_environments(
                 ssh_hosts_by_id=ssh_hosts_by_id,
                 vast_service=vast_service,
                 vast_unavailable_reason=vast_unavailable_reason,
+                occupied_environment_ids=occupied_environment_ids,
             )
             if state is not None:
                 candidates[component_id].append(state)
@@ -1725,17 +1740,26 @@ def _configured_candidate_environment(
     ssh_hosts_by_id: Mapping[str, SshHostConfig],
     vast_service: VastService | None,
     vast_unavailable_reason: str | None,
+    occupied_environment_ids: frozenset[str] = frozenset(),
 ) -> tuple[EnvironmentSchedulingState | None, VastProfileQuote | None]:
     """Resolve one configuration as a candidate for one component."""
     if isinstance(configuration, ModalRemoteConfiguration):
         return _modal_configuration_environment_state(configuration, settings), None
     if isinstance(configuration, SshRemoteConfiguration):
         host = ssh_hosts_by_id[configuration.configuration_id]
-        return replace(
+        state = replace(
             host.scheduling_state(),
             configuration_id=configuration.configuration_id,
             display_name=configuration.display_name,
-        ), None
+        )
+        if state.environment_id in occupied_environment_ids:
+            state = _maximum_capacity_state(state)
+            logger.info(
+                "Planning queued work against reclaimable SSH capacity "
+                "environment=%s because an earlier workflow owns that host.",
+                state.environment_id,
+            )
+        return state, None
     if not isinstance(configuration, VastRemoteConfiguration):
         raise TypeError(
             f"Unsupported remote configuration type {type(configuration).__name__}."
@@ -7434,6 +7458,7 @@ def rewrite_prompt_for_modal(
     environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
     cancellation_check: Callable[[], bool] | None = None,
+    occupied_environment_ids: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Rewrite connected remote components into Modal proxy nodes."""
     if cancellation_check is not None and cancellation_check():
@@ -7496,6 +7521,7 @@ def rewrite_prompt_for_modal(
         status_callback=status_callback,
         environment_status_callback=environment_status_callback,
         plan_callback=plan_callback,
+        occupied_environment_ids=occupied_environment_ids,
     )
     assignments_by_component_id = execution_plan.assignments
     if execution_plan.configuration_set is not None:
@@ -7972,6 +7998,7 @@ async def rewrite_prompt_for_modal_async(
     environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
     cancellation_check: Callable[[], bool] | None = None,
+    occupied_environment_ids: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], RewriteSummary]:
     """Prepare one Modal prompt without blocking ComfyUI's event loop."""
     return await asyncio.to_thread(
@@ -7986,6 +8013,7 @@ async def rewrite_prompt_for_modal_async(
         environment_status_callback=environment_status_callback,
         plan_callback=plan_callback,
         cancellation_check=cancellation_check,
+        occupied_environment_ids=occupied_environment_ids,
     )
 
 
@@ -8476,6 +8504,52 @@ def _queue_item_prompt_ids(items: Iterable[Any]) -> set[str]:
         for item in items
         if isinstance(item, (list, tuple)) and len(item) > 1
     }
+
+
+def _queued_ssh_environment_ids(
+    prompt_server: Any,
+    *,
+    excluding_prompt_id: str | None = None,
+) -> frozenset[str]:
+    """Return SSH environments reserved by prompts already in ComfyUI's queue."""
+    prompt_queue = getattr(prompt_server, "prompt_queue", None)
+    get_current_queue = getattr(prompt_queue, "get_current_queue", None)
+    if not callable(get_current_queue):
+        return frozenset()
+    queue_state = get_current_queue()
+    if not isinstance(queue_state, (list, tuple)) or len(queue_state) != 2:
+        return frozenset()
+    running, queued = queue_state
+    queue_items = [
+        item
+        for collection in (running, queued)
+        if isinstance(collection, (list, tuple))
+        for item in collection
+    ]
+    environment_ids: set[str] = set()
+    for item in queue_items:
+        if not isinstance(item, (list, tuple)) or len(item) <= 3:
+            continue
+        prompt_id = str(item[1]) if len(item) > 1 else ""
+        if excluding_prompt_id is not None and prompt_id == excluding_prompt_id:
+            continue
+        extra_data = item[3]
+        if not isinstance(extra_data, Mapping):
+            continue
+        remote_execution = extra_data.get("remote_execution")
+        if not isinstance(remote_execution, Mapping):
+            continue
+        assignments = remote_execution.get("assignments")
+        if not isinstance(assignments, Mapping):
+            continue
+        for assignment in assignments.values():
+            if not isinstance(assignment, Mapping):
+                continue
+            provider = str(assignment.get("provider") or "").strip().lower()
+            environment_id = str(assignment.get("environment_id") or "").strip()
+            if provider == ExecutionProvider.SSH_DOCKER.value and environment_id:
+                environment_ids.add(environment_id)
+    return frozenset(environment_ids)
 
 
 def _set_remote_preparation(
@@ -9237,6 +9311,16 @@ def setup_modal_queue_route(
             if "prompt" in json_data:
                 emit_setup_status("Preparing remote workflow")
                 rewrite_started_at = time.perf_counter()
+                occupied_environment_ids = _queued_ssh_environment_ids(
+                    prompt_server,
+                    excluding_prompt_id=prompt_id,
+                )
+                if occupied_environment_ids:
+                    logger.info(
+                        "Queued workflow may reuse SSH capacity after earlier "
+                        "prompts finish environments=%s.",
+                        sorted(occupied_environment_ids),
+                    )
                 rewritten_prompt, summary = await rewrite_prompt_for_modal_async(
                     prompt=json_data["prompt"],
                     workflow=workflow,
@@ -9247,6 +9331,7 @@ def setup_modal_queue_route(
                     environment_status_callback=emit_environment_setup_status,
                     plan_callback=emit_execution_plan,
                     cancellation_check=preparation_cancellation.is_set,
+                    occupied_environment_ids=occupied_environment_ids,
                 )
                 selected_modal_gpus = _selected_modal_gpus(
                     summary,

@@ -5,6 +5,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 
 class _RemoteImageNode:
     """Minimal remote image producer used by rewrite integration coverage."""
@@ -336,6 +338,90 @@ def test_workflow_ssh_configuration_is_probed_and_carried_into_execution_metadat
         "nvidia_container_runtime"
     ] is True
     assert metadata["ssh_host_config"]["health"] == "unknown"
+
+
+def test_queued_workflow_uses_nameplate_capacity_of_occupied_ssh_host(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+    remote_configuration_nodes_module: Any,
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A later prompt should admit capacity that its earlier prompt will release."""
+    api = api_intercept_module
+    environment_module = execution_environments_module
+    nodes = remote_configuration_nodes_module
+    busy_capabilities = _capabilities(environment_module, "Busy SSH GPU")
+    busy_capabilities = api.replace(
+        busy_capabilities,
+        gpus=tuple(
+            api.replace(gpu, free_vram_bytes=11 * 1024**3)
+            for gpu in busy_capabilities.gpus
+        ),
+    )
+
+    def probe(configuration: Any) -> Any:
+        """Report low live VRAM on the workflow-owned SSH host."""
+        return api.replace(
+            configuration.host,
+            capabilities=busy_capabilities,
+            health=environment_module.EnvironmentHealth.READY,
+        )
+
+    requirements = {
+        "1": environment_module.ComponentResourceRequirements(
+            minimum_vram_bytes=16 * 1024**3,
+            gpu_required=True,
+            architecture="x86_64",
+            required_provider=environment_module.ExecutionProvider.SSH_DOCKER,
+        )
+    }
+    monkeypatch.setattr(api, "_probe_workflow_ssh_configuration", probe)
+    monkeypatch.setattr(
+        api,
+        "_configured_component_requirements",
+        lambda **_kwargs: requirements,
+    )
+    monkeypatch.setattr(api, "_execution_history", lambda _settings: None)
+    prompt = {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "30": {
+            "class_type": nodes.SSH_REMOTE_CONFIGURATION_NODE_ID,
+            "inputs": {
+                "environment_id": "lambda",
+                "display_name": "Lambda GPU",
+                "ssh_target": "lambda",
+                "maximum_workers": 1,
+            },
+        },
+        "99": {
+            "class_type": nodes.REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
+            "inputs": {"configuration_0": ["30", 0]},
+        },
+    }
+
+    with pytest.raises(api.ModalPromptValidationError, match="insufficient GPU VRAM"):
+        api._plan_component_execution(
+            components=[_component(api, "1")],
+            prompt=prompt,
+            workflow=None,
+            settings=settings_module.get_settings(),
+        )
+
+    plan = api._plan_component_execution(
+        components=[_component(api, "1")],
+        prompt=prompt,
+        workflow=None,
+        settings=settings_module.get_settings(),
+        occupied_environment_ids=frozenset({"lambda"}),
+    )
+
+    assignment = plan.assignments["1"]
+    assert assignment.environment_id == "lambda"
+    assert (
+        "capacity available after the earlier workflow completes"
+        in assignment.reasons
+    )
 
 
 def test_rewrite_stamps_selected_modal_configuration_on_proxy_payload(
