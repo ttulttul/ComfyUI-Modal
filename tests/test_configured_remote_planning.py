@@ -383,6 +383,12 @@ def test_queued_workflow_uses_nameplate_capacity_of_occupied_ssh_host(
         lambda **_kwargs: requirements,
     )
     monkeypatch.setattr(api, "_execution_history", lambda _settings: None)
+    reclaim_attempts: list[str] = []
+    monkeypatch.setattr(
+        api,
+        "_remove_idle_ssh_workers_for_reclaim",
+        lambda host: reclaim_attempts.append(host.environment_id) or (),
+    )
     prompt = {
         "1": {"class_type": "KSampler", "inputs": {}},
         "30": {
@@ -422,6 +428,87 @@ def test_queued_workflow_uses_nameplate_capacity_of_occupied_ssh_host(
         "capacity available after the earlier workflow completes"
         in assignment.reasons
     )
+    assert reclaim_attempts == ["lambda"]
+
+
+def test_configured_planner_reclaims_idle_worker_memory_before_admission(
+    api_intercept_module: Any,
+    execution_environments_module: Any,
+    remote_configuration_nodes_module: Any,
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Cached models in an idle configured worker should not block a new prompt."""
+    api = api_intercept_module
+    environment_module = execution_environments_module
+    nodes = remote_configuration_nodes_module
+    prompt = {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "30": {
+            "class_type": nodes.SSH_REMOTE_CONFIGURATION_NODE_ID,
+            "inputs": {
+                "environment_id": "lambda",
+                "display_name": "Lambda GPU",
+                "ssh_target": "lambda",
+                "maximum_workers": 1,
+            },
+        },
+        "99": {
+            "class_type": nodes.REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
+            "inputs": {"configuration_0": ["30", 0]},
+        },
+    }
+    full_capabilities = _capabilities(environment_module, "Configured SSH GPU")
+    busy_capabilities = api.replace(
+        full_capabilities,
+        gpus=tuple(
+            api.replace(gpu, free_vram_bytes=11 * 1024**3)
+            for gpu in full_capabilities.gpus
+        ),
+    )
+    probe_count = 0
+
+    def probe(configuration: Any) -> Any:
+        """Report busy memory first and full memory after worker removal."""
+        nonlocal probe_count
+        probe_count += 1
+        return api.replace(
+            configuration.host,
+            capabilities=(busy_capabilities if probe_count == 1 else full_capabilities),
+            health=environment_module.EnvironmentHealth.READY,
+        )
+
+    removed_hosts: list[str] = []
+    monkeypatch.setattr(api, "_probe_workflow_ssh_configuration", probe)
+    monkeypatch.setattr(
+        api,
+        "_remove_idle_ssh_workers_for_reclaim",
+        lambda host: removed_hosts.append(host.environment_id) or ("worker-0",),
+    )
+    monkeypatch.setattr(
+        api,
+        "_configured_component_requirements",
+        lambda **_kwargs: {
+            "1": environment_module.ComponentResourceRequirements(
+                minimum_vram_bytes=16 * 1024**3,
+                gpu_required=True,
+                architecture="x86_64",
+                required_provider=environment_module.ExecutionProvider.SSH_DOCKER,
+            )
+        },
+    )
+    monkeypatch.setattr(api, "_execution_history", lambda _settings: None)
+
+    plan = api._plan_component_execution(
+        components=[_component(api, "1")],
+        prompt=prompt,
+        workflow=None,
+        settings=settings_module.get_settings(),
+    )
+
+    assert plan.assignments["1"].environment_id == "lambda"
+    assert removed_hosts == ["lambda"]
+    assert probe_count == 2
 
 
 def test_rewrite_stamps_selected_modal_configuration_on_proxy_payload(

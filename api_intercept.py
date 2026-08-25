@@ -1392,6 +1392,21 @@ def _plan_configured_component_execution(
         vast_unavailable_reason=vast_unavailable_reason,
         occupied_environment_ids=occupied_environment_ids,
     )
+    if _reclaim_idle_configured_ssh_capacity(
+        configuration_set=configuration_set,
+        requirements_by_component=requirements_by_component,
+        ssh_hosts_by_id=ssh_hosts_by_id,
+        occupied_environment_ids=occupied_environment_ids,
+    ):
+        environments_by_component, vast_quotes = _configured_candidate_environments(
+            configuration_set=configuration_set,
+            requirements_by_component=requirements_by_component,
+            settings=settings,
+            ssh_hosts_by_id=ssh_hosts_by_id,
+            vast_service=vast_service,
+            vast_unavailable_reason=vast_unavailable_reason,
+            occupied_environment_ids=occupied_environment_ids,
+        )
     _apply_historical_execution_estimates(
         components=components,
         environments_by_component=environments_by_component,
@@ -1695,6 +1710,55 @@ def _configured_candidate_environments(
             if quote is not None:
                 vast_quotes[(component_id, configuration.configuration_id)] = quote
     return candidates, vast_quotes
+
+
+def _reclaim_idle_configured_ssh_capacity(
+    *,
+    configuration_set: RemoteConfigurationSet,
+    requirements_by_component: Mapping[str, ComponentResourceRequirements],
+    ssh_hosts_by_id: dict[str, SshHostConfig],
+    occupied_environment_ids: frozenset[str],
+) -> bool:
+    """Recycle idle configured workers when only their cached memory blocks work."""
+    scheduler = CostAwareEnvironmentScheduler()
+    reclaimed = False
+    for configuration in configuration_set.capacity_configurations:
+        if not isinstance(configuration, SshRemoteConfiguration):
+            continue
+        host = ssh_hosts_by_id[configuration.configuration_id]
+        if host.environment_id in occupied_environment_ids:
+            continue
+        state = replace(
+            host.scheduling_state(),
+            configuration_id=configuration.configuration_id,
+            display_name=configuration.display_name,
+        )
+        optimistic_state = _maximum_capacity_state(state)
+        reclaimable = any(
+            _optional_scheduler_choice(scheduler, [state], requirements)[0] is None
+            and _optional_scheduler_choice(
+                scheduler,
+                [optimistic_state],
+                requirements,
+            )[0]
+            is not None
+            for requirements in requirements_by_component.values()
+        )
+        if not reclaimable:
+            continue
+        removed_workers = _remove_idle_ssh_workers_for_reclaim(host)
+        if not removed_workers:
+            continue
+        refreshed_host = _probe_workflow_ssh_configuration(configuration)
+        ssh_hosts_by_id[configuration.configuration_id] = refreshed_host
+        reclaimed = True
+        logger.info(
+            "Recycled idle workflow-configured SSH worker(s) environment=%s "
+            "containers=%s and refreshed available memory.",
+            host.environment_id,
+            removed_workers,
+        )
+    return reclaimed
 
 
 def _prefetch_configured_vast_offers(
