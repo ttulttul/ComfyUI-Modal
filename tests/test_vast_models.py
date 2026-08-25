@@ -22,6 +22,7 @@ def test_profile_builds_documented_hard_filter_payload(
         allocated_disk_gb=500.0,
         maximum_hourly_cost_usd=2.5,
         allowed_geolocations=("US", "CA"),
+        excluded_country_codes=("CN", "RU"),
     )
 
     payload = profile.search_payload(limit=12)
@@ -32,15 +33,18 @@ def test_profile_builds_documented_hard_filter_payload(
     assert payload["cpu_ram"] == {"gte": 128 * 1024}
     assert payload["allocated_storage"] == 500.0
     assert payload["dph_total"] == {"lte": 2.5}
-    assert payload["geolocation"] == {"in": ["US", "CA"]}
+    assert payload["geolocation"] == {
+        "in": ["US", "CA"],
+        "notin": ["CN", "RU"],
+    }
     assert payload["order"] == [["dph_total", "asc"]]
     assert profile.environment_id == "vast:17"
 
 
-def test_any_profile_omits_every_optional_marketplace_filter(
+def test_default_profile_excludes_problematic_country_codes(
     vast_models_module: Any,
 ) -> None:
-    """None-backed Any selectors should produce the broadest safe search."""
+    """A broad profile should still avoid countries with unreliable model access."""
     profile = vast_models_module.VastResourceProfile(
         profile_id="any",
         profile_name="any",
@@ -61,8 +65,57 @@ def test_any_profile_omits_every_optional_marketplace_filter(
         "allocated_storage",
         "cuda_max_good",
         "direct_port_count",
+        "geolocation",
         "order",
     }
+    assert payload["geolocation"] == {"notin": ["CN", "RU"]}
+
+
+def test_profile_can_disable_default_country_exclusions(
+    vast_models_module: Any,
+) -> None:
+    """An explicit empty exclusion should restore an unrestricted geo search."""
+    profile = vast_models_module.VastResourceProfile(
+        profile_id="anywhere",
+        profile_name="anywhere",
+        excluded_country_codes=(),
+    )
+
+    assert "geolocation" not in profile.search_payload()
+
+
+def test_offer_in_excluded_country_is_rejected_client_side(
+    vast_models_module: Any,
+) -> None:
+    """Provider results must not bypass an excluded-country marketplace filter."""
+    profile = vast_models_module.VastResourceProfile(
+        profile_id="safe-egress",
+        profile_name="safe-egress",
+    )
+    offer = vast_models_module.VastOffer.from_api(
+        {
+            "id": 42,
+            "gpu_name": "GPU",
+            "num_gpus": 1,
+            "gpu_ram": 96 * 1024,
+            "gpu_total_ram": 96 * 1024,
+            "total_flops": 100,
+            "cpu_ram": 128 * 1024,
+            "cpu_cores_effective": 16,
+            "disk_space": 500,
+            "duration": 30 * 86400,
+            "reliability": 0.999,
+            "dlperf": 50,
+            "inet_down": 1000,
+            "cuda_max_good": 13.0,
+            "direct_port_count": 1,
+            "dph_total": 0.5,
+            "verification": "verified",
+            "geolocation": "Beijing, CN",
+        }
+    )
+
+    assert offer.incompatibility_reason(profile) == "geolocation is excluded"
 
 
 def test_offer_ranking_is_price_first_and_deterministic(
@@ -143,6 +196,7 @@ def test_offer_is_revalidated_after_server_filtering(vast_models_module: Any) ->
         ("maximum_hourly_cost_usd", 0.0),
         ("minimum_reliability", 1.1),
         ("maximum_instances", 0),
+        ("excluded_country_codes", ("CHINA",)),
     ],
 )
 def test_profile_rejects_invalid_or_unsafe_values(

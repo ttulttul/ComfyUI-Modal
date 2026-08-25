@@ -13,12 +13,14 @@ from comfy_api.latest import _io as io
 if __package__:
     from .vast_models import (
         VAST_CONFIG_NODE_ID,
+        VAST_DEFAULT_EXCLUDED_COUNTRY_CODES,
         VAST_DEFAULT_IDLE_RETENTION_HOURS,
         VastResourceProfile,
     )
 else:  # pragma: no cover - direct ComfyUI loading fallback.
     from vast_models import (
         VAST_CONFIG_NODE_ID,
+        VAST_DEFAULT_EXCLUDED_COUNTRY_CODES,
         VAST_DEFAULT_IDLE_RETENTION_HOURS,
         VastResourceProfile,
     )
@@ -178,6 +180,17 @@ class VastAILeaseConfiguration(io.ComfyNode):
                         "codes, such as US, CA."
                     ),
                 ),
+                io.String.Input(
+                    "excluded_country_codes",
+                    default=", ".join(VAST_DEFAULT_EXCLUDED_COUNTRY_CODES),
+                    optional=True,
+                    advanced=True,
+                    tooltip=(
+                        "Comma-separated two-letter country codes to exclude from "
+                        "Vast marketplace searches, such as CN, RU. Leave blank to "
+                        "disable country exclusions."
+                    ),
+                ),
                 io.Int.Input(
                     "maximum_instances",
                     default=1,
@@ -241,6 +254,12 @@ def profile_from_inputs(
         for location in str(inputs.get("allowed_geolocations") or "").split(",")
         if location.strip() and not _is_any(location)
     )
+    excluded_country_codes = _excluded_country_codes(
+        inputs.get(
+            "excluded_country_codes",
+            ", ".join(VAST_DEFAULT_EXCLUDED_COUNTRY_CODES),
+        )
+    )
     return VastResourceProfile(
         profile_id=str(profile_id).strip(),
         profile_name=str(inputs.get("profile_name") or "vast-default").strip(),
@@ -290,8 +309,21 @@ def profile_from_inputs(
         ),
         verified_only=_verified_only(inputs.get("verified_hosts_only")),
         allowed_geolocations=locations,
+        excluded_country_codes=excluded_country_codes,
         maximum_instances=int(inputs.get("maximum_instances", 1)),
     )
+
+
+def _excluded_country_codes(value: Any) -> tuple[str, ...]:
+    """Normalize a comma-separated list of unique ISO-style country codes."""
+    country_codes: list[str] = []
+    for raw_country_code in str(value or "").split(","):
+        country_code = raw_country_code.strip().upper()
+        if not country_code or _is_any(country_code):
+            continue
+        if country_code not in country_codes:
+            country_codes.append(country_code)
+    return tuple(country_codes)
 
 
 def extract_vast_profiles(prompt: Mapping[str, Any]) -> tuple[VastResourceProfile, ...]:

@@ -12,7 +12,9 @@ VAST_API_BASE_URL = "https://console.vast.ai"
 VAST_CONFIG_NODE_ID = "VastAILeaseConfiguration"
 VAST_DEFAULT_IDLE_RETENTION_HOURS = 24.0
 VAST_DEFAULT_MINIMUM_OFFER_DURATION_DAYS = 7.0
+VAST_DEFAULT_EXCLUDED_COUNTRY_CODES = ("CN", "RU")
 _PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+_COUNTRY_CODE_PATTERN = re.compile(r"^[A-Z]{2}$")
 
 
 class VastRentalType(str, Enum):
@@ -43,6 +45,7 @@ class VastResourceProfile:
     minimum_cuda_version: float = 13.0
     verified_only: bool = False
     allowed_geolocations: tuple[str, ...] = ()
+    excluded_country_codes: tuple[str, ...] = VAST_DEFAULT_EXCLUDED_COUNTRY_CODES
     maximum_instances: int = 1
     rental_type: VastRentalType = VastRentalType.ON_DEMAND
 
@@ -103,6 +106,26 @@ class VastResourceProfile:
             for location in self.allowed_geolocations
         ):
             raise ValueError("allowed_geolocations contains an invalid location.")
+        if any(
+            not _COUNTRY_CODE_PATTERN.fullmatch(country_code)
+            for country_code in self.excluded_country_codes
+        ):
+            raise ValueError(
+                "excluded_country_codes must contain uppercase two-letter country codes."
+            )
+        if len(set(self.excluded_country_codes)) != len(self.excluded_country_codes):
+            raise ValueError("excluded_country_codes must not contain duplicates.")
+        allowed_country_codes = {
+            location.strip().upper()
+            for location in self.allowed_geolocations
+            if _COUNTRY_CODE_PATTERN.fullmatch(location.strip().upper())
+        }
+        overlap = allowed_country_codes.intersection(self.excluded_country_codes)
+        if overlap:
+            raise ValueError(
+                "Vast geolocation filters cannot both allow and exclude: "
+                + ", ".join(sorted(overlap))
+            )
 
     @property
     def environment_id(self) -> str:
@@ -154,10 +177,15 @@ class VastResourceProfile:
             payload["dlperf"] = {"gte": self.minimum_dlperf}
         if self.verified_only:
             payload["verified"] = {"eq": True}
+        geolocation_filter: dict[str, list[str]] = {}
         if self.allowed_geolocations:
-            payload["geolocation"] = {
-                "in": [location.strip() for location in self.allowed_geolocations]
-            }
+            geolocation_filter["in"] = [
+                location.strip() for location in self.allowed_geolocations
+            ]
+        if self.excluded_country_codes:
+            geolocation_filter["notin"] = list(self.excluded_country_codes)
+        if geolocation_filter:
+            payload["geolocation"] = geolocation_filter
         return payload
 
 
@@ -306,6 +334,8 @@ class VastOffer:
             self.geolocation, profile.allowed_geolocations
         ):
             return "geolocation is not allowed"
+        if _matches_geolocation(self.geolocation, profile.excluded_country_codes):
+            return "geolocation is excluded"
         return None
 
     def ranking_key(self) -> tuple[float, float, float, float, int]:
@@ -555,6 +585,7 @@ def _require_finite_non_negative(value: float, field_name: str) -> None:
 __all__ = [
     "VAST_API_BASE_URL",
     "VAST_CONFIG_NODE_ID",
+    "VAST_DEFAULT_EXCLUDED_COUNTRY_CODES",
     "VAST_DEFAULT_IDLE_RETENTION_HOURS",
     "VAST_DEFAULT_MINIMUM_OFFER_DURATION_DAYS",
     "VastInstance",

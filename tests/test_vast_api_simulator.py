@@ -53,6 +53,14 @@ def test_client_search_create_poll_manage_and_destroy_lifecycle(
 
             assert account == {"id": 42, "credit": 100.0}
             assert [offer.offer_id for offer in offers] == [1001, 1002, 1003]
+            search_request = next(
+                entry
+                for entry in state.request_log
+                if entry["path"] == "/api/v0/bundles/"
+            )
+            assert search_request["body"]["geolocation"] == {
+                "notin": ["CN", "RU"]
+            }
             launch = vast_models_module.VastInstanceLaunchSpec(
                 image="ghcr.io/example/worker:latest",
                 disk_gb=profile.allocated_disk_gb,

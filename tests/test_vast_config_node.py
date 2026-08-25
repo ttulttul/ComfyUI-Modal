@@ -26,6 +26,7 @@ def _inputs(**overrides: Any) -> dict[str, Any]:
         "minimum_offer_duration_days": 14.0,
         "verified_hosts_only": True,
         "allowed_geolocations": "US, CA",
+        "excluded_country_codes": "cn, RU, cn",
         "maximum_instances": 2,
     }
     values.update(overrides)
@@ -70,6 +71,7 @@ def test_configuration_node_defaults_marketplace_selectors_to_any(
         "minimum_offer_duration_days": "Any",
         "verified_hosts_only": "Any",
         "allowed_geolocations": "Any",
+        "excluded_country_codes": "CN, RU",
         "maximum_instances": 1,
     }
 
@@ -94,6 +96,7 @@ def test_any_selectors_are_omitted_from_marketplace_profile(
             "minimum_offer_duration_days": "Any",
             "verified_hosts_only": "Any",
             "allowed_geolocations": "Any",
+            "excluded_country_codes": "Any",
         },
     )
 
@@ -103,12 +106,57 @@ def test_any_selectors_are_omitted_from_marketplace_profile(
     assert profile.maximum_hourly_cost_usd is None
     assert profile.verified_only is False
     assert profile.allowed_geolocations == ()
+    assert profile.excluded_country_codes == ()
     payload = profile.search_payload()
     assert "num_gpus" not in payload
     assert "gpu_ram" not in payload
     assert "cpu_ram" not in payload
     assert "dph_total" not in payload
     assert "verified" not in payload
+    assert "geolocation" not in payload
+
+
+def test_country_exclusions_default_for_legacy_prompts_and_normalize_input(
+    vast_config_node_module: Any,
+) -> None:
+    """Missing legacy inputs use the safe default; authored codes are normalized."""
+    legacy_profile = vast_config_node_module.profile_from_inputs(
+        "17",
+        {"profile_name": "legacy"},
+    )
+    configured_profile = vast_config_node_module.profile_from_inputs(
+        "18",
+        {
+            "profile_name": "configured",
+            "excluded_country_codes": " cn, RU, cn ",
+        },
+    )
+
+    assert legacy_profile.excluded_country_codes == ("CN", "RU")
+    assert configured_profile.excluded_country_codes == ("CN", "RU")
+    assert configured_profile.search_payload()["geolocation"] == {
+        "notin": ["CN", "RU"]
+    }
+
+
+def test_country_exclusions_reject_invalid_and_conflicting_codes(
+    vast_config_node_module: Any,
+) -> None:
+    """Malformed or contradictory workflow filters should fail before API access."""
+    with pytest.raises(ValueError, match="two-letter country codes"):
+        vast_config_node_module.profile_from_inputs(
+            "17",
+            {"profile_name": "invalid", "excluded_country_codes": "CHINA"},
+        )
+    with pytest.raises(ValueError, match="both allow and exclude"):
+        vast_config_node_module.profile_from_inputs(
+            "18",
+            {
+                "profile_name": "conflict",
+                "allowed_geolocations": "CN",
+                "excluded_country_codes": "CN, RU",
+            },
+        )
 
 
 def test_extension_exports_configuration_node(
