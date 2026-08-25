@@ -77,11 +77,25 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "pyopengl==3.1.10" in runtime_packages
     assert "pypdf==6.16.1" in runtime_packages
     assert "numpy==2.3.5" in runtime_packages
+    assert "av==18.1.0" in runtime_packages
     assert "safetensors==0.8.0" in runtime_packages
     assert "huggingface-hub==1.28.0" in runtime_packages
     assert "hf-xet==1.6.0" in runtime_packages
     assert "transformers==5.15.0" in runtime_packages
     assert "simpleeval==1.0.7" in runtime_packages
+
+
+def test_remote_video_stack_is_pinned_and_validated(
+    runtime_environment_module: Any,
+) -> None:
+    """Remote images must expose the PyAV enum imported by current ComfyUI."""
+    command = runtime_environment_module.remote_runtime_validation_command()
+
+    assert runtime_environment_module.REMOTE_AV_SPEC == "av==18.1.0"
+    assert command.startswith("python -c ")
+    assert "ColorPrimaries" in command
+    assert "Expected PyAV" in command
+    assert "18.1.0" in command
 
 
 def test_remote_huggingface_stack_is_pinned_and_validated(

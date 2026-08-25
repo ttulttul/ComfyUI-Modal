@@ -27,6 +27,7 @@ REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
 REMOTE_HF_XET_SPEC = "hf-xet==1.6.0"
 REMOTE_VLLM_SPEC = "vllm==0.27.1"
+REMOTE_AV_SPEC = "av==18.1.0"
 REMOTE_VLLM_WHEEL_URL = (
     "https://wheels.vllm.ai/"
     "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac/"
@@ -47,7 +48,7 @@ _REMOTE_RUNTIME_PACKAGES = (
     "aiohttp==3.13.3",
     "accelerate==1.14.0",
     "alembic==1.18.4",
-    "av==16.1.0",
+    REMOTE_AV_SPEC,
     "blake3==1.0.9",
     "comfy-angle==0.1.0",
     "comfy-aimdo==0.4.13",
@@ -216,6 +217,21 @@ class RemoteTorchBuild:
 def remote_runtime_packages() -> tuple[str, ...]:
     """Return the exact ComfyUI support package set used by Modal images."""
     return _REMOTE_RUNTIME_PACKAGES
+
+
+def remote_runtime_validation_command() -> str:
+    """Return a build-time check for ComfyUI's required PyAV API."""
+    validation_script = (
+        "from importlib import metadata; "
+        "from av.video.reformatter import ColorPrimaries; "
+        f"expected_av={REMOTE_AV_SPEC.split('==', maxsplit=1)[1]!r}; "
+        "actual_av=metadata.version('av'); "
+        "assert actual_av == expected_av, "
+        "f'Expected PyAV {expected_av}, found {actual_av}'; "
+        "assert ColorPrimaries.BT709 is not None; "
+        "print('Validated ComfyUI video stack:', 'PyAV', actual_av)"
+    )
+    return f"python -c {shlex.quote(validation_script)}"
 
 
 def remote_huggingface_packages() -> tuple[str, ...]:

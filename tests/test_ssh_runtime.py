@@ -242,6 +242,7 @@ def test_worker_dockerfile_disables_inherited_base_image_healthcheck(
     assert dockerfile.index("HEALTHCHECK NONE") < dockerfile.index("ENTRYPOINT")
     assert "LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}" in dockerfile
     assert "COMFY_MODAL_LLM_EXECUTION_TARGET=ssh_docker" in dockerfile
+    assert "from av.video.reformatter import ColorPrimaries" in dockerfile
 
 
 def test_worker_dockerfile_retries_large_accelerator_downloads(

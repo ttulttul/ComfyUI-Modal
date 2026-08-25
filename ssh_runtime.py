@@ -26,6 +26,7 @@ if __package__:
         remote_accelerator_validation_command,
         remote_apt_packages,
         remote_runtime_packages,
+        remote_runtime_validation_command,
         select_remote_torch_build,
     )
     from .settings import ModalSyncSettings
@@ -43,6 +44,7 @@ else:  # pragma: no cover - remote entrypoint compatibility.
         remote_accelerator_validation_command,
         remote_apt_packages,
         remote_runtime_packages,
+        remote_runtime_validation_command,
         select_remote_torch_build,
     )
     from settings import ModalSyncSettings
@@ -347,6 +349,7 @@ class SshRuntimeManager:
         if custom_packages:
             lines.append(_pip_install(custom_packages))
             lines.append(_pip_install(remote_runtime_packages()))
+        lines.append(f"RUN {remote_runtime_validation_command()}")
         lines.extend(
             [
                 "COPY repo /opt/comfy-remote/repo",
