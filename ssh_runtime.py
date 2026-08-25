@@ -27,6 +27,7 @@ if __package__:
         remote_apt_packages,
         remote_compiler_validation_command,
         remote_runtime_packages,
+        remote_runtime_dependency_fingerprint,
         remote_runtime_validation_command,
         select_remote_torch_build,
     )
@@ -46,6 +47,7 @@ else:  # pragma: no cover - remote entrypoint compatibility.
         remote_apt_packages,
         remote_compiler_validation_command,
         remote_runtime_packages,
+        remote_runtime_dependency_fingerprint,
         remote_runtime_validation_command,
         select_remote_torch_build,
     )
@@ -58,6 +60,7 @@ _REMOTE_REPO_ROOT = Path("/opt/comfy-remote/repo")
 _REMOTE_COMFYUI_ROOT = Path("/opt/comfy-remote/ComfyUI")
 _REMOTE_STORAGE_ROOT = Path("/storage")
 _RUNTIME_LABEL = "comfy.remote.runtime-fingerprint"
+_DEPENDENCY_LABEL = "comfy.remote.dependency-fingerprint"
 _ENVIRONMENT_LABEL = "comfy.remote.environment-id"
 _WORKER_LABEL = "comfy.remote.worker-index"
 _LARGE_DOWNLOAD_RESUME_RETRIES = 20
@@ -140,7 +143,7 @@ class SshRuntimeManager:
                     f"Building SSH runtime environment={environment_id} "
                     f"image={spec.image_tag}",
                 )
-                self._build_image(spec)
+                self._build_image(spec, status_callback=status_callback)
             self._remove_stale_worker_containers(spec)
             if not self._container_is_current_and_running(spec):
                 _emit_runtime_status(
@@ -238,47 +241,153 @@ class SshRuntimeManager:
             and labels.get(_WORKER_LABEL) == str(spec.worker_index)
         )
 
-    def _build_image(self, spec: SshRuntimeSpec) -> None:
-        """Stream a deterministic Docker build context to the remote daemon."""
-        context = self._build_context(spec)
+    def _build_image(
+        self,
+        spec: SshRuntimeSpec,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """Build a stable dependency image and apply the current source overlay."""
+        dependency_fingerprint = remote_runtime_dependency_fingerprint(spec.identity)
+        dependency_image_tag = self._dependency_image_tag(spec)
+        if not self._dependency_image_is_current(spec):
+            _emit_runtime_status(
+                status_callback,
+                f"Building SSH dependency base environment="
+                f"{self.controller.host.environment_id} image={dependency_image_tag}",
+            )
+            dependency_context = self._dependency_build_context()
+            logger.info(
+                "Building SSH dependency base environment=%s image=%s "
+                "dependency_fingerprint=%s context_bytes=%d.",
+                self.controller.host.environment_id,
+                dependency_image_tag,
+                dependency_fingerprint,
+                len(dependency_context),
+            )
+            self.controller.docker(
+                self._buildx_arguments(
+                    image_tag=dependency_image_tag,
+                    labels={_DEPENDENCY_LABEL: dependency_fingerprint},
+                    pull=True,
+                ),
+                input_payload=dependency_context,
+                timeout_seconds=max(
+                    3600.0,
+                    self.settings.startup_timeout_seconds,
+                ),
+            )
+
+        _emit_runtime_status(
+            status_callback,
+            f"Applying SSH source overlay environment="
+            f"{self.controller.host.environment_id} image={spec.image_tag}",
+        )
+        context = self._source_overlay_build_context(spec)
         logger.info(
-            "Building SSH runtime environment=%s image=%s fingerprint=%s "
-            "context_bytes=%d.",
+            "Applying SSH source overlay environment=%s image=%s fingerprint=%s "
+            "dependency_image=%s context_bytes=%d.",
             self.controller.host.environment_id,
             spec.image_tag,
             spec.identity.fingerprint,
+            dependency_image_tag,
             len(context),
         )
         self.controller.docker(
-            (
-                "build",
-                "--pull",
-                "--load",
-                "--label",
-                f"{_RUNTIME_LABEL}={spec.identity.fingerprint}",
-                "-t",
-                spec.image_tag,
-                "-",
+            self._buildx_arguments(
+                image_tag=spec.image_tag,
+                labels={
+                    _RUNTIME_LABEL: spec.identity.fingerprint,
+                    _DEPENDENCY_LABEL: dependency_fingerprint,
+                },
+                pull=False,
             ),
             input_payload=context,
             timeout_seconds=max(3600.0, self.settings.startup_timeout_seconds),
         )
 
+    def _dependency_image_tag(self, spec: SshRuntimeSpec) -> str:
+        """Return the stable local tag for one dependency-only worker base."""
+        fingerprint = remote_runtime_dependency_fingerprint(spec.identity)
+        return f"comfy-remote-deps:{fingerprint[:16]}"
+
+    def _dependency_image_is_current(self, spec: SshRuntimeSpec) -> bool:
+        """Return whether the dependency-only image is retained by Docker."""
+        dependency_fingerprint = remote_runtime_dependency_fingerprint(spec.identity)
+        result = self.controller.docker(
+            (
+                "image",
+                "inspect",
+                "--format",
+                f'{{{{index .Config.Labels "{_DEPENDENCY_LABEL}"}}}}',
+                self._dependency_image_tag(spec),
+            ),
+            check=False,
+        )
+        return (
+            result.returncode == 0
+            and result.stdout_text.strip() == dependency_fingerprint
+        )
+
+    def _buildx_arguments(
+        self,
+        *,
+        image_tag: str,
+        labels: dict[str, str],
+        pull: bool,
+    ) -> tuple[str, ...]:
+        """Return a build command pinned to Docker's persistent local builder."""
+        arguments = ["buildx", "build", "--builder", "default"]
+        if pull:
+            arguments.append("--pull")
+        arguments.append("--load")
+        for label_name, label_value in sorted(labels.items()):
+            arguments.extend(("--label", f"{label_name}={label_value}"))
+        arguments.extend(("-t", image_tag, "-"))
+        return tuple(arguments)
+
     def _build_context(self, spec: SshRuntimeSpec) -> bytes:
-        """Return a tar build context containing only worker runtime sources."""
+        """Return the self-contained worker context used for published images."""
+        return self._tar_build_context(
+            dockerfile=self._dockerfile(spec),
+            include_runtime_sources=True,
+        )
+
+    def _dependency_build_context(self) -> bytes:
+        """Return the small Docker context for stable dependency installation."""
+        return self._tar_build_context(
+            dockerfile=self._dependency_dockerfile(),
+            include_runtime_sources=False,
+        )
+
+    def _source_overlay_build_context(self, spec: SshRuntimeSpec) -> bytes:
+        """Return the current runtime sources layered over a retained dependency image."""
+        return self._tar_build_context(
+            dockerfile=self._source_overlay_dockerfile(spec),
+            include_runtime_sources=True,
+        )
+
+    def _tar_build_context(
+        self,
+        *,
+        dockerfile: str,
+        include_runtime_sources: bool,
+    ) -> bytes:
+        """Return a deterministic tar context for one generated Dockerfile."""
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode="w") as archive:
-            dockerfile = self._dockerfile(spec).encode("utf-8")
+            dockerfile_payload = dockerfile.encode("utf-8")
             dockerfile_info = tarfile.TarInfo("Dockerfile")
-            dockerfile_info.size = len(dockerfile)
+            dockerfile_info.size = len(dockerfile_payload)
             dockerfile_info.mtime = 0
             dockerfile_info.mode = 0o644
-            archive.addfile(dockerfile_info, io.BytesIO(dockerfile))
-            for source_path, archive_path in self._runtime_context_files():
-                info = archive.gettarinfo(str(source_path), arcname=archive_path)
-                info.mtime = 0
-                with source_path.open("rb") as source_file:
-                    archive.addfile(info, source_file)
+            archive.addfile(dockerfile_info, io.BytesIO(dockerfile_payload))
+            if include_runtime_sources:
+                for source_path, archive_path in self._runtime_context_files():
+                    info = archive.gettarinfo(str(source_path), arcname=archive_path)
+                    info.mtime = 0
+                    with source_path.open("rb") as source_file:
+                        archive.addfile(info, source_file)
         return output.getvalue()
 
     def _runtime_context_files(self) -> Iterable[tuple[Path, str]]:
@@ -328,7 +437,30 @@ class SshRuntimeManager:
             yield source_path, f"comfyui/{relative_path.as_posix()}"
 
     def _dockerfile(self, spec: SshRuntimeSpec) -> str:
-        """Return the immutable Dockerfile for one runtime identity."""
+        """Return the self-contained Dockerfile used for published worker images."""
+        lines = [
+            *self._dependency_dockerfile_lines(),
+            *self._source_layer_lines(spec),
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _dependency_dockerfile(self) -> str:
+        """Return a Dockerfile containing only stable worker dependencies."""
+        return "\n".join([*self._dependency_dockerfile_lines(), ""])
+
+    def _source_overlay_dockerfile(self, spec: SshRuntimeSpec) -> str:
+        """Return the small source layer built on a retained dependency image."""
+        return "\n".join(
+            [
+                f"FROM {self._dependency_image_tag(spec)}",
+                *self._source_layer_lines(spec),
+                "",
+            ]
+        )
+
+    def _dependency_dockerfile_lines(self) -> list[str]:
+        """Return Dockerfile instructions for the heavyweight stable base."""
         torch_build = select_remote_torch_build(self.settings.modal_gpu)
         lines = [
             f"FROM python:{REMOTE_PYTHON_VERSION}-slim-bookworm AS python-runtime",
@@ -383,28 +515,28 @@ class SshRuntimeManager:
             lines.append(_pip_install(custom_packages))
             lines.append(_pip_install(remote_runtime_packages()))
         lines.append(f"RUN {remote_runtime_validation_command()}")
-        lines.extend(
-            [
-                "COPY repo /opt/comfy-remote/repo",
-                "COPY comfyui /opt/comfy-remote/ComfyUI",
-                (
-                    f"ENV PYTHONPATH={_REMOTE_REPO_ROOT}:{_REMOTE_COMFYUI_ROOT} "
-                    "LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH} "
-                    f"COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
-                    f"COMFY_MODAL_COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
-                    f"COMFY_MODAL_LOCAL_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
-                    f"COMFY_MODAL_REMOTE_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
-                    "COMFY_MODAL_EXECUTION_MODE=local COMFY_MODAL_REMOTE_WORKER=1 "
-                    "COMFY_MODAL_LLM_EXECUTION_TARGET=ssh_docker "
-                    f"COMFY_MODAL_RUNTIME_FINGERPRINT={spec.identity.fingerprint}"
-                ),
-                "WORKDIR /opt/comfy-remote/repo",
-                "HEALTHCHECK NONE",
-                'ENTRYPOINT ["python","-m","remote.ssh_worker","serve"]',
-                "",
-            ]
-        )
-        return "\n".join(lines)
+        return lines
+
+    def _source_layer_lines(self, spec: SshRuntimeSpec) -> list[str]:
+        """Return Dockerfile instructions for frequently changing runtime source."""
+        return [
+            "COPY repo /opt/comfy-remote/repo",
+            "COPY comfyui /opt/comfy-remote/ComfyUI",
+            (
+                f"ENV PYTHONPATH={_REMOTE_REPO_ROOT}:{_REMOTE_COMFYUI_ROOT} "
+                "LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH} "
+                f"COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
+                f"COMFY_MODAL_COMFYUI_ROOT={_REMOTE_COMFYUI_ROOT} "
+                f"COMFY_MODAL_LOCAL_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
+                f"COMFY_MODAL_REMOTE_STORAGE_ROOT={_REMOTE_STORAGE_ROOT} "
+                "COMFY_MODAL_EXECUTION_MODE=local COMFY_MODAL_REMOTE_WORKER=1 "
+                "COMFY_MODAL_LLM_EXECUTION_TARGET=ssh_docker "
+                f"COMFY_MODAL_RUNTIME_FINGERPRINT={spec.identity.fingerprint}"
+            ),
+            "WORKDIR /opt/comfy-remote/repo",
+            "HEALTHCHECK NONE",
+            'ENTRYPOINT ["python","-m","remote.ssh_worker","serve"]',
+        ]
 
     def _replace_worker_container(self, spec: SshRuntimeSpec) -> None:
         """Replace one exact managed worker with a compatible warm container."""

@@ -29,7 +29,11 @@ def test_worker_lifecycle_reports_build_and_readiness_status(
     )
     monkeypatch.setattr(manager, "runtime_spec", lambda _worker_index: spec)
     monkeypatch.setattr(manager, "_image_is_current", lambda _spec: False)
-    monkeypatch.setattr(manager, "_build_image", lambda _spec: None)
+    monkeypatch.setattr(
+        manager,
+        "_build_image",
+        lambda _spec, status_callback=None: None,
+    )
     monkeypatch.setattr(manager, "_remove_stale_worker_containers", lambda _spec: None)
     monkeypatch.setattr(
         manager,
@@ -58,9 +62,12 @@ def test_worker_build_loads_image_into_the_remote_daemon(
     """BuildKit docker-container drivers must export the image for docker run."""
     calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
 
-    def docker(arguments: tuple[str, ...], **kwargs: Any) -> None:
+    def docker(arguments: tuple[str, ...], **kwargs: Any) -> Any:
         """Record one remote Docker invocation."""
         calls.append((arguments, kwargs))
+        if arguments[:2] == ("image", "inspect"):
+            return SimpleNamespace(returncode=1, stdout_text="")
+        return None
 
     manager = ssh_runtime_module.SshRuntimeManager(
         controller=SimpleNamespace(
@@ -74,13 +81,104 @@ def test_worker_build_loads_image_into_the_remote_daemon(
         image_tag="comfy-remote:deadbeef",
         identity=SimpleNamespace(fingerprint="deadbeef"),
     )
-    monkeypatch.setattr(manager, "_build_context", lambda runtime_spec: b"context")
+    monkeypatch.setattr(
+        manager,
+        "_dependency_build_context",
+        lambda: b"dependencies",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_source_overlay_build_context",
+        lambda runtime_spec: b"source-overlay",
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_runtime_dependency_fingerprint",
+        lambda _identity: "cafebabe" * 8,
+    )
 
     manager._build_image(spec)
 
-    arguments, kwargs = calls[0]
-    assert arguments[:3] == ("build", "--pull", "--load")
-    assert kwargs["input_payload"] == b"context"
+    assert calls[0][0][:2] == ("image", "inspect")
+    dependency_arguments, dependency_kwargs = calls[1]
+    assert dependency_arguments[:6] == (
+        "buildx",
+        "build",
+        "--builder",
+        "default",
+        "--pull",
+        "--load",
+    )
+    assert dependency_kwargs["input_payload"] == b"dependencies"
+    overlay_arguments, overlay_kwargs = calls[2]
+    assert overlay_arguments[:5] == (
+        "buildx",
+        "build",
+        "--builder",
+        "default",
+        "--load",
+    )
+    assert "--pull" not in overlay_arguments
+    assert overlay_kwargs["input_payload"] == b"source-overlay"
+
+
+def test_worker_build_reuses_retained_dependency_image(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A code-only runtime change should build only the source overlay."""
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def docker(arguments: tuple[str, ...], **kwargs: Any) -> Any:
+        """Report a current dependency image and record the overlay build."""
+        calls.append((arguments, kwargs))
+        if arguments[:2] == ("image", "inspect"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout_text="cafebabe" * 8,
+            )
+        return None
+
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(
+            host=SimpleNamespace(environment_id="gpu-host"),
+            docker=docker,
+        ),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(startup_timeout_seconds=900),
+    )
+    spec = SimpleNamespace(
+        image_tag="comfy-remote:source-change",
+        identity=SimpleNamespace(fingerprint="source-change"),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_runtime_dependency_fingerprint",
+        lambda _identity: "cafebabe" * 8,
+    )
+    def fail_dependency_build() -> bytes:
+        """Fail if a retained dependency image is rebuilt."""
+        raise AssertionError("dependency context should not be rebuilt")
+
+    monkeypatch.setattr(manager, "_dependency_build_context", fail_dependency_build)
+    monkeypatch.setattr(
+        manager,
+        "_source_overlay_build_context",
+        lambda _runtime_spec: b"52MB-source-overlay",
+    )
+
+    manager._build_image(spec)
+
+    assert len(calls) == 2
+    assert calls[0][0][:2] == ("image", "inspect")
+    assert calls[1][0][:5] == (
+        "buildx",
+        "build",
+        "--builder",
+        "default",
+        "--load",
+    )
+    assert calls[1][1]["input_payload"] == b"52MB-source-overlay"
 
 
 def test_conflicting_worker_launch_adopts_current_managed_winner(
@@ -292,6 +390,70 @@ def test_worker_dockerfile_disables_inherited_base_image_healthcheck(
     assert "LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}" in dockerfile
     assert "COMFY_MODAL_LLM_EXECUTION_TARGET=ssh_docker" in dockerfile
     assert "from av.video.reformatter import ColorPrimaries" in dockerfile
+
+
+def test_worker_dependency_base_is_separate_from_source_overlay(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Frequent source edits must not invalidate heavyweight package layers."""
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "select_remote_torch_build",
+        lambda _gpu: SimpleNamespace(
+            install_layers=(),
+            validation_command=lambda: "true",
+        ),
+    )
+    monkeypatch.setattr(ssh_runtime_module, "remote_apt_packages", lambda: ())
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_runtime_packages",
+        lambda: ("runtime-package==1",),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_packages",
+        lambda _gpu: ("accelerator-package==1",),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_validation_command",
+        lambda _gpu: "true",
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "custom_node_runtime_packages",
+        lambda _path: (),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_runtime_dependency_fingerprint",
+        lambda _identity: "cafebabe" * 8,
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(
+            modal_gpu="RTX-PRO-6000",
+            custom_nodes_dir=Path("/custom_nodes"),
+        ),
+    )
+    spec = SimpleNamespace(identity=SimpleNamespace(fingerprint="source-fingerprint"))
+
+    dependency_dockerfile = manager._dependency_dockerfile()
+    overlay_dockerfile = manager._source_overlay_dockerfile(spec)
+
+    assert "pip install --no-cache-dir runtime-package==1" in dependency_dockerfile
+    assert "accelerator-package==1" in dependency_dockerfile
+    assert "COPY repo" not in dependency_dockerfile
+    assert "COPY comfyui" not in dependency_dockerfile
+    assert overlay_dockerfile.startswith("FROM comfy-remote-deps:cafebabecafebabe\n")
+    assert "COPY repo /opt/comfy-remote/repo" in overlay_dockerfile
+    assert "COPY comfyui /opt/comfy-remote/ComfyUI" in overlay_dockerfile
+    assert "apt-get" not in overlay_dockerfile
+    assert "pip install" not in overlay_dockerfile
+    assert "COMFY_MODAL_RUNTIME_FINGERPRINT=source-fingerprint" in overlay_dockerfile
 
 
 def test_worker_dockerfile_exposes_triton_compiler_toolchain(

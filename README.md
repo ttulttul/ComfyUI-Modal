@@ -144,7 +144,7 @@ Self-hosted execution runs the same workers on machines you control, reached ove
 
 The installation-wide **Settings → Remote Execution: SSH environments** manager remains available for legacy workflows and host preflight. New configured workflows carry their own credential-free SSH destination and scheduling snapshot, including the probed GPU capabilities, so their execution does not depend on mutating that global registry. Older queued payloads without a capability snapshot are re-probed before launch. GPU workers are always started with the selected GPU device request; missing GPU/runtime capability is an explicit setup error instead of a silent CPU-only container. The worker image also pins and validates the PyAV API required by the copied ComfyUI source, so a stale video dependency fails during image construction instead of at the first remote node import.
 
-Worker images embed every file beneath ComfyUI's curated runtime package directories, including tokenizer vocabularies, model configuration JSON, SentencePiece data, and other non-Python resources. Those files participate in the runtime fingerprint, so adding or changing required package data automatically replaces a stale SSH worker and is reflected in the next published Vast worker image. The image also retains an explicit `gcc`/`g++` build toolchain and exports `CC`/`CXX`, because Triton may compile native launchers lazily when a ComfyUI node first executes; the image build validates that toolchain before publication.
+Worker images embed every file beneath ComfyUI's curated runtime package directories, including tokenizer vocabularies, model configuration JSON, SentencePiece data, and other non-Python resources. Those files participate in the runtime fingerprint, so adding or changing required package data automatically replaces a stale SSH worker and is reflected in the next published Vast worker image. On self-hosted SSH machines, the heavyweight apt, PyTorch, CUDA, accelerator, and custom-requirement stack is retained as a separately fingerprinted local dependency image. A normal source edit therefore rebuilds only the roughly 52 MiB source overlay; the multi-gigabyte base is rebuilt only when its package inputs change. The image also retains an explicit `gcc`/`g++` build toolchain and exports `CC`/`CXX`, because Triton may compile native launchers lazily when a ComfyUI node first executes; the dependency build validates that toolchain before publication.
 
 Parallel components assigned to the same SSH worker slot share one lifecycle operation. If two launchers race for the deterministic container name, the loser adopts the correctly labeled, fingerprint-matching worker that won the race; containers without the configured environment ownership label are never removed automatically.
 
@@ -152,7 +152,7 @@ Each host must provide:
 
 - Linux on `x86_64`
 - a non-interactive SSH login with an already trusted host key
-- a working Docker CLI and daemon available to that login
+- a working Docker CLI and daemon with the Buildx `default` builder available to that login
 - NVIDIA drivers plus Docker's NVIDIA runtime or CDI configuration for GPU work
 - outbound package/image access during the first worker build
 

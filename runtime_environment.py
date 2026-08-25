@@ -22,6 +22,7 @@ else:  # pragma: no cover - the stable cloud entrypoint imports this module top-
 logger = logging.getLogger(__name__)
 
 REMOTE_APP_PROTOCOL_VERSION = 9
+REMOTE_RUNTIME_DEPENDENCY_LAYER_VERSION = 1
 REMOTE_PYTHON_VERSION = "3.13"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
@@ -173,6 +174,37 @@ class RemoteRuntimeIdentity:
 
     fingerprint: str
     manifest: dict[str, Any]
+
+
+_REMOTE_RUNTIME_DEPENDENCY_MANIFEST_KEYS = frozenset(
+    {
+        "accelerator_packages",
+        "apt_packages",
+        "custom_node_packages",
+        "dependency_layer_version",
+        "llama_cpp_server_image",
+        "modal_sdk_spec",
+        "python_base_image",
+        "python_version",
+        "runtime_packages",
+        "torch_build",
+        "torch_packages",
+    }
+)
+
+
+def remote_runtime_dependency_fingerprint(identity: RemoteRuntimeIdentity) -> str:
+    """Hash only the stable image inputs that install worker dependencies."""
+    dependency_manifest = {
+        key: identity.manifest[key]
+        for key in sorted(_REMOTE_RUNTIME_DEPENDENCY_MANIFEST_KEYS)
+    }
+    canonical_manifest = json.dumps(
+        dependency_manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_manifest).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -556,7 +588,10 @@ def build_remote_runtime_identity(
     torch_build = select_remote_torch_build(settings.modal_gpu)
     manifest: dict[str, Any] = {
         "protocol_version": REMOTE_APP_PROTOCOL_VERSION,
+        "dependency_layer_version": REMOTE_RUNTIME_DEPENDENCY_LAYER_VERSION,
         "python_version": REMOTE_PYTHON_VERSION,
+        "python_base_image": f"python:{REMOTE_PYTHON_VERSION}-slim-bookworm",
+        "llama_cpp_server_image": REMOTE_LLAMA_CPP_SERVER_IMAGE,
         "modal_sdk_spec": REMOTE_MODAL_SDK_SPEC,
         "apt_packages": list(remote_apt_packages()),
         "runtime_packages": list(remote_runtime_packages()),

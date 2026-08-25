@@ -239,6 +239,14 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
     )
 
     assert source_changed.fingerprint != baseline.fingerprint
+    assert (
+        runtime_environment_module.remote_runtime_dependency_fingerprint(
+            source_changed
+        )
+        == runtime_environment_module.remote_runtime_dependency_fingerprint(
+            baseline
+        )
+    )
     assert option_changed.fingerprint != source_changed.fingerprint
     assert secret_changed.fingerprint != source_changed.fingerprint
     assert vllm_mode_changed.fingerprint != baseline.fingerprint
@@ -371,6 +379,22 @@ def test_runtime_identity_tracks_custom_node_requirements_but_ignores_payload_so
 
     assert source_changed.fingerprint == baseline.fingerprint
     assert dependency_changed.fingerprint != baseline.fingerprint
+    assert (
+        runtime_environment_module.remote_runtime_dependency_fingerprint(
+            source_changed
+        )
+        == runtime_environment_module.remote_runtime_dependency_fingerprint(
+            baseline
+        )
+    )
+    assert (
+        runtime_environment_module.remote_runtime_dependency_fingerprint(
+            dependency_changed
+        )
+        != runtime_environment_module.remote_runtime_dependency_fingerprint(
+            baseline
+        )
+    )
 
 
 def test_custom_node_packages_exclude_deployment_owned_runtime_conflicts(
