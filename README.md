@@ -347,6 +347,8 @@ export COMFY_MODAL_CLOUDFLARE_OAUTH_SCOPES='account-settings.read workers-r2.wri
 
 When ComfyUI is opened through an HTTP loopback URL, the callback is derived automatically if the redirect variable is omitted. A remote, reverse-proxied, or HTTPS installation must set the registered redirect URI explicitly. When the OAuth grant contains more than one Cloudflare account, enter the desired 32-character account ID on the node and select Login again. R2 must already be activated for that account; Cloudflare's first-time checkout remains an interactive dashboard operation.
 
+ComfyUI normally rejects all cross-site browser requests through its origin-only middleware. Cloudflare's redirect is necessarily cross-site, so the extension installs a narrow exception ahead of that guard for `GET /remote/storage/r2/oauth/callback` only. The callback remains protected by its random, single-use OAuth state and PKCE verifier; all other cross-site ComfyUI requests continue through the standard guard.
+
 The environment-only configuration remains supported for legacy workflows and scripts. Create a private R2 bucket and an API token scoped to that bucket, then configure the ComfyUI process:
 
 ```bash

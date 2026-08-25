@@ -13,7 +13,7 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urlencode, urlparse
@@ -402,6 +402,8 @@ def setup_r2_oauth_routes(
             )
         return oauth_service
 
+    _install_r2_callback_middleware(prompt_server, resolved_service)
+
     @prompt_server.routes.post(R2_OAUTH_START_ROUTE)
     async def start_r2_oauth(request: web.Request) -> web.Response:
         """Return a PKCE authorization URL without executing a workflow."""
@@ -421,6 +423,55 @@ def setup_r2_oauth_routes(
     async def r2_credential_status(request: web.Request) -> web.Response:
         """Report whether one opaque workflow reference exists in the OS keyring."""
         return await _r2_credential_status_response(request, credential_store)
+
+
+def _install_r2_callback_middleware(
+    prompt_server: Any,
+    service_factory: Callable[[], CloudflareR2OAuthService],
+) -> None:
+    """Install an exact-path OAuth callback ahead of ComfyUI's origin guard."""
+    app = getattr(prompt_server, "app", None)
+    middlewares = getattr(app, "middlewares", None)
+    if middlewares is None:
+        logger.warning(
+            "ComfyUI does not expose its middleware list; cross-site Cloudflare "
+            "OAuth callbacks may be rejected."
+        )
+        return
+    if any(
+        getattr(middleware, "_comfy_modal_r2_callback", False)
+        for middleware in middlewares
+    ):
+        return
+    middleware = _r2_callback_middleware(service_factory)
+    setattr(middleware, "_comfy_modal_r2_callback", True)
+    try:
+        middlewares.insert(0, middleware)
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        logger.warning(
+            "Could not install the Cloudflare OAuth callback middleware: %s",
+            exc,
+        )
+
+
+def _r2_callback_middleware(
+    service_factory: Callable[[], CloudflareR2OAuthService],
+) -> Callable[
+    [web.Request, Callable[[web.Request], Awaitable[web.StreamResponse]]],
+    Awaitable[web.StreamResponse],
+]:
+    """Return middleware that exempts only the state-protected callback GET."""
+
+    @web.middleware
+    async def callback_middleware(
+        request: web.Request,
+        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    ) -> web.StreamResponse:
+        if request.method == "GET" and request.path == R2_OAUTH_CALLBACK_ROUTE:
+            return await _complete_r2_oauth_response(request, service_factory)
+        return await handler(request)
+
+    return callback_middleware
 
 
 async def _start_r2_oauth_response(
@@ -562,14 +613,27 @@ def _oauth_popup_response(payload: Mapping[str, Any]) -> web.Response:
         else html.escape(str(payload.get("error") or "Cloudflare Login failed."))
     )
     body = (
-        "<!doctype html><meta charset='utf-8'><title>Cloudflare R2 Login</title>"
+        "<!doctype html><meta charset='utf-8'><meta name='referrer' content='no-referrer'>"
+        "<title>Cloudflare R2 Login</title>"
         f"<p>{message}</p><script>"
         f"const payload={encoded_payload};"
         "if(window.opener){window.opener.postMessage(payload,window.location.origin);"
         "window.close();}"
         "</script>"
     )
-    return web.Response(text=body, content_type="text/html")
+    return web.Response(
+        text=body,
+        content_type="text/html",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'unsafe-inline'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _base64url_sha256(value: str) -> str:

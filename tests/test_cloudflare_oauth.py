@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
 
 class CapturingCredentialStore:
     """Capture credential records persisted after manual import."""
@@ -120,6 +125,65 @@ def test_complete_provisions_bucket_without_attempting_token_creation(
     assert result["account_id"] == "a" * 32
     assert result["credentials_required"] is True
     assert credential_store.saved == []
+
+
+def test_callback_middleware_bypasses_only_exact_oauth_get(
+    cloudflare_oauth_module: Any,
+) -> None:
+    """Cloudflare's cross-site callback must bypass only its state-protected GET."""
+
+    @web.middleware
+    async def reject_cross_site(
+        request: web.Request,
+        handler: Any,
+    ) -> web.StreamResponse:
+        """Model ComfyUI's origin-only middleware."""
+        if request.headers.get("Sec-Fetch-Site") == "cross-site":
+            return web.Response(status=403)
+        return await handler(request)
+
+    def unexpected_service() -> Any:
+        """Fail if the synthetic provider-error callback attempts OAuth work."""
+        raise AssertionError("OAuth service should not load for provider errors")
+
+    async def exercise() -> None:
+        """Issue callback and non-callback requests through real aiohttp middleware."""
+        async def unused_route(_request: web.Request) -> web.Response:
+            """Return a sentinel response when the security middleware delegates."""
+            return web.Response(status=204)
+
+        app = web.Application(middlewares=[reject_cross_site])
+        cloudflare_oauth_module._install_r2_callback_middleware(
+            SimpleNamespace(app=app),
+            unexpected_service,
+        )
+        app.router.add_get(
+            cloudflare_oauth_module.R2_OAUTH_CALLBACK_ROUTE,
+            unused_route,
+        )
+        app.router.add_get("/other", unused_route)
+        async with TestClient(TestServer(app)) as client:
+            callback = await client.get(
+                f"{cloudflare_oauth_module.R2_OAUTH_CALLBACK_ROUTE}"
+                "?error_description=diagnostic&state=diagnostic",
+                headers={"Sec-Fetch-Site": "cross-site"},
+            )
+            other = await client.get(
+                "/other",
+                headers={"Sec-Fetch-Site": "cross-site"},
+            )
+            callback_post = await client.post(
+                cloudflare_oauth_module.R2_OAUTH_CALLBACK_ROUTE,
+                headers={"Sec-Fetch-Site": "cross-site"},
+            )
+            assert callback.status == 200
+            assert callback.headers["Cache-Control"] == "no-store"
+            assert callback.headers["Referrer-Policy"] == "no-referrer"
+            assert "Cloudflare Login was not completed" in await callback.text()
+            assert other.status == 403
+            assert callback_post.status == 403
+
+    asyncio.run(exercise())
 
 
 def test_import_validates_and_saves_user_created_r2_credentials(
