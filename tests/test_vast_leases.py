@@ -89,6 +89,10 @@ def test_manager_recovers_offer_race_then_reuses_persisted_lease(
     async def scenario() -> None:
         state = vast_simulator_module.VastSimulatorState(
             create_failures_remaining={1001: 1},
+            create_failure_status=400,
+            create_failure_message=(
+                "error 404/3603: no_such_ask Instance type by id 1001 is not available."
+            ),
             polls_until_running=1,
         )
         async with _running_simulator(

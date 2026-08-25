@@ -100,6 +100,8 @@ class VastSimulatorState:
     destroyed_instance_ids: list[int] = field(default_factory=list)
     request_log: list[dict[str, Any]] = field(default_factory=list)
     create_failures_remaining: dict[int, int] = field(default_factory=dict)
+    create_failure_status: int = 404
+    create_failure_message: str = "Offer is no longer available"
     polls_until_running: int = 2
     next_instance_id: int = 9001
 
@@ -201,7 +203,10 @@ class VastApiSimulator:
         failures_remaining = self.state.create_failures_remaining.get(offer_id, 0)
         if failures_remaining > 0:
             self.state.create_failures_remaining[offer_id] = failures_remaining - 1
-            return web.json_response({"error": "Offer is no longer available"}, status=404)
+            return web.json_response(
+                {"error": self.state.create_failure_message},
+                status=self.state.create_failure_status,
+            )
         if not body.get("cancel_unavail", False):
             return web.json_response(
                 {"error": "Simulator requires cancel_unavail for deterministic tests."},

@@ -75,6 +75,7 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert "function renderRemoteConfiguratorStatus(panel, state)" in source
     assert "function renderRemoteConfiguratorEnvironments(panel, assignments, configurations)" in source
     assert "function updateRemoteConfiguratorEnvironmentStatus(promptId, detail)" in source
+    assert "promptState?.remoteEnvironmentStatuses.set(environmentId" in source
     assert "function renderRemoteConfiguratorPlan(panel, assignments, configurations)" in source
     assert 'widget = node.addDOMWidget(\n      "remote_execution_plan"' in source
     assert "serialize: false" in source

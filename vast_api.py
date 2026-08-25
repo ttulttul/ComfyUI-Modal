@@ -39,6 +39,7 @@ _RETRIABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 VAST_OFFER_CACHE_TTL_SECONDS = 60.0 * 60.0
 VAST_UNKNOWN_INSTANCE_STATE_TIMEOUT_SECONDS = 120.0
 _VAST_OFFER_CACHE_MAX_ENTRIES = 256
+_VAST_OFFER_UNAVAILABLE_MARKERS = frozenset({"no_such_ask", "3603"})
 
 
 class VastApiError(RuntimeError):
@@ -295,7 +296,13 @@ class VastApiClient:
             offer_creation=True,
         )
         if not payload.get("success", False):
-            raise VastApiError(_safe_error_message(payload, "Vast did not create the instance."))
+            error_message = _safe_error_message(
+                payload,
+                "Vast did not create the instance.",
+            )
+            if _is_offer_unavailable_response(200, error_message):
+                raise VastOfferUnavailableError(error_message)
+            raise VastApiError(error_message)
         try:
             instance_id = int(payload["new_contract"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -461,9 +468,12 @@ class VastApiClient:
             )
             if status in {401, 403}:
                 raise VastAuthenticationError(error_message)
+            if offer_creation and _is_offer_unavailable_response(
+                status,
+                error_message,
+            ):
+                raise VastOfferUnavailableError(error_message)
             if status == 404:
-                if offer_creation:
-                    raise VastOfferUnavailableError(error_message)
                 if path.startswith("/api/v0/instances/"):
                     raise VastInstanceNotFoundError(error_message)
                 raise VastApiError(error_message)
@@ -541,6 +551,17 @@ def _safe_error_message(payload: Mapping[str, Any], fallback: str) -> str:
             if "api_key" not in normalized.casefold() and "token" not in normalized.casefold():
                 return normalized[:1000]
     return fallback
+
+
+def _is_offer_unavailable_response(status: int, error_message: str) -> bool:
+    """Recognize Vast's HTTP and provider-code forms of a stale marketplace ask."""
+    if status == 404:
+        return True
+    normalized_message = error_message.casefold()
+    return any(
+        marker in normalized_message
+        for marker in _VAST_OFFER_UNAVAILABLE_MARKERS
+    )
 
 
 def _retry_delay(attempt: int, retry_after: str | None) -> float:

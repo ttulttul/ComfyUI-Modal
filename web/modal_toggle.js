@@ -3734,18 +3734,45 @@ function refreshRemoteConfiguratorPanelForPrompt(promptId) {
  */
 function setRemoteConfiguratorTerminalStatus(promptId, phase, message = null) {
   const promptState = modalPromptStates.get(promptId);
-  const panel =
+  const candidatePanel =
     remoteConfiguratorPanel(promptState?.configuratorNodeId) ??
     Array.from(remoteConfiguratorPanels.values()).find(
       (candidate) => candidate?.promptId === promptId,
     );
-  if (!panel || panel.promptId !== promptId) {
+  const panel = candidatePanel?.promptId === promptId ? candidatePanel : null;
+  if (!promptState && !panel) {
     return;
   }
-  const terminalState = { phase, statusMessage: message };
+  const terminalState = {
+    phase,
+    statusMessage: message,
+    statusCurrent: null,
+    statusTotal: null,
+    updatedAt: nowMs(),
+  };
+  const environmentIds = new Set([
+    ...(promptState?.remoteEnvironmentStatuses.keys() ?? []),
+    ...remoteConfiguratorEnvironmentEntries(
+      promptState?.remoteExecutionPlanAssignments ?? {},
+      promptState?.remoteExecutionConfigurations ?? [],
+    ).map((entry) => entry.environmentId),
+    ...(panel?.environmentRows.keys() ?? []),
+  ]);
+  for (const environmentId of environmentIds) {
+    promptState?.remoteEnvironmentStatuses.set(environmentId, {
+      ...(promptState.remoteEnvironmentStatuses.get(environmentId) ?? {}),
+      ...terminalState,
+    });
+  }
+  if (!panel) {
+    return;
+  }
   renderRemoteConfiguratorStatus(panel, terminalState);
-  for (const row of panel.environmentRows.values()) {
-    renderRemoteConfiguratorEnvironmentStatus(row, terminalState);
+  for (const [environmentId, row] of panel.environmentRows.entries()) {
+    renderRemoteConfiguratorEnvironmentStatus(
+      row,
+      promptState?.remoteEnvironmentStatuses.get(environmentId) ?? terminalState,
+    );
   }
 }
 

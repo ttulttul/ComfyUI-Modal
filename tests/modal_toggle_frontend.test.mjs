@@ -1622,6 +1622,40 @@ assert.equal(modalEnvironmentRow.statusText.textContent, "Starting Lambda");
 assert.equal(modalEnvironmentRow.progressValue.textContent, "1/4");
 assert.equal(modalEnvironmentRow.progressFill.style.width, "25%");
 
+modalToggle.handleModalStatus({
+  detail: {
+    phase: "error",
+    prompt_id: "plan-before-capacity",
+    node_ids: ["14", "15", "24"],
+    configurator_node_id: "381",
+    error_message: "Hugging Face could not be reached",
+  },
+});
+const failedPromptState = modalToggle.modalPromptStates.get("plan-before-capacity");
+assert.equal(
+  failedPromptState.remoteEnvironmentStatuses.get("vast:profile:slot-0")?.phase,
+  "error",
+);
+assert.equal(
+  failedPromptState.remoteEnvironmentStatuses.get("modal:lambda")?.statusMessage,
+  "Hugging Face could not be reached",
+);
+assert.equal(vastEnvironmentRow.progress.hidden, true);
+assert.equal(modalEnvironmentRow.progress.hidden, true);
+modalToggle.registerRemoteConfiguratorPlan(
+  "plan-before-capacity",
+  failedPromptState.remoteExecutionPlanAssignments,
+  failedPromptState.remoteExecutionConfigurations,
+);
+assert.equal(
+  retainedPanel.environmentRows.get("vast:profile:slot-0").root.dataset.phase,
+  "error",
+);
+assert.equal(
+  retainedPanel.environmentRows.get("modal:lambda").statusText.textContent,
+  "Hugging Face could not be reached",
+);
+
 modalToggle.registerPromptConfigurator("newer-prompt", "381");
 modalToggle.modalPromptStates.get("plan-before-capacity").startedAt = 1;
 modalToggle.modalPromptStates.get("newer-prompt").startedAt = 2;
