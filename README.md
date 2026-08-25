@@ -1,5 +1,10 @@
 # ComfyUI Modal-Sync
 
+## Breaking Change: Remote Execution Configurator Required
+
+> [!IMPORTANT]
+> Starting with version 0.4.0, every workflow that uses remote execution must include a **Remote Execution Configurator** connected to at least one **Modal Configuration**, **Vast.ai Configuration**, or **SSH Configuration** node. Existing workflows that relied only on the legacy workflow-wide provider and GPU settings must add and connect these nodes before they can run remotely. Optional storage backends, including **R2 Storage Configuration**, connect to the same Configurator.
+
 > [!WARNING]
 > This project is still alpha. Expect missing features, rough edges, and breaking changes.
 
@@ -15,6 +20,7 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 
 ## Table of Contents
 
+- [Breaking Change: Remote Execution Configurator Required](#breaking-change-remote-execution-configurator-required)
 - [Highlights](#highlights)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
