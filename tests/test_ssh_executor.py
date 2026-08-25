@@ -9,6 +9,7 @@ from typing import Any
 
 def test_runtime_uses_workflow_host_snapshot_without_global_registry(
     ssh_executor_module: Any,
+    remote_modal_app_module: Any,
     remote_hosts_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
@@ -41,13 +42,26 @@ def test_runtime_uses_workflow_host_snapshot_without_global_registry(
             """Record construction arguments."""
             observed["manager"] = kwargs
 
-        def ensure_worker(self, worker_index: int) -> Any:
+        def ensure_worker(
+            self,
+            worker_index: int,
+            status_callback: Any = None,
+        ) -> Any:
             """Return a deterministic worker specification."""
             observed["worker_index"] = worker_index
+            observed["status_callback"] = status_callback
+            status_callback("Building SSH runtime environment=workflow-host")
             return SimpleNamespace(worker_index=worker_index)
 
     monkeypatch.setattr(ssh_executor_module, "SshDockerController", FakeController)
     monkeypatch.setattr(ssh_executor_module, "SshRuntimeManager", FakeManager)
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_emit_local_remote_startup_status",
+        lambda payload, **kwargs: observed.setdefault("status_events", []).append(
+            (payload, kwargs)
+        ),
+    )
     client = ssh_executor_module.SshDockerExecutorClient(
         registry=None,
         repo_root=tmp_path,
@@ -65,6 +79,20 @@ def test_runtime_uses_workflow_host_snapshot_without_global_registry(
     assert observed["host"] == host
     assert observed["probed"] is True
     assert observed["worker_index"] == 1
+    assert callable(observed["status_callback"])
+    assert observed["status_events"] == [
+        (
+            {
+                "execution_environment_id": "workflow-host",
+                "execution_worker_index": 1,
+                "ssh_host_config": host.to_dict(),
+            },
+            {
+                "phase": "starting",
+                "status_message": "Building SSH runtime environment=workflow-host",
+            },
+        )
+    ]
     assert spec.worker_index == 1
 
 

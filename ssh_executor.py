@@ -525,7 +525,21 @@ class SshDockerExecutorClient:
             settings=resolved_settings,
         )
         worker_index = int(payload.get("execution_worker_index", 0))
-        return manager, manager.ensure_worker(worker_index)
+
+        def emit_runtime_status(message: str) -> None:
+            """Forward worker lifecycle progress to its Configurator row."""
+            from .remote.modal_app import _emit_local_remote_startup_status
+
+            _emit_local_remote_startup_status(
+                payload,
+                phase="starting",
+                status_message=message,
+            )
+
+        return manager, manager.ensure_worker(
+            worker_index,
+            status_callback=emit_runtime_status,
+        )
 
     def _relay_arguments(self, spec: SshRuntimeSpec) -> tuple[str, ...]:
         """Return the Docker exec argv for the worker's binary relay client."""

@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 if __package__:
     from .runtime_environment import (
@@ -64,6 +64,15 @@ _WORKER_LIFECYCLE_LOCKS_GUARD = threading.Lock()
 _WORKER_LIFECYCLE_LOCKS: dict[tuple[str, int], threading.Lock] = {}
 
 
+def _emit_runtime_status(
+    status_callback: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    """Publish one SSH runtime lifecycle message when a callback is available."""
+    if status_callback is not None:
+        status_callback(message)
+
+
 @dataclass(frozen=True)
 class SshRuntimeSpec:
     """Describe one immutable SSH worker image and warm container."""
@@ -105,7 +114,11 @@ class SshRuntimeManager:
             worker_index=worker_index,
         )
 
-    def ensure_worker(self, worker_index: int = 0) -> SshRuntimeSpec:
+    def ensure_worker(
+        self,
+        worker_index: int = 0,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> SshRuntimeSpec:
         """Ensure a compatible image and running warm worker exist."""
         lifecycle_lock = _worker_lifecycle_lock(
             self.controller.host.environment_id,
@@ -113,13 +126,32 @@ class SshRuntimeManager:
         )
         with lifecycle_lock:
             spec = self.runtime_spec(worker_index)
+            environment_id = self.controller.host.environment_id
+            _emit_runtime_status(
+                status_callback,
+                f"Checking SSH runtime environment={environment_id}",
+            )
             self.controller.ensure_volume(spec.storage_volume_name)
             if not self._image_is_current(spec):
+                _emit_runtime_status(
+                    status_callback,
+                    f"Building SSH runtime environment={environment_id} "
+                    f"image={spec.image_tag}",
+                )
                 self._build_image(spec)
             self._remove_stale_worker_containers(spec)
             if not self._container_is_current_and_running(spec):
+                _emit_runtime_status(
+                    status_callback,
+                    f"Starting SSH worker environment={environment_id}",
+                )
                 self._replace_worker_container(spec)
+            _emit_runtime_status(
+                status_callback,
+                f"Waiting for SSH worker environment={environment_id}",
+            )
             self._wait_until_ready(spec)
+            _emit_runtime_status(status_callback, "Ready for remote execution")
             return spec
 
     def stop_worker(self, worker_index: int = 0) -> bool:

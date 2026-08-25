@@ -8,6 +8,49 @@ from types import SimpleNamespace
 from typing import Any
 
 
+def test_worker_lifecycle_reports_build_and_readiness_status(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A rebuilt SSH worker should expose every material readiness transition."""
+    statuses: list[str] = []
+    spec = SimpleNamespace(
+        image_tag="comfy-remote:deadbeef",
+        storage_volume_name="comfy-remote-lambda",
+    )
+    controller = SimpleNamespace(
+        host=SimpleNamespace(environment_id="lambda"),
+        ensure_volume=lambda _name: None,
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=controller,
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+    monkeypatch.setattr(manager, "runtime_spec", lambda _worker_index: spec)
+    monkeypatch.setattr(manager, "_image_is_current", lambda _spec: False)
+    monkeypatch.setattr(manager, "_build_image", lambda _spec: None)
+    monkeypatch.setattr(manager, "_remove_stale_worker_containers", lambda _spec: None)
+    monkeypatch.setattr(
+        manager,
+        "_container_is_current_and_running",
+        lambda _spec: False,
+    )
+    monkeypatch.setattr(manager, "_replace_worker_container", lambda _spec: None)
+    monkeypatch.setattr(manager, "_wait_until_ready", lambda _spec: None)
+
+    result = manager.ensure_worker(status_callback=statuses.append)
+
+    assert result is spec
+    assert statuses == [
+        "Checking SSH runtime environment=lambda",
+        "Building SSH runtime environment=lambda image=comfy-remote:deadbeef",
+        "Starting SSH worker environment=lambda",
+        "Waiting for SSH worker environment=lambda",
+        "Ready for remote execution",
+    ]
+
+
 def test_worker_build_loads_image_into_the_remote_daemon(
     ssh_runtime_module: Any,
     monkeypatch: Any,

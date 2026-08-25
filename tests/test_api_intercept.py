@@ -5972,15 +5972,21 @@ def test_remote_environment_assets_are_prepared_in_parallel(
         SimpleNamespace(representative_node_id="b", node_ids=["b"]),
     ]
     assignments = {
-        "a": SimpleNamespace(environment_id="vast:big:1"),
-        "b": SimpleNamespace(environment_id="vast:small:2"),
+        "a": SimpleNamespace(
+            environment_id="vast:big:1",
+            provider=api_intercept_module.ExecutionProvider.VAST,
+        ),
+        "b": SimpleNamespace(
+            environment_id="lambda",
+            provider=api_intercept_module.ExecutionProvider.SSH_DOCKER,
+        ),
     }
     results = api_intercept_module._prepare_remote_environment_assets(
         components=components,
         assignments_by_component_id=assignments,
         sync_engines_by_environment={
             "vast:big:1": FakeSyncEngine(),
-            "vast:small:2": FakeSyncEngine(),
+            "lambda": FakeSyncEngine(),
         },
         rewritten_prompt={
             "a": {"class_type": "VAELoader", "inputs": {"vae": "a.safetensors"}},
@@ -5996,11 +6002,11 @@ def test_remote_environment_assets_are_prepared_in_parallel(
     )
 
     assert maximum_active_environment_count == 2
-    assert list(results) == ["vast:big:1", "vast:small:2"]
+    assert list(results) == ["vast:big:1", "lambda"]
     assert results["vast:big:1"].component_prompts["a"]["a"]["inputs"] == {
         "vae": "a.safetensors"
     }
-    assert results["vast:small:2"].component_prompts["b"]["b"]["inputs"] == {
+    assert results["lambda"].component_prompts["b"]["b"]["inputs"] == {
         "vae": "b.safetensors"
     }
     for environment_id in results:
@@ -6009,11 +6015,16 @@ def test_remote_environment_assets_are_prepared_in_parallel(
             for event_environment_id, message in environment_events
             if event_environment_id == environment_id
         ]
+        expected_completion = (
+            "Ready for remote execution"
+            if environment_id == "vast:big:1"
+            else "Remote assets prepared; SSH runtime starts on dispatch"
+        )
         assert messages == [
             "Preparing remote assets",
             "Uploading custom nodes",
             "Downloading prompt asset",
-            "Ready to plan remote execution",
+            expected_completion,
         ]
 
 
@@ -6036,7 +6047,10 @@ def test_remote_environment_asset_worker_failures_bubble_up(
                 SimpleNamespace(representative_node_id="a", node_ids=["a"])
             ],
             assignments_by_component_id={
-                "a": SimpleNamespace(environment_id="vast:broken:1")
+                "a": SimpleNamespace(
+                    environment_id="vast:broken:1",
+                    provider=api_intercept_module.ExecutionProvider.VAST,
+                )
             },
             sync_engines_by_environment={
                 "vast:broken:1": FailingSyncEngine()
@@ -6615,7 +6629,7 @@ def test_selected_vast_capacity_streams_setup_status(
         ("vast:vast-config", "Initializing Vast.ai worker", None, None),
         (
             "vast:vast-config:42",
-            "Ready to plan remote execution",
+            "Vast.ai worker ready; preparing remote assets next",
             None,
             None,
         ),

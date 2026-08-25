@@ -1829,7 +1829,7 @@ def _prepare_selected_vast_capacity(
         _emit_vast_capacity_status(
             environment_id=lease.environment_id,
             message=f"Vast.ai capacity {slot_number} of {total_slots} is ready",
-            environment_message="Ready to plan remote execution",
+            environment_message="Vast.ai worker ready; preparing remote assets next",
             current=slot_number,
             total=total_slots,
             status_callback=status_callback,
@@ -7183,6 +7183,7 @@ def _prepare_environment_assets(
     engine_lock: threading.Lock,
     rewritten_prompt: dict[str, Any],
     sync_custom_nodes: bool,
+    completion_message: str,
     status_callback: SetupStatusCallback | None,
     environment_status_callback: EnvironmentSetupStatusCallback | None,
 ) -> _EnvironmentAssetPreparationResult:
@@ -7217,7 +7218,7 @@ def _prepare_environment_assets(
             )
         )
     if environment_callback is not None:
-        environment_callback("Ready to plan remote execution", None, None)
+        environment_callback(completion_message, None, None)
     logger.info(
         "Finished remote asset preparation environment=%s components=%d assets=%d elapsed_seconds=%.3f.",
         environment_id,
@@ -7276,9 +7277,11 @@ def _prepare_remote_environment_assets(
     components_by_environment: dict[str, list[RemoteComponentPlan]] = {
         environment_id: [] for environment_id in sync_engines_by_environment
     }
+    providers_by_environment: dict[str, ExecutionProvider] = {}
     for component in components:
         assignment = assignments_by_component_id[component.representative_node_id]
         components_by_environment[assignment.environment_id].append(component)
+        providers_by_environment[assignment.environment_id] = assignment.provider
     locks_by_engine: dict[int, threading.Lock] = {}
     environment_ids = list(components_by_environment)
     if not environment_ids:
@@ -7305,6 +7308,9 @@ def _prepare_remote_environment_assets(
                 ),
                 rewritten_prompt=rewritten_prompt,
                 sync_custom_nodes=sync_custom_nodes,
+                completion_message=_asset_preparation_completion_message(
+                    providers_by_environment[environment_id]
+                ),
                 status_callback=status_callback,
                 environment_status_callback=environment_status_callback,
             )
@@ -7314,6 +7320,15 @@ def _prepare_remote_environment_assets(
             environment_id: futures_by_environment[environment_id].result()
             for environment_id in environment_ids
         }
+
+
+def _asset_preparation_completion_message(provider: ExecutionProvider) -> str:
+    """Return the truthful state after assets, but not runtime startup, finish."""
+    if provider is ExecutionProvider.SSH_DOCKER:
+        return "Remote assets prepared; SSH runtime starts on dispatch"
+    if provider is ExecutionProvider.MODAL:
+        return "Remote assets prepared; Modal runtime starts on dispatch"
+    return "Ready for remote execution"
 
 
 def rewrite_prompt_for_modal(

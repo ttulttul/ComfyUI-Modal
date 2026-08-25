@@ -3432,7 +3432,10 @@ function remoteConfiguratorEnvironmentEntries(assignments, configurations) {
             phase: STATE_SETUP,
             statusMessage: "Waiting for Vast.ai setup",
           }
-        : {},
+        : {
+            phase: STATE_SETUP,
+            statusMessage: "Waiting for remote preparation",
+          },
     });
   }
   return Array.from(entries.values());
