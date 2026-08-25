@@ -156,6 +156,55 @@ def test_offer_ranking_is_price_first_and_deterministic(
     )
 
 
+def test_instance_prefers_console_direct_ssh_mapping(
+    vast_models_module: Any,
+) -> None:
+    """The public port mapping should win when Vast's SSH proxy endpoint is stale."""
+    instance = vast_models_module.VastInstance.from_api(
+        {
+            "id": 48627244,
+            "actual_status": "running",
+            "ssh_host": "ssh9.vast.ai",
+            "ssh_port": 27244,
+            "public_ipaddr": "172.125.76.174",
+            "ports": {
+                "22/tcp": [
+                    {"HostIp": "0.0.0.0", "HostPort": "40638"},
+                    {"HostIp": "::", "HostPort": "40638"},
+                ]
+            },
+            "num_gpus": 1,
+            "gpu_ram": 97887,
+            "cpu_ram": 128625,
+        }
+    )
+
+    assert instance.ssh_host == "172.125.76.174"
+    assert instance.ssh_port == 40638
+
+
+def test_instance_falls_back_to_proxy_for_malformed_direct_mapping(
+    vast_models_module: Any,
+) -> None:
+    """A partial direct mapping must not hide Vast's legacy proxy endpoint."""
+    instance = vast_models_module.VastInstance.from_api(
+        {
+            "id": 17,
+            "actual_status": "running",
+            "ssh_host": "ssh7.vast.ai",
+            "ssh_port": 22017,
+            "public_ipaddr": "192.0.2.17",
+            "ports": {"22/tcp": [{"HostPort": "invalid"}]},
+            "num_gpus": 1,
+            "gpu_ram": 24576,
+            "cpu_ram": 65536,
+        }
+    )
+
+    assert instance.ssh_host == "ssh7.vast.ai"
+    assert instance.ssh_port == 22017
+
+
 def test_offer_is_revalidated_after_server_filtering(vast_models_module: Any) -> None:
     """A malformed server result must not bypass client-side constraints."""
     profile = vast_models_module.VastResourceProfile(

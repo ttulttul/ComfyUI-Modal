@@ -234,11 +234,23 @@ class VastSshRunner:
         timeout_seconds: float | None = None,
         check: bool = True,
         cancellation_check: Callable[[], bool] | None = None,
+        transport_attempts: int | None = None,
     ) -> VastSshCommandResult:
         """Execute one command with bounded transient transport retries."""
         resolved_input_file = _resolved_input_file(input_payload, input_file)
+        resolved_transport_attempts = (
+            self.retry_attempts
+            if transport_attempts is None
+            else transport_attempts
+        )
+        if (
+            isinstance(resolved_transport_attempts, bool)
+            or not isinstance(resolved_transport_attempts, int)
+            or resolved_transport_attempts <= 0
+        ):
+            raise ValueError("Vast SSH transport attempts must be a positive integer.")
         started_at = time.monotonic()
-        for attempt in range(1, self.retry_attempts + 1):
+        for attempt in range(1, resolved_transport_attempts + 1):
             result = self._run_attempt(
                 remote_argv,
                 input_payload=input_payload,
@@ -247,11 +259,15 @@ class VastSshRunner:
                 cancellation_check=cancellation_check,
             )
             if _is_transient_ssh_transport_failure(result):
-                if attempt >= self.retry_attempts:
+                if attempt >= resolved_transport_attempts:
                     raise self._command_error(
                         remote_argv,
                         result,
-                        suffix=f" after {attempt} transport attempts",
+                        suffix=(
+                            f" after {attempt} transport attempts"
+                            if resolved_transport_attempts > 1
+                            else ""
+                        ),
                     )
                 delay_seconds = self._retry_delay_seconds(attempt)
                 logger.warning(
@@ -260,7 +276,7 @@ class VastSshRunner:
                     self.connection.host,
                     remote_argv[0],
                     attempt,
-                    self.retry_attempts,
+                    resolved_transport_attempts,
                     delay_seconds,
                     result.stderr_text.strip() or result.stdout_text.strip(),
                 )

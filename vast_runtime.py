@@ -203,6 +203,7 @@ class VastRuntimeManager:
         result = self.runner.run(
             ("python", "-m", "remote.ssh_worker", "runtime-info"),
             check=True,
+            transport_attempts=1,
         )
         try:
             payload = json.loads(result.stdout_text)

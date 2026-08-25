@@ -24,12 +24,13 @@ class FakeRunner:
         """Configure runtime states returned by successive probes."""
         self.infos = infos
         self.calls: list[tuple[str, ...]] = []
+        self.call_options: list[dict[str, Any]] = []
 
     def run(self, argv: Any, **kwargs: Any) -> FakeResult:
         """Record the command and return its simulated result."""
-        del kwargs
         arguments = tuple(argv)
         self.calls.append(arguments)
+        self.call_options.append(dict(kwargs))
         if arguments[-1] == "runtime-info":
             return FakeResult(self.infos.pop(0))
         return FakeResult({"ok": True})
@@ -106,6 +107,12 @@ def test_runtime_manager_starts_missing_socket_then_verifies_fingerprint(
 
     assert info["worker_socket_ready"] is True
     assert any("remote.vast_supervisor" in call for call in runner.calls)
+    runtime_info_options = [
+        options
+        for call, options in zip(runner.calls, runner.call_options, strict=True)
+        if call[-1] == "runtime-info"
+    ]
+    assert all(options["transport_attempts"] == 1 for options in runtime_info_options)
 
 
 def test_runtime_manager_rejects_image_fingerprint_drift(

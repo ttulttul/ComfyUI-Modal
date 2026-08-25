@@ -370,6 +370,7 @@ class VastInstance:
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> "VastInstance":
         """Normalize one Vast instance response record."""
+        ssh_host, ssh_port = _instance_ssh_endpoint(payload)
         return cls(
             instance_id=_required_int(payload, "id"),
             actual_status=str(payload.get("actual_status") or "unknown").strip(),
@@ -377,8 +378,8 @@ class VastInstance:
             current_state=_optional_string(payload.get("cur_state")),
             status_message=_bounded_status_string(payload.get("status_msg")),
             label=_optional_string(payload.get("label")),
-            ssh_host=_optional_string(payload.get("ssh_host")),
-            ssh_port=_optional_int(payload.get("ssh_port"), "ssh_port"),
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
             gpu_name=_optional_string(payload.get("gpu_name")),
             num_gpus=_non_negative_int(payload.get("num_gpus"), "num_gpus"),
             gpu_ram_mb=_non_negative_int(payload.get("gpu_ram"), "gpu_ram"),
@@ -501,6 +502,35 @@ def _matches_geolocation(
         normalized_value == allowed.strip().casefold()
         or normalized_value.endswith(f", {allowed.strip().casefold()}")
         for allowed in allowed_geolocations
+    )
+
+
+def _instance_ssh_endpoint(
+    payload: Mapping[str, Any],
+) -> tuple[str | None, int | None]:
+    """Prefer Vast's console-equivalent direct TCP mapping over its SSH proxy."""
+    public_host = _optional_string(payload.get("public_ipaddr"))
+    raw_ports = payload.get("ports")
+    if public_host is not None and isinstance(raw_ports, Mapping):
+        raw_ssh_mappings = raw_ports.get("22/tcp")
+        ssh_mappings = (
+            raw_ssh_mappings
+            if isinstance(raw_ssh_mappings, list)
+            else [raw_ssh_mappings]
+        )
+        for raw_mapping in ssh_mappings:
+            if not isinstance(raw_mapping, Mapping):
+                continue
+            raw_host_port = raw_mapping.get("HostPort")
+            try:
+                host_port = int(raw_host_port)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= host_port <= 65535:
+                return public_host, host_port
+    return (
+        _optional_string(payload.get("ssh_host")),
+        _optional_int(payload.get("ssh_port"), "ssh_port"),
     )
 
 

@@ -267,6 +267,46 @@ def test_runner_bounds_repeated_transient_disconnects(
     assert delays == [0.5, 1.0]
 
 
+def test_runner_allows_one_attempt_for_outer_readiness_polling(
+    tmp_path: Path,
+    vast_ssh_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """An outer readiness loop should not multiply every probe by transport retries."""
+    connection = vast_ssh_module.VastSshConnection(
+        host="ssh.example.invalid",
+        port=22,
+        known_hosts_path=(tmp_path / "known-hosts").resolve(),
+    )
+    delays: list[float] = []
+    runner = vast_ssh_module.VastSshRunner(
+        connection,
+        retry_attempts=4,
+        sleep=delays.append,
+    )
+    call_count = 0
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        """Report one provider-side connection closure."""
+        nonlocal call_count
+        del kwargs
+        call_count += 1
+        return vast_ssh_module.subprocess.CompletedProcess(
+            args=command,
+            returncode=255,
+            stdout=b"",
+            stderr=b"Connection closed by 54.80.37.79 port 11714",
+        )
+
+    monkeypatch.setattr(vast_ssh_module.subprocess, "run", fake_run)
+
+    with pytest.raises(vast_ssh_module.VastSshError, match="Connection closed"):
+        runner.run(("true",), transport_attempts=1)
+
+    assert call_count == 1
+    assert delays == []
+
+
 def test_volume_backend_writes_atomically_and_caches_existence(
     vast_ssh_module: Any,
 ) -> None:
