@@ -6,14 +6,17 @@ import asyncio
 import logging
 import subprocess
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from uuid import uuid4
 
 if __package__:
     from .durable_state import stable_remote_invocation_id
     from .llm_profiles import (
+        encoded_resolved_llm_profile_payloads,
         llm_model_references_from_payload,
         rewrite_llm_model_references,
     )
@@ -27,6 +30,11 @@ if __package__:
     )
     from .serialization import deserialize_node_outputs, serialize_node_inputs
     from .settings import ModalSyncSettings, get_settings
+    from .staging_process import (
+        RemoteStagingProcessError,
+        consume_staging_process,
+        terminate_staging_transport,
+    )
     from .vast_leases import VastLeaseRecord, VastLeaseRegistry
     from .vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
     from .vast_ssh import (
@@ -37,6 +45,7 @@ if __package__:
 else:  # pragma: no cover - direct debugging imports.
     from durable_state import stable_remote_invocation_id
     from llm_profiles import (
+        encoded_resolved_llm_profile_payloads,
         llm_model_references_from_payload,
         rewrite_llm_model_references,
     )
@@ -50,6 +59,11 @@ else:  # pragma: no cover - direct debugging imports.
     )
     from serialization import deserialize_node_outputs, serialize_node_inputs
     from settings import ModalSyncSettings, get_settings
+    from staging_process import (
+        RemoteStagingProcessError,
+        consume_staging_process,
+        terminate_staging_transport,
+    )
     from vast_leases import VastLeaseRecord, VastLeaseRegistry
     from vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
     from vast_ssh import VastSshError, VastSshRunner, vast_connection_from_lease
@@ -57,6 +71,11 @@ else:  # pragma: no cover - direct debugging imports.
 logger = logging.getLogger(__name__)
 _STAGED_VAST_PROFILES_LOCK = threading.Lock()
 _STAGED_VAST_PROFILE_RESULTS: dict[tuple[int, str], dict[str, Any]] = {}
+_ACTIVE_VAST_STAGERS_LOCK = threading.Lock()
+_ACTIVE_VAST_STAGERS: dict[
+    str,
+    tuple[VastSshRunner, str, subprocess.Popen[bytes]],
+] = {}
 
 
 class VastRemoteInvocationError(RuntimeError):
@@ -128,6 +147,23 @@ class VastExecutorClient:
 
     def cancel(self, payload: Mapping[str, Any], invocation_id: str) -> bool:
         """Signal one active direct worker invocation."""
+        with _ACTIVE_VAST_STAGERS_LOCK:
+            active_stager = _ACTIVE_VAST_STAGERS.get(invocation_id)
+        if active_stager is not None:
+            runner, owner_id, process = active_stager
+            terminate_staging_transport(process)
+            remote_cancelled = self._cancel_remote_stager(
+                runner,
+                owner_id,
+                wait_for_owner_seconds=5.0,
+            )
+            logger.info(
+                "Cancelled Vast model staging invocation=%s "
+                "remote_process_found=%s.",
+                invocation_id,
+                remote_cancelled,
+            )
+            return True
         _lease, runner, runtime = self._runtime(payload)
         runtime.ensure_worker()
         request = encode_json_frame(
@@ -305,21 +341,89 @@ class VastExecutorClient:
             phase="llm_staging",
             status_message="Preparing LLM model snapshots on the Vast.ai instance",
         )
-        arguments = ["python", "-m", "remote.ssh_worker", "stage-profiles"]
+        invocation_id = str(payload["invocation_id"])
+        owner_id = f"vast:{invocation_id}:{uuid4().hex}"
+        arguments = [
+            "python",
+            "-m",
+            "remote.ssh_worker",
+            "stage-profiles",
+            "--owner-id",
+            owner_id,
+        ]
         for reference in model_references:
             arguments.extend(("--model-reference", reference))
-        process = runner.popen(tuple(arguments))
-        results = _consume_stager_output(
-            process,
+        resolved_profiles = encoded_resolved_llm_profile_payloads(
             payload,
-            _emit_local_llm_staging_progress,
+            model_references,
         )
+        if resolved_profiles is not None:
+            arguments.extend(("--resolved-profiles", resolved_profiles))
+        process = runner.popen(tuple(arguments))
+        with _ACTIVE_VAST_STAGERS_LOCK:
+            _ACTIVE_VAST_STAGERS[invocation_id] = (runner, owner_id, process)
+        try:
+            results = consume_staging_process(
+                process,
+                payload,
+                _emit_local_llm_staging_progress,
+                provider_label="Vast",
+                abort_remote=lambda: self._cancel_remote_stager(
+                    runner,
+                    owner_id,
+                ),
+            )
+        except RemoteStagingProcessError as exc:
+            raise VastRemoteInvocationError(str(exc)) from exc
+        finally:
+            with _ACTIVE_VAST_STAGERS_LOCK:
+                _ACTIVE_VAST_STAGERS.pop(invocation_id, None)
         _emit_local_remote_startup_status(
             payload,
             phase="llm_staged",
             status_message="Vast.ai LLM staging complete",
         )
         return results
+
+    @staticmethod
+    def _cancel_remote_stager(
+        runner: VastSshRunner,
+        owner_id: str,
+        *,
+        wait_for_owner_seconds: float = 0.0,
+    ) -> bool:
+        """Terminate one exact owner-tagged stager on a Vast instance."""
+        deadline = time.monotonic() + max(0.0, wait_for_owner_seconds)
+        while True:
+            result = runner.run(
+                (
+                    "python",
+                    "-m",
+                    "remote.ssh_worker",
+                    "cancel-staging",
+                    "--owner-id",
+                    owner_id,
+                ),
+                timeout_seconds=15.0,
+                check=False,
+                transport_attempts=1,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "Vast remote stager cancellation failed owner=%s error=%s.",
+                    owner_id,
+                    result.stderr_text.strip() or result.stdout_text.strip(),
+                )
+                return False
+            try:
+                response = decode_json_payload(result.stdout)
+            except (RemoteProtocolError, UnicodeDecodeError):
+                return False
+            if response.get("cancelled"):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
 
     def _cache_staged_profiles(
         self,
@@ -510,54 +614,6 @@ def _payload_retention_seconds(payload: Mapping[str, Any]) -> float:
             "Vast execution payload idle retention must not be negative."
         )
     return retention
-
-
-def _consume_stager_output(
-    process: subprocess.Popen[bytes],
-    payload: dict[str, Any],
-    progress_callback: Callable[[dict[str, Any], Mapping[str, Any]], None],
-) -> list[dict[str, Any]]:
-    """Consume JSON-line progress and terminal direct staging results."""
-    if process.stdout is None or process.stderr is None:
-        process.kill()
-        raise VastRemoteInvocationError(
-            "Vast model stager did not expose output streams."
-        )
-    stderr_chunks: list[bytes] = []
-    stderr_thread = threading.Thread(
-        target=_collect_bounded_stream,
-        args=(process.stderr, stderr_chunks),
-        daemon=True,
-    )
-    stderr_thread.start()
-    results: list[dict[str, Any]] | None = None
-    for raw_line in process.stdout:
-        try:
-            event = decode_json_payload(raw_line)
-        except (RemoteProtocolError, UnicodeDecodeError) as exc:
-            process.terminate()
-            raise VastRemoteInvocationError(
-                "Vast model stager returned invalid progress JSON."
-            ) from exc
-        if event.get("kind") == "progress":
-            progress_callback(payload, event)
-        elif event.get("kind") == "result" and isinstance(event.get("results"), list):
-            results = [
-                dict(result)
-                for result in event["results"]
-                if isinstance(result, Mapping)
-            ]
-    returncode = process.wait()
-    stderr_thread.join(timeout=1.0)
-    if returncode != 0 or results is None:
-        diagnostics = (
-            b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
-        )
-        raise VastRemoteInvocationError(
-            "Vast model staging failed: "
-            f"{diagnostics or f'exit status {returncode}'}."
-        )
-    return results
 
 
 def _collect_bounded_stream(stream: Any, chunks: list[bytes]) -> None:

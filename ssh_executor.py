@@ -6,14 +6,17 @@ import asyncio
 import logging
 import subprocess
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 if __package__:
     from .durable_state import stable_remote_invocation_id
     from .llm_profiles import (
+        encoded_resolved_llm_profile_payloads,
         llm_model_references_from_payload,
         rewrite_llm_model_references,
     )
@@ -28,11 +31,17 @@ if __package__:
     )
     from .serialization import deserialize_node_outputs, serialize_node_inputs
     from .settings import ModalSyncSettings, get_settings
+    from .staging_process import (
+        RemoteStagingProcessError,
+        consume_staging_process,
+        terminate_staging_transport,
+    )
     from .ssh_docker import SshDockerController, SshDockerError
     from .ssh_runtime import SshRuntimeManager, SshRuntimeSpec
 else:  # pragma: no cover - top-level remote imports.
     from durable_state import stable_remote_invocation_id
     from llm_profiles import (
+        encoded_resolved_llm_profile_payloads,
         llm_model_references_from_payload,
         rewrite_llm_model_references,
     )
@@ -47,6 +56,11 @@ else:  # pragma: no cover - top-level remote imports.
     )
     from serialization import deserialize_node_outputs, serialize_node_inputs
     from settings import ModalSyncSettings, get_settings
+    from staging_process import (
+        RemoteStagingProcessError,
+        consume_staging_process,
+        terminate_staging_transport,
+    )
     from ssh_docker import SshDockerController, SshDockerError
     from ssh_runtime import SshRuntimeManager, SshRuntimeSpec
 
@@ -56,7 +70,7 @@ _STAGED_SSH_PROFILE_RESULTS: dict[tuple[str, str], dict[str, Any]] = {}
 _ACTIVE_SSH_STAGERS_LOCK = threading.Lock()
 _ACTIVE_SSH_STAGERS: dict[
     str,
-    tuple[SshRuntimeManager, SshRuntimeSpec],
+    tuple[SshRuntimeManager, SshRuntimeSpec, str, subprocess.Popen[bytes]],
 ] = {}
 
 
@@ -119,17 +133,23 @@ class SshDockerExecutorClient:
         with _ACTIVE_SSH_STAGERS_LOCK:
             active_stager = _ACTIVE_SSH_STAGERS.get(invocation_id)
         if active_stager is not None:
-            active_manager, active_spec = active_stager
-            stopped = active_manager.stop_worker(active_spec.worker_index)
+            active_manager, active_spec, owner_id, process = active_stager
+            terminate_staging_transport(process)
+            remote_cancelled = self._cancel_remote_stager(
+                active_manager,
+                active_spec,
+                owner_id,
+                wait_for_owner_seconds=5.0,
+            )
             logger.info(
-                "Stopped SSH worker to cancel active model staging invocation=%s "
-                "environment=%s worker_index=%d stopped=%s.",
+                "Cancelled SSH model staging invocation=%s "
+                "environment=%s worker_index=%d remote_process_found=%s.",
                 invocation_id,
                 active_manager.controller.host.environment_id,
                 active_spec.worker_index,
-                stopped,
+                remote_cancelled,
             )
-            return stopped
+            return True
         manager, spec = self._runtime(payload)
         request = encode_json_frame(
             RemoteFrameKind.CANCEL,
@@ -296,18 +316,39 @@ class SshDockerExecutorClient:
             "remote.ssh_worker",
             "stage-profiles",
         ]
+        invocation_id = str(payload["invocation_id"])
+        owner_id = f"ssh:{invocation_id}:{uuid4().hex}"
+        arguments.extend(("--owner-id", owner_id))
         for model_reference in model_references:
             arguments.extend(("--model-reference", model_reference))
+        resolved_profiles = encoded_resolved_llm_profile_payloads(
+            payload,
+            model_references,
+        )
+        if resolved_profiles is not None:
+            arguments.extend(("--resolved-profiles", resolved_profiles))
         process = manager.controller.docker_popen(tuple(arguments))
-        invocation_id = str(payload["invocation_id"])
         with _ACTIVE_SSH_STAGERS_LOCK:
-            _ACTIVE_SSH_STAGERS[invocation_id] = (manager, spec)
+            _ACTIVE_SSH_STAGERS[invocation_id] = (
+                manager,
+                spec,
+                owner_id,
+                process,
+            )
         try:
-            results = self._consume_stager_output(
+            results = consume_staging_process(
                 process,
                 payload,
                 _emit_local_llm_staging_progress,
+                provider_label="SSH",
+                abort_remote=lambda: self._cancel_remote_stager(
+                    manager,
+                    spec,
+                    owner_id,
+                ),
             )
+        except RemoteStagingProcessError as exc:
+            raise SshRemoteInvocationError(str(exc)) from exc
         finally:
             with _ACTIVE_SSH_STAGERS_LOCK:
                 _ACTIVE_SSH_STAGERS.pop(invocation_id, None)
@@ -325,44 +366,47 @@ class SshDockerExecutorClient:
         )
         return results
 
-    def _consume_stager_output(
-        self,
-        process: subprocess.Popen[bytes],
-        payload: dict[str, Any],
-        progress_callback: Any,
-    ) -> list[dict[str, Any]]:
-        """Consume JSON-line progress and the terminal SSH staging result."""
-        if process.stdout is None or process.stderr is None:
-            process.kill()
-            raise SshRemoteInvocationError("SSH model stager did not expose output streams.")
-        stderr_chunks: list[bytes] = []
-        stderr_thread = threading.Thread(
-            target=_collect_bounded_stream,
-            args=(process.stderr, stderr_chunks),
-            daemon=True,
-        )
-        stderr_thread.start()
-        results: list[dict[str, Any]] | None = None
-        for raw_line in process.stdout:
-            try:
-                event = decode_json_payload(raw_line)
-            except (RemoteProtocolError, UnicodeDecodeError) as exc:
-                process.terminate()
-                raise SshRemoteInvocationError(
-                    "SSH model stager returned invalid progress JSON."
-                ) from exc
-            if event.get("kind") == "progress":
-                progress_callback(payload, event)
-            elif event.get("kind") == "result" and isinstance(event.get("results"), list):
-                results = [dict(result) for result in event["results"] if isinstance(result, Mapping)]
-        returncode = process.wait()
-        stderr_thread.join(timeout=1.0)
-        if returncode != 0 or results is None:
-            diagnostics = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
-            raise SshRemoteInvocationError(
-                f"SSH model staging failed: {diagnostics or 'no result returned'}"
+    @staticmethod
+    def _cancel_remote_stager(
+        manager: SshRuntimeManager,
+        spec: SshRuntimeSpec,
+        owner_id: str,
+        *,
+        wait_for_owner_seconds: float = 0.0,
+    ) -> bool:
+        """Terminate one exact owner-tagged stager without recycling its worker."""
+        deadline = time.monotonic() + max(0.0, wait_for_owner_seconds)
+        while True:
+            result = manager.controller.docker(
+                (
+                    "exec",
+                    spec.container_name,
+                    "python",
+                    "-m",
+                    "remote.ssh_worker",
+                    "cancel-staging",
+                    "--owner-id",
+                    owner_id,
+                ),
+                timeout_seconds=15.0,
+                check=False,
             )
-        return results
+            if result.returncode != 0:
+                logger.warning(
+                    "SSH remote stager cancellation failed owner=%s error=%s.",
+                    owner_id,
+                    result.stderr_text.strip() or result.stdout_text.strip(),
+                )
+                return False
+            try:
+                response = decode_json_payload(result.stdout)
+            except (RemoteProtocolError, UnicodeDecodeError):
+                return False
+            if response.get("cancelled"):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
 
     def _cache_staged_profiles(
         self,

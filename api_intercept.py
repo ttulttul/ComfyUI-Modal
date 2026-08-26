@@ -347,6 +347,7 @@ class ComponentExecutionPlan:
     ssh_hosts_by_id: dict[str, SshHostConfig] = field(default_factory=dict)
     vast_service: VastService | None = None
     vast_leases_by_environment: dict[str, Any] = field(default_factory=dict)
+    resolved_llm_profiles: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1185,10 +1186,15 @@ def _plan_component_execution_assignments(
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
     status_callback: SetupStatusCallback | None = None,
+    resolved_llm_profiles: Mapping[str, Any] | None = None,
 ) -> dict[str, ExecutionAssignment]:
     """Assign components across Modal, SSH Docker, and workflow-declared Vast pools."""
     preferences = WorkflowExecutionPreferences.from_workflow(workflow)
-    resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
+    active_llm_profiles = (
+        dict(resolved_llm_profiles)
+        if resolved_llm_profiles is not None
+        else _resolve_prompt_llm_profiles(prompt, settings)
+    )
     if preferences.policy is ExecutionPolicy.MODAL:
         incompatible_component_ids = [
             component.representative_node_id
@@ -1196,7 +1202,7 @@ def _plan_component_execution_assignments(
             if _component_required_provider(
                 component,
                 prompt,
-                resolved_llm_profiles,
+                active_llm_profiles,
             )
             is ExecutionProvider.SSH_DOCKER
         ]
@@ -1272,13 +1278,13 @@ def _plan_component_execution_assignments(
             prompt,
             preferences,
             settings,
-            resolved_llm_profiles,
+            active_llm_profiles,
         )
         component_memory_estimates[component_id] = memory_estimate
         component_required_providers[component_id] = _component_required_provider(
             component,
             prompt,
-            resolved_llm_profiles,
+            active_llm_profiles,
         )
         if memory_estimate.model_asset_count:
             logger.info(
@@ -1436,6 +1442,7 @@ def _plan_component_execution(
         configuration_set = compile_remote_configuration_set(prompt)
     except (TypeError, ValueError) as exc:
         raise ModalPromptValidationError(str(exc)) from exc
+    resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
     if configuration_set is None:
         return ComponentExecutionPlan(
             assignments=_plan_component_execution_assignments(
@@ -1444,7 +1451,9 @@ def _plan_component_execution(
                 workflow=workflow,
                 settings=settings,
                 status_callback=status_callback,
-            )
+                resolved_llm_profiles=resolved_llm_profiles,
+            ),
+            resolved_llm_profiles=resolved_llm_profiles,
         )
     return _plan_configured_component_execution(
         components=components,
@@ -1456,6 +1465,7 @@ def _plan_component_execution(
         environment_status_callback=environment_status_callback,
         plan_callback=plan_callback,
         occupied_environment_ids=occupied_environment_ids,
+        resolved_llm_profiles=resolved_llm_profiles,
     )
 
 
@@ -1470,6 +1480,7 @@ def _plan_configured_component_execution(
     environment_status_callback: EnvironmentSetupStatusCallback | None = None,
     plan_callback: ExecutionPlanStatusCallback | None = None,
     occupied_environment_ids: frozenset[str] = frozenset(),
+    resolved_llm_profiles: Mapping[str, Any] | None = None,
 ) -> ComponentExecutionPlan:
     """Resolve and prepare a capacity-aware plan from connected configurations."""
     configurations_by_id = {
@@ -1486,6 +1497,7 @@ def _plan_configured_component_execution(
         prompt=prompt,
         workflow=workflow,
         settings=settings,
+        resolved_llm_profiles=resolved_llm_profiles,
     )
     _prefetch_configured_vast_offers(
         configuration_set=configuration_set,
@@ -1590,6 +1602,7 @@ def _plan_configured_component_execution(
         ssh_hosts_by_id=ssh_hosts_by_id,
         vast_service=vast_service,
         vast_leases_by_environment=vast_leases,
+        resolved_llm_profiles=dict(resolved_llm_profiles or {}),
     )
 
 
@@ -1840,10 +1853,15 @@ def _configured_component_requirements(
     prompt: Mapping[str, Any],
     workflow: Mapping[str, Any] | None,
     settings: ModalSyncSettings,
+    resolved_llm_profiles: Mapping[str, Any] | None = None,
 ) -> dict[str, ComponentResourceRequirements]:
     """Build provider-neutral requirements for every remote component."""
     preferences = WorkflowExecutionPreferences.from_workflow(workflow)
-    resolved_llm_profiles = _resolve_prompt_llm_profiles(prompt, settings)
+    active_llm_profiles = (
+        dict(resolved_llm_profiles)
+        if resolved_llm_profiles is not None
+        else _resolve_prompt_llm_profiles(prompt, settings)
+    )
     requirements: dict[str, ComponentResourceRequirements] = {}
     for component in components:
         memory_estimate = _component_memory_estimate(
@@ -1851,7 +1869,7 @@ def _configured_component_requirements(
             prompt,
             preferences,
             settings,
-            resolved_llm_profiles,
+            active_llm_profiles,
         )
         component_id = component.representative_node_id
         requirements[component_id] = ComponentResourceRequirements(
@@ -1864,7 +1882,7 @@ def _configured_component_requirements(
             required_provider=_component_required_provider(
                 component,
                 prompt,
-                resolved_llm_profiles,
+                active_llm_profiles,
             ),
         )
     return requirements
@@ -3063,6 +3081,68 @@ def _attach_snapshot_profile_key(
             payload.get("payload_kind"),
         )
     return payload
+
+
+def _resolved_llm_profile_entry(
+    profile: Any,
+    settings: ModalSyncSettings,
+) -> dict[str, Any]:
+    """Serialize planner metadata plus its persisted security-scan result."""
+    from .llm_profiles import generated_profile_manifest_path
+
+    security_scan_complete = True
+    if getattr(profile, "source", "curated") == "generated":
+        manifest_path = generated_profile_manifest_path(
+            settings.local_storage_root,
+            profile.profile_id,
+        )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+            raise ModalPromptValidationError(
+                f"Planner-resolved LLM manifest {manifest_path} is unavailable."
+            ) from exc
+        if not isinstance(manifest, Mapping):
+            raise ModalPromptValidationError(
+                f"Planner-resolved LLM manifest {manifest_path} is invalid."
+            )
+        security_scan_complete = bool(
+            manifest.get("security_scan_complete", False)
+        )
+    return {
+        "profile": profile.to_mapping(),
+        "security_scan_complete": security_scan_complete,
+    }
+
+
+def _attach_resolved_llm_profiles(
+    payload: dict[str, Any],
+    resolved_profiles: Mapping[str, Any],
+    settings: ModalSyncSettings,
+) -> None:
+    """Attach only the planner-resolved profiles used by each payload subtree."""
+    from .llm_profiles import llm_model_references_from_payload
+
+    if not resolved_profiles:
+        return
+    references = llm_model_references_from_payload(payload)
+    entries = {
+        reference: _resolved_llm_profile_entry(resolved_profiles[reference], settings)
+        for reference in references
+        if reference in resolved_profiles
+    }
+    if entries:
+        payload["resolved_llm_profiles"] = entries
+    split_payloads = payload.get("split_proxy_payloads")
+    if isinstance(split_payloads, Mapping):
+        children = split_payloads.values()
+    elif isinstance(split_payloads, list):
+        children = split_payloads
+    else:
+        children = ()
+    for child in children:
+        if isinstance(child, dict):
+            _attach_resolved_llm_profiles(child, resolved_profiles, settings)
 
 
 def _boundary_source_signature(
@@ -8086,6 +8166,11 @@ def rewrite_prompt_for_modal(
             remote_session=remote_sessions_by_component_id.get(
                 component.representative_node_id
             ),
+        )
+        _attach_resolved_llm_profiles(
+            payload,
+            execution_plan.resolved_llm_profiles,
+            resolved_settings,
         )
         _stamp_execution_assignment(
             payload,

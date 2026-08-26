@@ -4400,6 +4400,34 @@ def test_snapshot_profile_stamping_excludes_llm_phase_from_comfy_profile(
     assert phases[2]["snapshot_profile_key"] == snapshot_profile_key
 
 
+def test_planner_resolved_llm_profile_is_attached_to_matching_payload(
+    api_intercept_module: Any,
+    llm_profiles_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The execution payload should carry metadata already resolved by planning."""
+    profile = llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct")
+    payload = {
+        "component_id": "llm",
+        "subgraph_prompt": {
+            "llm": {
+                "class_type": "ModalLLM",
+                "inputs": {"model_profile": profile.profile_id},
+            }
+        },
+    }
+
+    api_intercept_module._attach_resolved_llm_profiles(
+        payload,
+        {profile.profile_id: profile},
+        SimpleNamespace(local_storage_root=tmp_path),
+    )
+
+    entry = payload["resolved_llm_profiles"][profile.profile_id]
+    assert entry["profile"] == profile.to_mapping()
+    assert entry["security_scan_complete"] is True
+
+
 def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
     api_intercept_module: Any,
 ) -> None:

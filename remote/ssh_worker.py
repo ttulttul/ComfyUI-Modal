@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
+import re
+import signal
 import socket
 import socketserver
 import sys
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Mapping, Sequence
+from uuid import uuid4
 
 try:
     from ..remote_protocol import (
@@ -40,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WORKER_SOCKET_PATH = Path("/run/comfy-remote/worker.sock")
 DEFAULT_STORAGE_ROOT = Path("/storage")
+_STAGING_OWNER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_STAGING_TERMINATE_GRACE_SECONDS = 5.0
 
 
 class SshWorkerError(RuntimeError):
@@ -249,6 +257,9 @@ def runtime_info() -> dict[str, Any]:
 def stage_profiles(
     model_references: list[str],
     storage_root: Path = DEFAULT_STORAGE_ROOT,
+    *,
+    resolved_profiles: Mapping[str, Mapping[str, Any]] | None = None,
+    owner_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve and stage immutable LLM profiles in the worker's storage volume."""
     try:
@@ -280,6 +291,8 @@ def stage_profiles(
         model_references,
         storage_root,
         progress_callback=emit_progress,
+        resolved_profiles=resolved_profiles,
+        owner_id=owner_id,
     )
     result_payload = [result.to_dict() for result in results]
     print(
@@ -291,6 +304,175 @@ def stage_profiles(
         flush=True,
     )
     return result_payload
+
+
+def _validated_staging_owner_id(owner_id: str) -> str:
+    """Return a filesystem-safe controller-issued staging owner identity."""
+    normalized = owner_id.strip()
+    if not _STAGING_OWNER_ID_PATTERN.fullmatch(normalized):
+        raise ValueError(f"Invalid staging owner id {owner_id!r}.")
+    return normalized
+
+
+def _staging_owner_path(storage_root: Path, owner_id: str) -> Path:
+    """Return the isolated process record for one staging invocation."""
+    return (
+        storage_root.resolve()
+        / "llm_staging"
+        / "owners"
+        / f"{_validated_staging_owner_id(owner_id)}.json"
+    )
+
+
+def _linux_process_start(pid: int) -> str | None:
+    """Return one Linux process start tick for PID-reuse validation."""
+    try:
+        stat_record = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    fields_after_command = stat_record.rpartition(") ")[2].split()
+    return fields_after_command[19] if len(fields_after_command) > 19 else None
+
+
+def _owner_record_matches(path: Path, expected: Mapping[str, Any]) -> bool:
+    """Return whether a process record still belongs to the expected owner."""
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    return bool(
+        isinstance(current, Mapping)
+        and current.get("pid") == expected.get("pid")
+        and current.get("process_start") == expected.get("process_start")
+    )
+
+
+def _remove_owned_snapshot_leases(
+    storage_root: Path,
+    owner: Mapping[str, Any],
+) -> None:
+    """Remove snapshot leases that still name one terminated staging owner."""
+    model_root = storage_root.resolve() / "llm_models"
+    if not model_root.is_dir():
+        return
+    for lease_path in model_root.rglob(".*.download.lock"):
+        try:
+            lease_owner = json.loads(lease_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(lease_owner, Mapping):
+            continue
+        if any(
+            lease_owner.get(field) != owner.get(field)
+            for field in ("owner_id", "pid", "process_start")
+        ):
+            continue
+        try:
+            lease_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def staging_process_owner(storage_root: Path, owner_id: str) -> Iterator[None]:
+    """Publish an exact process record that a controller can safely terminate."""
+    owner_path = _staging_owner_path(storage_root, owner_id)
+    owner_path.parent.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid()
+    owner_record = {
+        "version": 1,
+        "owner_id": _validated_staging_owner_id(owner_id),
+        "pid": pid,
+        "process_start": _linux_process_start(pid),
+        "created_at": time.time(),
+    }
+    temporary_path = owner_path.with_suffix(f".{uuid4().hex}.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(owner_record, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, owner_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    try:
+        yield
+    finally:
+        if _owner_record_matches(owner_path, owner_record):
+            try:
+                owner_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def cancel_staging_process(storage_root: Path, owner_id: str) -> bool:
+    """Terminate only the live process matching one controller owner record."""
+    owner_path = _staging_owner_path(storage_root, owner_id)
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SshWorkerError(f"Staging owner record is unreadable: {exc}") from exc
+    if not isinstance(owner, Mapping):
+        raise SshWorkerError("Staging owner record must be an object.")
+    try:
+        pid = int(owner.get("pid"))
+    except (TypeError, ValueError) as exc:
+        raise SshWorkerError("Staging owner record has an invalid PID.") from exc
+    if pid <= 0:
+        raise SshWorkerError("Staging owner record has an invalid PID.")
+    expected_start = str(owner.get("process_start") or "")
+    if _linux_process_start(pid) != expected_start:
+        _remove_owned_snapshot_leases(storage_root, owner)
+        owner_path.unlink(missing_ok=True)
+        return False
+    try:
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (FileNotFoundError, OSError):
+        owner_path.unlink(missing_ok=True)
+        return False
+    encoded_owner = owner_id.encode("utf-8")
+    if (
+        b"stage-profiles" not in command_line
+        or b"--owner-id" not in command_line
+        or encoded_owner not in command_line
+    ):
+        raise SshWorkerError(
+            f"Refusing to terminate PID {pid}; its command does not match owner "
+            f"{owner_id!r}."
+        )
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + _STAGING_TERMINATE_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if _linux_process_start(pid) != expected_start:
+            _remove_owned_snapshot_leases(storage_root, owner)
+            owner_path.unlink(missing_ok=True)
+            return True
+        time.sleep(0.1)
+    os.kill(pid, signal.SIGKILL)
+    _remove_owned_snapshot_leases(storage_root, owner)
+    owner_path.unlink(missing_ok=True)
+    return True
+
+
+def _decode_resolved_profiles(encoded_payload: str | None) -> dict[str, dict[str, Any]]:
+    """Decode planner-resolved profile metadata from a credential-free CLI value."""
+    if not encoded_payload:
+        return {}
+    try:
+        decoded = base64.urlsafe_b64decode(encoded_payload.encode("ascii"))
+        payload = json.loads(decoded.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Resolved LLM profile payload is invalid.") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("Resolved LLM profile payload must be an object.")
+    return {
+        str(reference): dict(profile)
+        for reference, profile in payload.items()
+        if isinstance(reference, str) and isinstance(profile, Mapping)
+    }
 
 
 def _copy_request_frames(source: BinaryIO, destination: socket.socket) -> None:
@@ -341,7 +523,13 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("serve", "client", "runtime-info", "stage-profiles"),
+        choices=(
+            "serve",
+            "client",
+            "runtime-info",
+            "stage-profiles",
+            "cancel-staging",
+        ),
     )
     parser.add_argument(
         "--socket",
@@ -354,6 +542,16 @@ def _argument_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Curated profile or Hugging Face model reference to stage.",
+    )
+    parser.add_argument(
+        "--owner-id",
+        default="",
+        help="Controller-issued identity used for targeted staging cancellation.",
+    )
+    parser.add_argument(
+        "--resolved-profiles",
+        default="",
+        help="URL-safe base64 encoded planner-resolved profile metadata.",
     )
     parser.add_argument(
         "--storage-root",
@@ -376,7 +574,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "stage-profiles":
         if not arguments.model_reference:
             raise ValueError("stage-profiles requires at least one --model-reference.")
-        stage_profiles(arguments.model_reference, arguments.storage_root)
+        resolved_profiles = _decode_resolved_profiles(arguments.resolved_profiles)
+        if arguments.owner_id:
+            with staging_process_owner(arguments.storage_root, arguments.owner_id):
+                stage_profiles(
+                    arguments.model_reference,
+                    arguments.storage_root,
+                    resolved_profiles=resolved_profiles,
+                    owner_id=arguments.owner_id,
+                )
+        else:
+            stage_profiles(
+                arguments.model_reference,
+                arguments.storage_root,
+                resolved_profiles=resolved_profiles,
+            )
+        return 0
+    if arguments.command == "cancel-staging":
+        if not arguments.owner_id:
+            raise ValueError("cancel-staging requires --owner-id.")
+        print(
+            json.dumps(
+                {"cancelled": cancel_staging_process(
+                    arguments.storage_root,
+                    arguments.owner_id,
+                )},
+                sort_keys=True,
+            )
+        )
         return 0
     print(json.dumps(runtime_info(), sort_keys=True))
     return 0

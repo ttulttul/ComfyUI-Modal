@@ -291,7 +291,7 @@ Local snapshots are stored under `<ComfyUI models>/modal_llm`; set `COMFY_MODAL_
 
 Loaded models are cached in a per-target LRU and reused across executions. Before a cold load, the manager asks ComfyUI to release idle managed models, evicts older resident LLMs if needed, and enforces a free-memory reserve (`local_reserve_free_memory_gb` for macOS unified memory, `reserve_free_vram_gb` for remote GPUs). On Modal, vLLM-backed profiles default to eager mode for a container's first workflow and are promoted to throughput mode — backed by a persistent compilation cache — when the container serves a second one; pin either behavior with `COMFY_MODAL_LLM_VLLM_EXECUTION_MODE`.
 
-Model staging is deliberately kept off billed GPU time: weights are downloaded by a CPU-only stager (Modal) or inside the persistent worker (SSH) before the GPU allocation begins, and the planner applies each model's VRAM/RAM floors before placement so a too-small GPU cannot win cost ranking for a checkpoint it cannot load.
+Model staging is deliberately kept off billed GPU time: weights are downloaded by a CPU-only stager (Modal) or inside the persistent worker (SSH) before the GPU allocation begins, and the planner applies each model's VRAM/RAM floors before placement so a too-small GPU cannot win cost ranking for a checkpoint it cannot load. The planner's already validated, credential-free model profile travels with the execution payload, so the worker reports **Using planner-resolved metadata** instead of repeating Hugging Face inspection. Before downloading, the stager checks that the missing artifacts fit while retaining a free-disk reserve. Snapshot leases carry a host, PID, process-start identity, and heartbeat; a dead same-host owner is reclaimed immediately, while a live download cannot lose its lease merely because it runs for a long time. Cancelling a Vast or SSH staging phase targets that exact owner process without recycling the whole worker, and every provider aborts a staging stream that produces no progress within the configured deadline.
 
 ### Modal Endpoint Chat
 
@@ -467,6 +467,10 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 | `COMFY_MODAL_LLM_RESERVE_FREE_GB` | `24.0` | Default minimum free VRAM retained for ComfyUI-managed image and video models; the node can override per request. |
 | `COMFY_MODAL_LLM_VLLM_EXECUTION_MODE` | `auto` | `auto` uses eager for a container's first workflow and promotes to throughput on its second; `eager` and `throughput` pin one mode. |
 | `COMFY_MODAL_LLM_MEMORY_RECOVERY_TIMEOUT_SECONDS` | `15.0` | Maximum post-eviction wait for CUDA free memory before retiring the worker and retrying once on a fresh worker. |
+| `COMFY_MODAL_LLM_MIN_FREE_DISK_GB` | `8.0` | Free storage that must remain after staging the model bytes not already present in a resumable snapshot. |
+| `COMFY_MODAL_LLM_STAGE_LEASE_TIMEOUT_SECONDS` | `7200` | Maximum wait for a foreign or legacy snapshot lease; dead local process owners are reclaimed immediately and live leases heartbeat. |
+| `COMFY_MODAL_LLM_STAGE_LEASE_HEARTBEAT_STALE_SECONDS` | `300` | Age after which a structured lease with a missing heartbeat is reclaimable, including after its former worker container disappears. Must exceed two heartbeat intervals. |
+| `COMFY_MODAL_LLM_STAGE_NO_PROGRESS_TIMEOUT_SECONDS` | `600` | Maximum silence between model-staging events before the controller terminates the transport and requests provider-side cancellation. |
 | `COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE` | `256` | Maximum buffered remote progress/result envelopes; stale progress is coalesced when full. |
 | `COMFY_MODAL_ENABLE_PROACTIVE_WARMUP` | `true` | Start background warmup from runtime parallelism signals and planner lookahead. |
 | `COMFY_MODAL_ENABLE_LOADER_PREWARM` | `true` | During warmup, execute synthetic loader prompts for root literal model-loader nodes. |

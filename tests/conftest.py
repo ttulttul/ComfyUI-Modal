@@ -336,6 +336,12 @@ def llm_staging_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def staging_process_module(extension_package: object) -> object:
+    """Return the bounded remote staging process controller module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.staging_process")
+
+
+@pytest.fixture(scope="session")
 def modal_llm_runtime_module(extension_package: object) -> object:
     """Return the resident Modal LLM runtime module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_llm_runtime")

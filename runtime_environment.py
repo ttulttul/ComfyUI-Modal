@@ -21,7 +21,7 @@ else:  # pragma: no cover - the stable cloud entrypoint imports this module top-
 
 logger = logging.getLogger(__name__)
 
-REMOTE_APP_PROTOCOL_VERSION = 9
+REMOTE_APP_PROTOCOL_VERSION = 10
 REMOTE_RUNTIME_DEPENDENCY_LAYER_VERSION = 1
 REMOTE_PYTHON_VERSION = "3.13"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from functools import lru_cache
+import base64
 import hashlib
 import json
 import logging
-from pathlib import Path
 import re
-from typing import Any, Mapping
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 if __package__:
     from .llm_compatibility import (
@@ -505,6 +506,60 @@ def rewrite_llm_model_references(
     visit(payload)
 
 
+def resolved_llm_profile_payloads(
+    payload: Mapping[str, Any],
+    model_references: Sequence[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return validated planner-resolved metadata attached to a remote payload."""
+    raw_profiles = payload.get("resolved_llm_profiles")
+    if raw_profiles is None:
+        return {}
+    if not isinstance(raw_profiles, Mapping):
+        raise ValueError("resolved_llm_profiles must be an object.")
+    selected_references = (
+        set(model_references)
+        if model_references is not None
+        else {str(reference) for reference in raw_profiles}
+    )
+    profiles: dict[str, dict[str, Any]] = {}
+    for raw_reference, raw_entry in raw_profiles.items():
+        reference = str(raw_reference).strip()
+        if reference not in selected_references:
+            continue
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(
+                f"Resolved LLM profile entry for {reference!r} must be an object."
+            )
+        raw_profile = raw_entry.get("profile", raw_entry)
+        if not isinstance(raw_profile, Mapping):
+            raise ValueError(
+                f"Resolved LLM profile entry for {reference!r} has no profile object."
+            )
+        security_scan_complete = raw_entry.get("security_scan_complete", False)
+        if not isinstance(security_scan_complete, bool):
+            raise ValueError(
+                f"Resolved LLM profile entry for {reference!r} has an invalid "
+                "security scan state."
+            )
+        LLMModelProfile.from_mapping(raw_profile)
+        profiles[reference] = dict(raw_entry)
+    return profiles
+
+
+def encoded_resolved_llm_profile_payloads(
+    payload: Mapping[str, Any],
+    model_references: Sequence[str],
+) -> str | None:
+    """Encode selected planner metadata for the direct worker command line."""
+    profiles = resolved_llm_profile_payloads(payload, model_references)
+    if not profiles:
+        return None
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(profiles, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return encoded.decode("ascii")
+
+
 def llm_profile_ids_from_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
     """Find curated LLM profiles referenced anywhere in a remote payload."""
     profile_ids: set[str] = set()
@@ -551,4 +606,6 @@ __all__ = [
     "load_llm_profiles",
     "profile_for_execution_target",
     "rewrite_llm_model_references",
+    "resolved_llm_profile_payloads",
+    "encoded_resolved_llm_profile_payloads",
 ]

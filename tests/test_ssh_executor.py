@@ -273,17 +273,17 @@ def test_ssh_dispatch_stages_and_rewrites_hugging_face_model_reference(
     assert stage_calls == [[requested_model]]
 
 
-def test_ssh_cancel_stops_worker_during_model_staging(
+def test_ssh_cancel_targets_owner_during_model_staging(
     ssh_executor_module: Any,
+    monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Cancellation must stop a worker whose CPU stager is still downloading."""
-    stopped: list[int] = []
+    """Cancellation must target one stager without stopping its worker."""
     manager = SimpleNamespace(
         controller=SimpleNamespace(host=SimpleNamespace(environment_id="lambda")),
-        stop_worker=lambda worker_index: stopped.append(worker_index) or True,
     )
     spec = SimpleNamespace(worker_index=3)
+    process = SimpleNamespace()
     invocation_id = "RIV_staging"
     client = ssh_executor_module.SshDockerExecutorClient(
         registry=SimpleNamespace(),
@@ -291,7 +291,24 @@ def test_ssh_cancel_stops_worker_during_model_staging(
         settings=SimpleNamespace(comfyui_root=tmp_path, app_name="app"),
     )
     with ssh_executor_module._ACTIVE_SSH_STAGERS_LOCK:
-        ssh_executor_module._ACTIVE_SSH_STAGERS[invocation_id] = (manager, spec)
+        ssh_executor_module._ACTIVE_SSH_STAGERS[invocation_id] = (
+            manager,
+            spec,
+            "ssh:RIV_staging:owner",
+            process,
+        )
+    targeted: list[tuple[Any, Any, str]] = []
+    terminated: list[Any] = []
+    monkeypatch.setattr(
+        ssh_executor_module,
+        "terminate_staging_transport",
+        terminated.append,
+    )
+    client._cancel_remote_stager = (  # type: ignore[method-assign]
+        lambda active_manager, active_spec, owner_id, **_kwargs: (
+            targeted.append((active_manager, active_spec, owner_id)) or True
+        )
+    )
     try:
         cancelled = client.cancel({}, invocation_id)
     finally:
@@ -299,4 +316,5 @@ def test_ssh_cancel_stops_worker_during_model_staging(
             ssh_executor_module._ACTIVE_SSH_STAGERS.pop(invocation_id, None)
 
     assert cancelled is True
-    assert stopped == [3]
+    assert terminated == [process]
+    assert targeted == [(manager, spec, "ssh:RIV_staging:owner")]

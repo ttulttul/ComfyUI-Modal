@@ -85,6 +85,7 @@ from ..llm_profiles import (
     get_llm_profile,
     llm_model_reference_node_ids_from_payload,
     llm_model_references_from_payload,
+    resolved_llm_profile_payloads,
     rewrite_llm_model_references,
 )
 from ..llm_recovery import (
@@ -92,6 +93,7 @@ from ..llm_recovery import (
     exhausted_recovery_used_vllm_throughput,
     is_llm_memory_recovery_exhausted,
 )
+from ..staging_process import staging_no_progress_timeout_seconds
 from ..settings import (
     MODAL_GPU_TYPES,
     ModalSyncSettings,
@@ -128,6 +130,16 @@ _LOCAL_GAP_KEEPALIVES_LOCK = threading.Lock()
 _LOCAL_GAP_KEEPALIVES: dict[tuple[str, int], "_LocalGapKeepaliveState"] = {}
 _SNAPSHOT_PROFILE_RECORDS_LOCK = threading.Lock()
 _SNAPSHOT_PROFILE_RECORDS: dict[str, dict[str, Any]] = {}
+_MODAL_STAGE_STREAM_END = object()
+
+
+@dataclass(frozen=True)
+class _ModalStageStreamFailure:
+    """Carry an arbitrary Modal stream exception across a reader thread."""
+
+    error: Exception
+
+
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
     {
@@ -6288,6 +6300,65 @@ def _emit_local_llm_staging_progress(
         )
 
 
+def _read_modal_stage_events(
+    stage_events: Iterable[Any],
+    output: queue.Queue[Any],
+) -> None:
+    """Read a blocking Modal generator while exposing controller timeouts."""
+    try:
+        for event in stage_events:
+            output.put(event)
+    except Exception as exc:
+        output.put(_ModalStageStreamFailure(exc))
+    finally:
+        output.put(_MODAL_STAGE_STREAM_END)
+
+
+def _close_modal_stage_events(stage_events: Iterable[Any]) -> None:
+    """Ask Modal to cancel a stage generator that stopped reporting progress."""
+    close = getattr(stage_events, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Unable to close stalled Modal model staging stream: %s", exc)
+
+
+def _bounded_modal_stage_events(stage_events: Iterable[Any]) -> Iterator[Any]:
+    """Yield Modal staging events with a bounded interval between updates."""
+    try:
+        timeout_seconds = staging_no_progress_timeout_seconds()
+    except ValueError:
+        _close_modal_stage_events(stage_events)
+        raise
+    output: queue.Queue[Any] = queue.Queue()
+    reader = threading.Thread(
+        target=_read_modal_stage_events,
+        args=(stage_events, output),
+        name="modal-llm-stage-stream",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        while True:
+            try:
+                item = output.get(timeout=timeout_seconds)
+            except queue.Empty as exc:
+                _close_modal_stage_events(stage_events)
+                raise ModalRemoteInvocationError(
+                    "Modal model staging produced no progress for "
+                    f"{timeout_seconds:.0f} seconds; the staging call was cancelled."
+                ) from exc
+            if item is _MODAL_STAGE_STREAM_END:
+                return
+            if isinstance(item, _ModalStageStreamFailure):
+                raise item.error
+            yield item
+    finally:
+        reader.join(timeout=1.0)
+
+
 def _ensure_llm_profiles_staged(
     payload: dict[str, Any],
     deployment_app_name: str,
@@ -6307,6 +6378,10 @@ def _ensure_llm_profiles_staged(
             if (deployment_app_name, reference) not in _STAGED_LLM_PROFILE_RESULTS
         ]
         if missing_model_references:
+            resolved_profiles = resolved_llm_profile_payloads(
+                payload,
+                missing_model_references,
+            )
             _emit_local_remote_startup_status(
                 payload,
                 phase="llm_staging",
@@ -6327,7 +6402,12 @@ def _ensure_llm_profiles_staged(
             stage_stream = getattr(stager, "stage_profiles_stream", None)
             remote_generator = getattr(stage_stream, "remote_gen", None)
             if callable(remote_generator):
-                for stage_event in remote_generator(missing_model_references):
+                stage_events = (
+                    remote_generator(missing_model_references, resolved_profiles)
+                    if resolved_profiles
+                    else remote_generator(missing_model_references)
+                )
+                for stage_event in _bounded_modal_stage_events(stage_events):
                     if not isinstance(stage_event, Mapping):
                         continue
                     if stage_event.get("kind") == "result":
@@ -6339,8 +6419,13 @@ def _ensure_llm_profiles_staged(
                         continue
                     _emit_local_llm_staging_progress(payload, stage_event)
             else:
-                stage_results = stager.stage_profiles.remote(
-                    missing_model_references
+                stage_results = (
+                    stager.stage_profiles.remote(
+                        missing_model_references,
+                        resolved_profiles,
+                    )
+                    if resolved_profiles
+                    else stager.stage_profiles.remote(missing_model_references)
                 )
             confirmed_references: set[str] = set()
             for stage_result in stage_results:

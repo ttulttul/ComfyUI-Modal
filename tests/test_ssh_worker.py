@@ -93,6 +93,68 @@ def test_worker_stage_profiles_streams_progress_and_result(
     assert events[1] == {"kind": "result", "results": results}
 
 
+def test_worker_cancels_only_matching_owned_stager(
+    ssh_worker_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The cancellation command should validate identity before killing a PID."""
+    owner_id = "vast:RIV_test:owner"
+    pid = 12345
+    owner_path = ssh_worker_module._staging_owner_path(tmp_path, owner_id)
+    owner_path.parent.mkdir(parents=True)
+    owner_path.write_text(
+        json.dumps(
+            {
+                "owner_id": owner_id,
+                "pid": pid,
+                "process_start": "start-tick",
+            }
+        ),
+        encoding="utf-8",
+    )
+    lease_path = tmp_path / "llm_models" / "repo" / ".revision.download.lock"
+    lease_path.parent.mkdir(parents=True)
+    lease_path.write_text(
+        json.dumps(
+            {
+                "owner_id": owner_id,
+                "pid": pid,
+                "process_start": "start-tick",
+                "token": "lease-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    starts = iter(("start-tick", None))
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        ssh_worker_module,
+        "_linux_process_start",
+        lambda _pid: next(starts),
+    )
+    monkeypatch.setattr(
+        ssh_worker_module.Path,
+        "read_bytes",
+        lambda _path: (
+            b"python\0-m\0remote.ssh_worker\0stage-profiles\0--owner-id\0"
+            + owner_id.encode("utf-8")
+            + b"\0"
+        ),
+    )
+    monkeypatch.setattr(
+        ssh_worker_module.os,
+        "kill",
+        lambda target_pid, sent_signal: killed.append((target_pid, sent_signal)),
+    )
+
+    assert ssh_worker_module.cancel_staging_process(tmp_path, owner_id) is True
+
+    assert not owner_path.exists()
+    assert not lease_path.exists()
+    assert killed == [(pid, ssh_worker_module.signal.SIGTERM)]
+
+
 def test_worker_request_relay_preserves_framed_binary_payload(
     ssh_worker_module: Any,
     remote_protocol_module: Any,

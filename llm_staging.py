@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import shutil
+import socket
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
+from uuid import uuid4
 
 if __package__:
     from .llm_profiles import LLMModelProfile, get_llm_profile, load_llm_profiles
@@ -21,6 +26,9 @@ logger = logging.getLogger(__name__)
 _COMPLETE_MARKER_FILENAME = ".comfy-modal-llm-complete.json"
 _DEFAULT_LEASE_TIMEOUT_SECONDS = 7200.0
 _LEASE_POLL_SECONDS = 2.0
+_LEASE_HEARTBEAT_SECONDS = 30.0
+_DEFAULT_LEASE_HEARTBEAT_STALE_SECONDS = 300.0
+_DEFAULT_MINIMUM_FREE_DISK_BYTES = 8 * 1024**3
 _SNAPSHOT_ALLOW_PATTERNS = (
     "*.safetensors",
     "*.safetensors.index.json",
@@ -280,71 +288,326 @@ def _legacy_snapshot_matches(
     )
 
 
+def _process_start_identity(pid: int) -> str | None:
+    """Return the Linux process start tick used to reject PID reuse."""
+    try:
+        stat_record = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    fields_after_command = stat_record.rpartition(") ")[2].split()
+    return fields_after_command[19] if len(fields_after_command) > 19 else None
+
+
+def _lease_owner_payload(owner_id: str) -> dict[str, Any]:
+    """Return an owner record that can be validated on this worker."""
+    pid = os.getpid()
+    return {
+        "version": 1,
+        "owner_id": owner_id,
+        "host_id": socket.gethostname(),
+        "pid": pid,
+        "process_start": _process_start_identity(pid),
+        "token": uuid4().hex,
+        "acquired_at": time.time(),
+    }
+
+
+def _read_lease_owner(lease_path: Path) -> dict[str, Any] | None:
+    """Read a snapshot lease owner, tolerating legacy text records."""
+    try:
+        raw_value = lease_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _local_lease_owner_is_alive(owner: Mapping[str, Any]) -> bool | None:
+    """Return local owner liveness, or None for another worker host."""
+    if str(owner.get("host_id") or "") != socket.gethostname():
+        return None
+    try:
+        pid = int(owner.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    expected_start = str(owner.get("process_start") or "")
+    actual_start = _process_start_identity(pid)
+    if actual_start is None:
+        if expected_start:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    return not expected_start or actual_start == expected_start
+
+
+def _lease_record_matches(lease_path: Path, owner: Mapping[str, Any]) -> bool:
+    """Return whether a path still contains the observed owner token."""
+    current = _read_lease_owner(lease_path)
+    return bool(
+        current
+        and current.get("token")
+        and current.get("token") == owner.get("token")
+    )
+
+
+def _remove_owned_lease(lease_path: Path, owner: Mapping[str, Any]) -> None:
+    """Remove a lock only while its ownership token still matches."""
+    if not _lease_record_matches(lease_path, owner):
+        return
+    try:
+        lease_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _heartbeat_snapshot_lease(
+    lease_path: Path,
+    owner: Mapping[str, Any],
+    stop_event: threading.Event,
+) -> None:
+    """Refresh an active lease so another container never steals live work."""
+    while not stop_event.wait(_LEASE_HEARTBEAT_SECONDS):
+        if not _lease_record_matches(lease_path, owner):
+            return
+        try:
+            lease_path.touch()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.warning(
+                "Unable to heartbeat LLM staging lease %s: %s",
+                lease_path,
+                exc,
+            )
+            return
+
+
+def _snapshot_lease_wait_timeout_seconds() -> float:
+    """Return the configured maximum wait to acquire one snapshot lease."""
+    timeout_seconds = float(
+        os.getenv("COMFY_MODAL_LLM_STAGE_LEASE_TIMEOUT_SECONDS", "7200")
+    )
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError(
+            "COMFY_MODAL_LLM_STAGE_LEASE_TIMEOUT_SECONDS must be positive."
+        )
+    return timeout_seconds
+
+
+def _snapshot_lease_stale_seconds(
+    existing_owner: Mapping[str, Any] | None,
+) -> float:
+    """Return the age that proves a heartbeating or legacy lease abandoned."""
+    if existing_owner is None or not existing_owner.get("token"):
+        return _DEFAULT_LEASE_TIMEOUT_SECONDS
+    raw_value = os.getenv(
+        "COMFY_MODAL_LLM_STAGE_LEASE_HEARTBEAT_STALE_SECONDS",
+        str(_DEFAULT_LEASE_HEARTBEAT_STALE_SECONDS),
+    )
+    stale_seconds = float(raw_value)
+    if (
+        not math.isfinite(stale_seconds)
+        or stale_seconds <= _LEASE_HEARTBEAT_SECONDS * 2
+    ):
+        raise ValueError(
+            "COMFY_MODAL_LLM_STAGE_LEASE_HEARTBEAT_STALE_SECONDS must exceed "
+            f"{_LEASE_HEARTBEAT_SECONDS * 2:.0f} seconds."
+        )
+    return stale_seconds
+
+
+def _remove_expired_snapshot_lease(
+    lease_path: Path,
+    existing_owner: Mapping[str, Any] | None,
+) -> None:
+    """Remove one expired lease without deleting a replacement owner."""
+    logger.warning(
+        "Removing expired LLM staging lease %s owner=%s.",
+        lease_path,
+        (existing_owner or {}).get("owner_id"),
+    )
+    if existing_owner is not None:
+        _remove_owned_lease(lease_path, existing_owner)
+        return
+    try:
+        lease_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _report_snapshot_lease_wait(
+    progress_callback: StagingProgressCallback | None,
+    model_label: str,
+) -> None:
+    """Publish the first wait state for a contended snapshot."""
+    if progress_callback is None:
+        return
+    progress_callback(
+        LLMStagingProgress(
+            stage="waiting_for_download",
+            message=f"Waiting for another download of {model_label} to finish",
+            indeterminate=True,
+        )
+    )
+
+
+def _wait_for_existing_snapshot_lease(
+    lease_path: Path,
+    *,
+    started_at: float,
+    timeout_seconds: float,
+    progress_callback: StagingProgressCallback | None,
+    model_label: str,
+    report_wait: bool,
+) -> bool:
+    """Wait once or reclaim an abandoned existing snapshot lease."""
+    existing_owner = _read_lease_owner(lease_path)
+    if (
+        existing_owner is not None
+        and _local_lease_owner_is_alive(existing_owner) is False
+    ):
+        logger.warning(
+            "Removing abandoned LLM staging lease %s owner=%s.",
+            lease_path,
+            existing_owner.get("owner_id"),
+        )
+        _remove_owned_lease(lease_path, existing_owner)
+        return False
+    try:
+        lease_age = time.time() - lease_path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    if lease_age >= _snapshot_lease_stale_seconds(existing_owner):
+        _remove_expired_snapshot_lease(lease_path, existing_owner)
+        return False
+    if time.monotonic() - started_at >= timeout_seconds:
+        raise TimeoutError(
+            f"Timed out waiting {timeout_seconds:.0f}s for model staging lease "
+            f"{lease_path}."
+        )
+    if report_wait:
+        _report_snapshot_lease_wait(progress_callback, model_label)
+    time.sleep(_LEASE_POLL_SECONDS)
+    return True
+
+
+def _acquire_snapshot_lease(
+    lease_path: Path,
+    owner: Mapping[str, Any],
+    *,
+    progress_callback: StagingProgressCallback | None,
+    model_label: str,
+) -> None:
+    """Acquire one exclusive snapshot lease, waiting or reclaiming as needed."""
+    timeout_seconds = _snapshot_lease_wait_timeout_seconds()
+    started_at = time.monotonic()
+    waiting_reported = False
+    while True:
+        try:
+            descriptor = os.open(lease_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            waited = _wait_for_existing_snapshot_lease(
+                lease_path,
+                started_at=started_at,
+                timeout_seconds=timeout_seconds,
+                progress_callback=progress_callback,
+                model_label=model_label,
+                report_wait=not waiting_reported,
+            )
+            waiting_reported = waiting_reported or waited
+            continue
+        with os.fdopen(descriptor, "w", encoding="utf-8") as lease_file:
+            json.dump(owner, lease_file, sort_keys=True, separators=(",", ":"))
+        return
+
+
 @contextmanager
 def _snapshot_lease(
     snapshot_path: Path,
     *,
     progress_callback: StagingProgressCallback | None = None,
     model_label: str,
+    owner_id: str,
 ) -> Iterator[None]:
-    """Serialize a snapshot download and report waits for another downloader."""
+    """Serialize downloads with liveness-checked, heartbeating ownership."""
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     lease_path = snapshot_path.parent / f".{snapshot_path.name}.download.lock"
-    timeout_seconds = float(
-        os.getenv("COMFY_MODAL_LLM_STAGE_LEASE_TIMEOUT_SECONDS", "7200")
+    owner = _lease_owner_payload(owner_id)
+    _acquire_snapshot_lease(
+        lease_path,
+        owner,
+        progress_callback=progress_callback,
+        model_label=model_label,
     )
-    if timeout_seconds <= 0:
-        raise ValueError(
-            "COMFY_MODAL_LLM_STAGE_LEASE_TIMEOUT_SECONDS must be positive."
-        )
-    started_at = time.monotonic()
-    acquired = False
-    waiting_reported = False
-    while not acquired:
-        try:
-            descriptor = os.open(lease_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            if progress_callback is not None and not waiting_reported:
-                progress_callback(
-                    LLMStagingProgress(
-                        stage="waiting_for_download",
-                        message=(
-                            f"Waiting for another download of {model_label} to finish"
-                        ),
-                        indeterminate=True,
-                    )
-                )
-                waiting_reported = True
-            try:
-                lease_age = time.time() - lease_path.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            if lease_age >= _DEFAULT_LEASE_TIMEOUT_SECONDS:
-                logger.warning(
-                    "Removing abandoned Modal LLM staging lease %s.", lease_path
-                )
-                try:
-                    lease_path.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
-            if time.monotonic() - started_at >= timeout_seconds:
-                raise TimeoutError(
-                    f"Timed out waiting {timeout_seconds:.0f}s for model staging lease "
-                    f"{lease_path}."
-                )
-            time.sleep(_LEASE_POLL_SECONDS)
-        else:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as lease_file:
-                lease_file.write(f"pid={os.getpid()} acquired_at={time.time()}\n")
-            acquired = True
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_snapshot_lease,
+        args=(lease_path, owner, heartbeat_stop),
+        name="llm-snapshot-lease-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     try:
         yield
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
+        _remove_owned_lease(lease_path, owner)
+
+
+def _snapshot_existing_bytes(snapshot_path: Path) -> int:
+    """Return bytes already present for a resumable model snapshot."""
+    total = 0
+    if not snapshot_path.exists():
+        return total
+    for candidate in snapshot_path.rglob("*"):
         try:
-            lease_path.unlink()
-        except FileNotFoundError:
-            pass
+            if candidate.is_file() and not candidate.name.endswith(".lock"):
+                total += candidate.stat().st_size
+        except (FileNotFoundError, OSError):
+            continue
+    return total
+
+
+def _minimum_free_disk_bytes() -> int:
+    """Return the configured free-space reserve retained after staging."""
+    raw_value = os.getenv("COMFY_MODAL_LLM_MIN_FREE_DISK_GB")
+    if raw_value is None:
+        return _DEFAULT_MINIMUM_FREE_DISK_BYTES
+    value_gb = float(raw_value)
+    if not math.isfinite(value_gb) or value_gb < 0:
+        raise ValueError("COMFY_MODAL_LLM_MIN_FREE_DISK_GB must not be negative.")
+    return int(value_gb * 1024**3)
+
+
+def _preflight_snapshot_capacity(
+    snapshot_path: Path,
+    profile: LLMModelProfile,
+) -> tuple[int, int, int]:
+    """Require room for missing artifacts plus a post-download safety reserve."""
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    free_bytes = shutil.disk_usage(snapshot_path.parent).free
+    existing_bytes = _snapshot_existing_bytes(snapshot_path)
+    remaining_bytes = max(0, profile.artifact_bytes - existing_bytes)
+    required_bytes = remaining_bytes + _minimum_free_disk_bytes()
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            "Insufficient disk space to stage LLM profile "
+            f"{profile.profile_id!r}: {free_bytes / 1024**3:.2f} GiB free, "
+            f"{remaining_bytes / 1024**3:.2f} GiB still required, and "
+            f"{_minimum_free_disk_bytes() / 1024**3:.2f} GiB must remain free."
+        )
+    return free_bytes, remaining_bytes, required_bytes
 
 
 def stage_model_profile(
@@ -355,6 +618,7 @@ def stage_model_profile(
     snapshot_download: Callable[..., str] | None = None,
     progress_callback: StagingProgressCallback | None = None,
     model_reference: str | None = None,
+    owner_id: str | None = None,
 ) -> StagedModelSnapshot:
     """Download one pinned curated or generated snapshot on a CPU worker."""
     profile = profile or get_llm_profile(profile_id, storage_root=storage_root)
@@ -408,6 +672,7 @@ def stage_model_profile(
         snapshot_path,
         progress_callback=report,
         model_label=model_label,
+        owner_id=owner_id or f"pid-{os.getpid()}",
     ):
         if is_model_snapshot_staged(storage_root, profile):
             report(
@@ -429,6 +694,23 @@ def stage_model_profile(
                 downloaded=False,
                 elapsed_seconds=time.perf_counter() - started_at,
             )
+        free_bytes, remaining_bytes, _required_bytes = _preflight_snapshot_capacity(
+            snapshot_path,
+            profile,
+        )
+        report(
+            LLMStagingProgress(
+                stage="disk_check",
+                message=(
+                    f"Storage ready for {model_label}: "
+                    f"{free_bytes / 1024**3:.1f} GiB free, "
+                    f"{remaining_bytes / 1024**3:.1f} GiB remaining"
+                ),
+                value=free_bytes,
+                maximum=free_bytes,
+                unit="bytes",
+            )
+        )
         if snapshot_download is None:
             from huggingface_hub import (
                 snapshot_download as huggingface_snapshot_download,
@@ -513,11 +795,148 @@ def stage_model_profile(
     return result
 
 
+def _persist_supplied_profile(
+    model_reference: str,
+    storage_root: str | Path,
+    supplied: Mapping[str, Any],
+) -> tuple[LLMModelProfile, str | None, bool, bool]:
+    """Validate planner metadata and persist a generated manifest remotely."""
+    raw_profile = supplied.get("profile", supplied)
+    if not isinstance(raw_profile, Mapping):
+        raise ValueError(
+            f"Resolved LLM profile for {model_reference!r} must contain an object."
+        )
+    profile = LLMModelProfile.from_mapping(raw_profile)
+    _validate_supplied_profile_reference(model_reference, profile)
+    if profile.source != "generated":
+        return profile, None, False, True
+    if __package__:
+        from .llm_profiles import generated_profile_manifest_path
+    else:  # pragma: no cover - stable cloud entrypoint imports top-level modules.
+        from llm_profiles import generated_profile_manifest_path
+
+    manifest_path = generated_profile_manifest_path(storage_root, profile.profile_id)
+    manifest_payload = _supplied_profile_manifest_payload(
+        model_reference,
+        profile,
+        supplied,
+    )
+    existing_scan = _existing_supplied_profile_scan(
+        manifest_path,
+        raw_profile,
+    )
+    if existing_scan is not None:
+        return profile, str(manifest_path), False, existing_scan
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = manifest_path.with_suffix(f".{uuid4().hex}.tmp")
+    temporary_path.write_text(
+        json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, manifest_path)
+    return profile, str(manifest_path), True, bool(
+        manifest_payload["security_scan_complete"]
+    )
+
+
+def _supplied_profile_manifest_payload(
+    model_reference: str,
+    profile: LLMModelProfile,
+    supplied: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the generated manifest persisted from trusted planner metadata."""
+    security_scan_complete = supplied.get("security_scan_complete", False)
+    if not isinstance(security_scan_complete, bool):
+        raise ValueError(
+            f"Resolved LLM profile for {model_reference!r} has an invalid "
+            "security scan state."
+        )
+    return {
+        "schema_version": profile.schema_version,
+        "compatibility_policy_version": profile.compatibility_policy_version,
+        "requested_reference": model_reference,
+        "resolved_at_unix": time.time(),
+        "security_scan_complete": security_scan_complete,
+        "profile": profile.to_mapping(),
+    }
+
+
+def _existing_supplied_profile_scan(
+    manifest_path: Path,
+    raw_profile: Mapping[str, Any],
+) -> bool | None:
+    """Return an existing matching manifest's scan state, or None if absent."""
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(
+                f"Resolved LLM manifest {manifest_path} is unreadable: {exc}"
+            ) from exc
+        if not isinstance(existing, Mapping) or existing.get("profile") != raw_profile:
+            raise RuntimeError(
+                f"Resolved LLM profile collision at {manifest_path}."
+            )
+        return bool(existing.get("security_scan_complete", False))
+    return None
+
+
+def _validate_supplied_profile_reference(
+    model_reference: str,
+    profile: LLMModelProfile,
+) -> None:
+    """Reject planner metadata that does not describe its requested reference."""
+    curated_profile = load_llm_profiles().get(model_reference)
+    if curated_profile is not None:
+        if profile != curated_profile:
+            raise ValueError(
+                f"Resolved metadata for curated profile {model_reference!r} does "
+                "not match the checked-in profile."
+            )
+        return
+    if model_reference.startswith("hf-"):
+        if profile.profile_id != model_reference:
+            raise ValueError(
+                f"Resolved metadata profile id {profile.profile_id!r} does not "
+                f"match requested id {model_reference!r}."
+            )
+        return
+    if profile.source != "generated":
+        raise ValueError(
+            f"Resolved metadata for Hugging Face reference {model_reference!r} "
+            "must contain a generated profile."
+        )
+    if __package__:
+        from .llm_resolver import HuggingFaceModelReference
+    else:  # pragma: no cover - stable cloud entrypoint imports top-level modules.
+        from llm_resolver import HuggingFaceModelReference
+
+    parsed = HuggingFaceModelReference.parse(model_reference)
+    if profile.repository != parsed.repository:
+        raise ValueError(
+            f"Resolved metadata repository {profile.repository!r} does not match "
+            f"requested repository {parsed.repository!r}."
+        )
+    requested_revision = (parsed.requested_revision or "").lower()
+    if len(requested_revision) == 40 and requested_revision != profile.revision:
+        raise ValueError(
+            f"Resolved metadata revision {profile.revision!r} does not match "
+            f"requested revision {requested_revision!r}."
+        )
+
+
 def _resolve_profile_for_staging(
     model_reference: str,
     storage_root: str | Path,
+    supplied_profile: Mapping[str, Any] | None = None,
 ) -> tuple[LLMModelProfile, str | None, bool, bool]:
     """Resolve one curated, generated, or Hugging Face model reference."""
+    if supplied_profile is not None:
+        return _persist_supplied_profile(
+            model_reference,
+            storage_root,
+            supplied_profile,
+        )
     curated_profiles = load_llm_profiles()
     if model_reference in curated_profiles:
         return curated_profiles[model_reference], None, False, True
@@ -547,10 +966,13 @@ def resolve_and_stage_model_references(
     storage_root: str | Path,
     *,
     progress_callback: StagingProgressCallback | None = None,
+    resolved_profiles: Mapping[str, Mapping[str, Any]] | None = None,
+    owner_id: str | None = None,
 ) -> list[ResolvedStagedModelProfile]:
     """Resolve and stage model references on any CPU-backed remote worker."""
     results: list[ResolvedStagedModelProfile] = []
     for model_reference in model_references:
+        supplied_profile = (resolved_profiles or {}).get(model_reference)
         if progress_callback is not None:
             is_hugging_face_reference = (
                 "/" in model_reference and not model_reference.startswith("hf-")
@@ -558,12 +980,16 @@ def resolve_and_stage_model_references(
             progress_callback(
                 LLMStagingProgress(
                     stage=(
-                        "metadata"
+                        "resolved_metadata"
+                        if supplied_profile is not None
+                        else "metadata"
                         if is_hugging_face_reference
                         else "profile_resolution"
                     ),
                     message=(
-                        f"Inspecting Hugging Face metadata for {model_reference}"
+                        f"Using planner-resolved metadata for {model_reference}"
+                        if supplied_profile is not None
+                        else f"Inspecting Hugging Face metadata for {model_reference}"
                         if is_hugging_face_reference
                         else f"Resolving model profile {model_reference}"
                     ),
@@ -577,7 +1003,15 @@ def resolve_and_stage_model_references(
             manifest_path,
             manifest_created,
             scan_complete,
-        ) = _resolve_profile_for_staging(model_reference, storage_root)
+        ) = (
+            _resolve_profile_for_staging(
+                model_reference,
+                storage_root,
+                supplied_profile,
+            )
+            if supplied_profile is not None
+            else _resolve_profile_for_staging(model_reference, storage_root)
+        )
         resolve_elapsed_seconds = time.perf_counter() - resolve_started_at
         staged = stage_model_profile(
             profile.profile_id,
@@ -585,6 +1019,7 @@ def resolve_and_stage_model_references(
             profile=profile,
             progress_callback=progress_callback,
             model_reference=model_reference,
+            owner_id=owner_id,
         )
         results.append(
             ResolvedStagedModelProfile(

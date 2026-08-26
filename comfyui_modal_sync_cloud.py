@@ -7824,12 +7824,15 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def _stage_profiles(
             self,
             model_references: list[str],
+            resolved_profiles: Mapping[str, Any] | None = None,
             progress_callback: Callable[[dict[str, Any]], None] | None = None,
         ) -> list[dict[str, Any]]:
             """Resolve and stage profiles while optionally publishing progress."""
             staged_profiles = resolve_and_stage_model_references(
                 model_references,
                 settings.remote_storage_root,
+                resolved_profiles=resolved_profiles,
+                owner_id=f"modal:{os.getpid()}:{time.time_ns()}",
                 progress_callback=(
                     lambda progress: progress_callback(
                         {
@@ -7865,14 +7868,19 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             return results
 
         @modal.method()
-        def stage_profiles(self, model_references: list[str]) -> list[dict[str, Any]]:
+        def stage_profiles(
+            self,
+            model_references: list[str],
+            resolved_profiles: Mapping[str, Any] | None = None,
+        ) -> list[dict[str, Any]]:
             """Resolve model references, stage snapshots, and return metadata."""
-            return self._stage_profiles(model_references)
+            return self._stage_profiles(model_references, resolved_profiles)
 
         @modal.method()
         def stage_profiles_stream(
             self,
             model_references: list[str],
+            resolved_profiles: Mapping[str, Any] | None = None,
         ) -> Iterator[dict[str, Any]]:
             """Stream CPU staging progress and finish with resolved profile data."""
             progress_events: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -7885,6 +7893,7 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     results.append(
                         self._stage_profiles(
                             model_references,
+                            resolved_profiles,
                             progress_events.put,
                         )
                     )

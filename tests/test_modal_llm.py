@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import sys
+import threading
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from io import BytesIO, StringIO
@@ -823,6 +824,7 @@ def test_cpu_stager_writes_completion_marker_and_reuses_snapshot(
     ]
     assert [event.stage for event in progress] == [
         "snapshot_check",
+        "disk_check",
         "download_preparing",
         "download",
         "download",
@@ -949,6 +951,201 @@ def test_provider_neutral_stager_resolves_and_stages_model_reference(
     assert progress[0].stage == "metadata"
     assert progress[0].message == "Inspecting Hugging Face metadata for owner/model"
     assert progress[0].model_reference == "owner/model"
+
+
+def test_provider_neutral_stager_uses_planner_resolved_profile(
+    llm_staging_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Remote staging must not repeat Hugging Face inspection done by the planner."""
+    digest = "c" * 64
+    raw_profile = {
+        "id": f"hf-{digest}",
+        "display_name": "Owner Model",
+        "repository": "owner/model",
+        "revision": "9" * 40,
+        "dtype": "bfloat16",
+        "modalities": ["text"],
+        "estimated_vram_gb": 12,
+        "max_context_tokens": 4096,
+        "max_images": 1,
+        "max_video_frames": 1,
+        "max_file_bytes": 1024,
+        "max_file_characters": 1024,
+        "allow_mixed_image_video": False,
+        "trust_remote_code": False,
+        "schema_version": 2,
+        "source": "generated",
+        "profile_digest": digest,
+        "backend": "transformers",
+        "artifact_bytes": 1024,
+    }
+    staged = llm_staging_module.StagedModelSnapshot(
+        profile_id=raw_profile["id"],
+        repository="owner/model",
+        revision="9" * 40,
+        path=str(tmp_path / "snapshot"),
+        downloaded=False,
+        elapsed_seconds=0.0,
+    )
+    monkeypatch.setattr(
+        llm_staging_module,
+        "stage_model_profile",
+        lambda *_args, **_kwargs: staged,
+    )
+    progress: list[Any] = []
+
+    results = llm_staging_module.resolve_and_stage_model_references(
+        ["owner/model"],
+        tmp_path,
+        resolved_profiles={
+            "owner/model": {
+                "profile": raw_profile,
+                "security_scan_complete": False,
+            }
+        },
+        progress_callback=progress.append,
+        owner_id="vast:invocation:owner",
+    )
+
+    assert results[0].profile_id == raw_profile["id"]
+    assert results[0].security_scan_complete is False
+    assert results[0].manifest_created is True
+    assert progress[0].stage == "resolved_metadata"
+    assert "planner-resolved" in progress[0].message
+
+
+def test_snapshot_lease_reclaims_dead_local_owner(
+    llm_staging_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A dead process record should never force a two-hour stale-lock wait."""
+    snapshot_path = tmp_path / "llm_models" / "profile" / ("1" * 40)
+    snapshot_path.parent.mkdir(parents=True)
+    lease_path = snapshot_path.parent / f".{snapshot_path.name}.download.lock"
+    lease_path.write_text(
+        json.dumps(
+            {
+                "owner_id": "orphan",
+                "host_id": llm_staging_module.socket.gethostname(),
+                "pid": 2_000_000_000,
+                "process_start": "missing",
+                "token": "old-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with llm_staging_module._snapshot_lease(
+        snapshot_path,
+        model_label="test model",
+        owner_id="replacement",
+    ):
+        owner = json.loads(lease_path.read_text(encoding="utf-8"))
+        assert owner["owner_id"] == "replacement"
+
+    assert not lease_path.exists()
+
+
+def test_snapshot_lease_recognizes_live_owner_without_procfs(
+    llm_staging_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Portable PID probing should keep a live macOS staging owner valid."""
+    monkeypatch.setattr(
+        llm_staging_module,
+        "_process_start_identity",
+        lambda _pid: None,
+    )
+
+    alive = llm_staging_module._local_lease_owner_is_alive(
+        {
+            "host_id": llm_staging_module.socket.gethostname(),
+            "pid": llm_staging_module.os.getpid(),
+            "process_start": None,
+        }
+    )
+
+    assert alive is True
+
+
+def test_snapshot_lease_reclaims_missing_foreign_heartbeat(
+    llm_staging_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A vanished prior container should not leave a structured lease for hours."""
+    snapshot_path = tmp_path / "llm_models" / "profile" / ("2" * 40)
+    snapshot_path.parent.mkdir(parents=True)
+    lease_path = snapshot_path.parent / f".{snapshot_path.name}.download.lock"
+    lease_path.write_text(
+        json.dumps(
+            {
+                "owner_id": "old-container",
+                "host_id": "different-container",
+                "pid": 123,
+                "process_start": "456",
+                "token": "old-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_time = (
+        llm_staging_module.time.time()
+        - llm_staging_module._DEFAULT_LEASE_HEARTBEAT_STALE_SECONDS
+        - 1
+    )
+    llm_staging_module.os.utime(lease_path, (stale_time, stale_time))
+
+    with llm_staging_module._snapshot_lease(
+        snapshot_path,
+        model_label="test model",
+        owner_id="replacement",
+    ):
+        owner = json.loads(lease_path.read_text(encoding="utf-8"))
+        assert owner["owner_id"] == "replacement"
+
+    assert not lease_path.exists()
+
+
+def test_snapshot_disk_preflight_rejects_insufficient_capacity(
+    llm_staging_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Staging should fail before download when artifacts plus reserve do not fit."""
+    profile = llm_staging_module.get_llm_profile("smolvlm2-2.2b-instruct")
+    monkeypatch.setattr(
+        llm_staging_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=profile.artifact_bytes),
+    )
+
+    with pytest.raises(RuntimeError, match="Insufficient disk space"):
+        llm_staging_module._preflight_snapshot_capacity(
+            tmp_path / "snapshot",
+            profile,
+        )
+
+
+def test_direct_stager_payload_encodes_planner_profiles(
+    llm_profiles_module: Any,
+) -> None:
+    """SSH and Vast CLI staging should receive the validated planner envelope."""
+    profile = llm_profiles_module.get_llm_profile("smolvlm2-2.2b-instruct")
+    entry = {
+        "profile": profile.to_mapping(),
+        "security_scan_complete": True,
+    }
+
+    encoded = llm_profiles_module.encoded_resolved_llm_profile_payloads(
+        {"resolved_llm_profiles": {profile.profile_id: entry}},
+        [profile.profile_id],
+    )
+
+    assert encoded is not None
+    decoded = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    assert decoded == {profile.profile_id: entry}
 
 
 def test_weight_snapshot_is_shared_across_runtime_profiles(
@@ -2749,6 +2946,43 @@ def test_remote_dispatch_streams_cpu_llm_staging_progress(
         payload["subgraph_prompt"]["llm-node"]["inputs"]["model_profile"]
         == "hf-" + "b" * 64
     )
+
+
+def test_modal_staging_stream_has_bounded_no_progress_wait(
+    remote_modal_app_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent Modal generator should be closed instead of hanging forever."""
+
+    class SilentStream:
+        """Block until the controller asks this fake remote stream to close."""
+
+        def __init__(self) -> None:
+            self.closed = threading.Event()
+
+        def __iter__(self) -> Any:
+            """Wait without producing a staging event."""
+            self.closed.wait(timeout=5)
+            return
+            yield  # pragma: no cover - makes this method a generator.
+
+        def close(self) -> None:
+            """Model successful cancellation of the remote generator."""
+            self.closed.set()
+
+    monkeypatch.setenv(
+        "COMFY_MODAL_LLM_STAGE_NO_PROGRESS_TIMEOUT_SECONDS",
+        "0.05",
+    )
+    stream = SilentStream()
+
+    with pytest.raises(
+        remote_modal_app_module.ModalRemoteInvocationError,
+        match="produced no progress",
+    ):
+        list(remote_modal_app_module._bounded_modal_stage_events(stream))
+
+    assert stream.closed.is_set()
 
 
 def test_llm_staging_progress_targets_the_matching_llm_node(
