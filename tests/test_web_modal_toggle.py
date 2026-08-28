@@ -122,7 +122,18 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert 'class="remote-configurator-storage-reload"' in source
     assert ">Reload</button>" in source
     assert 'const R2_STORAGE_USAGE_ROUTE = "/remote/storage/r2/usage";' in source
+    assert (
+        'const R2_KEYCHAIN_UNLOCK_ROUTE = "/remote/storage/r2/keychain/unlock";'
+        in source
+    )
+    assert 'const R2_KEYCHAIN_UNLOCK_REQUIRED_CODE = "keychain_unlock_required";' in source
     assert "function refreshRemoteConfiguratorStorage(panel)" in source
+    assert "function unlockRemoteConfiguratorKeychain(panel)" in source
+    assert "function setRemoteConfiguratorKeychainUnlockRequired(panel, required)" in source
+    assert "function setRemoteConfiguratorStorageCredentialError(panel, code)" in source
+    assert 'class="remote-configurator-keychain-unlock"' in source
+    assert "Unlock Keychain" in source
+    assert "background: rgba(154, 52, 18, 0.32)" in source
     assert 'label: "Bucket"' in source
     assert 'label: "Storage used"' in source
     assert 'label: "Jurisdiction"' in source

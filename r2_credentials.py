@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import keyring
 from keyring.errors import KeyringError
@@ -20,11 +22,19 @@ else:  # pragma: no cover - direct ComfyUI loading fallback.
 logger = logging.getLogger(__name__)
 
 R2_KEYRING_SERVICE = "comfyui-modal-sync-cloudflare-r2"
+R2_KEYCHAIN_UNLOCK_REQUIRED_CODE = "keychain_unlock_required"
 _CREDENTIAL_SCHEMA_VERSION = 1
+_MACOS_INTERACTION_NOT_ALLOWED_STATUS = -25308
+_MACOS_KEYCHAIN_UNLOCK_TIMEOUT_SECONDS = 120.0
 
 
 class R2CredentialError(RuntimeError):
     """Raised when controller-held R2 credentials cannot be stored or loaded."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        """Retain an optional credential-safe recovery code for the browser."""
+        super().__init__(message)
+        self.code = code
 
 
 class PasswordStore(Protocol):
@@ -155,6 +165,15 @@ class R2CredentialStore:
         try:
             value = self.password_store.get_password(self.service_name, normalized_id)
         except KeyringError as exc:
+            if _exception_contains_status(
+                exc,
+                _MACOS_INTERACTION_NOT_ALLOWED_STATUS,
+            ):
+                raise R2CredentialError(
+                    "The macOS login keychain must be unlocked before Cloudflare "
+                    "R2 credentials can be read.",
+                    code=R2_KEYCHAIN_UNLOCK_REQUIRED_CODE,
+                ) from exc
             raise R2CredentialError(
                 "The operating-system credential vault could not read Cloudflare "
                 "R2 credentials."
@@ -220,10 +239,64 @@ def _validated_credential_id(credential_id: str) -> str:
     return normalized_id
 
 
+def _exception_contains_status(error: BaseException, status: int) -> bool:
+    """Return whether an exception chain contains one integer OS status."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if getattr(current, "status", None) == status or status in current.args:
+            return True
+        for nested in (current.__cause__, current.__context__):
+            if nested is not None:
+                pending.append(nested)
+    return False
+
+
+def request_macos_keychain_unlock(
+    *,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    platform_name: str | None = None,
+    timeout_seconds: float = _MACOS_KEYCHAIN_UNLOCK_TIMEOUT_SECONDS,
+) -> None:
+    """Ask macOS SecurityAgent to display its default-keychain unlock dialog."""
+    if (platform_name or sys.platform) != "darwin":
+        raise R2CredentialError(
+            "Interactive keychain unlock is available only on macOS."
+        )
+    try:
+        result = command_runner(
+            ["/usr/bin/security", "unlock-keychain", "-u"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise R2CredentialError(
+            "The macOS keychain unlock prompt timed out."
+        ) from exc
+    except OSError as exc:
+        raise R2CredentialError(
+            "macOS could not start the system keychain unlock prompt."
+        ) from exc
+    if result.returncode != 0:
+        raise R2CredentialError(
+            "The macOS login keychain was not unlocked."
+        )
+    logger.info("The macOS login keychain was unlocked through SecurityAgent.")
+
+
 __all__ = [
     "R2CredentialError",
     "R2CredentialRecord",
     "R2CredentialStore",
+    "R2_KEYCHAIN_UNLOCK_REQUIRED_CODE",
     "R2_KEYRING_SERVICE",
+    "request_macos_keychain_unlock",
     "validate_r2_credentials",
 ]

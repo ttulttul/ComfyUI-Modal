@@ -339,6 +339,12 @@ def test_remote_environment_routes_save_and_probe_hosts(
             object_count=17,
         ),
     )
+    unlock_requests: list[bool] = []
+    monkeypatch.setattr(
+        api_intercept_module,
+        "request_macos_keychain_unlock",
+        lambda: unlock_requests.append(True),
+    )
     monkeypatch.setattr(
         api_intercept_module,
         "_get_server_module",
@@ -388,11 +394,41 @@ def test_remote_environment_routes_save_and_probe_hosts(
             )
         )
     )
+    r2_unlock = routes.handlers[("POST", "/remote/storage/r2/keychain/unlock")]
+    r2_unlock_response = asyncio.run(r2_unlock(FakeRequest({})))
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_refresh_r2_storage_usage",
+        lambda _storage: (_ for _ in ()).throw(
+            api_intercept_module.R2CredentialError(
+                "The macOS login keychain must be unlocked.",
+                code=api_intercept_module.R2_KEYCHAIN_UNLOCK_REQUIRED_CODE,
+            )
+        ),
+    )
+    r2_locked_response = asyncio.run(
+        r2_usage(
+            FakeRequest(
+                {
+                    "configuration_id": "385",
+                    "display_name": "Shared R2",
+                    "account_id": "a" * 32,
+                    "bucket": "models",
+                    "credential_id": "opaque-reference",
+                    "jurisdiction": "eu",
+                }
+            )
+        )
+    )
 
     assert update_response.status == 200
     assert probe_response.status == 200
     assert vast_verify_response.status == 400
     assert r2_usage_response.status == 200
+    assert r2_unlock_response.status == 200
+    assert unlock_requests == [True]
+    assert r2_locked_response.status == 423
+    assert json.loads(r2_locked_response.text)["code"] == "keychain_unlock_required"
     assert json.loads(r2_usage_response.text)["storage_usage_bytes"] == 7 * 1024**3
     assert json.loads(r2_usage_response.text)["storage_object_count"] == 17
     assert ("GET", "/remote/vast/status") in routes.handlers
@@ -404,6 +440,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
     assert ("POST", "/remote/storage/r2/credentials") in routes.handlers
     assert ("GET", "/remote/storage/r2/status") in routes.handlers
     assert ("POST", "/remote/storage/r2/usage") in routes.handlers
+    assert ("POST", "/remote/storage/r2/keychain/unlock") in routes.handlers
     assert registry.get_host("gpu-one").health.value == "ready"
     assert registry.get_host("gpu-one").capabilities == capabilities
 

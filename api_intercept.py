@@ -71,7 +71,12 @@ from .sync_engine import (
 )
 from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
 from .r2_cache import R2CacheClient, R2CacheError, R2StorageUsage
-from .r2_credentials import R2CredentialStore
+from .r2_credentials import (
+    R2CredentialError,
+    R2CredentialStore,
+    R2_KEYCHAIN_UNLOCK_REQUIRED_CODE,
+    request_macos_keychain_unlock,
+)
 from .cloudflare_oauth import setup_r2_oauth_routes
 from .remote_configuration_nodes import (
     REMOTE_CONFIGURATION_NODE_IDS,
@@ -115,6 +120,7 @@ _REMOTE_PREPARATION_CANCELLATIONS_ATTR = (
 _REMOTE_PREPARATION_LOCK_ATTR = "__comfy_modal_remote_preparation_lock"
 _REMOTE_ASSET_PREPARATION_MAX_WORKERS = 8
 _R2_STORAGE_USAGE_ROUTE = "/remote/storage/r2/usage"
+_R2_KEYCHAIN_UNLOCK_ROUTE = "/remote/storage/r2/keychain/unlock"
 _R2_STORAGE_USAGE_CACHE_SECONDS = 5 * 60
 _R2_STORAGE_USAGE_CACHE_LOCK = threading.Lock()
 _R2_STORAGE_USAGE_CACHE: dict[
@@ -1618,11 +1624,13 @@ def _safe_remote_configuration_payload(
     for storage in configuration_set.storage_configurations:
         if not isinstance(storage, R2StorageBackingConfiguration):
             continue
-        usage = _cached_r2_storage_usage(storage)
-        if usage is None:
-            continue
         safe_storage = payload_by_id.get(storage.configuration_id)
         if safe_storage is None:
+            continue
+        usage, error_code = _cached_r2_storage_usage(storage)
+        if error_code is not None:
+            safe_storage["credential_error_code"] = error_code
+        if usage is None:
             continue
         safe_storage["storage_usage_bytes"] = usage.size_bytes
         safe_storage["storage_object_count"] = usage.object_count
@@ -1631,16 +1639,24 @@ def _safe_remote_configuration_payload(
 
 def _cached_r2_storage_usage(
     storage: R2StorageBackingConfiguration,
-) -> R2StorageUsage | None:
-    """Return cached bucket usage, degrading safely when R2 cannot be queried."""
+) -> tuple[R2StorageUsage | None, str | None]:
+    """Return cached bucket usage and an optional credential recovery code."""
     cache_key = (storage.account_id, storage.bucket, storage.jurisdiction)
     now = time.monotonic()
     with _R2_STORAGE_USAGE_CACHE_LOCK:
         cached = _R2_STORAGE_USAGE_CACHE.get(cache_key)
         if cached is not None and now - cached[0] < _R2_STORAGE_USAGE_CACHE_SECONDS:
-            return cached[1]
+            return cached[1], None
     try:
         usage = _refresh_r2_storage_usage(storage)
+    except R2CredentialError as exc:
+        logger.warning(
+            "Unable to read R2 storage usage for configuration=%s bucket=%s: %s",
+            storage.configuration_id,
+            storage.bucket,
+            exc,
+        )
+        return None, exc.code
     except (R2CacheError, RuntimeError, ValueError) as exc:
         logger.warning(
             "Unable to read R2 storage usage for configuration=%s bucket=%s: %s",
@@ -1648,8 +1664,8 @@ def _cached_r2_storage_usage(
             storage.bucket,
             exc,
         )
-        return None
-    return usage
+        return None, None
+    return usage, None
 
 
 def _refresh_r2_storage_usage(
@@ -9107,6 +9123,18 @@ def setup_modal_queue_route(
             return web.json_response({"error": str(exc)}, status=400)
         try:
             usage = await asyncio.to_thread(_refresh_r2_storage_usage, storage)
+        except R2CredentialError as exc:
+            logger.warning(
+                "Unable to refresh R2 storage usage configuration=%s bucket=%s: %s",
+                storage.configuration_id,
+                storage.bucket,
+                exc,
+            )
+            status = 423 if exc.code == R2_KEYCHAIN_UNLOCK_REQUIRED_CODE else 502
+            return web.json_response(
+                {"error": str(exc), "code": exc.code},
+                status=status,
+            )
         except (R2CacheError, RuntimeError, ValueError) as exc:
             logger.warning(
                 "Unable to refresh R2 storage usage configuration=%s bucket=%s: %s",
@@ -9123,6 +9151,17 @@ def setup_modal_queue_route(
                 "refreshed_at": time.time(),
             }
         )
+
+    @prompt_server.routes.post(_R2_KEYCHAIN_UNLOCK_ROUTE)
+    async def unlock_r2_keychain(request: web.Request) -> web.Response:
+        """Display macOS's system-owned login-keychain unlock prompt."""
+        del request
+        try:
+            await asyncio.to_thread(request_macos_keychain_unlock)
+        except R2CredentialError as exc:
+            logger.warning("Unable to unlock the macOS login keychain: %s", exc)
+            return web.json_response({"error": str(exc)}, status=409)
+        return web.json_response({"unlocked": True})
 
     @prompt_server.routes.post(cancel_preparation_route_path)
     async def cancel_remote_preparation(request: web.Request) -> web.Response:

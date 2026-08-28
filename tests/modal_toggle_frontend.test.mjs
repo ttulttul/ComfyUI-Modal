@@ -78,6 +78,9 @@ class FakeElement {
       ".remote-configurator-storage-list",
       ".remote-configurator-storage-reload",
       ".remote-configurator-storage-refresh-status",
+      ".remote-configurator-keychain",
+      ".remote-configurator-keychain-unlock",
+      ".remote-configurator-keychain-status",
     ]) {
       this.elementsBySelector.set(selector, new FakeElement(selector));
     }
@@ -150,6 +153,7 @@ const transformedSource = `${[
   "  mountRemoteExecutionConfiguratorPanel,",
   "  remoteConfiguratorStorageEntries,",
   "  refreshRemoteConfiguratorStorage,",
+  "  unlockRemoteConfiguratorKeychain,",
   "  remoteManagedCapacityEntries,",
   "  refreshRemoteManagedCapacity,",
   "  killRemoteManagedCapacity,",
@@ -1695,6 +1699,7 @@ modalToggle.registerRemoteConfiguratorPlan(
       jurisdiction: "eu",
       key_prefix: "comfy-modal-cache/v1/blobs/sha256",
       write_back_mode: "async",
+      credential_error_code: "keychain_unlock_required",
     },
   ],
 );
@@ -1791,6 +1796,11 @@ assert.deepEqual(
 assert.equal(retainedPanel.storage.hidden, false);
 assert.equal(retainedPanel.storageList.children.length, 1);
 assert.equal(typeof retainedPanel.storageReload.listeners.get("click"), "function");
+assert.equal(retainedPanel.keychainUnlock.hidden, false);
+assert.equal(
+  typeof retainedPanel.keychainUnlockButton.listeners.get("click"),
+  "function",
+);
 const storageCard = retainedPanel.storageList.children[0];
 assert.deepEqual(
   storageCard.children[0].children.map((child) => child.textContent),
@@ -1815,6 +1825,16 @@ assert.deepEqual(modalToggle.remoteConfiguratorStorageEntries([]), []);
 const storageRefreshRequests = [];
 globalThis.__modalApiStub.fetchApi = async (route, options) => {
   storageRefreshRequests.push({ route, options });
+  if (route === "/remote/storage/r2/keychain/unlock") {
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      async json() {
+        return { unlocked: true };
+      },
+    };
+  }
   return {
     ok: true,
     status: 200,
@@ -1828,13 +1848,18 @@ globalThis.__modalApiStub.fetchApi = async (route, options) => {
     },
   };
 };
-await modalToggle.refreshRemoteConfiguratorStorage(retainedPanel);
-assert.equal(storageRefreshRequests.length, 1);
-assert.equal(storageRefreshRequests[0].route, "/remote/storage/r2/usage");
+await modalToggle.unlockRemoteConfiguratorKeychain(retainedPanel);
+assert.equal(storageRefreshRequests.length, 2);
 assert.equal(
-  JSON.parse(storageRefreshRequests[0].options.body).credential_id,
+  storageRefreshRequests[0].route,
+  "/remote/storage/r2/keychain/unlock",
+);
+assert.equal(storageRefreshRequests[1].route, "/remote/storage/r2/usage");
+assert.equal(
+  JSON.parse(storageRefreshRequests[1].options.body).credential_id,
   "opaque-reference",
 );
+assert.equal(retainedPanel.keychainUnlock.hidden, true);
 assert.equal(retainedPanel.storageRefreshStatus.textContent, "Updated");
 assert.equal(retainedPanel.storageReload.textContent, "Reload");
 assert.equal(
@@ -1858,6 +1883,31 @@ assert.equal(
 assert.equal(
   retainedPanel.storageList.children[0].children[1].children[3].textContent,
   "6.00 GiB · 43 objects",
+);
+assert.equal(retainedPanel.keychainUnlock.hidden, true);
+globalThis.__modalApiStub.fetchApi = async () => ({
+  ok: false,
+  status: 423,
+  statusText: "Locked",
+  async json() {
+    return {
+      code: "keychain_unlock_required",
+      error: "The macOS login keychain must be unlocked.",
+    };
+  },
+});
+await modalToggle.refreshRemoteConfiguratorStorage(retainedPanel);
+assert.equal(retainedPanel.keychainUnlock.hidden, false);
+assert.equal(
+  retainedPanel.configurations.find(
+    (configuration) => configuration.storage_provider === "cloudflare_r2",
+  ).credential_error_code,
+  "keychain_unlock_required",
+);
+assert.equal(retainedPanel.storageRefreshStatus.textContent, "Refresh failed");
+assert.equal(
+  retainedPanel.storageRefreshStatus.title,
+  "The macOS login keychain must be unlocked.",
 );
 assert.equal(retainedPanel.root.isConnected, false);
 

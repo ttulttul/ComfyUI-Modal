@@ -5,6 +5,7 @@
 ## 2026-08-28
 
 - A DOM widget can declare `width: 100%` and still overflow a resized legacy ComfyUI node when the widget object's cached `width` field remains fixed. Keep that field undefined outside Vue-node mode so ComfyUI recalculates the widget allocation from the node on every layout, and let the panel stretch within that allocation.
+- macOS keyring status `-25308` is a recoverable interaction state, not a missing Cloudflare credential. Preserve it as a credential-safe browser error code and expose an explicit recovery action; `/usr/bin/security unlock-keychain -u` delegates password entry to the system-owned dialog without placing the login password in ComfyUI memory or process arguments.
 
 ## 2026-08-24
 

@@ -17,6 +17,8 @@ const MODAL_CANCEL_PREPARATION_ROUTE = MODAL_ROUTE.replace(
   "/cancel_preparation",
 );
 const R2_STORAGE_USAGE_ROUTE = "/remote/storage/r2/usage";
+const R2_KEYCHAIN_UNLOCK_ROUTE = "/remote/storage/r2/keychain/unlock";
+const R2_KEYCHAIN_UNLOCK_REQUIRED_CODE = "keychain_unlock_required";
 const VAST_STATUS_ROUTE = "/remote/vast/status";
 const VAST_DESTROY_ROUTE = "/remote/vast/destroy";
 const COMFY_QUEUE_ROUTE = "/queue";
@@ -3777,9 +3779,92 @@ async function requestRemoteStorageRefresh(configuration) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.error || `${response.status} ${response.statusText}`);
+    const error = new Error(
+      payload.error || `${response.status} ${response.statusText}`,
+    );
+    error.code = String(payload.code ?? "");
+    throw error;
   }
   return payload;
+}
+
+/** Show or hide the Configurator's explicit macOS keychain recovery action. */
+function setRemoteConfiguratorKeychainUnlockRequired(panel, required) {
+  if (!panel?.keychainUnlock) {
+    return;
+  }
+  const nextHeight = required ? 28 : 0;
+  const heightDelta = nextHeight - Number(panel.keychainUnlockHeight ?? 0);
+  panel.keychainUnlockHeight = nextHeight;
+  panel.keychainUnlock.hidden = !required;
+  if (heightDelta > 0) {
+    panel.minHeight += heightDelta;
+    panel.node.setSize?.([
+      Number(panel.node.size?.[0]) || 500,
+      Math.max(Number(panel.node.size?.[1]) || 0, panel.minHeight),
+    ]);
+  }
+  panel.node.graph?.setDirtyCanvas?.(true, true);
+}
+
+/** Retain or clear a storage credential recovery code with the displayed plan. */
+function setRemoteConfiguratorStorageCredentialError(panel, code) {
+  if (!panel) {
+    return;
+  }
+  const updatedConfigurations = (panel.configurations ?? []).map((configuration) => {
+    if (configuration?.storage_provider !== "cloudflare_r2") {
+      return configuration;
+    }
+    const updated = { ...configuration };
+    if (code) {
+      updated.credential_error_code = code;
+    } else {
+      delete updated.credential_error_code;
+    }
+    return updated;
+  });
+  panel.configurations = updatedConfigurations;
+  const promptState = modalPromptStates.get(String(panel.promptId ?? ""));
+  if (promptState) {
+    promptState.remoteExecutionConfigurations = updatedConfigurations;
+  }
+}
+
+/** Ask macOS to unlock its login keychain, then retry the R2 refresh. */
+async function unlockRemoteConfiguratorKeychain(panel) {
+  if (!panel || panel.keychainUnlockInFlight) {
+    return;
+  }
+  panel.keychainUnlockInFlight = true;
+  panel.keychainUnlockButton.disabled = true;
+  panel.keychainUnlockButton.textContent = "Unlocking…";
+  panel.keychainUnlockStatus.hidden = false;
+  panel.keychainUnlockStatus.dataset.state = "loading";
+  panel.keychainUnlockStatus.textContent = "Complete the macOS prompt";
+  panel.keychainUnlockStatus.title = "";
+  try {
+    const response = await api.fetchApi(R2_KEYCHAIN_UNLOCK_ROUTE, {
+      method: "POST",
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || `${response.status} ${response.statusText}`);
+    }
+    setRemoteConfiguratorStorageCredentialError(panel, null);
+    setRemoteConfiguratorKeychainUnlockRequired(panel, false);
+    await refreshRemoteConfiguratorStorage(panel);
+  } catch (error) {
+    setRemoteConfiguratorKeychainUnlockRequired(panel, true);
+    panel.keychainUnlockStatus.hidden = false;
+    panel.keychainUnlockStatus.dataset.state = "error";
+    panel.keychainUnlockStatus.textContent = "Unlock failed";
+    panel.keychainUnlockStatus.title = String(error?.message ?? error);
+  } finally {
+    panel.keychainUnlockInFlight = false;
+    panel.keychainUnlockButton.disabled = false;
+    panel.keychainUnlockButton.textContent = "Unlock Keychain";
+  }
 }
 
 /** Reload every supported storage backend shown by one Configurator panel. */
@@ -3807,13 +3892,16 @@ async function refreshRemoteConfiguratorStorage(panel) {
     );
     const updatedConfigurations = configurations.map((configuration) => {
       const state = refreshedById.get(String(configuration?.configuration_id ?? ""));
-      return state
-        ? {
-            ...configuration,
-            storage_usage_bytes: state.storage_usage_bytes,
-            storage_object_count: state.storage_object_count,
-          }
-        : configuration;
+      if (!state) {
+        return configuration;
+      }
+      const updated = {
+        ...configuration,
+        storage_usage_bytes: state.storage_usage_bytes,
+        storage_object_count: state.storage_object_count,
+      };
+      delete updated.credential_error_code;
+      return updated;
     });
     panel.configurations = updatedConfigurations;
     const promptState = modalPromptStates.get(String(panel.promptId ?? ""));
@@ -3821,10 +3909,15 @@ async function refreshRemoteConfiguratorStorage(panel) {
       promptState.remoteExecutionConfigurations = updatedConfigurations;
     }
     renderRemoteConfiguratorPlan(panel, panel.assignments, updatedConfigurations);
+    setRemoteConfiguratorKeychainUnlockRequired(panel, false);
     panel.storageRefreshStatus.dataset.state = "success";
     panel.storageRefreshStatus.textContent = "Updated";
     panel.storageRefreshStatus.title = "";
   } catch (error) {
+    if (error?.code === R2_KEYCHAIN_UNLOCK_REQUIRED_CODE) {
+      setRemoteConfiguratorStorageCredentialError(panel, error.code);
+      setRemoteConfiguratorKeychainUnlockRequired(panel, true);
+    }
     panel.storageRefreshStatus.dataset.state = "error";
     panel.storageRefreshStatus.textContent = "Refresh failed";
     panel.storageRefreshStatus.title = String(error?.message ?? error);
@@ -3838,6 +3931,13 @@ async function refreshRemoteConfiguratorStorage(panel) {
 /** Render connected storage backends beneath the execution plan. */
 function renderRemoteConfiguratorStorage(panel, configurations) {
   const entries = remoteConfiguratorStorageEntries(configurations);
+  setRemoteConfiguratorKeychainUnlockRequired(
+    panel,
+    (configurations ?? []).some(
+      (configuration) =>
+        configuration?.credential_error_code === R2_KEYCHAIN_UNLOCK_REQUIRED_CODE,
+    ),
+  );
   panel.storageReload.hidden = !entries.some(
     (entry) => entry.storageProvider === "cloudflare_r2",
   );
@@ -4268,7 +4368,8 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
     Math.max(31, planHeight) +
     panel.environmentRows.size * 52 +
     panel.storageHeight +
-    panel.capacityHeight;
+    panel.capacityHeight +
+    panel.keychainUnlockHeight;
   const currentWidth = Number(panel.node.size?.[0]) || 0;
   const currentHeight = Number(panel.node.size?.[1]) || 0;
   panel.node.setSize?.([
@@ -4624,6 +4725,10 @@ function mountRemoteExecutionConfiguratorPanel(node) {
         </div>
       </div>
       <div class="remote-configurator-storage-list"></div>
+    </div>
+    <div class="remote-configurator-keychain" hidden>
+      <button class="remote-configurator-keychain-unlock" type="button">Unlock Keychain</button>
+      <span class="remote-configurator-keychain-status" hidden></span>
     </div>`;
   const panel = {
     node,
@@ -4632,7 +4737,9 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     minHeight: 198,
     storageHeight: 0,
     capacityHeight: 49,
+    keychainUnlockHeight: 0,
     storageRefreshInFlight: false,
+    keychainUnlockInFlight: false,
     capacityRefreshInFlight: false,
     capacityKillInFlight: null,
     assignments: {},
@@ -4658,6 +4765,13 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     storageRefreshStatus: root.querySelector(
       ".remote-configurator-storage-refresh-status",
     ),
+    keychainUnlock: root.querySelector(".remote-configurator-keychain"),
+    keychainUnlockButton: root.querySelector(
+      ".remote-configurator-keychain-unlock",
+    ),
+    keychainUnlockStatus: root.querySelector(
+      ".remote-configurator-keychain-status",
+    ),
   };
   for (const eventName of ["pointerdown", "pointermove", "pointerup", "wheel"]) {
     root.addEventListener(eventName, (event) => {
@@ -4671,6 +4785,9 @@ function mountRemoteExecutionConfiguratorPanel(node) {
   });
   panel.capacityReload.addEventListener("click", () => {
     void refreshRemoteManagedCapacity(panel);
+  });
+  panel.keychainUnlockButton.addEventListener("click", () => {
+    void unlockRemoteConfiguratorKeychain(panel);
   });
   let widget;
   try {
@@ -7684,6 +7801,60 @@ function installGlobalStatusStyles() {
     .remote-configurator-storage-reload:disabled {
       cursor: wait;
       opacity: 0.65;
+    }
+
+    .remote-configurator-keychain {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      padding-top: 2px;
+    }
+
+    .remote-configurator-keychain[hidden] {
+      display: none;
+    }
+
+    .remote-configurator-keychain-unlock {
+      padding: 4px 9px;
+      border: 1px solid rgba(251, 146, 60, 0.62);
+      border-radius: 5px;
+      background: rgba(154, 52, 18, 0.32);
+      color: #fdba74;
+      cursor: pointer;
+      font: 700 9px/1.35 ui-sans-serif, system-ui, sans-serif;
+      pointer-events: auto;
+      touch-action: manipulation;
+    }
+
+    .remote-configurator-keychain-unlock:hover:not(:disabled) {
+      border-color: #fb923c;
+      background: rgba(194, 65, 12, 0.48);
+      color: #ffedd5;
+    }
+
+    .remote-configurator-keychain-unlock:active:not(:disabled) {
+      background: rgba(234, 88, 12, 0.62);
+      transform: translateY(1px);
+    }
+
+    .remote-configurator-keychain-unlock:disabled {
+      cursor: wait;
+      opacity: 0.7;
+    }
+
+    .remote-configurator-keychain-status {
+      min-width: 0;
+      overflow: hidden;
+      color: #94a3b8;
+      font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-keychain-status[data-state="error"] {
+      color: #f87171;
     }
 
     .remote-configurator-capacity-empty {

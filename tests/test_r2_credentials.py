@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
 from typing import Any
+
+import pytest
 
 
 class MemoryPasswordStore:
@@ -98,3 +101,58 @@ def test_keyring_record_must_match_workflow_bucket(
         assert "changed after credentials were saved" in str(error)
     else:
         raise AssertionError("Expected a mismatched R2 credential to be rejected.")
+
+
+def test_macos_interaction_error_requests_keychain_unlock(
+    r2_credentials_module: Any,
+) -> None:
+    """macOS interaction denial should become a credential-safe recovery code."""
+
+    class LockedPasswordStore(MemoryPasswordStore):
+        """Raise the nested status emitted by keyring's macOS backend."""
+
+        def get_password(self, service_name: str, username: str) -> str | None:
+            """Fail as though the login keychain cannot display authentication."""
+            del service_name, username
+            try:
+                raise RuntimeError(-25308, "Unknown Error")
+            except RuntimeError as exc:
+                raise r2_credentials_module.KeyringError(
+                    "Can't get password from keychain"
+                ) from exc
+
+    store = r2_credentials_module.R2CredentialStore(
+        password_store=LockedPasswordStore()
+    )
+
+    with pytest.raises(r2_credentials_module.R2CredentialError) as captured:
+        store.load("credential-reference")
+
+    assert captured.value.code == "keychain_unlock_required"
+    assert "macOS login keychain must be unlocked" in str(captured.value)
+
+
+def test_macos_unlock_uses_system_owned_prompt(
+    r2_credentials_module: Any,
+) -> None:
+    """Unlock recovery must never place a password in the child command."""
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """Capture the security invocation and report successful authentication."""
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    r2_credentials_module.request_macos_keychain_unlock(
+        command_runner=run_command,
+        platform_name="darwin",
+        timeout_seconds=15,
+    )
+
+    assert calls[0][0] == ["/usr/bin/security", "unlock-keychain", "-u"]
+    assert calls[0][1] == {
+        "capture_output": True,
+        "check": False,
+        "text": True,
+        "timeout": 15,
+    }
