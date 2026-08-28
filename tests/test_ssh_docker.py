@@ -212,10 +212,12 @@ def test_r2_materialization_keeps_signed_url_in_docker_stdin(
         _host(remote_hosts_module),
         runner=runner,
     )
+    image_preparations: list[bool] = []
     volume = ssh_docker_module.SshDockerVolumeBackend(
         controller,
         "safe-volume",
         materializer_image="comfy-remote:current",
+        materializer_image_preparer=lambda: image_preparations.append(True),
     )
     signed_url = (
         "https://account.r2.cloudflarestorage.com/object?X-Amz-Signature=secret"
@@ -228,11 +230,13 @@ def test_r2_materialization_keeps_signed_url_in_docker_stdin(
     )
 
     volume.materialize_r2_file(request, "/assets/model.safetensors")
+    volume.materialize_r2_file(request, "/assets/model.safetensors")
 
     command, input_payload = runner.calls[-1]
     assert command[-2:] == ("-m", "remote.r2_materializer")
     assert "secret" not in " ".join(command)
     assert input_payload is not None and b"secret" in input_payload
+    assert image_preparations == [True]
     assert volume.exists("/assets/model.safetensors") is True
 
 

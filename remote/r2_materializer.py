@@ -408,6 +408,58 @@ def _execute_payload() -> None:
     print(json.dumps(result, separators=(",", ":"), sort_keys=True), flush=True)
 
 
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    """Return a cycle-safe exception chain for credential-free classification."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _safe_error_details(exc: BaseException) -> tuple[str, int | None]:
+    """Classify one failure without returning messages, URLs, or credentials."""
+    chain = _exception_chain(exc)
+    for error in chain:
+        if isinstance(error, requests.HTTPError):
+            response = error.response
+            status_code = getattr(response, "status_code", None)
+            if isinstance(status_code, int) and 100 <= status_code <= 599:
+                if 400 <= status_code <= 499:
+                    return "http_client", status_code
+                if 500 <= status_code <= 599:
+                    return "http_server", status_code
+                return "http", status_code
+    if any(isinstance(error, requests.Timeout) for error in chain):
+        return "timeout", None
+    if any(isinstance(error, requests.exceptions.SSLError) for error in chain):
+        return "tls", None
+    if any(isinstance(error, requests.ConnectionError) for error in chain):
+        return "connection", None
+    if any(isinstance(error, FileNotFoundError) for error in chain):
+        return "source_missing", None
+    if any(isinstance(error, json.JSONDecodeError) for error in chain):
+        return "invalid_request", None
+    if any(isinstance(error, TypeError) for error in chain):
+        return "invalid_request", None
+    if any(isinstance(error, ValueError) for error in chain):
+        return "validation", None
+    if any(isinstance(error, OSError) for error in chain):
+        return "io", None
+    return "transfer", None
+
+
+def _safe_error_summary(exc: BaseException) -> str:
+    """Return fixed diagnostic fields that cannot contain signed request data."""
+    category, status_code = _safe_error_details(exc)
+    if status_code is None:
+        return f"category={category}"
+    return f"category={category} status={status_code}"
+
+
 def main() -> int:
     """Run one request while preventing signed URLs from entering stderr."""
     try:
@@ -420,7 +472,7 @@ def main() -> int:
         ValueError,
     ) as exc:
         print(
-            f"R2 materializer failed safely ({type(exc).__name__}).",
+            f"R2 materializer failed safely ({_safe_error_summary(exc)}).",
             file=sys.stderr,
             flush=True,
         )

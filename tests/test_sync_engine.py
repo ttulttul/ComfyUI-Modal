@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
@@ -1818,6 +1819,82 @@ def _r2_sync_settings(settings_module: Any, tmp_path: Path) -> Any:
     )
 
 
+class _R2BackfillVolume:
+    """Retain worker paths and record uploads made through signed R2 plans."""
+
+    def __init__(self, r2_cache_module: Any) -> None:
+        """Initialize empty worker storage and upload history."""
+        self.r2_cache_module = r2_cache_module
+        self.paths: set[str] = set()
+        self.worker_puts: list[str] = []
+        self.r2_uploads: list[tuple[Any, str]] = []
+
+    def exists(self, remote_path: str) -> bool:
+        """Return whether ordinary sync previously published the worker path."""
+        return remote_path in self.paths
+
+    def put_file(self, local_path: Path, remote_path: str) -> None:
+        """Record one ordinary controller-to-worker file upload."""
+        assert local_path.is_file()
+        self.paths.add(remote_path)
+        self.worker_puts.append(remote_path)
+
+    def put_bytes(self, payload: bytes, remote_path: str) -> None:
+        """Record one ordinary controller-to-worker byte upload."""
+        del payload
+        self.paths.add(remote_path)
+        self.worker_puts.append(remote_path)
+
+    def materialize_r2_file(self, *args: Any, **kwargs: Any) -> None:
+        """Reject downloads because backfill tests begin with an empty R2 cache."""
+        del args, kwargs
+        raise AssertionError("backfill should not download from R2")
+
+    def upload_r2_file(self, plan: Any, remote_path: str) -> Any:
+        """Record one worker-to-R2 upload and return successful part metadata."""
+        self.r2_uploads.append((plan, remote_path))
+        return self.r2_cache_module.R2UploadResult()
+
+
+class _SynchronousBackfillCache:
+    """Plan deterministic synchronous uploads for missing R2 objects."""
+
+    write_back_mode = "sync"
+
+    def __init__(self, r2_cache_module: Any) -> None:
+        """Retain the R2 data models and every requested upload identity."""
+        self.r2_cache_module = r2_cache_module
+        self.requests: list[tuple[str, int, bool]] = []
+
+    def prepare_upload(
+        self,
+        digest: str,
+        size_bytes: int,
+        *,
+        force: bool = False,
+    ) -> Any:
+        """Return one single-part plan and record its immutable identity."""
+        self.requests.append((digest, size_bytes, force))
+        return self.r2_cache_module.R2UploadPlan(
+            key=f"cache/{digest}",
+            sha256=digest,
+            size_bytes=size_bytes,
+            allowed_host="account.r2.cloudflarestorage.com",
+            mode="single",
+            urls=("https://account.r2.cloudflarestorage.com/object?secret=1",),
+        )
+
+    def complete_upload(self, plan: Any, result: Any) -> None:
+        """Validate successful completion of one planned upload."""
+        assert plan.sha256
+        assert result == self.r2_cache_module.R2UploadResult()
+
+    def abort_upload(self, plan: Any) -> None:
+        """Reject aborts because backfill test uploads must succeed."""
+        del plan
+        raise AssertionError("successful backfill should not abort")
+
+
 def test_r2_cache_hit_materializes_without_local_upload(
     settings_module: Any,
     sync_engine_module: Any,
@@ -1986,6 +2063,130 @@ def test_local_upload_writes_back_to_r2_in_sync_mode(
     assert len(remote_uploads) == 1
     assert len(completed_plans) == 1
     assert completed_plans[0].sha256 == sha256
+
+
+def test_indexed_remote_payload_is_backfilled_to_r2(
+    settings_module: Any,
+    sync_engine_module: Any,
+    r2_cache_module: Any,
+    tmp_path: Path,
+) -> None:
+    """An indexed worker file should still populate a newly enabled R2 cache."""
+    asset_path = tmp_path / "model.safetensors"
+    asset_path.write_bytes(b"previously-synced-model")
+    sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+    volume = _R2BackfillVolume(r2_cache_module)
+    cache = _SynchronousBackfillCache(r2_cache_module)
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=volume,
+        settings=_r2_sync_settings(settings_module, tmp_path),
+        r2_cache=cache,
+    )
+    indexed_remote_path = "/assets/indexed-model.safetensors"
+    engine.sync_index.put(
+        engine._asset_sync_index_key(sha256),
+        {"remote_path": indexed_remote_path, "source": "previous sync"},
+    )
+
+    result = engine.sync_file(asset_path)
+
+    assert result.uploaded is False
+    assert result.remote_path == indexed_remote_path
+    assert volume.worker_puts == []
+    assert [(plan.sha256, path) for plan, path in volume.r2_uploads] == [
+        (sha256, indexed_remote_path)
+    ]
+    assert cache.requests == [(sha256, asset_path.stat().st_size, False)]
+
+
+def test_custom_node_archive_uses_archive_byte_digest_for_object_identity(
+    settings_module: Any,
+    sync_engine_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """R2 identity should describe ZIP bytes rather than the source-tree digest."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    source_path = package_dir / "__init__.py"
+    source_path.write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=object(),
+        settings=_r2_sync_settings(settings_module, tmp_path),
+    )
+    source_digest = engine._hash_file_group(custom_nodes_dir, [source_path])
+    archive_spec = sync_engine_module._CustomNodesArchiveSpec(
+        entry_name="example",
+        display_name="example",
+        source_description=str(package_dir),
+        files=(source_path,),
+        sha256=source_digest,
+    )
+    captured_identity: list[tuple[Path, str, str]] = []
+
+    def sync_file(**kwargs: Any) -> Any:
+        """Capture the exact local payload and identities selected for sync."""
+        captured_identity.append(
+            (kwargs["local_path"], kwargs["sha256"], kwargs["sync_key"])
+        )
+        return sync_engine_module._ContentAddressedSyncResult(
+            remote_path=kwargs["remote_path"],
+            uploaded=True,
+        )
+
+    monkeypatch.setattr(engine, "_sync_content_addressed_file", sync_file)
+
+    result = engine._sync_custom_nodes_archive_spec(custom_nodes_dir, archive_spec)
+
+    archive_path, payload_digest, sync_key = captured_identity[0]
+    assert payload_digest == hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    assert payload_digest != source_digest
+    assert sync_key.endswith(f"custom_nodes_entry:example:{source_digest}")
+    assert result.sha256 == payload_digest
+
+
+def test_indexed_custom_node_manifest_backfills_archives_and_manifest_to_r2(
+    settings_module: Any,
+    sync_engine_module: Any,
+    r2_cache_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Enabling R2 should revisit every object behind an indexed manifest."""
+    custom_nodes_dir = tmp_path / "custom_nodes"
+    package_dir = custom_nodes_dir / "example"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text(
+        "NODE_CLASS_MAPPINGS = {}\n",
+        encoding="utf-8",
+    )
+    settings = replace(
+        _r2_sync_settings(settings_module, tmp_path),
+        sync_custom_nodes=True,
+        custom_nodes_dir=custom_nodes_dir,
+    )
+    volume = _R2BackfillVolume(r2_cache_module)
+    initial_engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=volume,
+        settings=settings,
+    )
+    initial_bundle = initial_engine.sync_custom_nodes_directory()
+    assert initial_bundle is not None
+    assert initial_bundle.uploaded is True
+
+    backfill_engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=volume,
+        settings=settings,
+        r2_cache=_SynchronousBackfillCache(r2_cache_module),
+    )
+    backfilled_bundle = backfill_engine.sync_custom_nodes_directory()
+
+    assert backfilled_bundle is not None
+    assert backfilled_bundle.uploaded is False
+    assert len(volume.r2_uploads) == 2
+    uploaded_paths = [remote_path for _, remote_path in volume.r2_uploads]
+    assert any(remote_path.endswith(".zip") for remote_path in uploaded_paths)
+    assert any(remote_path.endswith(".json") for remote_path in uploaded_paths)
 
 
 def test_existing_remote_content_is_adopted_without_reupload(

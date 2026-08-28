@@ -2321,15 +2321,24 @@ def _ssh_sync_engine(
     )
     resolved_r2_cache = r2_cache or R2CacheClient.from_environment()
     controller = SshDockerController(host)
-    materializer_image = SshRuntimeManager(
+    runtime_manager = SshRuntimeManager(
         controller=controller,
         repo_root=Path(__file__).resolve().parent,
         settings=settings,
-    ).runtime_spec().image_tag
+    )
+    materializer_spec = runtime_manager.runtime_spec()
+
+    def prepare_materializer_image() -> None:
+        """Make the SSH runtime image available before an R2 helper starts."""
+        runtime_manager.ensure_image(materializer_spec)
+
     volume = SshDockerVolumeBackend(
         controller,
         host.resolved_storage_volume_name,
-        materializer_image=materializer_image,
+        materializer_image=materializer_spec.image_tag,
+        materializer_image_preparer=(
+            prepare_materializer_image if resolved_r2_cache is not None else None
+        ),
     )
     return ModalAssetSyncEngine(
         volume=volume,

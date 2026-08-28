@@ -17,6 +17,7 @@ def test_worker_lifecycle_reports_build_and_readiness_status(
     spec = SimpleNamespace(
         image_tag="comfy-remote:deadbeef",
         storage_volume_name="comfy-remote-lambda",
+        worker_index=0,
     )
     controller = SimpleNamespace(
         host=SimpleNamespace(environment_id="lambda"),
@@ -52,6 +53,45 @@ def test_worker_lifecycle_reports_build_and_readiness_status(
         "Starting SSH worker environment=lambda",
         "Waiting for SSH worker environment=lambda",
         "Ready for remote execution",
+    ]
+
+
+def test_image_only_preparation_builds_before_storage_helpers_run(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """R2 setup should make the runtime image available without starting a worker."""
+    statuses: list[str] = []
+    ensured_volumes: list[str] = []
+    built_specs: list[Any] = []
+    spec = SimpleNamespace(
+        image_tag="comfy-remote:deadbeef",
+        storage_volume_name="comfy-remote-lambda",
+        worker_index=0,
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(
+            host=SimpleNamespace(environment_id="lambda-image-helper"),
+            ensure_volume=ensured_volumes.append,
+        ),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+    monkeypatch.setattr(manager, "_image_is_current", lambda _spec: False)
+    monkeypatch.setattr(
+        manager,
+        "_build_image",
+        lambda runtime_spec, status_callback=None: built_specs.append(runtime_spec),
+    )
+
+    result = manager.ensure_image(spec, status_callback=statuses.append)
+
+    assert result is spec
+    assert ensured_volumes == ["comfy-remote-lambda"]
+    assert built_specs == [spec]
+    assert statuses == [
+        "Building SSH runtime environment=lambda-image-helper "
+        "image=comfy-remote:deadbeef"
     ]
 
 

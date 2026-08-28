@@ -7,6 +7,7 @@ import logging
 import math
 import shlex
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -473,7 +474,17 @@ class SshDockerVolumeBackend:
     volume_name: str
     helper_image: str = DEFAULT_VOLUME_HELPER_IMAGE
     materializer_image: str | None = None
+    materializer_image_preparer: Callable[[], None] | None = field(
+        default=None,
+        repr=False,
+    )
     _exists_cache: dict[str, bool] = field(default_factory=dict)
+    _materializer_image_ready: bool = field(init=False, default=False)
+    _materializer_image_lock: threading.Lock = field(
+        init=False,
+        default_factory=threading.Lock,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Validate and ensure the configured storage volume."""
@@ -486,6 +497,10 @@ class SshDockerVolumeBackend:
             )
         ):
             raise ValueError("SSH R2 materializer image must be a non-empty single line.")
+        if self.materializer_image_preparer is not None and not callable(
+            self.materializer_image_preparer
+        ):
+            raise TypeError("SSH R2 materializer image preparer must be callable.")
 
     def exists(self, remote_path: str) -> bool:
         """Return whether one regular file exists in the remote volume."""
@@ -574,6 +589,7 @@ class SshDockerVolumeBackend:
         """Run signed transfers with URLs supplied only through protected stdin."""
         if self.materializer_image is None:
             raise SshDockerError("SSH R2 backing requires a current worker image.")
+        self._ensure_materializer_image()
         result = self.controller.docker(
             (
                 "run",
@@ -597,6 +613,17 @@ class SshDockerVolumeBackend:
         if not isinstance(payload, Mapping):
             raise SshDockerError("SSH R2 materializer returned a non-object result.")
         return payload
+
+    def _ensure_materializer_image(self) -> None:
+        """Prepare the R2 helper image once before the first signed transfer."""
+        if self._materializer_image_ready:
+            return
+        with self._materializer_image_lock:
+            if self._materializer_image_ready:
+                return
+            if self.materializer_image_preparer is not None:
+                self.materializer_image_preparer()
+            self._materializer_image_ready = True
 
     def _put_payload(self, payload: bytes, remote_path: str) -> None:
         """Atomically stream one payload into the remote named volume."""

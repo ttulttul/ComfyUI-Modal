@@ -139,13 +139,7 @@ class SshRuntimeManager:
                 f"Checking SSH runtime environment={environment_id}",
             )
             self.controller.ensure_volume(spec.storage_volume_name)
-            if not self._image_is_current(spec):
-                _emit_runtime_status(
-                    status_callback,
-                    f"Building SSH runtime environment={environment_id} "
-                    f"image={spec.image_tag}",
-                )
-                self._build_image(spec, status_callback=status_callback)
+            self._ensure_image(spec, status_callback=status_callback)
             self._remove_stale_worker_containers(spec)
             if not self._container_is_current_and_running(spec):
                 _emit_runtime_status(
@@ -160,6 +154,37 @@ class SshRuntimeManager:
             self._wait_until_ready(spec)
             _emit_runtime_status(status_callback, "Ready for remote execution")
             return spec
+
+    def ensure_image(
+        self,
+        spec: SshRuntimeSpec,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> SshRuntimeSpec:
+        """Ensure the image needed by pre-execution storage helpers exists."""
+        lifecycle_lock = _worker_lifecycle_lock(
+            self.controller.host.environment_id,
+            spec.worker_index,
+        )
+        with lifecycle_lock:
+            self.controller.ensure_volume(spec.storage_volume_name)
+            self._ensure_image(spec, status_callback=status_callback)
+            return spec
+
+    def _ensure_image(
+        self,
+        spec: SshRuntimeSpec,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """Build the expected runtime image when the remote daemon lacks it."""
+        if self._image_is_current(spec):
+            return
+        _emit_runtime_status(
+            status_callback,
+            f"Building SSH runtime environment={self.controller.host.environment_id} "
+            f"image={spec.image_tag}",
+        )
+        self._build_image(spec, status_callback=status_callback)
 
     def stop_worker(self, worker_index: int = 0) -> bool:
         """Stop and remove one exact managed worker container when present."""

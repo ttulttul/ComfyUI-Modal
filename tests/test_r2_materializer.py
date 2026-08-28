@@ -238,4 +238,41 @@ def test_main_never_prints_signed_url_on_transfer_failure(
     assert r2_materializer_module.main() == 1
     captured = capsys.readouterr()
     assert "secret" not in captured.err
+    assert "category=transfer" in captured.err
+
+
+def test_main_reports_http_status_without_exposing_presigned_request(
+    r2_materializer_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """HTTP failures should retain status and category but discard request details."""
+    signed_url = "https://account.r2.cloudflarestorage.com/object?signature=secret"
+    monkeypatch.setattr(
+        r2_materializer_module.sys,
+        "stdin",
+        types.SimpleNamespace(buffer=io.BytesIO(b"{}")),
+    )
+    response = r2_materializer_module.requests.Response()
+    response.status_code = 403
+    response.url = signed_url
+
+    def fail_request(request: Any) -> dict[str, object]:
+        """Wrap the requests error in the same transfer failure used after retries."""
+        del request
+        try:
+            raise r2_materializer_module.requests.HTTPError(
+                f"403 Client Error for url: {signed_url}",
+                response=response,
+            )
+        except r2_materializer_module.requests.HTTPError as exc:
+            raise RuntimeError(f"R2 upload failed for {signed_url}") from exc
+
+    monkeypatch.setattr(r2_materializer_module, "process_request", fail_request)
+
+    assert r2_materializer_module.main() == 1
+    captured = capsys.readouterr()
+    assert "category=http_client status=403" in captured.err
+    assert "secret" not in captured.err
+    assert "cloudflarestorage.com" not in captured.err
     assert signed_url not in captured.err

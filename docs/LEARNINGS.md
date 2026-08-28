@@ -6,6 +6,10 @@
 
 - A DOM widget can declare `width: 100%` and still overflow a resized legacy ComfyUI node when the widget object's cached `width` field remains fixed. Keep that field undefined outside Vue-node mode so ComfyUI recalculates the widget allocation from the node on every layout, and let the panel stretch within that allocation.
 - macOS keyring status `-25308` is a recoverable interaction state, not a missing Cloudflare credential. Preserve it as a credential-safe browser error code and expose an explicit recovery action; `/usr/bin/security unlock-keychain -u` delegates password entry to the system-owned dialog without placing the login password in ComfyUI memory or process arguments.
+- A semantic source-tree hash can select a reusable custom-node archive without being the archive's content identity. Object storage verification must use the SHA-256 of the final ZIP bytes; otherwise every safe worker-side upload rejects the payload even though the archive path correctly represents its source tree.
+- A local sync-index hit is evidence that the hot layer contains an asset, not evidence that a newly enabled or previously failed backing cache contains it. Schedule the same idempotent R2 write-back on indexed reuse, and traverse entries behind an indexed custom-node manifest when write-back is enabled so existing installations can backfill without clearing their remote volumes.
+- A storage helper that runs inside the fingerprinted SSH image cannot execute during queue-time write-back until that image exists. Give the runtime manager an image-only, lifecycle-locked preparation path and call it before the first Docker materializer; later worker startup can reuse the image without racing another build.
+- Presigned transfer errors often embed credential-bearing URLs, but suppressing the entire error makes authorization, request, and provider failures indistinguishable. Walk the exception chain on the worker and emit only a fixed category plus a validated numeric HTTP status, never exception text, response bodies, headers, or URLs.
 
 ## 2026-08-24
 

@@ -888,7 +888,7 @@ class ModalAssetSyncEngine:
         )
         manifest_sync_key = self._custom_nodes_manifest_sync_index_key(directory_hash)
         manifest_record = self._lookup_sync_record(manifest_sync_key)
-        if manifest_record is not None:
+        if manifest_record is not None and not self._r2_writeback_enabled():
             remote_path = str(manifest_record["remote_path"])
             logger.info(
                 "Custom_nodes manifest already mirrored at %s after %.3fs total sync time.",
@@ -900,6 +900,11 @@ class ModalAssetSyncEngine:
                 remote_path=remote_path,
                 sha256=directory_hash,
                 uploaded=False,
+            )
+        if manifest_record is not None:
+            logger.info(
+                "Revisiting indexed custom_nodes entries so R2 write-back can "
+                "backfill missing objects."
             )
         remote_path = self._custom_nodes_manifest_remote_path(directory_hash)
 
@@ -1026,9 +1031,15 @@ class ModalAssetSyncEngine:
             status_total=status_total,
             huggingface_source=huggingface_source,
         )
+        size_bytes = spec.local_path.stat().st_size
         existing_record = self._lookup_sync_record(spec.sync_key)
         if existing_record is not None:
             indexed_remote_path = str(existing_record["remote_path"])
+            self._schedule_r2_writeback(
+                sha256=spec.sha256,
+                size_bytes=size_bytes,
+                remote_path=indexed_remote_path,
+            )
             logger.info(
                 "Reusing mirrored asset at %s because sync index key %s already exists.",
                 indexed_remote_path,
@@ -1039,7 +1050,6 @@ class ModalAssetSyncEngine:
                 uploaded=False,
             )
 
-        size_bytes = spec.local_path.stat().st_size
         adopted = self._adopt_existing_remote(spec, size_bytes)
         if adopted is not None:
             return adopted
@@ -1256,12 +1266,9 @@ class ModalAssetSyncEngine:
         force: bool = False,
     ) -> None:
         """Write one remote file into R2 synchronously or on a bounded executor."""
-        if (
-            self.r2_cache is None
-            or self.r2_cache.write_back_mode == "off"
-            or not isinstance(self.volume, R2MaterializingBackend)
-        ):
+        if not self._r2_writeback_enabled():
             return
+        assert self.r2_cache is not None
         if self.r2_cache.write_back_mode == "sync":
             self._write_back_r2_file(sha256, size_bytes, remote_path, force)
             return
@@ -1274,6 +1281,14 @@ class ModalAssetSyncEngine:
         )
         with self._r2_writeback_lock:
             self._r2_writeback_futures.append(future)
+
+    def _r2_writeback_enabled(self) -> bool:
+        """Return whether this engine can populate its configured R2 cache."""
+        return bool(
+            self.r2_cache is not None
+            and self.r2_cache.write_back_mode != "off"
+            and isinstance(self.volume, R2MaterializingBackend)
+        )
 
     def _write_back_r2_file(
         self,
@@ -1426,10 +1441,11 @@ class ModalAssetSyncEngine:
                 time.perf_counter() - archive_started_at,
             )
 
+        archive_sha256 = self._hash_file(archive_path)
         entry_uploaded = self._sync_content_addressed_file(
             local_path=archive_path,
             remote_path=archive_remote_path,
-            sha256=archive_spec.sha256,
+            sha256=archive_sha256,
             sync_key=self._custom_nodes_entry_sync_index_key(
                 archive_spec.entry_name,
                 archive_spec.sha256,
@@ -1439,7 +1455,7 @@ class ModalAssetSyncEngine:
         return _CustomNodesArchiveSyncResult(
             entry_name=archive_spec.entry_name,
             display_name=archive_spec.display_name,
-            sha256=archive_spec.sha256,
+            sha256=archive_sha256,
             remote_path=entry_uploaded.remote_path,
             uploaded=entry_uploaded.uploaded,
         )
