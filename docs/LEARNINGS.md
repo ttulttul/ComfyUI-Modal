@@ -2,6 +2,10 @@
 
 - The pinned vLLM wheel is large enough that pip's default five resumptions and 15-second socket timeout can be exhausted by an unstable connection during an SSH/Vast worker build. Give the accelerator-wheel layer an extended timeout and bounded resume budget while leaving earlier package layers unchanged so Docker can reuse their successful cache entries.
 
+## 2026-08-28
+
+- A DOM widget can declare `width: 100%` and still overflow a resized legacy ComfyUI node when the widget object's cached `width` field remains fixed. Keep that field undefined outside Vue-node mode so ComfyUI recalculates the widget allocation from the node on every layout, and let the panel stretch within that allocation.
+
 ## 2026-08-24
 
 - Prompt assets should be prepared in parallel across concrete execution environments, not across arbitrary components. One bounded worker per environment allows independent Vast and SSH destinations to download concurrently while preserving a single request cache, deterministic component order, and sync-engine safety within each destination.

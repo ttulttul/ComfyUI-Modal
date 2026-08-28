@@ -1734,6 +1734,25 @@ assert.equal(stalePanelRoot.removed, true);
 assert.equal(stalePanelWidget.wasUnregistered, true);
 assert.equal(lateConfiguratorNode.widgets.length, 1);
 assert.equal(lateConfiguratorNode.widgets[0].element, retainedPanel.root);
+assert.equal(
+  lateConfiguratorNode.widgets[0].width,
+  undefined,
+  "the DOM widget must use the node's current layout width",
+);
+lateConfiguratorNode.widgets[0].width = 275;
+assert.equal(
+  lateConfiguratorNode.widgets[0].width,
+  undefined,
+  "legacy frontend width writes must not freeze the Configurator panel",
+);
+globalThis.LiteGraph.vueNodesMode = true;
+lateConfiguratorNode.widgets[0].width = 275;
+assert.equal(
+  lateConfiguratorNode.widgets[0].width,
+  275,
+  "Vue-node mode must retain its managed widget width",
+);
+globalThis.LiteGraph.vueNodesMode = false;
 assert.equal(retainedPanel.promptId, "plan-before-capacity");
 assert.equal(retainedPanel.targets.children.length, 2);
 assert.equal(retainedPanel.environmentRows.size, 2);

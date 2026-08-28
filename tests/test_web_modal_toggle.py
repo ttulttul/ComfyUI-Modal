@@ -87,6 +87,7 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert "function serializedRemoteConfiguratorNodeId(prompt)" in source
     assert "function mountRemoteExecutionConfiguratorPanel(node)" in source
     assert "function removeStaleRemoteConfiguratorWidgets(node)" in source
+    assert "function makeRemoteConfiguratorWidgetResponsive(widget)" in source
     assert "function registerPromptConfigurator(promptId, configuratorNodeId)" in source
     assert "function registerRemoteConfiguratorPlan(promptId, assignments, configurations)" in source
     assert "function renderRemoteConfiguratorStatus(panel, state)" in source
@@ -103,6 +104,9 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert 'widget = node.addDOMWidget(\n      "remote_execution_plan"' in source
     assert "serialize: false" in source
     assert "getMinHeight: () => panel.minHeight" in source
+    assert "makeRemoteConfiguratorWidgetResponsive(widget)" in source
+    assert "max-width: 100%" in source
+    assert "align-self: stretch" in source
     assert 'class="remote-configurator-targets"' in source
     assert "function remoteConfiguratorTargetGroups(assignments, configurations)" in source
     assert "function remoteConfiguratorHardwareLabels(hardware)" in source

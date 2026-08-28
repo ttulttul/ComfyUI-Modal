@@ -146,6 +146,8 @@ const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 const remoteLocationIconImages = new Map();
 const remoteConfiguratorPanels = new Map();
+const REMOTE_CONFIGURATOR_WIDGET_WIDTH_VALUE = "__comfyModalResponsiveWidth";
+const REMOTE_CONFIGURATOR_WIDGET_WIDTH_GUARD = "__comfyModalResponsiveWidthGuard";
 
 let animationFrameHandle = null;
 let modalLastAnimationRedrawAt = 0;
@@ -4469,6 +4471,39 @@ function removeStaleRemoteConfiguratorWidgets(node) {
 }
 
 /**
+ * Keep a Configurator DOM widget on ComfyUI's node-width layout path.
+ * @param {object | null | undefined} widget
+ */
+function makeRemoteConfiguratorWidgetResponsive(widget) {
+  if (!widget || widget[REMOTE_CONFIGURATOR_WIDGET_WIDTH_GUARD]) {
+    return;
+  }
+  try {
+    widget[REMOTE_CONFIGURATOR_WIDGET_WIDTH_VALUE] = undefined;
+    const setResponsiveWidgetWidth = function setResponsiveWidgetWidth(value) {
+      if (globalThis.LiteGraph?.vueNodesMode) {
+        this[REMOTE_CONFIGURATOR_WIDGET_WIDTH_VALUE] = value;
+      }
+    };
+    Object.defineProperty(widget, "width", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return this[REMOTE_CONFIGURATOR_WIDGET_WIDTH_VALUE];
+      },
+      set: setResponsiveWidgetWidth,
+    });
+    Object.defineProperty(widget, REMOTE_CONFIGURATOR_WIDGET_WIDTH_GUARD, {
+      configurable: true,
+      value: true,
+    });
+  } catch (error) {
+    widget.width = undefined;
+    console.warn("Unable to guard the Configurator widget width.", error);
+  }
+}
+
+/**
  * Mount the non-serialized planning and status surface on the configurator node.
  * @param {LGraphNode} node
  */
@@ -4585,6 +4620,7 @@ function mountRemoteExecutionConfiguratorPanel(node) {
   }
   if (widget) {
     widget.serialize = false;
+    makeRemoteConfiguratorWidgetResponsive(widget);
   }
   node.setSize?.([
     Math.max(Number(node.size?.[0]) || 0, 500),
@@ -7175,7 +7211,9 @@ function installGlobalStatusStyles() {
     .comfy-remote-configurator-panel {
       display: flex;
       width: 100%;
+      max-width: 100%;
       min-width: 0;
+      align-self: stretch;
       flex-direction: column;
       gap: 8px;
       box-sizing: border-box;
