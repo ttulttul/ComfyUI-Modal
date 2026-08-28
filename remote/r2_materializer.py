@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Mapping
@@ -25,6 +26,26 @@ _CONNECT_TIMEOUT_SECONDS = 30.0
 _READ_TIMEOUT_SECONDS = 120.0
 _RETRIABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _SHA256_HEX_CHARACTERS = frozenset("0123456789abcdef")
+_MAX_ERROR_RESPONSE_BYTES = 64 * 1024
+_R2_ERROR_CODE_PATTERN = re.compile(
+    rb"<(?:[A-Za-z0-9_.-]+:)?Code>\s*([A-Za-z][A-Za-z0-9]{0,63})\s*"
+    rb"</(?:[A-Za-z0-9_.-]+:)?Code>"
+)
+
+
+class _R2HttpError(requests.HTTPError):
+    """Retain only the safe R2 error code alongside an HTTP failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: requests.Response,
+        r2_error_code: str | None,
+    ) -> None:
+        """Initialize an HTTP error without embedding its signed request URL."""
+        super().__init__(message, response=response)
+        self.r2_error_code = r2_error_code
 
 
 @dataclass(frozen=True)
@@ -146,6 +167,34 @@ def _response_is_retriable(response: requests.Response) -> bool:
     return response.status_code in _RETRIABLE_STATUS_CODES
 
 
+def _safe_r2_error_code(response: requests.Response) -> str | None:
+    """Return one bounded syntax-validated R2 XML error code, when present."""
+    payload = bytearray()
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            remaining = _MAX_ERROR_RESPONSE_BYTES - len(payload)
+            payload.extend(chunk[:remaining])
+            if len(payload) >= _MAX_ERROR_RESPONSE_BYTES:
+                break
+    except (AttributeError, OSError, TypeError, requests.RequestException):
+        return None
+    match = _R2_ERROR_CODE_PATTERN.search(payload)
+    if match is None:
+        return None
+    return match.group(1).decode("ascii")
+
+
+def _http_error(response: requests.Response, action: str) -> _R2HttpError:
+    """Create one URL-free HTTP exception with an optional safe R2 code."""
+    return _R2HttpError(
+        f"{action} returned status {response.status_code}.",
+        response=response,
+        r2_error_code=_safe_r2_error_code(response),
+    )
+
+
 def _stream_response_to_file(
     response: requests.Response,
     temporary_path: Path,
@@ -179,13 +228,11 @@ def _download_once(
         timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
     ) as response:
         if _response_is_retriable(response):
-            raise requests.HTTPError(
-                f"R2 download returned retriable status {response.status_code}.",
-                response=response,
-            )
+            raise _http_error(response, "R2 download")
         if response.status_code == requests.codes.requested_range_not_satisfiable:
             return
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise _http_error(response, "R2 download")
         _stream_response_to_file(response, temporary_path, existing_size)
 
 
@@ -292,11 +339,9 @@ def _put_single_upload(
                     timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
                 )
             if _response_is_retriable(response):
-                raise requests.HTTPError(
-                    f"R2 upload returned retriable status {response.status_code}.",
-                    response=response,
-                )
-            response.raise_for_status()
+                raise _http_error(response, "R2 upload")
+            if response.status_code >= 400:
+                raise _http_error(response, "R2 upload")
             return
         except (OSError, requests.RequestException) as exc:
             if attempt >= _RETRY_ATTEMPTS - 1:
@@ -324,11 +369,9 @@ def _put_upload_part(
                     timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
                 )
             if _response_is_retriable(response):
-                raise requests.HTTPError(
-                    f"R2 upload part returned retriable status {response.status_code}.",
-                    response=response,
-                )
-            response.raise_for_status()
+                raise _http_error(response, "R2 upload part")
+            if response.status_code >= 400:
+                raise _http_error(response, "R2 upload part")
             etag = response.headers.get("ETag", "").strip()
             if not etag:
                 raise RuntimeError("R2 multipart upload response omitted its ETag.")
@@ -420,43 +463,51 @@ def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
     return tuple(chain)
 
 
-def _safe_error_details(exc: BaseException) -> tuple[str, int | None]:
+def _safe_error_details(exc: BaseException) -> tuple[str, int | None, str | None]:
     """Classify one failure without returning messages, URLs, or credentials."""
     chain = _exception_chain(exc)
     for error in chain:
         if isinstance(error, requests.HTTPError):
             response = error.response
             status_code = getattr(response, "status_code", None)
+            r2_error_code = (
+                error.r2_error_code if isinstance(error, _R2HttpError) else None
+            )
             if isinstance(status_code, int) and 100 <= status_code <= 599:
                 if 400 <= status_code <= 499:
-                    return "http_client", status_code
+                    return "http_client", status_code, r2_error_code
                 if 500 <= status_code <= 599:
-                    return "http_server", status_code
-                return "http", status_code
+                    return "http_server", status_code, r2_error_code
+                return "http", status_code, r2_error_code
     if any(isinstance(error, requests.Timeout) for error in chain):
-        return "timeout", None
+        return "timeout", None, None
     if any(isinstance(error, requests.exceptions.SSLError) for error in chain):
-        return "tls", None
+        return "tls", None, None
     if any(isinstance(error, requests.ConnectionError) for error in chain):
-        return "connection", None
+        return "connection", None, None
     if any(isinstance(error, FileNotFoundError) for error in chain):
-        return "source_missing", None
+        return "source_missing", None, None
     if any(isinstance(error, json.JSONDecodeError) for error in chain):
-        return "invalid_request", None
+        return "invalid_request", None, None
     if any(isinstance(error, TypeError) for error in chain):
-        return "invalid_request", None
+        return "invalid_request", None, None
     if any(isinstance(error, ValueError) for error in chain):
-        return "validation", None
+        return "validation", None, None
     if any(isinstance(error, OSError) for error in chain):
-        return "io", None
-    return "transfer", None
+        return "io", None, None
+    return "transfer", None, None
 
 
 def _safe_error_summary(exc: BaseException) -> str:
     """Return fixed diagnostic fields that cannot contain signed request data."""
-    category, status_code = _safe_error_details(exc)
+    category, status_code, r2_error_code = _safe_error_details(exc)
     if status_code is None:
         return f"category={category}"
+    if r2_error_code is not None:
+        return (
+            f"category={category} status={status_code} "
+            f"r2_code={r2_error_code}"
+        )
     return f"category={category} status={status_code}"
 
 

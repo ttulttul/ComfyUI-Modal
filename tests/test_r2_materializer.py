@@ -276,3 +276,40 @@ def test_main_reports_http_status_without_exposing_presigned_request(
     assert "secret" not in captured.err
     assert "cloudflarestorage.com" not in captured.err
     assert signed_url not in captured.err
+
+
+def test_main_reports_safe_r2_error_code_without_exposing_response_body(
+    r2_materializer_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R2's bounded symbolic code should survive while its message is discarded."""
+    signed_url = "https://account.r2.cloudflarestorage.com/object?signature=secret"
+    secret_message = "credential scope contains private-value"
+    monkeypatch.setattr(
+        r2_materializer_module.sys,
+        "stdin",
+        types.SimpleNamespace(buffer=io.BytesIO(b"{}")),
+    )
+    response = r2_materializer_module.requests.Response()
+    response.status_code = 403
+    response.url = signed_url
+    response._content = (
+        f"<Error><Code>AccessDenied</Code><Message>{secret_message}</Message></Error>"
+    ).encode()
+    response._content_consumed = True
+
+    def fail_request(request: Any) -> dict[str, object]:
+        """Raise the sanitized materializer HTTP error used by real transfers."""
+        del request
+        error = r2_materializer_module._http_error(response, "R2 upload")
+        raise RuntimeError("R2 upload failed after retries") from error
+
+    monkeypatch.setattr(r2_materializer_module, "process_request", fail_request)
+
+    assert r2_materializer_module.main() == 1
+    captured = capsys.readouterr()
+    assert "category=http_client status=403 r2_code=AccessDenied" in captured.err
+    assert "secret" not in captured.err
+    assert secret_message not in captured.err
+    assert "cloudflarestorage.com" not in captured.err

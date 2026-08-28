@@ -355,7 +355,7 @@ When ComfyUI is opened through an HTTP loopback URL, the callback is derived aut
 
 ComfyUI normally rejects all cross-site browser requests through its origin-only middleware. Cloudflare's redirect is necessarily cross-site, so the extension installs a narrow exception ahead of that guard for `GET /remote/storage/r2/oauth/callback` only. The callback remains protected by its random, single-use OAuth state and PKCE verifier; all other cross-site ComfyUI requests continue through the standard guard.
 
-The environment-only configuration remains supported for legacy workflows and scripts. Create a private R2 bucket and an API token scoped to that bucket, then configure the ComfyUI process:
+The environment-only configuration remains supported for legacy workflows and scripts. Create a private R2 bucket and an API token scoped to that bucket, then configure the ComfyUI process. Do not apply client-IP filtering to a token used for direct worker transfers unless every possible Vast.ai and SSH worker egress address is included: presigned requests are still evaluated under that token and otherwise fail from workers with `403 AccessDenied`. Transfer failures retain only a safe HTTP category, status, and bounded R2 error code such as `AccessDenied`, `ExpiredRequest`, or `SignatureDoesNotMatch`; response messages, object URLs, and signatures are discarded.
 
 ```bash
 export COMFY_MODAL_R2_ENABLED=true
