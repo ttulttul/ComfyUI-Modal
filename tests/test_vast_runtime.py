@@ -156,19 +156,26 @@ def test_runtime_manager_rejects_image_fingerprint_drift(
         ),
     )
 
-    with pytest.raises(Exception, match="fingerprint mismatch"):
+    with pytest.raises(
+        vast_runtime_module.VastRuntimeFingerprintDriftError,
+        match="source fingerprint drift",
+    ) as raised:
         manager.ensure_worker()
 
+    assert raised.value.expected_fingerprint == "a" * 64
+    assert raised.value.actual_fingerprint == "b" * 64
+    assert raised.value.protocol_version == 0
 
-def test_runtime_manager_accepts_same_protocol_fingerprint_drift(
+
+def test_runtime_manager_rejects_same_protocol_fingerprint_drift(
     vast_runtime_module: Any,
 ) -> None:
-    """Controller-only source changes may reuse the same protocol-compatible image."""
+    """A protocol match must not hide source-level worker incompatibility."""
     manager = vast_runtime_module.VastRuntimeManager(
         runner=FakeRunner(
             [
                 {
-                    "protocol_version": vast_runtime_module.REMOTE_PROTOCOL_VERSION,
+                    "protocol_version": 1,
                     "runtime_fingerprint": "b" * 64,
                     "worker_socket_ready": True,
                 }
@@ -180,9 +187,12 @@ def test_runtime_manager_accepts_same_protocol_fingerprint_drift(
         ),
     )
 
-    info = manager.ensure_worker()
+    with pytest.raises(
+        vast_runtime_module.VastRuntimeFingerprintDriftError
+    ) as raised:
+        manager.ensure_worker()
 
-    assert info["worker_socket_ready"] is True
+    assert raised.value.protocol_version == 1
 
 
 def test_runtime_manager_logs_changed_ssh_readiness_diagnostics(

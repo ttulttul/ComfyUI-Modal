@@ -13,13 +13,11 @@ from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
 if __package__:
-    from .remote_protocol import REMOTE_PROTOCOL_VERSION
     from .remote.vast_watchdog import VastWatchdogSnapshot
     from .vast_leases import VastLeaseRecord
     from .vast_models import VastInstanceLaunchSpec, VastResourceProfile
     from .vast_ssh import VastSshError, VastSshRunner, VastSshVolumeBackend
 else:  # pragma: no cover - direct debugging imports.
-    from remote_protocol import REMOTE_PROTOCOL_VERSION
     from remote.vast_watchdog import VastWatchdogSnapshot
     from vast_leases import VastLeaseRecord
     from vast_models import VastInstanceLaunchSpec, VastResourceProfile
@@ -34,6 +32,27 @@ DEFAULT_VAST_REMOTE_STORAGE_ROOT = PurePosixPath("/storage")
 DEFAULT_VAST_WATCHDOG_STATE_PATH = PurePosixPath(
     "/storage/comfy-vast-watchdog.json"
 )
+
+
+class VastRuntimeFingerprintDriftError(VastSshError):
+    """Report that a published Vast worker does not match the local runtime."""
+
+    def __init__(
+        self,
+        *,
+        expected_fingerprint: str,
+        actual_fingerprint: str,
+        protocol_version: int,
+    ) -> None:
+        """Retain the compared identities for automated image replacement."""
+        self.expected_fingerprint = expected_fingerprint
+        self.actual_fingerprint = actual_fingerprint
+        self.protocol_version = protocol_version
+        super().__init__(
+            "Vast worker image source fingerprint drift: expected "
+            f"{expected_fingerprint[:12]}, found "
+            f"{actual_fingerprint[:12] or 'empty'}, protocol {protocol_version}."
+        )
 
 
 def _ssh_permission_repair_lines() -> tuple[str, ...]:
@@ -180,19 +199,10 @@ class VastRuntimeManager:
                 actual_fingerprint = str(info.get("runtime_fingerprint") or "")
                 if actual_fingerprint != self.configuration.runtime_fingerprint:
                     actual_protocol = int(info.get("protocol_version") or 0)
-                    if actual_protocol != REMOTE_PROTOCOL_VERSION:
-                        raise VastSshError(
-                            "Vast worker image fingerprint mismatch: expected "
-                            f"{self.configuration.runtime_fingerprint[:12]}, found "
-                            f"{actual_fingerprint[:12] or 'empty'}, with incompatible "
-                            f"protocol {actual_protocol}."
-                        )
-                    logger.warning(
-                        "Reusing Vast worker with compatible protocol despite source "
-                        "fingerprint drift expected=%s actual=%s protocol=%d.",
-                        self.configuration.runtime_fingerprint[:12],
-                        actual_fingerprint[:12] or "empty",
-                        actual_protocol,
+                    raise VastRuntimeFingerprintDriftError(
+                        expected_fingerprint=self.configuration.runtime_fingerprint,
+                        actual_fingerprint=actual_fingerprint,
+                        protocol_version=actual_protocol,
                     )
                 if bool(info.get("worker_socket_ready")):
                     logger.info(
@@ -289,5 +299,6 @@ __all__ = [
     "DEFAULT_VAST_WATCHDOG_STATE_PATH",
     "VAST_IMAGE_ENV",
     "VastRuntimeConfiguration",
+    "VastRuntimeFingerprintDriftError",
     "VastRuntimeManager",
 ]

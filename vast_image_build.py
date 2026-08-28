@@ -1,0 +1,179 @@
+"""Build and publish a current worker image after Vast source drift."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import subprocess
+import threading
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import IO
+
+logger = logging.getLogger(__name__)
+
+VAST_IMAGE_BUILD_COMMAND = (
+    "uv",
+    "run",
+    "python",
+    "scripts/build_vast_worker_image.py",
+    "--push",
+)
+_IMAGE_RESULT_PREFIX = "COMFY_MODAL_VAST_IMAGE="
+_DIGEST_REFERENCE_PATTERN = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
+_DIGEST_IN_TEXT_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_MAXIMUM_STATUS_LINE_CHARACTERS = 300
+_BUILD_LOCK = threading.Lock()
+_BUILT_IMAGES_BY_FINGERPRINT: dict[str, str] = {}
+
+VastImageBuildStatusCallback = Callable[[str], None]
+
+
+class VastWorkerImageBuildError(RuntimeError):
+    """Report that the automatic Vast worker image build could not finish."""
+
+
+@dataclass(frozen=True)
+class VastWorkerImageBuilder:
+    """Run the repository image builder and stream bounded progress messages."""
+
+    repo_root: Path
+    comfyui_root: Path | None
+    environment: Mapping[str, str] | None = None
+
+    def build_and_push(
+        self,
+        expected_fingerprint: str,
+        *,
+        status_callback: VastImageBuildStatusCallback | None = None,
+    ) -> str:
+        """Build once per fingerprint and return the published digest reference."""
+        with _BUILD_LOCK:
+            cached = _BUILT_IMAGES_BY_FINGERPRINT.get(expected_fingerprint)
+            if cached is not None:
+                self._emit(
+                    status_callback,
+                    "Using the worker image published by another workflow",
+                )
+                return cached
+            image = self._run_build(status_callback=status_callback)
+            _BUILT_IMAGES_BY_FINGERPRINT[expected_fingerprint] = image
+            return image
+
+    def _run_build(
+        self,
+        *,
+        status_callback: VastImageBuildStatusCallback | None,
+    ) -> str:
+        """Execute the image builder and extract its immutable result reference."""
+        command_text = " ".join(VAST_IMAGE_BUILD_COMMAND)
+        self._emit(status_callback, "Building the current Vast worker image")
+        environment = dict(os.environ if self.environment is None else self.environment)
+        environment.setdefault("BUILDKIT_PROGRESS", "plain")
+        if self.comfyui_root is not None:
+            environment["COMFYUI_ROOT"] = str(self.comfyui_root)
+        try:
+            process = subprocess.Popen(
+                VAST_IMAGE_BUILD_COMMAND,
+                cwd=self.repo_root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise VastWorkerImageBuildError(
+                self._manual_build_message(
+                    f"Unable to start {VAST_IMAGE_BUILD_COMMAND[0]!r}: {exc}"
+                )
+            ) from exc
+        image_reference, recent_output = self._consume_output(
+            process.stdout,
+            status_callback=status_callback,
+        )
+        return_code = process.wait()
+        if return_code != 0:
+            diagnostic = recent_output[-1] if recent_output else "no build output"
+            raise VastWorkerImageBuildError(
+                self._manual_build_message(
+                    f"{command_text} exited with status {return_code}: {diagnostic}"
+                )
+            )
+        if image_reference is None:
+            raise VastWorkerImageBuildError(
+                self._manual_build_message(
+                    "The build completed without returning an immutable image digest."
+                )
+            )
+        self._emit(status_callback, "Published the current Vast worker image")
+        return image_reference
+
+    def _consume_output(
+        self,
+        output: IO[str] | None,
+        *,
+        status_callback: VastImageBuildStatusCallback | None,
+    ) -> tuple[str | None, tuple[str, ...]]:
+        """Forward subprocess lines and return its digest plus recent diagnostics."""
+        if output is None:
+            return None, ()
+        image_reference: str | None = None
+        recent_output: list[str] = []
+        for raw_line in output:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(_IMAGE_RESULT_PREFIX):
+                candidate = line.removeprefix(_IMAGE_RESULT_PREFIX).strip()
+                if _DIGEST_REFERENCE_PATTERN.fullmatch(candidate):
+                    image_reference = candidate
+                continue
+            bounded = self._safe_status_line(line)
+            recent_output.append(bounded)
+            del recent_output[:-10]
+            logger.info("Vast worker image build: %s", bounded)
+            self._emit(status_callback, f"Vast image build: {bounded}")
+        return image_reference, tuple(recent_output)
+
+    @staticmethod
+    def _safe_status_line(line: str) -> str:
+        """Bound one progress line and remove terminal codes and exact digests."""
+        without_ansi = _ANSI_ESCAPE_PATTERN.sub("", line)
+        redacted = _DIGEST_IN_TEXT_PATTERN.sub("sha256:[redacted]", without_ansi)
+        printable = "".join(
+            character for character in redacted if character.isprintable()
+        )
+        return printable[:_MAXIMUM_STATUS_LINE_CHARACTERS]
+
+    def _manual_build_message(self, cause: str) -> str:
+        """Return an actionable error without leaking subprocess environment data."""
+        return (
+            f"Automatic Vast worker image publication failed. {cause} Run `"
+            + " ".join(VAST_IMAGE_BUILD_COMMAND)
+            + "` from "
+            + str(self.repo_root)
+            + ", set COMFY_MODAL_VAST_IMAGE to the printed digest, restart ComfyUI, "
+            "and retry the workflow."
+        )
+
+    @staticmethod
+    def _emit(
+        status_callback: VastImageBuildStatusCallback | None,
+        message: str,
+    ) -> None:
+        """Send one build update when workflow progress is available."""
+        if status_callback is not None:
+            status_callback(message)
+
+
+__all__ = [
+    "VAST_IMAGE_BUILD_COMMAND",
+    "VastWorkerImageBuildError",
+    "VastWorkerImageBuilder",
+]

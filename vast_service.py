@@ -28,6 +28,11 @@ if __package__:
     from .sync_engine import ModalAssetSyncEngine
     from .vast_api import VastApiClient, VastApiError, VastInstanceNotFoundError
     from .vast_executor import VastExecutorClient
+    from .vast_image_build import (
+        VAST_IMAGE_BUILD_COMMAND,
+        VastWorkerImageBuildError,
+        VastWorkerImageBuilder,
+    )
     from .vast_leases import (
         VastLeaseManager,
         VastLeaseRecord,
@@ -35,7 +40,12 @@ if __package__:
         vast_profile_fingerprint,
     )
     from .vast_models import VastInstance, VastOffer, VastResourceProfile
-    from .vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
+    from .vast_runtime import (
+        VAST_IMAGE_ENV,
+        VastRuntimeConfiguration,
+        VastRuntimeFingerprintDriftError,
+        VastRuntimeManager,
+    )
     from .vast_ssh import (
         VastSshError,
         VastSshRunner,
@@ -58,6 +68,11 @@ else:  # pragma: no cover - direct debugging imports.
     from sync_engine import ModalAssetSyncEngine
     from vast_api import VastApiClient, VastApiError, VastInstanceNotFoundError
     from vast_executor import VastExecutorClient
+    from vast_image_build import (
+        VAST_IMAGE_BUILD_COMMAND,
+        VastWorkerImageBuildError,
+        VastWorkerImageBuilder,
+    )
     from vast_leases import (
         VastLeaseManager,
         VastLeaseRecord,
@@ -65,7 +80,12 @@ else:  # pragma: no cover - direct debugging imports.
         vast_profile_fingerprint,
     )
     from vast_models import VastInstance, VastOffer, VastResourceProfile
-    from vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
+    from vast_runtime import (
+        VAST_IMAGE_ENV,
+        VastRuntimeConfiguration,
+        VastRuntimeFingerprintDriftError,
+        VastRuntimeManager,
+    )
     from vast_ssh import (
         VastSshError,
         VastSshRunner,
@@ -144,6 +164,8 @@ class VastService:
         registry: VastLeaseRegistry,
         identity_file: Path | None = None,
         r2_cache: R2CacheClient | None = None,
+        image_builder: VastWorkerImageBuilder | None = None,
+        update_process_environment: bool = False,
     ) -> None:
         """Initialize the controller and its persistent lease manager."""
         self.settings = settings
@@ -154,6 +176,11 @@ class VastService:
         self.registry = registry
         self.identity_file = identity_file
         self.r2_cache = r2_cache
+        self.image_builder = image_builder or VastWorkerImageBuilder(
+            repo_root=self.repo_root,
+            comfyui_root=getattr(settings, "comfyui_root", None),
+        )
+        self.update_process_environment = update_process_environment
         self.huggingface_asset_registry = (
             HuggingFaceAssetRegistry.for_user_directory(self.user_directory)
         )
@@ -162,10 +189,17 @@ class VastService:
             user_directory=self.user_directory,
             comfyui_root=getattr(settings, "comfyui_root", None),
         )
-        self.lease_manager = VastLeaseManager(
-            api_client=api_client,
-            registry=registry,
-            owner_id=settings.app_name,
+        self.lease_manager = self._lease_manager_for(runtime_configuration)
+
+    def _lease_manager_for(
+        self,
+        runtime_configuration: VastRuntimeConfiguration,
+    ) -> VastLeaseManager:
+        """Return a lease manager bound to one immutable worker image."""
+        return VastLeaseManager(
+            api_client=self.api_client,
+            registry=self.registry,
+            owner_id=self.settings.app_name,
             runtime_fingerprint=runtime_configuration.runtime_fingerprint,
             launch_spec_factory=runtime_configuration.launch_spec,
             startup_timeout_seconds=runtime_configuration.startup_timeout_seconds,
@@ -223,6 +257,12 @@ class VastService:
             registry=VastLeaseRegistry.for_user_directory(user_directory),
             identity_file=identity_file,
             r2_cache=R2CacheClient.from_environment(source),
+            image_builder=VastWorkerImageBuilder(
+                repo_root=repo_root.resolve(),
+                comfyui_root=settings.comfyui_root,
+                environment=(source if environment is not None else None),
+            ),
+            update_process_environment=environment is None,
         )
 
     async def quote_best_profile(
@@ -427,6 +467,7 @@ class VastService:
         slot: int,
         status_callback: Callable[[str], None] | None,
         instance_status_callback: Callable[[VastInstance], None] | None,
+        allow_image_rebuild: bool = True,
     ) -> VastLeaseRecord:
         """Initialize capacity and replace one disappeared or unusable contract."""
         excluded_offer_ids: set[int] = set()
@@ -444,6 +485,48 @@ class VastService:
                 status_callback("Initializing Vast.ai worker")
             try:
                 await asyncio.to_thread(self._initialize_runtime, lease)
+            except VastRuntimeFingerprintDriftError as exc:
+                cleanup_completed = await self._discard_failed_runtime_lease(
+                    lease,
+                    str(exc),
+                )
+                if status_callback is not None:
+                    cleanup_status = (
+                        "terminated" if cleanup_completed else "marked unusable"
+                    )
+                    status_callback(
+                        "Vast worker source drift detected; stale instance "
+                        f"{lease.instance_id} was {cleanup_status}"
+                    )
+                if not allow_image_rebuild:
+                    raise RuntimeError(
+                        self._manual_image_build_message(
+                            "The automatically published worker image still reported "
+                            f"fingerprint {exc.actual_fingerprint[:12]} instead of "
+                            f"{exc.expected_fingerprint[:12]}."
+                        )
+                    ) from exc
+                try:
+                    image = self.image_builder.build_and_push(
+                        exc.expected_fingerprint,
+                        status_callback=status_callback,
+                    )
+                except VastWorkerImageBuildError:
+                    if status_callback is not None:
+                        status_callback("Automatic Vast worker image build failed")
+                    raise
+                self._adopt_runtime_image(image)
+                if status_callback is not None:
+                    status_callback(
+                        "Vast worker image updated; requesting fresh capacity"
+                    )
+                return await self._acquire_with_replacement(
+                    profile,
+                    slot=slot,
+                    status_callback=status_callback,
+                    instance_status_callback=instance_status_callback,
+                    allow_image_rebuild=False,
+                )
             except VastInstanceNotFoundError as exc:
                 self.registry.remove(lease.instance_id)
                 excluded_offer_ids.add(lease.offer_id)
@@ -508,6 +591,26 @@ class VastService:
                 status_callback("Vast.ai worker is ready")
             return lease
         raise RuntimeError("Vast replacement attempts ended without a lease.")
+
+    def _adopt_runtime_image(self, image: str) -> None:
+        """Use one freshly published image for this and later process-local runs."""
+        configuration = replace(self.runtime_configuration, image=image)
+        self.runtime_configuration = configuration
+        self.lease_manager = self._lease_manager_for(configuration)
+        if self.update_process_environment:
+            os.environ[VAST_IMAGE_ENV] = image
+        logger.info(
+            "Adopted rebuilt Vast worker image fingerprint=%s.",
+            configuration.runtime_fingerprint[:12],
+        )
+
+    def _manual_image_build_message(self, cause: str) -> str:
+        """Return the manual recovery required after an unusable rebuilt image."""
+        return (
+            f"{cause} Run `{' '.join(VAST_IMAGE_BUILD_COMMAND)}` from "
+            f"{self.repo_root}, set {VAST_IMAGE_ENV} to the printed digest, restart "
+            "ComfyUI, and retry the workflow."
+        )
 
     async def _discard_failed_runtime_lease(
         self,

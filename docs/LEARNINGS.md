@@ -1,5 +1,12 @@
 # Learnings
 
+## 2026-08-28: A matching protocol number cannot make a stale Vast worker safe
+
+- A newly rented Vast instance can still report the same old runtime fingerprint as a destroyed instance because `COMFY_MODAL_VAST_IMAGE` is an immutable registry digest; destroying capacity does not rebuild that image.
+- The worker staging CLI gained arguments and commands while the remote protocol remained at version 1. Allowing fingerprint drift whenever the protocol matched therefore admitted a worker that could pass readiness but fail model staging.
+- Vast readiness now treats every source fingerprint mismatch as a typed drift error. Queue-time acquisition destroys the stale lease, coordinates a single local `uv run python scripts/build_vast_worker_image.py --push`, streams bounded subprocess output through the existing per-environment setup status, adopts the returned digest in the current process, and retries with fresh capacity.
+- Automatic publication must remain fail-closed: missing `uv`, Docker, registry authentication, a failed build/push, a missing digest, or a second mismatched worker cancels preparation with the manual build command and configuration steps.
+
 - The pinned vLLM wheel is large enough that pip's default five resumptions and 15-second socket timeout can be exhausted by an unstable connection during an SSH/Vast worker build. Give the accelerator-wheel layer an extended timeout and bounded resume budget while leaving earlier package layers unchanged so Docker can reuse their successful cache entries.
 
 ## 2026-08-28

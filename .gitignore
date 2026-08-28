@@ -47,6 +47,7 @@
 !/vast_api.py
 !/vast_config_node.py
 !/vast_executor.py
+!/vast_image_build.py
 !/vast_leases.py
 !/vast_models.py
 !/vast_runtime.py

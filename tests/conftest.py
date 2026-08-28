@@ -274,6 +274,12 @@ def vast_runtime_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def vast_image_build_module(extension_package: object) -> object:
+    """Return automatic Vast worker image publication helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vast_image_build")
+
+
+@pytest.fixture(scope="session")
 def vast_executor_module(extension_package: object) -> object:
     """Return the direct Vast remote executor client."""
     return importlib.import_module(f"{PACKAGE_NAME}.vast_executor")

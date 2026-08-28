@@ -277,9 +277,12 @@ def build_image(
         _docker_build_command(image_tag, identity.fingerprint),
         input_payload=context,
     )
+    logger.info("Finished building Vast worker image tag=%s.", image_tag)
     if not push:
         return image_tag
+    logger.info("Pushing Vast worker image tag=%s.", image_tag)
     _run(("docker", "push", image_tag))
+    logger.info("Resolving immutable digest for Vast worker image tag=%s.", image_tag)
     repository_digests = _run(
         (
             "docker",

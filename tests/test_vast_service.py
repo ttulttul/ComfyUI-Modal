@@ -379,3 +379,104 @@ def test_acquire_replaces_instance_that_disappears_before_ssh(
     assert lease_manager.excluded_offer_ids == [frozenset(), frozenset({1001})]
     assert "Vast.ai instance disappeared; requesting a replacement" in messages
     assert messages[-1] == "Vast.ai worker is ready"
+
+
+def test_acquire_rebuilds_image_and_replaces_fingerprint_drift(
+    vast_service_module: Any,
+) -> None:
+    """A stale published worker should be rebuilt once before capacity is retried."""
+
+    class FakeRegistry:
+        """Record stale worker draining before its destruction."""
+
+        def __init__(self) -> None:
+            """Initialize the updated instance log."""
+            self.updated_instance_ids: list[int] = []
+
+        def update(self, instance_id: int, updater: Any) -> None:
+            """Record one stale lease update."""
+            del updater
+            self.updated_instance_ids.append(instance_id)
+
+    class FakeLeaseManager:
+        """Return one stale lease followed by a fresh-image lease."""
+
+        def __init__(self, leases: list[Any]) -> None:
+            """Retain sequenced leases and destruction calls."""
+            self.leases = leases
+            self.destroyed_instance_ids: list[int] = []
+
+        async def ensure_lease(self, profile: Any, **kwargs: Any) -> Any:
+            """Return the next lease without contacting Vast."""
+            del profile, kwargs
+            return self.leases.pop(0)
+
+        async def destroy_owned_lease(self, instance_id: int) -> bool:
+            """Record stale capacity cleanup."""
+            self.destroyed_instance_ids.append(instance_id)
+            return True
+
+    class FakeImageBuilder:
+        """Publish a deterministic replacement image."""
+
+        def __init__(self) -> None:
+            """Initialize requested fingerprint tracking."""
+            self.fingerprints: list[str] = []
+
+        def build_and_push(
+            self,
+            expected_fingerprint: str,
+            *,
+            status_callback: Any,
+        ) -> str:
+            """Emit progress and return a digest-pinned image."""
+            self.fingerprints.append(expected_fingerprint)
+            status_callback("Building replacement worker")
+            return "ghcr.io/example/worker@sha256:" + "c" * 64
+
+    stale = SimpleNamespace(
+        instance_id=42,
+        offer_id=1001,
+        environment_id="vast:test:42",
+    )
+    replacement = SimpleNamespace(
+        instance_id=43,
+        offer_id=1001,
+        environment_id="vast:test:43",
+    )
+    lease_manager = FakeLeaseManager([stale, replacement])
+    image_builder = FakeImageBuilder()
+    service = object.__new__(vast_service_module.VastService)
+    service.lease_manager = lease_manager
+    service.registry = FakeRegistry()
+    service.image_builder = image_builder
+    adopted_images: list[str] = []
+    service._adopt_runtime_image = adopted_images.append
+
+    def initialize_runtime(lease: Any) -> None:
+        """Reject only the worker baked into the first lease."""
+        if lease.instance_id == stale.instance_id:
+            raise vast_service_module.VastRuntimeFingerprintDriftError(
+                expected_fingerprint="a" * 64,
+                actual_fingerprint="b" * 64,
+                protocol_version=1,
+            )
+
+    service._initialize_runtime = initialize_runtime
+    messages: list[str] = []
+
+    acquired = asyncio.run(
+        service.acquire(
+            SimpleNamespace(profile=SimpleNamespace()),
+            status_callback=messages.append,
+        )
+    )
+
+    assert acquired is replacement
+    assert service.registry.updated_instance_ids == [42]
+    assert lease_manager.destroyed_instance_ids == [42]
+    assert image_builder.fingerprints == ["a" * 64]
+    assert adopted_images == ["ghcr.io/example/worker@sha256:" + "c" * 64]
+    assert "Building replacement worker" in messages
+    assert "Vast worker image updated; requesting fresh capacity" in messages
+    assert messages[-1] == "Vast.ai worker is ready"
