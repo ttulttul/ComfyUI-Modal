@@ -407,6 +407,10 @@ def test_configurator_lists_and_kills_exact_managed_capacity() -> None:
     assert 'class="remote-configurator-capacity-title">Managed capacity</div>' in source
     assert 'button.textContent = "KILL";' in source
     assert "{ instance_id: Number(entry.resourceId), force: true }" in source
+    assert 'for (const eventName of ["pointerdown", "pointermove", "pointerup", "wheel"])' in source
+    assert 'event.target?.closest?.("button")' in source
+    assert source.count("pointer-events: auto;") >= 3
+    assert ".remote-configurator-capacity-kill:active:not(:disabled)" in source
 
 
 def test_global_modal_status_badge_estimates_prompt_gpu_cost() -> None:

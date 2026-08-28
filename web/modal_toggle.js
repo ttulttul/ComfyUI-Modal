@@ -4553,6 +4553,13 @@ function mountRemoteExecutionConfiguratorPanel(node) {
       ".remote-configurator-storage-refresh-status",
     ),
   };
+  for (const eventName of ["pointerdown", "pointermove", "pointerup", "wheel"]) {
+    root.addEventListener(eventName, (event) => {
+      if (event.target?.closest?.("button")) {
+        event.stopPropagation();
+      }
+    });
+  }
   panel.storageReload.addEventListener("click", () => {
     void refreshRemoteConfiguratorStorage(panel);
   });
@@ -7548,12 +7555,20 @@ function installGlobalStatusStyles() {
       color: #7dd3fc;
       cursor: pointer;
       font: 600 9px/1.35 ui-sans-serif, system-ui, sans-serif;
+      pointer-events: auto;
+      touch-action: manipulation;
     }
 
     .remote-configurator-capacity-reload:hover:not(:disabled),
     .remote-configurator-storage-reload:hover:not(:disabled) {
       border-color: rgba(56, 189, 248, 0.55);
       background: rgba(14, 116, 144, 0.24);
+    }
+
+    .remote-configurator-capacity-reload:active:not(:disabled),
+    .remote-configurator-storage-reload:active:not(:disabled) {
+      background: rgba(14, 116, 144, 0.42);
+      transform: translateY(1px);
     }
 
     .remote-configurator-capacity-reload:disabled,
@@ -7627,12 +7642,19 @@ function installGlobalStatusStyles() {
       color: #fca5a5;
       cursor: pointer;
       font: 750 9px/1.3 ui-monospace, SFMono-Regular, monospace;
+      pointer-events: auto;
+      touch-action: manipulation;
     }
 
     .remote-configurator-capacity-kill:hover:not(:disabled) {
       border-color: #ef4444;
       background: rgba(185, 28, 28, 0.42);
       color: #fee2e2;
+    }
+
+    .remote-configurator-capacity-kill:active:not(:disabled) {
+      background: rgba(220, 38, 38, 0.6);
+      transform: translateY(1px);
     }
 
     .remote-configurator-capacity-kill:disabled {
