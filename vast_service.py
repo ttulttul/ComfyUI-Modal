@@ -484,7 +484,12 @@ class VastService:
             if status_callback is not None:
                 status_callback("Initializing Vast.ai worker")
             try:
-                await asyncio.to_thread(self._initialize_runtime, lease)
+                initialized_lease = await asyncio.to_thread(
+                    self._initialize_runtime,
+                    lease,
+                )
+                if initialized_lease is not None:
+                    lease = initialized_lease
             except VastRuntimeFingerprintDriftError as exc:
                 cleanup_completed = await self._discard_failed_runtime_lease(
                     lease,
@@ -765,7 +770,7 @@ class VastService:
         )
 
     def _runner(self, lease: VastLeaseRecord) -> VastSshRunner:
-        """Return a direct SSH runner for one ready lease."""
+        """Return an SSH runner for the lease's selected endpoint."""
         return VastSshRunner(
             vast_connection_from_lease(
                 ssh_host=lease.ssh_host,
@@ -775,7 +780,58 @@ class VastService:
             )
         )
 
-    def _initialize_runtime(self, lease: VastLeaseRecord) -> None:
+    def _proxy_runner(self, lease: VastLeaseRecord) -> VastSshRunner | None:
+        """Return the distinct Vast proxy endpoint available after direct failure."""
+        if (
+            lease.ssh_proxy_host is None
+            or lease.ssh_proxy_port is None
+            or (
+                lease.ssh_host == lease.ssh_proxy_host
+                and lease.ssh_port == lease.ssh_proxy_port
+            )
+        ):
+            return None
+        return VastSshRunner(
+            vast_connection_from_lease(
+                ssh_host=lease.ssh_proxy_host,
+                ssh_port=lease.ssh_proxy_port,
+                user_directory=self.user_directory,
+                identity_file=self.identity_file,
+            )
+        )
+
+    def _promote_proxy_endpoint(self, lease: VastLeaseRecord) -> None:
+        """Persist the proxy as primary after it proves reachable."""
+        if lease.ssh_proxy_host is None or lease.ssh_proxy_port is None:
+            raise ValueError("Vast lease does not expose a complete proxy endpoint.")
+        self.registry.update(
+            lease.instance_id,
+            lambda current: replace(
+                current,
+                ssh_host=lease.ssh_proxy_host,
+                ssh_port=lease.ssh_proxy_port,
+            ),
+        )
+        logger.warning(
+            "Selected Vast SSH proxy after direct endpoint failure instance_id=%d.",
+            lease.instance_id,
+        )
+
+    def _current_lease(self, instance_id: int) -> VastLeaseRecord:
+        """Return the latest persisted lease after endpoint selection."""
+        lease = next(
+            (
+                candidate
+                for candidate in self.registry.load().leases
+                if candidate.instance_id == instance_id
+            ),
+            None,
+        )
+        if lease is None:
+            raise KeyError(f"Vast lease {instance_id} disappeared during setup.")
+        return lease
+
+    def _initialize_runtime(self, lease: VastLeaseRecord) -> VastLeaseRecord:
         """Require the pinned worker and publish its initial idle fail-safe state."""
         logger.info(
             "Initializing Vast worker instance_id=%d environment=%s.",
@@ -785,11 +841,14 @@ class VastService:
         runtime = VastRuntimeManager(
             runner=self._runner(lease),
             configuration=self.runtime_configuration,
+            fallback_runner=self._proxy_runner(lease),
+            fallback_selected=partial(self._promote_proxy_endpoint, lease),
             instance_validator=partial(self._validate_live_instance, lease),
         )
         try:
             runtime.ensure_worker()
-            runtime.update_watchdog(lease)
+            active_lease = self._current_lease(lease.instance_id)
+            runtime.update_watchdog(active_lease)
         except (
             TimeoutError,
             VastInstanceNotFoundError,
@@ -808,6 +867,7 @@ class VastService:
             lease.instance_id,
             lease.environment_id,
         )
+        return active_lease
 
     def _validate_live_instance(self, lease: VastLeaseRecord) -> None:
         """Require the managed Vast contract to exist before an SSH probe."""

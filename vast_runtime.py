@@ -175,6 +175,8 @@ class VastRuntimeManager:
 
     runner: VastSshRunner
     configuration: VastRuntimeConfiguration
+    fallback_runner: VastSshRunner | None = None
+    fallback_selected: Callable[[], None] | None = None
     instance_validator: Callable[[], None] | None = None
     clock: Callable[[], float] = time.time
     monotonic: Callable[[], float] = time.monotonic
@@ -229,7 +231,32 @@ class VastRuntimeManager:
 
     def runtime_info(self) -> dict[str, Any]:
         """Return validated JSON from the direct worker image."""
-        result = self.runner.run(
+        try:
+            return self._runtime_info(self.runner)
+        except VastSshError as primary_error:
+            fallback_runner = self.fallback_runner
+            if fallback_runner is None:
+                raise
+            try:
+                payload = self._runtime_info(fallback_runner)
+            except VastSshError as fallback_error:
+                raise VastSshError(
+                    "Vast direct and proxy SSH endpoints are both unavailable. "
+                    f"Direct: {primary_error} Proxy: {fallback_error}"
+                ) from fallback_error
+            self.runner = fallback_runner
+            self.fallback_runner = None
+            if self.fallback_selected is not None:
+                self.fallback_selected()
+            logger.warning(
+                "Vast direct SSH failed; continuing through the Vast SSH proxy."
+            )
+            return payload
+
+    @staticmethod
+    def _runtime_info(runner: VastSshRunner) -> dict[str, Any]:
+        """Return validated runtime metadata through one exact SSH endpoint."""
+        result = runner.run(
             ("python", "-m", "remote.ssh_worker", "runtime-info"),
             check=True,
             transport_attempts=1,

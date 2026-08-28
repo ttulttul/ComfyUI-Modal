@@ -366,11 +366,22 @@ class VastInstance:
     gpu_ram_mb: int
     cpu_ram_mb: int
     hourly_cost_usd: float | None
+    ssh_direct_host: str | None
+    ssh_direct_port: int | None
+    ssh_proxy_host: str | None
+    ssh_proxy_port: int | None
 
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> "VastInstance":
         """Normalize one Vast instance response record."""
-        ssh_host, ssh_port = _instance_ssh_endpoint(payload)
+        (
+            ssh_host,
+            ssh_port,
+            ssh_direct_host,
+            ssh_direct_port,
+            ssh_proxy_host,
+            ssh_proxy_port,
+        ) = _instance_ssh_endpoints(payload)
         return cls(
             instance_id=_required_int(payload, "id"),
             actual_status=str(payload.get("actual_status") or "unknown").strip(),
@@ -387,6 +398,10 @@ class VastInstance:
             hourly_cost_usd=_optional_non_negative_float(
                 payload.get("dph_total"), "dph_total"
             ),
+            ssh_direct_host=ssh_direct_host,
+            ssh_direct_port=ssh_direct_port,
+            ssh_proxy_host=ssh_proxy_host,
+            ssh_proxy_port=ssh_proxy_port,
         )
 
     @property
@@ -505,11 +520,20 @@ def _matches_geolocation(
     )
 
 
-def _instance_ssh_endpoint(
+def _instance_ssh_endpoints(
     payload: Mapping[str, Any],
-) -> tuple[str | None, int | None]:
-    """Prefer Vast's console-equivalent direct TCP mapping over its SSH proxy."""
+) -> tuple[
+    str | None,
+    int | None,
+    str | None,
+    int | None,
+    str | None,
+    int | None,
+]:
+    """Return the preferred endpoint while retaining direct and proxy choices."""
     public_host = _optional_string(payload.get("public_ipaddr"))
+    direct_host: str | None = None
+    direct_port: int | None = None
     raw_ports = payload.get("ports")
     if public_host is not None and isinstance(raw_ports, Mapping):
         raw_ssh_mappings = raw_ports.get("22/tcp")
@@ -527,10 +551,23 @@ def _instance_ssh_endpoint(
             except (TypeError, ValueError):
                 continue
             if 1 <= host_port <= 65535:
-                return public_host, host_port
+                direct_host = public_host
+                direct_port = host_port
+                break
+    raw_proxy_host = _optional_string(payload.get("ssh_host"))
+    raw_proxy_port = _optional_int(payload.get("ssh_port"), "ssh_port")
+    proxy_complete = raw_proxy_host is not None and raw_proxy_port is not None
+    proxy_host = raw_proxy_host if proxy_complete else None
+    proxy_port = raw_proxy_port if proxy_complete else None
+    primary_host = direct_host or raw_proxy_host
+    primary_port = direct_port if direct_host is not None else raw_proxy_port
     return (
-        _optional_string(payload.get("ssh_host")),
-        _optional_int(payload.get("ssh_port"), "ssh_port"),
+        primary_host,
+        primary_port,
+        direct_host,
+        direct_port,
+        proxy_host,
+        proxy_port,
     )
 
 

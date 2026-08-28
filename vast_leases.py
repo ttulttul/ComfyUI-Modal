@@ -158,6 +158,10 @@ class VastLeaseRecord:
     draining: bool = False
     last_error: str | None = None
     worker_image: str | None = None
+    ssh_direct_host: str | None = None
+    ssh_direct_port: int | None = None
+    ssh_proxy_host: str | None = None
+    ssh_proxy_port: int | None = None
 
     def __post_init__(self) -> None:
         """Validate ownership, lifecycle, and scheduling fields."""
@@ -188,8 +192,21 @@ class VastLeaseRecord:
         expected_prefix = vast_managed_label_prefix(self.owner_id)
         if not self.label.startswith(f"{expected_prefix}:"):
             raise ValueError("Vast lease label does not match its owner identity.")
-        if self.ssh_port is not None and self.ssh_port <= 0:
-            raise ValueError("ssh_port must be positive when present.")
+        for field_name, port in (
+            ("ssh_port", self.ssh_port),
+            ("ssh_direct_port", self.ssh_direct_port),
+            ("ssh_proxy_port", self.ssh_proxy_port),
+        ):
+            if port is not None and port <= 0:
+                raise ValueError(f"{field_name} must be positive when present.")
+        for field_name, host, port in (
+            ("direct", self.ssh_direct_host, self.ssh_direct_port),
+            ("proxy", self.ssh_proxy_host, self.ssh_proxy_port),
+        ):
+            if (host is None) != (port is None):
+                raise ValueError(
+                    f"Vast SSH {field_name} host and port must be set together."
+                )
         if self.worker_image is not None and not self.worker_image.strip():
             raise ValueError("worker_image must be non-empty when present.")
 
@@ -245,6 +262,26 @@ class VastLeaseRecord:
             last_error=(str(payload["last_error"]) if payload.get("last_error") else None),
             worker_image=(
                 str(payload["worker_image"]) if payload.get("worker_image") else None
+            ),
+            ssh_direct_host=(
+                str(payload["ssh_direct_host"])
+                if payload.get("ssh_direct_host")
+                else None
+            ),
+            ssh_direct_port=(
+                int(payload["ssh_direct_port"])
+                if payload.get("ssh_direct_port")
+                else None
+            ),
+            ssh_proxy_host=(
+                str(payload["ssh_proxy_host"])
+                if payload.get("ssh_proxy_host")
+                else None
+            ),
+            ssh_proxy_port=(
+                int(payload["ssh_proxy_port"])
+                if payload.get("ssh_proxy_port")
+                else None
             ),
         )
 
@@ -983,11 +1020,26 @@ class VastLeaseManager:
         instance: VastInstance,
     ) -> VastLeaseRecord:
         """Apply current API status to one persisted record."""
+        proxy_selected = (
+            lease.ssh_proxy_host is not None
+            and lease.ssh_host == lease.ssh_proxy_host
+            and lease.ssh_port == lease.ssh_proxy_port
+        )
+        selected_host = (
+            instance.ssh_proxy_host if proxy_selected else instance.ssh_host
+        )
+        selected_port = (
+            instance.ssh_proxy_port if proxy_selected else instance.ssh_port
+        )
         return replace(
             lease,
             actual_status=instance.actual_status,
-            ssh_host=instance.ssh_host,
-            ssh_port=instance.ssh_port,
+            ssh_host=selected_host or instance.ssh_host,
+            ssh_port=selected_port or instance.ssh_port,
+            ssh_direct_host=instance.ssh_direct_host,
+            ssh_direct_port=instance.ssh_direct_port,
+            ssh_proxy_host=instance.ssh_proxy_host,
+            ssh_proxy_port=instance.ssh_proxy_port,
             gpu_name=instance.gpu_name or lease.gpu_name,
             gpu_count=instance.num_gpus or lease.gpu_count,
             gpu_ram_mb=instance.gpu_ram_mb or lease.gpu_ram_mb,

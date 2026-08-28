@@ -181,6 +181,10 @@ def test_instance_prefers_console_direct_ssh_mapping(
 
     assert instance.ssh_host == "172.125.76.174"
     assert instance.ssh_port == 40638
+    assert instance.ssh_direct_host == "172.125.76.174"
+    assert instance.ssh_direct_port == 40638
+    assert instance.ssh_proxy_host == "ssh9.vast.ai"
+    assert instance.ssh_proxy_port == 27244
 
 
 def test_instance_falls_back_to_proxy_for_malformed_direct_mapping(
@@ -203,6 +207,31 @@ def test_instance_falls_back_to_proxy_for_malformed_direct_mapping(
 
     assert instance.ssh_host == "ssh7.vast.ai"
     assert instance.ssh_port == 22017
+    assert instance.ssh_direct_host is None
+    assert instance.ssh_direct_port is None
+    assert instance.ssh_proxy_host == "ssh7.vast.ai"
+    assert instance.ssh_proxy_port == 22017
+
+
+def test_instance_does_not_retain_an_incomplete_proxy_pair(
+    vast_models_module: Any,
+) -> None:
+    """Transient proxy publication must not create invalid durable lease state."""
+    instance = vast_models_module.VastInstance.from_api(
+        {
+            "id": 43,
+            "actual_status": "loading",
+            "ssh_host": "ssh7.vast.ai",
+            "num_gpus": 1,
+            "gpu_ram": 24576,
+            "cpu_ram": 65536,
+        }
+    )
+
+    assert instance.ssh_host == "ssh7.vast.ai"
+    assert instance.ssh_port is None
+    assert instance.ssh_proxy_host is None
+    assert instance.ssh_proxy_port is None
 
 
 def test_offer_is_revalidated_after_server_filtering(vast_models_module: Any) -> None:

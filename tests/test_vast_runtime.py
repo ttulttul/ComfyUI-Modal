@@ -167,6 +167,48 @@ def test_runtime_manager_rejects_image_fingerprint_drift(
     assert raised.value.protocol_version == 0
 
 
+def test_runtime_manager_selects_proxy_when_direct_ssh_fails(
+    vast_runtime_module: Any,
+) -> None:
+    """A reachable Vast proxy should replace one refused direct port mapping."""
+
+    class RefusedRunner:
+        """Simulate a provider-advertised direct port that is closed."""
+
+        def run(self, argv: Any, **kwargs: Any) -> FakeResult:
+            """Reject every direct SSH attempt."""
+            del argv, kwargs
+            raise vast_runtime_module.VastSshError("Connection refused")
+
+    fingerprint = "a" * 64
+    proxy_runner = FakeRunner(
+        [
+            {
+                "protocol_version": 1,
+                "runtime_fingerprint": fingerprint,
+                "worker_socket_ready": True,
+            }
+        ]
+    )
+    selected: list[bool] = []
+    manager = vast_runtime_module.VastRuntimeManager(
+        runner=RefusedRunner(),
+        fallback_runner=proxy_runner,
+        fallback_selected=lambda: selected.append(True),
+        configuration=vast_runtime_module.VastRuntimeConfiguration(
+            image="worker",
+            runtime_fingerprint=fingerprint,
+        ),
+    )
+
+    info = manager.ensure_worker()
+
+    assert info["worker_socket_ready"] is True
+    assert manager.runner is proxy_runner
+    assert manager.fallback_runner is None
+    assert selected == [True]
+
+
 def test_runtime_manager_rejects_same_protocol_fingerprint_drift(
     vast_runtime_module: Any,
 ) -> None:

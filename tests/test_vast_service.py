@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
@@ -480,3 +481,48 @@ def test_acquire_rebuilds_image_and_replaces_fingerprint_drift(
     assert "Building replacement worker" in messages
     assert "Vast worker image updated; requesting fresh capacity" in messages
     assert messages[-1] == "Vast.ai worker is ready"
+
+
+def test_proxy_endpoint_promotion_persists_the_working_route(
+    vast_service_module: Any,
+) -> None:
+    """Successful proxy readiness must replace the dead direct primary endpoint."""
+
+    @dataclass(frozen=True)
+    class Lease:
+        """Represent the endpoint fields changed by proxy promotion."""
+
+        instance_id: int
+        ssh_host: str
+        ssh_port: int
+        ssh_proxy_host: str
+        ssh_proxy_port: int
+
+    class UpdatingRegistry:
+        """Apply one lease update in memory."""
+
+        def __init__(self, lease: Any) -> None:
+            """Retain the current lease."""
+            self.lease = lease
+
+        def update(self, instance_id: int, updater: Any) -> Any:
+            """Apply and retain the requested endpoint change."""
+            assert instance_id == self.lease.instance_id
+            self.lease = updater(self.lease)
+            return self.lease
+
+    lease = Lease(
+        instance_id=42,
+        ssh_host="192.0.2.4",
+        ssh_port=40112,
+        ssh_proxy_host="ssh7.vast.ai",
+        ssh_proxy_port=22017,
+    )
+    registry = UpdatingRegistry(lease)
+    service = object.__new__(vast_service_module.VastService)
+    service.registry = registry
+
+    service._promote_proxy_endpoint(lease)
+
+    assert registry.lease.ssh_host == "ssh7.vast.ai"
+    assert registry.lease.ssh_port == 22017
