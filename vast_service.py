@@ -78,7 +78,7 @@ VAST_API_KEY_ENV = "VAST_API_KEY"
 VAST_API_BASE_URL_ENV = "COMFY_MODAL_VAST_API_BASE_URL"
 VAST_SSH_IDENTITY_FILE_ENV = "COMFY_MODAL_VAST_SSH_IDENTITY_FILE"
 VAST_OFFER_PREFETCH_CONCURRENCY = 8
-VAST_DISAPPEARED_INSTANCE_REPLACEMENTS = 1
+VAST_INSTANCE_SETUP_REPLACEMENTS = 1
 
 
 def _vast_startup_status_message(instance: VastInstance) -> str:
@@ -428,28 +428,33 @@ class VastService:
         status_callback: Callable[[str], None] | None,
         instance_status_callback: Callable[[VastInstance], None] | None,
     ) -> VastLeaseRecord:
-        """Initialize capacity and replace one provider-disappeared contract."""
+        """Initialize capacity and replace one disappeared or unusable contract."""
         excluded_offer_ids: set[int] = set()
         for replacement_attempt in range(
-            VAST_DISAPPEARED_INSTANCE_REPLACEMENTS + 1
+            VAST_INSTANCE_SETUP_REPLACEMENTS + 1
         ):
             lease = await self.lease_manager.ensure_lease(
                 profile,
                 slot=slot,
                 status_callback=instance_status_callback,
+                event_callback=status_callback,
                 excluded_offer_ids=frozenset(excluded_offer_ids),
             )
             if status_callback is not None:
                 status_callback("Initializing Vast.ai worker")
             try:
                 await asyncio.to_thread(self._initialize_runtime, lease)
-            except VastInstanceNotFoundError:
+            except VastInstanceNotFoundError as exc:
                 self.registry.remove(lease.instance_id)
                 excluded_offer_ids.add(lease.offer_id)
-                if replacement_attempt >= VAST_DISAPPEARED_INSTANCE_REPLACEMENTS:
+                if replacement_attempt >= VAST_INSTANCE_SETUP_REPLACEMENTS:
                     if status_callback is not None:
                         status_callback("Vast.ai worker initialization failed")
-                    raise
+                    raise RuntimeError(
+                        "Vast.ai worker setup failed after the replacement "
+                        f"instance also disappeared. Last instance: "
+                        f"{lease.instance_id}."
+                    ) from exc
                 logger.warning(
                     "Vast instance disappeared before worker initialization "
                     "instance_id=%d offer=%d; cold-starting a replacement.",
@@ -462,10 +467,43 @@ class VastService:
                     )
                 continue
             except (TimeoutError, VastSshError, ValueError) as exc:
+                cleanup_completed = await self._discard_failed_runtime_lease(
+                    lease,
+                    str(exc),
+                )
+                excluded_offer_ids.add(lease.offer_id)
+                if replacement_attempt >= VAST_INSTANCE_SETUP_REPLACEMENTS:
+                    if status_callback is not None:
+                        status_callback("Vast.ai worker initialization failed")
+                    cleanup_summary = (
+                        "was destroyed"
+                        if cleanup_completed
+                        else "could not be confirmed destroyed"
+                    )
+                    raise RuntimeError(
+                        "Vast.ai worker setup failed after a replacement attempt. "
+                        f"Last instance {lease.instance_id} {cleanup_summary}. "
+                        f"Last error: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Vast instance failed worker initialization instance_id=%d "
+                    "offer=%d cleanup_completed=%s; cold-starting a replacement: %s",
+                    lease.instance_id,
+                    lease.offer_id,
+                    cleanup_completed,
+                    exc,
+                )
                 if status_callback is not None:
-                    status_callback("Vast.ai worker initialization failed")
-                await self._discard_failed_runtime_lease(lease, str(exc))
-                raise
+                    cleanup_status = (
+                        "terminated"
+                        if cleanup_completed
+                        else "marked unusable"
+                    )
+                    status_callback(
+                        f"Vast.ai instance {lease.instance_id} failed worker setup "
+                        f"and was {cleanup_status}; requesting a replacement"
+                    )
+                continue
             if status_callback is not None:
                 status_callback("Vast.ai worker is ready")
             return lease
@@ -475,7 +513,7 @@ class VastService:
         self,
         lease: VastLeaseRecord,
         error_message: str,
-    ) -> None:
+    ) -> bool:
         """Drain and destroy capacity that never produced a usable worker."""
         self.registry.update(
             lease.instance_id,
@@ -486,18 +524,26 @@ class VastService:
             ),
         )
         try:
-            await self.lease_manager.destroy_owned_lease(lease.instance_id)
+            destroyed = await self.lease_manager.destroy_owned_lease(lease.instance_id)
         except (RuntimeError, ValueError, VastApiError) as cleanup_error:
             logger.warning(
                 "Unable to destroy unusable Vast worker instance_id=%d: %s",
                 lease.instance_id,
                 cleanup_error,
             )
-            return
+            return False
+        if not destroyed:
+            logger.warning(
+                "Unusable Vast worker was not destroyed because ownership could not "
+                "be confirmed instance_id=%d.",
+                lease.instance_id,
+            )
+            return False
         logger.info(
             "Destroyed unusable Vast worker instance_id=%d after initialization failure.",
             lease.instance_id,
         )
+        return True
 
     def quote_best_profile_sync(self, *args: object, **kwargs: object) -> VastProfileQuote:
         """Synchronously quote a profile from ComfyUI's queue worker thread."""

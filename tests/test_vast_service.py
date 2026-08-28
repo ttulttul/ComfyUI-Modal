@@ -221,10 +221,10 @@ def test_prefetch_deduplicates_effective_profiles_and_searches_in_parallel(
     asyncio.run(scenario())
 
 
-def test_acquire_destroys_lease_when_worker_initialization_fails(
+def test_acquire_replaces_lease_when_worker_initialization_fails(
     vast_service_module: Any,
 ) -> None:
-    """An SSH-unusable rental must be drained instead of reused next run."""
+    """An SSH-unusable rental must be destroyed and replaced in the same run."""
 
     class FakeRegistry:
         """Record that the unusable lease was marked before destruction."""
@@ -239,53 +239,70 @@ def test_acquire_destroys_lease_when_worker_initialization_fails(
             self.updated_instance_ids.append(instance_id)
 
     class FakeLeaseManager:
-        """Return and destroy one deterministic unusable rental."""
+        """Return an unusable rental followed by a healthy replacement."""
 
-        def __init__(self, lease: Any) -> None:
-            """Retain the fake lease and destruction log."""
-            self.lease = lease
+        def __init__(self, leases: list[Any]) -> None:
+            """Retain the fake leases, exclusions, and destruction log."""
+            self.leases = leases
             self.destroyed_instance_ids: list[int] = []
+            self.excluded_offer_ids: list[frozenset[int]] = []
 
-        async def ensure_lease(self, profile: Any, **kwargs: Any) -> Any:
-            """Return the selected lease without provider calls."""
+        async def ensure_lease(
+            self,
+            profile: Any,
+            *,
+            excluded_offer_ids: frozenset[int],
+            **kwargs: Any,
+        ) -> Any:
+            """Return each selected lease while recording rejected offers."""
             del profile, kwargs
-            return self.lease
+            self.excluded_offer_ids.append(excluded_offer_ids)
+            return self.leases.pop(0)
 
         async def destroy_owned_lease(self, instance_id: int) -> bool:
             """Record cleanup of the unusable capacity."""
             self.destroyed_instance_ids.append(instance_id)
             return True
 
-    lease = SimpleNamespace(instance_id=42, environment_id="vast:test:42")
-    lease_manager = FakeLeaseManager(lease)
+    failed = SimpleNamespace(
+        instance_id=42,
+        offer_id=1001,
+        environment_id="vast:test:42",
+    )
+    replacement = SimpleNamespace(
+        instance_id=43,
+        offer_id=1002,
+        environment_id="vast:test:43",
+    )
+    lease_manager = FakeLeaseManager([failed, replacement])
     registry = FakeRegistry()
     service = object.__new__(vast_service_module.VastService)
     service.lease_manager = lease_manager
     service.registry = registry
 
-    def fail_runtime(_lease: Any) -> None:
-        """Simulate the observed provider SSH key-exchange failure."""
-        raise vast_service_module.VastSshError(
-            "kex_exchange_identification: Connection closed by remote host"
-        )
+    def initialize_runtime(lease: Any) -> None:
+        """Simulate the observed SSH failure only on the first rental."""
+        if lease.instance_id == failed.instance_id:
+            raise vast_service_module.VastSshError(
+                "kex_exchange_identification: Connection closed by remote host"
+            )
 
-    service._initialize_runtime = fail_runtime
+    service._initialize_runtime = initialize_runtime
     messages: list[str] = []
 
-    with pytest.raises(
-        vast_service_module.VastSshError,
-        match="Connection closed by remote host",
-    ):
-        asyncio.run(
-            service.acquire(
-                SimpleNamespace(profile=SimpleNamespace()),
-                status_callback=messages.append,
-            )
+    acquired = asyncio.run(
+        service.acquire(
+            SimpleNamespace(profile=SimpleNamespace()),
+            status_callback=messages.append,
         )
+    )
 
+    assert acquired is replacement
     assert registry.updated_instance_ids == [42]
     assert lease_manager.destroyed_instance_ids == [42]
-    assert messages[-1] == "Vast.ai worker initialization failed"
+    assert lease_manager.excluded_offer_ids == [frozenset(), frozenset({1001})]
+    assert any("failed worker setup" in message for message in messages)
+    assert messages[-1] == "Vast.ai worker is ready"
 
 
 def test_acquire_replaces_instance_that_disappears_before_ssh(

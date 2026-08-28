@@ -50,6 +50,84 @@ VAST_LEASE_REGISTRY_FILENAME = "vast-leases.json"
 VAST_MANAGED_LABEL_PREFIX = "comfy-modal-vast"
 _SAFE_LABEL_PART_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
 VastInstanceStatusCallback = Callable[[VastInstance], None]
+VastLeaseEventCallback = Callable[[str], None]
+VAST_STARTUP_INSTANCE_REPLACEMENTS = 1
+
+
+class VastLeaseStartupError(RuntimeError):
+    """Describe one rented instance that failed before becoming usable."""
+
+    def __init__(
+        self,
+        instance_id: int,
+        offer_id: int,
+        message: str,
+        *,
+        cleanup_completed: bool,
+    ) -> None:
+        """Retain failed capacity identity and whether cleanup was confirmed."""
+        cleanup_status = (
+            "was destroyed"
+            if cleanup_completed
+            else "could not be confirmed destroyed"
+        )
+        super().__init__(
+            f"Vast instance {instance_id} from offer {offer_id} failed setup and "
+            f"{cleanup_status}: {message}"
+        )
+        self.instance_id = instance_id
+        self.offer_id = offer_id
+        self.cleanup_completed = cleanup_completed
+        self.failure_message = message
+
+
+class VastLeaseStartupExhaustedError(RuntimeError):
+    """Report that the initial Vast rental and its replacement both failed."""
+
+
+def _startup_replacement_status(failure: VastLeaseStartupError) -> str:
+    """Return a clear user-facing transition after one failed rental."""
+    cleanup = (
+        "terminated"
+        if failure.cleanup_completed
+        else "marked unusable, but automatic termination was not confirmed"
+    )
+    return (
+        f"Vast.ai instance {failure.instance_id} failed setup and was {cleanup}; "
+        "requesting a replacement"
+    )
+
+
+def _startup_terminal_status(failure: VastLeaseStartupError) -> str:
+    """Return a clear status when the bounded replacement also fails."""
+    cleanup = (
+        "was terminated"
+        if failure.cleanup_completed
+        else "could not be confirmed terminated"
+    )
+    return (
+        f"Replacement Vast.ai instance {failure.instance_id} also failed setup and "
+        f"{cleanup}; no further automatic attempts remain"
+    )
+
+
+def _aggregate_startup_failure(
+    profile: VastResourceProfile,
+    failures: list[VastLeaseStartupError],
+) -> VastLeaseStartupExhaustedError:
+    """Summarize bounded initial plus replacement startup failures."""
+    last_failure = failures[-1]
+    instance_ids = ", ".join(str(failure.instance_id) for failure in failures)
+    cleanup_summary = (
+        "All failed instances were terminated."
+        if all(failure.cleanup_completed for failure in failures)
+        else "At least one failed instance could not be confirmed terminated."
+    )
+    return VastLeaseStartupExhaustedError(
+        f"Vast profile {profile.profile_name!r} could not obtain SSH-ready "
+        f"capacity after {len(failures)} attempts (instances {instance_ids}). "
+        f"{cleanup_summary} Last failure: {last_failure.failure_message}"
+    )
 
 
 @dataclass(frozen=True)
@@ -360,6 +438,7 @@ class VastLeaseManager:
         *,
         slot: int = 0,
         status_callback: VastInstanceStatusCallback | None = None,
+        event_callback: VastLeaseEventCallback | None = None,
         excluded_offer_ids: frozenset[int] = frozenset(),
     ) -> VastLeaseRecord:
         """Reuse or rent one compatible SSH-ready lease for a profile slot."""
@@ -370,10 +449,13 @@ class VastLeaseManager:
             )
         slot_profile_id = _slot_profile_id(profile.profile_id, slot)
         async with self._profile_lock(slot_profile_id):
+            unavailable_offer_ids = set(excluded_offer_ids)
             existing = await self._reusable_lease(
                 profile,
                 slot_profile_id,
                 status_callback=status_callback,
+                event_callback=event_callback,
+                unavailable_offer_ids=unavailable_offer_ids,
             )
             if existing is not None:
                 return existing
@@ -381,7 +463,8 @@ class VastLeaseManager:
                 profile,
                 slot_profile_id,
                 status_callback=status_callback,
-                excluded_offer_ids=excluded_offer_ids,
+                event_callback=event_callback,
+                excluded_offer_ids=frozenset(unavailable_offer_ids),
             )
 
     async def _reusable_lease(
@@ -390,6 +473,8 @@ class VastLeaseManager:
         slot_profile_id: str,
         *,
         status_callback: VastInstanceStatusCallback | None,
+        event_callback: VastLeaseEventCallback | None,
+        unavailable_offer_ids: set[int],
     ) -> VastLeaseRecord | None:
         """Return one matching live lease after refreshing its API state."""
         fingerprint = vast_profile_fingerprint(profile)
@@ -416,14 +501,17 @@ class VastLeaseManager:
                 instance = await self.api_client.show_instance(lease.instance_id)
             except VastInstanceNotFoundError:
                 self.registry.remove(lease.instance_id)
+                unavailable_offer_ids.add(lease.offer_id)
                 continue
-            if instance.actual_status == "stopped":
-                await self.api_client.set_instance_state(lease.instance_id, "running")
-                instance = await self.api_client.wait_until_ready(
-                    lease.instance_id,
-                    timeout_seconds=self.startup_timeout_seconds,
-                    status_callback=status_callback,
-                )
+            instance = await self._prepare_reusable_instance(
+                lease,
+                instance,
+                status_callback=status_callback,
+                event_callback=event_callback,
+            )
+            if instance is None:
+                unavailable_offer_ids.add(lease.offer_id)
+                continue
             refreshed = self._refresh_record(lease, instance)
             if refreshed.runtime_fingerprint != self.runtime_fingerprint:
                 logger.info(
@@ -450,12 +538,80 @@ class VastLeaseManager:
                 return refreshed
         return None
 
+    async def _prepare_reusable_instance(
+        self,
+        lease: VastLeaseRecord,
+        instance: VastInstance,
+        *,
+        status_callback: VastInstanceStatusCallback | None,
+        event_callback: VastLeaseEventCallback | None,
+    ) -> VastInstance | None:
+        """Ready an existing contract or destroy it when startup cannot recover."""
+        if instance.ready_for_ssh:
+            return instance
+        try:
+            timeout_seconds = self.startup_timeout_seconds
+            if instance.actual_status == "stopped":
+                await self.api_client.set_instance_state(lease.instance_id, "running")
+            else:
+                elapsed_seconds = max(0.0, self.clock() - lease.created_at_epoch)
+                timeout_seconds = self.startup_timeout_seconds - elapsed_seconds
+                if timeout_seconds <= 0:
+                    raise TimeoutError(
+                        f"Vast instance {lease.instance_id} exceeded its "
+                        f"{self.startup_timeout_seconds:.0f}s SSH-readiness window."
+                    )
+            return await self.api_client.wait_until_ready(
+                lease.instance_id,
+                timeout_seconds=timeout_seconds,
+                status_callback=status_callback,
+            )
+        except VastInstanceNotFoundError:
+            self.registry.remove(lease.instance_id)
+            return None
+        except (TimeoutError, VastApiError) as exc:
+            cleanup_completed = await self._discard_startup_lease(lease, str(exc))
+            failure = VastLeaseStartupError(
+                lease.instance_id,
+                lease.offer_id,
+                str(exc),
+                cleanup_completed=cleanup_completed,
+            )
+            logger.warning("%s", failure)
+            if event_callback is not None:
+                event_callback(_startup_replacement_status(failure))
+            return None
+
+    async def _discard_startup_lease(
+        self,
+        lease: VastLeaseRecord,
+        error_message: str,
+    ) -> bool:
+        """Mark and destroy one owned contract that never became SSH-ready."""
+        failed = replace(lease, draining=True, last_error=error_message)
+        self.registry.upsert(failed)
+        try:
+            await self.api_client.destroy_instance(lease.instance_id)
+        except VastInstanceNotFoundError:
+            self.registry.remove(lease.instance_id)
+            return True
+        except VastApiError as cleanup_error:
+            logger.warning(
+                "Unable to destroy failed Vast lease instance=%d: %s",
+                lease.instance_id,
+                cleanup_error,
+            )
+            return False
+        self.registry.remove(lease.instance_id)
+        return True
+
     async def _rent_lease(
         self,
         profile: VastResourceProfile,
         slot_profile_id: str,
         *,
         status_callback: VastInstanceStatusCallback | None,
+        event_callback: VastLeaseEventCallback | None,
         excluded_offer_ids: frozenset[int],
     ) -> VastLeaseRecord:
         """Search, rent, and persist the first still-available compatible offer."""
@@ -465,6 +621,7 @@ class VastLeaseManager:
                 f"No Vast.ai offer satisfies profile {profile.profile_name!r}."
             )
         unavailable_offer_ids = set(excluded_offer_ids)
+        startup_failures: list[VastLeaseStartupError] = []
         for search_attempt in range(2):
             for offer in offers:
                 if offer.offer_id in unavailable_offer_ids:
@@ -491,11 +648,34 @@ class VastLeaseManager:
                         profile.profile_name,
                         offer.offer_id,
                     )
+                except VastLeaseStartupError as exc:
+                    startup_failures.append(exc)
+                    unavailable_offer_ids.add(offer.offer_id)
+                    logger.warning(
+                        "Vast instance failed during provider startup profile=%s "
+                        "instance=%d offer=%d cleanup_completed=%s; trying a "
+                        "replacement.",
+                        profile.profile_name,
+                        exc.instance_id,
+                        exc.offer_id,
+                        exc.cleanup_completed,
+                    )
+                    if len(startup_failures) > VAST_STARTUP_INSTANCE_REPLACEMENTS:
+                        if event_callback is not None:
+                            event_callback(_startup_terminal_status(exc))
+                        raise _aggregate_startup_failure(
+                            profile,
+                            startup_failures,
+                        ) from exc
+                    if event_callback is not None:
+                        event_callback(_startup_replacement_status(exc))
             if search_attempt == 0:
                 offers = await self.api_client.search_offers(
                     profile,
                     force_refresh=True,
                 )
+        if startup_failures:
+            raise _aggregate_startup_failure(profile, startup_failures)
         raise VastOfferUnavailableError(
             f"Compatible Vast.ai offers disappeared before profile "
             f"{profile.profile_name!r} could be rented."
@@ -553,19 +733,16 @@ class VastLeaseManager:
             self.registry.remove(created.instance_id)
             raise
         except (TimeoutError, VastApiError) as exc:
-            failed = replace(provisional, last_error=str(exc))
-            self.registry.upsert(failed)
-            try:
-                await self.api_client.destroy_instance(created.instance_id)
-            except (VastApiError, VastInstanceNotFoundError) as cleanup_error:
-                logger.warning(
-                    "Unable to destroy failed Vast lease instance=%d: %s",
-                    created.instance_id,
-                    cleanup_error,
-                )
-            else:
-                self.registry.remove(created.instance_id)
-            raise
+            cleanup_completed = await self._discard_startup_lease(
+                provisional,
+                str(exc),
+            )
+            raise VastLeaseStartupError(
+                created.instance_id,
+                offer.offer_id,
+                str(exc),
+                cleanup_completed=cleanup_completed,
+            ) from exc
         ready = self._refresh_record(provisional, instance)
         self.registry.upsert(ready)
         logger.info(
@@ -688,7 +865,14 @@ class VastLeaseManager:
             raise RuntimeError(
                 f"Vast instance {instance_id} label no longer matches its managed lease."
             )
-        await self.api_client.destroy_instance(instance_id)
+        try:
+            await self.api_client.destroy_instance(instance_id)
+        except VastInstanceNotFoundError:
+            logger.info(
+                "Vast lease disappeared between ownership verification and "
+                "destruction instance=%d.",
+                instance_id,
+            )
         self.registry.remove(instance_id)
         return True
 
@@ -836,6 +1020,8 @@ __all__ = [
     "VastLeaseRecord",
     "VastLeaseRegistry",
     "VastLeaseRegistryState",
+    "VastLeaseStartupError",
+    "VastLeaseStartupExhaustedError",
     "vast_managed_label",
     "vast_managed_label_prefix",
     "vast_profile_fingerprint",

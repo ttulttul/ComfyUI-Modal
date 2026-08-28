@@ -251,6 +251,134 @@ def test_manager_replaces_contract_that_disappears_during_provider_startup(
     asyncio.run(scenario())
 
 
+def test_manager_replaces_instance_that_times_out_during_provider_startup(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """A loading instance that misses its deadline should be destroyed and replaced."""
+
+    class TimingOutClient(vast_api_module.VastApiClient):
+        """Timeout the first rental and allow its replacement to become ready."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Initialize the deterministic readiness attempt counter."""
+            super().__init__(*args, **kwargs)
+            self.readiness_calls = 0
+
+        async def wait_until_ready(
+            self,
+            instance_id: int,
+            **kwargs: Any,
+        ) -> Any:
+            """Fail only the initial instance's provider-readiness wait."""
+            self.readiness_calls += 1
+            if self.readiness_calls == 1:
+                raise TimeoutError(
+                    f"Vast instance {instance_id} remained in 'loading'."
+                )
+            return await super().wait_until_ready(instance_id, **kwargs)
+
+    async def scenario() -> None:
+        """Verify API destruction, offer exclusion, and replacement telemetry."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            registry = vast_leases_module.VastLeaseRegistry.for_user_directory(tmp_path)
+            manager = vast_leases_module.VastLeaseManager(
+                api_client=TimingOutClient(state.api_key, base_url=base_url),
+                registry=registry,
+                owner_id="comfy-owner",
+                runtime_fingerprint=_runtime_fingerprint(),
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+            events: list[str] = []
+
+            lease = await manager.ensure_lease(
+                _profile(vast_models_module),
+                event_callback=events.append,
+            )
+
+            assert lease.offer_id == 1002
+            assert len(state.destroyed_instance_ids) == 1
+            assert state.destroyed_instance_ids[0] != lease.instance_id
+            assert [record.instance_id for record in registry.load().leases] == [
+                lease.instance_id
+            ]
+            create_requests = [
+                request
+                for request in state.request_log
+                if request["path"].startswith("/api/v0/asks/")
+            ]
+            assert [request["path"] for request in create_requests] == [
+                "/api/v0/asks/1001/",
+                "/api/v0/asks/1002/",
+            ]
+            assert "failed setup and was terminated" in events[0]
+            assert "requesting a replacement" in events[0]
+
+    asyncio.run(scenario())
+
+
+def test_manager_bounds_replacements_when_every_instance_times_out(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """A bad marketplace pool must not create an unbounded rental loop."""
+
+    class AlwaysTimingOutClient(vast_api_module.VastApiClient):
+        """Keep every newly created instance in a synthetic failed setup state."""
+
+        async def wait_until_ready(
+            self,
+            instance_id: int,
+            **kwargs: Any,
+        ) -> Any:
+            """Fail immediately while preserving the instance for API destruction."""
+            del kwargs
+            raise TimeoutError(f"Vast instance {instance_id} remained in 'loading'.")
+
+    async def scenario() -> None:
+        """Verify exactly an initial attempt plus one replacement."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            manager = vast_leases_module.VastLeaseManager(
+                api_client=AlwaysTimingOutClient(state.api_key, base_url=base_url),
+                registry=vast_leases_module.VastLeaseRegistry.for_user_directory(
+                    tmp_path
+                ),
+                owner_id="comfy-owner",
+                runtime_fingerprint=_runtime_fingerprint(),
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+            events: list[str] = []
+
+            with pytest.raises(
+                vast_leases_module.VastLeaseStartupExhaustedError,
+                match="after 2 attempts",
+            ):
+                await manager.ensure_lease(
+                    _profile(vast_models_module),
+                    event_callback=events.append,
+                )
+
+            assert len(state.destroyed_instance_ids) == 2
+            assert "requesting a replacement" in events[0]
+            assert "no further automatic attempts remain" in events[-1]
+
+    asyncio.run(scenario())
+
+
 def test_manager_adopts_legacy_lease_for_unchanged_worker_image(
     tmp_path: Any,
     vast_api_module: Any,
@@ -422,6 +550,58 @@ def test_manual_destroy_requires_owned_matching_label(
                 await manager.destroy_owned_lease(lease.instance_id)
 
             assert lease.instance_id in state.instances
+
+    asyncio.run(scenario())
+
+
+def test_destroy_removes_registry_when_instance_vanishes_after_ownership_check(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """A destroy-time not-found response confirms cleanup of the owned lease."""
+
+    class VanishingOnDestroyClient(vast_api_module.VastApiClient):
+        """Delete the contract immediately before its destroy API response."""
+
+        def __init__(self, *args: Any, state: Any, **kwargs: Any) -> None:
+            """Retain simulator state for the synthetic provider race."""
+            super().__init__(*args, **kwargs)
+            self.state = state
+
+        async def destroy_instance(self, instance_id: int) -> None:
+            """Simulate Vast removing the contract between show and destroy."""
+            self.state.instances.pop(instance_id, None)
+            raise vast_api_module.VastInstanceNotFoundError(
+                f"Vast instance {instance_id} does not exist."
+            )
+
+    async def scenario() -> None:
+        """Verify the provider race does not retain stale local inventory."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            registry = vast_leases_module.VastLeaseRegistry.for_user_directory(tmp_path)
+            manager = vast_leases_module.VastLeaseManager(
+                api_client=VanishingOnDestroyClient(
+                    state.api_key,
+                    base_url=base_url,
+                    state=state,
+                ),
+                registry=registry,
+                owner_id="comfy-owner",
+                runtime_fingerprint=_runtime_fingerprint(),
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+            lease = await manager.ensure_lease(_profile(vast_models_module))
+
+            assert await manager.destroy_owned_lease(lease.instance_id)
+            assert registry.load().leases == ()
+            assert lease.instance_id not in state.instances
 
     asyncio.run(scenario())
 
