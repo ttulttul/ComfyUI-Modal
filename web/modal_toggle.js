@@ -2066,6 +2066,7 @@ function ensurePromptState(promptId) {
       configuratorNodeId: null,
       remoteExecutionPlanAssignments: {},
       remoteExecutionConfigurations: [],
+      remoteExecutionPlanInvalidated: false,
       remoteEnvironmentStatuses: new Map(),
       descendantNodeIdsByAncestor: new Map(),
       laneNodeIdsByLane: new Map(),
@@ -3931,6 +3932,24 @@ async function requestRemoteCapacityJson(route, options = {}) {
   return payload;
 }
 
+/** Clear a Configurator plan that can no longer describe available capacity. */
+function invalidateRemoteConfiguratorExecutionPlan(panel) {
+  if (!panel) {
+    return;
+  }
+  const promptState = modalPromptStates.get(String(panel.promptId ?? ""));
+  if (promptState) {
+    promptState.remoteExecutionPlanInvalidated = true;
+    promptState.remoteExecutionPlanAssignments = {};
+    promptState.remoteEnvironmentStatuses.clear();
+  }
+  renderRemoteConfiguratorPlan(
+    panel,
+    {},
+    promptState?.remoteExecutionConfigurations ?? panel.configurations,
+  );
+}
+
 /** Kill one exact managed resource after explicit destructive confirmation. */
 async function killRemoteManagedCapacity(panel, entry, button) {
   const providerName = entry.provider === "vast" ? "Vast.ai lease" : "Modal container";
@@ -3961,6 +3980,9 @@ async function killRemoteManagedCapacity(panel, entry, button) {
         ),
       },
     );
+    if (isVast) {
+      invalidateRemoteConfiguratorExecutionPlan(panel);
+    }
     panel.capacityRefreshStatus.dataset.state = "success";
     panel.capacityRefreshStatus.textContent = `${entry.resourceId} stopped`;
     await refreshRemoteManagedCapacity(panel, { preserveStatus: true });
@@ -4303,7 +4325,7 @@ function registerPromptConfigurator(promptId, configuratorNodeId) {
  */
 function registerRemoteConfiguratorPlan(promptId, assignments, configurations) {
   const promptState = ensurePromptState(promptId);
-  if (!promptState) {
+  if (!promptState || promptState.remoteExecutionPlanInvalidated) {
     return;
   }
   promptState.remoteExecutionPlanAssignments = { ...(assignments ?? {}) };
@@ -4374,7 +4396,7 @@ function promoteProvisionalVastEnvironment(
 function updateRemoteConfiguratorEnvironmentStatus(promptId, detail) {
   const environmentId = String(detail?.execution_environment_id ?? "").trim();
   const promptState = modalPromptStates.get(promptId);
-  if (!environmentId || !promptState) {
+  if (!environmentId || !promptState || promptState.remoteExecutionPlanInvalidated) {
     return;
   }
   const panel = remoteConfiguratorPanel(promptState.configuratorNodeId);

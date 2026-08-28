@@ -152,6 +152,7 @@ const transformedSource = `${[
   "  refreshRemoteConfiguratorStorage,",
   "  remoteManagedCapacityEntries,",
   "  refreshRemoteManagedCapacity,",
+  "  killRemoteManagedCapacity,",
   "  remoteStorageSizeLabel,",
   "  remoteStorageUsageLabel,",
   "  resolveComponentNodeIds,",
@@ -1968,6 +1969,59 @@ assert.equal(
   retainedPanel.environmentRows.get("modal:lambda").statusText.textContent,
   "Hugging Face could not be reached",
 );
+
+const staleAssignmentsAfterVastKill = {
+  ...failedPromptState.remoteExecutionPlanAssignments,
+};
+const capacityKillRequests = [];
+globalThis.confirm = () => true;
+globalThis.__modalApiStub.fetchApi = async (route, options = {}) => {
+  capacityKillRequests.push({ route, options });
+  const payload = route === "/remote/vast/status"
+    ? { leases: [] }
+    : route.startsWith("/modal/container_status")
+      ? { containers: [] }
+      : {};
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    async json() {
+      return payload;
+    },
+  };
+};
+const vastKillButton = { disabled: false, textContent: "KILL" };
+await modalToggle.killRemoteManagedCapacity(
+  retainedPanel,
+  { provider: "vast", resourceId: "49052528" },
+  vastKillButton,
+);
+assert.equal(capacityKillRequests[0].route, "/remote/vast/destroy");
+assert.deepEqual(JSON.parse(capacityKillRequests[0].options.body), {
+  instance_id: 49052528,
+  force: true,
+});
+assert.deepEqual(retainedPanel.assignments, {});
+assert.equal(retainedPanel.targets.children.length, 0);
+assert.equal(retainedPanel.targets.hidden, true);
+assert.equal(retainedPanel.emptyText.hidden, false);
+assert.equal(retainedPanel.environmentRows.size, 0);
+assert.equal(failedPromptState.remoteExecutionPlanInvalidated, true);
+assert.deepEqual(failedPromptState.remoteExecutionPlanAssignments, {});
+assert.equal(failedPromptState.remoteEnvironmentStatuses.size, 0);
+assert.equal(retainedPanel.storage.hidden, false);
+modalToggle.registerRemoteConfiguratorPlan(
+  "plan-before-capacity",
+  staleAssignmentsAfterVastKill,
+  failedPromptState.remoteExecutionConfigurations,
+);
+modalToggle.updateRemoteConfiguratorEnvironmentStatus("plan-before-capacity", {
+  execution_environment_id: "vast:vast-big:49052528",
+  status_message: "Delayed stale update",
+});
+assert.deepEqual(retainedPanel.assignments, {});
+assert.equal(retainedPanel.environmentRows.size, 0);
 
 modalToggle.registerPromptConfigurator("newer-prompt", "381");
 modalToggle.modalPromptStates.get("plan-before-capacity").startedAt = 1;
