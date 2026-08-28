@@ -8452,6 +8452,7 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
     request_environment_names: list[str] = []
     request_thread_ids: list[int] = []
     request_event_loops: list[Any] = []
+    stopped_container_ids: list[str] = []
     caller_thread_id = threading.get_ident()
     sdk_event_loop = asyncio.new_event_loop()
 
@@ -8488,6 +8489,13 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
                     ),
                 ]
             )
+
+        async def ContainerStop(self, request: Any) -> Any:
+            """Capture one exact Modal task termination request."""
+            stopped_container_ids.append(request.task_id)
+            request_thread_ids.append(threading.get_ident())
+            request_event_loops.append(asyncio.get_running_loop())
+            return types.SimpleNamespace()
 
     class FakeClient:
         """Expose the synchronized Modal TaskList stub."""
@@ -8529,7 +8537,8 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
             return types.SimpleNamespace(Error=RuntimeError)
         if name == "modal_proto.api_pb2":
             return types.SimpleNamespace(
-                TaskListRequest=lambda **kwargs: types.SimpleNamespace(**kwargs)
+                TaskListRequest=lambda **kwargs: types.SimpleNamespace(**kwargs),
+                ContainerStopRequest=lambda **kwargs: types.SimpleNamespace(**kwargs),
             )
         return original_import_module(name)
 
@@ -8540,6 +8549,9 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
         remote_modal_app_module.list_active_modal_containers(settings)
     )
     containers = asyncio.run(remote_modal_app_module.list_active_modal_containers(settings))
+    stopped = asyncio.run(
+        remote_modal_app_module.stop_managed_modal_container("ta-running", settings)
+    )
 
     assert first_containers == containers
     assert [container.container_id for container in containers] == ["ta-running", "ta-starting"]
@@ -8547,11 +8559,82 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
     assert all(container.modal_gpu == "B300" for container in containers)
     assert containers[0].as_dict()["started_at"] == 101.0
     assert containers[0].as_dict()["estimated_gpu_cost_per_second"] == 0.001972
-    assert request_environment_names == ["test-env", "test-env"]
+    assert stopped
+    assert stopped_container_ids == ["ta-running"]
+    assert request_environment_names == ["test-env", "test-env", "test-env"]
     assert request_thread_ids
     assert all(thread_id != caller_thread_id for thread_id in request_thread_ids)
-    assert request_event_loops == [sdk_event_loop, sdk_event_loop]
+    assert request_event_loops == [sdk_event_loop] * 4
     sdk_event_loop.close()
+
+
+def test_stop_managed_modal_container_verifies_ownership_before_exact_stop(
+    remote_modal_app_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Container termination must target only a currently listed managed task."""
+    stopped_container_ids: list[str] = []
+
+    async def fake_list_active(_settings: Any) -> list[Any]:
+        """Return one container already filtered to this ComfyUI installation."""
+        return [
+            remote_modal_app_module.ModalContainerStatus(
+                container_id="ta-managed",
+                app_id="ap-managed",
+                app_name="comfy-modal-sync-B300",
+                modal_gpu="B300",
+                estimated_gpu_cost_per_second=0.001972,
+                state="running",
+                enqueued_at=100.0,
+                started_at=101.0,
+            )
+        ]
+
+    def fake_stop(
+        _client_module: Any,
+        _api_pb2: Any,
+        container_id: str,
+    ) -> None:
+        """Record the exact task passed to the synchronized SDK bridge."""
+        stopped_container_ids.append(container_id)
+
+    original_import_module = remote_modal_app_module.importlib.import_module
+
+    def fake_import_module(name: str) -> Any:
+        """Supply the minimal modules needed after ownership verification."""
+        if name == "modal.client":
+            return types.SimpleNamespace()
+        if name == "modal.exception":
+            return types.SimpleNamespace(Error=RuntimeError)
+        if name == "modal_proto.api_pb2":
+            return types.SimpleNamespace()
+        return original_import_module(name)
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "list_active_modal_containers",
+        fake_list_active,
+    )
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "_stop_modal_task_synchronously",
+        fake_stop,
+    )
+    monkeypatch.setattr(remote_modal_app_module.importlib, "import_module", fake_import_module)
+
+    assert asyncio.run(
+        remote_modal_app_module.stop_managed_modal_container(
+            "ta-managed",
+            remote_modal_app_module.get_settings(),
+        )
+    )
+    assert not asyncio.run(
+        remote_modal_app_module.stop_managed_modal_container(
+            "ta-unrelated",
+            remote_modal_app_module.get_settings(),
+        )
+    )
+    assert stopped_container_ids == ["ta-managed"]
 
 
 def test_modal_gpu_estimated_rates_cover_supported_aliases(

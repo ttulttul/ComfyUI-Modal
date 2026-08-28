@@ -517,6 +517,45 @@ def test_reconcile_after_restart_clears_stale_activity_count(
     asyncio.run(scenario())
 
 
+def test_inventory_refresh_preserves_live_activity_count(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """A UI inventory refresh must not make an active lease appear idle."""
+
+    async def scenario() -> None:
+        """Refresh provider state without applying restart reconciliation semantics."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            manager = vast_leases_module.VastLeaseManager(
+                api_client=vast_api_module.VastApiClient(
+                    state.api_key,
+                    base_url=base_url,
+                ),
+                registry=vast_leases_module.VastLeaseRegistry.for_user_directory(
+                    tmp_path
+                ),
+                owner_id="comfy-owner",
+                runtime_fingerprint=_runtime_fingerprint(),
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+            lease = await manager.ensure_lease(_profile(vast_models_module))
+            manager.begin_activity(lease.instance_id)
+
+            refreshed = await manager.refresh_owned_leases()
+
+            assert refreshed[0].active_invocations == 1
+            assert manager.registry.load().leases[0].active_invocations == 1
+
+    asyncio.run(scenario())
+
+
 def test_manual_destroy_requires_owned_matching_label(
     tmp_path: Any,
     vast_api_module: Any,
@@ -600,6 +639,48 @@ def test_destroy_removes_registry_when_instance_vanishes_after_ownership_check(
             lease = await manager.ensure_lease(_profile(vast_models_module))
 
             assert await manager.destroy_owned_lease(lease.instance_id)
+            assert registry.load().leases == ()
+            assert lease.instance_id not in state.instances
+
+    asyncio.run(scenario())
+
+
+def test_explicit_force_destroy_can_terminate_active_owned_lease(
+    tmp_path: Any,
+    vast_api_module: Any,
+    vast_leases_module: Any,
+    vast_models_module: Any,
+    vast_simulator_module: Any,
+) -> None:
+    """The destructive UI path may kill active work after exact ownership checks."""
+
+    async def scenario() -> None:
+        """Acquire, mark busy, and explicitly force-destroy one owned lease."""
+        state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
+        async with _running_simulator(
+            vast_simulator_module.create_vast_simulator_app(state)
+        ) as base_url:
+            registry = vast_leases_module.VastLeaseRegistry.for_user_directory(tmp_path)
+            manager = vast_leases_module.VastLeaseManager(
+                api_client=vast_api_module.VastApiClient(
+                    state.api_key,
+                    base_url=base_url,
+                ),
+                registry=registry,
+                owner_id="comfy-owner",
+                runtime_fingerprint=_runtime_fingerprint(),
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+            lease = await manager.ensure_lease(_profile(vast_models_module))
+            manager.begin_activity(lease.instance_id)
+
+            with pytest.raises(RuntimeError, match="active work"):
+                await manager.destroy_owned_lease(lease.instance_id)
+            assert await manager.destroy_owned_lease(
+                lease.instance_id,
+                allow_active_work=True,
+            )
             assert registry.load().leases == ()
             assert lease.instance_id not in state.instances
 

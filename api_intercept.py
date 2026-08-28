@@ -91,7 +91,7 @@ from .ssh_runtime import SshRuntimeManager
 from .vast_config_node import extract_vast_profiles
 from .vast_service import VastProfileQuote, VastSearchRequirements, VastService
 from .vast_api import VastApiClient
-from .vast_leases import VastLeaseRegistry
+from .vast_leases import VastLeaseManager, VastLeaseRegistry
 
 logger = logging.getLogger(__name__)
 SetupStatusCallback = Callable[[str, int | None, int | None], None]
@@ -9064,6 +9064,9 @@ def setup_modal_queue_route(
     container_status_route_path = _container_status_route_path(
         resolved_settings.route_path
     )
+    container_stop_route_path = container_status_route_path.replace(
+        "/container_status", "/container_stop"
+    )
     delete_caches_route_path = _delete_modal_caches_route_path(
         resolved_settings.route_path
     )
@@ -9183,17 +9186,27 @@ def setup_modal_queue_route(
             containers_task = asyncio.create_task(
                 list_active_modal_containers(resolved_settings)
             )
-            billing_task = asyncio.create_task(
-                get_hourly_modal_app_billing(
-                    selected_settings.modal_gpu,
-                    resolved_settings,
+            include_billing = request.query.get("include_billing", "true").casefold() not in {
+                "0",
+                "false",
+                "no",
+            }
+            billing_task = (
+                asyncio.create_task(
+                    get_hourly_modal_app_billing(
+                        selected_settings.modal_gpu,
+                        resolved_settings,
+                    )
                 )
+                if include_billing
+                else None
             )
             try:
                 containers = await containers_task
             except ModalContainerStatusError as exc:
-                billing_task.cancel()
-                await asyncio.gather(billing_task, return_exceptions=True)
+                if billing_task is not None:
+                    billing_task.cancel()
+                    await asyncio.gather(billing_task, return_exceptions=True)
                 logger.warning("Unable to refresh Modal container status: %s", exc)
                 return web.json_response(
                     {"containers": [], "error": str(exc), "polled_at": time.time()},
@@ -9201,11 +9214,12 @@ def setup_modal_queue_route(
                 )
             billing = None
             billing_error = None
-            try:
-                billing = await billing_task
-            except ModalBillingStatusError as exc:
-                billing_error = str(exc)
-                logger.warning("Unable to refresh Modal hourly billing: %s", exc)
+            if billing_task is not None:
+                try:
+                    billing = await billing_task
+                except ModalBillingStatusError as exc:
+                    billing_error = str(exc)
+                    logger.warning("Unable to refresh Modal hourly billing: %s", exc)
             return web.json_response(
                 {
                     "containers": [container.as_dict() for container in containers],
@@ -9215,9 +9229,30 @@ def setup_modal_queue_route(
                 }
             )
 
+        @prompt_server.routes.post(container_stop_route_path)
+        async def modal_container_stop(request: web.Request) -> web.Response:
+            """Stop one exact active Modal container owned by this installation."""
+            from .remote.modal_app import (
+                ModalContainerStatusError,
+                stop_managed_modal_container,
+            )
+
+            try:
+                payload = await request.json()
+                container_id = str(payload.get("container_id") or "").strip()
+                stopped = await stop_managed_modal_container(
+                    container_id,
+                    resolved_settings,
+                )
+            except (ModalContainerStatusError, TypeError, ValueError) as exc:
+                return web.json_response({"error": str(exc)}, status=502)
+            return web.json_response(
+                {"container_id": container_id, "stopped": stopped}
+            )
+
         @prompt_server.routes.get("/remote/vast/status")
         async def vast_status(request: web.Request) -> web.Response:
-            """Return credential-free managed lease state and controller readiness."""
+            """Return refreshed credential-free managed Vast lease inventory."""
             del request
             if vast_registry is None:
                 return web.json_response(
@@ -9225,17 +9260,34 @@ def setup_modal_queue_route(
                     status=503,
                 )
             try:
-                state = await asyncio.to_thread(vast_registry.load)
-            except ValueError as exc:
+                if not os.getenv("VAST_API_KEY"):
+                    state = await asyncio.to_thread(vast_registry.load)
+                    leases = state.leases
+                else:
+                    api_key = str(os.getenv("VAST_API_KEY") or "").strip()
+                    base_url = str(
+                        os.getenv("COMFY_MODAL_VAST_API_BASE_URL") or ""
+                    ).strip()
+                    api_client = VastApiClient(
+                        api_key,
+                        **({"base_url": base_url} if base_url else {}),
+                    )
+                    manager = VastLeaseManager.for_inventory(
+                        api_client=api_client,
+                        registry=vast_registry,
+                        owner_id=resolved_settings.app_name,
+                    )
+                    leases = await manager.refresh_owned_leases()
+            except (OSError, RuntimeError, ValueError) as exc:
                 return web.json_response(
                     {"configured": bool(os.getenv("VAST_API_KEY")), "leases": [], "error": str(exc)},
-                    status=500,
+                    status=502,
                 )
             return web.json_response(
                 {
                     "configured": bool(os.getenv("VAST_API_KEY")),
                     "image_configured": bool(os.getenv("COMFY_MODAL_VAST_IMAGE")),
-                    "leases": [lease.to_dict() for lease in state.leases],
+                    "leases": [lease.to_dict() for lease in leases],
                 }
             )
 
@@ -9342,11 +9394,27 @@ def setup_modal_queue_route(
         try:
             payload = await request.json()
             instance_id = int(payload.get("instance_id"))
-            service = VastService.from_environment(
-                resolved_settings,
-                repo_root=Path(__file__).resolve().parent,
+            api_key = str(os.getenv("VAST_API_KEY") or "").strip()
+            if not api_key:
+                raise RuntimeError("Set VAST_API_KEY before destroying Vast capacity.")
+            if vast_registry is None:
+                raise RuntimeError("ComfyUI user directory is unavailable.")
+            base_url = str(
+                os.getenv("COMFY_MODAL_VAST_API_BASE_URL") or ""
+            ).strip()
+            api_client = VastApiClient(
+                api_key,
+                **({"base_url": base_url} if base_url else {}),
             )
-            destroyed = await service.lease_manager.destroy_owned_lease(instance_id)
+            manager = VastLeaseManager.for_inventory(
+                api_client=api_client,
+                registry=vast_registry,
+                owner_id=resolved_settings.app_name,
+            )
+            destroyed = await manager.destroy_owned_lease(
+                instance_id,
+                allow_active_work=payload.get("force") is True,
+            )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=502)
         return web.json_response({"instance_id": instance_id, "destroyed": destroyed})

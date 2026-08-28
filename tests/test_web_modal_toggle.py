@@ -392,6 +392,23 @@ def test_global_modal_status_badge_polls_and_renders_active_containers() -> None
     assert "?modal_gpu=${encodeURIComponent(requestedModalGpu)}" in source
 
 
+def test_configurator_lists_and_kills_exact_managed_capacity() -> None:
+    """The Configurator should expose guarded exact-instance lifecycle controls."""
+    source = _modal_toggle_source()
+
+    assert 'const VAST_STATUS_ROUTE = "/remote/vast/status";' in source
+    assert 'const VAST_DESTROY_ROUTE = "/remote/vast/destroy";' in source
+    assert '"/container_stop"' in source
+    assert "function remoteManagedCapacityEntries(" in source
+    assert "function refreshRemoteManagedCapacity(" in source
+    assert "function killRemoteManagedCapacity(" in source
+    assert "Any workflow using it will fail. This cannot be undone." in source
+    assert "?include_billing=false" in source
+    assert 'class="remote-configurator-capacity-title">Managed capacity</div>' in source
+    assert 'button.textContent = "KILL";' in source
+    assert "{ instance_id: Number(entry.resourceId), force: true }" in source
+
+
 def test_global_modal_status_badge_estimates_prompt_gpu_cost() -> None:
     """The global pill should integrate active GPU-container seconds per prompt."""
     source = _modal_toggle_source()

@@ -582,6 +582,28 @@ def _list_modal_tasks_synchronously(
     return blocking_callable(client_module, api_pb2, environment_name)
 
 
+async def _stop_modal_task_on_sdk_loop(
+    client_module: Any,
+    api_pb2: Any,
+    container_id: str,
+) -> Any:
+    """Stop one exact Modal task while running on Modal's managed event loop."""
+    client = await client_module._Client.from_env()
+    return await client.stub.ContainerStop(
+        api_pb2.ContainerStopRequest(task_id=container_id)
+    )
+
+
+def _stop_modal_task_synchronously(
+    client_module: Any,
+    api_pb2: Any,
+    container_id: str,
+) -> Any:
+    """Run one Modal task-stop request through the synchronized SDK bridge."""
+    blocking_callable = _synchronized_modal_callable(_stop_modal_task_on_sdk_loop)
+    return blocking_callable(client_module, api_pb2, container_id)
+
+
 def _prune_modal_hourly_billing_cache() -> None:
     """Bound retained hourly billing records across apps and GPU selections."""
     retained_keys = set(_MODAL_HOURLY_BILLING_CACHE) | set(
@@ -864,6 +886,47 @@ async def list_active_modal_containers(
         "Listed %d active Modal container(s) for the status UI.", len(containers)
     )
     return containers
+
+
+async def stop_managed_modal_container(
+    container_id: str,
+    settings: ModalSyncSettings | None = None,
+) -> bool:
+    """Stop one active container after verifying it belongs to this installation."""
+    normalized_container_id = container_id.strip()
+    if not normalized_container_id:
+        raise ValueError("Modal container_id must not be empty.")
+
+    active_containers = await list_active_modal_containers(settings)
+    if not any(
+        container.container_id == normalized_container_id
+        for container in active_containers
+    ):
+        return False
+
+    try:
+        client_module = importlib.import_module("modal.client")
+        exception_module = importlib.import_module("modal.exception")
+        api_pb2 = importlib.import_module("modal_proto.api_pb2")
+    except ModuleNotFoundError as exc:
+        raise ModalContainerStatusError(
+            "The installed Modal SDK does not expose the container stop API."
+        ) from exc
+
+    modal_error_type = getattr(exception_module, "Error", RuntimeError)
+    try:
+        await asyncio.to_thread(
+            _stop_modal_task_synchronously,
+            client_module,
+            api_pb2,
+            normalized_container_id,
+        )
+    except (modal_error_type, OSError, AttributeError, RuntimeError) as exc:
+        raise ModalContainerStatusError(
+            f"Unable to stop Modal container {normalized_container_id}: {exc}"
+        ) from exc
+    logger.warning("Stopped managed Modal container %s.", normalized_container_id)
+    return True
 
 
 async def _stream_remote_container_logs_via_modal_sdk_async(

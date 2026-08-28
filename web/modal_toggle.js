@@ -9,6 +9,7 @@ const MODAL_ROUTE = "/modal/queue_prompt";
 const MODAL_ANALYZE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/analyze_remote_nodes");
 const MODAL_PROGRESS_STATE_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/progress_state");
 const MODAL_CONTAINER_STATUS_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/container_status");
+const MODAL_CONTAINER_STOP_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/container_stop");
 const MODAL_DELETE_CACHES_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_caches");
 const MODAL_DELETE_VOLUME_ROUTE = MODAL_ROUTE.replace(/\/queue_prompt$/, "/delete_volume");
 const MODAL_CANCEL_PREPARATION_ROUTE = MODAL_ROUTE.replace(
@@ -16,6 +17,8 @@ const MODAL_CANCEL_PREPARATION_ROUTE = MODAL_ROUTE.replace(
   "/cancel_preparation",
 );
 const R2_STORAGE_USAGE_ROUTE = "/remote/storage/r2/usage";
+const VAST_STATUS_ROUTE = "/remote/vast/status";
+const VAST_DESTROY_ROUTE = "/remote/vast/destroy";
 const COMFY_QUEUE_ROUTE = "/queue";
 const COMFY_HISTORY_ROUTE = "/history";
 const INTERNAL_NODE_PREFIX = "ModalUniversalExecutor";
@@ -3875,6 +3878,186 @@ function renderRemoteConfiguratorStorage(panel, configurations) {
     : 24 + entries.reduce((height, entry) => height + 34 + entry.details.length * 17, 0);
 }
 
+/** Return safe, provider-neutral rows for managed Vast leases and Modal containers. */
+function remoteManagedCapacityEntries(vastPayload, modalPayload) {
+  const vastEntries = (Array.isArray(vastPayload?.leases) ? vastPayload.leases : []).map(
+    (lease) => ({
+      provider: "vast",
+      resourceId: String(lease?.instance_id ?? ""),
+      title: String(lease?.profile_name ?? "Vast.ai lease"),
+      subtitle: `Instance ${lease?.instance_id ?? "unknown"}`,
+      state: String(lease?.actual_status ?? "unknown"),
+      active: Math.max(0, Number(lease?.active_invocations ?? 0)),
+      details: [
+        `${Math.max(1, Number(lease?.gpu_count ?? 1))} × ${String(lease?.gpu_name ?? "GPU")}`,
+        Number(lease?.gpu_ram_mb) > 0
+          ? `${remoteStorageSizeLabel(Number(lease.gpu_ram_mb) * 1024 ** 2)} VRAM`
+          : null,
+        Number(lease?.cpu_ram_mb) > 0
+          ? `${remoteStorageSizeLabel(Number(lease.cpu_ram_mb) * 1024 ** 2)} RAM`
+          : null,
+        Number.isFinite(Number(lease?.hourly_cost_usd))
+          ? `$${Number(lease.hourly_cost_usd).toFixed(3)}/hr`
+          : null,
+      ].filter(Boolean),
+    }),
+  );
+  const modalEntries = normalizedModalContainerStatuses(modalPayload).map((container) => ({
+    provider: "modal",
+    resourceId: container.containerId,
+    title: container.appName || "Modal container",
+    subtitle: `Container ${container.containerId}`,
+    state: container.state,
+    active: container.state === "running" ? 1 : 0,
+    details: [
+      container.modalGpu || "GPU unavailable",
+      container.estimatedGpuCostPerSecond > 0
+        ? `$${(container.estimatedGpuCostPerSecond * 3600).toFixed(3)}/hr`
+        : null,
+    ].filter(Boolean),
+  }));
+  return [...vastEntries, ...modalEntries].filter((entry) => entry.resourceId);
+}
+
+/** Request JSON and convert an unsuccessful API response into a useful error. */
+async function requestRemoteCapacityJson(route, options = {}) {
+  const response = await api.fetchApi(route, options);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || `${response.status} ${response.statusText}`);
+  }
+  return payload;
+}
+
+/** Kill one exact managed resource after explicit destructive confirmation. */
+async function killRemoteManagedCapacity(panel, entry, button) {
+  const providerName = entry.provider === "vast" ? "Vast.ai lease" : "Modal container";
+  const confirmed = globalThis.confirm?.(
+    `KILL ${providerName} ${entry.resourceId}?\n\nAny workflow using it will fail. This cannot be undone.`,
+  );
+  if (!confirmed || panel.capacityKillInFlight) {
+    return;
+  }
+  panel.capacityKillInFlight = `${entry.provider}:${entry.resourceId}`;
+  button.disabled = true;
+  button.textContent = "KILLING…";
+  panel.capacityRefreshStatus.hidden = false;
+  panel.capacityRefreshStatus.dataset.state = "loading";
+  panel.capacityRefreshStatus.textContent = `Stopping ${entry.resourceId}`;
+  panel.capacityRefreshStatus.title = "";
+  try {
+    const isVast = entry.provider === "vast";
+    await requestRemoteCapacityJson(
+      isVast ? VAST_DESTROY_ROUTE : MODAL_CONTAINER_STOP_ROUTE,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          isVast
+            ? { instance_id: Number(entry.resourceId), force: true }
+            : { container_id: entry.resourceId },
+        ),
+      },
+    );
+    panel.capacityRefreshStatus.dataset.state = "success";
+    panel.capacityRefreshStatus.textContent = `${entry.resourceId} stopped`;
+    await refreshRemoteManagedCapacity(panel, { preserveStatus: true });
+  } catch (error) {
+    panel.capacityRefreshStatus.dataset.state = "error";
+    panel.capacityRefreshStatus.textContent = "Kill failed";
+    panel.capacityRefreshStatus.title = String(error?.message ?? error);
+    button.disabled = false;
+    button.textContent = "KILL";
+  } finally {
+    panel.capacityKillInFlight = null;
+  }
+}
+
+/** Render every currently managed cloud resource with an exact kill control. */
+function renderRemoteManagedCapacity(panel, entries) {
+  panel.capacityList.replaceChildren();
+  for (const entry of entries) {
+    const card = document.createElement("div");
+    card.className = "remote-configurator-capacity-card";
+    const icon = document.createElement("img");
+    icon.className = "remote-configurator-capacity-icon";
+    icon.alt = entry.provider === "vast" ? "Vast.ai" : "Modal";
+    icon.src = REMOTE_LOCATION_ICON_SOURCES[entry.provider];
+    const identity = document.createElement("div");
+    identity.className = "remote-configurator-capacity-identity";
+    const name = document.createElement("span");
+    name.className = "remote-configurator-capacity-name";
+    name.textContent = entry.title;
+    const subtitle = document.createElement("span");
+    subtitle.className = "remote-configurator-capacity-subtitle";
+    subtitle.textContent = entry.subtitle;
+    identity.append(name, subtitle);
+    const summary = document.createElement("span");
+    summary.className = "remote-configurator-capacity-summary";
+    const activity = entry.active > 0 ? ` · ${entry.active} active` : " · idle";
+    summary.textContent = `${entry.state}${activity} · ${entry.details.join(" · ")}`;
+    const button = document.createElement("button");
+    button.className = "remote-configurator-capacity-kill";
+    button.type = "button";
+    button.textContent = "KILL";
+    button.title = `Permanently stop ${entry.subtitle}`;
+    button.addEventListener("click", () => {
+      void killRemoteManagedCapacity(panel, entry, button);
+    });
+    card.append(icon, identity, summary, button);
+    panel.capacityList.appendChild(card);
+  }
+  panel.capacityEmpty.hidden = entries.length > 0;
+  panel.capacityHeight = 29 + Math.max(20, entries.length * 49);
+}
+
+/** Reload all managed Vast leases and Modal containers shown by one panel. */
+async function refreshRemoteManagedCapacity(panel, { preserveStatus = false } = {}) {
+  if (
+    !panel ||
+    panel.capacityRefreshInFlight ||
+    typeof api.fetchApi !== "function"
+  ) {
+    return;
+  }
+  panel.capacityRefreshInFlight = true;
+  panel.capacityReload.disabled = true;
+  panel.capacityReload.textContent = "Reloading…";
+  if (!preserveStatus) {
+    panel.capacityRefreshStatus.hidden = false;
+    panel.capacityRefreshStatus.dataset.state = "loading";
+    panel.capacityRefreshStatus.textContent = "Refreshing capacity";
+    panel.capacityRefreshStatus.title = "";
+  }
+  const results = await Promise.allSettled([
+    requestRemoteCapacityJson(VAST_STATUS_ROUTE),
+    requestRemoteCapacityJson(`${MODAL_CONTAINER_STATUS_ROUTE}?include_billing=false`),
+  ]);
+  const errors = results
+    .filter((result) => result.status === "rejected")
+    .map((result) => String(result.reason?.message ?? result.reason));
+  const entries = remoteManagedCapacityEntries(
+    results[0].status === "fulfilled" ? results[0].value : {},
+    results[1].status === "fulfilled" ? results[1].value : {},
+  );
+  renderRemoteManagedCapacity(panel, entries);
+  if (errors.length > 0) {
+    panel.capacityRefreshStatus.hidden = false;
+    panel.capacityRefreshStatus.dataset.state = "error";
+    panel.capacityRefreshStatus.textContent = entries.length > 0 ? "Partially refreshed" : "Refresh failed";
+    panel.capacityRefreshStatus.title = errors.join("\n");
+  } else if (!preserveStatus) {
+    panel.capacityRefreshStatus.hidden = false;
+    panel.capacityRefreshStatus.dataset.state = "success";
+    panel.capacityRefreshStatus.textContent = "Updated";
+    panel.capacityRefreshStatus.title = "";
+  }
+  panel.capacityRefreshInFlight = false;
+  panel.capacityReload.disabled = false;
+  panel.capacityReload.textContent = "Reload";
+  renderRemoteConfiguratorPlan(panel, panel.assignments, panel.configurations);
+}
+
 /** Return compact GPU-memory and RAM capacity labels for one target. */
 function remoteConfiguratorHardwareLabels(hardware) {
   const gpuCount = Math.max(0, Number(hardware?.gpu_count ?? 0));
@@ -4060,7 +4243,8 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
     118 +
     Math.max(31, planHeight) +
     panel.environmentRows.size * 52 +
-    panel.storageHeight;
+    panel.storageHeight +
+    panel.capacityHeight;
   const currentWidth = Number(panel.node.size?.[0]) || 0;
   const currentHeight = Number(panel.node.size?.[1]) || 0;
   panel.node.setSize?.([
@@ -4314,6 +4498,17 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     <div class="remote-configurator-plan-title">Execution plan</div>
     <div class="remote-configurator-empty">The selected environments will appear here after planning.</div>
     <div class="remote-configurator-targets" hidden></div>
+    <div class="remote-configurator-capacity">
+      <div class="remote-configurator-capacity-header">
+        <div class="remote-configurator-capacity-title">Managed capacity</div>
+        <div class="remote-configurator-capacity-refresh">
+          <span class="remote-configurator-capacity-refresh-status" hidden></span>
+          <button class="remote-configurator-capacity-reload" type="button">Reload</button>
+        </div>
+      </div>
+      <div class="remote-configurator-capacity-empty">No managed Vast.ai leases or Modal containers.</div>
+      <div class="remote-configurator-capacity-list"></div>
+    </div>
     <div class="remote-configurator-storage" hidden>
       <div class="remote-configurator-storage-header">
         <div class="remote-configurator-storage-title">Storage backends</div>
@@ -4328,9 +4523,12 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     node,
     root,
     promptId: null,
-    minHeight: 149,
+    minHeight: 198,
     storageHeight: 0,
+    capacityHeight: 49,
     storageRefreshInFlight: false,
+    capacityRefreshInFlight: false,
+    capacityKillInFlight: null,
     assignments: {},
     configurations: [],
     statusText: root.querySelector(".remote-configurator-status-text"),
@@ -4341,6 +4539,13 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     environmentRows: new Map(),
     emptyText: root.querySelector(".remote-configurator-empty"),
     targets: root.querySelector(".remote-configurator-targets"),
+    capacity: root.querySelector(".remote-configurator-capacity"),
+    capacityList: root.querySelector(".remote-configurator-capacity-list"),
+    capacityEmpty: root.querySelector(".remote-configurator-capacity-empty"),
+    capacityReload: root.querySelector(".remote-configurator-capacity-reload"),
+    capacityRefreshStatus: root.querySelector(
+      ".remote-configurator-capacity-refresh-status",
+    ),
     storage: root.querySelector(".remote-configurator-storage"),
     storageList: root.querySelector(".remote-configurator-storage-list"),
     storageReload: root.querySelector(".remote-configurator-storage-reload"),
@@ -4350,6 +4555,9 @@ function mountRemoteExecutionConfiguratorPanel(node) {
   };
   panel.storageReload.addEventListener("click", () => {
     void refreshRemoteConfiguratorStorage(panel);
+  });
+  panel.capacityReload.addEventListener("click", () => {
+    void refreshRemoteManagedCapacity(panel);
   });
   let widget;
   try {
@@ -4378,6 +4586,7 @@ function mountRemoteExecutionConfiguratorPanel(node) {
   remoteConfiguratorPanels.set(safeNodeId, panel);
   node.__remoteConfiguratorPanelMounted = true;
   restoreRemoteConfiguratorPanel(panel);
+  void refreshRemoteManagedCapacity(panel);
   const originalOnRemoved = node.onRemoved;
   node.onRemoved = function onRemoved() {
     remoteConfiguratorPanels.delete(nodeId(this));
@@ -7278,6 +7487,7 @@ function installGlobalStatusStyles() {
       white-space: nowrap;
     }
 
+    .remote-configurator-capacity,
     .remote-configurator-storage {
       display: flex;
       min-width: 0;
@@ -7286,10 +7496,7 @@ function installGlobalStatusStyles() {
       padding-top: 2px;
     }
 
-    .remote-configurator-storage[hidden] {
-      display: none;
-    }
-
+    .remote-configurator-capacity-title,
     .remote-configurator-storage-title {
       color: #94a3b8;
       font-size: 9px;
@@ -7298,6 +7505,8 @@ function installGlobalStatusStyles() {
       text-transform: uppercase;
     }
 
+    .remote-configurator-capacity-header,
+    .remote-configurator-capacity-refresh,
     .remote-configurator-storage-header,
     .remote-configurator-storage-refresh {
       display: flex;
@@ -7306,10 +7515,12 @@ function installGlobalStatusStyles() {
       gap: 7px;
     }
 
+    .remote-configurator-capacity-header,
     .remote-configurator-storage-header {
       justify-content: space-between;
     }
 
+    .remote-configurator-capacity-refresh-status,
     .remote-configurator-storage-refresh-status {
       overflow: hidden;
       color: #64748b;
@@ -7318,14 +7529,17 @@ function installGlobalStatusStyles() {
       white-space: nowrap;
     }
 
+    .remote-configurator-capacity-refresh-status[data-state="error"],
     .remote-configurator-storage-refresh-status[data-state="error"] {
       color: #f87171;
     }
 
+    .remote-configurator-capacity-refresh-status[data-state="success"],
     .remote-configurator-storage-refresh-status[data-state="success"] {
       color: #4ade80;
     }
 
+    .remote-configurator-capacity-reload,
     .remote-configurator-storage-reload {
       padding: 2px 7px;
       border: 1px solid rgba(56, 189, 248, 0.28);
@@ -7336,14 +7550,98 @@ function installGlobalStatusStyles() {
       font: 600 9px/1.35 ui-sans-serif, system-ui, sans-serif;
     }
 
+    .remote-configurator-capacity-reload:hover:not(:disabled),
     .remote-configurator-storage-reload:hover:not(:disabled) {
       border-color: rgba(56, 189, 248, 0.55);
       background: rgba(14, 116, 144, 0.24);
     }
 
+    .remote-configurator-capacity-reload:disabled,
     .remote-configurator-storage-reload:disabled {
       cursor: wait;
       opacity: 0.65;
+    }
+
+    .remote-configurator-capacity-empty {
+      color: #64748b;
+      font-size: 9px;
+    }
+
+    .remote-configurator-capacity-list {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .remote-configurator-capacity-card {
+      display: grid;
+      min-width: 0;
+      grid-template-columns: 20px minmax(100px, 0.8fr) minmax(140px, 1.2fr) max-content;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 7px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: 7px;
+      background: rgba(15, 23, 42, 0.54);
+    }
+
+    .remote-configurator-capacity-icon {
+      width: 18px;
+      height: 18px;
+      object-fit: contain;
+    }
+
+    .remote-configurator-capacity-identity {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 1px;
+    }
+
+    .remote-configurator-capacity-name,
+    .remote-configurator-capacity-subtitle,
+    .remote-configurator-capacity-summary {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-capacity-name {
+      color: #e2e8f0;
+      font-size: 10px;
+      font-weight: 650;
+    }
+
+    .remote-configurator-capacity-subtitle,
+    .remote-configurator-capacity-summary {
+      color: #94a3b8;
+      font: 8.5px/1.3 ui-monospace, SFMono-Regular, monospace;
+    }
+
+    .remote-configurator-capacity-kill {
+      padding: 3px 7px;
+      border: 1px solid rgba(248, 113, 113, 0.55);
+      border-radius: 5px;
+      background: rgba(127, 29, 29, 0.26);
+      color: #fca5a5;
+      cursor: pointer;
+      font: 750 9px/1.3 ui-monospace, SFMono-Regular, monospace;
+    }
+
+    .remote-configurator-capacity-kill:hover:not(:disabled) {
+      border-color: #ef4444;
+      background: rgba(185, 28, 28, 0.42);
+      color: #fee2e2;
+    }
+
+    .remote-configurator-capacity-kill:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    .remote-configurator-storage[hidden] {
+      display: none;
     }
 
     .remote-configurator-storage-list {

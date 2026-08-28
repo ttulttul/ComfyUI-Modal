@@ -432,6 +432,32 @@ class VastLeaseManager:
         self._profile_locks_guard = threading.Lock()
         self._profile_locks: dict[str, asyncio.Lock] = {}
 
+    @classmethod
+    def for_inventory(
+        cls,
+        *,
+        api_client: VastApiClient,
+        registry: VastLeaseRegistry,
+        owner_id: str,
+    ) -> "VastLeaseManager":
+        """Build a lifecycle-only manager without requiring a worker image."""
+
+        def unavailable_launch_spec(
+            profile: VastResourceProfile,
+            label: str,
+        ) -> VastInstanceLaunchSpec:
+            """Reject acquisition through an inventory-only manager."""
+            del profile, label
+            raise RuntimeError("Inventory-only Vast manager cannot acquire capacity.")
+
+        return cls(
+            api_client=api_client,
+            registry=registry,
+            owner_id=owner_id,
+            runtime_fingerprint="0" * 64,
+            launch_spec_factory=unavailable_launch_spec,
+        )
+
     async def ensure_lease(
         self,
         profile: VastResourceProfile,
@@ -839,7 +865,12 @@ class VastLeaseManager:
             )
         return tuple(destroyed)
 
-    async def destroy_owned_lease(self, instance_id: int) -> bool:
+    async def destroy_owned_lease(
+        self,
+        instance_id: int,
+        *,
+        allow_active_work: bool = False,
+    ) -> bool:
         """Destroy one exact registry-owned lease after checking its API label."""
         lease = next(
             (
@@ -852,7 +883,7 @@ class VastLeaseManager:
         )
         if lease is None:
             return False
-        if lease.active_invocations:
+        if lease.active_invocations and not allow_active_work:
             raise RuntimeError(
                 f"Vast lease {instance_id} has active work and cannot be destroyed."
             )
@@ -876,8 +907,12 @@ class VastLeaseManager:
         self.registry.remove(instance_id)
         return True
 
-    async def reconcile(self) -> tuple[VastLeaseRecord, ...]:
-        """Refresh owned registry records and remove instances no longer visible."""
+    async def refresh_owned_leases(
+        self,
+        *,
+        clear_stale_activity: bool = False,
+    ) -> tuple[VastLeaseRecord, ...]:
+        """Refresh managed inventory without normally changing live activity counts."""
         visible_instances = {
             instance.instance_id: instance
             for instance in await self.api_client.list_instances()
@@ -892,21 +927,27 @@ class VastLeaseManager:
                 self.registry.remove(lease.instance_id)
                 continue
             if instance.label != lease.label:
-                self.registry.upsert(
-                    replace(
-                        lease,
-                        draining=True,
-                        last_error="Vast instance label no longer matches managed state.",
-                    )
+                mismatched = replace(
+                    lease,
+                    draining=True,
+                    last_error="Vast instance label no longer matches managed state.",
                 )
+                self.registry.upsert(mismatched)
+                reconciled.append(mismatched)
                 continue
-            recovered = replace(
+            refreshed = replace(
                 self._refresh_record(lease, instance),
-                active_invocations=0,
+                active_invocations=(
+                    0 if clear_stale_activity else lease.active_invocations
+                ),
             )
-            self.registry.upsert(recovered)
-            reconciled.append(recovered)
+            self.registry.upsert(refreshed)
+            reconciled.append(refreshed)
         return tuple(reconciled)
+
+    async def reconcile(self) -> tuple[VastLeaseRecord, ...]:
+        """Refresh leases after restart and clear activity owned by the dead process."""
+        return await self.refresh_owned_leases(clear_stale_activity=True)
 
     def incremental_retention_cost_usd(
         self,

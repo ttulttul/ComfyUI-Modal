@@ -69,6 +69,11 @@ class FakeElement {
       ".remote-configurator-environments",
       ".remote-configurator-empty",
       ".remote-configurator-targets",
+      ".remote-configurator-capacity",
+      ".remote-configurator-capacity-list",
+      ".remote-configurator-capacity-empty",
+      ".remote-configurator-capacity-reload",
+      ".remote-configurator-capacity-refresh-status",
       ".remote-configurator-storage",
       ".remote-configurator-storage-list",
       ".remote-configurator-storage-reload",
@@ -145,6 +150,8 @@ const transformedSource = `${[
   "  mountRemoteExecutionConfiguratorPanel,",
   "  remoteConfiguratorStorageEntries,",
   "  refreshRemoteConfiguratorStorage,",
+  "  remoteManagedCapacityEntries,",
+  "  refreshRemoteManagedCapacity,",
   "  remoteStorageSizeLabel,",
   "  remoteStorageUsageLabel,",
   "  resolveComponentNodeIds,",
@@ -216,6 +223,37 @@ assert.equal(
   }),
   "1.00 KiB · 1 object",
 );
+
+const managedCapacityEntries = modalToggle.remoteManagedCapacityEntries(
+  {
+    leases: [{
+      instance_id: 49047119,
+      profile_name: "vast-small",
+      actual_status: "running",
+      active_invocations: 0,
+      gpu_name: "RTX PRO 6000 WS",
+      gpu_count: 1,
+      gpu_ram_mb: 97894,
+      cpu_ram_mb: 148275,
+      hourly_cost_usd: 0.056,
+    }],
+  },
+  {
+    containers: [{
+      container_id: "ta-managed",
+      app_name: "comfy-modal-sync-B300",
+      modal_gpu: "B300",
+      state: "running",
+      estimated_gpu_cost_per_second: 0.001972,
+    }],
+  },
+);
+assert.equal(managedCapacityEntries.length, 2);
+assert.equal(managedCapacityEntries[0].provider, "vast");
+assert.equal(managedCapacityEntries[0].resourceId, "49047119");
+assert.equal(managedCapacityEntries[0].details.at(-1), "$0.056/hr");
+assert.equal(managedCapacityEntries[1].provider, "modal");
+assert.equal(managedCapacityEntries[1].resourceId, "ta-managed");
 
 assert.equal(
   modalToggle.queueErrorMessage({

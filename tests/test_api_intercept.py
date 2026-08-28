@@ -398,6 +398,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
     assert ("GET", "/remote/vast/status") in routes.handlers
     assert ("POST", "/remote/vast/reap") in routes.handlers
     assert ("POST", "/remote/vast/destroy") in routes.handlers
+    assert ("POST", "/modal/container_stop") in routes.handlers
     assert ("POST", "/remote/storage/r2/oauth/start") in routes.handlers
     assert ("GET", "/remote/storage/r2/oauth/callback") in routes.handlers
     assert ("POST", "/remote/storage/r2/credentials") in routes.handlers
