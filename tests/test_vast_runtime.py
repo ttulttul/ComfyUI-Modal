@@ -65,6 +65,33 @@ def test_launch_spec_starts_worker_and_watchdog_without_exporting_api_key(
     assert "COMFY_MODAL_RUNTIME_FINGERPRINT" not in payload["onstart"]
 
 
+def test_launch_spec_repairs_vast_injected_ssh_key_permissions(
+    vast_models_module: Any,
+    vast_runtime_module: Any,
+) -> None:
+    """Vast's injected root key must satisfy sshd StrictModes checks."""
+    configuration = vast_runtime_module.VastRuntimeConfiguration(
+        image="ghcr.io/example/worker@sha256:abc",
+        runtime_fingerprint="a" * 64,
+    )
+    profile = vast_models_module.VastResourceProfile(
+        profile_id="17",
+        profile_name="default",
+    )
+
+    onstart = configuration.launch_spec(profile, "managed-label").onstart
+
+    assert "chown root:root /root" in onstart
+    assert "chmod go-w /root" in onstart
+    assert "chown root:root /root/.ssh" in onstart
+    assert "chmod 700 /root/.ssh" in onstart
+    assert "chown root:root /root/.ssh/authorized_keys" in onstart
+    assert "chmod 600 /root/.ssh/authorized_keys" in onstart
+    assert onstart.index("chmod 600 /root/.ssh/authorized_keys") < onstart.index(
+        "remote.vast_supervisor start"
+    )
+
+
 def test_configuration_requires_explicit_published_image(
     vast_runtime_module: Any,
 ) -> None:

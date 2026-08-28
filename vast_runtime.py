@@ -36,6 +36,21 @@ DEFAULT_VAST_WATCHDOG_STATE_PATH = PurePosixPath(
 )
 
 
+def _ssh_permission_repair_lines() -> tuple[str, ...]:
+    """Return idempotent repairs for the SSH key path injected by Vast."""
+    return (
+        "chown root:root /root",
+        "chmod go-w /root",
+        "mkdir -p /root/.ssh",
+        "chown root:root /root/.ssh",
+        "chmod 700 /root/.ssh",
+        "if [ -f /root/.ssh/authorized_keys ]; then",
+        "  chown root:root /root/.ssh/authorized_keys",
+        "  chmod 600 /root/.ssh/authorized_keys",
+        "fi",
+    )
+
+
 @dataclass(frozen=True)
 class VastRuntimeConfiguration:
     """Describe the digest-pinned worker image and direct runtime layout."""
@@ -117,6 +132,7 @@ class VastRuntimeConfiguration:
         onstart = "\n".join(
             (
                 "set -e",
+                *_ssh_permission_repair_lines(),
                 "mkdir -p /run/comfy-remote /storage/logs",
                 "cat >> /etc/environment <<'COMFY_VAST_ENV'",
                 exported_lines,
