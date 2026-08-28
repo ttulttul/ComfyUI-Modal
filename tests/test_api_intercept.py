@@ -6917,3 +6917,61 @@ def test_selected_vast_capacity_streams_setup_status(
         ),
     ]
     assert assignments["component-1"].environment_id == "vast:vast-config:42"
+
+
+def test_selected_vast_capacity_preserves_intentional_cancellation(
+    api_intercept_module: Any,
+    vast_models_module: Any,
+) -> None:
+    """Cancelling capacity acquisition should not become a provider failure."""
+    profile = vast_models_module.VastResourceProfile(
+        profile_id="vast-config",
+        profile_name="Vast-pool",
+        maximum_instances=1,
+    )
+    configuration = api_intercept_module.VastRemoteConfiguration(
+        configuration_id="vast-config",
+        display_name="Vast-pool",
+        profile=profile,
+    )
+    assignment = api_intercept_module.ExecutionAssignment(
+        environment_id=profile.environment_id,
+        provider=api_intercept_module.ExecutionProvider.VAST,
+        predicted_cost_usd=0.02,
+        predicted_completion_seconds=30.0,
+        configuration_id="vast-config",
+        capacity_slot_index=0,
+    )
+    quote = SimpleNamespace(
+        profile=profile,
+        predicted_incremental_cost_usd=0.02,
+    )
+
+    class CancelledVastService:
+        """Stop acquisition as though the user cancelled queue preparation."""
+
+        def acquire_sync(self, selected_quote: Any, *, slot: int) -> Any:
+            """Raise the prompt-scoped cancellation without a provider failure."""
+            assert selected_quote is quote
+            assert slot == 0
+            raise api_intercept_module.SyncCancelledError(
+                "Remote workflow preparation was cancelled."
+            )
+
+    with pytest.raises(
+        api_intercept_module.SyncCancelledError,
+        match="Remote workflow preparation was cancelled",
+    ):
+        api_intercept_module._prepare_selected_vast_capacity(
+            assignments={"component-1": assignment},
+            configuration_set=api_intercept_module.RemoteConfigurationSet(
+                configurations=(configuration,)
+            ),
+            requirements_by_component={
+                "component-1": api_intercept_module.ComponentResourceRequirements(
+                    estimated_execution_seconds=30.0
+                )
+            },
+            vast_quotes={("component-1", "vast-config"): quote},
+            vast_service=CancelledVastService(),
+        )

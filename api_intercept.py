@@ -2215,6 +2215,8 @@ def _prepare_selected_vast_capacity(
                         )
                     ),
                 )
+        except SyncCancelledError:
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
             raise ModalPromptValidationError(
                 f"Unable to acquire Vast.ai capacity for configuration "

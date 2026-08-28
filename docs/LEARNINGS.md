@@ -10,6 +10,7 @@
 - A local sync-index hit is evidence that the hot layer contains an asset, not evidence that a newly enabled or previously failed backing cache contains it. Schedule the same idempotent R2 write-back on indexed reuse, and traverse entries behind an indexed custom-node manifest when write-back is enabled so existing installations can backfill without clearing their remote volumes.
 - A storage helper that runs inside the fingerprinted SSH image cannot execute during queue-time write-back until that image exists. Give the runtime manager an image-only, lifecycle-locked preparation path and call it before the first Docker materializer; later worker startup can reuse the image without racing another build.
 - Presigned transfer errors often embed credential-bearing URLs, but suppressing the entire error makes authorization, request, and provider failures indistinguishable. Walk the exception chain on the worker and emit only a fixed category plus a validated numeric HTTP status, never exception text, response bodies, headers, or URLs.
+- Intentional queue-preparation cancellation is a control-flow outcome even though its exception derives from `RuntimeError`. Provider boundaries that translate ordinary runtime failures into validation errors must pass the cancellation type through first, allowing the queue handler to log at INFO, emit `execution_interrupted`, and return its existing cancelled response without a misleading provider-failure traceback.
 
 ## 2026-08-24
 
