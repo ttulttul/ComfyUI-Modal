@@ -1396,7 +1396,11 @@ const fastPromptResponse = await globalThis.__modalApiStub.queuePrompt(0, {
     nodes: [{ id: 80, properties: { is_modal_remote: true } }],
   },
 });
-assert.equal(fastPromptResponse.modal_gpu, "B300");
+assert.equal(typeof fastPromptResponse.prompt_id, "string");
+assert.deepEqual(fastPromptResponse.node_errors, {});
+assert.equal(fastPromptResponse.modal_gpu, undefined);
+await Promise.resolve();
+await Promise.resolve();
 assert.equal(modalToggle.modalNodeStates.has("80"), false);
 assert.deepEqual(Array.from(modalToggle.modalSandwichedLocalNodeIds), ["174"]);
 
@@ -1467,6 +1471,8 @@ assert.equal(
 );
 releaseVastOnlyResponse();
 await vastOnlyPrompt;
+await Promise.resolve();
+await Promise.resolve();
 assert.equal(modalToggle.currentGlobalStatus()?.statusMessage, "Waiting for Vast.ai instance");
 assert.equal(modalToggle.currentGlobalStatus()?.modalGpu, null);
 assert.equal(

@@ -6728,6 +6728,49 @@ def test_remote_preparation_bridge_tracks_prompt_cancellation(
     assert "prompt-cancel" not in cancellations
 
 
+def test_jobs_api_interrupt_cancels_remote_preparation(
+    api_intercept_module: Any,
+) -> None:
+    """ComfyUI's normal Jobs API cancellation should stop remote setup."""
+
+    class FakePromptQueue:
+        """Provide queue and interruption methods used by the bridge."""
+
+        def __init__(self) -> None:
+            """Track whether native interruption was used."""
+            self.native_interrupts: list[str] = []
+
+        def get_current_queue(self) -> tuple[list[Any], list[Any]]:
+            """Return no native work."""
+            return [], []
+
+        def interrupt_if_running(self, prompt_id: str) -> bool:
+            """Record native fallback interruptions."""
+            self.native_interrupts.append(prompt_id)
+            return False
+
+    prompt_queue = FakePromptQueue()
+    prompt_server = SimpleNamespace(prompt_queue=prompt_queue)
+    cancellation_event = api_intercept_module.threading.Event()
+    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+    api_intercept_module._set_remote_preparation(
+        prompt_server,
+        prompt_id="prompt-cancel",
+        prompt={},
+        extra_data={},
+        cancellation_event=cancellation_event,
+    )
+
+    running, queued = prompt_queue.get_current_queue()
+    assert [item[1] for item in running] == ["prompt-cancel"]
+    assert queued == []
+    assert prompt_queue.interrupt_if_running("prompt-cancel") is True
+    assert cancellation_event.is_set()
+    assert prompt_queue.native_interrupts == []
+    assert prompt_queue.interrupt_if_running("native-prompt") is False
+    assert prompt_queue.native_interrupts == ["native-prompt"]
+
+
 def test_selected_vast_capacity_streams_setup_status(
     api_intercept_module: Any,
     vast_models_module: Any,

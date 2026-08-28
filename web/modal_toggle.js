@@ -6428,6 +6428,28 @@ function queueErrorMessage(error) {
 }
 
 /**
+ * Preserve remote setup failure state after ComfyUI has accepted the local job record.
+ * @param {string[]} remoteNodeIds
+ * @param {string} promptId
+ * @param {Error | any} error
+ */
+function reportBackgroundQueueFailure(remoteNodeIds, promptId, error) {
+  if (error?.modalQueueResponse?.cancelled === true) {
+    clearPromptQueued(promptId);
+    endSyntheticExecutionUi(promptId);
+    handlePromptInterruption(promptId);
+    console.info(`Remote queue preparation cancelled for prompt ${promptId}.`);
+    return;
+  }
+  const message = queueErrorMessage(error);
+  clearPromptQueued(promptId);
+  endSyntheticExecutionUi(promptId, true, message);
+  markQueueFailure(remoteNodeIds, promptId, error);
+  setRemoteConfiguratorTerminalStatus(promptId, STATE_ERROR, message);
+  console.error(`Remote queue submission failed for prompt ${promptId}.`, error);
+}
+
+/**
  * Dispatch a synthetic frontend API event when the underlying API supports EventTarget semantics.
  * @param {string} eventType
  * @param {any} detail
@@ -6622,7 +6644,7 @@ function patchQueuePrompt() {
       body.number = number;
     }
 
-    try {
+    const queueSubmission = (async () => {
       const response = await this.fetchApi(MODAL_ROUTE, {
         method: "POST",
         headers: {
@@ -6728,17 +6750,21 @@ function patchQueuePrompt() {
       }
 
       return responsePayload;
-    } catch (error) {
-      clearPromptQueued(promptId);
-      endSyntheticExecutionUi(promptId, true, queueErrorMessage(error));
-      markQueueFailure(remoteNodeIds, promptId, error);
-      setRemoteConfiguratorTerminalStatus(
-        promptId,
-        STATE_ERROR,
-        queueErrorMessage(error),
-      );
+    })().catch((error) => {
+      reportBackgroundQueueFailure(remoteNodeIds, promptId, error);
       throw error;
+    });
+
+    if (remoteNodeIds.length === 0) {
+      return queueSubmission;
     }
+
+    void queueSubmission.catch(() => {});
+    return {
+      prompt_id: promptId,
+      number,
+      node_errors: {},
+    };
   };
 
   api.__modalQueuePromptPatched = true;

@@ -29,6 +29,23 @@ def test_synthetic_preparation_events_avoid_native_node_execution() -> None:
     assert 'dispatchSyntheticApiEvent("execution_error"' not in source
 
 
+def test_remote_queue_returns_before_capacity_preparation_finishes() -> None:
+    """ComfyUI should own the job while remote capacity initializes."""
+    source = _modal_toggle_source()
+
+    submission = source.index("const queueSubmission = (async () => {")
+    acknowledgement = source.index("prompt_id: promptId,", submission)
+
+    assert source.index("await this.fetchApi(MODAL_ROUTE", submission) < acknowledgement
+    assert "void queueSubmission.catch(() => {});" in source
+    assert "node_errors: {}," in source[acknowledgement:]
+    assert "function reportBackgroundQueueFailure(" in source
+    assert "Remote queue submission failed for prompt" in source
+    assert "error?.modalQueueResponse?.cancelled === true" in source
+    assert "handlePromptInterruption(promptId);" in source
+    assert "if (remoteNodeIds.length === 0)" in source
+
+
 def test_global_modal_status_badge_is_installed() -> None:
     """The frontend should expose a dedicated global Modal activity indicator."""
     source = _modal_toggle_source()
@@ -434,10 +451,7 @@ def test_queue_failure_preserves_server_validation_detail() -> None:
 
     assert "function queueErrorMessage(error)" in source
     assert "promptError.modalQueueResponse = responsePayload;" in source
-    assert (
-        "endSyntheticExecutionUi(promptId, true, queueErrorMessage(error));"
-        in source
-    )
+    assert "endSyntheticExecutionUi(promptId, true, message);" in source
     assert "endSyntheticExecutionUi(promptId, true, errorMessage);" in source
     assert 'dispatchSyntheticApiEvent("execution_error"' not in source
     assert (

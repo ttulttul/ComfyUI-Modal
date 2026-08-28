@@ -8769,6 +8769,9 @@ def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
         prompt_queue, "get_current_queue_volatile", None
     )
     original_get_tasks_remaining = getattr(prompt_queue, "get_tasks_remaining", None)
+    original_interrupt_if_running = getattr(
+        prompt_queue, "interrupt_if_running", None
+    )
     if not any(
         callable(method)
         for method in (
@@ -8867,6 +8870,16 @@ def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
 
         setattr(prompt_queue, "get_tasks_remaining", remote_get_tasks_remaining)
 
+    if callable(original_interrupt_if_running):
+
+        def remote_interrupt_if_running(prompt_id: str) -> bool:
+            """Cancel remote preparation or interrupt matching native execution."""
+            if _cancel_remote_preparation(prompt_server, prompt_id):
+                return True
+            return bool(original_interrupt_if_running(prompt_id))
+
+        setattr(prompt_queue, "interrupt_if_running", remote_interrupt_if_running)
+
     setattr(prompt_queue, _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR, True)
     logger.info("Installed remote preparation bridge on ComfyUI prompt queue.")
 
@@ -8878,6 +8891,33 @@ def _queue_item_prompt_ids(items: Iterable[Any]) -> set[str]:
         for item in items
         if isinstance(item, (list, tuple)) and len(item) > 1
     }
+
+
+def _cancel_remote_preparation(prompt_server: Any, prompt_id: str) -> bool:
+    """Signal cancellation when the prompt is preparing remote capacity."""
+    normalized_prompt_id = str(prompt_id).strip()
+    prompt_queue = getattr(prompt_server, "prompt_queue", None)
+    cancellations = getattr(
+        prompt_queue,
+        _REMOTE_PREPARATION_CANCELLATIONS_ATTR,
+        None,
+    )
+    preparation_lock = getattr(prompt_queue, _REMOTE_PREPARATION_LOCK_ATTR, None)
+    if (
+        not normalized_prompt_id
+        or not isinstance(cancellations, dict)
+        or preparation_lock is None
+    ):
+        return False
+    with preparation_lock:
+        cancellation_event = cancellations.get(normalized_prompt_id)
+        if cancellation_event is None:
+            return False
+        cancellation_event.set()
+    logger.info(
+        "Cancelled remote preparation for prompt %s.", normalized_prompt_id
+    )
+    return True
 
 
 def _queued_ssh_environment_ids(
@@ -9084,22 +9124,8 @@ def setup_modal_queue_route(
         """Cancel one prompt while it is still preparing remote execution."""
         payload = await request.json()
         prompt_id = str(payload.get("prompt_id") or "").strip()
-        prompt_queue = getattr(prompt_server, "prompt_queue", None)
-        cancellations = getattr(
-            prompt_queue,
-            _REMOTE_PREPARATION_CANCELLATIONS_ATTR,
-            None,
-        )
-        cancellation_event = (
-            cancellations.get(prompt_id)
-            if isinstance(cancellations, dict) and prompt_id
-            else None
-        )
-        if cancellation_event is None:
-            return web.json_response({"cancelled": False, "prompt_id": prompt_id})
-        cancellation_event.set()
-        logger.info("Cancelled remote preparation for prompt %s.", prompt_id)
-        return web.json_response({"cancelled": True, "prompt_id": prompt_id})
+        cancelled = _cancel_remote_preparation(prompt_server, prompt_id)
+        return web.json_response({"cancelled": cancelled, "prompt_id": prompt_id})
 
     if hasattr(prompt_server.routes, "get"):
 
