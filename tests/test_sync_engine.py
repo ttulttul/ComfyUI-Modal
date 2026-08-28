@@ -1895,6 +1895,81 @@ class _SynchronousBackfillCache:
         raise AssertionError("successful backfill should not abort")
 
 
+def test_r2_worker_preflight_runs_before_transfer_and_reports_ip_filter_hint(
+    settings_module: Any,
+    sync_engine_module: Any,
+    r2_cache_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A remote AccessDenied probe should become an actionable preparation failure."""
+    events: list[str] = []
+
+    class PreflightVolume:
+        """Reject the read-only worker probe with a sanitized R2 diagnostic."""
+
+        def exists(self, remote_path: str) -> bool:
+            """Satisfy the storage protocol without accessing a worker path."""
+            del remote_path
+            return False
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            """Reject asset mutation before a successful preflight."""
+            del local_path, remote_path
+            raise AssertionError("preflight must run before file transfer")
+
+        def put_bytes(self, payload: bytes, remote_path: str) -> None:
+            """Reject asset mutation before a successful preflight."""
+            del payload, remote_path
+            raise AssertionError("preflight must run before byte transfer")
+
+        def preflight_r2_access(
+            self,
+            request: Any,
+            *,
+            cancellation_check: Any = None,
+        ) -> None:
+            """Record the protected request and report the worker policy denial."""
+            del cancellation_check
+            events.append(request.allowed_host)
+            raise RuntimeError(
+                "R2 materializer failed safely "
+                "(category=http_client status=403 r2_code=AccessDenied)."
+            )
+
+    class PreflightCache:
+        """Return one controller-approved read-only worker request."""
+
+        write_back_mode = "off"
+
+        def worker_preflight_request(self) -> Any:
+            """Record controller validation before returning the signed probe."""
+            events.append("controller")
+            return r2_cache_module.R2WorkerPreflightRequest(
+                url="https://account.r2.cloudflarestorage.com/missing?secret=1",
+                allowed_host="account.r2.cloudflarestorage.com",
+            )
+
+    engine = sync_engine_module.ModalAssetSyncEngine(
+        volume=PreflightVolume(),
+        settings=_r2_sync_settings(settings_module, tmp_path),
+        r2_cache=PreflightCache(),
+    )
+    statuses: list[str] = []
+
+    with pytest.raises(
+        r2_cache_module.R2CacheError,
+        match="Remove Client IP Address Filtering",
+    ):
+        engine.preflight_r2_access(
+            status_callback=lambda message, _current, _total: statuses.append(message)
+        )
+
+    assert events == ["controller", "account.r2.cloudflarestorage.com"]
+    assert statuses == [
+        "Checking Cloudflare R2 access from the Vast.ai instance"
+    ]
+
+
 def test_r2_cache_hit_materializes_without_local_upload(
     settings_module: Any,
     sync_engine_module: Any,

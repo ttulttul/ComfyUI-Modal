@@ -24,6 +24,7 @@ from .r2_cache import (
     R2DownloadRequest,
     R2UploadPlan,
     R2UploadResult,
+    R2WorkerPreflightRequest,
 )
 from .settings import ModalSyncSettings, get_settings
 
@@ -252,6 +253,19 @@ class R2MaterializingBackend(Protocol):
         remote_path: str,
     ) -> R2UploadResult:
         """Upload one remote file through a controller-issued signed plan."""
+
+
+@runtime_checkable
+class R2WorkerPreflightBackend(Protocol):
+    """Optional backend capability for testing effective worker-side R2 access."""
+
+    def preflight_r2_access(
+        self,
+        request: R2WorkerPreflightRequest,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> None:
+        """Verify one read-only presigned request from the worker environment."""
 
 
 class SyncCancelledError(RuntimeError):
@@ -692,6 +706,59 @@ class ModalAssetSyncEngine:
         if self.settings.execution_mode == "vast":
             return "the Vast.ai instance"
         return "Modal"
+
+    def preflight_r2_access(
+        self,
+        *,
+        status_callback: SyncStatusCallback | None = None,
+    ) -> None:
+        """Fail before asset transfer when a worker cannot use configured R2 URLs."""
+        self._raise_if_cancelled()
+        if self.r2_cache is None or not isinstance(
+            self.volume,
+            R2WorkerPreflightBackend,
+        ):
+            return
+        destination = self._destination_label()
+        _emit_sync_status(
+            status_callback,
+            f"Checking Cloudflare R2 access from {destination}",
+        )
+        try:
+            request = self.r2_cache.worker_preflight_request()
+        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise R2CacheError(
+                "Cloudflare R2 controller validation failed before the worker "
+                f"preflight: {exc}"
+            ) from exc
+        try:
+            self.volume.preflight_r2_access(
+                request,
+                cancellation_check=self.cancellation_check,
+            )
+        except InterruptedError as exc:
+            self._raise_if_cancelled()
+            raise R2CacheError(
+                f"Cloudflare R2 worker preflight was interrupted for {destination}."
+            ) from exc
+        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            diagnostic = str(exc)
+            hint = (
+                " Remove Client IP Address Filtering from the bucket-scoped R2 "
+                "API token; dynamic worker egress addresses cannot be reliably "
+                "allowlisted."
+                if "r2_code=AccessDenied" in diagnostic
+                else ""
+            )
+            raise R2CacheError(
+                f"Cloudflare R2 is reachable from the controller but not from "
+                f"{destination}.{hint} Safe worker diagnostic: {diagnostic}"
+            ) from exc
+        self._raise_if_cancelled()
+        logger.info(
+            "Validated Cloudflare R2 access from %s before asset transfer.",
+            destination,
+        )
 
     @classmethod
     def from_environment(cls, settings: ModalSyncSettings | None = None) -> "ModalAssetSyncEngine":

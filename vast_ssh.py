@@ -19,10 +19,20 @@ from typing import Any, BinaryIO, Callable, Mapping, Sequence
 
 if __package__:
     from .huggingface_assets import HuggingFaceAssetSource
-    from .r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
+    from .r2_cache import (
+        R2DownloadRequest,
+        R2UploadPlan,
+        R2UploadResult,
+        R2WorkerPreflightRequest,
+    )
 else:  # pragma: no cover - direct debugging imports.
     from huggingface_assets import HuggingFaceAssetSource
-    from r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
+    from r2_cache import (
+        R2DownloadRequest,
+        R2UploadPlan,
+        R2UploadResult,
+        R2WorkerPreflightRequest,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -657,6 +667,26 @@ class VastSshVolumeBackend:
         except VastSshCancelledError as exc:
             raise InterruptedError("Vast R2 download was cancelled.") from exc
         self._exists_cache[normalized] = True
+
+    def preflight_r2_access(
+        self,
+        request: R2WorkerPreflightRequest,
+        *,
+        cancellation_check: Callable[[], bool] | None = None,
+    ) -> None:
+        """Test one read-only signed R2 request directly on the Vast host."""
+        active_cancellation_check = cancellation_check or (lambda: False)
+        try:
+            self._run_r2_materializer(
+                {
+                    "operation": "preflight",
+                    "preflight": request.to_dict(),
+                },
+                size_bytes=0,
+                cancellation_check=active_cancellation_check,
+            )
+        except VastSshCancelledError as exc:
+            raise InterruptedError("Vast R2 preflight was cancelled.") from exc
 
     def upload_r2_file(
         self,

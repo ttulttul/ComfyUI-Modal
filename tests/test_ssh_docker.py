@@ -90,7 +90,13 @@ class _FakeRunner:
             if command[-2:] == ("-m", "remote.r2_materializer"):
                 operation = json.loads(input_payload or b"{}")["operation"]
                 stdout = json.dumps(
-                    {"parts": []} if operation == "upload" else {"sha256": "a" * 64}
+                    {"parts": []}
+                    if operation == "upload"
+                    else (
+                        {"authorized": True}
+                        if operation == "preflight"
+                        else {"sha256": "a" * 64}
+                    )
                 ).encode()
             else:
                 stdout = b""
@@ -238,6 +244,36 @@ def test_r2_materialization_keeps_signed_url_in_docker_stdin(
     assert input_payload is not None and b"secret" in input_payload
     assert image_preparations == [True]
     assert volume.exists("/assets/model.safetensors") is True
+
+
+def test_r2_preflight_uses_worker_image_and_protected_stdin(
+    ssh_docker_module: Any,
+    remote_hosts_module: Any,
+    r2_cache_module: Any,
+) -> None:
+    """SSH worker authorization probes must not expose their signed URL in argv."""
+    runner = _FakeRunner(ssh_docker_module)
+    controller = ssh_docker_module.SshDockerController(
+        _host(remote_hosts_module),
+        runner=runner,
+    )
+    volume = ssh_docker_module.SshDockerVolumeBackend(
+        controller,
+        "safe-volume",
+        materializer_image="comfy-remote:current",
+    )
+    request = r2_cache_module.R2WorkerPreflightRequest(
+        url="https://account.r2.cloudflarestorage.com/missing?signature=secret",
+        allowed_host="account.r2.cloudflarestorage.com",
+    )
+
+    volume.preflight_r2_access(request)
+
+    command, input_payload = runner.calls[-1]
+    assert "secret" not in " ".join(command)
+    assert input_payload is not None
+    assert b'"operation": "preflight"' in input_payload
+    assert b"secret" in input_payload
 
 
 def test_managed_worker_status_and_removal_are_label_scoped(

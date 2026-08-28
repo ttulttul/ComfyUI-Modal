@@ -297,6 +297,52 @@ def materialize_download(
     raise RuntimeError("R2 download retry loop exited unexpectedly.")
 
 
+def materialize_preflight(
+    request: Mapping[str, Any],
+    *,
+    session: requests.Session | None = None,
+) -> dict[str, object]:
+    """Verify effective worker-side R2 authorization without reading an object."""
+    preflight = _required_mapping(request, "preflight")
+    allowed_host = _required_string(preflight, "allowed_host")
+    url = _validated_url(preflight.get("url"), allowed_host)
+    active_session = session or requests.Session()
+    try:
+        for attempt in range(_RETRY_ATTEMPTS):
+            try:
+                with active_session.get(
+                    url,
+                    headers={"Range": "bytes=0-0"},
+                    stream=True,
+                    allow_redirects=False,
+                    timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+                ) as response:
+                    status_code = response.status_code
+                    if 200 <= status_code <= 299 or status_code in {
+                        requests.codes.not_found,
+                        requests.codes.requested_range_not_satisfiable,
+                    }:
+                        return {"authorized": True}
+                    error = _http_error(response, "R2 worker preflight")
+                    if _response_is_retriable(response):
+                        raise error
+                    raise error
+            except (OSError, requests.RequestException) as exc:
+                if attempt >= _RETRY_ATTEMPTS - 1 or (
+                    isinstance(exc, requests.HTTPError)
+                    and exc.response is not None
+                    and not _response_is_retriable(exc.response)
+                ):
+                    raise RuntimeError(
+                        "R2 worker preflight failed after retries."
+                    ) from exc
+                time.sleep(_retry_delay(attempt))
+    finally:
+        if session is None:
+            active_session.close()
+    raise RuntimeError("R2 worker preflight retry loop exited unexpectedly.")
+
+
 def _source_file(
     request: Mapping[str, Any], target: _MaterializerTarget
 ) -> tuple[Path, int]:
@@ -432,6 +478,8 @@ def materialize_upload(
 def process_request(request: Mapping[str, Any]) -> dict[str, object]:
     """Dispatch one validated R2 transfer request."""
     operation = _required_string(request, "operation").casefold()
+    if operation == "preflight":
+        return materialize_preflight(request)
     if operation == "download":
         return materialize_download(request)
     if operation == "upload":
@@ -535,4 +583,10 @@ if __name__ == "__main__":  # pragma: no cover - exercised through remote subpro
     raise SystemExit(main())
 
 
-__all__ = ["main", "materialize_download", "materialize_upload", "process_request"]
+__all__ = [
+    "main",
+    "materialize_download",
+    "materialize_preflight",
+    "materialize_upload",
+    "process_request",
+]

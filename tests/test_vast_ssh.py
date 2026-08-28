@@ -53,11 +53,16 @@ class FakeRunner:
             len(arguments) == 2 and arguments[1].endswith(".pyz")
         ):
             request = __import__("json").loads(input_payload or b"{}")
-            self.existing.add(f"/storage/{request['remote_path']}")
+            if "remote_path" in request:
+                self.existing.add(f"/storage/{request['remote_path']}")
             stdout = (
                 b'{"parts":[]}'
                 if request.get("operation") == "upload"
-                else b'{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+                else (
+                    b'{"authorized":true}'
+                    if request.get("operation") == "preflight"
+                    else b'{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+                )
             )
             return self.module.VastSshCommandResult(
                 stdout=stdout,
@@ -437,6 +442,32 @@ def test_r2_materialization_keeps_signed_url_out_of_ssh_arguments(
     assert "secret" not in " ".join(materialize_call["argv"])
     assert b"secret" in materialize_call["input"]
     assert backend.exists("assets/model.safetensors") is True
+
+
+def test_r2_preflight_keeps_signed_url_out_of_ssh_arguments(
+    vast_ssh_module: Any,
+    r2_cache_module: Any,
+) -> None:
+    """Vast authorization probes should receive signed URLs only through stdin."""
+    runner = FakeRunner(vast_ssh_module)
+    backend = vast_ssh_module.VastSshVolumeBackend(runner=runner)
+    request = r2_cache_module.R2WorkerPreflightRequest(
+        url="https://account.r2.cloudflarestorage.com/missing?signature=secret",
+        allowed_host="account.r2.cloudflarestorage.com",
+    )
+
+    backend.preflight_r2_access(request)
+
+    materialize_call = next(
+        call
+        for call in runner.calls
+        if len(call["argv"]) == 2
+        and call["argv"][0] == "python"
+        and call["argv"][-1].endswith(".pyz")
+        and b'"operation": "preflight"' in (call["input"] or b"")
+    )
+    assert "secret" not in " ".join(materialize_call["argv"])
+    assert b"secret" in materialize_call["input"]
 
 
 def test_materializer_bundle_is_self_contained_and_executable(

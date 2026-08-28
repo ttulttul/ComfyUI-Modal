@@ -230,6 +230,32 @@ def test_download_request_requires_an_exact_size_match(r2_cache_module: Any) -> 
     assert replacement is not None and replacement.mode == "multipart"
 
 
+def test_worker_preflight_validates_controller_and_signs_short_read_probe(
+    r2_cache_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker probes should use an absent key and a bounded presigned GET lifetime."""
+    configuration = _configuration(r2_cache_module, url_ttl_seconds=3600)
+    fake_s3 = FakeS3Client(r2_cache_module)
+    client = r2_cache_module.R2CacheClient(configuration, s3_client=fake_s3)
+    monkeypatch.setattr(r2_cache_module.secrets, "token_hex", lambda _bytes: "probe-id")
+
+    request = client.worker_preflight_request()
+
+    assert request.allowed_host == configuration.endpoint_host
+    assert "operation=get_object" in request.url
+    assert fake_s3.calls[0] == (
+        "list_objects_v2",
+        {"Bucket": configuration.bucket, "MaxKeys": 1},
+    )
+    sign_call = fake_s3.calls[1]
+    assert sign_call[0] == "get_object"
+    assert sign_call[1]["Params"]["Key"].endswith(
+        "/.worker-preflight/probe-id"
+    )
+    assert sign_call[1]["ExpiresIn"] == 300
+
+
 def test_single_and_multipart_upload_plans_are_completed(r2_cache_module: Any) -> None:
     """The controller should sign small PUTs and complete large multipart uploads."""
     configuration = _configuration(r2_cache_module)

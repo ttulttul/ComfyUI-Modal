@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ R2_MAX_SINGLE_UPLOAD_BYTES = 5 * 1024**3
 R2_MIN_MULTIPART_PART_BYTES = 5 * 1024**2
 R2_MAX_MULTIPART_PART_BYTES = 5 * 1024**3
 R2_MAX_MULTIPART_PARTS = 10_000
+R2_WORKER_PREFLIGHT_TTL_SECONDS = 5 * 60
 _HASH_BUFFER_BYTES = 4 * 1024 * 1024
 
 _ACCOUNT_ID_PATTERN = re.compile(r"^[a-fA-F0-9]{32}$")
@@ -272,6 +274,18 @@ class R2DownloadRequest:
 
 
 @dataclass(frozen=True)
+class R2WorkerPreflightRequest:
+    """Describe one short-lived read-only worker authorization probe."""
+
+    url: str = field(repr=False)
+    allowed_host: str
+
+    def to_dict(self) -> dict[str, str]:
+        """Return the credential-sensitive request for protected standard input."""
+        return {"url": self.url, "allowed_host": self.allowed_host}
+
+
+@dataclass(frozen=True)
 class R2UploadPlan:
     """Describe one short-lived single-part or multipart worker upload."""
 
@@ -414,6 +428,36 @@ class R2CacheClient:
                 "Cloudflare rejected the R2 credentials or they do not grant "
                 "object access to the configured bucket."
             ) from exc
+
+    def worker_preflight_request(self) -> R2WorkerPreflightRequest:
+        """Validate controller access and sign a read-only absent-object worker probe."""
+        self.validate_bucket_access()
+        sentinel_key = (
+            f"{self.configuration.key_prefix}/.worker-preflight/"
+            f"{secrets.token_hex(16)}"
+        )
+        assert self.s3_client is not None
+        try:
+            url = self.s3_client.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": self.configuration.bucket,
+                    "Key": sentinel_key,
+                },
+                ExpiresIn=min(
+                    self.configuration.url_ttl_seconds,
+                    R2_WORKER_PREFLIGHT_TTL_SECONDS,
+                ),
+            )
+        except _R2_CLIENT_ERRORS as exc:
+            raise R2CacheError(
+                "Unable to sign the Cloudflare R2 worker preflight request."
+            ) from exc
+        self._validate_generated_url(url)
+        return R2WorkerPreflightRequest(
+            url=url,
+            allowed_host=self.configuration.endpoint_host,
+        )
 
     def storage_usage(self) -> R2StorageUsage:
         """Return the exact current object bytes and count for the configured bucket."""
@@ -795,4 +839,5 @@ __all__ = [
     "R2UploadPlan",
     "R2UploadResult",
     "R2UploadedPart",
+    "R2WorkerPreflightRequest",
 ]

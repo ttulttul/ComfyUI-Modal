@@ -7702,6 +7702,7 @@ def _prepare_environment_assets(
     if environment_callback is not None:
         environment_callback("Preparing remote assets", None, None)
     with engine_lock:
+        sync_engine.preflight_r2_access(status_callback=environment_callback)
         custom_nodes_bundle = (
             sync_engine.sync_custom_nodes_directory(
                 status_callback=environment_callback,
@@ -8069,15 +8070,18 @@ def rewrite_prompt_for_modal(
     if status_callback is not None:
         status_callback("Preparing assets for remote execution", None, None)
 
-    environment_preparations = _prepare_remote_environment_assets(
-        components=components,
-        assignments_by_component_id=assignments_by_component_id,
-        sync_engines_by_environment=sync_engines_by_environment,
-        rewritten_prompt=rewritten_prompt,
-        sync_custom_nodes=resolved_settings.sync_custom_nodes,
-        status_callback=status_callback,
-        environment_status_callback=environment_status_callback,
-    )
+    try:
+        environment_preparations = _prepare_remote_environment_assets(
+            components=components,
+            assignments_by_component_id=assignments_by_component_id,
+            sync_engines_by_environment=sync_engines_by_environment,
+            rewritten_prompt=rewritten_prompt,
+            sync_custom_nodes=resolved_settings.sync_custom_nodes,
+            status_callback=status_callback,
+            environment_status_callback=environment_status_callback,
+        )
+    except R2CacheError as exc:
+        raise ModalPromptValidationError(str(exc)) from exc
     if resolved_settings.sync_custom_nodes:
         summary.custom_nodes_bundles_by_environment = {
             environment_id: preparation.custom_nodes_bundle

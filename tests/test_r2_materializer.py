@@ -119,6 +119,53 @@ def test_corrupt_download_is_deleted_before_failure(
     assert target.with_name(f".{target.name}.r2.part").exists() is False
 
 
+def test_preflight_accepts_missing_object_as_authorized(
+    r2_materializer_module: Any,
+) -> None:
+    """A signed GET reaching the expected absent sentinel proves worker access."""
+    session = FakeSession([FakeResponse(status_code=404)])
+    request = {
+        "operation": "preflight",
+        "preflight": {
+            "url": "https://account.r2.cloudflarestorage.com/missing?secret=1",
+            "allowed_host": "account.r2.cloudflarestorage.com",
+        },
+    }
+
+    assert r2_materializer_module.materialize_preflight(
+        request,
+        session=session,
+    ) == {"authorized": True}
+    assert session.get_calls[0][1] == {"Range": "bytes=0-0"}
+
+
+def test_preflight_preserves_safe_r2_denial_code(
+    r2_materializer_module: Any,
+) -> None:
+    """A worker-side policy denial should remain actionable but credential-free."""
+    response = FakeResponse(
+        b"<Error><Code>AccessDenied</Code><Message>private detail</Message></Error>",
+        status_code=403,
+    )
+    request = {
+        "operation": "preflight",
+        "preflight": {
+            "url": "https://account.r2.cloudflarestorage.com/missing?secret=1",
+            "allowed_host": "account.r2.cloudflarestorage.com",
+        },
+    }
+
+    with pytest.raises(RuntimeError) as failure:
+        r2_materializer_module.materialize_preflight(
+            request,
+            session=FakeSession([response]),
+        )
+
+    assert r2_materializer_module._safe_error_summary(failure.value) == (
+        "category=http_client status=403 r2_code=AccessDenied"
+    )
+
+
 def test_single_upload_uses_exact_content_length(
     r2_materializer_module: Any,
     tmp_path: Path,

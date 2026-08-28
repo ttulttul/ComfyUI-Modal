@@ -15,11 +15,21 @@ from typing import Any, Callable, Mapping, Sequence
 
 if __package__:
     from .execution_environments import EnvironmentCapabilities, GpuCapability
-    from .r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
+    from .r2_cache import (
+        R2DownloadRequest,
+        R2UploadPlan,
+        R2UploadResult,
+        R2WorkerPreflightRequest,
+    )
     from .remote_hosts import SshHostConfig
 else:  # pragma: no cover - stable remote entrypoints may import modules top-level.
     from execution_environments import EnvironmentCapabilities, GpuCapability
-    from r2_cache import R2DownloadRequest, R2UploadPlan, R2UploadResult
+    from r2_cache import (
+        R2DownloadRequest,
+        R2UploadPlan,
+        R2UploadResult,
+        R2WorkerPreflightRequest,
+    )
     from remote_hosts import SshHostConfig
 
 logger = logging.getLogger(__name__)
@@ -537,6 +547,25 @@ class SshDockerVolumeBackend:
     def put_bytes(self, payload: bytes, remote_path: str) -> None:
         """Upload bytes into the named volume."""
         self._put_payload(payload, remote_path)
+
+    def preflight_r2_access(
+        self,
+        request: R2WorkerPreflightRequest,
+        *,
+        cancellation_check: Callable[[], bool] | None = None,
+    ) -> None:
+        """Test one read-only signed R2 request inside the worker image."""
+        if cancellation_check is not None and cancellation_check():
+            raise InterruptedError("SSH R2 preflight was cancelled.")
+        self._run_r2_materializer(
+            {
+                "operation": "preflight",
+                "preflight": request.to_dict(),
+            },
+            size_bytes=0,
+        )
+        if cancellation_check is not None and cancellation_check():
+            raise InterruptedError("SSH R2 preflight was cancelled.")
 
     def materialize_r2_file(
         self,

@@ -6103,9 +6103,19 @@ def test_remote_environment_assets_are_prepared_in_parallel(
     class FakeSyncEngine:
         """Block custom-node setup until both environment workers are active."""
 
+        def __init__(self) -> None:
+            """Record the environment-local preparation order."""
+            self.calls: list[str] = []
+
+        def preflight_r2_access(self, *, status_callback: Any) -> None:
+            """Represent an environment without configured R2 backing."""
+            del status_callback
+            self.calls.append("r2_preflight")
+
         def sync_custom_nodes_directory(self, *, status_callback: Any) -> None:
             """Prove the second environment starts before the first can finish."""
             nonlocal active_environment_count, maximum_active_environment_count
+            self.calls.append("custom_nodes")
             with state_lock:
                 active_environment_count += 1
                 maximum_active_environment_count = max(
@@ -6122,6 +6132,7 @@ def test_remote_environment_assets_are_prepared_in_parallel(
         def create_request_asset_cache(self, values: Any) -> object:
             """Consume the environment-local input plan and return a sentinel cache."""
             tuple(values)
+            self.calls.append("asset_plan")
             return object()
 
         def sync_prompt_inputs(
@@ -6133,6 +6144,7 @@ def test_remote_environment_assets_are_prepared_in_parallel(
         ) -> tuple[dict[str, Any], list[Any]]:
             """Return one prepared prompt after publishing environment-local status."""
             assert request_cache is not None
+            self.calls.append("prompt_assets")
             status_callback("Downloading prompt asset", 1, 1)
             return inputs, []
 
@@ -6150,12 +6162,14 @@ def test_remote_environment_assets_are_prepared_in_parallel(
             provider=api_intercept_module.ExecutionProvider.SSH_DOCKER,
         ),
     }
+    vast_engine = FakeSyncEngine()
+    ssh_engine = FakeSyncEngine()
     results = api_intercept_module._prepare_remote_environment_assets(
         components=components,
         assignments_by_component_id=assignments,
         sync_engines_by_environment={
-            "vast:big:1": FakeSyncEngine(),
-            "lambda": FakeSyncEngine(),
+            "vast:big:1": vast_engine,
+            "lambda": ssh_engine,
         },
         rewritten_prompt={
             "a": {"class_type": "VAELoader", "inputs": {"vae": "a.safetensors"}},
@@ -6178,6 +6192,13 @@ def test_remote_environment_assets_are_prepared_in_parallel(
     assert results["lambda"].component_prompts["b"]["b"]["inputs"] == {
         "vae": "b.safetensors"
     }
+    assert vast_engine.calls == [
+        "r2_preflight",
+        "custom_nodes",
+        "asset_plan",
+        "prompt_assets",
+    ]
+    assert ssh_engine.calls == vast_engine.calls
     for environment_id in results:
         messages = [
             message
@@ -6204,6 +6225,10 @@ def test_remote_environment_asset_worker_failures_bubble_up(
 
     class FailingSyncEngine:
         """Fail before prompt assets are considered prepared."""
+
+        def preflight_r2_access(self, *, status_callback: Any) -> None:
+            """Represent an environment without configured R2 backing."""
+            del status_callback
 
         def sync_custom_nodes_directory(self, *, status_callback: Any) -> None:
             """Raise the representative environment-specific setup failure."""
