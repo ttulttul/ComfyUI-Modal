@@ -8980,12 +8980,14 @@ def _set_remote_preparation(
     preparation_lock = getattr(prompt_queue, _REMOTE_PREPARATION_LOCK_ATTR, None)
     if not isinstance(preparations, dict) or preparation_lock is None:
         return False
+    preparation_extra_data = copy.deepcopy(dict(extra_data))
+    preparation_extra_data.setdefault("create_time", int(time.time() * 1000))
     with preparation_lock:
         preparations[prompt_id] = (
             0,
             prompt_id,
             copy.deepcopy(dict(prompt)),
-            copy.deepcopy(dict(extra_data)),
+            preparation_extra_data,
             [],
             {},
         )

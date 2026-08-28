@@ -6577,6 +6577,10 @@ def test_remote_preparation_bridge_exposes_work_to_all_queue_views(
     assert [item[1] for item in prompt_queue.get_current_queue_volatile()[0]] == [
         "prompt-preparing"
     ]
+    preparation_item = prompt_queue.get_current_queue_volatile()[0][0]
+    assert preparation_item[3]["client_id"] == "client-1"
+    assert isinstance(preparation_item[3]["create_time"], int)
+    assert preparation_item[3]["create_time"] > 0
 
     prompt_queue.queued.append((1, "prompt-preparing", {}, {}, []))
     assert prompt_queue.get_tasks_remaining() == 1
