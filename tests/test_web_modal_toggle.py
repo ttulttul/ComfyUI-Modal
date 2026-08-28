@@ -92,6 +92,7 @@ def test_configurator_renders_out_of_band_plan_and_status() -> None:
     assert "function registerRemoteConfiguratorPlan(promptId, assignments, configurations)" in source
     assert "function renderRemoteConfiguratorStatus(panel, state)" in source
     assert "function renderRemoteConfiguratorEnvironments(panel, assignments, configurations)" in source
+    assert "function promoteProvisionalVastEnvironment(" in source
     assert "function remoteConfiguratorStorageEntries(configurations)" in source
     assert "function renderRemoteConfiguratorStorage(panel, configurations)" in source
     assert "function updateRemoteConfiguratorEnvironmentStatus(promptId, detail)" in source

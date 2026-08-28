@@ -1649,7 +1649,7 @@ modalToggle.registerRemoteConfiguratorPlan(
   {
     "14": {
       provider: "vast",
-      environment_id: "vast:profile:slot-0",
+      environment_id: "vast:vast-big",
       configuration_id: "vast-big",
       node_ids: ["14", "15"],
       predicted_cost_usd: 0.031,
@@ -1882,7 +1882,17 @@ modalToggle.handleModalStatus({
     prompt_id: "plan-before-capacity",
     node_ids: ["14", "15"],
     configurator_node_id: "381",
-    execution_environment_id: "vast:profile:slot-0",
+    execution_environment_id: "vast:vast-big",
+    status_message: "Vast.ai worker is ready",
+  },
+});
+modalToggle.handleModalStatus({
+  detail: {
+    phase: "setup",
+    prompt_id: "plan-before-capacity",
+    node_ids: ["14", "15"],
+    configurator_node_id: "381",
+    execution_environment_id: "vast:vast-big:49052528",
     status_message: "Uploading Vast assets",
     status_current: 3,
     status_total: 10,
@@ -1900,8 +1910,24 @@ modalToggle.handleModalStatus({
     status_total: 4,
   },
 });
-const vastEnvironmentRow = retainedPanel.environmentRows.get("vast:profile:slot-0");
+const vastEnvironmentRow = retainedPanel.environmentRows.get("vast:vast-big:49052528");
 const modalEnvironmentRow = retainedPanel.environmentRows.get("modal:lambda");
+assert.equal(retainedPanel.environmentRows.size, 2);
+assert.equal(retainedPanel.environmentRows.has("vast:vast-big"), false);
+assert.equal(
+  vastEnvironmentRow.label.textContent,
+  "Vast Big · Vast.ai vast:vast-big:49052528",
+);
+assert.equal(
+  retainedPanel.assignments["14"].environment_id,
+  "vast:vast-big:49052528",
+);
+assert.equal(
+  modalToggle.modalPromptStates
+    .get("plan-before-capacity")
+    .remoteEnvironmentStatuses.has("vast:vast-big"),
+  false,
+);
 assert.equal(vastEnvironmentRow.statusText.textContent, "Uploading Vast assets");
 assert.equal(vastEnvironmentRow.progressValue.textContent, "3/10");
 assert.equal(vastEnvironmentRow.progressFill.style.width, "30%");
@@ -1920,7 +1946,7 @@ modalToggle.handleModalStatus({
 });
 const failedPromptState = modalToggle.modalPromptStates.get("plan-before-capacity");
 assert.equal(
-  failedPromptState.remoteEnvironmentStatuses.get("vast:profile:slot-0")?.phase,
+  failedPromptState.remoteEnvironmentStatuses.get("vast:vast-big:49052528")?.phase,
   "error",
 );
 assert.equal(
@@ -1935,7 +1961,7 @@ modalToggle.registerRemoteConfiguratorPlan(
   failedPromptState.remoteExecutionConfigurations,
 );
 assert.equal(
-  retainedPanel.environmentRows.get("vast:profile:slot-0").root.dataset.phase,
+  retainedPanel.environmentRows.get("vast:vast-big:49052528").root.dataset.phase,
   "error",
 );
 assert.equal(

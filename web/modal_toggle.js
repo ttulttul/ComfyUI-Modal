@@ -4321,6 +4321,52 @@ function registerRemoteConfiguratorPlan(promptId, assignments, configurations) {
 }
 
 /**
+ * Replace one provisional Vast configuration lane with its concrete lease lane.
+ * @param {Record<string, any>} panel
+ * @param {Record<string, any>} promptState
+ * @param {string} concreteEnvironmentId
+ * @returns {boolean}
+ */
+function promoteProvisionalVastEnvironment(
+  panel,
+  promptState,
+  concreteEnvironmentId,
+) {
+  const provisionalEnvironmentIds = Object.values(panel?.assignments ?? {})
+    .filter((assignment) => assignment?.provider === "vast")
+    .map((assignment) => `vast:${String(assignment?.configuration_id ?? "")}`)
+    .filter(
+      (environmentId) =>
+        panel.environmentRows.has(environmentId) &&
+        /^\d+$/.test(concreteEnvironmentId.slice(environmentId.length + 1)) &&
+        concreteEnvironmentId.startsWith(`${environmentId}:`),
+    )
+    .sort((left, right) => right.length - left.length);
+  const provisionalEnvironmentId = provisionalEnvironmentIds[0];
+  if (!provisionalEnvironmentId) {
+    return false;
+  }
+  const assignments = Object.fromEntries(
+    Object.entries(promptState.remoteExecutionPlanAssignments).map(([componentId, assignment]) => [
+      componentId,
+      assignment?.environment_id === provisionalEnvironmentId
+        ? { ...assignment, environment_id: concreteEnvironmentId }
+        : assignment,
+    ]),
+  );
+  const provisionalState = promptState.remoteEnvironmentStatuses.get(
+    provisionalEnvironmentId,
+  );
+  promptState.remoteEnvironmentStatuses.delete(provisionalEnvironmentId);
+  if (provisionalState && !promptState.remoteEnvironmentStatuses.has(concreteEnvironmentId)) {
+    promptState.remoteEnvironmentStatuses.set(concreteEnvironmentId, provisionalState);
+  }
+  promptState.remoteExecutionPlanAssignments = assignments;
+  renderRemoteConfiguratorPlan(panel, assignments, promptState.remoteExecutionConfigurations);
+  return true;
+}
+
+/**
  * Store and render one environment's latest status independently of its peers.
  * @param {string} promptId
  * @param {Record<string, any>} detail
@@ -4330,6 +4376,10 @@ function updateRemoteConfiguratorEnvironmentStatus(promptId, detail) {
   const promptState = modalPromptStates.get(promptId);
   if (!environmentId || !promptState) {
     return;
+  }
+  const panel = remoteConfiguratorPanel(promptState.configuratorNodeId);
+  if (panel?.promptId === promptId && !panel.environmentRows.has(environmentId)) {
+    promoteProvisionalVastEnvironment(panel, promptState, environmentId);
   }
   const existing = promptState.remoteEnvironmentStatuses.get(environmentId) ?? {};
   const state = {
@@ -4342,7 +4392,6 @@ function updateRemoteConfiguratorEnvironmentStatus(promptId, detail) {
     updatedAt: nowMs(),
   };
   promptState.remoteEnvironmentStatuses.set(environmentId, state);
-  const panel = remoteConfiguratorPanel(promptState.configuratorNodeId);
   if (!panel || panel.promptId !== promptId) {
     return;
   }
