@@ -492,6 +492,14 @@ def mapped_execution_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_llm_profile_staging_module(extension_package: object) -> object:
+    """Return host-side Modal LLM staging helpers and registry state."""
+    return importlib.import_module(
+        f"{PACKAGE_NAME}.remote.modal_llm_profile_staging"
+    )
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")

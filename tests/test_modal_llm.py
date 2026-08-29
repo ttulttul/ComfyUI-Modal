@@ -2731,6 +2731,7 @@ def test_resident_manager_reports_ssh_docker_execution_target(
 
 def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The local dispatcher should finish CPU staging before sending work to a GPU."""
@@ -2773,10 +2774,14 @@ def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
             assert class_name == "ModelStager"
             return FakeRemoteClass()
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", SimpleNamespace(Cls=FakeCls))
-    with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
-        remote_modal_app_module._STAGED_LLM_PROFILES.clear()
-        remote_modal_app_module._STAGED_LLM_PROFILE_RESULTS.clear()
+    monkeypatch.setattr(
+        modal_llm_profile_staging_module,
+        "modal",
+        SimpleNamespace(Cls=FakeCls),
+    )
+    with modal_llm_profile_staging_module._STAGED_LLM_PROFILES_LOCK:
+        modal_llm_profile_staging_module._STAGED_LLM_PROFILES.clear()
+        modal_llm_profile_staging_module._STAGED_LLM_PROFILE_RESULTS.clear()
     payload = {
         "component_id": "llm-component",
         "subgraph_prompt": {
@@ -2787,9 +2792,9 @@ def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
         },
     }
 
-    remote_modal_app_module._ensure_llm_profiles_staged(payload, "test-b300-app")
+    modal_llm_profile_staging_module._ensure_llm_profiles_staged(payload, "test-b300-app")
     first_marker = payload["volume_reload_marker"]
-    remote_modal_app_module._ensure_llm_profiles_staged(payload, "test-b300-app")
+    modal_llm_profile_staging_module._ensure_llm_profiles_staged(payload, "test-b300-app")
 
     assert stage_calls == [["smolvlm2-2.2b-instruct"]]
     assert payload["requires_volume_reload"] is True
@@ -2798,6 +2803,7 @@ def test_remote_dispatch_stages_llm_once_and_forces_volume_reload(
 
 def test_remote_dispatch_rewrites_hugging_face_id_to_generated_profile(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GPU payloads should contain only immutable generated profile IDs."""
@@ -2829,10 +2835,14 @@ def test_remote_dispatch_rewrites_hugging_face_id_to_generated_profile(
             assert class_name == "ModelStager"
             return lambda: SimpleNamespace(stage_profiles=FakeStageMethod())
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", SimpleNamespace(Cls=FakeCls))
-    with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
-        remote_modal_app_module._STAGED_LLM_PROFILES.clear()
-        remote_modal_app_module._STAGED_LLM_PROFILE_RESULTS.clear()
+    monkeypatch.setattr(
+        modal_llm_profile_staging_module,
+        "modal",
+        SimpleNamespace(Cls=FakeCls),
+    )
+    with modal_llm_profile_staging_module._STAGED_LLM_PROFILES_LOCK:
+        modal_llm_profile_staging_module._STAGED_LLM_PROFILES.clear()
+        modal_llm_profile_staging_module._STAGED_LLM_PROFILE_RESULTS.clear()
     payload = {
         "component_id": "dynamic-llm",
         "subgraph_prompt": {
@@ -2843,12 +2853,12 @@ def test_remote_dispatch_rewrites_hugging_face_id_to_generated_profile(
         },
     }
 
-    remote_modal_app_module._ensure_llm_profiles_staged(payload, "test-b300-app")
+    modal_llm_profile_staging_module._ensure_llm_profiles_staged(payload, "test-b300-app")
     direct_inputs = remote_modal_app_module.serialize_node_inputs(
         {"model_profile": requested_model, "prompt": "hello"}
     )
     rewritten_inputs = remote_modal_app_module.deserialize_node_inputs(
-        remote_modal_app_module._rewrite_staged_llm_kwargs_payload(
+        modal_llm_profile_staging_module._rewrite_staged_llm_kwargs_payload(
             direct_inputs,
             "test-b300-app",
         )
@@ -2867,6 +2877,7 @@ def test_remote_dispatch_rewrites_hugging_face_id_to_generated_profile(
 
 def test_remote_dispatch_streams_cpu_llm_staging_progress(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """First-run Hugging Face progress should render before GPU allocation."""
@@ -2908,15 +2919,19 @@ def test_remote_dispatch_streams_cpu_llm_staging_progress(
             assert class_name == "ModelStager"
             return lambda: SimpleNamespace(stage_profiles_stream=FakeStageStream())
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", SimpleNamespace(Cls=FakeCls))
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_llm_profile_staging_module,
+        "modal",
+        SimpleNamespace(Cls=FakeCls),
+    )
+    monkeypatch.setattr(
+        modal_llm_profile_staging_module,
         "_emit_local_llm_staging_progress",
         lambda payload, event: observed_progress.append(dict(event)),
     )
-    with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
-        remote_modal_app_module._STAGED_LLM_PROFILES.clear()
-        remote_modal_app_module._STAGED_LLM_PROFILE_RESULTS.clear()
+    with modal_llm_profile_staging_module._STAGED_LLM_PROFILES_LOCK:
+        modal_llm_profile_staging_module._STAGED_LLM_PROFILES.clear()
+        modal_llm_profile_staging_module._STAGED_LLM_PROFILE_RESULTS.clear()
     payload = {
         "prompt_id": "prompt-1",
         "component_id": "llm-node",
@@ -2929,7 +2944,7 @@ def test_remote_dispatch_streams_cpu_llm_staging_progress(
         },
     }
 
-    remote_modal_app_module._ensure_llm_profiles_staged(payload, "test-app")
+    modal_llm_profile_staging_module._ensure_llm_profiles_staged(payload, "test-app")
 
     assert observed_progress == [
         {
@@ -2950,6 +2965,7 @@ def test_remote_dispatch_streams_cpu_llm_staging_progress(
 
 def test_modal_staging_stream_has_bounded_no_progress_wait(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A silent Modal generator should be closed instead of hanging forever."""
@@ -2980,19 +2996,20 @@ def test_modal_staging_stream_has_bounded_no_progress_wait(
         remote_modal_app_module.ModalRemoteInvocationError,
         match="produced no progress",
     ):
-        list(remote_modal_app_module._bounded_modal_stage_events(stream))
+        list(modal_llm_profile_staging_module._bounded_modal_stage_events(stream))
 
     assert stream.closed.is_set()
 
 
 def test_llm_staging_progress_targets_the_matching_llm_node(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A component representative must not receive an inner LLM staging bar."""
     observed_progress: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_llm_profile_staging_module,
         "_emit_local_modal_progress",
         lambda **kwargs: observed_progress.append(kwargs),
     )
@@ -3014,7 +3031,7 @@ def test_llm_staging_progress_targets_the_matching_llm_node(
         },
     }
 
-    remote_modal_app_module._emit_local_llm_staging_progress(
+    modal_llm_profile_staging_module._emit_local_llm_staging_progress(
         payload,
         {
             "stage": "metadata",

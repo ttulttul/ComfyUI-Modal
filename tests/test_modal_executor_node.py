@@ -6449,6 +6449,7 @@ def test_modal_cloud_finds_memory_mapped_compile_cache_files(
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     modal_deployment_module: Any,
     local_ui_events_module: Any,
     monkeypatch: Any,
@@ -6522,6 +6523,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_llm_profile_staging_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
         local_ui_events_module,
@@ -6537,8 +6539,8 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module.get_settings.cache_clear()
     modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
     modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
-    with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
-        remote_modal_app_module._STAGED_LLM_PROFILES.clear()
+    with modal_llm_profile_staging_module._STAGED_LLM_PROFILES_LOCK:
+        modal_llm_profile_staging_module._STAGED_LLM_PROFILES.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {
@@ -6559,8 +6561,8 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         remote_modal_app_module.get_settings.cache_clear()
         modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
         modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
-        with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
-            remote_modal_app_module._STAGED_LLM_PROFILES.clear()
+        with modal_llm_profile_staging_module._STAGED_LLM_PROFILES_LOCK:
+            modal_llm_profile_staging_module._STAGED_LLM_PROFILES.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, None)]
@@ -6606,6 +6608,7 @@ def test_remote_modal_does_not_classify_remote_execution_error_as_missing_app(
 
 def test_remote_modal_does_not_redeploy_after_remote_execution_error(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -6659,6 +6662,7 @@ def test_remote_modal_does_not_redeploy_after_remote_execution_error(
         raise AssertionError("remote execution errors must not trigger auto-deploy")
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_llm_profile_staging_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "_load_modal_cloud_module", fail_load_cloud_module)
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
@@ -6675,6 +6679,7 @@ def test_remote_modal_does_not_redeploy_after_remote_execution_error(
 
 def test_remote_modal_redeploys_when_cached_app_was_deleted(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -6740,6 +6745,7 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_llm_profile_staging_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
         modal_deployment_module,
@@ -6772,6 +6778,7 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
 
 def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_invoke(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -6843,6 +6850,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_llm_profile_staging_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
         modal_deployment_module,
@@ -6870,6 +6878,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
 
 def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
@@ -6941,6 +6950,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_llm_profile_staging_module, "modal", FakeModal)
     monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
@@ -6968,6 +6978,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
 
 def test_remote_modal_replaces_out_of_date_deployed_app(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -7051,6 +7062,7 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
         FakeModal.deployed = False
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_llm_profile_staging_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "_stop_modal_app_for_replacement", fake_stop_app)
     monkeypatch.setattr(
@@ -7414,6 +7426,7 @@ def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
 
 def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     remote_modal_app_module: Any,
+    modal_llm_profile_staging_module: Any,
     modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
@@ -7500,6 +7513,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_llm_profile_staging_module, "modal", FakeModal)
     monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
