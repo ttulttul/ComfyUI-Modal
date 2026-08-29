@@ -516,6 +516,8 @@ COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
 
 For full local development including the remote and Apple-local extras, use `uv sync --extra remote --extra local-apple --group test`.
 
+The prompt interception layer is organized as a compatibility aggregator over focused modules: `remote_plan_types.py` owns planning values, `modal_hardware.py` owns hardware metadata, `intercept_route_paths.py` owns route derivation, `modal_admin_ops.py` owns persistent-object maintenance, and `modal_ui_events.py` owns client event buffering. Root modules support both package imports used by ComfyUI and flat imports used by the Modal container; `tests/test_import_shapes.py` guards both layouts and the stable `comfyui_modal_sync_cloud` surface.
+
 ### Vast.ai API Simulator
 
 Vast development and CI need no live credentials or billable instances. Start the stateful local simulator:

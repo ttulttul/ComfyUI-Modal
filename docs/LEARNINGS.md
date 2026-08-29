@@ -13,6 +13,8 @@
 
 - Every module that directly uses the optional Modal SDK owns its own guarded `modal` binding (`try: import modal` / `except ModuleNotFoundError: modal = None`). Do not centralize that binding in a shared compatibility module: local tests and fallback paths need to monkeypatch the exact consumer module without mutating unrelated consumers.
 - Tests must patch `modal` on the module whose function is under test. This remains true after an implementation moves to an extracted module; patching a compatibility re-export on its former module does not change the moved function's globals.
+- Compatibility aggregators may safely re-export functions, immutable value types, and tables whose identity is intentionally shared. Mutable lifecycle state such as locks, queues, and cache dictionaries must have one owner; tests should address that owner directly so clearing or replacing a binding cannot silently affect the wrong module.
+- Import compatibility needs executable coverage rather than inspection. Dynamically importing every root module under both the ComfyUI package identity and the Modal container's flat identity caught four legacy relative-only roots before the first extraction landed.
 
 ## 2026-08-29: Vast publication cost is dominated by stable dependencies
 
