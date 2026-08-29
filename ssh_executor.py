@@ -572,7 +572,7 @@ class SshDockerExecutorClient:
 
         def emit_runtime_status(message: str) -> None:
             """Forward worker lifecycle progress to its Configurator row."""
-            from .remote.modal_app import _emit_local_remote_startup_status
+            from .remote.local_ui_events import _emit_local_remote_startup_status
 
             _emit_local_remote_startup_status(
                 payload,

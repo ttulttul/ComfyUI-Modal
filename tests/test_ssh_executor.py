@@ -9,7 +9,7 @@ from typing import Any
 
 def test_runtime_uses_workflow_host_snapshot_without_global_registry(
     ssh_executor_module: Any,
-    remote_modal_app_module: Any,
+    local_ui_events_module: Any,
     remote_hosts_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
@@ -56,7 +56,7 @@ def test_runtime_uses_workflow_host_snapshot_without_global_registry(
     monkeypatch.setattr(ssh_executor_module, "SshDockerController", FakeController)
     monkeypatch.setattr(ssh_executor_module, "SshRuntimeManager", FakeManager)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        local_ui_events_module,
         "_emit_local_remote_startup_status",
         lambda payload, **kwargs: observed.setdefault("status_events", []).append(
             (payload, kwargs)

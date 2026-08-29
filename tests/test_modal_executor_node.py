@@ -6433,6 +6433,7 @@ def test_modal_cloud_finds_memory_mapped_compile_cache_files(
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module: Any,
+    local_ui_events_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Remote mode should auto-deploy the stable Modal app on first lookup failure."""
@@ -6505,7 +6506,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        local_ui_events_module,
         "_emit_local_modal_status",
         lambda **event: status_events.append(event),
     )
@@ -8181,6 +8182,7 @@ def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
 
 def test_remote_modal_consumes_streamed_progress_and_result(
     remote_modal_app_module: Any,
+    local_ui_events_module: Any,
     monkeypatch: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -8198,7 +8200,7 @@ def test_remote_modal_consumes_streamed_progress_and_result(
             self.messages.append((event, data, sid))
 
     prompt_server = FakePromptServer()
-    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+    monkeypatch.setattr(local_ui_events_module, "_lookup_local_prompt_server", lambda: prompt_server)
 
     payload = {
         "prompt_id": "prompt-1",
@@ -8323,6 +8325,7 @@ def test_remote_stream_first_event_triggers_speculative_prewarm_once(
 
 def test_emit_local_remote_dispatch_status_marks_component_starting(
     remote_modal_app_module: Any,
+    local_ui_events_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Dispatching a remote component should immediately tell the local UI it is starting."""
@@ -8339,7 +8342,7 @@ def test_emit_local_remote_dispatch_status_marks_component_starting(
             self.messages.append((event, data, sid))
 
     prompt_server = FakePromptServer()
-    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+    monkeypatch.setattr(local_ui_events_module, "_lookup_local_prompt_server", lambda: prompt_server)
 
     remote_modal_app_module._emit_local_remote_dispatch_status(
         {
@@ -9218,6 +9221,7 @@ def test_remote_modal_log_stream_survives_short_container_reuse_gap(
 
 def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
     remote_modal_app_module: Any,
+    local_ui_events_module: Any,
     monkeypatch: Any,
     serialization_module: Any,
 ) -> None:
@@ -9240,7 +9244,7 @@ def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
     Image.new("RGB", (2, 2), color="red").save(preview_buffer, format="PNG")
 
     prompt_server = FakePromptServer()
-    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+    monkeypatch.setattr(local_ui_events_module, "_lookup_local_prompt_server", lambda: prompt_server)
 
     payload = {
         "prompt_id": "prompt-1",
@@ -9323,6 +9327,7 @@ def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
 
 def test_remote_modal_consumes_streamed_boundary_output_preview_targets(
     remote_modal_app_module: Any,
+    local_ui_events_module: Any,
     monkeypatch: Any,
     serialization_module: Any,
 ) -> None:
@@ -9360,7 +9365,7 @@ def test_remote_modal_consumes_streamed_boundary_output_preview_targets(
             }
 
     prompt_server = FakePromptServer()
-    monkeypatch.setattr(remote_modal_app_module, "_lookup_local_prompt_server", lambda: prompt_server)
+    monkeypatch.setattr(local_ui_events_module, "_lookup_local_prompt_server", lambda: prompt_server)
     monkeypatch.setitem(sys.modules, "nodes", types.SimpleNamespace(PreviewImage=FakePreviewImage))
 
     payload = {

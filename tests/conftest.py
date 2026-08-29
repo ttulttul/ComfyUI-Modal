@@ -468,6 +468,12 @@ def local_execution_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def local_ui_events_module(extension_package: object) -> object:
+    """Return local ComfyUI event emission helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.local_ui_events")
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")
