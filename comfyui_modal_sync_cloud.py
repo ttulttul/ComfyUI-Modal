@@ -158,7 +158,6 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
         _serialize_loader_cache_key,
         _validated_custom_node_asset_relative_path,
         _wrap_loader_method_with_cache,
-        clear_warm_caches as clear_comfy_bootstrap_warm_caches,
         configure_cloud_comfy_bootstrap_hooks,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
@@ -206,7 +205,6 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         _serialize_loader_cache_key,
         _validated_custom_node_asset_relative_path,
         _wrap_loader_method_with_cache,
-        clear_warm_caches as clear_comfy_bootstrap_warm_caches,
         configure_cloud_comfy_bootstrap_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
@@ -330,7 +328,6 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
         _unwrap_wrapped_prompt_link,
         _validate_prompt_input_shapes,
         _validate_required_prompt_inputs,
-        clear_warm_caches as clear_cloud_prompt_execution_warm_caches,
         configure_cloud_prompt_execution_hooks,
         execute_node_locally,
         execute_subgraph_locally,
@@ -386,7 +383,6 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         _unwrap_wrapped_prompt_link,
         _validate_prompt_input_shapes,
         _validate_required_prompt_inputs,
-        clear_warm_caches as clear_cloud_prompt_execution_warm_caches,
         configure_cloud_prompt_execution_hooks,
         execute_node_locally,
         execute_subgraph_locally,
@@ -424,6 +420,106 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         _abandon_streamed_remote_invocation,
         _stream_remote_payload_events as _stream_remote_payload_events_impl,
         configure_cloud_streaming_errors,
+    )
+try:  # noqa: E402 - support package and flat Modal-container imports.
+    from .cloud_volume_reload import (
+        CloudVolumeReloadHooks,
+        _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS,
+        _clear_warm_remote_caches,
+        _custom_nodes_manifest_dependency_paths,
+        _download_committed_volume_path,
+        _emit_modal_volume_reload_skip,
+        _has_seen_modal_volume_reload_marker,
+        _hydrate_missing_payload_volume_paths,
+        _is_modal_volume_open_files_error,
+        _iter_payload_input_strings,
+        _log_payload_volume_reload_diagnostics,
+        _modal_volume_reload_marker,
+        _payload_uploaded_volume_paths,
+        _payload_uploaded_volume_paths_visible,
+        _payload_volume_paths,
+        _payload_volume_paths_visible,
+        _prepare_for_modal_volume_reload,
+        _record_modal_volume_reload_marker,
+        _reload_modal_volume_for_request,
+        _runtime_volume_path_visible,
+        _should_reload_modal_volume,
+        _sleep_before_modal_volume_reload_retry,
+        configure_cloud_volume_reload_hooks,
+    )
+except ImportError:  # pragma: no cover - exercised by flat cloud imports.
+    from cloud_volume_reload import (
+        CloudVolumeReloadHooks,
+        _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS,
+        _clear_warm_remote_caches,
+        _custom_nodes_manifest_dependency_paths,
+        _download_committed_volume_path,
+        _emit_modal_volume_reload_skip,
+        _has_seen_modal_volume_reload_marker,
+        _hydrate_missing_payload_volume_paths,
+        _is_modal_volume_open_files_error,
+        _iter_payload_input_strings,
+        _log_payload_volume_reload_diagnostics,
+        _modal_volume_reload_marker,
+        _payload_uploaded_volume_paths,
+        _payload_uploaded_volume_paths_visible,
+        _payload_volume_paths,
+        _payload_volume_paths_visible,
+        _prepare_for_modal_volume_reload,
+        _record_modal_volume_reload_marker,
+        _reload_modal_volume_for_request,
+        _runtime_volume_path_visible,
+        _should_reload_modal_volume,
+        _sleep_before_modal_volume_reload_retry,
+        configure_cloud_volume_reload_hooks,
+    )
+try:  # noqa: E402 - support package and flat Modal-container imports.
+    from .cloud_prewarm import (
+        CloudPrewarmHooks,
+        _LLMCompileMissCheckpoint,
+        _build_loader_prewarm_payload,
+        _commit_actual_llm_compile_cache,
+        _execute_llm_prewarm_plans,
+        _execute_loader_prewarm_plans,
+        _llm_compile_manifest_path,
+        _llm_compile_miss_checkpoint,
+        _llm_profiles_in_payload,
+        _llm_prewarm_model_profile,
+        _loader_prewarm_plan_key,
+        _log_compile_cache_memory_maps,
+        _mapped_process_files_under,
+        _prepare_warm_container_for_request,
+        _prewarm_restored_runtime,
+        _prewarm_snapshot_state,
+        _reload_compile_cache_volume,
+        _triton_compile_listener_engine_pids,
+        _triton_compile_miss_signal_size,
+        _write_llm_compile_manifest,
+        configure_cloud_prewarm_hooks,
+    )
+except ImportError:  # pragma: no cover - exercised by flat cloud imports.
+    from cloud_prewarm import (
+        CloudPrewarmHooks,
+        _LLMCompileMissCheckpoint,
+        _build_loader_prewarm_payload,
+        _commit_actual_llm_compile_cache,
+        _execute_llm_prewarm_plans,
+        _execute_loader_prewarm_plans,
+        _llm_compile_manifest_path,
+        _llm_compile_miss_checkpoint,
+        _llm_profiles_in_payload,
+        _llm_prewarm_model_profile,
+        _loader_prewarm_plan_key,
+        _log_compile_cache_memory_maps,
+        _mapped_process_files_under,
+        _prepare_warm_container_for_request,
+        _prewarm_restored_runtime,
+        _prewarm_snapshot_state,
+        _reload_compile_cache_volume,
+        _triton_compile_listener_engine_pids,
+        _triton_compile_miss_signal_size,
+        _write_llm_compile_manifest,
+        configure_cloud_prewarm_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_session_bridge import (
@@ -597,26 +693,7 @@ logger = logging.getLogger(__name__)
 # Cloud app and ComfyUI bootstrap state.
 _CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
 
-# Loader and prewarm state.
-_LOADER_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
-_LOADER_PREWARM_PLAN_KEYS: set[str] = set()
-_LLM_PREWARM_PLAN_KEYS_LOCK = threading.Lock()
-_LLM_PREWARM_PLAN_KEYS: set[str] = set()
-
-# Modal volume reload and poisoned-container retirement state.
-_MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
-_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (
-    0.0,
-    0.25,
-    0.5,
-    1.0,
-    2.0,
-    4.0,
-    8.0,
-)
-_MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT = 256
-_MODAL_VOLUME_RELOAD_MARKERS: queue.SimpleQueue[str] | None = None
-_MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
+# Poisoned-container retirement state.
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
 _REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS = 1.0
 _CONTAINER_TERMINATION_SCHEDULED = False
@@ -993,1018 +1070,6 @@ def _stream_remote_payload_events(
     )
 
 
-def _prewarm_snapshot_state(
-    *,
-    gpu_snapshot_enabled: bool,
-    snapshot_profile_key: str = "",
-) -> None:
-    """Run snapshot-safe initialization before Modal captures a memory snapshot."""
-    with _timed_phase(
-        "prewarm_snapshot_state",
-        gpu_snapshot=gpu_snapshot_enabled,
-        snapshot_profile=snapshot_profile_key or None,
-    ):
-        _ensure_comfyui_support_packages()
-        normalized_snapshot_profile_key = snapshot_profile_key.strip()
-        if gpu_snapshot_enabled and normalized_snapshot_profile_key:
-            _ensure_comfy_runtime_initialized(None)
-            _load_execution_module()
-            loader_prewarm_plans = _load_loader_snapshot_profile(
-                normalized_snapshot_profile_key
-            )
-            if loader_prewarm_plans:
-                _execute_loader_prewarm_plans(
-                    component_id=f"snapshot-profile:{normalized_snapshot_profile_key}",
-                    loader_prewarm_plans=loader_prewarm_plans,
-                    custom_nodes_root=None,
-                )
-            _emit_cloud_info(
-                "Completed GPU-snapshot ComfyUI prewarm before snapshot capture."
-            )
-            return
-
-        if gpu_snapshot_enabled:
-            _emit_cloud_info(
-                "Skipping GPU-snapshot ComfyUI prewarm before snapshot capture because no snapshot profile was provided."
-            )
-        else:
-            _emit_cloud_info(
-                "Skipping full ComfyUI runtime prewarm during CPU-only snapshot to avoid accidental CUDA initialization."
-            )
-
-
-def _reload_compile_cache_volume(volume: Any | None) -> bool:
-    """Refresh persistent compiler artifacts before a runtime opens its caches."""
-    if volume is None:
-        return False
-    reload_method = getattr(volume, "reload", None)
-    if not callable(reload_method):
-        logger.warning("Modal compile-cache Volume does not expose reload().")
-        return False
-    with _timed_phase("llm_compile_cache_reload"):
-        try:
-            reload_method()
-        except RuntimeError as exc:
-            if _is_modal_volume_open_files_error(exc):
-                _log_compile_cache_memory_maps()
-            raise
-    return True
-
-
-def _mapped_process_files_under(
-    volume_root: Path,
-    *,
-    proc_root: Path = Path("/proc"),
-) -> tuple[tuple[int, str], ...]:
-    """Return process ids and files memory-mapped beneath one filesystem root."""
-    try:
-        resolved_root = volume_root.resolve(strict=True)
-        process_directories = tuple(proc_root.iterdir())
-    except OSError:
-        return ()
-
-    mapped_files: set[tuple[int, str]] = set()
-    for process_directory in process_directories:
-        if not process_directory.name.isdecimal():
-            continue
-        try:
-            maps_text = (process_directory / "maps").read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-        except OSError:
-            continue
-        for line in maps_text.splitlines():
-            fields = line.split(maxsplit=5)
-            if len(fields) != 6 or not fields[5].startswith("/"):
-                continue
-            mapped_path = fields[5].removesuffix(" (deleted)")
-            try:
-                Path(mapped_path).relative_to(resolved_root)
-            except ValueError:
-                continue
-            mapped_files.add((int(process_directory.name), mapped_path))
-    return tuple(sorted(mapped_files))
-
-
-def _log_compile_cache_memory_maps() -> None:
-    """Log native mappings that explain a busy compile-cache Volume reload."""
-    mapped_files = _mapped_process_files_under(_REMOTE_LLM_COMPILE_CACHE_ROOT)
-    if not mapped_files:
-        logger.warning(
-            "Modal compile-cache Volume reload reported open files, but no "
-            "memory-mapped cache files were visible in /proc."
-        )
-        return
-    logger.error(
-        "Modal compile-cache Volume reload is blocked by %d memory-mapped "
-        "native cache file(s): %s",
-        len(mapped_files),
-        [
-            {"pid": process_id, "path": mapped_path}
-            for process_id, mapped_path in mapped_files[:8]
-        ],
-    )
-
-
-def _prewarm_restored_runtime(compile_cache_volume: Any | None = None) -> None:
-    """Run post-restore initialization that should be ready before serving requests."""
-    with _timed_phase("prewarm_restored_runtime"):
-        _reload_compile_cache_volume(compile_cache_volume)
-        _ensure_comfy_runtime_initialized(None)
-        _load_execution_module()
-
-
-
-
-def _should_reload_modal_volume(payload: dict[str, Any]) -> bool:
-    """Return whether this request needs the mounted Modal volume reloaded."""
-    if _payload_volume_paths(payload) and not _payload_volume_paths_visible(payload):
-        return True
-    if not bool(payload.get("requires_volume_reload", True)):
-        return False
-    if _payload_uploaded_volume_paths_visible(payload):
-        reload_marker = _modal_volume_reload_marker(payload)
-        if reload_marker is not None:
-            _record_modal_volume_reload_marker(reload_marker)
-        return False
-    reload_marker = _modal_volume_reload_marker(payload)
-    if reload_marker is None:
-        return True
-    return not _has_seen_modal_volume_reload_marker(reload_marker)
-
-
-def _modal_volume_reload_marker(payload: dict[str, Any]) -> str | None:
-    """Return the per-request Modal volume reload marker attached to this payload."""
-    marker = payload.get("volume_reload_marker")
-    if marker is None:
-        return None
-    marker_text = str(marker).strip()
-    return marker_text or None
-
-
-def _has_seen_modal_volume_reload_marker(reload_marker: str) -> bool:
-    """Return whether this container already reloaded the volume for this marker."""
-    with _MODAL_VOLUME_RELOAD_MARKERS_LOCK:
-        return reload_marker in _MODAL_VOLUME_RELOAD_MARKER_SET
-
-
-def _record_modal_volume_reload_marker(reload_marker: str) -> None:
-    """Remember that this container has already reloaded the volume for one marker."""
-    global _MODAL_VOLUME_RELOAD_MARKERS
-
-    with _MODAL_VOLUME_RELOAD_MARKERS_LOCK:
-        if reload_marker in _MODAL_VOLUME_RELOAD_MARKER_SET:
-            return
-        if _MODAL_VOLUME_RELOAD_MARKERS is None:
-            _MODAL_VOLUME_RELOAD_MARKERS = queue.SimpleQueue()
-        _MODAL_VOLUME_RELOAD_MARKER_SET.add(reload_marker)
-        _MODAL_VOLUME_RELOAD_MARKERS.put(reload_marker)
-        while (
-            len(_MODAL_VOLUME_RELOAD_MARKER_SET)
-            > _MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT
-        ):
-            expired_marker = _MODAL_VOLUME_RELOAD_MARKERS.get()
-            _MODAL_VOLUME_RELOAD_MARKER_SET.discard(expired_marker)
-
-
-def _clear_warm_remote_caches() -> None:
-    """Drop warm-container caches that may retain references to mounted volume files."""
-    clear_cloud_prompt_execution_warm_caches()
-    clear_comfy_bootstrap_warm_caches()
-
-
-def _prepare_for_modal_volume_reload() -> None:
-    """Release warm runtime state so a Modal volume reload can proceed safely."""
-    _clear_warm_remote_caches()
-    try:
-        import comfy.model_management as model_management
-    except ModuleNotFoundError:
-        gc.collect()
-        return
-
-    model_management.unload_all_models()
-    model_management.cleanup_models()
-    model_management.soft_empty_cache(True)
-    gc.collect()
-
-
-def _is_modal_volume_open_files_error(exc: RuntimeError) -> bool:
-    """Return whether a Modal volume reload failed because mounted files are still open."""
-    return "open files" in str(exc)
-
-
-def _sleep_before_modal_volume_reload_retry(delay_seconds: float) -> None:
-    """Pause briefly so recently cancelled work can release mounted-volume file handles."""
-    if delay_seconds <= 0:
-        return
-    time.sleep(delay_seconds)
-
-
-def _iter_payload_input_strings(value: Any) -> Iterator[str]:
-    """Yield string literals nested inside one serialized prompt input value."""
-    if isinstance(value, str):
-        yield value
-        return
-    if isinstance(value, list):
-        if len(value) == 2 and isinstance(value[0], str):
-            return
-        for item in value:
-            yield from _iter_payload_input_strings(item)
-        return
-    if isinstance(value, dict):
-        for nested_value in value.values():
-            yield from _iter_payload_input_strings(nested_value)
-
-
-def _payload_volume_paths(payload: dict[str, Any]) -> set[Path]:
-    """Return mounted-volume paths referenced by this remote payload."""
-    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
-    referenced_paths: set[Path] = set()
-
-    custom_nodes_bundle = payload.get("custom_nodes_bundle")
-    if isinstance(custom_nodes_bundle, str):
-        bundle_path = Path(_materialize_remote_asset_path(custom_nodes_bundle))
-        if bundle_path.is_absolute() and bundle_path.resolve().is_relative_to(
-            remote_storage_root
-        ):
-            referenced_paths.add(bundle_path)
-
-    prompt = payload.get("subgraph_prompt", {})
-    if not isinstance(prompt, dict):
-        return referenced_paths
-
-    for prompt_node in prompt.values():
-        if not isinstance(prompt_node, dict):
-            continue
-        inputs = prompt_node.get("inputs", {})
-        if not isinstance(inputs, dict):
-            continue
-        for input_value in inputs.values():
-            for candidate_path in _iter_payload_input_strings(input_value):
-                materialized_path = _materialize_remote_asset_path(candidate_path)
-                materialized_path_obj = Path(materialized_path)
-                if (
-                    materialized_path_obj.is_absolute()
-                    and materialized_path_obj.resolve().is_relative_to(
-                        remote_storage_root
-                    )
-                ):
-                    referenced_paths.add(materialized_path_obj)
-    return referenced_paths
-
-
-def _payload_uploaded_volume_paths(payload: dict[str, Any]) -> set[Path]:
-    """Return newly uploaded mounted-volume paths relevant to this payload."""
-    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
-    uploaded_paths: set[Path] = set()
-    for candidate_path in payload.get("uploaded_volume_paths", []):
-        if isinstance(candidate_path, str) and candidate_path.strip():
-            materialized_path = Path(_materialize_remote_asset_path(candidate_path))
-            if (
-                materialized_path.is_absolute()
-                and materialized_path.resolve().is_relative_to(remote_storage_root)
-            ):
-                uploaded_paths.add(materialized_path)
-    return uploaded_paths
-
-
-def _payload_uploaded_volume_paths_visible(payload: dict[str, Any]) -> bool:
-    """Return whether every newly uploaded mounted-volume path is already visible."""
-    uploaded_paths = _payload_uploaded_volume_paths(payload)
-    if not uploaded_paths:
-        return False
-    return all(_runtime_volume_path_visible(path) for path in uploaded_paths)
-
-
-def _runtime_volume_path_visible(volume_path: Path) -> bool:
-    """Return whether a mounted path is available directly or through read-through storage."""
-    if volume_path.exists():
-        return True
-    cache_path = _readthrough_cache_path(volume_path)
-    return cache_path is not None and cache_path.exists()
-
-
-def _payload_volume_paths_visible(payload: dict[str, Any]) -> bool:
-    """Return whether every mounted-volume path referenced by this payload is already visible."""
-    referenced_paths = _payload_volume_paths(payload)
-    if not referenced_paths:
-        return False
-    return all(_runtime_volume_path_visible(path) for path in referenced_paths)
-
-
-def _download_committed_volume_path(
-    volume: Any, volume_path: Path, cache_path: Path
-) -> None:
-    """Stream one committed Modal Volume file into the worker's ephemeral cache."""
-    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
-    relative_path = volume_path.resolve().relative_to(remote_storage_root).as_posix()
-    read_file_into_fileobj = getattr(volume, "read_file_into_fileobj", None)
-    read_file = getattr(volume, "read_file", None)
-    if not callable(read_file_into_fileobj) and not callable(read_file):
-        raise AttributeError(
-            "The configured Modal Volume does not support committed file reads."
-        )
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{cache_path.name}.",
-        suffix=".tmp",
-        dir=cache_path.parent,
-    )
-    os.close(descriptor)
-    temporary_path = Path(temporary_name)
-    try:
-        with temporary_path.open("wb") as cache_file:
-            if callable(read_file_into_fileobj):
-                read_file_into_fileobj(relative_path, cache_file)
-            else:
-                assert callable(read_file)
-                for chunk in read_file(relative_path):
-                    cache_file.write(chunk)
-        os.replace(temporary_path, cache_path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
-def _custom_nodes_manifest_dependency_paths(
-    volume_path: Path,
-    runtime_path: Path,
-) -> set[Path]:
-    """Return mounted-volume dependencies declared by one custom-node manifest."""
-    remote_storage_root = Path(get_settings().remote_storage_root).resolve()
-    custom_nodes_root = remote_storage_root / "custom_nodes"
-    if (
-        volume_path.suffix.lower() != ".json"
-        or not volume_path.resolve().is_relative_to(custom_nodes_root)
-    ):
-        return set()
-    try:
-        manifest_payload = _load_custom_nodes_manifest(runtime_path)
-    except RuntimeError:
-        return set()
-
-    dependency_paths: set[Path] = set()
-    entry_payloads = manifest_payload.get("entries", [])
-    if not isinstance(entry_payloads, list):
-        return dependency_paths
-    for entry_payload in entry_payloads:
-        if not isinstance(entry_payload, dict):
-            continue
-        candidate_payloads = [entry_payload]
-        asset_payloads = entry_payload.get("assets", [])
-        if isinstance(asset_payloads, list):
-            candidate_payloads.extend(
-                asset_payload
-                for asset_payload in asset_payloads
-                if isinstance(asset_payload, dict)
-            )
-        for candidate_payload in candidate_payloads:
-            remote_path = candidate_payload.get("remote_path")
-            if not isinstance(remote_path, str) or not remote_path.strip():
-                continue
-            materialized_path = Path(_materialize_remote_asset_path(remote_path))
-            if _readthrough_cache_path(materialized_path) is not None:
-                dependency_paths.add(materialized_path)
-    return dependency_paths
-
-
-def _hydrate_missing_payload_volume_paths(
-    volume: Any, payload: dict[str, Any]
-) -> list[Path]:
-    """Cache committed payload files that are absent from this worker's mounted snapshot."""
-    candidate_paths = _payload_volume_paths(payload) | _payload_uploaded_volume_paths(
-        payload
-    )
-    if not candidate_paths:
-        return []
-    if not callable(getattr(volume, "read_file_into_fileobj", None)) and not callable(
-        getattr(volume, "read_file", None)
-    ):
-        return []
-
-    hydrated_paths: list[Path] = []
-    pending_paths = sorted(candidate_paths)
-    visited_paths: set[Path] = set()
-    component_id = str(payload.get("component_id") or "modal-subgraph")
-    while pending_paths:
-        volume_path = pending_paths.pop(0)
-        if volume_path in visited_paths:
-            continue
-        visited_paths.add(volume_path)
-        runtime_path = Path(_resolve_runtime_asset_path(str(volume_path)))
-        if not _runtime_volume_path_visible(volume_path):
-            cache_path = _readthrough_cache_path(volume_path)
-            if cache_path is None:
-                continue
-            try:
-                with _timed_phase(
-                    "committed_volume_readthrough",
-                    component=component_id,
-                    path=volume_path.name,
-                ):
-                    _download_committed_volume_path(volume, volume_path, cache_path)
-            except FileNotFoundError:
-                logger.warning(
-                    "Committed Modal Volume path %s was unavailable for component=%s; falling back to mounted-volume reload.",
-                    volume_path,
-                    component_id,
-                )
-                continue
-            hydrated_paths.append(cache_path)
-            runtime_path = cache_path
-
-        pending_paths.extend(
-            sorted(
-                _custom_nodes_manifest_dependency_paths(volume_path, runtime_path)
-                - visited_paths
-            )
-        )
-
-    if hydrated_paths:
-        _emit_cloud_info(
-            "Hydrated %d missing committed volume file(s) through read-through storage for component=%s.",
-            len(hydrated_paths),
-            component_id,
-        )
-    return hydrated_paths
-
-
-def _log_payload_volume_reload_diagnostics(
-    component_id: str,
-    payload: dict[str, Any] | None,
-    *,
-    context: str,
-) -> None:
-    """Log the mounted-volume paths relevant to one reload decision or failure."""
-    if payload is None:
-        return
-
-    uploaded_paths = sorted(
-        str(path) for path in _payload_uploaded_volume_paths(payload)
-    )
-    referenced_paths = sorted(str(path) for path in _payload_volume_paths(payload))
-    logger.info(
-        "Modal volume reload diagnostics for component=%s context=%s uploaded_paths=%s referenced_paths=%s visible_uploaded=%s visible_referenced=%s.",
-        component_id,
-        context,
-        uploaded_paths,
-        referenced_paths,
-        _payload_uploaded_volume_paths_visible(payload),
-        _payload_volume_paths_visible(payload),
-    )
-
-
-def _reload_modal_volume_for_request(
-    volume: Any,
-    component_id: str,
-    reload_marker: str | None = None,
-    payload: dict[str, Any] | None = None,
-) -> None:
-    """Reload the Modal volume, retrying briefly while warm state releases open files."""
-    with _timed_phase("modal_volume_reload", component=component_id):
-        diagnostics_logged = False
-        for attempt_index, retry_delay_seconds in enumerate(
-            _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS,
-            start=1,
-        ):
-            if attempt_index > 1:
-                _sleep_before_modal_volume_reload_retry(retry_delay_seconds)
-            try:
-                volume.reload()
-                if reload_marker is not None:
-                    _record_modal_volume_reload_marker(reload_marker)
-                if attempt_index > 1:
-                    _emit_cloud_info(
-                        "Modal volume reload succeeded for component=%s after %d attempt(s).",
-                        component_id,
-                        attempt_index,
-                    )
-                return
-            except RuntimeError as exc:
-                if not _is_modal_volume_open_files_error(exc):
-                    raise
-                if payload is not None and not diagnostics_logged:
-                    _log_payload_volume_reload_diagnostics(
-                        component_id,
-                        payload,
-                        context="open_files_retry",
-                    )
-                    diagnostics_logged = True
-                if attempt_index == len(
-                    _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS
-                ):
-                    if payload is not None and _payload_volume_paths_visible(payload):
-                        _emit_cloud_info(
-                            "Modal volume reload still reported open files for component=%s after %d attempt(s), "
-                            "but all referenced mounted-volume paths are already visible. Proceeding without reload.",
-                            component_id,
-                            attempt_index,
-                        )
-                        if reload_marker is not None:
-                            _record_modal_volume_reload_marker(reload_marker)
-                        return
-                    raise
-                _emit_cloud_info(
-                    "Modal volume reload hit open files for component=%s on attempt %d/%d; clearing warm caches and retrying after %.2fs.",
-                    component_id,
-                    attempt_index,
-                    len(_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS),
-                    _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS[attempt_index],
-                )
-                _prepare_for_modal_volume_reload()
-
-
-def _emit_modal_volume_reload_skip(component_id: Any, payload: dict[str, Any]) -> None:
-    """Log why a request did not need a Modal volume reload."""
-    if _payload_uploaded_volume_paths_visible(payload):
-        _emit_cloud_info(
-            "Skipping modal_volume_reload for component=%s because all uploaded mounted-volume paths are already visible in this container.",
-            component_id,
-        )
-        _log_payload_volume_reload_diagnostics(
-            str(component_id),
-            payload,
-            context="skip_visible_uploaded_paths",
-        )
-        return
-    reload_marker = _modal_volume_reload_marker(payload)
-    if reload_marker is not None and _has_seen_modal_volume_reload_marker(
-        reload_marker
-    ):
-        _emit_cloud_info(
-            "Skipping modal_volume_reload for component=%s because this container already reloaded marker=%s.",
-            component_id,
-            reload_marker,
-        )
-        _log_payload_volume_reload_diagnostics(
-            str(component_id),
-            payload,
-            context="skip_reload_marker_seen",
-        )
-        return
-    _emit_cloud_info(
-        "Skipping modal_volume_reload for component=%s because no new assets were uploaded for this request.",
-        component_id,
-    )
-    _log_payload_volume_reload_diagnostics(
-        str(component_id),
-        payload,
-        context="skip_no_new_assets",
-    )
-
-
-def _prepare_warm_container_for_request(
-    volume: Any,
-    payload: dict[str, Any],
-    compile_cache_volume: Any | None = None,
-) -> dict[str, Any]:
-    """Prime one RemoteEngine container for a request before the first real execution payload arrives."""
-    component_id = str(payload.get("component_id") or "modal-warmup")
-    reload_marker = _modal_volume_reload_marker(payload)
-    _hydrate_missing_payload_volume_paths(volume, payload)
-    needs_volume_reload = _should_reload_modal_volume(payload)
-    with _timed_phase("remote_engine_warmup", component=component_id):
-        if needs_volume_reload:
-            _reload_modal_volume_for_request(
-                volume,
-                component_id,
-                reload_marker=reload_marker,
-                payload=payload,
-            )
-        else:
-            _emit_modal_volume_reload_skip(component_id, payload)
-        custom_nodes_bundle = payload.get("custom_nodes_bundle")
-        custom_nodes_root: Path | None = None
-        if isinstance(custom_nodes_bundle, str) and custom_nodes_bundle.strip():
-            custom_nodes_root = _extract_custom_nodes_bundle(custom_nodes_bundle)
-            if custom_nodes_root is not None:
-                _register_custom_nodes_root(custom_nodes_root)
-        loader_prewarm_plans = payload.get("loader_prewarm_plans")
-        if isinstance(loader_prewarm_plans, list) and loader_prewarm_plans:
-            _execute_loader_prewarm_plans(
-                component_id=component_id,
-                loader_prewarm_plans=loader_prewarm_plans,
-                custom_nodes_root=custom_nodes_root,
-            )
-        llm_prewarm_plans = payload.get("llm_prewarm_plans")
-        llm_prewarm_results: list[dict[str, Any]] = []
-        if isinstance(llm_prewarm_plans, list) and llm_prewarm_plans:
-            llm_prewarm_results = _execute_llm_prewarm_plans(
-                component_id=component_id,
-                prompt_id=(
-                    str(payload["prompt_id"])
-                    if payload.get("prompt_id") is not None
-                    else None
-                ),
-                llm_prewarm_plans=llm_prewarm_plans,
-                compile_cache_volume=compile_cache_volume,
-            )
-        return {
-            "component_id": component_id,
-            "task_id": os.getenv("MODAL_TASK_ID"),
-            "warmup_slot_index": (
-                int(payload["warmup_slot_index"])
-                if payload.get("warmup_slot_index") is not None
-                else None
-            ),
-            "reloaded_volume": needs_volume_reload,
-            "llm_prewarm_results": llm_prewarm_results,
-        }
-
-
-def _loader_prewarm_plan_key(plan: Mapping[str, Any]) -> str | None:
-    """Return the stable worker-local dedupe key for one loader prewarm plan."""
-    signature = plan.get("signature")
-    if signature is None:
-        return None
-    normalized_signature = str(signature).strip()
-    return normalized_signature or None
-
-
-def _build_loader_prewarm_payload(
-    *,
-    component_id: str,
-    plan_index: int,
-    plan: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Build one synthetic single-node subgraph payload for loader warmup."""
-    plan_node_id = str(plan.get("node_id") or f"loader-{plan_index}")
-    prompt_id = plan.get("prompt_id")
-    return {
-        "payload_kind": "subgraph",
-        "component_id": f"{component_id}::loader-prewarm:{plan_node_id}",
-        "prompt_id": (str(prompt_id) if prompt_id is not None else None),
-        "component_node_ids": [plan_node_id],
-        "subgraph_prompt": copy.deepcopy(dict(plan["subgraph_prompt"])),
-        "boundary_inputs": [],
-        "boundary_outputs": [],
-        "execute_node_ids": list(plan.get("execute_node_ids") or [plan_node_id]),
-        "extra_data": {},
-    }
-
-
-def _execute_loader_prewarm_plans(
-    *,
-    component_id: str,
-    loader_prewarm_plans: list[dict[str, Any]],
-    custom_nodes_root: Path | None,
-) -> None:
-    """Execute synthetic one-node loader workflows so fresh workers preload heavyweight models."""
-    if not get_settings().enable_loader_prewarm:
-        return
-
-    _ensure_comfy_runtime_initialized(custom_nodes_root)
-    executable_plans: list[tuple[int, Mapping[str, Any], str | None]] = []
-    skipped_plan_count = 0
-    for plan_index, plan in enumerate(loader_prewarm_plans):
-        if not isinstance(plan, Mapping):
-            continue
-        plan_key = _loader_prewarm_plan_key(plan)
-        if plan_key is not None:
-            with _LOADER_PREWARM_PLAN_KEYS_LOCK:
-                if plan_key in _LOADER_PREWARM_PLAN_KEYS:
-                    skipped_plan_count += 1
-                    continue
-                _LOADER_PREWARM_PLAN_KEYS.add(plan_key)
-        executable_plans.append((plan_index, plan, plan_key))
-
-    def execute_plan(
-        plan_entry: tuple[int, Mapping[str, Any], str | None]
-    ) -> None:
-        """Execute one reserved loader plan and make failures retryable."""
-        plan_index, plan, plan_key = plan_entry
-        started_at = time.perf_counter()
-        try:
-            _execute_subgraph_prompt(
-                _build_loader_prewarm_payload(
-                    component_id=component_id,
-                    plan_index=plan_index,
-                    plan=plan,
-                ),
-                hydrated_inputs={},
-                custom_nodes_root=custom_nodes_root,
-            )
-        except Exception:
-            if plan_key is not None:
-                with _LOADER_PREWARM_PLAN_KEYS_LOCK:
-                    _LOADER_PREWARM_PLAN_KEYS.discard(plan_key)
-            raise
-        logger.info(
-            "Completed loader prewarm component=%s class_type=%s plan_index=%d elapsed_seconds=%.3f.",
-            component_id,
-            plan.get("class_type"),
-            plan_index,
-            time.perf_counter() - started_at,
-        )
-
-    worker_count = min(
-        len(executable_plans),
-        max(1, int(get_settings().loader_prewarm_workers)),
-    )
-    if worker_count > 1:
-        logger.info(
-            "Running %d independent loader prewarms with bounded concurrency=%d component=%s.",
-            len(executable_plans),
-            worker_count,
-            component_id,
-        )
-        with ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="modal-loader-prewarm",
-        ) as executor:
-            futures = [
-                executor.submit(execute_plan, plan_entry)
-                for plan_entry in executable_plans
-            ]
-            for future in futures:
-                future.result()
-    else:
-        for plan_entry in executable_plans:
-            execute_plan(plan_entry)
-
-    executed_plan_count = len(executable_plans)
-    if executed_plan_count or skipped_plan_count:
-        logger.info(
-            "Warm container loader prewarm finished for component=%s executed=%d skipped=%d.",
-            component_id,
-            executed_plan_count,
-            skipped_plan_count,
-        )
-
-
-def _llm_prewarm_model_profile(plan: Mapping[str, Any]) -> str:
-    """Return the staged model profile from one rewritten LLM warmup plan."""
-    prompt_node = plan.get("prompt_node")
-    if isinstance(prompt_node, Mapping):
-        inputs = prompt_node.get("inputs")
-        if isinstance(inputs, Mapping):
-            model_profile = inputs.get("model_profile")
-            if isinstance(model_profile, str) and model_profile.strip():
-                return model_profile.strip()
-    model_profile = plan.get("model_profile")
-    if not isinstance(model_profile, str) or not model_profile.strip():
-        raise ValueError("LLM prewarm plan requires a fixed model_profile.")
-    return model_profile.strip()
-
-
-def _llm_compile_manifest_path(signature: str) -> Path:
-    """Return the content-addressed completion marker for one JIT warmup plan."""
-    cache_root = Path(
-        os.getenv("TRITON_CACHE_DIR", str(_REMOTE_LLM_COMPILE_CACHE_ROOT))
-    ).parent
-    return cache_root / "manifests" / f"{signature}.json"
-
-
-def _write_llm_compile_manifest(
-    *,
-    signature: str,
-    model_profile: str,
-    result: Mapping[str, Any],
-) -> Path:
-    """Atomically publish successful representative-warmup metadata."""
-    manifest_path = _llm_compile_manifest_path(signature)
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = manifest_path.with_suffix(f".{os.getpid()}.tmp")
-    temporary_path.write_text(
-        json.dumps(
-            {
-                "signature": signature,
-                "model_profile": model_profile,
-                "runtime_fingerprint": os.getenv(
-                    "COMFY_MODAL_RUNTIME_FINGERPRINT", ""
-                ),
-                "completed_at": time.time(),
-                "result": dict(result),
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    temporary_path.replace(manifest_path)
-    return manifest_path
-
-
-def _execute_llm_prewarm_plans(
-    *,
-    component_id: str,
-    prompt_id: str | None,
-    llm_prewarm_plans: list[dict[str, Any]],
-    compile_cache_volume: Any | None,
-) -> list[dict[str, Any]]:
-    """Load resident LLMs, exercise representative shapes, and commit JIT caches."""
-    from modal_llm_runtime import prewarm_modal_llm_profile
-
-    results: list[dict[str, Any]] = []
-    for plan in llm_prewarm_plans:
-        if not isinstance(plan, Mapping):
-            continue
-        plan_signature = str(plan.get("signature") or "").strip()
-        if not plan_signature:
-            raise ValueError("LLM prewarm plan requires a stable signature.")
-        model_profile = _llm_prewarm_model_profile(plan)
-        signature = hashlib.sha256(
-            json.dumps(
-                {
-                    "model_profile": model_profile,
-                    "plan_signature": plan_signature,
-                    "runtime_fingerprint": os.getenv(
-                        "COMFY_MODAL_RUNTIME_FINGERPRINT", ""
-                    ),
-                },
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        manifest_path = _llm_compile_manifest_path(signature)
-        representative_request_count = (
-            1
-            if manifest_path.exists()
-            else max(1, int(plan.get("representative_request_count") or 3))
-        )
-        with _LLM_PREWARM_PLAN_KEYS_LOCK:
-            already_resident = signature in _LLM_PREWARM_PLAN_KEYS
-            _LLM_PREWARM_PLAN_KEYS.add(signature)
-        if already_resident:
-            logger.info(
-                "Skipping duplicate resident LLM prewarm profile=%s component=%s.",
-                model_profile,
-                component_id,
-            )
-            continue
-        try:
-            compile_checkpoint = _LLMCompileMissCheckpoint(
-                profiles=(model_profile,),
-                signal_size=_triton_compile_miss_signal_size(),
-                listener_engine_pids=_triton_compile_listener_engine_pids(),
-            )
-            with _timed_phase(
-                "llm_representative_prewarm",
-                component=component_id,
-                profile=model_profile,
-                requests=representative_request_count,
-            ):
-                result = prewarm_modal_llm_profile(
-                    model_profile=model_profile,
-                    representative_request_count=representative_request_count,
-                    workflow_execution_id=prompt_id,
-                )
-            manifest_path = _write_llm_compile_manifest(
-                signature=signature,
-                model_profile=model_profile,
-                result=result,
-            )
-            compile_cache_committed = _commit_actual_llm_compile_cache(
-                compile_checkpoint,
-                compile_cache_volume,
-            )
-            results.append(
-                {
-                    **result,
-                    "manifest_path": str(manifest_path),
-                    "manifest_cache_hit": representative_request_count == 1,
-                    "compile_cache_committed": compile_cache_committed,
-                }
-            )
-        except Exception:
-            with _LLM_PREWARM_PLAN_KEYS_LOCK:
-                _LLM_PREWARM_PLAN_KEYS.discard(signature)
-            raise
-    return results
-
-
-def _llm_profiles_in_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
-    """Collect ModalLLM profiles in the executable subgraph dependency closure."""
-    if payload.get("payload_kind") not in {"subgraph", "mapped_subgraph"}:
-        return ()
-    subgraph_prompt = payload.get("subgraph_prompt")
-    execute_node_ids = payload.get("execute_node_ids")
-    if not isinstance(subgraph_prompt, Mapping) or not isinstance(
-        execute_node_ids, (list, tuple)
-    ):
-        return ()
-    prompt = {str(node_id): node for node_id, node in subgraph_prompt.items()}
-    profiles: set[str] = set()
-    visited: set[str] = set()
-    pending = [str(node_id) for node_id in execute_node_ids]
-    while pending:
-        node_id = pending.pop()
-        if node_id in visited:
-            continue
-        visited.add(node_id)
-        prompt_node = prompt.get(node_id)
-        if not isinstance(prompt_node, Mapping):
-            continue
-        inputs = prompt_node.get("inputs")
-        if prompt_node.get("class_type") == "ModalLLM" and isinstance(
-            inputs, Mapping
-        ):
-            profile = inputs.get("model_profile")
-            if isinstance(profile, str) and profile.strip():
-                profiles.add(profile.strip())
-        if not isinstance(inputs, Mapping):
-            continue
-        for input_value in inputs.values():
-            if _is_link(input_value):
-                pending.append(str(input_value[0]))
-    return tuple(sorted(profiles))
-
-
-@dataclass(frozen=True)
-class _LLMCompileMissCheckpoint:
-    """Capture the genuine Triton miss signal before one LLM subgraph executes."""
-
-    profiles: tuple[str, ...]
-    signal_size: int
-    listener_engine_pids: tuple[int, ...]
-
-
-def _triton_compile_miss_signal_size() -> int:
-    """Read the EngineCore compile-miss signal shared through container storage."""
-    runtime_module = importlib.import_module("modal_llm_runtime")
-    signal_reader = getattr(runtime_module, "triton_compile_miss_signal_size", None)
-    if not callable(signal_reader):
-        raise RuntimeError(
-            "Modal LLM runtime does not expose triton_compile_miss_signal_size()."
-        )
-    return int(signal_reader())
-
-
-def _triton_compile_listener_engine_pids() -> tuple[int, ...]:
-    """Return live EngineCore processes with cache-aware Triton telemetry."""
-    runtime_module = importlib.import_module("modal_llm_runtime")
-    listener_reader = getattr(
-        runtime_module,
-        "triton_compile_listener_engine_pids",
-        None,
-    )
-    if not callable(listener_reader):
-        raise RuntimeError(
-            "Modal LLM runtime does not expose "
-            "triton_compile_listener_engine_pids()."
-        )
-    return tuple(int(pid) for pid in listener_reader())
-
-
-def _llm_compile_miss_checkpoint(
-    payload: Mapping[str, Any],
-) -> _LLMCompileMissCheckpoint | None:
-    """Capture the current miss signal for an executable ModalLLM subgraph."""
-    profiles = _llm_profiles_in_payload(payload)
-    if not profiles:
-        return None
-    return _LLMCompileMissCheckpoint(
-        profiles=profiles,
-        signal_size=_triton_compile_miss_signal_size(),
-        listener_engine_pids=_triton_compile_listener_engine_pids(),
-    )
-
-
-def _commit_actual_llm_compile_cache(
-    checkpoint: _LLMCompileMissCheckpoint | None,
-    compile_cache_volume: Any | None,
-) -> bool:
-    """Commit the compile-cache Volume after a genuine Triton disk-cache miss."""
-    if checkpoint is None or compile_cache_volume is None:
-        return False
-    listener_engine_pids = _triton_compile_listener_engine_pids()
-    if not listener_engine_pids:
-        logger.warning(
-            "Skipping LLM compile-cache commit because no live vLLM EngineCore "
-            "reported the cache-aware Triton listener profiles=%s "
-            "listener_pids_before=%s.",
-            checkpoint.profiles,
-            checkpoint.listener_engine_pids,
-        )
-        return False
-    signal_size = _triton_compile_miss_signal_size()
-    if signal_size < checkpoint.signal_size:
-        raise RuntimeError(
-            "Triton compile-miss signal shrank during LLM execution: "
-            f"before={checkpoint.signal_size} after={signal_size}."
-        )
-    if signal_size == checkpoint.signal_size:
-        logger.info(
-            "Skipping LLM compile-cache commit because every Triton lookup hit "
-            "the persistent cache profiles=%s signal_size=%d listener_pids=%s.",
-            checkpoint.profiles,
-            signal_size,
-            listener_engine_pids,
-        )
-        return False
-    commit_method = getattr(compile_cache_volume, "commit", None)
-    if not callable(commit_method):
-        raise RuntimeError("Modal compile-cache Volume does not expose commit().")
-    with _timed_phase(
-        "llm_actual_compile_cache_commit",
-        profiles=checkpoint.profiles,
-        miss_signal_bytes=signal_size - checkpoint.signal_size,
-    ):
-        commit_method()
-    return True
-
-
-
-
 configure_cloud_session_bridge_hooks(
     CloudSessionBridgeHooks(
         clone_loader_cache_value=_clone_loader_cache_value,
@@ -2027,6 +1092,20 @@ configure_cloud_comfy_bootstrap_hooks(
 
 configure_cloud_node_output_cache_hooks(
     CloudNodeOutputCacheHooks(
+        emit_cloud_info=_emit_cloud_info,
+        timed_phase=_timed_phase,
+    )
+)
+
+configure_cloud_volume_reload_hooks(
+    CloudVolumeReloadHooks(
+        emit_cloud_info=_emit_cloud_info,
+        timed_phase=_timed_phase,
+    )
+)
+
+configure_cloud_prewarm_hooks(
+    CloudPrewarmHooks(
         emit_cloud_info=_emit_cloud_info,
         timed_phase=_timed_phase,
     )

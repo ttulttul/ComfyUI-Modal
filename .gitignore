@@ -16,9 +16,11 @@
 !/cloud_node_output_cache.py
 !/cloud_prompt_execution.py
 !/cloud_prompt_server_shims.py
+!/cloud_prewarm.py
 !/cloud_runtime_context.py
 !/cloud_session_bridge.py
 !/cloud_streaming.py
+!/cloud_volume_reload.py
 !/comfyui_modal_sync_cloud.py
 !/component_planning.py
 !/durable_state.py

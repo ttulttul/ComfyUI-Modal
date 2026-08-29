@@ -78,6 +78,16 @@ def _cloud_streaming_owner() -> Any:
     return importlib.import_module("cloud_streaming")
 
 
+def _cloud_volume_reload_owner() -> Any:
+    """Return the module that owns cloud volume reload state and read-through."""
+    return importlib.import_module("cloud_volume_reload")
+
+
+def _cloud_prewarm_owner() -> Any:
+    """Return the module that owns cloud warm-container preparation state."""
+    return importlib.import_module("cloud_prewarm")
+
+
 def _patch_cloud_storage_root(
     monkeypatch: pytest.MonkeyPatch,
     modal_cloud_module: Any,
@@ -94,6 +104,7 @@ def _patch_cloud_storage_root(
 
     monkeypatch.setattr(modal_cloud_module, "get_settings", settings)
     monkeypatch.setattr(_cloud_comfy_bootstrap_owner(), "get_settings", settings)
+    monkeypatch.setattr(_cloud_volume_reload_owner(), "get_settings", settings)
 
 
 class _FakeOriginalNode:
@@ -3478,7 +3489,7 @@ def test_modal_cloud_skips_reload_when_uploaded_paths_are_already_visible(
 
     _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_record_modal_volume_reload_marker",
         lambda marker: recorded_markers.append(marker),
     )
@@ -3762,6 +3773,34 @@ def test_modal_cloud_does_not_schedule_container_exit_for_session_state_misses(
     assert scheduled_exits == []
 
 
+def test_modal_cloud_clears_each_owner_cache_before_volume_reload(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Volume preparation should clear every cache that can retain mounted files."""
+    cleared: list[str] = []
+    volume_reload_owner = _cloud_volume_reload_owner()
+    monkeypatch.setattr(
+        volume_reload_owner,
+        "clear_cloud_prompt_execution_warm_caches",
+        lambda: cleared.append("prompt-execution"),
+    )
+    monkeypatch.setattr(
+        volume_reload_owner,
+        "clear_cloud_session_bridge_warm_caches",
+        lambda: cleared.append("session-bridge"),
+    )
+    monkeypatch.setattr(
+        volume_reload_owner,
+        "clear_comfy_bootstrap_warm_caches",
+        lambda: cleared.append("comfy-bootstrap"),
+    )
+
+    modal_cloud_module._clear_warm_remote_caches()
+
+    assert cleared == ["prompt-execution", "session-bridge", "comfy-bootstrap"]
+
+
 def test_modal_cloud_skips_duplicate_reload_markers_in_same_container(
     modal_cloud_module: Any,
 ) -> None:
@@ -3778,10 +3817,11 @@ def test_modal_cloud_skips_duplicate_reload_markers_in_same_container(
             """Record one reload attempt."""
             self.reload_calls += 1
 
-    original_marker_queue = modal_cloud_module._MODAL_VOLUME_RELOAD_MARKERS
-    original_marker_set = set(modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET)
-    modal_cloud_module._MODAL_VOLUME_RELOAD_MARKERS = None
-    modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET.clear()
+    volume_reload_owner = _cloud_volume_reload_owner()
+    original_marker_queue = volume_reload_owner._MODAL_VOLUME_RELOAD_MARKERS
+    original_marker_set = set(volume_reload_owner._MODAL_VOLUME_RELOAD_MARKER_SET)
+    volume_reload_owner._MODAL_VOLUME_RELOAD_MARKERS = None
+    volume_reload_owner._MODAL_VOLUME_RELOAD_MARKER_SET.clear()
     try:
         payload = {"requires_volume_reload": True, "volume_reload_marker": "marker-1"}
         assert modal_cloud_module._should_reload_modal_volume(payload) is True
@@ -3796,9 +3836,9 @@ def test_modal_cloud_skips_duplicate_reload_markers_in_same_container(
         assert volume.reload_calls == 1
         assert modal_cloud_module._should_reload_modal_volume(payload) is False
     finally:
-        modal_cloud_module._MODAL_VOLUME_RELOAD_MARKERS = original_marker_queue
-        modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET.clear()
-        modal_cloud_module._MODAL_VOLUME_RELOAD_MARKER_SET.update(original_marker_set)
+        volume_reload_owner._MODAL_VOLUME_RELOAD_MARKERS = original_marker_queue
+        volume_reload_owner._MODAL_VOLUME_RELOAD_MARKER_SET.clear()
+        volume_reload_owner._MODAL_VOLUME_RELOAD_MARKER_SET.update(original_marker_set)
 
 
 def test_modal_cloud_retries_volume_reload_after_clearing_warm_state(
@@ -3823,12 +3863,12 @@ def test_modal_cloud_retries_volume_reload_after_clearing_warm_state(
     prepare_calls: list[str] = []
     sleep_calls: list[float] = []
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_prepare_for_modal_volume_reload",
         lambda: prepare_calls.append("prepared"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_sleep_before_modal_volume_reload_retry",
         lambda delay_seconds: sleep_calls.append(delay_seconds),
     )
@@ -3862,12 +3902,12 @@ def test_modal_cloud_raises_after_exhausting_open_file_reload_retries(
     prepare_calls: list[str] = []
     sleep_calls: list[float] = []
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_prepare_for_modal_volume_reload",
         lambda: prepare_calls.append("prepared"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_sleep_before_modal_volume_reload_retry",
         lambda delay_seconds: sleep_calls.append(delay_seconds),
     )
@@ -3920,17 +3960,17 @@ def test_modal_cloud_proceeds_when_referenced_volume_paths_are_already_visible(
     sleep_calls: list[float] = []
     _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_prepare_for_modal_volume_reload",
         lambda: prepare_calls.append("prepared"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_sleep_before_modal_volume_reload_retry",
         lambda delay_seconds: sleep_calls.append(delay_seconds),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_record_modal_volume_reload_marker",
         lambda marker: recorded_markers.append(marker),
     )
@@ -3986,17 +4026,17 @@ def test_modal_cloud_logs_volume_reload_diagnostics_for_open_file_retries(
 
     _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_prepare_for_modal_volume_reload",
         lambda: None,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_volume_reload_owner(),
         "_sleep_before_modal_volume_reload_retry",
         lambda delay_seconds: None,
     )
     monkeypatch.setattr(
-        modal_cloud_module.logger,
+        _cloud_volume_reload_owner().logger,
         "info",
         lambda message, *args: logged_messages.append((message, args)),
     )
@@ -5841,17 +5881,17 @@ def test_modal_cloud_prewarms_snapshot_state_without_gpu_runtime_by_default(
     calls: list[str] = []
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfyui_support_packages",
         lambda: calls.append("support"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfy_runtime_initialized",
         lambda custom_nodes_root: calls.append(f"runtime:{custom_nodes_root}"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_load_execution_module",
         lambda: calls.append("execution"),
     )
@@ -5871,22 +5911,22 @@ def test_modal_cloud_prewarms_snapshot_loader_profile_when_gpu_snapshots_enabled
     calls: list[tuple[str, Any]] = []
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfyui_support_packages",
         lambda: calls.append(("support", None)),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfy_runtime_initialized",
         lambda custom_nodes_root: calls.append(("runtime", custom_nodes_root)),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_load_execution_module",
         lambda: calls.append(("execution", None)),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_load_loader_snapshot_profile",
         lambda snapshot_profile_key: [
             {
@@ -5900,7 +5940,7 @@ def test_modal_cloud_prewarms_snapshot_loader_profile_when_gpu_snapshots_enabled
         else [],
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_execute_loader_prewarm_plans",
         lambda *, component_id, loader_prewarm_plans, custom_nodes_root: calls.append(
             ("prewarm", component_id, tuple(plan["signature"] for plan in loader_prewarm_plans), custom_nodes_root)
@@ -5928,17 +5968,17 @@ def test_modal_cloud_skips_generic_gpu_snapshot_prewarm_without_profile(
     calls: list[str] = []
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfyui_support_packages",
         lambda: calls.append("support"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfy_runtime_initialized",
         lambda custom_nodes_root: calls.append(f"runtime:{custom_nodes_root}"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_load_execution_module",
         lambda: calls.append("execution"),
     )
@@ -5958,12 +5998,12 @@ def test_modal_cloud_prewarms_restored_runtime(
     calls: list[str] = []
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfy_runtime_initialized",
         lambda custom_nodes_root: calls.append(f"runtime:{custom_nodes_root}"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_load_execution_module",
         lambda: calls.append("execution"),
     )
@@ -5980,26 +6020,28 @@ def test_modal_cloud_prepares_warm_container_for_request(
     """Warmup requests should prime volume visibility and extracted custom nodes without executing a payload."""
     calls: list[tuple[str, Any]] = []
 
-    monkeypatch.setattr(modal_cloud_module, "_should_reload_modal_volume", lambda payload: True)
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(), "_should_reload_modal_volume", lambda payload: True
+    )
+    monkeypatch.setattr(
+        _cloud_prewarm_owner(),
         "_reload_modal_volume_for_request",
         lambda volume, component_id, reload_marker=None, payload=None: calls.append(
             ("reload", component_id, reload_marker, payload.get("uploaded_volume_paths"))
         ),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_extract_custom_nodes_bundle",
         lambda bundle_path: Path("/tmp/extracted-bundle") if bundle_path else None,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_register_custom_nodes_root",
         lambda custom_nodes_root: calls.append(("register", custom_nodes_root)),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_execute_loader_prewarm_plans",
         lambda *, component_id, loader_prewarm_plans, custom_nodes_root: calls.append(
             ("prewarm", component_id, tuple(plan["signature"] for plan in loader_prewarm_plans), custom_nodes_root)
@@ -6038,17 +6080,18 @@ def test_modal_cloud_executes_loader_prewarm_plans_once_per_worker(
     monkeypatch: Any,
 ) -> None:
     """Worker-local loader prewarm plans should execute once and then be skipped on reuse."""
-    original_plan_keys = set(modal_cloud_module._LOADER_PREWARM_PLAN_KEYS)
-    modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.clear()
+    prewarm_owner = _cloud_prewarm_owner()
+    original_plan_keys = set(prewarm_owner._LOADER_PREWARM_PLAN_KEYS)
+    prewarm_owner._LOADER_PREWARM_PLAN_KEYS.clear()
     observed_calls: list[tuple[str, tuple[str, ...]]] = []
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        prewarm_owner,
         "_ensure_comfy_runtime_initialized",
         lambda custom_nodes_root: observed_calls.append(("runtime", (str(custom_nodes_root),))),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        prewarm_owner,
         "_execute_subgraph_prompt",
         lambda payload, hydrated_inputs, custom_nodes_root, **kwargs: observed_calls.append(
             ("execute", (str(payload["component_id"]), str(tuple(payload["execute_node_ids"]))))
@@ -6078,8 +6121,8 @@ def test_modal_cloud_executes_loader_prewarm_plans_once_per_worker(
         )
     finally:
         modal_cloud_module.get_settings.cache_clear()
-        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.clear()
-        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.update(original_plan_keys)
+        prewarm_owner._LOADER_PREWARM_PLAN_KEYS.clear()
+        prewarm_owner._LOADER_PREWARM_PLAN_KEYS.update(original_plan_keys)
 
     assert observed_calls == [
         ("runtime", ("/tmp/extracted-bundle",)),
@@ -6096,9 +6139,10 @@ def test_modal_cloud_parallelizes_independent_loader_prewarms(
     active_count = 0
     maximum_active_count = 0
     counter_lock = threading.Lock()
-    original_plan_keys = set(modal_cloud_module._LOADER_PREWARM_PLAN_KEYS)
+    prewarm_owner = _cloud_prewarm_owner()
+    original_plan_keys = set(prewarm_owner._LOADER_PREWARM_PLAN_KEYS)
     monkeypatch.setattr(
-        modal_cloud_module,
+        prewarm_owner,
         "_ensure_comfy_runtime_initialized",
         lambda custom_nodes_root: None,
     )
@@ -6115,7 +6159,7 @@ def test_modal_cloud_parallelizes_independent_loader_prewarms(
             active_count -= 1
         return ()
 
-    monkeypatch.setattr(modal_cloud_module, "_execute_subgraph_prompt", execute_plan)
+    monkeypatch.setattr(prewarm_owner, "_execute_subgraph_prompt", execute_plan)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
     monkeypatch.setenv("COMFY_MODAL_LOADER_PREWARM_WORKERS", "2")
     modal_cloud_module.get_settings.cache_clear()
@@ -6139,8 +6183,8 @@ def test_modal_cloud_parallelizes_independent_loader_prewarms(
         )
     finally:
         modal_cloud_module.get_settings.cache_clear()
-        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.clear()
-        modal_cloud_module._LOADER_PREWARM_PLAN_KEYS.update(original_plan_keys)
+        prewarm_owner._LOADER_PREWARM_PLAN_KEYS.clear()
+        prewarm_owner._LOADER_PREWARM_PLAN_KEYS.update(original_plan_keys)
 
     assert maximum_active_count == 2
 
@@ -6205,13 +6249,14 @@ def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
         "triton_compile_listener_engine_pids",
         lambda: (321,),
     )
+    prewarm_owner = _cloud_prewarm_owner()
     monkeypatch.setattr(
-        modal_cloud_module,
+        prewarm_owner,
         "_llm_compile_manifest_path",
         lambda signature: tmp_path / "manifests" / f"{signature}.json",
     )
-    original_plan_keys = set(modal_cloud_module._LLM_PREWARM_PLAN_KEYS)
-    modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
+    original_plan_keys = set(prewarm_owner._LLM_PREWARM_PLAN_KEYS)
+    prewarm_owner._LLM_PREWARM_PLAN_KEYS.clear()
     volume = FakeVolume()
     try:
         results = modal_cloud_module._execute_llm_prewarm_plans(
@@ -6231,8 +6276,8 @@ def test_modal_cloud_llm_prewarm_commits_content_addressed_manifest(
             compile_cache_volume=volume,
         )
     finally:
-        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
-        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.update(original_plan_keys)
+        prewarm_owner._LLM_PREWARM_PLAN_KEYS.clear()
+        prewarm_owner._LLM_PREWARM_PLAN_KEYS.update(original_plan_keys)
 
     assert observed_requests == [("staged-profile", 3, "prompt-1")]
     assert volume.commits == 1
@@ -6276,13 +6321,14 @@ def test_modal_cloud_llm_prewarm_does_not_commit_persistent_cache_hit(
         "triton_compile_listener_engine_pids",
         lambda: (654,),
     )
+    prewarm_owner = _cloud_prewarm_owner()
     monkeypatch.setattr(
-        modal_cloud_module,
+        prewarm_owner,
         "_llm_compile_manifest_path",
         lambda signature: tmp_path / "manifests" / f"{signature}.json",
     )
-    original_plan_keys = set(modal_cloud_module._LLM_PREWARM_PLAN_KEYS)
-    modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
+    original_plan_keys = set(prewarm_owner._LLM_PREWARM_PLAN_KEYS)
+    prewarm_owner._LLM_PREWARM_PLAN_KEYS.clear()
     try:
         results = modal_cloud_module._execute_llm_prewarm_plans(
             component_id="llm-component",
@@ -6297,8 +6343,8 @@ def test_modal_cloud_llm_prewarm_does_not_commit_persistent_cache_hit(
             compile_cache_volume=FakeVolume(),
         )
     finally:
-        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.clear()
-        modal_cloud_module._LLM_PREWARM_PLAN_KEYS.update(original_plan_keys)
+        prewarm_owner._LLM_PREWARM_PLAN_KEYS.clear()
+        prewarm_owner._LLM_PREWARM_PLAN_KEYS.update(original_plan_keys)
 
     assert results[0]["compile_cache_committed"] is False
 
@@ -6445,12 +6491,12 @@ def test_modal_cloud_reloads_compile_cache_before_restored_runtime(
             calls.append("reload")
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_ensure_comfy_runtime_initialized",
         lambda custom_nodes_root: calls.append("runtime"),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_load_execution_module",
         lambda: calls.append("execution"),
     )
@@ -6474,17 +6520,17 @@ def test_modal_cloud_does_not_reload_compile_cache_during_request_warmup(
             raise AssertionError("request-time compile-cache reload is unsafe")
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_hydrate_missing_payload_volume_paths",
         lambda volume, payload: [],
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_should_reload_modal_volume",
         lambda payload: False,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prewarm_owner(),
         "_emit_modal_volume_reload_skip",
         lambda component_id, payload: None,
     )
