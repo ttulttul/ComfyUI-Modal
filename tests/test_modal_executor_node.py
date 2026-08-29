@@ -73,6 +73,11 @@ def _cloud_prompt_execution_owner() -> Any:
     return importlib.import_module("cloud_prompt_execution")
 
 
+def _cloud_streaming_owner() -> Any:
+    """Return the module that owns cloud stream buffering and payload dispatch."""
+    return importlib.import_module("cloud_streaming")
+
+
 def _patch_cloud_storage_root(
     monkeypatch: pytest.MonkeyPatch,
     modal_cloud_module: Any,
@@ -3283,7 +3288,11 @@ def test_modal_cloud_streams_progress_and_result_events(
         progress_callbacks.append({"component_id": payload["component_id"], "kwargs": kwargs_payload})
         return b"serialized-outputs"
 
-    monkeypatch.setattr(modal_cloud_module, "execute_subgraph_locally", fake_execute_subgraph_locally)
+    monkeypatch.setattr(
+        _cloud_streaming_owner(),
+        "execute_subgraph_locally",
+        fake_execute_subgraph_locally,
+    )
 
     events = list(
         modal_cloud_module._stream_remote_payload_events(
@@ -3336,7 +3345,11 @@ def test_modal_cloud_streams_remote_log_task_id_before_progress(
         return b"serialized-outputs"
 
     monkeypatch.setenv("MODAL_TASK_ID", "ta-remote-123")
-    monkeypatch.setattr(modal_cloud_module, "execute_subgraph_locally", fake_execute_subgraph_locally)
+    monkeypatch.setattr(
+        _cloud_streaming_owner(),
+        "execute_subgraph_locally",
+        fake_execute_subgraph_locally,
+    )
 
     events = list(
         modal_cloud_module._stream_remote_payload_events(
@@ -3383,7 +3396,11 @@ def test_modal_cloud_streams_tensor_safe_progress_and_result_events(
             )
         return (tensor,)
 
-    monkeypatch.setattr(modal_cloud_module, "execute_subgraph_locally", fake_execute_subgraph_locally)
+    monkeypatch.setattr(
+        _cloud_streaming_owner(),
+        "execute_subgraph_locally",
+        fake_execute_subgraph_locally,
+    )
 
     events = list(
         modal_cloud_module._stream_remote_payload_events(

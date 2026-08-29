@@ -23,6 +23,11 @@ def _cloud_session_bridge_owner() -> Any:
     return importlib.import_module("cloud_session_bridge")
 
 
+def _cloud_streaming_owner() -> Any:
+    """Return the module that owns cloud stream buffering and payload dispatch."""
+    return importlib.import_module("cloud_streaming")
+
+
 def _patch_cloud_durable_state(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
@@ -218,7 +223,9 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
     _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
     _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
     _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
-    monkeypatch.setattr(modal_cloud_module, "execute_node_locally", execute_node_locally)
+    monkeypatch.setattr(
+        _cloud_streaming_owner(), "execute_node_locally", execute_node_locally
+    )
     monkeypatch.setenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", "1")
     modal_cloud_module.get_settings.cache_clear()
     consumer_thread_id = threading.current_thread().ident
@@ -263,11 +270,12 @@ def test_cloud_stream_logs_result_persistence_and_transport_boundaries(
     _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
     _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_streaming_owner(),
         "execute_node_locally",
         lambda payload, kwargs_payload: serialized_outputs,
     )
     caplog.set_level(logging.INFO, logger=modal_cloud_module.__name__)
+    caplog.set_level(logging.INFO, logger=_cloud_streaming_owner().__name__)
     caplog.set_level(
         logging.INFO,
         logger=_cloud_durable_invocation_owner().__name__,
@@ -388,11 +396,13 @@ def test_cloud_stream_abandonment_cancels_and_retries_failed_attempt(
     _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
     _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_streaming_owner(),
         "execute_subgraph_locally",
         execute_subgraph_locally,
     )
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_ABANDON_JOIN_SECONDS", 0.5)
+    monkeypatch.setattr(
+        _cloud_streaming_owner(), "_REMOTE_INVOCATION_ABANDON_JOIN_SECONDS", 0.5
+    )
     payload = {
         "invocation_id": invocation_id,
         "component_id": "component-1",
@@ -442,7 +452,7 @@ def test_cloud_stream_close_after_result_preserves_completed_record(
     _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
     _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_streaming_owner(),
         "execute_node_locally",
         lambda payload, kwargs_payload: serialized_outputs,
     )

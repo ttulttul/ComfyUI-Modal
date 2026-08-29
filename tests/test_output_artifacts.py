@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+
+def _cloud_streaming_owner() -> Any:
+    """Return the module that owns cloud stream buffering and payload dispatch."""
+    return importlib.import_module("cloud_streaming")
 
 
 def test_output_snapshot_collects_new_and_replaced_regular_files(
@@ -248,7 +254,7 @@ def test_cloud_stream_returns_output_artifact_bundle(
         return b"serialized-outputs"
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_streaming_owner(),
         "execute_subgraph_locally",
         execute_subgraph,
     )

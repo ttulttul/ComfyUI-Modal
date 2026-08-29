@@ -18,6 +18,7 @@
 !/cloud_prompt_server_shims.py
 !/cloud_runtime_context.py
 !/cloud_session_bridge.py
+!/cloud_streaming.py
 !/comfyui_modal_sync_cloud.py
 !/component_planning.py
 !/durable_state.py
