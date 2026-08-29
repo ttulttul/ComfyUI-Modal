@@ -37,17 +37,17 @@ if __package__:
         resolve_model_profile,
     )
     from .llm_staging import LLMStagingProgress, stage_model_profile
-    from .modal_llm_runtime import (
+    from .llm_inputs import prepare_llm_inputs
+    from .llm_types import (
         BackendGenerationResult,
         LLMGenerationSettings,
         LLMInferenceResult,
         LLMProgressCallback,
         LLMProgressEvent,
         PreparedLLMInputs,
-        ResidentLLMManager,
-        _coerce_positive_int,
-        prepare_llm_inputs,
+        coerce_positive_int as _coerce_positive_int,
     )
+    from .modal_llm_runtime import ResidentLLMManager
 else:  # pragma: no cover - ComfyUI loads this module as part of the package.
     from llm_compatibility import LOCAL_MLX_DSPARK_VERSION, LOCAL_MLX_VLM_VERSION
     from llm_profiles import (
@@ -68,17 +68,17 @@ else:  # pragma: no cover - ComfyUI loads this module as part of the package.
         resolve_model_profile,
     )
     from llm_staging import LLMStagingProgress, stage_model_profile
-    from modal_llm_runtime import (
+    from llm_inputs import prepare_llm_inputs
+    from llm_types import (
         BackendGenerationResult,
         LLMGenerationSettings,
         LLMInferenceResult,
         LLMProgressCallback,
         LLMProgressEvent,
         PreparedLLMInputs,
-        ResidentLLMManager,
-        _coerce_positive_int,
-        prepare_llm_inputs,
+        coerce_positive_int as _coerce_positive_int,
     )
+    from modal_llm_runtime import ResidentLLMManager
 
 logger = logging.getLogger(__name__)
 

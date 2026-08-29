@@ -420,6 +420,30 @@ def modal_llm_runtime_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def vllm_instrumentation_module(extension_package: object) -> object:
+    """Return the vLLM execution-policy and Triton instrumentation module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.vllm_instrumentation")
+
+
+@pytest.fixture(scope="session")
+def llm_backend_llamacpp_module(extension_package: object) -> object:
+    """Return the resident llama.cpp backend module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_backend_llamacpp")
+
+
+@pytest.fixture(scope="session")
+def llm_backend_transformers_module(extension_package: object) -> object:
+    """Return the resident Transformers backend module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_backend_transformers")
+
+
+@pytest.fixture(scope="session")
+def llm_backend_vllm_module(extension_package: object) -> object:
+    """Return the resident vLLM backend module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.llm_backend_vllm")
+
+
+@pytest.fixture(scope="session")
 def local_llm_runtime_module(extension_package: object) -> object:
     """Return the Apple-local resident LLM runtime module."""
     return importlib.import_module(f"{PACKAGE_NAME}.local_llm_runtime")

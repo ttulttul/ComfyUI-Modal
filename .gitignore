@@ -36,8 +36,13 @@
 !/llm_recovery.py
 !/llm_reasoning.py
 !/llm_compatibility.py
+!/llm_backend_llamacpp.py
+!/llm_backend_transformers.py
+!/llm_backend_vllm.py
+!/llm_inputs.py
 !/llm_resolver.py
 !/llm_staging.py
+!/llm_types.py
 !/local_llm_runtime.py
 !/modal_executor_node.py
 !/modal_admin_ops.py
@@ -85,6 +90,7 @@
 !/vast_simulator.py
 !/vast_ssh.py
 !/vast_service.py
+!/vllm_instrumentation.py
 
 !/docs/
 /docs/*

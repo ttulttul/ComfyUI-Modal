@@ -22,6 +22,7 @@ from PIL import Image
 
 def test_accurate_triton_listener_distinguishes_persistent_cache_hits(
     modal_llm_runtime_module: Any,
+    vllm_instrumentation_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -65,41 +66,41 @@ def test_accurate_triton_listener_distinguishes_persistent_cache_hits(
         raise ModuleNotFoundError(name)
 
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_TRITON_COMPILE_MISS_SIGNAL_PATH",
         signal_path,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_TRITON_COMPILE_LISTENER_STATUS_PATH",
         status_path,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_TRITON_COMPILE_LISTENER_INSTALLED_PID",
         None,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_TRITON_ENGINE_CORE_LISTENER_RECORDED_PID",
         None,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_VLLM_ENGINE_CORE_ENTRYPOINT_PATCHED_PID",
         None,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT",
         None,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module.importlib,
+        vllm_instrumentation_module.importlib,
         "import_module",
         import_module,
     )
-    modal_llm_runtime_module._install_accurate_triton_compile_listener()
+    vllm_instrumentation_module._install_accurate_triton_compile_listener()
     result = fake_engine_core.EngineCoreProc.run_engine_core("spawned")
 
     listener = fake_triton.knobs.compilation.listener
@@ -137,6 +138,7 @@ def test_accurate_triton_listener_distinguishes_persistent_cache_hits(
 
 def test_spawned_engine_core_recovers_original_entrypoint_and_installs_listener(
     modal_llm_runtime_module: Any,
+    vllm_instrumentation_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -164,33 +166,33 @@ def test_spawned_engine_core_recovers_original_entrypoint_and_installs_listener(
         "vllm.v1.engine.core": SimpleNamespace(EngineCoreProc=FakeEngineCoreProc),
     }
     monkeypatch.setattr(
-        modal_llm_runtime_module.importlib,
+        vllm_instrumentation_module.importlib,
         "import_module",
         lambda name: modules[name],
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_TRITON_COMPILE_LISTENER_STATUS_PATH",
         tmp_path / "listeners.jsonl",
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_TRITON_COMPILE_LISTENER_INSTALLED_PID",
         None,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_TRITON_ENGINE_CORE_LISTENER_RECORDED_PID",
         None,
     )
     monkeypatch.setattr(
-        modal_llm_runtime_module,
+        vllm_instrumentation_module,
         "_VLLM_ENGINE_CORE_ORIGINAL_ENTRYPOINT",
         None,
     )
 
     result = (
-        modal_llm_runtime_module._run_vllm_engine_core_with_accurate_triton_listener()
+        vllm_instrumentation_module._run_vllm_engine_core_with_accurate_triton_listener()
     )
 
     assert result == "started"
@@ -1584,6 +1586,7 @@ def test_llama_cpp_backend_generates_with_curated_gguf_profile(
 
 def test_llama_cpp_backend_adds_binary_directory_to_library_path(
     modal_llm_runtime_module: Any,
+    llm_backend_llamacpp_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1607,7 +1610,7 @@ def test_llama_cpp_backend_adds_binary_directory_to_library_path(
         return SimpleNamespace()
 
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
-    monkeypatch.setattr(modal_llm_runtime_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(llm_backend_llamacpp_module.subprocess, "Popen", popen)
 
     backend._start_server()
 
