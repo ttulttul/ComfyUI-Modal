@@ -1218,6 +1218,7 @@ def test_modal_local_bridge_materializer_downloads_without_blocking_event_loop(
 
 def test_local_bridge_materialization_restores_durable_inline_output(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A local branch should restore the producer's durable serialized output."""
@@ -1240,12 +1241,12 @@ def test_local_bridge_materialization_restores_durable_inline_output(
         serialized_output_io_type="IMAGE",
     )
     monkeypatch.setattr(
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE,
         "get_record",
         lambda bridge_key: record,
     )
 
-    restored = remote_modal_app_module.materialize_remote_session_bridge_ref_locally(
+    restored = host_session_bridge_module.materialize_remote_session_bridge_ref_locally(
         bridge_ref.to_payload()
     )
 
@@ -1254,6 +1255,7 @@ def test_local_bridge_materialization_restores_durable_inline_output(
 
 def test_local_bridge_materialization_downloads_object_backed_output(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A large bridge should download its content-addressed output object locally."""
@@ -1303,7 +1305,7 @@ def test_local_bridge_materialization_downloads_object_backed_output(
             )
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        host_session_bridge_module,
         "get_settings",
         lambda: types.SimpleNamespace(
             execution_mode="remote",
@@ -1312,14 +1314,14 @@ def test_local_bridge_materialization_downloads_object_backed_output(
         ),
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        host_session_bridge_module,
         "modal",
         types.SimpleNamespace(Dict=FakeDict, Volume=FakeVolume),
     )
-    remote_modal_app_module._MODAL_SESSION_BRIDGE_DICTS.clear()
-    remote_modal_app_module._MODAL_DURABLE_VOLUMES.clear()
+    host_session_bridge_module._MODAL_SESSION_BRIDGE_DICTS.clear()
+    host_session_bridge_module._MODAL_DURABLE_VOLUMES.clear()
 
-    restored = remote_modal_app_module.materialize_remote_session_bridge_ref_locally(
+    restored = host_session_bridge_module.materialize_remote_session_bridge_ref_locally(
         bridge_ref.to_payload()
     )
 
@@ -1336,8 +1338,8 @@ def test_local_bridge_materialization_downloads_object_backed_output(
             {"environment_name": None, "create_if_missing": True},
         )
     ]
-    remote_modal_app_module._MODAL_SESSION_BRIDGE_DICTS.clear()
-    remote_modal_app_module._MODAL_DURABLE_VOLUMES.clear()
+    host_session_bridge_module._MODAL_SESSION_BRIDGE_DICTS.clear()
+    host_session_bridge_module._MODAL_DURABLE_VOLUMES.clear()
 
 
 def test_parallel_local_dispatch_frontier_stops_at_nearest_remote_component(
@@ -11016,6 +11018,7 @@ def test_modal_cloud_execute_mapped_subgraph_payload_preserves_assigned_lane_id(
 
 def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     serialization_module: Any,
     session_state_module: Any,
 ) -> None:
@@ -11058,7 +11061,7 @@ def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
         )
     )
     assert session_state_module.is_remote_session_bridge_ref_payload(static_outputs[0])
-    remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(
+    host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(
         session_state_module.RemoteSessionHandle.from_payload(static_payload["remote_session"])
     )
 
@@ -11131,6 +11134,7 @@ def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
 
 def test_local_fallback_skips_seed_execution_when_session_outputs_are_already_restored(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Local fallback seed payloads should no-op when bridge outputs are already in session memory."""
@@ -11140,7 +11144,7 @@ def test_local_fallback_skips_seed_execution_when_session_outputs_are_already_re
         owner_component_id="component-1",
     )
     restored_value = _FakeModelValue("restored-model")
-    remote_modal_app_module._REMOTE_SESSION_STORE.put_output(
+    host_session_bridge_module._REMOTE_SESSION_STORE.put_output(
         session_handle,
         node_id="5",
         output_index=0,
@@ -11199,7 +11203,7 @@ def test_local_fallback_skips_seed_execution_when_session_outputs_are_already_re
             node_mapping={"ShouldNotRun": type("ShouldNotRun", (), {})},
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(session_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(session_handle)
 
     assert len(outputs) == 1
     assert remote_modal_app_module.is_remote_session_bridge_ref_payload(outputs[0])
@@ -11207,6 +11211,7 @@ def test_local_fallback_skips_seed_execution_when_session_outputs_are_already_re
 
 def test_local_remote_app_rehydrates_bridge_refs_from_warm_value_cache_without_replay(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
 ) -> None:
     """The local fallback bridge fast path should restore retained values without replaying producers."""
     bridge_key = "RSB_local_cached_bridge"
@@ -11221,23 +11226,23 @@ def test_local_remote_app_rehydrates_bridge_refs_from_warm_value_cache_without_r
         output_index=0,
         session_id="session-source",
     )
-    original_cache = dict(remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE)
-    original_order = list(remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER)
+    original_cache = dict(host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE)
+    original_order = list(host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER)
     try:
         seed_value = _CloneableCacheValue("warm-local-bridge-value")
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
-        remote_modal_app_module._store_remote_session_bridge_value(bridge_key, seed_value)
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
+        host_session_bridge_module._store_remote_session_bridge_value(bridge_key, seed_value)
         resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
-        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+        restored_value = host_session_bridge_module._rehydrate_remote_session_bridge_value(
             bridge_ref,
             target_session_handle=target_handle,
             node_mapping=None,
             resolution_stats=resolution_stats,
         )
 
-        stored_value = remote_modal_app_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = host_session_bridge_module._REMOTE_SESSION_STORE.get_output(
             remote_modal_app_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="node-7",
@@ -11245,11 +11250,11 @@ def test_local_remote_app_rehydrates_bridge_refs_from_warm_value_cache_without_r
             )
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.update(original_cache)
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.extend(original_order)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.update(original_cache)
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.extend(original_order)
 
     assert isinstance(restored_value, _CloneableCacheValue)
     assert restored_value.value == "warm-local-bridge-value"
@@ -11263,6 +11268,7 @@ def test_local_remote_app_rehydrates_bridge_refs_from_warm_value_cache_without_r
 
 def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_record_without_replay(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local fallback should restore durably serialized CONDITIONING bridge values without replay."""
@@ -11286,7 +11292,7 @@ def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_recor
         ]
     ]
     monkeypatch.setattr(
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE,
         "get_record",
         lambda bridge_key: remote_modal_app_module.RemoteSessionBridgeRecord(
             bridge_key=bridge_key,
@@ -11308,13 +11314,13 @@ def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_recor
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
     try:
-        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+        restored_value = host_session_bridge_module._rehydrate_remote_session_bridge_value(
             bridge_ref,
             target_session_handle=target_handle,
             node_mapping=None,
             resolution_stats=resolution_stats,
         )
-        stored_value = remote_modal_app_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = host_session_bridge_module._REMOTE_SESSION_STORE.get_output(
             remote_modal_app_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="node-9",
@@ -11322,7 +11328,7 @@ def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_recor
             )
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
 
     assert torch.equal(restored_value[0][0], conditioning[0][0])
     assert torch.equal(restored_value[0][1]["pooled_output"], conditioning[0][1]["pooled_output"])
@@ -11336,6 +11342,7 @@ def test_local_remote_app_rehydrates_conditioning_bridge_refs_from_durable_recor
 
 def test_remote_session_input_resolution_handles_nested_conditioning_bridge_refs(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
 ) -> None:
     """Boundary input resolution should resolve bridge refs nested inside list outputs."""
     source_handle = remote_modal_app_module.RemoteSessionHandle(
@@ -11343,14 +11350,14 @@ def test_remote_session_input_resolution_handles_nested_conditioning_bridge_refs
         prompt_id="prompt-1",
         owner_component_id="component-1",
     )
-    first_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_bridge_output(
+    first_ref = host_session_bridge_module._REMOTE_SESSION_STORE.put_bridge_output(
         source_handle,
         bridge_key="RSB_a",
         node_id="508:item:0",
         output_index=0,
         value=[["conditioning-a", {"pooled_output": "pool-a"}]],
     )
-    second_ref = remote_modal_app_module._REMOTE_SESSION_STORE.put_bridge_output(
+    second_ref = host_session_bridge_module._REMOTE_SESSION_STORE.put_bridge_output(
         source_handle,
         bridge_key="RSB_b",
         node_id="508:item:1",
@@ -11359,7 +11366,7 @@ def test_remote_session_input_resolution_handles_nested_conditioning_bridge_refs
     )
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
     try:
-        resolved_inputs = remote_modal_app_module._resolve_remote_session_inputs(
+        resolved_inputs = host_session_bridge_module._resolve_remote_session_inputs(
             {
                 "positive": [
                     remote_modal_app_module.RemoteSessionBridgeRef(
@@ -11380,7 +11387,7 @@ def test_remote_session_input_resolution_handles_nested_conditioning_bridge_refs
             resolution_stats=resolution_stats,
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(source_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(source_handle)
 
     assert resolved_inputs["positive"] == [
         [["conditioning-a", {"pooled_output": "pool-a"}]],
@@ -11391,6 +11398,7 @@ def test_remote_session_input_resolution_handles_nested_conditioning_bridge_refs
 
 def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_record_without_replay(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local fallback should restore serialized LATENT bridge values without sampler replay."""
@@ -11408,7 +11416,7 @@ def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_rec
         session_id="session-source",
     )
     latent = {"samples": torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2)}
-    record = remote_modal_app_module._build_remote_session_bridge_record(
+    record = host_session_bridge_module._build_remote_session_bridge_record(
         payload={
             "component_id": "sampler-component",
             "execute_node_ids": ["sampler-1"],
@@ -11428,7 +11436,7 @@ def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_rec
     assert record.serialized_output is not None
     assert record.serialized_output_io_type == "LATENT"
     monkeypatch.setattr(
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE,
         "get_record",
         lambda bridge_key: record,
     )
@@ -11442,13 +11450,13 @@ def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_rec
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
     try:
-        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+        restored_value = host_session_bridge_module._rehydrate_remote_session_bridge_value(
             bridge_ref,
             target_session_handle=target_handle,
             node_mapping=None,
             resolution_stats=resolution_stats,
         )
-        stored_value = remote_modal_app_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = host_session_bridge_module._REMOTE_SESSION_STORE.get_output(
             remote_modal_app_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="sampler-1",
@@ -11456,7 +11464,7 @@ def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_rec
             )
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
 
     assert torch.equal(restored_value["samples"], latent["samples"])
     assert torch.equal(stored_value["samples"], latent["samples"])
@@ -11476,6 +11484,7 @@ def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_rec
 )
 def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_replay(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
     io_type: str,
     node_id: str,
@@ -11494,7 +11503,7 @@ def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_r
         output_index=0,
         session_id="session-source",
     )
-    record = remote_modal_app_module._build_remote_session_bridge_record(
+    record = host_session_bridge_module._build_remote_session_bridge_record(
         payload={
             "component_id": "image-preview-component",
             "execute_node_ids": ["251"],
@@ -11538,7 +11547,7 @@ def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_r
     }
     execute_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
     monkeypatch.setattr(
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE,
         "get_record",
         lambda bridge_key: record,
     )
@@ -11565,14 +11574,14 @@ def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_r
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
     try:
-        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+        restored_value = host_session_bridge_module._rehydrate_remote_session_bridge_value(
             bridge_ref,
             target_session_handle=target_handle,
             node_mapping=None,
             resolution_stats=resolution_stats,
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
 
     assert restored_value == f"restored-{io_type.lower()}"
     assert execute_calls == [({"class_type": class_type}, node_inputs)]
@@ -11582,6 +11591,7 @@ def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_r
 
 def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without_replay(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local fallback should rebuild one MODEL bridge output from a durable plan without replay."""
@@ -11596,7 +11606,7 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
         output_index=0,
         session_id="session-source",
     )
-    record = remote_modal_app_module._build_remote_session_bridge_record(
+    record = host_session_bridge_module._build_remote_session_bridge_record(
         payload={
             "component_id": "component-seed",
             "subgraph_prompt": {
@@ -11612,7 +11622,7 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
         io_type="MODEL",
         output_value=_FakeModelValue("seed-model"),
     )
-    monkeypatch.setattr(remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
+    monkeypatch.setattr(host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
     monkeypatch.setattr(
         remote_modal_app_module,
         "_execute_subgraph_prompt",
@@ -11623,13 +11633,13 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
     try:
-        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+        restored_value = host_session_bridge_module._rehydrate_remote_session_bridge_value(
             bridge_ref,
             target_session_handle=target_handle,
             node_mapping={"CheckpointLoaderSimple": _FakeModelLoaderNode},
             resolution_stats=resolution_stats,
         )
-        stored_value = remote_modal_app_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = host_session_bridge_module._REMOTE_SESSION_STORE.get_output(
             remote_modal_app_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="node-5",
@@ -11637,7 +11647,7 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
             )
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
 
     assert isinstance(restored_value, _FakeModelValue)
     assert restored_value.value == "model::model.safetensors"
@@ -11651,6 +11661,7 @@ def test_local_remote_app_rehydrates_model_bridge_refs_from_durable_plan_without
 
 def test_local_remote_app_rehydrates_clip_bridge_refs_from_durable_plan_without_replay(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local fallback should rebuild one CLIP bridge output from a durable plan."""
@@ -11665,7 +11676,7 @@ def test_local_remote_app_rehydrates_clip_bridge_refs_from_durable_plan_without_
         output_index=0,
         session_id="session-source",
     )
-    record = remote_modal_app_module._build_remote_session_bridge_record(
+    record = host_session_bridge_module._build_remote_session_bridge_record(
         payload={
             "component_id": "sampler-component",
             "execute_node_ids": ["sampler-1"],
@@ -11692,7 +11703,7 @@ def test_local_remote_app_rehydrates_clip_bridge_refs_from_durable_plan_without_
     )
     assert record.rehydration_plan is not None
     assert record.rehydration_plan_io_type == "CLIP"
-    monkeypatch.setattr(remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
+    monkeypatch.setattr(host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
     monkeypatch.setattr(
         remote_modal_app_module,
         "_execute_subgraph_prompt",
@@ -11703,14 +11714,14 @@ def test_local_remote_app_rehydrates_clip_bridge_refs_from_durable_plan_without_
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
     try:
-        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+        restored_value = host_session_bridge_module._rehydrate_remote_session_bridge_value(
             bridge_ref,
             target_session_handle=target_handle,
             node_mapping={"CLIPLoader": _FakeClipLoaderNode},
             resolution_stats=resolution_stats,
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
 
     assert restored_value == "clip::text.safetensors:flux:default"
     assert resolution_stats.durable_bridge_hits == 1
@@ -11719,6 +11730,7 @@ def test_local_remote_app_rehydrates_clip_bridge_refs_from_durable_plan_without_
 
 def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgraph_plan(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local fallback should rehydrate linked MODEL bridges without sampler replay."""
@@ -11733,7 +11745,7 @@ def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgra
         output_index=0,
         session_id="session-source",
     )
-    record = remote_modal_app_module._build_remote_session_bridge_record(
+    record = host_session_bridge_module._build_remote_session_bridge_record(
         payload={
             "component_id": "sampler-component",
             "execute_node_ids": ["sampler-1"],
@@ -11760,7 +11772,7 @@ def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgra
     )
     assert record.rehydration_plan is not None
     assert record.rehydration_plan["kind"] == "subgraph_output"
-    monkeypatch.setattr(remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
+    monkeypatch.setattr(host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE, "get_record", lambda bridge_key: record)
     observed_payloads: list[dict[str, Any]] = []
 
     def fake_execute_subgraph_prompt(
@@ -11781,14 +11793,14 @@ def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgra
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
     try:
-        restored_value = remote_modal_app_module._rehydrate_remote_session_bridge_value(
+        restored_value = host_session_bridge_module._rehydrate_remote_session_bridge_value(
             bridge_ref,
             target_session_handle=target_handle,
             node_mapping=None,
             resolution_stats=resolution_stats,
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
 
     assert isinstance(restored_value, _FakeModelValue)
     assert restored_value.value == "restored-lora-model"
@@ -11799,6 +11811,7 @@ def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgra
 
 def test_local_remote_app_refuses_sampler_ancestor_bridge_replay(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local fallback should reject replay when a terminal depends on sampling."""
@@ -11814,7 +11827,7 @@ def test_local_remote_app_refuses_sampler_ancestor_bridge_replay(
         session_id="session-source",
     )
     monkeypatch.setattr(
-        remote_modal_app_module._REMOTE_SESSION_BRIDGE_STORE,
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE,
         "get_record",
         lambda bridge_key: remote_modal_app_module.RemoteSessionBridgeRecord(
             bridge_key=bridge_key,
@@ -11849,14 +11862,14 @@ def test_local_remote_app_refuses_sampler_ancestor_bridge_replay(
 
     try:
         with pytest.raises(remote_modal_app_module.RemoteSessionStateError, match="rerun a sampler"):
-            remote_modal_app_module._rehydrate_remote_session_bridge_value(
+            host_session_bridge_module._rehydrate_remote_session_bridge_value(
                 bridge_ref,
                 target_session_handle=target_handle,
                 node_mapping=None,
                 resolution_stats=resolution_stats,
             )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
 
     assert resolution_stats.bridge_record_lookups == 1
     assert resolution_stats.replay_count == 0

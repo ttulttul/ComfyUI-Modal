@@ -456,6 +456,12 @@ def modal_container_logs_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def host_session_bridge_module(extension_package: object) -> object:
+    """Return durable host session-bridge state and recovery helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.host_session_bridge")
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")

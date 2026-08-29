@@ -35,7 +35,7 @@ def test_remote_worker_affinity_separates_llm_and_comfy_pools(
 
 @pytest.mark.parametrize(
     "module_fixture_name",
-    ["modal_cloud_module", "remote_modal_app_module"],
+    ["modal_cloud_module", "host_session_bridge_module"],
 )
 def test_modal_durable_store_reads_committed_object_without_volume_reload(
     module_fixture_name: str,
@@ -793,6 +793,7 @@ def test_local_client_retries_exhausted_llm_memory_on_fresh_throughput_worker(
 
 def test_local_fallback_restores_object_backed_bridge_output(
     remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -800,7 +801,7 @@ def test_local_fallback_restores_object_backed_bridge_output(
     import torch
 
     object_store = remote_modal_app_module.FileDurableObjectStore(tmp_path)
-    monkeypatch.setattr(remote_modal_app_module, "_DURABLE_OBJECT_STORE", object_store)
+    monkeypatch.setattr(host_session_bridge_module, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setenv("COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES", "1")
     remote_modal_app_module.get_settings.cache_clear()
     latent = {"samples": torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)}
@@ -811,7 +812,7 @@ def test_local_fallback_restores_object_backed_bridge_output(
     )
 
     try:
-        record = remote_modal_app_module._build_remote_session_bridge_record(
+        record = host_session_bridge_module._build_remote_session_bridge_record(
             payload={"component_id": "component-1"},
             hydrated_inputs={"latent": latent},
             node_id="node-1",
@@ -820,13 +821,13 @@ def test_local_fallback_restores_object_backed_bridge_output(
             output_value=latent,
         )
         restored_value = (
-            remote_modal_app_module._restore_serialized_remote_session_bridge_value(
+            host_session_bridge_module._restore_serialized_remote_session_bridge_value(
                 record,
                 target_session_handle=target_handle,
             )
         )
     finally:
-        remote_modal_app_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        host_session_bridge_module._REMOTE_SESSION_STORE.clear_session(target_handle)
         remote_modal_app_module.get_settings.cache_clear()
 
     assert record.producer_inputs_object is None
@@ -840,7 +841,7 @@ def test_local_fallback_restores_object_backed_bridge_output(
 
 @pytest.mark.parametrize(
     "module_fixture_name",
-    ["modal_cloud_module", "remote_modal_app_module"],
+    ["modal_cloud_module", "host_session_bridge_module"],
 )
 def test_direct_bridge_identity_includes_omitted_producer_inputs(
     module_fixture_name: str,
@@ -875,7 +876,7 @@ def test_direct_bridge_identity_includes_omitted_producer_inputs(
 
 @pytest.mark.parametrize(
     "module_fixture_name",
-    ["modal_cloud_module", "remote_modal_app_module"],
+    ["modal_cloud_module", "host_session_bridge_module"],
 )
 def test_literal_loader_plan_omits_producer_inputs(
     module_fixture_name: str,
@@ -916,7 +917,7 @@ def test_literal_loader_plan_omits_producer_inputs(
 
 @pytest.mark.parametrize(
     "module_fixture_name",
-    ["modal_cloud_module", "remote_modal_app_module"],
+    ["modal_cloud_module", "host_session_bridge_module"],
 )
 def test_linked_loader_plan_retains_only_required_boundary_inputs(
     module_fixture_name: str,
