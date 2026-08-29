@@ -6403,6 +6403,7 @@ def test_modal_reset_route_paths_are_queue_route_siblings(api_intercept_module: 
 
 def test_delete_modal_cache_dicts_deletes_configured_dicts(
     api_intercept_module: Any,
+    modal_admin_ops_module: Any,
     settings_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
@@ -6474,7 +6475,7 @@ def test_delete_modal_cache_dicts_deletes_configured_dicts(
         snapshot_profile_dict_name="app-snapshot-profiles",
     )
     deleted: list[str] = []
-    monkeypatch.setattr(api_intercept_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_admin_ops_module, "modal", FakeModal)
 
     result = asyncio.run(api_intercept_module.delete_modal_cache_dicts(settings))
 
@@ -6492,6 +6493,7 @@ def test_delete_modal_cache_dicts_deletes_configured_dicts(
 
 def test_delete_modal_volume_deletes_configured_volume(
     api_intercept_module: Any,
+    modal_admin_ops_module: Any,
     settings_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
@@ -6553,7 +6555,7 @@ def test_delete_modal_volume_deletes_configured_volume(
         custom_nodes_dir=None,
     )
     deleted: list[str] = []
-    monkeypatch.setattr(api_intercept_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_admin_ops_module, "modal", FakeModal)
 
     result = asyncio.run(api_intercept_module.delete_modal_volume(settings))
 

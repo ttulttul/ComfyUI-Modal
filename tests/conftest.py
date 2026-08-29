@@ -310,6 +310,12 @@ def modal_executor_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_admin_ops_module(extension_package: object) -> object:
+    """Return the Modal persistent-object administration module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.modal_admin_ops")
+
+
+@pytest.fixture(scope="session")
 def modal_endpoint_module(extension_package: object) -> object:
     """Return the Modal hosted-model endpoint node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")
