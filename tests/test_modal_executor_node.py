@@ -58,6 +58,29 @@ def _patch_cloud_session_bridge(
     monkeypatch.setattr(_cloud_session_bridge_owner(), name, value)
 
 
+def _cloud_comfy_bootstrap_owner() -> Any:
+    """Return the module that owns cloud ComfyUI bootstrap state and helpers."""
+    return importlib.import_module("cloud_comfy_bootstrap")
+
+
+def _patch_cloud_storage_root(
+    monkeypatch: pytest.MonkeyPatch,
+    modal_cloud_module: Any,
+    storage_root: Path,
+) -> None:
+    """Patch storage settings across the cloud entrypoint and bootstrap owner."""
+
+    def settings() -> Any:
+        """Return storage settings for one isolated cloud test."""
+        return types.SimpleNamespace(
+            remote_storage_root=str(storage_root),
+            local_storage_root=None,
+        )
+
+    monkeypatch.setattr(modal_cloud_module, "get_settings", settings)
+    monkeypatch.setattr(_cloud_comfy_bootstrap_owner(), "get_settings", settings)
+
+
 class _FakeOriginalNode:
     """Simple fake legacy node for proxy signature mirroring."""
 
@@ -2827,12 +2850,13 @@ def test_modal_cloud_reuses_extracted_custom_nodes_bundle(
 
     monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(storage_root))
     modal_cloud_module.get_settings.cache_clear()
-    original_cache = dict(modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES)
-    modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    original_cache = dict(bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES)
+    bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
     try:
         first_root = modal_cloud_module._extract_custom_nodes_bundle("/custom_nodes/bundle.zip")
         monkeypatch.setattr(
-            modal_cloud_module.zipfile,
+            bootstrap_owner.zipfile,
             "ZipFile",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError("Expected cached extraction root to be reused.")
@@ -2841,8 +2865,8 @@ def test_modal_cloud_reuses_extracted_custom_nodes_bundle(
         second_root = modal_cloud_module._extract_custom_nodes_bundle("/custom_nodes/bundle.zip")
     finally:
         modal_cloud_module.get_settings.cache_clear()
-        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
-        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
+        bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+        bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
 
     assert first_root is not None
     assert second_root == first_root
@@ -2895,16 +2919,17 @@ def test_modal_cloud_extracts_custom_nodes_manifest_with_multiple_archives(
 
     monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(storage_root))
     modal_cloud_module.get_settings.cache_clear()
-    original_cache = dict(modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES)
-    modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    original_cache = dict(bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES)
+    bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
     try:
         extraction_root = modal_cloud_module._extract_custom_nodes_bundle(
             "/custom_nodes/manifests/bundle_manifest.json"
         )
     finally:
         modal_cloud_module.get_settings.cache_clear()
-        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
-        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
+        bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+        bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
 
     assert extraction_root is not None
     assert (extraction_root / "example_a" / "__init__.py").exists()
@@ -2961,16 +2986,17 @@ def test_modal_cloud_links_version_two_custom_node_assets(
 
     monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(storage_root))
     modal_cloud_module.get_settings.cache_clear()
-    original_cache = dict(modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES)
-    modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    original_cache = dict(bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES)
+    bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
     try:
         extraction_root = modal_cloud_module._extract_custom_nodes_bundle(
             "/custom_nodes/manifests/bundle_manifest_v2.json"
         )
     finally:
         modal_cloud_module.get_settings.cache_clear()
-        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
-        modal_cloud_module._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
+        bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.clear()
+        bootstrap_owner._EXTRACTED_CUSTOM_NODE_BUNDLES.update(original_cache)
 
     assert extraction_root is not None
     linked_asset = extraction_root / "example/checkpoints/model.pth"
@@ -3421,11 +3447,7 @@ def test_modal_cloud_skips_reload_when_uploaded_paths_are_already_visible(
     uploaded_path.write_bytes(b"weights")
     recorded_markers: list[str] = []
 
-    monkeypatch.setattr(
-        modal_cloud_module,
-        "get_settings",
-        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
-    )
+    _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
     monkeypatch.setattr(
         modal_cloud_module,
         "_record_modal_volume_reload_marker",
@@ -3465,13 +3487,10 @@ def test_modal_cloud_reads_missing_committed_asset_without_reloading_volume(
     storage_root = tmp_path / "storage"
     storage_root.mkdir()
     readthrough_root = tmp_path / "readthrough"
+    _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
     monkeypatch.setattr(
-        modal_cloud_module,
-        "get_settings",
-        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
-    )
-    monkeypatch.setattr(
-        modal_cloud_module,
+        bootstrap_owner,
         "_REMOTE_VOLUME_READTHROUGH_ROOT",
         readthrough_root,
     )
@@ -3508,13 +3527,9 @@ def test_modal_cloud_reloads_when_reused_referenced_asset_is_still_missing(
     """A sync-index hit must not suppress recovery for a missing runtime asset."""
     storage_root = tmp_path / "storage"
     storage_root.mkdir()
+    _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
     monkeypatch.setattr(
-        modal_cloud_module,
-        "get_settings",
-        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
-    )
-    monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_comfy_bootstrap_owner(),
         "_REMOTE_VOLUME_READTHROUGH_ROOT",
         tmp_path / "readthrough",
     )
@@ -3566,13 +3581,10 @@ def test_modal_cloud_readthrough_hydrates_custom_node_manifest_dependencies(
     storage_root = tmp_path / "storage"
     storage_root.mkdir()
     readthrough_root = tmp_path / "readthrough"
+    _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
     monkeypatch.setattr(
-        modal_cloud_module,
-        "get_settings",
-        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
-    )
-    monkeypatch.setattr(
-        modal_cloud_module,
+        bootstrap_owner,
         "_REMOTE_VOLUME_READTHROUGH_ROOT",
         readthrough_root,
     )
@@ -3877,11 +3889,7 @@ def test_modal_cloud_proceeds_when_referenced_volume_paths_are_already_visible(
     recorded_markers: list[str] = []
     prepare_calls: list[str] = []
     sleep_calls: list[float] = []
-    monkeypatch.setattr(
-        modal_cloud_module,
-        "get_settings",
-        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
-    )
+    _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
     monkeypatch.setattr(
         modal_cloud_module,
         "_prepare_for_modal_volume_reload",
@@ -3947,11 +3955,7 @@ def test_modal_cloud_logs_volume_reload_diagnostics_for_open_file_retries(
     uploaded_path = storage_root / "assets" / "missing_model.safetensors"
     logged_messages: list[tuple[str, tuple[Any, ...]]] = []
 
-    monkeypatch.setattr(
-        modal_cloud_module,
-        "get_settings",
-        lambda: types.SimpleNamespace(remote_storage_root=str(storage_root)),
-    )
+    _patch_cloud_storage_root(monkeypatch, modal_cloud_module, storage_root)
     monkeypatch.setattr(
         modal_cloud_module,
         "_prepare_for_modal_volume_reload",
@@ -4016,13 +4020,14 @@ def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
             self.calls += 1
             return (_CloneableCacheValue(f"{model_name}:{device}:{self.calls}"),)
 
-    original_cache = dict(modal_cloud_module._LOADER_OUTPUT_CACHE)
-    original_wrapped = set(modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES)
-    original_metrics = dict(modal_cloud_module._LOADER_CACHE_METRICS)
-    modal_cloud_module._LOADER_OUTPUT_CACHE.clear()
-    modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
-    modal_cloud_module._LOADER_CACHE_METRICS.clear()
-    modal_cloud_module._LOADER_CACHE_METRICS.update({"hit": 0, "miss": 0})
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    original_cache = dict(bootstrap_owner._LOADER_OUTPUT_CACHE)
+    original_wrapped = set(bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES)
+    original_metrics = dict(bootstrap_owner._LOADER_CACHE_METRICS)
+    bootstrap_owner._LOADER_OUTPUT_CACHE.clear()
+    bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES.clear()
+    bootstrap_owner._LOADER_CACHE_METRICS.clear()
+    bootstrap_owner._LOADER_CACHE_METRICS.update({"hit": 0, "miss": 0})
     try:
         modal_cloud_module._wrap_loader_method_with_cache(
             "FakeLoader",
@@ -4036,12 +4041,12 @@ def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
         third = loader.load("other.safetensors", device="cpu")[0]
         metrics_snapshot = modal_cloud_module._loader_cache_metric_snapshot()
     finally:
-        modal_cloud_module._LOADER_OUTPUT_CACHE.clear()
-        modal_cloud_module._LOADER_OUTPUT_CACHE.update(original_cache)
-        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
-        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
-        modal_cloud_module._LOADER_CACHE_METRICS.clear()
-        modal_cloud_module._LOADER_CACHE_METRICS.update(original_metrics)
+        bootstrap_owner._LOADER_OUTPUT_CACHE.clear()
+        bootstrap_owner._LOADER_OUTPUT_CACHE.update(original_cache)
+        bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES.clear()
+        bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
+        bootstrap_owner._LOADER_CACHE_METRICS.clear()
+        bootstrap_owner._LOADER_CACHE_METRICS.update(original_metrics)
 
     assert loader.calls == 2
     assert first.value == "model.safetensors:cpu:1"
@@ -4834,15 +4839,16 @@ def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
         }
     )
 
-    original_wrapped = set(modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES)
-    modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
-    monkeypatch.setattr(modal_cloud_module, "_load_nodes_module", lambda: fake_nodes_module)
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    original_wrapped = set(bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES)
+    bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES.clear()
+    monkeypatch.setattr(bootstrap_owner, "_load_nodes_module", lambda: fake_nodes_module)
     try:
         modal_cloud_module._install_loader_cache_wrappers()
-        installed_wrappers = set(modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES)
+        installed_wrappers = set(bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES)
     finally:
-        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.clear()
-        modal_cloud_module._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
+        bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES.clear()
+        bootstrap_owner._LOADER_CACHE_WRAPPED_CLASSES.update(original_wrapped)
 
     assert {
         "CheckpointLoader",
@@ -5591,8 +5597,17 @@ def test_modal_cloud_retries_custom_node_import_for_missing_prompt_class(
         init_external_custom_nodes=fake_init_external_custom_nodes,
     )
     monkeypatch.setitem(sys.modules, "nodes", fake_nodes_module)
-    monkeypatch.setattr(modal_cloud_module, "_register_custom_nodes_root", lambda path: import_calls.append(str(path)))
-    monkeypatch.setattr(modal_cloud_module, "_install_loader_cache_wrappers", lambda: import_calls.append("wrappers"))
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    monkeypatch.setattr(
+        bootstrap_owner,
+        "_register_custom_nodes_root",
+        lambda path: import_calls.append(str(path)),
+    )
+    monkeypatch.setattr(
+        bootstrap_owner,
+        "_install_loader_cache_wrappers",
+        lambda: import_calls.append("wrappers"),
+    )
 
     resolved_mapping = modal_cloud_module._ensure_prompt_node_classes_registered(
         component_id="component-1",
@@ -14745,10 +14760,11 @@ def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
     monkeypatch.setitem(sys.modules, "nodes", fake_nodes_module)
     monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths_module)
 
-    original_base_initialized = modal_cloud_module._COMFY_RUNTIME_BASE_INITIALIZED
-    original_custom_node_roots = set(modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS)
-    modal_cloud_module._COMFY_RUNTIME_BASE_INITIALIZED = False
-    modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.clear()
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    original_base_initialized = bootstrap_owner._COMFY_RUNTIME_BASE_INITIALIZED
+    original_custom_node_roots = set(bootstrap_owner._COMFY_RUNTIME_CUSTOM_NODE_ROOTS)
+    bootstrap_owner._COMFY_RUNTIME_BASE_INITIALIZED = False
+    bootstrap_owner._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.clear()
     try:
         custom_nodes_root = tmp_path / "custom_nodes"
         custom_nodes_root.mkdir()
@@ -14757,9 +14773,9 @@ def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
         modal_cloud_module._ensure_comfy_runtime_initialized(custom_nodes_root)
         modal_cloud_module._ensure_comfy_runtime_initialized(custom_nodes_root)
     finally:
-        modal_cloud_module._COMFY_RUNTIME_BASE_INITIALIZED = original_base_initialized
-        modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.clear()
-        modal_cloud_module._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.update(original_custom_node_roots)
+        bootstrap_owner._COMFY_RUNTIME_BASE_INITIALIZED = original_base_initialized
+        bootstrap_owner._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.clear()
+        bootstrap_owner._COMFY_RUNTIME_CUSTOM_NODE_ROOTS.update(original_custom_node_roots)
 
     assert init_calls == [("extra", False, True), ("external",)]
     assert folder_path_calls == [("custom_nodes", str(custom_nodes_root), True)]
@@ -15991,7 +16007,11 @@ def test_modal_cloud_model_state_dict_wrapper_forwards_new_comfyui_arguments(
     fake_comfy_module.sd = fake_sd_module
     monkeypatch.setitem(sys.modules, "comfy", fake_comfy_module)
     monkeypatch.setitem(sys.modules, "comfy.sd", fake_sd_module)
-    monkeypatch.setattr(modal_cloud_module, "_MODEL_STATE_DICT_COMPAT_WRAPPED", False)
+    monkeypatch.setattr(
+        _cloud_comfy_bootstrap_owner(),
+        "_MODEL_STATE_DICT_COMPAT_WRAPPED",
+        False,
+    )
 
     modal_cloud_module._install_model_state_dict_compatibility_wrappers()
     state_dict = {
@@ -16054,8 +16074,9 @@ def test_modal_cloud_creates_default_custom_nodes_dir_when_missing(
     """The remote runtime should create an empty default custom_nodes directory for ComfyUI."""
     comfyui_root = tmp_path / "comfyui"
     comfyui_root.mkdir()
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_COMFYUI_ROOT", comfyui_root)
-    monkeypatch.setattr(modal_cloud_module, "_LOCAL_COMFYUI_ROOT", tmp_path / "missing-local")
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    monkeypatch.setattr(bootstrap_owner, "_REMOTE_COMFYUI_ROOT", comfyui_root)
+    monkeypatch.setattr(bootstrap_owner, "_LOCAL_COMFYUI_ROOT", tmp_path / "missing-local")
 
     custom_nodes_dir = modal_cloud_module._ensure_default_custom_nodes_dir()
 

@@ -10,6 +10,7 @@
 !/api_intercept.py
 !/cloudflare_oauth.py
 !/cloud_app_guard.py
+!/cloud_comfy_bootstrap.py
 !/cloud_durable_invocation.py
 !/cloud_image_env.py
 !/cloud_prompt_server_shims.py
