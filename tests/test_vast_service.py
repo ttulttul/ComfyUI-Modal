@@ -287,9 +287,16 @@ def test_acquire_replaces_lease_when_worker_initialization_fails(
     service.lease_manager = lease_manager
     service.registry = registry
 
-    def initialize_runtime(lease: Any) -> None:
+    def initialize_runtime(
+        lease: Any,
+        *,
+        status_callback: Any,
+    ) -> None:
         """Simulate the observed SSH failure only on the first rental."""
         if lease.instance_id == failed.instance_id:
+            status_callback(
+                "Vast SSH attempt 1 failed: Connection refused; retrying in 1.00s"
+            )
             raise vast_service_module.VastSshError(
                 "kex_exchange_identification: Connection closed by remote host"
             )
@@ -308,6 +315,7 @@ def test_acquire_replaces_lease_when_worker_initialization_fails(
     assert registry.updated_instance_ids == [42]
     assert lease_manager.destroyed_instance_ids == [42]
     assert lease_manager.excluded_offer_ids == [frozenset(), frozenset({1001})]
+    assert any("Vast SSH attempt 1 failed" in message for message in messages)
     assert any("failed worker setup" in message for message in messages)
     assert messages[-1] == "Vast.ai worker is ready"
 
@@ -364,8 +372,13 @@ def test_acquire_replaces_instance_that_disappears_before_ssh(
     service.lease_manager = lease_manager
     service.registry = registry
 
-    def initialize_runtime(lease: Any) -> None:
+    def initialize_runtime(
+        lease: Any,
+        *,
+        status_callback: Any,
+    ) -> None:
         """Report only the first provider contract as missing."""
+        del status_callback
         if lease.instance_id == vanished.instance_id:
             raise vast_service_module.VastInstanceNotFoundError(
                 "Vast instance 42 does not exist."
@@ -460,8 +473,13 @@ def test_acquire_rebuilds_image_and_replaces_fingerprint_drift(
     adopted_images: list[str] = []
     service._adopt_runtime_image = adopted_images.append
 
-    def initialize_runtime(lease: Any) -> None:
+    def initialize_runtime(
+        lease: Any,
+        *,
+        status_callback: Any,
+    ) -> None:
         """Reject only the worker baked into the first lease."""
+        del status_callback
         if lease.instance_id == stale.instance_id:
             raise vast_service_module.VastRuntimeFingerprintDriftError(
                 expected_fingerprint="a" * 64,

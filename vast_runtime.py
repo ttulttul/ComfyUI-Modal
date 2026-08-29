@@ -81,7 +81,8 @@ class VastRuntimeConfiguration:
     remote_storage_root: PurePosixPath = DEFAULT_VAST_REMOTE_STORAGE_ROOT
     watchdog_state_path: PurePosixPath = DEFAULT_VAST_WATCHDOG_STATE_PATH
     startup_timeout_seconds: float = 900.0
-    readiness_poll_seconds: float = 2.0
+    readiness_poll_seconds: float = 1.0
+    readiness_backoff_multiplier: float = 1.5
 
     def __post_init__(self) -> None:
         """Validate launch and fingerprint values."""
@@ -99,8 +100,21 @@ class VastRuntimeConfiguration:
         ):
             if not path.is_absolute() or path == PurePosixPath("/"):
                 raise ValueError(f"{field_name} must be an absolute non-root path.")
-        if self.startup_timeout_seconds <= 0 or self.readiness_poll_seconds <= 0:
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (
+                self.startup_timeout_seconds,
+                self.readiness_poll_seconds,
+            )
+        ):
             raise ValueError("Vast runtime readiness timing must be positive.")
+        if (
+            not math.isfinite(self.readiness_backoff_multiplier)
+            or self.readiness_backoff_multiplier < 1.0
+        ):
+            raise ValueError(
+                "Vast readiness backoff multiplier must be finite and at least 1."
+            )
 
     @classmethod
     def from_environment(
@@ -178,6 +192,7 @@ class VastRuntimeManager:
     fallback_runner: VastSshRunner | None = None
     fallback_selected: Callable[[], None] | None = None
     instance_validator: Callable[[], None] | None = None
+    status_callback: Callable[[str], None] | None = None
     clock: Callable[[], float] = time.time
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
@@ -189,13 +204,18 @@ class VastRuntimeManager:
         last_error: str | None = None
         last_logged_error: str | None = None
         attempt = 0
+        retry_delay = self.configuration.readiness_poll_seconds
         while self.monotonic() < deadline:
             attempt += 1
+            ssh_error: str | None = None
             if self.instance_validator is not None:
                 self.instance_validator()
             try:
                 info = self.runtime_info()
-            except (VastSshError, ValueError) as exc:
+            except VastSshError as exc:
+                last_error = str(exc)
+                ssh_error = last_error
+            except ValueError as exc:
                 last_error = str(exc)
             else:
                 actual_fingerprint = str(info.get("runtime_fingerprint") or "")
@@ -213,16 +233,33 @@ class VastRuntimeManager:
                         self.monotonic() - started_at,
                     )
                     return info
-                self._start_supervisor()
-                last_error = "worker socket is not ready"
+                try:
+                    self._start_supervisor()
+                except VastSshError as exc:
+                    last_error = str(exc)
+                    ssh_error = last_error
+                else:
+                    last_error = "worker socket is not ready"
+            remaining_seconds = max(0.0, deadline - self.monotonic())
+            if remaining_seconds <= 0:
+                break
+            actual_delay = min(retry_delay, remaining_seconds)
             if last_error != last_logged_error:
                 logger.warning(
-                    "Vast worker readiness probe attempt=%d failed: %s",
+                    "Vast worker readiness probe attempt=%d failed; retrying in "
+                    "%.2fs: %s",
                     attempt,
+                    actual_delay,
                     last_error,
                 )
                 last_logged_error = last_error
-            self.sleep(self.configuration.readiness_poll_seconds)
+            if ssh_error is not None:
+                self._emit_status(
+                    f"Vast SSH attempt {attempt} failed: {ssh_error}; retrying in "
+                    f"{actual_delay:.2f}s"
+                )
+            self.sleep(actual_delay)
+            retry_delay *= self.configuration.readiness_backoff_multiplier
         raise TimeoutError(
             "Vast worker did not become ready within "
             f"{self.configuration.startup_timeout_seconds:.0f}s: "
@@ -248,10 +285,18 @@ class VastRuntimeManager:
             self.fallback_runner = None
             if self.fallback_selected is not None:
                 self.fallback_selected()
+            self._emit_status(
+                "Vast direct SSH failed; continuing through the Vast SSH proxy"
+            )
             logger.warning(
                 "Vast direct SSH failed; continuing through the Vast SSH proxy."
             )
             return payload
+
+    def _emit_status(self, message: str) -> None:
+        """Forward one readiness update to the workflow UI when available."""
+        if self.status_callback is not None:
+            self.status_callback(message)
 
     @staticmethod
     def _runtime_info(runner: VastSshRunner) -> dict[str, Any]:

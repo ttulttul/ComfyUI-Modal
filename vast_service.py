@@ -489,6 +489,7 @@ class VastService:
                 initialized_lease = await asyncio.to_thread(
                     self._initialize_runtime,
                     lease,
+                    status_callback=status_callback,
                 )
                 if initialized_lease is not None:
                     lease = initialized_lease
@@ -833,7 +834,12 @@ class VastService:
             raise KeyError(f"Vast lease {instance_id} disappeared during setup.")
         return lease
 
-    def _initialize_runtime(self, lease: VastLeaseRecord) -> VastLeaseRecord:
+    def _initialize_runtime(
+        self,
+        lease: VastLeaseRecord,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> VastLeaseRecord:
         """Require the pinned worker and publish its initial idle fail-safe state."""
         logger.info(
             "Initializing Vast worker instance_id=%d environment=%s.",
@@ -846,6 +852,7 @@ class VastService:
             fallback_runner=self._proxy_runner(lease),
             fallback_selected=partial(self._promote_proxy_endpoint, lease),
             instance_validator=partial(self._validate_live_instance, lease),
+            status_callback=status_callback,
         )
         try:
             runtime.ensure_worker()

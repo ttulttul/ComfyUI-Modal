@@ -191,10 +191,12 @@ def test_runtime_manager_selects_proxy_when_direct_ssh_fails(
         ]
     )
     selected: list[bool] = []
+    statuses: list[str] = []
     manager = vast_runtime_module.VastRuntimeManager(
         runner=RefusedRunner(),
         fallback_runner=proxy_runner,
         fallback_selected=lambda: selected.append(True),
+        status_callback=statuses.append,
         configuration=vast_runtime_module.VastRuntimeConfiguration(
             image="worker",
             runtime_fingerprint=fingerprint,
@@ -207,6 +209,9 @@ def test_runtime_manager_selects_proxy_when_direct_ssh_fails(
     assert manager.runner is proxy_runner
     assert manager.fallback_runner is None
     assert selected == [True]
+    assert statuses == [
+        "Vast direct SSH failed; continuing through the Vast SSH proxy"
+    ]
 
 
 def test_runtime_manager_rejects_same_protocol_fingerprint_drift(
@@ -254,6 +259,7 @@ def test_runtime_manager_logs_changed_ssh_readiness_diagnostics(
             )
 
     current_time = [0.0]
+    statuses: list[str] = []
 
     def advance(seconds: float) -> None:
         """Advance the deterministic monotonic readiness clock."""
@@ -269,6 +275,7 @@ def test_runtime_manager_logs_changed_ssh_readiness_diagnostics(
         ),
         monotonic=lambda: current_time[0],
         sleep=advance,
+        status_callback=statuses.append,
     )
 
     with caplog.at_level(logging.WARNING):
@@ -281,8 +288,61 @@ def test_runtime_manager_logs_changed_ssh_readiness_diagnostics(
         if "Vast worker readiness probe" in record.message
     ]
     assert readiness_messages == [
-        "Vast worker readiness probe attempt=1 failed: "
+        "Vast worker readiness probe attempt=1 failed; retrying in 1.00s: "
         "kex_exchange_identification: Connection closed by remote host"
+    ]
+    assert statuses == [
+        "Vast SSH attempt 1 failed: kex_exchange_identification: Connection "
+        "closed by remote host; retrying in 1.00s",
+        "Vast SSH attempt 2 failed: kex_exchange_identification: Connection "
+        "closed by remote host; retrying in 1.00s",
+    ]
+
+
+def test_runtime_manager_uses_exponential_ssh_readiness_backoff(
+    vast_runtime_module: Any,
+) -> None:
+    """Early SSH probes should start at one second and grow by 1.5 each time."""
+
+    class StartingRunner:
+        """Fail three SSH probes before returning ready runtime metadata."""
+
+        def __init__(self) -> None:
+            """Initialize the number of refused connections."""
+            self.failures_remaining = 3
+
+        def run(self, argv: Any, **kwargs: Any) -> FakeResult:
+            """Refuse early probes and then report the worker ready."""
+            del argv, kwargs
+            if self.failures_remaining > 0:
+                self.failures_remaining -= 1
+                raise vast_runtime_module.VastSshError("Connection refused")
+            return FakeResult(
+                {
+                    "runtime_fingerprint": "a" * 64,
+                    "worker_socket_ready": True,
+                }
+            )
+
+    delays: list[float] = []
+    statuses: list[str] = []
+    manager = vast_runtime_module.VastRuntimeManager(
+        runner=StartingRunner(),
+        configuration=vast_runtime_module.VastRuntimeConfiguration(
+            image="worker",
+            runtime_fingerprint="a" * 64,
+        ),
+        sleep=delays.append,
+        status_callback=statuses.append,
+    )
+
+    manager.ensure_worker()
+
+    assert delays == [1.0, 1.5, 2.25]
+    assert statuses == [
+        "Vast SSH attempt 1 failed: Connection refused; retrying in 1.00s",
+        "Vast SSH attempt 2 failed: Connection refused; retrying in 1.50s",
+        "Vast SSH attempt 3 failed: Connection refused; retrying in 2.25s",
     ]
 
 
