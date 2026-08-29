@@ -322,6 +322,12 @@ def modal_ui_events_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def remote_graph_analysis_module(extension_package: object) -> object:
+    """Return the provider-aware remote graph analysis module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote_graph_analysis")
+
+
+@pytest.fixture(scope="session")
 def modal_endpoint_module(extension_package: object) -> object:
     """Return the Modal hosted-model endpoint node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")

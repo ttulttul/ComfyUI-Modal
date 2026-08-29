@@ -37,6 +37,7 @@
 !/remote_hosts.py
 !/remote_configuration_nodes.py
 !/remote_configurations.py
+!/remote_graph_analysis.py
 !/remote_protocol.py
 !/remote_plan_types.py
 !/r2_cache.py

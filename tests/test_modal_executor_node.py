@@ -1341,6 +1341,7 @@ def test_local_bridge_materialization_downloads_object_backed_output(
 
 def test_parallel_local_dispatch_frontier_stops_at_nearest_remote_component(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
 ) -> None:
     """A preview gate should not wait for remote descendants of a remote frontier."""
     fake_nodes_module = types.SimpleNamespace(
@@ -1364,7 +1365,7 @@ def test_parallel_local_dispatch_frontier_stops_at_nearest_remote_component(
             "inputs": {"value": ["nearest", 0]},
         },
     }
-    consumers = api_intercept_module._build_consumer_map(rewritten_prompt)
+    consumers = remote_graph_analysis_module._build_consumer_map(rewritten_prompt)
 
     nearest_component_ids = (
         api_intercept_module._nearest_downstream_remote_component_ids(

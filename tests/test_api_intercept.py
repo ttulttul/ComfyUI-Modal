@@ -178,6 +178,7 @@ class _FakeRemoteArtifactWriterNode:
 
 def test_auto_placement_selects_every_eligible_prompt_node(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
 ) -> None:
     """Workflow auto placement should not require per-node remote toggles."""
     prompt = {
@@ -200,7 +201,7 @@ def test_auto_placement_selects_every_eligible_prompt_node(
         "nodes": [],
     }
 
-    selected = api_intercept_module.requested_remote_node_ids(
+    selected = remote_graph_analysis_module.requested_remote_node_ids(
         prompt=prompt,
         workflow=workflow,
         settings=SimpleNamespace(marker_property="is_modal_remote"),
@@ -211,6 +212,7 @@ def test_auto_placement_selects_every_eligible_prompt_node(
 
 def test_disabled_auto_placement_preserves_explicit_markers(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
 ) -> None:
     """Manual workflows should continue honoring the existing node property."""
     prompt = {
@@ -225,7 +227,7 @@ def test_disabled_auto_placement_preserves_explicit_markers(
         ],
     }
 
-    selected = api_intercept_module.requested_remote_node_ids(
+    selected = remote_graph_analysis_module.requested_remote_node_ids(
         prompt=prompt,
         workflow=workflow,
         settings=SimpleNamespace(marker_property="is_modal_remote"),
@@ -512,6 +514,7 @@ def test_scheduler_refreshes_recent_ssh_capabilities_before_placement(
 
 def test_remote_partition_preserves_dag_around_ssh_only_llm(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
 ) -> None:
     """Provider boundaries must not be undone by a coarse fanout cycle."""
     prompt = {
@@ -541,19 +544,19 @@ def test_remote_partition_preserves_dag_around_ssh_only_llm(
         NODE_DISPLAY_NAME_MAPPINGS={},
     )
 
-    component_groups = api_intercept_module._remote_component_partition_groups(
+    component_groups = remote_graph_analysis_module._remote_component_partition_groups(
         prompt,
         set(prompt),
-        api_intercept_module._build_consumer_map(prompt),
+        remote_graph_analysis_module._build_consumer_map(prompt),
         fake_nodes_module,
     )
-    components = api_intercept_module._component_topological_order(
+    components = remote_graph_analysis_module._component_topological_order(
         prompt,
         component_groups,
     )
 
     assert components == [["1", "2"], ["3"], ["4"]]
-    assert api_intercept_module._component_execution_stages(
+    assert remote_graph_analysis_module._component_execution_stages(
         prompt,
         component_groups,
     ) == [["1"], ["3"], ["4"]]
@@ -1428,6 +1431,7 @@ def test_planner_resolves_hugging_face_metadata_before_cost_ranking(
 
 def test_planner_keeps_unmarked_llm_local_between_remote_text_nodes(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
 ) -> None:
     """Transportable text boundaries must not absorb a local LLM into Modal."""
     prompt = {
@@ -1457,7 +1461,7 @@ def test_planner_keeps_unmarked_llm_local_between_remote_text_nodes(
         NODE_DISPLAY_NAME_MAPPINGS={},
     )
 
-    analysis = api_intercept_module.analyze_remote_node_selection(
+    analysis = remote_graph_analysis_module.analyze_remote_node_selection(
         prompt,
         workflow,
         [],
@@ -4791,6 +4795,7 @@ def test_boundary_source_signature_changes_with_upstream_prompt_structure(
 
 def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """Modal marker extraction should find nodes nested inside saved subgraph metadata."""
@@ -4827,13 +4832,13 @@ def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
         ]
     }
 
-    assert api_intercept_module.extract_remote_node_ids(workflow, settings) == {"11"}
-    assert api_intercept_module.extract_remote_node_ids(
+    assert remote_graph_analysis_module.extract_remote_node_ids(workflow, settings) == {"11"}
+    assert remote_graph_analysis_module.extract_remote_node_ids(
         workflow,
         settings,
         prompt_node_ids={"100"},
     ) == {"100"}
-    assert api_intercept_module.extract_remote_node_ids(
+    assert remote_graph_analysis_module.extract_remote_node_ids(
         workflow,
         settings,
         prompt_node_ids={"100:11"},
@@ -4842,6 +4847,7 @@ def test_extract_remote_node_ids_recurses_into_nested_subgraph_workflows(
 
 def test_extract_remote_node_ids_prefers_visible_toggle_over_stale_property(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """A restored disabled widget must prevent stale metadata from starting Modal."""
@@ -4877,11 +4883,12 @@ def test_extract_remote_node_ids_prefers_visible_toggle_over_stale_property(
         ]
     }
 
-    assert api_intercept_module.extract_remote_node_ids(workflow, settings) == {"10"}
+    assert remote_graph_analysis_module.extract_remote_node_ids(workflow, settings) == {"10"}
 
 
 def test_extract_remote_node_ids_maps_subgraph_container_to_descendant_prompt_nodes(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """A marked subgraph container should remote its expanded descendant prompt nodes."""
@@ -4918,7 +4925,7 @@ def test_extract_remote_node_ids_maps_subgraph_container_to_descendant_prompt_no
         ]
     }
 
-    assert api_intercept_module.extract_remote_node_ids(
+    assert remote_graph_analysis_module.extract_remote_node_ids(
         workflow,
         settings,
         prompt_node_ids={"24:23", "24:25", "99"},
@@ -4927,6 +4934,7 @@ def test_extract_remote_node_ids_maps_subgraph_container_to_descendant_prompt_no
 
 def test_extract_remote_node_ids_maps_defined_subgraph_nodes_through_instances(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """Markers in reusable subgraph definitions should map to every executable instance path."""
@@ -4981,7 +4989,7 @@ def test_extract_remote_node_ids_maps_defined_subgraph_nodes_through_instances(
         "300",
     }
 
-    assert api_intercept_module.extract_remote_node_ids(
+    assert remote_graph_analysis_module.extract_remote_node_ids(
         workflow,
         settings,
         prompt_node_ids=prompt_node_ids,
@@ -4994,6 +5002,7 @@ def test_extract_remote_node_ids_maps_defined_subgraph_nodes_through_instances(
 
 def test_extract_remote_node_ids_maps_nested_defined_subgraph_instances(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """Nested reusable definitions should retain every instance ancestor in prompt ids."""
@@ -5038,7 +5047,7 @@ def test_extract_remote_node_ids_maps_nested_defined_subgraph_instances(
         },
     }
 
-    assert api_intercept_module.extract_remote_node_ids(
+    assert remote_graph_analysis_module.extract_remote_node_ids(
         workflow,
         settings,
         prompt_node_ids={"105:7:11", "300"},
@@ -5380,6 +5389,7 @@ def test_rewrite_auto_expands_upstream_non_transportable_dependencies(
 
 def test_analyze_remote_node_selection_returns_nodes_to_mark_and_reasons(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """Dry-run analysis should surface the clicked node plus required upstream nodes."""
@@ -5433,7 +5443,7 @@ def test_analyze_remote_node_selection_returns_nodes_to_mark_and_reasons(
         },
     }
 
-    analysis = api_intercept_module.analyze_remote_node_selection(
+    analysis = remote_graph_analysis_module.analyze_remote_node_selection(
         prompt=prompt,
         workflow=workflow,
         seed_workflow_node_paths=["3"],
@@ -5457,6 +5467,7 @@ def test_analyze_remote_node_selection_returns_nodes_to_mark_and_reasons(
 
 def test_analyze_remote_node_selection_reports_local_reentry(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """Dry-run analysis should report local nodes between existing remote regions."""
@@ -5501,7 +5512,7 @@ def test_analyze_remote_node_selection_reports_local_reentry(
         "3": {"class_type": "RemoteString", "inputs": {"text": ["2", 0]}},
     }
 
-    analysis = api_intercept_module.analyze_remote_node_selection(
+    analysis = remote_graph_analysis_module.analyze_remote_node_selection(
         prompt=prompt,
         workflow=workflow,
         seed_workflow_node_paths=[],
@@ -5515,6 +5526,7 @@ def test_analyze_remote_node_selection_reports_local_reentry(
 
 def test_analyze_remote_node_selection_prefers_nested_workflow_paths(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """Nested prompt ids should map back to the specific inner workflow node path."""
@@ -5569,7 +5581,7 @@ def test_analyze_remote_node_selection_prefers_nested_workflow_paths(
         },
     }
 
-    analysis = api_intercept_module.analyze_remote_node_selection(
+    analysis = remote_graph_analysis_module.analyze_remote_node_selection(
         prompt=prompt,
         workflow=workflow,
         seed_workflow_node_paths=["24:23"],
@@ -5817,6 +5829,7 @@ def test_rewrite_keeps_remote_noise_producer_with_remote_sampler(
 
 def test_extract_remote_node_ids_prefers_nested_prompt_id_over_colliding_root_id(
     api_intercept_module: Any,
+    remote_graph_analysis_module: Any,
     settings_module: Any,
 ) -> None:
     """Nested Modal markers should resolve to their composed prompt ids when root ids collide."""
@@ -5853,7 +5866,7 @@ def test_extract_remote_node_ids_prefers_nested_prompt_id_over_colliding_root_id
         ]
     }
 
-    assert api_intercept_module.extract_remote_node_ids(
+    assert remote_graph_analysis_module.extract_remote_node_ids(
         workflow,
         settings,
         prompt_node_ids={"27", "195:27", "222", "223"},
