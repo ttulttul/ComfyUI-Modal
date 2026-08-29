@@ -570,6 +570,18 @@ def mapped_execution_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_interrupts_module(extension_package: object) -> object:
+    """Return Modal prompt cancellation and interrupt state."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.modal_interrupts")
+
+
+@pytest.fixture(scope="session")
+def payload_stream_module(extension_package: object) -> object:
+    """Return Modal stream-to-local-UI forwarding helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.payload_stream")
+
+
+@pytest.fixture(scope="session")
 def modal_llm_profile_staging_module(extension_package: object) -> object:
     """Return host-side Modal LLM staging helpers and registry state."""
     return importlib.import_module(

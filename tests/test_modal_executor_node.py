@@ -8402,6 +8402,7 @@ def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
 
 def test_remote_modal_consumes_streamed_progress_and_result(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     local_ui_events_module: Any,
     monkeypatch: Any,
     caplog: pytest.LogCaptureFixture,
@@ -8430,7 +8431,7 @@ def test_remote_modal_consumes_streamed_progress_and_result(
         "modal_gpu": "B300",
         "extra_data": {"client_id": "client-1"},
     }
-    caplog.set_level(logging.INFO, logger=remote_modal_app_module.__name__)
+    caplog.set_level(logging.INFO, logger=payload_stream_module.__name__)
     result = remote_modal_app_module._consume_remote_payload_stream(
         payload,
         iter(
@@ -8510,12 +8511,13 @@ def test_remote_modal_consumes_streamed_progress_and_result(
 
 def test_remote_stream_first_event_triggers_speculative_prewarm_once(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The current worker must emit an event before its future affinity is prepared."""
     scheduled_payloads: list[tuple[dict[str, Any], str]] = []
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_schedule_speculative_affinity_prewarm",
         lambda payload, *, reason: scheduled_payloads.append((dict(payload), reason))
         or True,
@@ -8629,6 +8631,7 @@ def test_emit_local_mapped_lane_progress_start_marks_lane_as_setup_only(
 
 def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     modal_container_logs_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -8641,12 +8644,12 @@ def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
         lambda: types.SimpleNamespace(stream_remote_container_logs=True),
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_retain_remote_container_log_stream",
         lambda task_id: log_stream_calls.append(("retain", task_id)) or task_id,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_release_remote_container_log_stream",
         lambda task_id: log_stream_calls.append(("release", task_id)),
     )
@@ -9948,6 +9951,7 @@ def test_remote_modal_requires_manual_deploy_when_auto_deploy_disabled(
 
 def test_invoke_remote_engine_propagates_local_interrupt_to_modal(
     remote_modal_app_module: Any,
+    modal_interrupts_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local proxy should propagate ComfyUI interrupts to the remote Modal call."""
@@ -9974,9 +9978,10 @@ def test_invoke_remote_engine_propagates_local_interrupt_to_modal(
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_interrupts_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "_local_processing_interrupted",
         fake_local_processing_interrupted,
     )
@@ -9998,6 +10003,7 @@ def test_invoke_remote_engine_propagates_local_interrupt_to_modal(
 
 def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
     remote_modal_app_module: Any,
+    modal_interrupts_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The async local proxy should also propagate ComfyUI interrupts to the remote Modal call."""
@@ -10024,9 +10030,10 @@ def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_interrupts_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "_local_processing_interrupted",
         fake_local_processing_interrupted,
     )
@@ -10050,6 +10057,7 @@ def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
 
 def test_invoke_remote_engine_releases_prompt_when_cancelled_during_deploy(
     remote_modal_app_module: Any,
+    modal_interrupts_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Cancellation during Modal deploy/provisioning should release the local prompt promptly."""
@@ -10084,12 +10092,12 @@ def test_invoke_remote_engine_releases_prompt_when_cancelled_during_deploy(
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "_local_processing_interrupted",
         fake_local_processing_interrupted,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "_request_remote_interrupt",
         lambda payload: remote_interrupt_payloads.append(dict(payload)) or True,
     )
@@ -10150,6 +10158,7 @@ def test_invoke_remote_engine_payload_refuses_dispatch_after_prestart_cancel(
 
 def test_remote_modal_interrupt_callback_writes_shared_control_flag(
     remote_modal_app_module: Any,
+    modal_interrupts_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local interrupt callback should write to the shared Modal Dict control store."""
@@ -10182,13 +10191,13 @@ def test_remote_modal_interrupt_callback_writes_shared_control_flag(
             return interrupt_store
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "modal",
         types.SimpleNamespace(Dict=FakeModalDict),
     )
     monkeypatch.setenv("COMFY_MODAL_INTERRUPT_DICT_NAME", "shared-interrupts")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+    modal_interrupts_module._MODAL_INTERRUPT_DICTS.clear()
     try:
         callback = remote_modal_app_module._build_remote_interrupt_callback(
             object(),
@@ -10198,7 +10207,7 @@ def test_remote_modal_interrupt_callback_writes_shared_control_flag(
         callback()
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+        modal_interrupts_module._MODAL_INTERRUPT_DICTS.clear()
 
     assert len(interrupt_store.put_calls) == 1
     interrupt_key, interrupt_value = interrupt_store.put_calls[0]
@@ -10208,6 +10217,7 @@ def test_remote_modal_interrupt_callback_writes_shared_control_flag(
 
 def test_request_remote_interrupt_async_uses_shared_control_async_put(
     remote_modal_app_module: Any,
+    modal_interrupts_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Async local cancellation should use Modal Dict.put.aio instead of blocking put."""
@@ -10255,13 +10265,13 @@ def test_request_remote_interrupt_async_uses_shared_control_async_put(
             return interrupt_store
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "modal",
         types.SimpleNamespace(Dict=FakeModalDict),
     )
     monkeypatch.setenv("COMFY_MODAL_INTERRUPT_DICT_NAME", "shared-interrupts")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+    modal_interrupts_module._MODAL_INTERRUPT_DICTS.clear()
     try:
         wrote_interrupt = asyncio.run(
             remote_modal_app_module._request_remote_interrupt_async(
@@ -10270,7 +10280,7 @@ def test_request_remote_interrupt_async_uses_shared_control_async_put(
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_INTERRUPT_DICTS.clear()
+        modal_interrupts_module._MODAL_INTERRUPT_DICTS.clear()
 
     assert wrote_interrupt is True
     assert interrupt_store.put.sync_calls == []
@@ -10302,6 +10312,7 @@ def test_request_remote_modal_prompt_interrupt_cancels_active_components(
 
 def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_outer_sync(
     remote_modal_app_module: Any,
+    modal_interrupts_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -10338,7 +10349,7 @@ def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_out
             return fake_stream_events()
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "_local_processing_interrupted",
         fake_local_processing_interrupted,
     )
@@ -10368,6 +10379,7 @@ def test_invoke_remote_engine_payload_stream_detects_local_interrupt_without_out
 
 def test_invoke_remote_engine_payload_releases_local_prompt_after_cancel_grace(
     remote_modal_app_module: Any,
+    modal_interrupts_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local proxy should not wait forever for a cancelled Modal call to unwind."""
@@ -10391,7 +10403,7 @@ def test_invoke_remote_engine_payload_releases_local_prompt_after_cancel_grace(
     monkeypatch.setenv("COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS", "0.05")
     remote_modal_app_module.get_settings.cache_clear()
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_interrupts_module,
         "_local_processing_interrupted",
         fake_local_processing_interrupted,
     )
@@ -14372,6 +14384,7 @@ def test_trim_subgraph_payload_to_required_nodes_drops_stale_execute_targets(
 
 def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_previews(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -14381,17 +14394,17 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
     preview_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_calls.append(kwargs),
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_modal_status",
         lambda **kwargs: status_calls.append(kwargs),
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_preview_boundary_output",
         lambda **kwargs: preview_calls.append(kwargs),
     )
@@ -14465,6 +14478,7 @@ def test_consume_remote_payload_stream_suppresses_status_but_keeps_boundary_prev
 
 def test_consume_remote_payload_stream_keeps_static_execute_node_progress_when_status_is_suppressed(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -14472,7 +14486,7 @@ def test_consume_remote_payload_stream_keeps_static_execute_node_progress_when_s
     progress_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_calls.append(kwargs),
     )
@@ -14537,6 +14551,7 @@ def test_consume_remote_payload_stream_keeps_static_execute_node_progress_when_s
 
 def test_consume_remote_payload_stream_marks_progress_node_ancestors_complete(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -14544,7 +14559,7 @@ def test_consume_remote_payload_stream_marks_progress_node_ancestors_complete(
     progress_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_calls.append(kwargs),
     )
@@ -14585,6 +14600,7 @@ def test_consume_remote_payload_stream_marks_progress_node_ancestors_complete(
 
 def test_consume_remote_payload_stream_clears_static_execute_node_progress_on_suppressed_completion(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -14592,7 +14608,7 @@ def test_consume_remote_payload_stream_clears_static_execute_node_progress_on_su
     progress_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_calls.append(kwargs),
     )
@@ -14662,6 +14678,7 @@ def test_consume_remote_payload_stream_clears_static_execute_node_progress_on_su
 
 def test_consume_remote_payload_stream_filters_static_sibling_ui_events_from_mapped_items(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -14670,12 +14687,12 @@ def test_consume_remote_payload_stream_filters_static_sibling_ui_events_from_map
     preview_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_executed_output",
         lambda **kwargs: executed_calls.append(kwargs),
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_preview_image",
         lambda **kwargs: preview_calls.append(kwargs),
     )
@@ -14763,6 +14780,7 @@ def test_consume_remote_payload_stream_filters_static_sibling_ui_events_from_map
 
 def test_consume_remote_payload_stream_forwards_cached_node_markers(
     remote_modal_app_module: Any,
+    payload_stream_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -14770,7 +14788,7 @@ def test_consume_remote_payload_stream_forwards_cached_node_markers(
     progress_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        payload_stream_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_calls.append(kwargs),
     )

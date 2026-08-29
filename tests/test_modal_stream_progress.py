@@ -54,9 +54,15 @@ def _load_modal_app_module() -> types.ModuleType:
     )
 
 
+def _loaded_payload_stream_module() -> types.ModuleType:
+    """Return the payload-stream owner loaded with the transient package."""
+    return sys.modules[f"{TEST_PACKAGE_NAME}.remote.payload_stream"]
+
+
 def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None:
     """Mapped lane progress should target the real executing node, not the representative."""
     modal_app = _load_modal_app_module()
+    payload_stream = _loaded_payload_stream_module()
     mapped_execution = sys.modules[
         f"{TEST_PACKAGE_NAME}.remote.mapped_execution"
     ]
@@ -66,7 +72,7 @@ def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None
         """Record forwarded local progress events for assertions."""
         emitted_progress.append(kwargs)
 
-    monkeypatch.setattr(modal_app, "_emit_local_modal_progress", capture_progress)
+    monkeypatch.setattr(payload_stream, "_emit_local_modal_progress", capture_progress)
     monkeypatch.setattr(
         mapped_execution, "_emit_local_modal_progress", capture_progress
     )
@@ -148,9 +154,10 @@ def test_llm_stream_progress_preserves_stage_and_token_metrics(
 ) -> None:
     """LLM labels, TTFT, and token rate should reach the local websocket."""
     modal_app = _load_modal_app_module()
+    payload_stream = _loaded_payload_stream_module()
     emitted_progress: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        modal_app,
+        payload_stream,
         "_emit_local_modal_progress",
         lambda **kwargs: emitted_progress.append(kwargs),
     )
@@ -207,9 +214,10 @@ def test_llm_stream_progress_preserves_stage_and_token_metrics(
 def test_stream_progress_reports_exact_modal_container_identity(monkeypatch: Any) -> None:
     """A Modal task id should follow its component progress into the node badge."""
     modal_app = _load_modal_app_module()
+    payload_stream = _loaded_payload_stream_module()
     emitted_progress: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        modal_app,
+        payload_stream,
         "_emit_local_modal_progress",
         lambda **kwargs: emitted_progress.append(kwargs),
     )
@@ -247,9 +255,10 @@ def test_stream_progress_reports_exact_modal_container_identity(monkeypatch: Any
 def test_stream_status_reports_exact_modal_container_identity(monkeypatch: Any) -> None:
     """Node status should expose a Modal task id before numeric progress begins."""
     modal_app = _load_modal_app_module()
+    payload_stream = _loaded_payload_stream_module()
     emitted_status: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        modal_app,
+        payload_stream,
         "_emit_local_modal_status",
         lambda **kwargs: emitted_status.append(kwargs),
     )

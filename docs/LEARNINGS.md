@@ -703,3 +703,7 @@ Saved workflows may nest reusable subgraph definitions while queued prompt nodes
 ## Route registration should inject the prompt rewrite boundary
 
 `api_intercept.py` builds a `RouteContext` with the asynchronous rewrite callable, while `prompt_interception.py` owns the synchronous rewrite and its thread-offloading wrapper. Tests that replace rewrite behavior must patch `prompt_interception.rewrite_prompt_for_modal` before route registration so the injected async boundary observes the replacement.
+
+## Stream forwarding and interrupt state need distinct patch owners
+
+Host-side Modal invocation coordinates two independent stateful concerns: `remote/modal_interrupts.py` owns prompt-scoped cancellation registries and shared interrupt-store access, while `remote/payload_stream.py` owns conversion of remote progress, preview, log, and result events into local UI messages. Compatibility exports remain on `remote.modal_app`, but tests that replace internal callbacks must patch the owning module because the extracted functions resolve their collaborators there.
