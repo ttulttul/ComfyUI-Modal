@@ -75,6 +75,7 @@
 !/serialization.py
 !/settings.py
 !/session_state.py
+!/snapshot_lease.py
 !/ssh_docker.py
 !/ssh_executor.py
 !/ssh_runtime.py

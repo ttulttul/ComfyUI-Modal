@@ -1020,6 +1020,7 @@ def test_provider_neutral_stager_uses_planner_resolved_profile(
 
 def test_snapshot_lease_reclaims_dead_local_owner(
     llm_staging_module: Any,
+    snapshot_lease_module: Any,
     tmp_path: Path,
 ) -> None:
     """A dead process record should never force a two-hour stale-lock wait."""
@@ -1030,7 +1031,7 @@ def test_snapshot_lease_reclaims_dead_local_owner(
         json.dumps(
             {
                 "owner_id": "orphan",
-                "host_id": llm_staging_module.socket.gethostname(),
+                "host_id": snapshot_lease_module.socket.gethostname(),
                 "pid": 2_000_000_000,
                 "process_start": "missing",
                 "token": "old-token",
@@ -1051,20 +1052,20 @@ def test_snapshot_lease_reclaims_dead_local_owner(
 
 
 def test_snapshot_lease_recognizes_live_owner_without_procfs(
-    llm_staging_module: Any,
+    snapshot_lease_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Portable PID probing should keep a live macOS staging owner valid."""
     monkeypatch.setattr(
-        llm_staging_module,
+        snapshot_lease_module,
         "_process_start_identity",
         lambda _pid: None,
     )
 
-    alive = llm_staging_module._local_lease_owner_is_alive(
+    alive = snapshot_lease_module._local_lease_owner_is_alive(
         {
-            "host_id": llm_staging_module.socket.gethostname(),
-            "pid": llm_staging_module.os.getpid(),
+            "host_id": snapshot_lease_module.socket.gethostname(),
+            "pid": snapshot_lease_module.os.getpid(),
             "process_start": None,
         }
     )
@@ -1074,6 +1075,7 @@ def test_snapshot_lease_recognizes_live_owner_without_procfs(
 
 def test_snapshot_lease_reclaims_missing_foreign_heartbeat(
     llm_staging_module: Any,
+    snapshot_lease_module: Any,
     tmp_path: Path,
 ) -> None:
     """A vanished prior container should not leave a structured lease for hours."""
@@ -1093,11 +1095,11 @@ def test_snapshot_lease_reclaims_missing_foreign_heartbeat(
         encoding="utf-8",
     )
     stale_time = (
-        llm_staging_module.time.time()
-        - llm_staging_module._DEFAULT_LEASE_HEARTBEAT_STALE_SECONDS
+        snapshot_lease_module.time.time()
+        - snapshot_lease_module._DEFAULT_LEASE_HEARTBEAT_STALE_SECONDS
         - 1
     )
-    llm_staging_module.os.utime(lease_path, (stale_time, stale_time))
+    snapshot_lease_module.os.utime(lease_path, (stale_time, stale_time))
 
     with llm_staging_module._snapshot_lease(
         snapshot_path,
