@@ -4524,7 +4524,7 @@ def test_planner_resolved_llm_profile_is_attached_to_matching_payload(
 
 def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
     api_intercept_module: Any,
-    prompt_rewrite_module: Any,
+    prompt_affinity_planning_module: Any,
 ) -> None:
     """Each proxy should prepare only its nearest reachable future worker group."""
     rewritten_prompt = {
@@ -4585,7 +4585,7 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
         },
     }
 
-    prompt_rewrite_module._configure_speculative_affinity_prewarm_payloads(
+    prompt_affinity_planning_module._configure_speculative_affinity_prewarm_payloads(
         rewritten_prompt=rewritten_prompt,
         execution_stages=[["spec-a", "spec-b"], ["spec-c"]],
     )
@@ -4612,7 +4612,7 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
 
 def test_planner_does_not_bridge_local_gap_keepalive_across_providers(
     api_intercept_module: Any,
-    prompt_rewrite_module: Any,
+    prompt_affinity_planning_module: Any,
 ) -> None:
     """A Modal producer must not retain a slot for an SSH continuation."""
     rewritten_prompt = {
@@ -4643,7 +4643,7 @@ def test_planner_does_not_bridge_local_gap_keepalive_across_providers(
         },
     }
 
-    prompt_rewrite_module._configure_local_gap_keepalive_payloads(
+    prompt_affinity_planning_module._configure_local_gap_keepalive_payloads(
         rewritten_prompt=rewritten_prompt,
         remote_component_ids=["modal-producer", "ssh-consumer"],
         sandwiched_local_node_ids={"local-gap"},

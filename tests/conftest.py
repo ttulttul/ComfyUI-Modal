@@ -346,6 +346,12 @@ def prompt_rewrite_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def prompt_affinity_planning_module(extension_package: object) -> object:
+    """Return affinity, keepalive, and speculative prewarm rewrite helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.prompt_affinity_planning")
+
+
+@pytest.fixture(scope="session")
 def execution_scheduling_module(extension_package: object) -> object:
     """Return provider-neutral scheduling and capacity helpers."""
     return importlib.import_module(f"{PACKAGE_NAME}.execution_scheduling")

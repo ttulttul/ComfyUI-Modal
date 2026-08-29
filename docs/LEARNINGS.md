@@ -691,3 +691,7 @@ The entrypoint logger has a similar identity constraint: tests and operators ins
 ## Mutable caches move with their reporting owner
 
 The short-lived R2 bucket-usage cache is plan-reporting state, not scheduler state. Moving the cache, lock, credential lookup, and rendering helpers together into `execution_plan_reporting.py` prevents compatibility re-exports from creating a second mutable binding. Tests that clear the cache or replace credential clients must patch that owner directly; callers may continue to use the compatibility functions exported by `execution_scheduling.py`.
+
+## Affinity decoration is downstream graph planning
+
+Parallel local-branch release, local-gap keepalive, and speculative worker prewarm all traverse the rewritten proxy graph after payload construction. Keeping them together in `prompt_affinity_planning.py` gives that post-rewrite graph mutation one owner while leaving `prompt_rewrite.py` focused on constructing payloads and proxy nodes.
