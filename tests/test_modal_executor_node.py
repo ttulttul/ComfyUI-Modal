@@ -6433,6 +6433,7 @@ def test_modal_cloud_finds_memory_mapped_compile_cache_files(
 
 def test_remote_modal_auto_deploys_missing_app_by_default(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     local_ui_events_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -6505,20 +6506,21 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
         local_ui_events_module,
         "_emit_local_modal_status",
         lambda **event: status_events.append(event),
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_load_modal_cloud_module",
         lambda: types.SimpleNamespace(app=FakeApp()),
     )
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
         remote_modal_app_module._STAGED_LLM_PROFILES.clear()
     try:
@@ -6539,8 +6541,8 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
         with remote_modal_app_module._STAGED_LLM_PROFILES_LOCK:
             remote_modal_app_module._STAGED_LLM_PROFILES.clear()
 
@@ -6566,6 +6568,7 @@ def test_remote_modal_auto_deploys_missing_app_by_default(
 
 def test_remote_modal_does_not_classify_remote_execution_error_as_missing_app(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
 ) -> None:
     """Remote execution tracebacks should surface directly instead of triggering redeploy."""
     remote_error = RuntimeError(
@@ -6581,12 +6584,13 @@ def test_remote_modal_does_not_classify_remote_execution_error_as_missing_app(
         "App 'comfy-modal-sync' not found in environment 'main'."
     )
 
-    assert not remote_modal_app_module._is_missing_modal_deployment_error(remote_error)
-    assert remote_modal_app_module._is_missing_modal_deployment_error(missing_lookup_error)
+    assert not modal_deployment_module._is_missing_modal_deployment_error(remote_error)
+    assert modal_deployment_module._is_missing_modal_deployment_error(missing_lookup_error)
 
 
 def test_remote_modal_does_not_redeploy_after_remote_execution_error(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The deployed invocation path should not auto-deploy after a remote runtime failure."""
@@ -6639,7 +6643,8 @@ def test_remote_modal_does_not_redeploy_after_remote_execution_error(
         raise AssertionError("remote execution errors must not trigger auto-deploy")
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
-    monkeypatch.setattr(remote_modal_app_module, "_load_modal_cloud_module", fail_load_cloud_module)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "_load_modal_cloud_module", fail_load_cloud_module)
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     remote_modal_app_module.get_settings.cache_clear()
     try:
@@ -6654,6 +6659,7 @@ def test_remote_modal_does_not_redeploy_after_remote_execution_error(
 
 def test_remote_modal_redeploys_when_cached_app_was_deleted(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A stale in-process auto-deploy cache should not block redeploy after app deletion."""
@@ -6718,20 +6724,21 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_load_modal_cloud_module",
         lambda: types.SimpleNamespace(app=FakeApp()),
     )
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES[
+    modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_AUTO_DEPLOY_STATES[
         (DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")
     ] = (
-        remote_modal_app_module._ModalAutoDeployState(ready=True)
+        modal_deployment_module._ModalAutoDeployState(ready=True)
     )
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
@@ -6740,8 +6747,8 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
@@ -6749,6 +6756,7 @@ def test_remote_modal_redeploys_when_cached_app_was_deleted(
 
 def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_invoke(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A stale deployed engine handle should auto-redeploy when invocation hydrate fails."""
@@ -6819,16 +6827,17 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_load_modal_cloud_module",
         lambda: types.SimpleNamespace(app=FakeApp()),
     )
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {"component_id": "component-1"},
@@ -6836,8 +6845,8 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
     assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
@@ -6845,6 +6854,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
 
 def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A stale deployed warmup handle should auto-redeploy instead of surfacing a warmup error."""
@@ -6914,24 +6924,25 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_load_modal_cloud_module",
         lambda: types.SimpleNamespace(app=FakeApp()),
     )
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         response = remote_modal_app_module._invoke_modal_warmup_blocking(
             {"component_id": "component-1::warmup:0"},
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == {"component_id": "component-1::warmup:0"}
     assert deploy_calls == [(DEFAULT_TEST_DEPLOYMENT_APP_NAME, "main")]
@@ -6939,6 +6950,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
 
 def test_remote_modal_replaces_out_of_date_deployed_app(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A deployed app with an old protocol should be stopped and auto-deployed again."""
@@ -7021,17 +7033,18 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
         FakeModal.deployed = False
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
-    monkeypatch.setattr(remote_modal_app_module, "_stop_modal_app_for_replacement", fake_stop_app)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "_stop_modal_app_for_replacement", fake_stop_app)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_load_modal_cloud_module",
         lambda: types.SimpleNamespace(app=FakeApp()),
     )
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         response = remote_modal_app_module._invoke_modal_payload_blocking(
             {"component_id": "component-1"},
@@ -7039,8 +7052,8 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert response == b"remote-response"
     assert stop_calls == [DEFAULT_TEST_DEPLOYMENT_APP_NAME]
@@ -7049,6 +7062,7 @@ def test_remote_modal_replaces_out_of_date_deployed_app(
 
 def test_remote_modal_stops_app_through_experimental_sdk(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Modal 1.4 should use its non-interactive experimental stop API."""
@@ -7059,7 +7073,7 @@ def test_remote_modal_stops_app_through_experimental_sdk(
         stop_calls.append((app_name, environment_name))
 
     fake_experimental_namespace = types.SimpleNamespace(stop_app=fake_stop_app)
-    original_import_module = remote_modal_app_module.importlib.import_module
+    original_import_module = modal_deployment_module.importlib.import_module
 
     def fake_import_module(module_name: str) -> Any:
         """Return the Modal experimental namespace and delegate other imports."""
@@ -7068,18 +7082,18 @@ def test_remote_modal_stops_app_through_experimental_sdk(
         return original_import_module(module_name)
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "modal",
         types.SimpleNamespace(exception=types.SimpleNamespace()),
     )
     monkeypatch.setattr(
-        remote_modal_app_module.importlib,
+        modal_deployment_module.importlib,
         "import_module",
         fake_import_module,
     )
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
 
-    stopped = remote_modal_app_module._stop_modal_app_via_sdk("comfy-modal-sync-instance")
+    stopped = modal_deployment_module._stop_modal_app_via_sdk("comfy-modal-sync-instance")
 
     assert stopped is True
     assert stop_calls == [("comfy-modal-sync-instance", "main")]
@@ -7087,6 +7101,7 @@ def test_remote_modal_stops_app_through_experimental_sdk(
 
 def test_remote_modal_cli_stop_is_noninteractive_and_environment_scoped(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The CLI fallback should never block waiting for confirmation."""
@@ -7097,11 +7112,11 @@ def test_remote_modal_cli_stop_is_noninteractive_and_environment_scoped(
         observed_calls.append((command, kwargs))
         return types.SimpleNamespace(returncode=0, stderr="")
 
-    monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda _: "/venv/bin/modal")
-    monkeypatch.setattr(remote_modal_app_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(modal_deployment_module.shutil, "which", lambda _: "/venv/bin/modal")
+    monkeypatch.setattr(modal_deployment_module.subprocess, "run", fake_run)
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
 
-    stopped = remote_modal_app_module._stop_modal_app_via_cli("comfy-modal-sync-instance")
+    stopped = modal_deployment_module._stop_modal_app_via_cli("comfy-modal-sync-instance")
 
     assert stopped is True
     assert observed_calls == [
@@ -7127,6 +7142,7 @@ def test_remote_modal_cli_stop_is_noninteractive_and_environment_scoped(
 
 def test_remote_modal_cli_stop_timeout_returns_controlled_failure(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
     caplog: Any,
 ) -> None:
@@ -7140,12 +7156,12 @@ def test_remote_modal_cli_stop_timeout_returns_controlled_failure(
             remote_modal_app_module._MODAL_APP_STOP_TIMEOUT_SECONDS,
         )
 
-    monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda _: "/venv/bin/modal")
-    monkeypatch.setattr(remote_modal_app_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(modal_deployment_module.shutil, "which", lambda _: "/venv/bin/modal")
+    monkeypatch.setattr(modal_deployment_module.subprocess, "run", fake_run)
     monkeypatch.delenv("MODAL_ENVIRONMENT", raising=False)
 
     with caplog.at_level(logging.WARNING):
-        stopped = remote_modal_app_module._stop_modal_app_via_cli(
+        stopped = modal_deployment_module._stop_modal_app_via_cli(
             "comfy-modal-sync-instance"
         )
 
@@ -7155,6 +7171,7 @@ def test_remote_modal_cli_stop_timeout_returns_controlled_failure(
 
 def test_remote_modal_rejects_fingerprint_mismatch_when_auto_deploy_is_disabled(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A same-protocol worker with different source or settings must not execute."""
@@ -7165,23 +7182,24 @@ def test_remote_modal_rejects_fingerprint_mismatch_when_auto_deploy_is_disabled(
     )
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "false")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
         with pytest.raises(
-            remote_modal_app_module.ModalRemoteInvocationError,
+            modal_deployment_module.ModalRemoteInvocationError,
             match="runtime fingerprint is out of date",
         ):
-            remote_modal_app_module._ensure_remote_engine_protocol_current(
+            modal_deployment_module._ensure_remote_engine_protocol_current(
                 remote_engine,
                 {"component_id": "component-1"},
             )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
 
 def test_remote_modal_rebinds_affinity_after_compatible_protocol_probe(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A legacy-safe version probe should be replaced before real execution."""
@@ -7198,19 +7216,19 @@ def test_remote_modal_rebinds_affinity_after_compatible_protocol_probe(
         return affinity_engine
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_lookup_deployed_remote_engine",
         fake_lookup,
     )
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     payload = {"component_id": "component-1"}
     try:
-        result = remote_modal_app_module._ensure_remote_engine_protocol_current(
+        result = modal_deployment_module._ensure_remote_engine_protocol_current(
             probe_engine,
             payload,
         )
     finally:
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert result is affinity_engine
     assert observed_payloads == [payload]
@@ -7218,6 +7236,7 @@ def test_remote_modal_rebinds_affinity_after_compatible_protocol_probe(
 
 def test_remote_modal_rebinds_affinity_after_cached_protocol_validation(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A cached protocol result must not turn its parameterless probe into execution."""
@@ -7231,7 +7250,7 @@ def test_remote_modal_rebinds_affinity_after_cached_protocol_validation(
         return affinity_engine
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_lookup_deployed_remote_engine",
         fake_lookup,
     )
@@ -7239,16 +7258,16 @@ def test_remote_modal_rebinds_affinity_after_cached_protocol_validation(
         "component_id": "component-llm",
         "remote_worker_affinity_group": "llm",
     }
-    runtime_cache_key = remote_modal_app_module._modal_runtime_cache_key(payload)
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
+    runtime_cache_key = modal_deployment_module._modal_runtime_cache_key(payload)
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
     try:
-        result = remote_modal_app_module._ensure_remote_engine_protocol_current(
+        result = modal_deployment_module._ensure_remote_engine_protocol_current(
             probe_engine,
             payload,
         )
     finally:
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert result is affinity_engine
     assert observed_payloads == [payload]
@@ -7256,6 +7275,7 @@ def test_remote_modal_rebinds_affinity_after_cached_protocol_validation(
 
 def test_remote_modal_cached_protocol_skips_parameterless_probe_construction(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A cached runtime must construct only the affinity-bound engine handle."""
@@ -7274,7 +7294,7 @@ def test_remote_modal_cached_protocol_skips_parameterless_probe_construction(
         return affinity_engine
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_lookup_deployed_remote_engine",
         fake_lookup,
     )
@@ -7282,13 +7302,13 @@ def test_remote_modal_cached_protocol_skips_parameterless_probe_construction(
         "component_id": "component-comfy::warmup:0",
         "remote_worker_affinity_group": "comfy",
     }
-    runtime_cache_key = remote_modal_app_module._modal_runtime_cache_key(payload)
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
+    runtime_cache_key = modal_deployment_module._modal_runtime_cache_key(payload)
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.add(runtime_cache_key)
     try:
-        result = remote_modal_app_module._lookup_protocol_current_remote_engine(payload)
+        result = modal_deployment_module._lookup_protocol_current_remote_engine(payload)
     finally:
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert result is affinity_engine
     assert observed_lookups == [(payload, False)]
@@ -7296,6 +7316,7 @@ def test_remote_modal_cached_protocol_skips_parameterless_probe_construction(
 
 def test_remote_modal_uncached_protocol_uses_cpu_stager_before_gpu_lookup(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """First validation should use CPU metadata and construct one bound GPU handle."""
@@ -7315,12 +7336,12 @@ def test_remote_modal_uncached_protocol_uses_cpu_stager_before_gpu_lookup(
         return affinity_engine
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_remote_runtime_version_from_cpu_stager",
         lambda payload: version_payload,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_lookup_deployed_remote_engine",
         fake_lookup,
     )
@@ -7328,16 +7349,16 @@ def test_remote_modal_uncached_protocol_uses_cpu_stager_before_gpu_lookup(
         "component_id": "component-llm",
         "remote_worker_affinity_group": "llm",
     }
-    runtime_cache_key = remote_modal_app_module._modal_runtime_cache_key(payload)
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    runtime_cache_key = modal_deployment_module._modal_runtime_cache_key(payload)
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
-        result = remote_modal_app_module._lookup_protocol_current_remote_engine(payload)
+        result = modal_deployment_module._lookup_protocol_current_remote_engine(payload)
         runtime_was_cached = (
             runtime_cache_key
-            in remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK
+            in modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK
         )
     finally:
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert result is affinity_engine
     assert runtime_was_cached is True
@@ -7346,34 +7367,36 @@ def test_remote_modal_uncached_protocol_uses_cpu_stager_before_gpu_lookup(
 
 def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
 ) -> None:
     """Each workflow GPU target should select a distinct deploy-time runtime identity."""
-    a100_fingerprint = remote_modal_app_module._expected_remote_runtime_fingerprint(
+    a100_fingerprint = modal_deployment_module._expected_remote_runtime_fingerprint(
         {"modal_gpu": "A100"}
     )
-    b300_fingerprint = remote_modal_app_module._expected_remote_runtime_fingerprint(
+    b300_fingerprint = modal_deployment_module._expected_remote_runtime_fingerprint(
         {"modal_gpu": "B300"}
     )
 
     assert a100_fingerprint != b300_fingerprint
-    assert remote_modal_app_module._settings_for_payload(
+    assert modal_deployment_module._settings_for_payload(
         {"modal_gpu": "L40S"}
     ).modal_gpu == "L40S"
-    configured_settings = remote_modal_app_module._settings_for_payload(
+    configured_settings = modal_deployment_module._settings_for_payload(
         {"modal_gpu": "H200", "modal_max_containers": 3}
     )
     assert configured_settings.modal_gpu == "H200"
     assert configured_settings.max_containers == 3
-    assert remote_modal_app_module._modal_deploy_cache_key(
+    assert modal_deployment_module._modal_deploy_cache_key(
         {"modal_gpu": "A100"}
     )[0] == "comfy-modal-sync"
-    assert remote_modal_app_module._modal_deploy_cache_key(
+    assert modal_deployment_module._modal_deploy_cache_key(
         {"modal_gpu": "B300"}
     )[0] == "comfy-modal-sync-gpu-b300"
 
 
 def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Concurrent first-run callers should share one deploy and wait for lookup readiness."""
@@ -7458,17 +7481,18 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_deployment_module,
         "_load_modal_cloud_module",
         lambda: types.SimpleNamespace(app=FakeApp()),
     )
-    monkeypatch.setattr(remote_modal_app_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(modal_deployment_module.time, "sleep", lambda _: None)
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "true")
     monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-    remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     try:
         payload_response: list[bytes] = []
@@ -7507,8 +7531,8 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
         warmup_thread.join(timeout=1.0)
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._MODAL_AUTO_DEPLOY_STATES.clear()
-        remote_modal_app_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+        modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
 
     assert thread_errors == []
     assert payload_response == [b"remote-response"]
@@ -7518,6 +7542,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
 
 def test_lookup_deployed_remote_engine_uses_affinity_as_modal_class_parameter(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Deployed Modal lookups should isolate reusable worker slots by class identity."""
@@ -7543,8 +7568,9 @@ def test_lookup_deployed_remote_engine_uses_affinity_as_modal_class_parameter(
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
 
-    result = remote_modal_app_module._lookup_deployed_remote_engine(
+    result = modal_deployment_module._lookup_deployed_remote_engine(
         {
             "component_id": "component-1",
             "remote_session": remote_modal_app_module.RemoteSessionHandle(
@@ -7554,7 +7580,7 @@ def test_lookup_deployed_remote_engine_uses_affinity_as_modal_class_parameter(
             ).to_payload(),
         }
     )
-    probe_result = remote_modal_app_module._lookup_deployed_remote_engine(
+    probe_result = modal_deployment_module._lookup_deployed_remote_engine(
         {"component_id": "component-1"},
         protocol_probe=True,
     )
@@ -7575,6 +7601,7 @@ def test_lookup_deployed_remote_engine_uses_affinity_as_modal_class_parameter(
 
 def test_lookup_deployed_remote_engine_uses_workflow_gpu_app_identity(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A B300 workflow must miss or reuse its own app without contacting the A100 class."""
@@ -7593,8 +7620,9 @@ def test_lookup_deployed_remote_engine_uses_workflow_gpu_app_identity(
                 return lambda **kwargs: kwargs
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
 
-    result = remote_modal_app_module._lookup_deployed_remote_engine(
+    result = modal_deployment_module._lookup_deployed_remote_engine(
         {"component_id": "component-1", "modal_gpu": "B300"}
     )
 
@@ -7607,6 +7635,7 @@ def test_lookup_deployed_remote_engine_uses_workflow_gpu_app_identity(
 
 def test_lookup_deployed_remote_engine_extends_local_gap_pool_scaledown(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Sandwiched local work should use a longer independently autoscaled Modal pool."""
@@ -7640,8 +7669,9 @@ def test_lookup_deployed_remote_engine_extends_local_gap_pool_scaledown(
                 return FakeRemoteCls()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
 
-    result = remote_modal_app_module._lookup_deployed_remote_engine(
+    result = modal_deployment_module._lookup_deployed_remote_engine(
         {
             "component_id": "component-1",
             "prompt_id": "prompt-1",
@@ -7656,6 +7686,7 @@ def test_lookup_deployed_remote_engine_extends_local_gap_pool_scaledown(
 
 def test_local_gap_components_share_one_affinity_slot(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
 ) -> None:
     """Sequential remote phases around local work must address the same worker pool."""
     parallelism_metadata = {
@@ -7678,15 +7709,16 @@ def test_local_gap_components_share_one_affinity_slot(
         "extra_data": parallelism_metadata,
     }
 
-    assert remote_modal_app_module._component_pool_slot_index(first_payload) == 0
-    assert remote_modal_app_module._component_pool_slot_index(second_payload) == 0
-    assert remote_modal_app_module._remote_worker_affinity_key(first_payload) == (
-        remote_modal_app_module._remote_worker_affinity_key(second_payload)
+    assert modal_deployment_module._component_pool_slot_index(first_payload) == 0
+    assert modal_deployment_module._component_pool_slot_index(second_payload) == 0
+    assert modal_deployment_module._remote_worker_affinity_key(first_payload) == (
+        modal_deployment_module._remote_worker_affinity_key(second_payload)
     )
 
 
 def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu_snapshots(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Deployed Modal lookups should parameterize workers by snapshot profile when enabled."""
@@ -7723,6 +7755,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
@@ -7736,7 +7769,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
         },
     }
     try:
-        result = remote_modal_app_module._lookup_deployed_remote_engine(payload)
+        result = modal_deployment_module._lookup_deployed_remote_engine(payload)
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
@@ -7750,6 +7783,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
 
 def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_when_possible(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Deployed lookups should backfill snapshot records even when the payload already carries the key."""
@@ -7786,6 +7820,7 @@ def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_w
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
@@ -7810,7 +7845,7 @@ def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_w
         },
     }
     try:
-        result = remote_modal_app_module._lookup_deployed_remote_engine(payload)
+        result = modal_deployment_module._lookup_deployed_remote_engine(payload)
     finally:
         remote_modal_app_module.get_settings.cache_clear()
         remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
@@ -7822,6 +7857,7 @@ def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_w
 
 def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_sessions(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Different prompt sessions should reuse one shared deployed RemoteEngine identity."""
@@ -7847,8 +7883,9 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
 
-    first_result = remote_modal_app_module._lookup_deployed_remote_engine(
+    first_result = modal_deployment_module._lookup_deployed_remote_engine(
         {
             "component_id": "component-1",
             "prompt_id": "prompt-1",
@@ -7859,7 +7896,7 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
             ).to_payload(),
         }
     )
-    second_result = remote_modal_app_module._lookup_deployed_remote_engine(
+    second_result = modal_deployment_module._lookup_deployed_remote_engine(
         {
             "component_id": "component-1",
             "prompt_id": "prompt-2",
@@ -7893,6 +7930,7 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
 
 def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Lane-specific affinity overrides should create stable separate Modal identities."""
@@ -7929,6 +7967,7 @@ def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
     remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
@@ -7942,11 +7981,11 @@ def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
         },
     }
     try:
-        first_result = remote_modal_app_module._lookup_deployed_remote_engine(
+        first_result = modal_deployment_module._lookup_deployed_remote_engine(
             payload,
             affinity_key_override="worker-pool:slot:0",
         )
-        second_result = remote_modal_app_module._lookup_deployed_remote_engine(
+        second_result = modal_deployment_module._lookup_deployed_remote_engine(
             payload,
             affinity_key_override="worker-pool:slot:3",
         )
@@ -7963,12 +8002,13 @@ def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
 
 def test_load_modal_cloud_module_reloads_stale_partial_module(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Stale partially imported cloud modules should be discarded and reloaded."""
-    original_module = sys.modules.get(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME)
+    original_module = sys.modules.get(modal_deployment_module._MODAL_CLOUD_MODULE_NAME)
     stale_module = types.SimpleNamespace(app=None)
-    sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = stale_module
+    sys.modules[modal_deployment_module._MODAL_CLOUD_MODULE_NAME] = stale_module
 
     loaded_module = types.SimpleNamespace(app="fresh-app")
 
@@ -7985,19 +8025,19 @@ def test_load_modal_cloud_module_reloads_stale_partial_module(
             module.app = loaded_module.app
 
     monkeypatch.setattr(
-        remote_modal_app_module.importlib.util,
+        modal_deployment_module.importlib.util,
         "spec_from_file_location",
         lambda *args, **kwargs: importlib.util.spec_from_loader(
-            remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+            modal_deployment_module._MODAL_CLOUD_MODULE_NAME,
             FakeLoader(),
         ),
     )
     try:
-        reloaded_module = remote_modal_app_module._load_modal_cloud_module()
+        reloaded_module = modal_deployment_module._load_modal_cloud_module()
     finally:
-        sys.modules.pop(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME, None)
+        sys.modules.pop(modal_deployment_module._MODAL_CLOUD_MODULE_NAME, None)
         if original_module is not None:
-            sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = original_module
+            sys.modules[modal_deployment_module._MODAL_CLOUD_MODULE_NAME] = original_module
 
     assert reloaded_module is not stale_module
     assert getattr(reloaded_module, "app", None) == "fresh-app"
@@ -8005,10 +8045,11 @@ def test_load_modal_cloud_module_reloads_stale_partial_module(
 
 def test_load_modal_cloud_module_reloads_for_workflow_gpu_change(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Cloud app construction should receive the workflow-selected GPU settings."""
-    module_name = remote_modal_app_module._MODAL_CLOUD_MODULE_NAME
+    module_name = modal_deployment_module._MODAL_CLOUD_MODULE_NAME
     original_module = sys.modules.get(module_name)
     sys.modules[module_name] = types.SimpleNamespace(
         app="a100-app",
@@ -8031,7 +8072,7 @@ def test_load_modal_cloud_module_reloads_for_workflow_gpu_change(
             module.app = "b300-app"
 
     monkeypatch.setattr(
-        remote_modal_app_module.importlib.util,
+        modal_deployment_module.importlib.util,
         "spec_from_file_location",
         lambda *args, **kwargs: importlib.util.spec_from_loader(module_name, FakeLoader()),
     )
@@ -8040,8 +8081,8 @@ def test_load_modal_cloud_module_reloads_for_workflow_gpu_change(
         "B300",
     )
     try:
-        with remote_modal_app_module._modal_cloud_settings_override(settings):
-            reloaded_module = remote_modal_app_module._load_modal_cloud_module()
+        with modal_deployment_module._modal_cloud_settings_override(settings):
+            reloaded_module = modal_deployment_module._load_modal_cloud_module()
     finally:
         sys.modules.pop(module_name, None)
         if original_module is not None:
@@ -8055,10 +8096,11 @@ def test_load_modal_cloud_module_reloads_for_workflow_gpu_change(
 
 def test_load_modal_cloud_module_reloads_for_secret_name_change(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Changing only the secret name should rebuild the cloud module with new settings."""
-    module_name = remote_modal_app_module._MODAL_CLOUD_MODULE_NAME
+    module_name = modal_deployment_module._MODAL_CLOUD_MODULE_NAME
     original_module = sys.modules.get(module_name)
     base_settings = remote_modal_app_module.get_settings()
     sys.modules[module_name] = types.SimpleNamespace(
@@ -8086,14 +8128,14 @@ def test_load_modal_cloud_module_reloads_for_secret_name_change(
             module.app = "new-secret-app"
 
     monkeypatch.setattr(
-        remote_modal_app_module.importlib.util,
+        modal_deployment_module.importlib.util,
         "spec_from_file_location",
         lambda *args, **kwargs: importlib.util.spec_from_loader(module_name, FakeLoader()),
     )
     new_settings = replace(base_settings, modal_secret_name="workflow-credentials")
     try:
-        with remote_modal_app_module._modal_cloud_settings_override(new_settings):
-            reloaded_module = remote_modal_app_module._load_modal_cloud_module()
+        with modal_deployment_module._modal_cloud_settings_override(new_settings):
+            reloaded_module = modal_deployment_module._load_modal_cloud_module()
     finally:
         sys.modules.pop(module_name, None)
         if original_module is not None:
@@ -8106,9 +8148,10 @@ def test_load_modal_cloud_module_reloads_for_secret_name_change(
 
 def test_remote_modal_installs_cloud_exception_compatibility_module(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
 ) -> None:
     """Deployed remote exceptions should have importable local definitions."""
-    module_name = remote_modal_app_module._MODAL_CLOUD_MODULE_NAME
+    module_name = modal_deployment_module._MODAL_CLOUD_MODULE_NAME
     original_module = sys.modules.pop(module_name, None)
     serialization_module = types.ModuleType(module_name)
     serialization_module.RemoteSubgraphExecutionError = type(
@@ -8122,7 +8165,7 @@ def test_remote_modal_installs_cloud_exception_compatibility_module(
     )
     sys.modules.pop(module_name)
     try:
-        remote_modal_app_module._install_modal_cloud_exception_compatibility_module()
+        modal_deployment_module._install_modal_cloud_exception_compatibility_module()
 
         compatibility_module = sys.modules[module_name]
         assert (
@@ -8141,11 +8184,12 @@ def test_remote_modal_installs_cloud_exception_compatibility_module(
 
 def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Failed cloud-module imports should not leave a poisoned cache entry behind."""
     original_module = sys.modules.pop(
-        remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+        modal_deployment_module._MODAL_CLOUD_MODULE_NAME,
         None,
     )
 
@@ -8163,21 +8207,21 @@ def test_load_modal_cloud_module_clears_failed_import_from_sys_modules(
             raise RuntimeError("boom")
 
     monkeypatch.setattr(
-        remote_modal_app_module.importlib.util,
+        modal_deployment_module.importlib.util,
         "spec_from_file_location",
         lambda *args, **kwargs: importlib.util.spec_from_loader(
-            remote_modal_app_module._MODAL_CLOUD_MODULE_NAME,
+            modal_deployment_module._MODAL_CLOUD_MODULE_NAME,
             FakeLoader(),
         ),
     )
     try:
         with pytest.raises(RuntimeError, match="boom"):
-            remote_modal_app_module._load_modal_cloud_module()
-        assert remote_modal_app_module._MODAL_CLOUD_MODULE_NAME not in sys.modules
+            modal_deployment_module._load_modal_cloud_module()
+        assert modal_deployment_module._MODAL_CLOUD_MODULE_NAME not in sys.modules
     finally:
-        sys.modules.pop(remote_modal_app_module._MODAL_CLOUD_MODULE_NAME, None)
+        sys.modules.pop(modal_deployment_module._MODAL_CLOUD_MODULE_NAME, None)
         if original_module is not None:
-            sys.modules[remote_modal_app_module._MODAL_CLOUD_MODULE_NAME] = original_module
+            sys.modules[modal_deployment_module._MODAL_CLOUD_MODULE_NAME] = original_module
 
 
 def test_remote_modal_consumes_streamed_progress_and_result(
@@ -9678,6 +9722,7 @@ def test_remote_modal_consumes_streamed_tensor_result_payload(
 
 def test_remote_modal_requires_manual_deploy_when_auto_deploy_disabled(
     remote_modal_app_module: Any,
+    modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Remote mode should fail clearly when auto-deploy and ephemeral fallback are both disabled."""
@@ -9703,6 +9748,7 @@ def test_remote_modal_requires_manual_deploy_when_auto_deploy_disabled(
                 raise FakeLookupError("not deployed")
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_AUTO_DEPLOY", "false")
     monkeypatch.setenv("COMFY_MODAL_ALLOW_EPHEMERAL_FALLBACK", "false")
     remote_modal_app_module.get_settings.cache_clear()

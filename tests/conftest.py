@@ -474,6 +474,12 @@ def local_ui_events_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_deployment_module(extension_package: object) -> object:
+    """Return Modal deployment and runtime compatibility helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.modal_deployment")
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")
