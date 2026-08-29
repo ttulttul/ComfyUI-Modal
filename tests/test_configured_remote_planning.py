@@ -70,12 +70,13 @@ def _capabilities(module: Any, name: str = "Configured GPU") -> Any:
 
 def test_connected_modal_configurations_replace_global_single_gpu_choice(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     remote_configuration_nodes_module: Any,
     settings_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Two Modal pools should both participate even under the legacy default policy."""
-    api = api_intercept_module
+    api = execution_scheduling_module
     nodes = remote_configuration_nodes_module
     monkeypatch.setattr(api, "_execution_history", lambda _settings: None)
     monkeypatch.setitem(api._MODAL_GPU_COST_USD_PER_SECOND, "T4", 0.0)
@@ -152,13 +153,14 @@ def test_connected_modal_configurations_replace_global_single_gpu_choice(
 
 def test_vast_capacity_is_quoted_globally_and_acquired_only_after_assignment(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
     remote_configuration_nodes_module: Any,
     settings_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Independent Vast pools and their capacity slots should survive into leases."""
-    api = api_intercept_module
+    api = execution_scheduling_module
     environment_module = execution_environments_module
     nodes = remote_configuration_nodes_module
     events: list[tuple[Any, ...]] = []
@@ -323,13 +325,14 @@ def test_vast_capacity_is_quoted_globally_and_acquired_only_after_assignment(
 
 def test_workflow_ssh_configuration_is_probed_and_carried_into_execution_metadata(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
     remote_configuration_nodes_module: Any,
     settings_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Workflow SSH hosts should not depend on the installation-wide host registry."""
-    api = api_intercept_module
+    api = execution_scheduling_module
     nodes = remote_configuration_nodes_module
 
     def probe(configuration: Any) -> Any:
@@ -409,13 +412,14 @@ def test_workflow_ssh_configuration_is_probed_and_carried_into_execution_metadat
 
 def test_queued_workflow_uses_nameplate_capacity_of_occupied_ssh_host(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
     remote_configuration_nodes_module: Any,
     settings_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A later prompt should admit capacity that its earlier prompt will release."""
-    api = api_intercept_module
+    api = execution_scheduling_module
     environment_module = execution_environments_module
     nodes = remote_configuration_nodes_module
     busy_capabilities = _capabilities(environment_module, "Busy SSH GPU")
@@ -500,13 +504,14 @@ def test_queued_workflow_uses_nameplate_capacity_of_occupied_ssh_host(
 
 def test_configured_planner_reclaims_idle_worker_memory_before_admission(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
     remote_configuration_nodes_module: Any,
     settings_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Cached models in an idle configured worker should not block a new prompt."""
-    api = api_intercept_module
+    api = execution_scheduling_module
     environment_module = execution_environments_module
     nodes = remote_configuration_nodes_module
     prompt = {

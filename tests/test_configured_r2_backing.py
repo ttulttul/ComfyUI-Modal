@@ -7,6 +7,7 @@ from typing import Any
 
 def test_workflow_r2_configuration_resolves_controller_signing_client(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     remote_configurations_module: Any,
     r2_cache_module: Any,
     monkeypatch: Any,
@@ -43,9 +44,9 @@ def test_workflow_r2_configuration_resolves_controller_signing_client(
             assert requested_storage is storage
             return expected
 
-    monkeypatch.setattr(api_intercept_module, "R2CredentialStore", Store)
+    monkeypatch.setattr(execution_scheduling_module, "R2CredentialStore", Store)
 
-    client = api_intercept_module._workflow_r2_cache(configuration_set)
+    client = execution_scheduling_module._workflow_r2_cache(configuration_set)
 
     assert client is not None
     assert client.configuration is expected
@@ -53,6 +54,7 @@ def test_workflow_r2_configuration_resolves_controller_signing_client(
 
 def test_safe_configuration_payload_adds_cached_r2_bucket_usage(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     remote_configurations_module: Any,
     r2_cache_module: Any,
     monkeypatch: Any,
@@ -107,12 +109,16 @@ def test_safe_configuration_payload_adds_cached_r2_bucket_usage(
                 object_count=42,
             )
 
-    api_intercept_module._R2_STORAGE_USAGE_CACHE.clear()
-    monkeypatch.setattr(api_intercept_module, "R2CredentialStore", Store)
-    monkeypatch.setattr(api_intercept_module, "R2CacheClient", Client)
+    execution_scheduling_module._R2_STORAGE_USAGE_CACHE.clear()
+    monkeypatch.setattr(execution_scheduling_module, "R2CredentialStore", Store)
+    monkeypatch.setattr(execution_scheduling_module, "R2CacheClient", Client)
 
-    first = api_intercept_module._safe_remote_configuration_payload(configuration_set)
-    second = api_intercept_module._safe_remote_configuration_payload(configuration_set)
+    first = execution_scheduling_module._safe_remote_configuration_payload(
+        configuration_set
+    )
+    second = execution_scheduling_module._safe_remote_configuration_payload(
+        configuration_set
+    )
 
     safe_storage = next(
         item for item in first if item["configuration_id"] == "r2-node"
@@ -124,8 +130,10 @@ def test_safe_configuration_payload_adds_cached_r2_bucket_usage(
     assert usage_calls == 1
 
     usage_size_bytes = 6 * 1024**3
-    refreshed = api_intercept_module._refresh_r2_storage_usage(storage)
-    third = api_intercept_module._safe_remote_configuration_payload(configuration_set)
+    refreshed = execution_scheduling_module._refresh_r2_storage_usage(storage)
+    third = execution_scheduling_module._safe_remote_configuration_payload(
+        configuration_set
+    )
 
     assert refreshed.size_bytes == 6 * 1024**3
     assert next(

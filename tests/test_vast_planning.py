@@ -22,13 +22,14 @@ def _component(api_intercept_module: Any) -> Any:
 
 def test_vast_only_policy_requires_configuration_node(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
 ) -> None:
     """A Vast-only workflow must make its capacity and spending policy explicit."""
     with pytest.raises(
         api_intercept_module.ModalPromptValidationError,
         match="Lease Configuration",
     ):
-        api_intercept_module._plan_component_execution_assignments(
+        execution_scheduling_module._plan_component_execution_assignments(
             components=[_component(api_intercept_module)],
             prompt={"1": {"class_type": "KSampler", "inputs": {}}},
             workflow={"extra": {"remote_execution": {"policy": "vast"}}},
@@ -38,6 +39,7 @@ def test_vast_only_policy_requires_configuration_node(
 
 def test_vast_only_policy_quotes_acquires_and_stamps_concrete_environment(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -111,8 +113,12 @@ def test_vast_only_policy_quotes_acquires_and_stamps_concrete_environment(
             calls.append(("acquire", selected_quote))
             return lease
 
-    monkeypatch.setattr(api_intercept_module, "VastService", FakeVastService)
-    monkeypatch.setattr(api_intercept_module, "_execution_history", lambda _settings: None)
+    monkeypatch.setattr(execution_scheduling_module, "VastService", FakeVastService)
+    monkeypatch.setattr(
+        execution_scheduling_module,
+        "_execution_history",
+        lambda _settings: None,
+    )
     prompt = {
         "1": {"class_type": "KSampler", "inputs": {"steps": 20}},
         "90": {
@@ -127,7 +133,7 @@ def test_vast_only_policy_quotes_acquires_and_stamps_concrete_environment(
         },
     }
 
-    assignments = api_intercept_module._plan_component_execution_assignments(
+    assignments = execution_scheduling_module._plan_component_execution_assignments(
         components=[_component(api_intercept_module)],
         prompt=prompt,
         workflow={"extra": {"remote_execution": {"policy": "vast"}}},
@@ -153,9 +159,10 @@ def test_vast_only_policy_quotes_acquires_and_stamps_concrete_environment(
 
 def test_vast_provider_metadata_exposes_safe_markdown_fields(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
 ) -> None:
     """Proxy payloads should carry the non-secret GPU details used by STRING output."""
-    metadata = api_intercept_module._vast_provider_metadata(
+    metadata = execution_scheduling_module._vast_provider_metadata(
         SimpleNamespace(
             instance_id=9001,
             profile_id="17",

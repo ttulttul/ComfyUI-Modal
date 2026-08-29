@@ -346,6 +346,12 @@ def prompt_rewrite_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def execution_scheduling_module(extension_package: object) -> object:
+    """Return provider-neutral scheduling and capacity helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.execution_scheduling")
+
+
+@pytest.fixture(scope="session")
 def modal_endpoint_module(extension_package: object) -> object:
     """Return the Modal hosted-model endpoint node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")

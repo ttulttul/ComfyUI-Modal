@@ -15,10 +15,11 @@ import pytest
 
 def test_ssh_hostname_extracts_safe_runtime_badge_label(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
 ) -> None:
     """Planner UI metadata should show the host rather than an SSH user target."""
-    assert api_intercept_module._ssh_hostname("worker@example.internal") == "example.internal"
-    assert api_intercept_module._ssh_hostname("[2001:db8::17]") == "2001:db8::17"
+    assert execution_scheduling_module._ssh_hostname("worker@example.internal") == "example.internal"
+    assert execution_scheduling_module._ssh_hostname("[2001:db8::17]") == "2001:db8::17"
 
 
 class _FakeRemoteModelNode:
@@ -331,8 +332,16 @@ def test_remote_environment_routes_save_and_probe_hosts(
             return capabilities
 
     monkeypatch.setattr(api_intercept_module, "_ROUTE_REGISTERED", False)
-    monkeypatch.setattr(api_intercept_module, "_ssh_host_registry", lambda _settings: registry)
-    monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
+    monkeypatch.setattr(
+        api_intercept_module,
+        "_ssh_host_registry",
+        lambda _settings: registry,
+    )
+    monkeypatch.setattr(
+        api_intercept_module,
+        "SshDockerController",
+        FakeController,
+    )
     monkeypatch.setattr(
         api_intercept_module,
         "_refresh_r2_storage_usage",
@@ -449,6 +458,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
 
 def test_scheduler_refreshes_recent_ssh_capabilities_before_placement(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     remote_hosts_module: Any,
     execution_environments_module: Any,
     monkeypatch: Any,
@@ -503,10 +513,18 @@ def test_scheduler_refreshes_recent_ssh_capabilities_before_placement(
             """Return current capabilities."""
             return capabilities
 
-    monkeypatch.setattr(api_intercept_module, "_ssh_host_registry", lambda _settings: registry)
-    monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
+    monkeypatch.setattr(
+        execution_scheduling_module,
+        "_ssh_host_registry",
+        lambda _settings: registry,
+    )
+    monkeypatch.setattr(
+        execution_scheduling_module,
+        "SshDockerController",
+        FakeController,
+    )
 
-    hosts = api_intercept_module._schedulable_ssh_hosts(SimpleNamespace())
+    hosts = execution_scheduling_module._schedulable_ssh_hosts(SimpleNamespace())
 
     assert hosts[0].health.value == "ready"
     assert hosts[0].capabilities == capabilities
@@ -565,6 +583,7 @@ def test_remote_partition_preserves_dag_around_ssh_only_llm(
 def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
     api_intercept_module: Any,
     component_planning_module: Any,
+    execution_scheduling_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     monkeypatch: Any,
@@ -628,7 +647,7 @@ def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
     assert component_plans[0].boundary_outputs[0].io_type == "IMAGE"
     assert component_plans[2].boundary_inputs[0].io_type == "STRING"
     assert component_plans[2].boundary_outputs == []
-    required_provider = api_intercept_module._component_required_provider(
+    required_provider = execution_scheduling_module._component_required_provider(
         component_plans[1],
         prompt,
         {
@@ -672,7 +691,7 @@ def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
         }
 
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_plan_component_execution_assignments",
         assign_to_modal,
     )
@@ -792,6 +811,7 @@ def test_remote_partition_replicates_linked_model_loader_closure(
 
 def test_modal_only_policy_rejects_ssh_only_llm_backend(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     tmp_path: Path,
 ) -> None:
     """A provider-specific backend must not be dispatched to Modal by policy."""
@@ -808,7 +828,7 @@ def test_modal_only_policy_rejects_ssh_only_llm_backend(
         api_intercept_module.ModalPromptValidationError,
         match="Modal-only execution cannot run SSH-only component",
     ):
-        api_intercept_module._plan_component_execution_assignments(
+        execution_scheduling_module._plan_component_execution_assignments(
             components=[component],
             prompt={
                 "257": {
@@ -1049,6 +1069,7 @@ def test_transportable_list_boundary_preserves_scheduler_items(
 
 def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     remote_hosts_module: Any,
     execution_environments_module: Any,
     monkeypatch: Any,
@@ -1085,17 +1106,17 @@ def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
         contains_output_node=False,
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_schedulable_ssh_hosts",
         lambda _settings: (host,),
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_execution_history",
         lambda _settings: None,
     )
 
-    assignments = api_intercept_module._plan_component_execution_assignments(
+    assignments = execution_scheduling_module._plan_component_execution_assignments(
         components=[component],
         prompt={"1": {"class_type": "KSampler", "inputs": {"steps": 20}}},
         workflow={
@@ -1115,6 +1136,7 @@ def test_automatic_policy_assigns_component_to_lower_cost_ready_host(
 
 def test_planner_recycles_idle_ssh_worker_before_cost_ranking(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     remote_hosts_module: Any,
     execution_environments_module: Any,
     monkeypatch: Any,
@@ -1186,23 +1208,27 @@ def test_planner_recycles_idle_ssh_worker_before_cost_ranking(
             return reclaimed_capabilities
 
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_schedulable_ssh_hosts",
         lambda _settings: (host,),
     )
-    monkeypatch.setattr(api_intercept_module, "SshDockerController", FakeController)
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
+        "SshDockerController",
+        FakeController,
+    )
+    monkeypatch.setattr(
+        execution_scheduling_module,
         "_ssh_host_registry",
         lambda _settings: None,
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_execution_history",
         lambda _settings: None,
     )
 
-    assignments = api_intercept_module._plan_component_execution_assignments(
+    assignments = execution_scheduling_module._plan_component_execution_assignments(
         components=[component],
         prompt={"1": {"class_type": "KSampler", "inputs": {"steps": 20}}},
         workflow={
@@ -1224,6 +1250,7 @@ def test_planner_recycles_idle_ssh_worker_before_cost_ranking(
 
 def test_planner_does_not_recycle_for_equal_cost_tie_break(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
 ) -> None:
     """A lexical tie alone must not discard a compatible worker's warm cache."""
@@ -1236,7 +1263,7 @@ def test_planner_does_not_recycle_for_equal_cost_tie_break(
     )
     optimistic = replace(actual, environment_id="idle-host")
 
-    assert not api_intercept_module._reclaim_improves_assignment(
+    assert not execution_scheduling_module._reclaim_improves_assignment(
         optimistic,
         actual,
         module.ComponentResourceRequirements(),
@@ -1245,6 +1272,7 @@ def test_planner_does_not_recycle_for_equal_cost_tie_break(
 
 def test_automatic_policy_rejects_zero_cost_host_for_oversized_model(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     remote_hosts_module: Any,
     execution_environments_module: Any,
     monkeypatch: Any,
@@ -1305,24 +1333,24 @@ def test_automatic_policy_rejects_zero_cost_host_for_oversized_model(
         comfyui_root=None,
     )
     preferences = module.WorkflowExecutionPreferences.from_workflow(workflow)
-    estimate = api_intercept_module._component_memory_estimate(
+    estimate = execution_scheduling_module._component_memory_estimate(
         component,
         prompt,
         preferences,
         settings,
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_schedulable_ssh_hosts",
         lambda _settings: (host,),
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_execution_history",
         lambda _settings: None,
     )
 
-    assignments = api_intercept_module._plan_component_execution_assignments(
+    assignments = execution_scheduling_module._plan_component_execution_assignments(
         components=[component],
         prompt=prompt,
         workflow=workflow,
@@ -1339,6 +1367,7 @@ def test_automatic_policy_rejects_zero_cost_host_for_oversized_model(
 
 def test_planner_resolves_hugging_face_metadata_before_cost_ranking(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
     remote_hosts_module: Any,
     llm_resolver_module: Any,
@@ -1409,19 +1438,23 @@ def test_planner_resolves_hugging_face_metadata_before_cost_ranking(
         comfyui_root=None,
         local_storage_root=tmp_path,
     )
-    monkeypatch.setattr(llm_resolver_module, "resolve_model_profile", resolve)
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
+        "resolve_model_profile",
+        resolve,
+    )
+    monkeypatch.setattr(
+        execution_scheduling_module,
         "_schedulable_ssh_hosts",
         lambda _settings: (host,),
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        execution_scheduling_module,
         "_execution_history",
         lambda _settings: None,
     )
 
-    assignments = api_intercept_module._plan_component_execution_assignments(
+    assignments = execution_scheduling_module._plan_component_execution_assignments(
         components=[component],
         prompt=prompt,
         workflow=workflow,
@@ -6287,6 +6320,7 @@ def test_remote_environment_asset_worker_failures_bubble_up(
 
 def test_workflow_ssh_metadata_preserves_probed_gpu_capabilities(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     execution_environments_module: Any,
     remote_configurations_module: Any,
     remote_hosts_module: Any,
@@ -6337,7 +6371,7 @@ def test_workflow_ssh_metadata_preserves_probed_gpu_capabilities(
         ssh_hosts_by_id={"lambda": host},
     )
 
-    metadata = api_intercept_module._configured_provider_metadata(
+    metadata = execution_scheduling_module._configured_provider_metadata(
         execution_plan=execution_plan,
         assignment=assignment,
         vast_leases_by_environment={},
@@ -6928,6 +6962,7 @@ def test_queue_bridge_releases_r2_writeback_reservations(
 
 def test_selected_vast_capacity_streams_setup_status(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     vast_models_module: Any,
 ) -> None:
     """Queue-time Vast acquisition should stream provider progress into the UI."""
@@ -6988,7 +7023,7 @@ def test_selected_vast_capacity_streams_setup_status(
                 idle_retention_seconds=3600.0,
             )
 
-    leases = api_intercept_module._prepare_selected_vast_capacity(
+    leases = execution_scheduling_module._prepare_selected_vast_capacity(
         assignments=assignments,
         configuration_set=configuration_set,
         requirements_by_component=requirements,
@@ -7034,6 +7069,7 @@ def test_selected_vast_capacity_streams_setup_status(
 
 def test_selected_vast_capacity_preserves_intentional_cancellation(
     api_intercept_module: Any,
+    execution_scheduling_module: Any,
     vast_models_module: Any,
 ) -> None:
     """Cancelling capacity acquisition should not become a provider failure."""
@@ -7075,7 +7111,7 @@ def test_selected_vast_capacity_preserves_intentional_cancellation(
         api_intercept_module.SyncCancelledError,
         match="Remote workflow preparation was cancelled",
     ):
-        api_intercept_module._prepare_selected_vast_capacity(
+        execution_scheduling_module._prepare_selected_vast_capacity(
             assignments={"component-1": assignment},
             configuration_set=api_intercept_module.RemoteConfigurationSet(
                 configurations=(configuration,)
