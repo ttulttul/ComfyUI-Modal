@@ -711,3 +711,11 @@ Host-side Modal invocation coordinates two independent stateful concerns: `remot
 ## Test-file splits expose hidden ordering dependencies
 
 Splitting a monolithic integration suite changes collection order even when every test function is preserved exactly. Tests that install compatibility modules in `sys.modules` must restore the previous binding, and cancellation tests that strand intentionally blocked calls in a shared executor must release those calls during cleanup. The old function order can otherwise conceal leaked process state until the tests are grouped by their production owners.
+
+## File extraction is not function decomposition
+
+Moving a large orchestration function into a focused module improves ownership without making its control flow reviewable. Payload construction, prompt interception, and streamed-event consumption each became easier to verify only after their mutable per-run state was made explicit and their distinct stages or event kinds were delegated to named helpers. Compatibility modules can continue to re-export the public seam, but the new owner must also be included in the repository's allowlist-style `.gitignore` or it will be absent from packaged node builds.
+
+## Shared status text belongs with the sync contracts
+
+Upload, Hugging Face discovery, Hugging Face download, and R2 download progress use the same indexed-message grammar. A single parameterized formatter in `sync_protocols.py` preserves the user-facing strings while preventing each transfer backend from slowly developing different progress semantics.

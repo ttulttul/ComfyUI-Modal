@@ -520,7 +520,7 @@ The prompt interception layer is organized as a compatibility aggregator over fo
 
 Execution scheduling keeps provider-neutral orchestration in `execution_scheduling.py` while resource estimation and history signatures live in `execution_resource_estimates.py`, credential-safe plan rendering and its R2 usage cache live in `execution_plan_reporting.py`, and runtime backend construction plus assignment stamping live in `execution_assignment_runtime.py`.
 
-Prompt rewriting keeps payload and proxy construction in `prompt_rewrite.py`; downstream frontier discovery, parallel local-branch release, local-gap keepalive, and speculative affinity prewarm decoration live in `prompt_affinity_planning.py`.
+Prompt rewriting keeps proxy construction in `prompt_rewrite.py`, while `prompt_payload_building.py` owns the ordered, hybrid, and single-phase payload builders; downstream frontier discovery, parallel local-branch release, local-gap keepalive, and speculative affinity prewarm decoration live in `prompt_affinity_planning.py`.
 
 Remote graph analysis keeps transportability and component partitioning in `remote_graph_analysis.py`, while recursive saved-workflow traversal and workflow-path-to-queued-prompt resolution live in `workflow_prompt_mapping.py`.
 

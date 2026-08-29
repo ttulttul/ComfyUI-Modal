@@ -346,6 +346,12 @@ def prompt_rewrite_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def prompt_payload_building_module(extension_package: object) -> object:
+    """Return remote component payload construction helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.prompt_payload_building")
+
+
+@pytest.fixture(scope="session")
 def prompt_affinity_planning_module(extension_package: object) -> object:
     """Return affinity, keepalive, and speculative prewarm rewrite helpers."""
     return importlib.import_module(f"{PACKAGE_NAME}.prompt_affinity_planning")
