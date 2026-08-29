@@ -352,6 +352,12 @@ def prompt_affinity_planning_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def prompt_interception_module(extension_package: object) -> object:
+    """Return queue-time prompt analysis, asset preparation, and rewrite orchestration."""
+    return importlib.import_module(f"{PACKAGE_NAME}.prompt_interception")
+
+
+@pytest.fixture(scope="session")
 def execution_scheduling_module(extension_package: object) -> object:
     """Return provider-neutral scheduling and capacity helpers."""
     return importlib.import_module(f"{PACKAGE_NAME}.execution_scheduling")

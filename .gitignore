@@ -63,6 +63,7 @@
 !/prompt_payload_metadata.py
 !/prompt_diagnostics.py
 !/prompt_affinity_planning.py
+!/prompt_interception.py
 !/prompt_rewrite.py
 !/proxy_node_factory.py
 !/proxy_payloads.py

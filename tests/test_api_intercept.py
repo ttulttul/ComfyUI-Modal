@@ -1895,6 +1895,7 @@ def test_split_phase_order_accounts_for_local_feedback_dependencies(
 
 def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     api_intercept_module: Any,
+    prompt_interception_module: Any,
     queue_bridge_module: Any,
     remote_modal_app_module: Any,
     settings_module: Any,
@@ -2037,7 +2038,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     monkeypatch.setattr(queue_bridge_module, "_get_execution_module", lambda: FakeExecutionModule)
     monkeypatch.setattr(api_intercept_module, "_emit_modal_status", lambda **_kwargs: None)
     monkeypatch.setattr(
-        api_intercept_module,
+        prompt_interception_module,
         "rewrite_prompt_for_modal",
         capture_rewrite_settings,
     )
@@ -2166,6 +2167,7 @@ def test_configured_modal_plan_reports_only_selected_modal_gpus(
 
 def test_modal_prompt_rewrite_keeps_event_loop_responsive(
     api_intercept_module: Any,
+    prompt_interception_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Hashing and upload preparation should execute outside the ComfyUI event loop."""
@@ -2178,7 +2180,11 @@ def test_modal_prompt_rewrite_keeps_event_loop_responsive(
         assert release_rewrite.wait(timeout=1.0)
         return kwargs["prompt"], api_intercept_module.RewriteSummary()
 
-    monkeypatch.setattr(api_intercept_module, "rewrite_prompt_for_modal", blocking_rewrite)
+    monkeypatch.setattr(
+        prompt_interception_module,
+        "rewrite_prompt_for_modal",
+        blocking_rewrite,
+    )
 
     async def run_test() -> None:
         """Run the blocking rewrite and an independent event-loop callback together."""
@@ -2208,6 +2214,7 @@ def test_modal_prompt_rewrite_keeps_event_loop_responsive(
 
 def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(
     api_intercept_module: Any,
+    prompt_interception_module: Any,
     queue_bridge_module: Any,
     settings_module: Any,
     monkeypatch: Any,
@@ -2315,7 +2322,11 @@ def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(
     )
     monkeypatch.setattr(queue_bridge_module, "_get_execution_module", lambda: FakeExecutionModule)
     monkeypatch.setattr(api_intercept_module, "_emit_modal_status", fail_modal_status)
-    monkeypatch.setattr(api_intercept_module, "rewrite_prompt_for_modal", fail_rewrite)
+    monkeypatch.setattr(
+        prompt_interception_module,
+        "rewrite_prompt_for_modal",
+        fail_rewrite,
+    )
 
     api_intercept_module.setup_modal_queue_route(
         prompt_server=prompt_server,
@@ -3627,6 +3638,7 @@ def test_rewrite_reports_mapped_parallelism_upper_bound(
 
 def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
     api_intercept_module: Any,
+    prompt_interception_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     monkeypatch: Any,
@@ -3716,7 +3728,7 @@ def test_rewrite_uses_one_request_wide_volume_reload_marker_across_components(
         }, [uploaded_asset]
 
     monkeypatch.setattr(
-        api_intercept_module,
+        prompt_interception_module,
         "_sync_component_prompt_inputs",
         fake_sync_component_prompt_inputs,
     )

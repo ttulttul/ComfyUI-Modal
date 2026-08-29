@@ -699,3 +699,7 @@ Parallel local-branch release, local-gap keepalive, and speculative worker prewa
 ## Workflow paths and queued prompt IDs are separate graph identities
 
 Saved workflows may nest reusable subgraph definitions while queued prompt nodes use composed identifiers. `workflow_prompt_mapping.py` owns the recursive traversal and bidirectional resolution between those identities; transportability and component partitioning can then operate only on queued prompt IDs in `remote_graph_analysis.py`.
+
+## Route registration should inject the prompt rewrite boundary
+
+`api_intercept.py` builds a `RouteContext` with the asynchronous rewrite callable, while `prompt_interception.py` owns the synchronous rewrite and its thread-offloading wrapper. Tests that replace rewrite behavior must patch `prompt_interception.rewrite_prompt_for_modal` before route registration so the injected async boundary observes the replacement.
