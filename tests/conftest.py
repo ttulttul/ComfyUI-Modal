@@ -555,6 +555,13 @@ def cloud_app_guard_module(modal_cloud_module: object) -> object:
     return importlib.import_module("cloud_app_guard")
 
 
+@pytest.fixture(scope="session")
+def cloud_durable_invocation_module(modal_cloud_module: object) -> object:
+    """Return the extracted durable cloud invocation module."""
+    del modal_cloud_module
+    return importlib.import_module("cloud_durable_invocation")
+
+
 @pytest.fixture(autouse=True)
 def reset_modal_environment(
     monkeypatch: pytest.MonkeyPatch,

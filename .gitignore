@@ -10,6 +10,7 @@
 !/api_intercept.py
 !/cloudflare_oauth.py
 !/cloud_app_guard.py
+!/cloud_durable_invocation.py
 !/cloud_image_env.py
 !/cloud_runtime_context.py
 !/comfyui_modal_sync_cloud.py

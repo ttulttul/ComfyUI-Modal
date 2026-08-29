@@ -182,6 +182,7 @@ def test_materialize_remote_outputs_rejects_local_symlink_escape(
 
 def test_cloud_payload_capture_bundles_new_remote_outputs(
     modal_cloud_module: Any,
+    cloud_durable_invocation_module: Any,
     output_artifacts_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -191,7 +192,7 @@ def test_cloud_payload_capture_bundles_new_remote_outputs(
     output_directory.mkdir()
     (output_directory / "old.png").write_bytes(b"old")
     monkeypatch.setattr(
-        modal_cloud_module,
+        cloud_durable_invocation_module,
         "_remote_comfy_output_directory",
         lambda: output_directory,
     )
@@ -222,6 +223,7 @@ def test_cloud_payload_capture_bundles_new_remote_outputs(
 
 def test_cloud_stream_returns_output_artifact_bundle(
     modal_cloud_module: Any,
+    cloud_durable_invocation_module: Any,
     output_artifacts_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -230,7 +232,7 @@ def test_cloud_stream_returns_output_artifact_bundle(
     output_directory = tmp_path / "remote-output"
     output_directory.mkdir()
     monkeypatch.setattr(
-        modal_cloud_module,
+        cloud_durable_invocation_module,
         "_remote_comfy_output_directory",
         lambda: output_directory,
     )

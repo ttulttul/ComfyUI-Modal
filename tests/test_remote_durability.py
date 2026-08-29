@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import logging
 from pathlib import Path
 import threading
@@ -10,6 +11,20 @@ import time
 from typing import Any, Iterator
 
 import pytest
+
+
+def _cloud_durable_invocation_owner() -> Any:
+    """Return the module that owns cloud durable-invocation mutable state."""
+    return importlib.import_module("cloud_durable_invocation")
+
+
+def _patch_cloud_durable_state(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: Any,
+) -> None:
+    """Patch mutable durable-invocation state at its extracted owner."""
+    monkeypatch.setattr(_cloud_durable_invocation_owner(), name, value)
 
 
 def test_remote_worker_affinity_separates_llm_and_comfy_pools(
@@ -75,14 +90,15 @@ def test_modal_durable_store_reads_committed_object_without_volume_reload(
 
     volume = FakeVolume()
     if module_fixture_name == "modal_cloud_module":
-        monkeypatch.setattr(runtime_module, "volume_store", lambda: volume)
+        durable_invocation_module = _cloud_durable_invocation_owner()
+        monkeypatch.setattr(durable_invocation_module, "volume_store", lambda: volume)
+        monkeypatch.setattr(durable_invocation_module, "_DURABLE_OBJECT_STORE", None)
+        monkeypatch.setenv("MODAL_IS_REMOTE", "1")
     else:
         monkeypatch.setattr(runtime_module, "vol", volume, raising=False)
-    monkeypatch.setattr(runtime_module, "_DURABLE_OBJECT_STORE", None)
+        monkeypatch.setattr(runtime_module, "_DURABLE_OBJECT_STORE", None)
     monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(tmp_path / "storage"))
-    if module_fixture_name == "modal_cloud_module":
-        monkeypatch.setattr(runtime_module, "_is_modal_container_runtime", lambda: True)
-    else:
+    if module_fixture_name != "modal_cloud_module":
         monkeypatch.setenv("MODAL_IS_REMOTE", "1")
     runtime_module.get_settings.cache_clear()
 
@@ -101,8 +117,8 @@ def test_cloud_invocation_replays_completed_result_without_reexecution(
 ) -> None:
     """A client retry should receive the first completed result without rerunning work."""
     invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
     serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
     execution_count = 0
 
@@ -137,9 +153,9 @@ def test_cloud_invocation_offloads_large_result_and_retries_failures(
     """Large results should use object storage and failed attempts should remain retryable."""
     invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
     object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
-    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", "1")
     modal_cloud_module.get_settings.cache_clear()
     payload = {"invocation_id": "RIV_large", "component_id": "component-1"}
@@ -194,9 +210,9 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
         object_store.put("bridge_outputs", b"bridge-result")
         return serialized_outputs
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
-    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(modal_cloud_module, "execute_node_locally", execute_node_locally)
     monkeypatch.setenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", "1")
     modal_cloud_module.get_settings.cache_clear()
@@ -238,15 +254,19 @@ def test_cloud_stream_logs_result_persistence_and_transport_boundaries(
         "component_id": "component-timing",
     }
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
-    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
         modal_cloud_module,
         "execute_node_locally",
         lambda payload, kwargs_payload: serialized_outputs,
     )
     caplog.set_level(logging.INFO, logger=modal_cloud_module.__name__)
+    caplog.set_level(
+        logging.INFO,
+        logger=_cloud_durable_invocation_owner().__name__,
+    )
 
     events = list(
         modal_cloud_module._stream_remote_payload_events(payload, b"inputs")
@@ -281,10 +301,10 @@ def test_cloud_invocation_waits_for_active_attempt_and_replays_result(
         )
     )
     serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 1.0)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_POLL_SECONDS", 0.005)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 1.0)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_RETRY_POLL_SECONDS", 0.005)
     execution_count = 0
 
     def complete_original_attempt() -> None:
@@ -359,9 +379,9 @@ def test_cloud_stream_abandonment_cancels_and_retries_failed_attempt(
         finally:
             worker_stopped.set()
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
-    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
         modal_cloud_module,
         "execute_subgraph_locally",
@@ -413,9 +433,9 @@ def test_cloud_stream_close_after_result_preserves_completed_record(
     serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
     invocation_id = "RIV_close_after_result"
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
-    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
         modal_cloud_module,
         "execute_node_locally",
@@ -449,9 +469,9 @@ def test_cloud_invocation_rejects_duplicate_active_attempt(
             updated_at=time.time(),
         )
     )
-    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
-    monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 0.0)
+    _patch_cloud_durable_state(monkeypatch, "invocation_record_store", lambda: None)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_STORE", invocation_store)
+    _patch_cloud_durable_state(monkeypatch, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 0.0)
 
     with pytest.raises(
         modal_cloud_module.RemoteInvocationInProgressError,
@@ -555,8 +575,10 @@ def test_cloud_canary_barrier_coordinates_shared_store_members(
     barrier_store: dict[str, Any] = {
         "CANARY_BARRIER:barrier-1:member-b": {"ready_at": time.time()}
     }
-    monkeypatch.setattr(
-        modal_cloud_module, "invocation_record_store", lambda: barrier_store
+    _patch_cloud_durable_state(
+        monkeypatch,
+        "invocation_record_store",
+        lambda: barrier_store,
     )
 
     released_at = modal_cloud_module._wait_for_canary_barrier(
@@ -585,7 +607,7 @@ def test_cloud_direct_bridge_output_omits_large_producer_inputs(
     import torch
 
     object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
-    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setenv("COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES", "1")
     modal_cloud_module.get_settings.cache_clear()
     latent = {"samples": torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2)}
@@ -641,7 +663,7 @@ def test_cloud_large_image_bridge_output_uses_object_store(
     import torch
 
     object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
-    monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
+    _patch_cloud_durable_state(monkeypatch, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setenv("COMFY_MODAL_BRIDGE_INLINE_MAX_BYTES", "1")
     modal_cloud_module.get_settings.cache_clear()
     image = torch.arange(48, dtype=torch.float32).reshape(1, 4, 4, 3)
