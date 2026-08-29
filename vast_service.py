@@ -179,6 +179,7 @@ class VastService:
         self.image_builder = image_builder or VastWorkerImageBuilder(
             repo_root=self.repo_root,
             comfyui_root=getattr(settings, "comfyui_root", None),
+            modal_gpu=settings.modal_gpu,
         )
         self.update_process_environment = update_process_environment
         self.huggingface_asset_registry = (
@@ -260,6 +261,7 @@ class VastService:
             image_builder=VastWorkerImageBuilder(
                 repo_root=repo_root.resolve(),
                 comfyui_root=settings.comfyui_root,
+                modal_gpu=settings.modal_gpu,
                 environment=(source if environment is not None else None),
             ),
             update_process_environment=environment is None,

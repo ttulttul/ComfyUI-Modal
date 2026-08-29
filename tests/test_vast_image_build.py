@@ -50,6 +50,7 @@ def test_builder_streams_progress_and_returns_digest(
     builder = vast_image_build_module.VastWorkerImageBuilder(
         repo_root=tmp_path,
         comfyui_root=comfyui_root,
+        modal_gpu="RTX-PRO-6000",
         environment={"PATH": "/usr/bin"},
     )
     statuses: list[str] = []
@@ -66,6 +67,7 @@ def test_builder_streams_progress_and_returns_digest(
     )
     assert observed["cwd"] == tmp_path
     assert observed["env"]["COMFYUI_ROOT"] == str(comfyui_root)
+    assert observed["env"]["COMFY_MODAL_GPU"] == "RTX-PRO-6000"
     assert observed["env"]["BUILDKIT_PROGRESS"] == "plain"
     assert statuses == [
         "Building the current Vast worker image",

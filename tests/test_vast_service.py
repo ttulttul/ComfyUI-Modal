@@ -47,7 +47,10 @@ def test_quote_raises_memory_floors_and_compares_effective_hourly_price(
         simulator_state = vast_simulator_module.VastSimulatorState()
         simulator = vast_simulator_module.VastApiSimulator(simulator_state)
         async with _running_app(simulator.app) as base_url:
-            settings = SimpleNamespace(app_name="test-owner")
+            settings = SimpleNamespace(
+                app_name="test-owner",
+                modal_gpu="RTX-PRO-6000",
+            )
             registry = vast_service_module.VastLeaseRegistry.for_user_directory(
                 tmp_path
             )
@@ -191,7 +194,10 @@ def test_prefetch_deduplicates_effective_profiles_and_searches_in_parallel(
         """Prefetch repeated low floors and one raised floor."""
         api_client = DelayedApiClient()
         service = vast_service_module.VastService(
-            settings=SimpleNamespace(app_name="test-owner"),
+            settings=SimpleNamespace(
+                app_name="test-owner",
+                modal_gpu="RTX-PRO-6000",
+            ),
             repo_root=tmp_path,
             user_directory=tmp_path,
             api_client=api_client,

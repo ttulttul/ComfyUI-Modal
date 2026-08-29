@@ -46,6 +46,7 @@ class VastWorkerImageBuilder:
 
     repo_root: Path
     comfyui_root: Path | None
+    modal_gpu: str | None = None
     environment: Mapping[str, str] | None = None
 
     def build_and_push(
@@ -84,6 +85,8 @@ class VastWorkerImageBuilder:
         environment.setdefault("BUILDKIT_PROGRESS", "plain")
         if self.comfyui_root is not None:
             environment["COMFYUI_ROOT"] = str(self.comfyui_root)
+        if self.modal_gpu is not None:
+            environment["COMFY_MODAL_GPU"] = self.modal_gpu
         try:
             process = subprocess.Popen(
                 command,
