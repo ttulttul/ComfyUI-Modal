@@ -803,6 +803,7 @@ def test_component_proxy_cache_distinguishes_scheduler_list_outputs(
 
 def test_mapped_boundary_payload_requests_scheduler_list_output(
     api_intercept_module: Any,
+    component_planning_module: Any,
 ) -> None:
     """Explicit mapped outputs should tell the local proxy to expose ComfyUI list semantics."""
     boundary_output = api_intercept_module.BoundaryOutputSpec(
@@ -812,14 +813,14 @@ def test_mapped_boundary_payload_requests_scheduler_list_output(
         is_list=False,
     )
 
-    payload = api_intercept_module._boundary_output_payload(
+    payload = component_planning_module._boundary_output_payload(
         boundary_output,
         mapped_output=True,
     )
 
     assert payload["mapped_output"] is True
     assert payload["scheduler_is_list"] is True
-    assert api_intercept_module._proxy_boundary_output_is_list(payload) is True
+    assert component_planning_module._proxy_boundary_output_is_list(payload) is True
 
 
 def test_scheduler_list_proxy_wraps_singleton_image_tensor(

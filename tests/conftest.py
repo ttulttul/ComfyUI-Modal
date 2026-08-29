@@ -328,6 +328,12 @@ def remote_graph_analysis_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def component_planning_module(extension_package: object) -> object:
+    """Return the remote component construction and validation module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.component_planning")
+
+
+@pytest.fixture(scope="session")
 def modal_endpoint_module(extension_package: object) -> object:
     """Return the Modal hosted-model endpoint node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")

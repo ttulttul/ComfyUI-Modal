@@ -10,6 +10,7 @@
 !/api_intercept.py
 !/cloudflare_oauth.py
 !/comfyui_modal_sync_cloud.py
+!/component_planning.py
 !/durable_state.py
 !/execution_environments.py
 !/execution_history.py

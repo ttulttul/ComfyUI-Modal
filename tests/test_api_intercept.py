@@ -564,6 +564,7 @@ def test_remote_partition_preserves_dag_around_ssh_only_llm(
 
 def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
     api_intercept_module: Any,
+    component_planning_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
     monkeypatch: Any,
@@ -598,12 +599,12 @@ def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
         NODE_DISPLAY_NAME_MAPPINGS={},
     )
     remote_node_ids = set(prompt)
-    component_plans = api_intercept_module._build_component_plans(
+    component_plans = component_planning_module._build_component_plans(
         prompt,
         remote_node_ids,
         fake_nodes_module,
     )
-    api_intercept_module.validate_remote_component_transport_compatibility(
+    component_planning_module.validate_remote_component_transport_compatibility(
         prompt,
         component_plans,
         fake_nodes_module,
@@ -616,7 +617,7 @@ def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
     replica_node_ids = {
         node_id
         for node_id in prompt
-        if node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+        if node_id.startswith(component_planning_module._REMOTE_REPLICA_NODE_PREFIX)
     }
     assert len(replica_node_ids) == 1
     replica_node_id = next(iter(replica_node_ids))
@@ -689,19 +690,19 @@ def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
     )
 
     assert not any(
-        node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+        node_id.startswith(component_planning_module._REMOTE_REPLICA_NODE_PREFIX)
         for node_id in rewritten_prompt
     )
     assert summary.component_node_ids_by_representative["4"] == ["4"]
     assert not any(
-        node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+        node_id.startswith(component_planning_module._REMOTE_REPLICA_NODE_PREFIX)
         for node_id in summary.rewritten_node_id_map
     )
     downstream_payload = rewritten_prompt["4"]["inputs"]["original_node_data"]
     replica_payload_node_ids = {
         node_id
         for node_id in downstream_payload["subgraph_prompt"]
-        if node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+        if node_id.startswith(component_planning_module._REMOTE_REPLICA_NODE_PREFIX)
     }
     assert len(replica_payload_node_ids) == 1
     downstream_vae_input = downstream_payload["subgraph_prompt"]["4"]["inputs"][
@@ -712,6 +713,7 @@ def test_remote_partition_replicates_non_transportable_fanout_around_ssh_llm(
 
 def test_remote_partition_replicates_linked_model_loader_closure(
     api_intercept_module: Any,
+    component_planning_module: Any,
 ) -> None:
     """A downstream provider phase should rebuild a linked loader chain, not sample."""
     prompt = {
@@ -749,7 +751,7 @@ def test_remote_partition_replicates_linked_model_loader_closure(
         NODE_DISPLAY_NAME_MAPPINGS={},
     )
 
-    component_plans = api_intercept_module._build_component_plans(
+    component_plans = component_planning_module._build_component_plans(
         prompt,
         set(prompt),
         fake_nodes_module,
@@ -763,7 +765,7 @@ def test_remote_partition_replicates_linked_model_loader_closure(
     replica_node_ids = sorted(
         node_id
         for node_id in prompt
-        if node_id.startswith(api_intercept_module._REMOTE_REPLICA_NODE_PREFIX)
+        if node_id.startswith(component_planning_module._REMOTE_REPLICA_NODE_PREFIX)
     )
     assert len(replica_node_ids) == 2
     replica_loader_id = next(
@@ -781,7 +783,7 @@ def test_remote_partition_replicates_linked_model_loader_closure(
     assert replica_node_ids == sorted(
         set(component_plans[2].node_ids) - {"5"}
     )
-    api_intercept_module.validate_remote_component_transport_compatibility(
+    component_planning_module.validate_remote_component_transport_compatibility(
         prompt,
         component_plans,
         fake_nodes_module,
@@ -829,6 +831,7 @@ def test_modal_only_policy_rejects_ssh_only_llm_backend(
 
 def test_cross_provider_boundary_uses_transport_instead_of_remote_session(
     api_intercept_module: Any,
+    component_planning_module: Any,
     execution_environments_module: Any,
 ) -> None:
     """Session-backed references must never cross provider storage boundaries."""
@@ -866,7 +869,7 @@ def test_cross_provider_boundary_uses_transport_instead_of_remote_session(
     provider_type = execution_environments_module.ExecutionProvider
 
     session_component_ids = (
-        api_intercept_module._mark_remote_to_remote_session_boundaries(
+        component_planning_module._mark_remote_to_remote_session_boundaries(
             {
                 "1": {"class_type": "RemoteImage", "inputs": {}},
                 "2": {
@@ -905,6 +908,7 @@ def test_cross_provider_boundary_uses_transport_instead_of_remote_session(
 
 def test_non_modal_boundary_with_local_preview_uses_transport(
     api_intercept_module: Any,
+    component_planning_module: Any,
     execution_environments_module: Any,
 ) -> None:
     """A Vast bridge with a local consumer must not require Modal shared storage."""
@@ -948,7 +952,7 @@ def test_non_modal_boundary_with_local_preview_uses_transport(
     )
 
     session_component_ids = (
-        api_intercept_module._mark_remote_to_remote_session_boundaries(
+        component_planning_module._mark_remote_to_remote_session_boundaries(
             {
                 "1": {"class_type": "RemoteImage", "inputs": {}},
                 "2": {
@@ -980,6 +984,7 @@ def test_non_modal_boundary_with_local_preview_uses_transport(
 
 def test_transportable_list_boundary_preserves_scheduler_items(
     api_intercept_module: Any,
+    component_planning_module: Any,
     execution_environments_module: Any,
 ) -> None:
     """Keep a same-host list output in ComfyUI instead of one bridge token."""
@@ -1023,7 +1028,7 @@ def test_transportable_list_boundary_preserves_scheduler_items(
     )
 
     session_component_ids = (
-        api_intercept_module._mark_remote_to_remote_session_boundaries(
+        component_planning_module._mark_remote_to_remote_session_boundaries(
             {
                 "1": {"class_type": "NextSeeds", "inputs": {}},
                 "2": {
@@ -1801,6 +1806,7 @@ def test_queue_prompt_json_logs_rewritten_modal_diagnostics_on_validation_failur
 
 def test_split_phase_order_accounts_for_local_feedback_dependencies(
     api_intercept_module: Any,
+    component_planning_module: Any,
 ) -> None:
     """Split phase ordering should treat local re-entry paths as real dependencies."""
     prompt = {
@@ -1837,7 +1843,7 @@ def test_split_phase_order_accounts_for_local_feedback_dependencies(
     }
 
     ordered_execute_node_ids = (
-        api_intercept_module._order_execute_node_ids_for_transportable_splits(
+        component_planning_module._order_execute_node_ids_for_transportable_splits(
             prompt=prompt,
             component_prompt=component_prompt,
             component_node_ids={"3", "14", "191", "358"},
@@ -3369,6 +3375,7 @@ def test_rewrite_keeps_local_branches_that_feed_remote_as_boundaries(
 
 def test_component_local_reentry_dependency_detection(
     api_intercept_module: Any,
+    component_planning_module: Any,
 ) -> None:
     """Boundary inputs that trace back to the same component require a split-capable proxy."""
     prompt = {
@@ -3410,7 +3417,7 @@ def test_component_local_reentry_dependency_detection(
         local_tap_node_ids=["9"],
     )
 
-    assert api_intercept_module._component_has_local_reentry_dependency(
+    assert component_planning_module._component_has_local_reentry_dependency(
         prompt=prompt,
         component=component,
     )
