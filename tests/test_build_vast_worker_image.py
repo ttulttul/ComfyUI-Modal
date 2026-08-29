@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -102,6 +103,43 @@ def test_parser_allows_push_without_explicit_tag() -> None:
 
     assert arguments.push is True
     assert arguments.tag is None
+
+
+def test_build_stops_before_docker_when_expected_source_changed(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: Any,
+) -> None:
+    """Automatic publication must compare startup identity before exporting context."""
+    module = _module()
+    expected = "a" * 64
+    actual = "b" * 64
+    settings = SimpleNamespace(
+        comfyui_root=tmp_path,
+        custom_nodes_dir=tmp_path,
+    )
+    monkeypatch.setattr(module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        module,
+        "build_remote_runtime_identity",
+        lambda **_kwargs: SimpleNamespace(fingerprint=actual),
+    )
+    monkeypatch.setattr(
+        module,
+        "export_worker_image_context",
+        lambda **_kwargs: pytest.fail("build context was exported after source drift"),
+    )
+
+    with pytest.raises(RuntimeError, match="Restart ComfyUI"):
+        module.build_image(
+            "ghcr.io/example/worker:v1",
+            push=True,
+            expected_fingerprint=expected,
+        )
+
+    assert capsys.readouterr().out.strip() == (
+        f"{module.SOURCE_FINGERPRINT_RESULT_PREFIX}{actual}"
+    )
 
 
 def test_docker_build_targets_vast_x86_64_platform() -> None:

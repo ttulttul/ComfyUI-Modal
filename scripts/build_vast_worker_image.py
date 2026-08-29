@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import subprocess
 import sys
 import tomllib
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TAG_TEMPLATE = "ghcr.io/{owner}/comfy-modal-worker:v{version}"
 VAST_WORKER_PLATFORM = "linux/amd64"
+SOURCE_FINGERPRINT_RESULT_PREFIX = "COMFY_MODAL_VAST_SOURCE_FINGERPRINT="
+_SHA256_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -66,7 +69,25 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Push the built tag and print its registry digest reference.",
     )
+    parser.add_argument(
+        "--expected-fingerprint",
+        type=_runtime_fingerprint,
+        help=(
+            "Abort before building if current source no longer matches this SHA-256 "
+            "runtime fingerprint. Used by automatic publication."
+        ),
+    )
     return parser
+
+
+def _runtime_fingerprint(value: str) -> str:
+    """Return one normalized SHA-256 runtime fingerprint for argparse."""
+    normalized = value.strip().casefold()
+    if not _SHA256_FINGERPRINT_PATTERN.fullmatch(normalized):
+        raise argparse.ArgumentTypeError(
+            "runtime fingerprint must be a 64-character lowercase SHA-256 value"
+        )
+    return normalized
 
 
 def _project_metadata(repo_root: Path = REPO_ROOT) -> Mapping[str, Any]:
@@ -235,6 +256,7 @@ def build_image(
     *,
     push: bool,
     comfyui_root: Path | None = None,
+    expected_fingerprint: str | None = None,
 ) -> str:
     """Build the current runtime, optionally push it, and return its image reference."""
     image_tag = _validate_tag(tag)
@@ -262,6 +284,16 @@ def build_image(
         custom_nodes_dir=settings.custom_nodes_dir,
         settings=settings,
     )
+    print(f"{SOURCE_FINGERPRINT_RESULT_PREFIX}{identity.fingerprint}", flush=True)
+    if (
+        expected_fingerprint is not None
+        and identity.fingerprint != expected_fingerprint
+    ):
+        raise RuntimeError(
+            "Local runtime source changed after ComfyUI started: expected "
+            f"{expected_fingerprint[:12]}, found {identity.fingerprint[:12]}. "
+            "Restart ComfyUI before publishing a replacement worker image."
+        )
     context = export_worker_image_context(
         repo_root=repo_root,
         settings=settings,
@@ -315,6 +347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         image_tag,
         push=arguments.push,
         comfyui_root=arguments.comfyui_root,
+        expected_fingerprint=arguments.expected_fingerprint,
     )
     print(f"COMFY_MODAL_VAST_IMAGE={image_reference}")
     return 0

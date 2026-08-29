@@ -24,7 +24,9 @@ VAST_IMAGE_BUILD_COMMAND = (
     "--push",
 )
 _IMAGE_RESULT_PREFIX = "COMFY_MODAL_VAST_IMAGE="
+_SOURCE_FINGERPRINT_RESULT_PREFIX = "COMFY_MODAL_VAST_SOURCE_FINGERPRINT="
 _DIGEST_REFERENCE_PATTERN = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
+_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_IN_TEXT_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _MAXIMUM_STATUS_LINE_CHARACTERS = 300
@@ -61,17 +63,21 @@ class VastWorkerImageBuilder:
                     "Using the worker image published by another workflow",
                 )
                 return cached
-            image = self._run_build(status_callback=status_callback)
+            image = self._run_build(
+                expected_fingerprint=expected_fingerprint,
+                status_callback=status_callback,
+            )
             _BUILT_IMAGES_BY_FINGERPRINT[expected_fingerprint] = image
             return image
 
     def _run_build(
         self,
         *,
+        expected_fingerprint: str,
         status_callback: VastImageBuildStatusCallback | None,
     ) -> str:
         """Execute the image builder and extract its immutable result reference."""
-        command = self._automatic_build_command()
+        command = self._automatic_build_command(expected_fingerprint)
         command_text = shlex.join(command)
         self._emit(status_callback, "Building the current Vast worker image")
         environment = dict(os.environ if self.environment is None else self.environment)
@@ -96,11 +102,22 @@ class VastWorkerImageBuilder:
                     f"Unable to start {command[0]!r}: {exc}"
                 )
             ) from exc
-        image_reference, recent_output = self._consume_output(
+        image_reference, source_fingerprint, recent_output = self._consume_output(
             process.stdout,
             status_callback=status_callback,
         )
         return_code = process.wait()
+        if (
+            source_fingerprint is not None
+            and source_fingerprint != expected_fingerprint
+        ):
+            raise VastWorkerImageBuildError(
+                "Automatic Vast worker image publication stopped because local "
+                "runtime source changed after ComfyUI started: expected "
+                f"{expected_fingerprint[:12]}, found "
+                f"{source_fingerprint[:12]}. Restart ComfyUI and retry the "
+                "workflow; no manual image build is needed."
+            )
         if return_code != 0:
             diagnostic = self._failure_diagnostic(recent_output)
             raise VastWorkerImageBuildError(
@@ -114,16 +131,24 @@ class VastWorkerImageBuilder:
                     "The build completed without returning an immutable image digest."
                 )
             )
+        if source_fingerprint is None:
+            raise VastWorkerImageBuildError(
+                self._manual_build_message(
+                    "The build did not report its baked runtime fingerprint."
+                )
+            )
         self._emit(status_callback, "Published the current Vast worker image")
         return image_reference
 
     @staticmethod
-    def _automatic_build_command() -> tuple[str, ...]:
+    def _automatic_build_command(expected_fingerprint: str) -> tuple[str, ...]:
         """Run with the exact interpreter hosting the active ComfyUI process."""
         return (
             sys.executable,
             "scripts/build_vast_worker_image.py",
             "--push",
+            "--expected-fingerprint",
+            expected_fingerprint,
         )
 
     @staticmethod
@@ -140,11 +165,12 @@ class VastWorkerImageBuilder:
         output: IO[str] | None,
         *,
         status_callback: VastImageBuildStatusCallback | None,
-    ) -> tuple[str | None, tuple[str, ...]]:
-        """Forward subprocess lines and return its digest plus recent diagnostics."""
+    ) -> tuple[str | None, str | None, tuple[str, ...]]:
+        """Forward output and return its digest, source identity, and diagnostics."""
         if output is None:
-            return None, ()
+            return None, None, ()
         image_reference: str | None = None
+        source_fingerprint: str | None = None
         recent_output: list[str] = []
         for raw_line in output:
             line = raw_line.strip()
@@ -155,12 +181,19 @@ class VastWorkerImageBuilder:
                 if _DIGEST_REFERENCE_PATTERN.fullmatch(candidate):
                     image_reference = candidate
                 continue
+            if line.startswith(_SOURCE_FINGERPRINT_RESULT_PREFIX):
+                candidate = line.removeprefix(
+                    _SOURCE_FINGERPRINT_RESULT_PREFIX
+                ).strip()
+                if _FINGERPRINT_PATTERN.fullmatch(candidate):
+                    source_fingerprint = candidate
+                    continue
             bounded = self._safe_status_line(line)
             recent_output.append(bounded)
             del recent_output[:-10]
             logger.info("Vast worker image build: %s", bounded)
             self._emit(status_callback, f"Vast image build: {bounded}")
-        return image_reference, tuple(recent_output)
+        return image_reference, source_fingerprint, tuple(recent_output)
 
     @staticmethod
     def _safe_status_line(line: str) -> str:
@@ -174,7 +207,7 @@ class VastWorkerImageBuilder:
 
     def _manual_build_message(self, cause: str) -> str:
         """Return an actionable error without leaking subprocess environment data."""
-        recovery_command = shlex.join(self._automatic_build_command())
+        recovery_command = shlex.join(VAST_IMAGE_BUILD_COMMAND)
         return (
             f"Automatic Vast worker image publication failed. {cause} Run `"
             + recovery_command

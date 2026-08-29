@@ -30,6 +30,7 @@ def test_builder_streams_progress_and_returns_digest(
 ) -> None:
     """Build output should reach workflow status before the digest is returned."""
     digest = "ghcr.io/example/worker@sha256:" + "a" * 64
+    fingerprint = "f" * 64
     observed: dict[str, Any] = {}
 
     def fake_popen(command: Any, **kwargs: Any) -> FakeProcess:
@@ -39,6 +40,7 @@ def test_builder_streams_progress_and_returns_digest(
         return FakeProcess(
             "\x1b[32mBuilding layer 1/3\x1b[0m\n"
             f"Pushing sha256:{'d' * 64}\n"
+            f"COMFY_MODAL_VAST_SOURCE_FINGERPRINT={fingerprint}\n"
             f"COMFY_MODAL_VAST_IMAGE={digest}\n"
         )
 
@@ -52,13 +54,15 @@ def test_builder_streams_progress_and_returns_digest(
     )
     statuses: list[str] = []
 
-    result = builder.build_and_push("f" * 64, status_callback=statuses.append)
+    result = builder.build_and_push(fingerprint, status_callback=statuses.append)
 
     assert result == digest
     assert observed["command"] == (
         sys.executable,
         "scripts/build_vast_worker_image.py",
         "--push",
+        "--expected-fingerprint",
+        fingerprint,
     )
     assert observed["cwd"] == tmp_path
     assert observed["env"]["COMFYUI_ROOT"] == str(comfyui_root)
@@ -103,3 +107,37 @@ def test_builder_failure_requires_the_documented_manual_command(
 
     assert "ModuleNotFoundError: No module named 'encodings'" in str(raised.value)
     assert "<no Python frame> Run" not in str(raised.value)
+
+
+def test_builder_rejects_source_changed_after_comfyui_started(
+    vast_image_build_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A newly built source identity must not be adopted under an old fingerprint."""
+    expected = "a" * 64
+    actual = "b" * 64
+    monkeypatch.setattr(
+        vast_image_build_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: FakeProcess(
+            f"COMFY_MODAL_VAST_SOURCE_FINGERPRINT={actual}\n"
+            "RuntimeError: Local runtime source changed after ComfyUI started\n",
+            1,
+        ),
+    )
+    vast_image_build_module._BUILT_IMAGES_BY_FINGERPRINT.clear()
+    builder = vast_image_build_module.VastWorkerImageBuilder(
+        repo_root=tmp_path,
+        comfyui_root=None,
+        environment={"PATH": "/usr/bin"},
+    )
+
+    with pytest.raises(
+        vast_image_build_module.VastWorkerImageBuildError,
+        match="no manual image build is needed",
+    ) as raised:
+        builder.build_and_push(expected)
+
+    assert expected[:12] in str(raised.value)
+    assert actual[:12] in str(raised.value)
