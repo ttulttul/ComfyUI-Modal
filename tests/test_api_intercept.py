@@ -1619,6 +1619,7 @@ class _FakeLocalStringSinkNode:
 
 def test_queue_prompt_json_includes_resolved_modal_metadata(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Successful queue responses should include resolved remote nodes and component membership."""
@@ -1660,11 +1661,11 @@ def test_queue_prompt_json_includes_resolved_modal_metadata(
             """Accept the supplied prompt with one fake execution target."""
             return True, None, ["1"], []
 
-    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(queue_bridge_module, "_get_execution_module", lambda: FakeExecutionModule)
     prompt_server = FakePromptServer()
 
     response = asyncio.run(
-        api_intercept_module._queue_prompt_json(
+        queue_bridge_module._queue_prompt_json(
             prompt_server,
             {
                 "prompt_id": "prompt-1",
@@ -1696,6 +1697,7 @@ def test_queue_prompt_json_includes_resolved_modal_metadata(
 
 def test_rewritten_prompt_diagnostics_reports_dependency_cycles(
     api_intercept_module: Any,
+    prompt_diagnostics_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rewritten prompt diagnostics should name local dependency cycles before Comfy executes."""
@@ -1725,8 +1727,8 @@ def test_rewritten_prompt_diagnostics_reports_dependency_cycles(
         """Record one generic log message."""
         log_messages.append(message % args)
 
-    monkeypatch.setattr(api_intercept_module.logger, "warning", record_warning)
-    monkeypatch.setattr(api_intercept_module.logger, "log", record_log)
+    monkeypatch.setattr(prompt_diagnostics_module.logger, "warning", record_warning)
+    monkeypatch.setattr(prompt_diagnostics_module.logger, "log", record_log)
 
     api_intercept_module._log_modal_rewritten_prompt_diagnostics(
         prompt_id="prompt-cycle",
@@ -1741,6 +1743,7 @@ def test_rewritten_prompt_diagnostics_reports_dependency_cycles(
 
 def test_queue_prompt_json_logs_rewritten_modal_diagnostics_on_validation_failure(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Validation failures for Modal prompts should log the rewritten dependency graph."""
@@ -1804,15 +1807,15 @@ def test_queue_prompt_json_logs_rewritten_modal_diagnostics_on_validation_failur
         """Record one rewritten-prompt diagnostics request."""
         diagnostic_calls.append(dict(kwargs))
 
-    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(queue_bridge_module, "_get_execution_module", lambda: FakeExecutionModule)
     monkeypatch.setattr(
-        api_intercept_module,
+        queue_bridge_module,
         "_log_modal_rewritten_prompt_diagnostics",
         record_diagnostics,
     )
 
     response = asyncio.run(
-        api_intercept_module._queue_prompt_json(
+        queue_bridge_module._queue_prompt_json(
             FakePromptServer(),
             {
                 "prompt_id": "prompt-cycle",
@@ -1889,6 +1892,7 @@ def test_split_phase_order_accounts_for_local_feedback_dependencies(
 
 def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
     remote_modal_app_module: Any,
     settings_module: Any,
     monkeypatch: Any,
@@ -2027,7 +2031,7 @@ def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
         "_get_server_module",
         lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
     )
-    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(queue_bridge_module, "_get_execution_module", lambda: FakeExecutionModule)
     monkeypatch.setattr(api_intercept_module, "_emit_modal_status", lambda **_kwargs: None)
     monkeypatch.setattr(
         api_intercept_module,
@@ -2201,6 +2205,7 @@ def test_modal_prompt_rewrite_keeps_event_loop_responsive(
 
 def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
     settings_module: Any,
     monkeypatch: Any,
     tmp_path: Path,
@@ -2305,7 +2310,7 @@ def test_queue_prompt_route_without_remote_nodes_skips_modal_status_and_rewrite(
         "_get_server_module",
         lambda: SimpleNamespace(PromptServer=SimpleNamespace(instance=prompt_server)),
     )
-    monkeypatch.setattr(api_intercept_module, "_get_execution_module", lambda: FakeExecutionModule)
+    monkeypatch.setattr(queue_bridge_module, "_get_execution_module", lambda: FakeExecutionModule)
     monkeypatch.setattr(api_intercept_module, "_emit_modal_status", fail_modal_status)
     monkeypatch.setattr(api_intercept_module, "rewrite_prompt_for_modal", fail_rewrite)
 
@@ -6626,6 +6631,7 @@ def test_delete_modal_volume_deletes_configured_volume(
 
 def test_modal_interrupt_queue_bridge_exposes_active_remote_prompts(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
     remote_modal_app_module: Any,
 ) -> None:
     """Targeted ComfyUI interrupts should see prompts currently blocked on Modal work."""
@@ -6641,7 +6647,7 @@ def test_modal_interrupt_queue_bridge_exposes_active_remote_prompts(
     prompt_server = SimpleNamespace(prompt_queue=prompt_queue)
     cancellation_event = remote_modal_app_module.threading.Event()
 
-    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+    queue_bridge_module._install_modal_interrupt_queue_bridge(prompt_server)
     with remote_modal_app_module._registered_active_remote_invocation(
         {"prompt_id": "prompt-1", "component_id": "component-1"},
         cancellation_event,
@@ -6655,6 +6661,7 @@ def test_modal_interrupt_queue_bridge_exposes_active_remote_prompts(
 
 def test_remote_preparation_bridge_exposes_work_to_all_queue_views(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
 ) -> None:
     """Capacity acquisition should look active before the rewritten prompt is queued."""
 
@@ -6686,9 +6693,9 @@ def test_remote_preparation_bridge_exposes_work_to_all_queue_views(
             prompt_queue.get_tasks_remaining()
         ),
     )
-    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+    queue_bridge_module._install_modal_interrupt_queue_bridge(prompt_server)
 
-    registered = api_intercept_module._set_remote_preparation(
+    registered = queue_bridge_module._set_remote_preparation(
         prompt_server,
         prompt_id="prompt-preparing",
         prompt={"1": {"class_type": "RemoteImage", "inputs": {}}},
@@ -6712,7 +6719,7 @@ def test_remote_preparation_bridge_exposes_work_to_all_queue_views(
     assert prompt_queue.get_tasks_remaining() == 1
     assert [item[1] for item in prompt_queue.get_current_queue_volatile()[0]] == []
 
-    api_intercept_module._clear_remote_preparation(
+    queue_bridge_module._clear_remote_preparation(
         prompt_server,
         "prompt-preparing",
     )
@@ -6723,6 +6730,7 @@ def test_remote_preparation_bridge_exposes_work_to_all_queue_views(
 
 def test_queued_ssh_environment_ids_reads_earlier_prompt_assignments(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
 ) -> None:
     """Queue-time planning should recognize SSH hosts owned by earlier prompts."""
 
@@ -6779,7 +6787,7 @@ def test_queued_ssh_environment_ids_reads_earlier_prompt_assignments(
         )
     )
 
-    environment_ids = api_intercept_module._queued_ssh_environment_ids(
+    environment_ids = queue_bridge_module._queued_ssh_environment_ids(
         prompt_server,
         excluding_prompt_id="prompt-current",
     )
@@ -6789,6 +6797,7 @@ def test_queued_ssh_environment_ids_reads_earlier_prompt_assignments(
 
 def test_remote_preparation_bridge_clears_failed_submission(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
 ) -> None:
     """A rejected pre-queue prompt must not leave phantom active queue work."""
 
@@ -6808,8 +6817,8 @@ def test_remote_preparation_bridge_clears_failed_submission(
         prompt_queue=prompt_queue,
         queue_updated=lambda: None,
     )
-    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
-    assert api_intercept_module._set_remote_preparation(
+    queue_bridge_module._install_modal_interrupt_queue_bridge(prompt_server)
+    assert queue_bridge_module._set_remote_preparation(
         prompt_server,
         prompt_id="prompt-failed",
         prompt={},
@@ -6817,7 +6826,7 @@ def test_remote_preparation_bridge_clears_failed_submission(
     )
     assert prompt_queue.get_tasks_remaining() == 1
 
-    api_intercept_module._clear_remote_preparation(prompt_server, "prompt-failed")
+    queue_bridge_module._clear_remote_preparation(prompt_server, "prompt-failed")
 
     assert prompt_queue.get_tasks_remaining() == 0
     assert prompt_queue.get_current_queue_volatile() == ([], [])
@@ -6825,6 +6834,7 @@ def test_remote_preparation_bridge_clears_failed_submission(
 
 def test_remote_preparation_bridge_tracks_prompt_cancellation(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
 ) -> None:
     """Queue-time work should expose a prompt-scoped cancellation event."""
 
@@ -6838,9 +6848,9 @@ def test_remote_preparation_bridge_tracks_prompt_cancellation(
     prompt_queue = FakePromptQueue()
     prompt_server = SimpleNamespace(prompt_queue=prompt_queue)
     cancellation_event = api_intercept_module.threading.Event()
-    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
+    queue_bridge_module._install_modal_interrupt_queue_bridge(prompt_server)
 
-    assert api_intercept_module._set_remote_preparation(
+    assert queue_bridge_module._set_remote_preparation(
         prompt_server,
         prompt_id="prompt-cancel",
         prompt={},
@@ -6849,17 +6859,18 @@ def test_remote_preparation_bridge_tracks_prompt_cancellation(
     )
     cancellations = getattr(
         prompt_queue,
-        api_intercept_module._REMOTE_PREPARATION_CANCELLATIONS_ATTR,
+        queue_bridge_module._REMOTE_PREPARATION_CANCELLATIONS_ATTR,
     )
     assert cancellations["prompt-cancel"] is cancellation_event
 
-    api_intercept_module._clear_remote_preparation(prompt_server, "prompt-cancel")
+    queue_bridge_module._clear_remote_preparation(prompt_server, "prompt-cancel")
 
     assert "prompt-cancel" not in cancellations
 
 
 def test_jobs_api_interrupt_cancels_remote_preparation(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
 ) -> None:
     """ComfyUI's normal Jobs API cancellation should stop remote setup."""
 
@@ -6882,8 +6893,8 @@ def test_jobs_api_interrupt_cancels_remote_preparation(
     prompt_queue = FakePromptQueue()
     prompt_server = SimpleNamespace(prompt_queue=prompt_queue)
     cancellation_event = api_intercept_module.threading.Event()
-    api_intercept_module._install_modal_interrupt_queue_bridge(prompt_server)
-    api_intercept_module._set_remote_preparation(
+    queue_bridge_module._install_modal_interrupt_queue_bridge(prompt_server)
+    queue_bridge_module._set_remote_preparation(
         prompt_server,
         prompt_id="prompt-cancel",
         prompt={},
@@ -6903,6 +6914,7 @@ def test_jobs_api_interrupt_cancels_remote_preparation(
 
 def test_queue_bridge_releases_r2_writeback_reservations(
     api_intercept_module: Any,
+    queue_bridge_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Completed, deleted, and wiped prompts should release idle cache work."""
@@ -6942,12 +6954,12 @@ def test_queue_bridge_releases_r2_writeback_reservations(
 
     released: list[str] = []
     monkeypatch.setattr(
-        api_intercept_module,
+        queue_bridge_module,
         "finish_r2_writeback_prompt",
         released.append,
     )
     prompt_queue = FakePromptQueue()
-    api_intercept_module._install_modal_interrupt_queue_bridge(
+    queue_bridge_module._install_modal_interrupt_queue_bridge(
         SimpleNamespace(prompt_queue=prompt_queue)
     )
 

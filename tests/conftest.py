@@ -352,6 +352,18 @@ def execution_scheduling_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def queue_bridge_module(extension_package: object) -> object:
+    """Return ComfyUI queue insertion and remote preparation helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.queue_bridge")
+
+
+@pytest.fixture(scope="session")
+def prompt_diagnostics_module(extension_package: object) -> object:
+    """Return rewritten prompt diagnostic helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.prompt_diagnostics")
+
+
+@pytest.fixture(scope="session")
 def modal_endpoint_module(extension_package: object) -> object:
     """Return the Modal hosted-model endpoint node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")
