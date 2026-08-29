@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
+import importlib
 import importlib.util
 import json
 import pickle
@@ -26,6 +27,35 @@ from typing import Any, Iterator
 import pytest
 
 DEFAULT_TEST_DEPLOYMENT_APP_NAME = "comfy-modal-sync-gpu-rtx-pro-6000"
+
+
+def _cloud_session_bridge_owner() -> Any:
+    """Return the module that owns cloud session-bridge state and replay helpers."""
+    return importlib.import_module("cloud_session_bridge")
+
+
+def _cloud_remote_session_store() -> Any:
+    """Return the process-local session store from its extracted owner."""
+    return _cloud_session_bridge_owner()._REMOTE_SESSION_STORE
+
+
+def _cloud_bridge_value_cache() -> dict[str, Any]:
+    """Return the warm bridge-value cache from its extracted owner."""
+    return _cloud_session_bridge_owner()._REMOTE_SESSION_BRIDGE_VALUE_CACHE
+
+
+def _cloud_bridge_value_cache_order() -> list[str]:
+    """Return the warm bridge-value eviction order from its extracted owner."""
+    return _cloud_session_bridge_owner()._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER
+
+
+def _patch_cloud_session_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: Any,
+) -> None:
+    """Patch a session-bridge helper at its extracted owner."""
+    monkeypatch.setattr(_cloud_session_bridge_owner(), name, value)
 
 
 class _FakeOriginalNode:
@@ -4038,15 +4068,15 @@ def test_modal_cloud_rehydrates_bridge_refs_from_warm_value_cache_without_replay
         output_index=0,
         session_id="session-source",
     )
-    original_cache = dict(modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE)
-    original_order = list(modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER)
+    original_cache = dict(_cloud_bridge_value_cache())
+    original_order = list(_cloud_bridge_value_cache_order())
     try:
         seed_value = _CloneableCacheValue("warm-bridge-value")
-        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
-        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
+        _cloud_bridge_value_cache().clear()
+        _cloud_bridge_value_cache_order().clear()
         modal_cloud_module._store_remote_session_bridge_value(bridge_key, seed_value)
-        monkeypatch.setattr(
-            modal_cloud_module,
+        _patch_cloud_session_bridge(
+            monkeypatch,
             "_load_remote_session_bridge_record",
             lambda bridge_key: (_ for _ in ()).throw(
                 AssertionError(f"warm bridge cache hit should skip record lookup for {bridge_key}")
@@ -4064,7 +4094,7 @@ def test_modal_cloud_rehydrates_bridge_refs_from_warm_value_cache_without_replay
             resolution_stats=resolution_stats,
         )
 
-        stored_value = modal_cloud_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = _cloud_remote_session_store().get_output(
             modal_cloud_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="node-7",
@@ -4072,11 +4102,11 @@ def test_modal_cloud_rehydrates_bridge_refs_from_warm_value_cache_without_replay
             )
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
-        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.clear()
-        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE.update(original_cache)
-        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.clear()
-        modal_cloud_module._REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER.extend(original_order)
+        _cloud_remote_session_store().clear_session(target_handle)
+        _cloud_bridge_value_cache().clear()
+        _cloud_bridge_value_cache().update(original_cache)
+        _cloud_bridge_value_cache_order().clear()
+        _cloud_bridge_value_cache_order().extend(original_order)
 
     assert isinstance(restored_value, _CloneableCacheValue)
     assert restored_value.value == "warm-bridge-value"
@@ -4112,8 +4142,8 @@ def test_modal_cloud_rehydrates_conditioning_bridge_refs_from_durable_record_wit
             {"pooled_output": torch.arange(4, dtype=torch.float32).reshape(1, 4)},
         ]
     ]
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_load_remote_session_bridge_record",
         lambda bridge_key: modal_cloud_module.RemoteSessionBridgeRecord(
             bridge_key=bridge_key,
@@ -4125,8 +4155,8 @@ def test_modal_cloud_rehydrates_conditioning_bridge_refs_from_durable_record_wit
             serialized_output_io_type="CONDITIONING",
         ),
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_subgraph_prompt",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("durable CONDITIONING restore should skip replay")
@@ -4144,7 +4174,7 @@ def test_modal_cloud_rehydrates_conditioning_bridge_refs_from_durable_record_wit
             interrupt_flag_key=None,
             resolution_stats=resolution_stats,
         )
-        stored_value = modal_cloud_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = _cloud_remote_session_store().get_output(
             modal_cloud_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="node-9",
@@ -4152,7 +4182,7 @@ def test_modal_cloud_rehydrates_conditioning_bridge_refs_from_durable_record_wit
             )
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_remote_session_store().clear_session(target_handle)
 
     assert torch.equal(restored_value[0][0], conditioning[0][0])
     assert torch.equal(restored_value[0][1]["pooled_output"], conditioning[0][1]["pooled_output"])
@@ -4231,28 +4261,28 @@ def test_modal_cloud_rehydrates_literal_sampling_strategy_bridges_without_replay
         "node_inputs": node_inputs,
     }
     execute_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_load_remote_session_bridge_record",
         lambda bridge_key: record,
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_subgraph_prompt",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("literal strategy bridge should not replay its producer component")
         ),
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_node_locally_raw",
         lambda node_data, kwargs_payload, **kwargs: (
             execute_calls.append((dict(node_data), dict(kwargs_payload))),
             (f"restored-{io_type.lower()}",),
         )[1],
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_store_remote_session_bridge_value",
         lambda bridge_key, value: None,
     )
@@ -4269,7 +4299,7 @@ def test_modal_cloud_rehydrates_literal_sampling_strategy_bridges_without_replay
             resolution_stats=resolution_stats,
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_remote_session_store().clear_session(target_handle)
 
     assert restored_value == f"restored-{io_type.lower()}"
     assert execute_calls == [({"class_type": class_type}, node_inputs)]
@@ -4315,13 +4345,13 @@ def test_modal_cloud_rehydrates_sampler_latent_bridge_refs_from_durable_record_w
     )
     assert record.serialized_output is not None
     assert record.serialized_output_io_type == "LATENT"
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_load_remote_session_bridge_record",
         lambda bridge_key: record,
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_subgraph_prompt",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("durable LATENT restore should skip sampler replay")
@@ -4339,7 +4369,7 @@ def test_modal_cloud_rehydrates_sampler_latent_bridge_refs_from_durable_record_w
             interrupt_flag_key=None,
             resolution_stats=resolution_stats,
         )
-        stored_value = modal_cloud_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = _cloud_remote_session_store().get_output(
             modal_cloud_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="sampler-1",
@@ -4347,7 +4377,7 @@ def test_modal_cloud_rehydrates_sampler_latent_bridge_refs_from_durable_record_w
             )
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_remote_session_store().clear_session(target_handle)
 
     assert torch.equal(restored_value["samples"], latent["samples"])
     assert torch.equal(stored_value["samples"], latent["samples"])
@@ -4391,16 +4421,16 @@ def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_repl
         output_value=_FakeModelValue("seed-model"),
     )
     execute_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    monkeypatch.setattr(modal_cloud_module, "_load_remote_session_bridge_record", lambda bridge_key: record)
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(monkeypatch, "_load_remote_session_bridge_record", lambda bridge_key: record)
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_subgraph_prompt",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("durable MODEL rehydration should skip replay")
         ),
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_node_locally_raw",
         lambda node_data, kwargs_payload, **kwargs: (
             execute_calls.append((dict(node_data), dict(kwargs_payload))),
@@ -4419,7 +4449,7 @@ def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_repl
             interrupt_flag_key=None,
             resolution_stats=resolution_stats,
         )
-        stored_value = modal_cloud_module._REMOTE_SESSION_STORE.get_output(
+        stored_value = _cloud_remote_session_store().get_output(
             modal_cloud_module.RemoteSessionValueRef(
                 session_id=target_handle.session_id,
                 node_id="node-5",
@@ -4427,7 +4457,7 @@ def test_modal_cloud_rehydrates_model_bridge_refs_from_durable_plan_without_repl
             )
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_remote_session_store().clear_session(target_handle)
 
     assert isinstance(restored_value, _FakeModelValue)
     assert restored_value.value == "restored-model"
@@ -4488,16 +4518,16 @@ def test_modal_cloud_rehydrates_clip_bridge_refs_from_durable_plan_without_repla
     )
     assert record.rehydration_plan is not None
     assert record.rehydration_plan_io_type == "CLIP"
-    monkeypatch.setattr(modal_cloud_module, "_load_remote_session_bridge_record", lambda bridge_key: record)
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(monkeypatch, "_load_remote_session_bridge_record", lambda bridge_key: record)
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_subgraph_prompt",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("durable CLIP rehydration should skip replay")
         ),
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_node_locally_raw",
         lambda node_data, kwargs_payload, **kwargs: (
             "clip::"
@@ -4519,7 +4549,7 @@ def test_modal_cloud_rehydrates_clip_bridge_refs_from_durable_plan_without_repla
             resolution_stats=resolution_stats,
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_remote_session_store().clear_session(target_handle)
 
     assert restored_value == "clip::text.safetensors:flux:default"
     assert resolution_stats.durable_bridge_hits == 1
@@ -4569,7 +4599,7 @@ def test_modal_cloud_rehydrates_linked_model_bridge_with_non_sampler_subgraph_pl
     )
     assert record.rehydration_plan is not None
     assert record.rehydration_plan["kind"] == "subgraph_output"
-    monkeypatch.setattr(modal_cloud_module, "_load_remote_session_bridge_record", lambda bridge_key: record)
+    _patch_cloud_session_bridge(monkeypatch, "_load_remote_session_bridge_record", lambda bridge_key: record)
     observed_payloads: list[dict[str, Any]] = []
 
     def fake_execute_subgraph_prompt(
@@ -4586,7 +4616,7 @@ def test_modal_cloud_rehydrates_linked_model_bridge_with_non_sampler_subgraph_pl
         assert "sampler-1" not in payload["subgraph_prompt"]
         return (_FakeModelValue("restored-lora-model"),)
 
-    monkeypatch.setattr(modal_cloud_module, "_execute_subgraph_prompt", fake_execute_subgraph_prompt)
+    _patch_cloud_session_bridge(monkeypatch, "_execute_subgraph_prompt", fake_execute_subgraph_prompt)
     resolution_stats = modal_cloud_module._RemoteSessionBridgeResolutionStats()
 
     try:
@@ -4600,7 +4630,7 @@ def test_modal_cloud_rehydrates_linked_model_bridge_with_non_sampler_subgraph_pl
             resolution_stats=resolution_stats,
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_remote_session_store().clear_session(target_handle)
 
     assert isinstance(restored_value, _FakeModelValue)
     assert restored_value.value == "restored-lora-model"
@@ -4625,8 +4655,8 @@ def test_modal_cloud_refuses_sampler_ancestor_bridge_replay(
         output_index=0,
         session_id="session-source",
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_load_remote_session_bridge_record",
         lambda bridge_key: modal_cloud_module.RemoteSessionBridgeRecord(
             bridge_key=bridge_key,
@@ -4650,8 +4680,8 @@ def test_modal_cloud_refuses_sampler_ancestor_bridge_replay(
             producer_inputs={},
         ),
     )
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_execute_subgraph_prompt",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("sampler bridge replay should be blocked")
@@ -4685,7 +4715,7 @@ def test_modal_cloud_skips_seed_execution_when_session_outputs_are_already_resto
         owner_component_id="component-1",
     )
     restored_value = _FakeModelValue("restored-model")
-    modal_cloud_module._REMOTE_SESSION_STORE.put_output(
+    _cloud_remote_session_store().put_output(
         session_handle,
         node_id="5",
         output_index=0,
@@ -4742,7 +4772,7 @@ def test_modal_cloud_skips_seed_execution_when_session_outputs_are_already_resto
             None,
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(session_handle)
+        _cloud_remote_session_store().clear_session(session_handle)
 
     assert len(outputs) == 1
     assert modal_cloud_module.is_remote_session_bridge_ref_payload(outputs[0])
@@ -4754,8 +4784,8 @@ def test_modal_cloud_logs_remote_session_resolution_summary(
 ) -> None:
     """Mapped-phase bridge resolution should emit one summary block with replay and loader deltas."""
     observed_logs: list[tuple[str, tuple[Any, ...]]] = []
-    monkeypatch.setattr(
-        modal_cloud_module,
+    _patch_cloud_session_bridge(
+        monkeypatch,
         "_emit_cloud_info",
         lambda message, *args: observed_logs.append((message, args)),
     )

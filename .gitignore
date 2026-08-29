@@ -13,6 +13,7 @@
 !/cloud_durable_invocation.py
 !/cloud_image_env.py
 !/cloud_runtime_context.py
+!/cloud_session_bridge.py
 !/comfyui_modal_sync_cloud.py
 !/component_planning.py
 !/durable_state.py

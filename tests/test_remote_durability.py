@@ -18,6 +18,11 @@ def _cloud_durable_invocation_owner() -> Any:
     return importlib.import_module("cloud_durable_invocation")
 
 
+def _cloud_session_bridge_owner() -> Any:
+    """Return the module that owns cloud session-bridge mutable state."""
+    return importlib.import_module("cloud_session_bridge")
+
+
 def _patch_cloud_durable_state(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
@@ -640,7 +645,9 @@ def test_cloud_direct_bridge_output_omits_large_producer_inputs(
                 record
             )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_session_bridge_owner()._REMOTE_SESSION_STORE.clear_session(
+            target_handle
+        )
         modal_cloud_module.get_settings.cache_clear()
 
     assert record.producer_inputs == {}
@@ -683,7 +690,7 @@ def test_cloud_large_image_bridge_output_uses_object_store(
             output_value=image,
         )
         monkeypatch.setattr(
-            modal_cloud_module,
+            _cloud_session_bridge_owner(),
             "_execute_subgraph_prompt",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError("durable IMAGE restore should skip producer replay")
@@ -696,7 +703,9 @@ def test_cloud_large_image_bridge_output_uses_object_store(
             )
         )
     finally:
-        modal_cloud_module._REMOTE_SESSION_STORE.clear_session(target_handle)
+        _cloud_session_bridge_owner()._REMOTE_SESSION_STORE.clear_session(
+            target_handle
+        )
         modal_cloud_module.get_settings.cache_clear()
 
     assert record.serialized_output is None
