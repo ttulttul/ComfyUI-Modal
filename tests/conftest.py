@@ -468,6 +468,24 @@ def modal_llm_node_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def remote_executor_router_module(extension_package: object) -> object:
+    """Return the provider-aware remote executor router module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote_executor_router")
+
+
+@pytest.fixture(scope="session")
+def proxy_payloads_module(extension_package: object) -> object:
+    """Return the run-scoped proxy payload registry module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.proxy_payloads")
+
+
+@pytest.fixture(scope="session")
+def proxy_node_factory_module(extension_package: object) -> object:
+    """Return the dynamic ComfyUI proxy-node factory module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.proxy_node_factory")
+
+
+@pytest.fixture(scope="session")
 def remote_modal_app_module(extension_package: object) -> object:
     """Return the remote execution module."""
     return importlib.import_module(f"{PACKAGE_NAME}.remote.modal_app")

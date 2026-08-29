@@ -522,6 +522,8 @@ Resident LLM inference uses the same ownership boundaries: `llm_types.py` define
 
 Asset synchronization is composed from focused collaborators: `sync_protocols.py` holds provider-neutral contracts and values, `sync_backends.py` owns local and Modal persistence adapters, `sync_hashing.py` owns the persistent content-hash cache, `sync_custom_nodes.py` builds and transfers custom-node archives and manifests, and `sync_r2_transfer.py` owns worker preflight plus idle-gated R2 read-through and write-back. `sync_engine.py` coordinates those collaborators and retains compatibility entrypoints.
 
+Proxy execution separates provider routing (`remote_executor_router.py`), run-scoped payload normalization and cache-safe registries (`proxy_payloads.py`), and dynamic v3 proxy class construction (`proxy_node_factory.py`). `modal_executor_node.py` retains workflow concurrency gates and the five static ComfyUI node classes, then injects those residual execution hooks into the factory.
+
 ### Vast.ai API Simulator
 
 Vast development and CI need no live credentials or billable instances. Start the stateful local simulator:

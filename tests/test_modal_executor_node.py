@@ -1746,6 +1746,7 @@ def test_cache_friendly_proxy_payload_rehydrates_without_hidden_unique_id(
 
 def test_cache_friendly_proxy_payload_ignores_volatile_queue_metadata(
     modal_executor_module: Any,
+    proxy_payloads_module: Any,
 ) -> None:
     """Identical proxy work should sanitize to one local cache surface across prompt runs."""
     first_payload = modal_executor_module.register_cache_friendly_proxy_payload(
@@ -1790,7 +1791,7 @@ def test_cache_friendly_proxy_payload_ignores_volatile_queue_metadata(
         "component_id": "component-9",
         "boundary_outputs": [],
         "execute_node_ids": ["12"],
-        modal_executor_module._PROXY_CACHE_CONTEXT_ID_KEY: "node-9",
+        proxy_payloads_module._PROXY_CACHE_CONTEXT_ID_KEY: "node-9",
     }
     assert modal_executor_module._rehydrate_proxy_payload(
         first_payload,
@@ -1872,6 +1873,7 @@ def test_proxy_execution_wraps_sync_remote_clients(
 
 def test_modal_map_input_execute_boosts_exact_warmup_for_registered_context(
     modal_executor_module: Any,
+    proxy_payloads_module: Any,
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -1895,8 +1897,8 @@ def test_modal_map_input_execute_boosts_exact_warmup_for_registered_context(
         "boost_mapped_component_warmup",
         fake_boost_mapped_component_warmup,
     )
-    with modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS_LOCK:
-        modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS.clear()
+    with proxy_payloads_module._MODAL_MAP_WARMUP_CONTEXTS_LOCK:
+        proxy_payloads_module._MODAL_MAP_WARMUP_CONTEXTS.clear()
     modal_executor_module.register_modal_map_input_warmup_context(
         "map-node-1",
         {
@@ -1926,6 +1928,7 @@ def test_modal_map_input_execute_boosts_exact_warmup_for_registered_context(
 
 def test_modal_map_input_execute_accepts_scalar_for_single_item_warmup(
     modal_executor_module: Any,
+    proxy_payloads_module: Any,
     remote_modal_app_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -1949,8 +1952,8 @@ def test_modal_map_input_execute_accepts_scalar_for_single_item_warmup(
         "boost_mapped_component_warmup",
         fake_boost_mapped_component_warmup,
     )
-    with modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS_LOCK:
-        modal_executor_module._MODAL_MAP_WARMUP_CONTEXTS.clear()
+    with proxy_payloads_module._MODAL_MAP_WARMUP_CONTEXTS_LOCK:
+        proxy_payloads_module._MODAL_MAP_WARMUP_CONTEXTS.clear()
     modal_executor_module.register_modal_map_input_warmup_context(
         "map-node-1",
         {

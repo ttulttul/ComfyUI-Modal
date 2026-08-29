@@ -9,7 +9,7 @@ import pytest
 
 
 def test_router_defaults_legacy_payloads_to_modal(
-    modal_executor_module: Any,
+    remote_executor_router_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Existing workflows without provider metadata must retain Modal behavior."""
@@ -24,25 +24,29 @@ def test_router_defaults_legacy_payloads_to_modal(
             calls.append("modal")
             return ["modal-output"]
 
-    monkeypatch.setattr(modal_executor_module, "ModalRemoteExecutorClient", FakeModalClient)
+    monkeypatch.setattr(
+        remote_executor_router_module,
+        "ModalRemoteExecutorClient",
+        FakeModalClient,
+    )
 
-    result = modal_executor_module.RemoteExecutorRouterClient().execute_payload({}, {})
+    result = remote_executor_router_module.RemoteExecutorRouterClient().execute_payload({}, {})
 
     assert result == ["modal-output"]
     assert calls == ["modal"]
 
 
-def test_router_rejects_unknown_provider(modal_executor_module: Any) -> None:
+def test_router_rejects_unknown_provider(remote_executor_router_module: Any) -> None:
     """Planner/provider drift should fail before any remote call begins."""
     with pytest.raises(ValueError, match="Unsupported remote execution provider"):
-        modal_executor_module.RemoteExecutorRouterClient().execute_payload(
+        remote_executor_router_module.RemoteExecutorRouterClient().execute_payload(
             {"execution_provider": "mystery"},
             {},
         )
 
 
 def test_router_records_successful_component_runtime(
-    modal_executor_module: Any,
+    remote_executor_router_module: Any,
     settings_module: Any,
     execution_history_module: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -58,7 +62,11 @@ def test_router_records_successful_component_runtime(
             del payload, kwargs
             return ["output"]
 
-    monkeypatch.setattr(modal_executor_module, "ModalRemoteExecutorClient", FakeModalClient)
+    monkeypatch.setattr(
+        remote_executor_router_module,
+        "ModalRemoteExecutorClient",
+        FakeModalClient,
+    )
     monkeypatch.setattr(settings_module, "get_settings", lambda: SimpleNamespace(modal_gpu="L40S"))
     monkeypatch.setattr(
         settings_module,
@@ -66,7 +74,7 @@ def test_router_records_successful_component_runtime(
         lambda _settings: tmp_path,
     )
 
-    result = modal_executor_module.RemoteExecutorRouterClient().execute_payload(
+    result = remote_executor_router_module.RemoteExecutorRouterClient().execute_payload(
         {
             "execution_provider": "modal",
             "execution_environment_id": "modal:L40S",
