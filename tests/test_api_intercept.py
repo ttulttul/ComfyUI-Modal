@@ -4081,6 +4081,7 @@ def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
 
 def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_with_unmapped_sibling(
     api_intercept_module: Any,
+    prompt_payload_metadata_module: Any,
     modal_executor_module: Any,
     settings_module: Any,
     sync_engine_module: Any,
@@ -4259,7 +4260,7 @@ def test_rewrite_supports_mapped_branch_that_shares_non_transportable_upstream_w
             "proxy_input_name": "static_input_0",
             "io_type": "MODEL",
             "targets": [{"node_id": "7", "input_name": "model"}],
-            "source_signature": api_intercept_module._boundary_source_signature(
+            "source_signature": prompt_payload_metadata_module._boundary_source_signature(
                 prompt,
                 api_intercept_module.LinkedOutputRef(node_id="1", output_index=0),
             ),
@@ -4404,6 +4405,7 @@ def test_rewrite_stamps_snapshot_profile_on_split_static_and_mapped_payloads(
 
 def test_snapshot_profile_stamping_excludes_llm_phase_from_comfy_profile(
     api_intercept_module: Any,
+    prompt_payload_metadata_module: Any,
 ) -> None:
     """A split LLM phase must not inherit the surrounding Comfy loader profile."""
     split_payload = {
@@ -4439,7 +4441,7 @@ def test_snapshot_profile_stamping_excludes_llm_phase_from_comfy_profile(
         enable_loader_prewarm=True,
     )
 
-    result = api_intercept_module._attach_snapshot_profile_key(split_payload, settings)
+    result = prompt_payload_metadata_module._attach_snapshot_profile_key(split_payload, settings)
 
     snapshot_profile_key = result["snapshot_profile_key"]
     phases = result["split_proxy_payloads"]
@@ -4451,6 +4453,7 @@ def test_snapshot_profile_stamping_excludes_llm_phase_from_comfy_profile(
 
 def test_planner_resolved_llm_profile_is_attached_to_matching_payload(
     api_intercept_module: Any,
+    prompt_payload_metadata_module: Any,
     llm_profiles_module: Any,
     tmp_path: Path,
 ) -> None:
@@ -4466,7 +4469,7 @@ def test_planner_resolved_llm_profile_is_attached_to_matching_payload(
         },
     }
 
-    api_intercept_module._attach_resolved_llm_profiles(
+    prompt_payload_metadata_module._attach_resolved_llm_profiles(
         payload,
         {profile.profile_id: profile},
         SimpleNamespace(local_storage_root=tmp_path),
@@ -4479,6 +4482,7 @@ def test_planner_resolved_llm_profile_is_attached_to_matching_payload(
 
 def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
     api_intercept_module: Any,
+    prompt_rewrite_module: Any,
 ) -> None:
     """Each proxy should prepare only its nearest reachable future worker group."""
     rewritten_prompt = {
@@ -4539,7 +4543,7 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
         },
     }
 
-    api_intercept_module._configure_speculative_affinity_prewarm_payloads(
+    prompt_rewrite_module._configure_speculative_affinity_prewarm_payloads(
         rewritten_prompt=rewritten_prompt,
         execution_stages=[["spec-a", "spec-b"], ["spec-c"]],
     )
@@ -4566,6 +4570,7 @@ def test_planner_attaches_next_distinct_affinity_as_speculative_prewarm_target(
 
 def test_planner_does_not_bridge_local_gap_keepalive_across_providers(
     api_intercept_module: Any,
+    prompt_rewrite_module: Any,
 ) -> None:
     """A Modal producer must not retain a slot for an SSH continuation."""
     rewritten_prompt = {
@@ -4596,7 +4601,7 @@ def test_planner_does_not_bridge_local_gap_keepalive_across_providers(
         },
     }
 
-    api_intercept_module._configure_local_gap_keepalive_payloads(
+    prompt_rewrite_module._configure_local_gap_keepalive_payloads(
         rewritten_prompt=rewritten_prompt,
         remote_component_ids=["modal-producer", "ssh-consumer"],
         sandwiched_local_node_ids={"local-gap"},
@@ -4768,6 +4773,7 @@ def test_rewrite_keeps_unmapped_remote_siblings_without_local_reentry_together(
 
 def test_boundary_source_signature_changes_with_upstream_prompt_structure(
     api_intercept_module: Any,
+    prompt_payload_metadata_module: Any,
 ) -> None:
     """Non-transportable boundary provenance should change when the upstream prompt changes."""
     source = api_intercept_module.LinkedOutputRef(node_id="2", output_index=0)
@@ -4792,9 +4798,9 @@ def test_boundary_source_signature_changes_with_upstream_prompt_structure(
         },
     }
 
-    first_signature = api_intercept_module._boundary_source_signature(base_prompt, source)
-    second_signature = api_intercept_module._boundary_source_signature(base_prompt, source)
-    changed_signature = api_intercept_module._boundary_source_signature(changed_prompt, source)
+    first_signature = prompt_payload_metadata_module._boundary_source_signature(base_prompt, source)
+    second_signature = prompt_payload_metadata_module._boundary_source_signature(base_prompt, source)
+    changed_signature = prompt_payload_metadata_module._boundary_source_signature(changed_prompt, source)
 
     assert first_signature == second_signature
     assert changed_signature != first_signature

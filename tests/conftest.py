@@ -334,6 +334,18 @@ def component_planning_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def prompt_payload_metadata_module(extension_package: object) -> object:
+    """Return prompt signatures and resolved-model metadata helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.prompt_payload_metadata")
+
+
+@pytest.fixture(scope="session")
+def prompt_rewrite_module(extension_package: object) -> object:
+    """Return remote payload construction and proxy rewrite helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.prompt_rewrite")
+
+
+@pytest.fixture(scope="session")
 def modal_endpoint_module(extension_package: object) -> object:
     """Return the Modal hosted-model endpoint node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")
