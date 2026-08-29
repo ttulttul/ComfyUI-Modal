@@ -687,3 +687,7 @@
 The stable cloud exception classes are defined by `comfyui_modal_sync_cloud.py` and injected into lower-level owners after imports finish. A helper extracted from `cloud_prompt_execution.py` must not bind `RemoteSubgraphExecutionError` with `from ... import ...` during module import, because that captures the temporary fallback class. `cloud_mapped_execution.py` delegates exception construction and phase execution through the prompt-execution module at call time, preserving both the configured exception identity and the test patch boundary without introducing an import cycle.
 
 The entrypoint logger has a similar identity constraint: tests and operators inspect the `comfyui_modal_sync_cloud` logger directly. `cloud_runtime_logging.py` therefore owns formatting and phase timing while configuring the entrypoint's logger object, rather than silently switching cloud output to a new logger name.
+
+## Mutable caches move with their reporting owner
+
+The short-lived R2 bucket-usage cache is plan-reporting state, not scheduler state. Moving the cache, lock, credential lookup, and rendering helpers together into `execution_plan_reporting.py` prevents compatibility re-exports from creating a second mutable binding. Tests that clear the cache or replace credential clients must patch that owner directly; callers may continue to use the compatibility functions exported by `execution_scheduling.py`.

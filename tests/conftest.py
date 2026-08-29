@@ -352,6 +352,24 @@ def execution_scheduling_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def execution_assignment_runtime_module(extension_package: object) -> object:
+    """Return execution backend and assignment metadata helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.execution_assignment_runtime")
+
+
+@pytest.fixture(scope="session")
+def execution_plan_reporting_module(extension_package: object) -> object:
+    """Return credential-safe execution plan reporting helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.execution_plan_reporting")
+
+
+@pytest.fixture(scope="session")
+def execution_resource_estimates_module(extension_package: object) -> object:
+    """Return execution resource estimation and signature helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.execution_resource_estimates")
+
+
+@pytest.fixture(scope="session")
 def queue_bridge_module(extension_package: object) -> object:
     """Return ComfyUI queue insertion and remote preparation helpers."""
     return importlib.import_module(f"{PACKAGE_NAME}.queue_bridge")

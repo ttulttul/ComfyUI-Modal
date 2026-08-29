@@ -29,7 +29,10 @@
 !/component_planning.py
 !/durable_state.py
 !/execution_environments.py
+!/execution_assignment_runtime.py
 !/execution_history.py
+!/execution_plan_reporting.py
+!/execution_resource_estimates.py
 !/execution_scheduling.py
 !/huggingface_assets.py
 !/huggingface_discovery.py

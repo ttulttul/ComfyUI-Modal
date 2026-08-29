@@ -1370,6 +1370,7 @@ def test_automatic_policy_rejects_zero_cost_host_for_oversized_model(
 def test_planner_resolves_hugging_face_metadata_before_cost_ranking(
     api_intercept_module: Any,
     execution_scheduling_module: Any,
+    execution_resource_estimates_module: Any,
     execution_environments_module: Any,
     remote_hosts_module: Any,
     llm_resolver_module: Any,
@@ -1441,7 +1442,7 @@ def test_planner_resolves_hugging_face_metadata_before_cost_ranking(
         local_storage_root=tmp_path,
     )
     monkeypatch.setattr(
-        execution_scheduling_module,
+        execution_resource_estimates_module,
         "resolve_model_profile",
         resolve,
     )
