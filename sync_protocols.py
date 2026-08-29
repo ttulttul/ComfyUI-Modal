@@ -26,6 +26,21 @@ else:  # pragma: no cover - flat import inside the Modal container.
 SyncStatusCallback = Callable[[str, int | None, int | None], None]
 CancellationCheck = Callable[[], bool]
 
+
+def _format_indexed_asset_status(
+    asset_name: str,
+    *,
+    action: str,
+    location: str,
+    item_index: int | None,
+    total_items: int | None,
+) -> str:
+    """Return one asset status with optional request-wide item progress."""
+    if item_index is not None and total_items is not None and total_items > 1:
+        return f"{action} {item_index}/{total_items} {location}: {asset_name}"
+    return f"{action} {location}: {asset_name}"
+
+
 class VolumeBackend(Protocol):
     """Minimal storage interface needed by the sync engine."""
 
@@ -266,4 +281,3 @@ class _R2MaterializationOutcome:
 
     result: _ContentAddressedSyncResult | None
     refresh_required: bool = False
-

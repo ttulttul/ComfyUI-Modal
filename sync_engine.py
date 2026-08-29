@@ -57,6 +57,7 @@ if __package__:
         _CustomNodesArchiveSpec,
         _CustomNodesArchiveSyncResult,
         _R2MaterializationOutcome,
+        _format_indexed_asset_status,
     )
     from .sync_r2_transfer import (
         R2TransferManager,
@@ -110,6 +111,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
         _CustomNodesArchiveSpec,
         _CustomNodesArchiveSyncResult,
         _R2MaterializationOutcome,
+        _format_indexed_asset_status,
     )
     from sync_r2_transfer import (
         R2TransferManager,
@@ -165,49 +167,6 @@ def _emit_sync_status(
     if status_callback is None:
         return
     status_callback(message, current, total)
-
-
-def _format_asset_upload_status(
-    asset_name: str,
-    *,
-    item_index: int | None,
-    total_items: int | None,
-    destination: str = "Modal",
-) -> str:
-    """Return the global-status message for one asset upload."""
-    if item_index is not None and total_items is not None and total_items > 1:
-        return f"Uploading asset {item_index}/{total_items} to {destination}: {asset_name}"
-    return f"Uploading asset to {destination}: {asset_name}"
-
-
-def _format_huggingface_download_status(
-    asset_name: str,
-    *,
-    item_index: int | None,
-    total_items: int | None,
-) -> str:
-    """Return one queue-time status for direct Hugging Face acquisition on Vast."""
-    if item_index is not None and total_items is not None and total_items > 1:
-        return (
-            f"Downloading asset {item_index}/{total_items} from Hugging Face on "
-            f"Vast.ai: {asset_name}"
-        )
-    return f"Downloading asset from Hugging Face on Vast.ai: {asset_name}"
-
-
-def _format_huggingface_discovery_status(
-    asset_name: str,
-    *,
-    item_index: int | None,
-    total_items: int | None,
-) -> str:
-    """Return one queue-time status for automatic Hugging Face source discovery."""
-    if item_index is not None and total_items is not None and total_items > 1:
-        return (
-            f"Identifying Hugging Face source {item_index}/{total_items} for "
-            f"Vast.ai: {asset_name}"
-        )
-    return f"Identifying Hugging Face source for Vast.ai: {asset_name}"
 
 
 @dataclass
@@ -379,11 +338,12 @@ class ModalAssetSyncEngine:
             sync_key=sync_key,
             source_description=str(source_path),
             status_callback=status_callback,
-            upload_status_message=_format_asset_upload_status(
+            upload_status_message=_format_indexed_asset_status(
                 source_path.name,
+                action="Uploading asset",
+                location=f"to {self._destination_label()}",
                 item_index=item_index,
                 total_items=total_items,
-                destination=self._destination_label(),
             ),
             status_current=item_index,
             status_total=total_items,
@@ -648,8 +608,10 @@ class ModalAssetSyncEngine:
             return None
         _emit_sync_status(
             spec.status_callback,
-            _format_huggingface_download_status(
+            _format_indexed_asset_status(
                 spec.local_path.name,
+                action="Downloading asset",
+                location="from Hugging Face on Vast.ai",
                 item_index=spec.status_current,
                 total_items=spec.status_total,
             ),
@@ -775,8 +737,10 @@ class ModalAssetSyncEngine:
         if source is None and self.huggingface_asset_discovery is not None:
             _emit_sync_status(
                 status_callback,
-                _format_huggingface_discovery_status(
+                _format_indexed_asset_status(
                     local_path.name,
+                    action="Identifying Hugging Face source",
+                    location="for Vast.ai",
                     item_index=item_index,
                     total_items=total_items,
                 ),

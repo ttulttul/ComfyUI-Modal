@@ -26,6 +26,7 @@ if __package__:
         _ContentAddressedSyncResult,
         _ContentAddressedSyncSpec,
         _R2MaterializationOutcome,
+        _format_indexed_asset_status,
     )
 else:  # pragma: no cover - flat import inside the Modal container.
     from r2_cache import R2CacheClient, R2CacheError, R2DownloadRequest, R2UploadPlan
@@ -38,6 +39,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
         _ContentAddressedSyncResult,
         _ContentAddressedSyncSpec,
         _R2MaterializationOutcome,
+        _format_indexed_asset_status,
     )
 
 logger = logging.getLogger(__name__)
@@ -217,21 +219,6 @@ def _emit_sync_status(
         status_callback(message, current, total)
 
 
-def _format_r2_download_status(
-    asset_name: str,
-    *,
-    item_index: int | None,
-    total_items: int | None,
-) -> str:
-    """Return one queue-time worker-side R2 download status."""
-    if item_index is not None and total_items is not None and total_items > 1:
-        return (
-            f"Downloading asset {item_index}/{total_items} from Cloudflare R2: "
-            f"{asset_name}"
-        )
-    return f"Downloading asset from Cloudflare R2: {asset_name}"
-
-
 class R2TransferHost(Protocol):
     """Define engine services used by R2 transfer coordination."""
 
@@ -329,8 +316,10 @@ class R2TransferManager:
                 return _R2MaterializationOutcome(result=None)
             _emit_sync_status(
                 spec.status_callback,
-                _format_r2_download_status(
+                _format_indexed_asset_status(
                     spec.local_path.name,
+                    action="Downloading asset",
+                    location="from Cloudflare R2",
                     item_index=spec.status_current,
                     total_items=spec.status_total,
                 ),
@@ -485,4 +474,3 @@ class R2TransferManager:
     def wait_for_r2_writebacks(self) -> None:
         """Wait for this engine's currently scheduled R2 writes to finish."""
         _R2_WRITE_BACK_COORDINATOR.wait_for_idle()
-
