@@ -16,6 +16,7 @@
 !/huggingface_assets.py
 !/huggingface_discovery.py
 !/instance_identity.py
+!/intercept_route_paths.py
 !/llm_profiles.json
 !/llm_profiles.py
 !/llm_recovery.py
