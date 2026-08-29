@@ -11135,6 +11135,7 @@ def test_execute_subgraph_locally_round_trips_remote_session_bridge_refs(
 def test_local_fallback_skips_seed_execution_when_session_outputs_are_already_restored(
     remote_modal_app_module: Any,
     host_session_bridge_module: Any,
+    local_execution_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Local fallback seed payloads should no-op when bridge outputs are already in session memory."""
@@ -11189,7 +11190,7 @@ def test_local_fallback_skips_seed_execution_when_session_outputs_are_already_re
         ).to_payload()
     }
     monkeypatch.setattr(
-        remote_modal_app_module,
+        local_execution_module,
         "_invoke_original_node",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("seed short-circuit should skip local node execution")
@@ -11485,6 +11486,7 @@ def test_local_remote_app_rehydrates_sampler_latent_bridge_refs_from_durable_rec
 def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_replay(
     remote_modal_app_module: Any,
     host_session_bridge_module: Any,
+    local_execution_module: Any,
     monkeypatch: Any,
     io_type: str,
     node_id: str,
@@ -11552,14 +11554,14 @@ def test_local_remote_app_rehydrates_literal_sampling_strategy_bridges_without_r
         lambda bridge_key: record,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        local_execution_module,
         "_execute_subgraph_prompt",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("literal strategy bridge should not replay its producer component")
         ),
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        local_execution_module,
         "_execute_node_locally_raw",
         lambda node_data, kwargs_payload, **kwargs: (
             execute_calls.append((dict(node_data), dict(kwargs_payload))),
@@ -11731,6 +11733,7 @@ def test_local_remote_app_rehydrates_clip_bridge_refs_from_durable_plan_without_
 def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgraph_plan(
     remote_modal_app_module: Any,
     host_session_bridge_module: Any,
+    local_execution_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local fallback should rehydrate linked MODEL bridges without sampler replay."""
@@ -11789,7 +11792,7 @@ def test_local_remote_app_rehydrates_linked_model_bridge_with_non_sampler_subgra
         assert "sampler-1" not in payload["subgraph_prompt"]
         return (_FakeModelValue("restored-lora-model"),)
 
-    monkeypatch.setattr(remote_modal_app_module, "_execute_subgraph_prompt", fake_execute_subgraph_prompt)
+    monkeypatch.setattr(local_execution_module, "_execute_subgraph_prompt", fake_execute_subgraph_prompt)
     resolution_stats = remote_modal_app_module._RemoteSessionBridgeResolutionStats()
 
     try:
@@ -14044,7 +14047,7 @@ def test_implicitly_mapped_subgraph_splits_singleton_wrapped_bridge_ref_lists(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -14091,7 +14094,7 @@ def test_trim_subgraph_payload_to_required_nodes_drops_unrelated_mapped_branch(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16224,7 +16227,7 @@ def test_local_remote_app_normalizes_wrapped_scalar_prompt_inputs(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16259,7 +16262,7 @@ def test_apply_boundary_inputs_normalizes_wrapped_scalar_values(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16296,7 +16299,7 @@ def test_apply_boundary_inputs_preserves_singleton_conditioning_lists(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16332,7 +16335,7 @@ def test_validate_required_prompt_inputs_reports_missing_latent_image(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16374,7 +16377,7 @@ def test_validate_required_prompt_inputs_expands_v3_autogrow_inputs(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16402,7 +16405,7 @@ def test_validate_prompt_input_shapes_rejects_list_on_primitive_socket(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16435,7 +16438,7 @@ def test_validate_prompt_input_shapes_allows_boundary_supplied_list_on_primitive
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )
@@ -16542,7 +16545,7 @@ def test_local_remote_app_coerces_primitive_widget_literals_before_execution(
 @pytest.mark.parametrize(
     ("module_fixture_name",),
     [
-        ("remote_modal_app_module",),
+        ("local_execution_module",),
         ("modal_cloud_module",),
     ],
 )

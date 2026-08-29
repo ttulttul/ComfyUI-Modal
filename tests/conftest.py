@@ -462,6 +462,12 @@ def host_session_bridge_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def local_execution_module(extension_package: object) -> object:
+    """Return headless local node and subgraph execution helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.local_execution")
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")

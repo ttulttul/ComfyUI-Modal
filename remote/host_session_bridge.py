@@ -74,8 +74,8 @@ _DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset(
 
 
 def _orchestrator_module() -> Any:
-    """Load the current host orchestrator for transitional execution adapters."""
-    return importlib.import_module(".modal_app", __package__)
+    """Load the local execution owner lazily to avoid an import cycle."""
+    return importlib.import_module(".local_execution", __package__)
 
 
 def _execute_node_locally_raw(*args: Any, **kwargs: Any) -> Any:
