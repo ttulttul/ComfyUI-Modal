@@ -68,6 +68,11 @@ def _cloud_node_output_cache_owner() -> Any:
     return importlib.import_module("cloud_node_output_cache")
 
 
+def _cloud_prompt_execution_owner() -> Any:
+    """Return the module that owns cloud prompt execution state and helpers."""
+    return importlib.import_module("cloud_prompt_execution")
+
+
 def _patch_cloud_storage_root(
     monkeypatch: pytest.MonkeyPatch,
     modal_cloud_module: Any,
@@ -3199,7 +3204,9 @@ def test_modal_cloud_hidden_prompt_stays_json_safe_after_tensor_boundary_hydrati
         "PromptMetadataSerializationNode",
         "PromptMetadataSerializationNode",
     )
-    monkeypatch.setattr(modal_cloud_module, "_node_output_cache_store", lambda: None)
+    monkeypatch.setattr(
+        _cloud_prompt_execution_owner(), "_node_output_cache_store", lambda: None
+    )
     payload = {
         "payload_kind": "subgraph",
         "component_id": "metadata-output",
@@ -4770,7 +4777,7 @@ def test_modal_cloud_skips_seed_execution_when_session_outputs_are_already_resto
         ).to_payload()
     }
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prompt_execution_owner(),
         "_load_execution_module",
         lambda: (_ for _ in ()).throw(AssertionError("seed short-circuit should skip PromptExecutor")),
     )
@@ -10944,7 +10951,7 @@ def test_modal_cloud_execute_mapped_subgraph_payload_injects_static_bridges(
         return (f"mapped:{hydrated_inputs['remote_input_1']}:{hydrated_inputs['static_input_0']}",)
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prompt_execution_owner(),
         "_execute_subgraph_prompt",
         fake_execute_subgraph_prompt,
     )
@@ -11091,7 +11098,7 @@ def test_modal_cloud_execute_mapped_subgraph_payload_preserves_assigned_lane_id(
         return (f"mapped:{hydrated_inputs['remote_input_1']}",)
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_prompt_execution_owner(),
         "_execute_subgraph_prompt",
         fake_execute_subgraph_prompt,
     )
@@ -15219,8 +15226,9 @@ def test_modal_cloud_reuses_prompt_executor_for_same_cache_scope(
     first_server = types.SimpleNamespace(client_id="first", last_node_id="node-1")
     second_server = types.SimpleNamespace(client_id="second", last_node_id="node-2")
 
-    original_states = dict(modal_cloud_module._PROMPT_EXECUTOR_STATES)
-    modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
+    prompt_execution_owner = _cloud_prompt_execution_owner()
+    original_states = dict(prompt_execution_owner._PROMPT_EXECUTOR_STATES)
+    prompt_execution_owner._PROMPT_EXECUTOR_STATES.clear()
     try:
         first_state = modal_cloud_module._get_or_create_prompt_executor_state(
             execution=fake_execution_module,
@@ -15239,8 +15247,8 @@ def test_modal_cloud_reuses_prompt_executor_for_same_cache_scope(
         )
         modal_cloud_module._reset_prompt_executor_request_state(second_state.executor, second_server)
     finally:
-        modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
-        modal_cloud_module._PROMPT_EXECUTOR_STATES.update(original_states)
+        prompt_execution_owner._PROMPT_EXECUTOR_STATES.clear()
+        prompt_execution_owner._PROMPT_EXECUTOR_STATES.update(original_states)
 
     assert FakePromptExecutor.instances_created == 1
     assert first_state is second_state
@@ -15275,8 +15283,9 @@ def test_modal_cloud_separates_prompt_executor_cache_scopes_by_custom_nodes_root
 
     fake_execution_module = types.SimpleNamespace(PromptExecutor=FakePromptExecutor)
 
-    original_states = dict(modal_cloud_module._PROMPT_EXECUTOR_STATES)
-    modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
+    prompt_execution_owner = _cloud_prompt_execution_owner()
+    original_states = dict(prompt_execution_owner._PROMPT_EXECUTOR_STATES)
+    prompt_execution_owner._PROMPT_EXECUTOR_STATES.clear()
     try:
         first_state = modal_cloud_module._get_or_create_prompt_executor_state(
             execution=fake_execution_module,
@@ -15293,8 +15302,8 @@ def test_modal_cloud_separates_prompt_executor_cache_scopes_by_custom_nodes_root
             custom_nodes_root=tmp_path / "bundle-b",
         )
     finally:
-        modal_cloud_module._PROMPT_EXECUTOR_STATES.clear()
-        modal_cloud_module._PROMPT_EXECUTOR_STATES.update(original_states)
+        prompt_execution_owner._PROMPT_EXECUTOR_STATES.clear()
+        prompt_execution_owner._PROMPT_EXECUTOR_STATES.update(original_states)
 
     assert FakePromptExecutor.instances_created == 2
     assert first_state is not second_state

@@ -14,6 +14,7 @@
 !/cloud_durable_invocation.py
 !/cloud_image_env.py
 !/cloud_node_output_cache.py
+!/cloud_prompt_execution.py
 !/cloud_prompt_server_shims.py
 !/cloud_runtime_context.py
 !/cloud_session_bridge.py
