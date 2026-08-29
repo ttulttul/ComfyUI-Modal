@@ -60,6 +60,7 @@
 /docs/*
 !/docs/LEARNINGS.md
 !/docs/MODAL_LLM.md
+!/docs/REFACTOR_PLAN.md
 
 !/remote/
 /remote/*
