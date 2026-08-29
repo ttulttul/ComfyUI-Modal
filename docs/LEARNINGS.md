@@ -707,3 +707,7 @@ Saved workflows may nest reusable subgraph definitions while queued prompt nodes
 ## Stream forwarding and interrupt state need distinct patch owners
 
 Host-side Modal invocation coordinates two independent stateful concerns: `remote/modal_interrupts.py` owns prompt-scoped cancellation registries and shared interrupt-store access, while `remote/payload_stream.py` owns conversion of remote progress, preview, log, and result events into local UI messages. Compatibility exports remain on `remote.modal_app`, but tests that replace internal callbacks must patch the owning module because the extracted functions resolve their collaborators there.
+
+## Test-file splits expose hidden ordering dependencies
+
+Splitting a monolithic integration suite changes collection order even when every test function is preserved exactly. Tests that install compatibility modules in `sys.modules` must restore the previous binding, and cancellation tests that strand intentionally blocked calls in a shared executor must release those calls during cleanup. The old function order can otherwise conceal leaked process state until the tests are grouped by their production owners.
