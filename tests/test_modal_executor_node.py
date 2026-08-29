@@ -63,6 +63,11 @@ def _cloud_comfy_bootstrap_owner() -> Any:
     return importlib.import_module("cloud_comfy_bootstrap")
 
 
+def _cloud_node_output_cache_owner() -> Any:
+    """Return the module that owns persisted cloud node-output cache behavior."""
+    return importlib.import_module("cloud_node_output_cache")
+
+
 def _patch_cloud_storage_root(
     monkeypatch: pytest.MonkeyPatch,
     modal_cloud_module: Any,
@@ -4988,14 +4993,14 @@ def test_modal_cloud_node_cache_key_rebuilds_input_signature_before_unhashable_c
     )
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_load_nodes_module",
         lambda: types.SimpleNamespace(
             NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
         ),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_include_unique_id_in_input_signature",
         lambda class_type: False,
     )
@@ -5083,14 +5088,14 @@ def test_modal_cloud_node_cache_key_uses_boundary_source_signature_for_unhashabl
     )
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_load_nodes_module",
         lambda: types.SimpleNamespace(
             NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
         ),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_include_unique_id_in_input_signature",
         lambda class_type: False,
     )
@@ -5171,14 +5176,14 @@ def test_modal_cloud_node_cache_key_includes_remote_session_bridge_key(
         return prompt
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_load_nodes_module",
         lambda: types.SimpleNamespace(
             NODE_CLASS_MAPPINGS={"FakeSampler": type("FakeSampler", (), {})}
         ),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_include_unique_id_in_input_signature",
         lambda class_type: False,
     )
@@ -5241,14 +5246,14 @@ def test_modal_cloud_node_cache_key_treats_nested_two_item_lists_as_data(
         get_data_key=lambda node_id: None,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_load_nodes_module",
         lambda: types.SimpleNamespace(
             NODE_CLASS_MAPPINGS={"AnythingToMarkdown": type("AnythingToMarkdown", (), {})}
         ),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_include_unique_id_in_input_signature",
         lambda class_type: False,
     )
@@ -15508,7 +15513,7 @@ def test_modal_cloud_installs_persisted_cache_restore_after_live_set_prompt(
         return ["12"]
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_restore_persisted_node_output_cache_entries_into_prepared_cache",
         fake_restore,
     )
@@ -15566,12 +15571,12 @@ def test_modal_cloud_skips_rewriting_restored_distributed_cache_entries(
     executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=FakeOutputsCache()))
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_node_output_cache_key_from_key_set_sync",
         lambda cache_key_set, node_id: cache_key if node_id == "node_1" else None,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_emit_cloud_info",
         lambda message, *args: observed_logs.append((message, *args)),
     )
@@ -15616,12 +15621,12 @@ def test_modal_cloud_skips_restored_hit_before_cache_entry_serialization(
 
     executor = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=FakeOutputsCache()))
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_node_output_cache_key_from_key_set_sync",
         lambda cache_key_set, node_id: "NC_existing" if node_id == "node_1" else None,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_serialize_node_output_cache_entry",
         lambda cache_entry, max_bytes: (_ for _ in ()).throw(
             AssertionError("restored-hit should skip before serialization")
@@ -15681,21 +15686,23 @@ def test_modal_cloud_restores_persisted_node_cache_entries_in_parallel(
         return {"cache_key": cache_key}
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_node_output_cache_key_from_key_set_async",
         fake_key_from_key_set,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_node_output_cache_store_get",
         fake_store_get,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_deserialize_node_output_cache_entry",
         lambda execution, record: record,
     )
-    monkeypatch.setattr(modal_cloud_module, "_emit_cloud_info", lambda *args: None)
+    monkeypatch.setattr(
+        _cloud_node_output_cache_owner(), "_emit_cloud_info", lambda *args: None
+    )
 
     outputs_cache = FakeOutputsCache()
     restored_node_ids = asyncio.run(
@@ -15756,27 +15763,27 @@ def test_modal_cloud_skips_downstream_cache_hit_when_boundary_ancestor_is_missin
         return None
 
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_node_output_cache_key_from_key_set_async",
         fake_key_from_key_set,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_node_output_cache_store_get",
         fake_store_get,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_deserialize_node_output_cache_entry",
         lambda execution, record: record,
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_node_output_cache_ancestor_ids",
         lambda cache_key_set, node_id: {"14"} if node_id == "11" else set(),
     )
     monkeypatch.setattr(
-        modal_cloud_module,
+        _cloud_node_output_cache_owner(),
         "_emit_cloud_info",
         lambda message, *args: observed_logs.append((message, *args)),
     )
