@@ -1940,6 +1940,7 @@ def test_remote_modal_call_worker_count_honors_explicit_inflight_limit(
 
 def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Prompt-scoped proactive warmup should only schedule each target slot once."""
@@ -1955,11 +1956,12 @@ def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
-    monkeypatch.setattr(remote_modal_app_module, "_REMOTE_MODAL_WARMUP_EXECUTOR", FakeExecutor())
+    monkeypatch.setattr(modal_warmup_module, "modal", object())
+    monkeypatch.setattr(modal_warmup_module, "_REMOTE_MODAL_WARMUP_EXECUTOR", FakeExecutor())
     remote_modal_app_module.get_settings.cache_clear()
-    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
-        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
+    with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+        modal_warmup_module._PROMPT_WARMUP_STATES.clear()
+        modal_warmup_module._PROMPT_WARMUP_STATE_ORDER = None
 
     try:
         warmup_request = {"prompt_id": "prompt-1", "component_id": "component-1"}
@@ -1990,6 +1992,7 @@ def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
 
 def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A running component should schedule its next distinct affinity exactly once."""
@@ -2006,15 +2009,16 @@ def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "false")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_warmup_module, "modal", object())
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_warmup_module,
         "_REMOTE_MODAL_WARMUP_EXECUTOR",
         FakeExecutor(),
     )
     remote_modal_app_module.get_settings.cache_clear()
-    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
-        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
+    with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+        modal_warmup_module._PROMPT_WARMUP_STATES.clear()
+        modal_warmup_module._PROMPT_WARMUP_STATE_ORDER = None
 
     payload = {
         "prompt_id": "prompt-spec",
@@ -2040,11 +2044,11 @@ def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
     }
 
     try:
-        assert remote_modal_app_module._schedule_speculative_affinity_prewarm(
+        assert modal_warmup_module._schedule_speculative_affinity_prewarm(
             payload,
             reason="test_first_event",
         ) is True
-        assert remote_modal_app_module._schedule_speculative_affinity_prewarm(
+        assert modal_warmup_module._schedule_speculative_affinity_prewarm(
             payload,
             reason="test_duplicate_event",
         ) is False
@@ -2053,7 +2057,7 @@ def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
 
     assert len(submitted_tasks) == 1
     scheduled_function, scheduled_args = submitted_tasks[0]
-    assert scheduled_function is remote_modal_app_module._run_speculative_affinity_prewarm
+    assert scheduled_function is modal_warmup_module._run_speculative_affinity_prewarm
     assert scheduled_args[0] == "prompt-spec"
     scheduled_identity = json.loads(scheduled_args[1])
     assert scheduled_identity["affinity"] == "worker-pool:comfy:slot:0"
@@ -2067,6 +2071,7 @@ def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
 
 def test_speculative_affinity_prewarm_rejects_cross_provider_target(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """An SSH continuation must never stage its payload on a Modal worker."""
@@ -2081,7 +2086,7 @@ def test_speculative_affinity_prewarm_rejects_cross_provider_target(
             return Future()
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_warmup_module,
         "_REMOTE_MODAL_WARMUP_EXECUTOR",
         FakeExecutor(),
     )
@@ -2099,7 +2104,7 @@ def test_speculative_affinity_prewarm_rejects_cross_provider_target(
     }
 
     assert (
-        remote_modal_app_module._schedule_speculative_affinity_prewarm(
+        modal_warmup_module._schedule_speculative_affinity_prewarm(
             payload,
             reason="provider_boundary",
         )
@@ -2110,6 +2115,7 @@ def test_speculative_affinity_prewarm_rejects_cross_provider_target(
 
 def test_local_gap_keepalive_is_bounded_and_stopped_by_next_remote_component(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A completed producer should retain its slot only until downstream remote work starts."""
@@ -2126,14 +2132,15 @@ def test_local_gap_keepalive_is_bounded_and_stopped_by_next_remote_component(
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_warmup_module, "modal", object())
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_warmup_module,
         "_REMOTE_MODAL_KEEPALIVE_EXECUTOR",
         FakeExecutor(),
     )
     remote_modal_app_module.get_settings.cache_clear()
-    with remote_modal_app_module._LOCAL_GAP_KEEPALIVES_LOCK:
-        remote_modal_app_module._LOCAL_GAP_KEEPALIVES.clear()
+    with modal_warmup_module._LOCAL_GAP_KEEPALIVES_LOCK:
+        modal_warmup_module._LOCAL_GAP_KEEPALIVES.clear()
         producer_payload = {
             "prompt_id": "prompt-gap",
             "component_id": "component-a",
@@ -2150,36 +2157,37 @@ def test_local_gap_keepalive_is_bounded_and_stopped_by_next_remote_component(
     }
 
     try:
-        assert remote_modal_app_module._start_local_gap_keepalive(producer_payload) is True
+        assert modal_warmup_module._start_local_gap_keepalive(producer_payload) is True
         assert len(submitted_tasks) == 1
         _fn, args, _future = submitted_tasks[0]
         stop_event = args[1]
         assert args[2:] == (900.0, 15.0)
         assert stop_event.is_set() is False
 
-        assert remote_modal_app_module._stop_local_gap_keepalive(
+        assert modal_warmup_module._stop_local_gap_keepalive(
             consumer_payload,
             reason="test_next_component",
         ) is True
         assert stop_event.is_set() is True
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        with remote_modal_app_module._LOCAL_GAP_KEEPALIVES_LOCK:
-            remote_modal_app_module._LOCAL_GAP_KEEPALIVES.clear()
+        with modal_warmup_module._LOCAL_GAP_KEEPALIVES_LOCK:
+            modal_warmup_module._LOCAL_GAP_KEEPALIVES.clear()
 
 
 def test_await_prompt_warmup_slots_waits_for_inflight_futures(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
 ) -> None:
     """Mapped execution should be able to wait briefly for already scheduled warmup slots."""
     prompt_id = "prompt-head-start"
-    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
-        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
-        remote_modal_app_module._ensure_prompt_warmup_state(prompt_id)
+    with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+        modal_warmup_module._PROMPT_WARMUP_STATES.clear()
+        modal_warmup_module._PROMPT_WARMUP_STATE_ORDER = None
+        modal_warmup_module._ensure_prompt_warmup_state(prompt_id)
 
     future: Future[Any] = Future()
-    remote_modal_app_module._track_prompt_warmup_future(prompt_id, 0, future)
+    modal_warmup_module._track_prompt_warmup_future(prompt_id, 0, future)
 
     def complete_future() -> None:
         """Complete the synthetic warmup slot after a short delay."""
@@ -2189,7 +2197,7 @@ def test_await_prompt_warmup_slots_waits_for_inflight_futures(
     threading.Thread(target=complete_future, daemon=True).start()
 
     completed_count = asyncio.run(
-        remote_modal_app_module._await_prompt_warmup_slots(
+        modal_warmup_module._await_prompt_warmup_slots(
             prompt_id,
             [0],
             0.2,
@@ -2253,6 +2261,7 @@ def test_build_prompt_warmup_request_includes_root_loader_prewarm_plans(
 
 def test_build_prompt_warmup_request_registers_snapshot_profile_when_gpu_snapshots_enabled(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Warmup requests should register one snapshot profile for GPU-snapshot loader plans."""
@@ -2276,12 +2285,13 @@ def test_build_prompt_warmup_request_registers_snapshot_profile_when_gpu_snapsho
                 return snapshot_profiles
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
     try:
-        warmup_request = remote_modal_app_module._build_prompt_warmup_request(
+        warmup_request = modal_warmup_module._build_prompt_warmup_request(
             {
                 "prompt_id": "prompt-1",
                 "component_id": "component-1",
@@ -2299,7 +2309,7 @@ def test_build_prompt_warmup_request_registers_snapshot_profile_when_gpu_snapsho
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+        modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
     snapshot_profile_key = warmup_request["snapshot_profile_key"]
     assert snapshot_profile_key.startswith("loader-profile:")
@@ -2415,6 +2425,7 @@ def test_build_prompt_warmup_request_ignores_llm_outside_executable_closure(
 
 def test_dispatch_joins_matching_speculative_warmup(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A real dispatch should wait on the exact active speculative worker identity."""
@@ -2426,30 +2437,31 @@ def test_dispatch_joins_matching_speculative_warmup(
         "remote_worker_affinity_group": "llm",
     }
     future: Future[Any] = Future()
-    identity = remote_modal_app_module._speculative_warmup_identity(
+    identity = modal_warmup_module._speculative_warmup_identity(
         {**payload, "gpu_snapshot_variant": "direct"}
     )
-    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
-        state = remote_modal_app_module._ensure_prompt_warmup_state("prompt-join")
+    with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+        modal_warmup_module._PROMPT_WARMUP_STATES.clear()
+        state = modal_warmup_module._ensure_prompt_warmup_state("prompt-join")
         state.speculative_affinity_futures[identity] = future
 
     timer = threading.Timer(0.03, lambda: future.set_result({"ready": True}))
     timer.start()
     started_at = time.perf_counter()
     try:
-        remote_modal_app_module._await_matching_speculative_prewarm(payload, None)
+        modal_warmup_module._await_matching_speculative_prewarm(payload, None)
     finally:
         timer.join()
         remote_modal_app_module.get_settings.cache_clear()
-        with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-            remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+        with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+            modal_warmup_module._PROMPT_WARMUP_STATES.clear()
 
     assert time.perf_counter() - started_at >= 0.02
 
 
 def test_snapshot_policy_samples_both_variants_then_selects_faster(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Loader profiles should learn snapshot versus direct startup independently."""
@@ -2478,37 +2490,39 @@ def test_snapshot_policy_samples_both_variants_then_selects_faster(
                 return store
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
     try:
         snapshot_payload = {"snapshot_profile_key": profile_key}
-        assert remote_modal_app_module._select_gpu_snapshot_for_profile(
+        assert modal_warmup_module._select_gpu_snapshot_for_profile(
             snapshot_payload, profile_key
         ) is True
-        remote_modal_app_module._record_snapshot_warmup_measurement(
+        modal_warmup_module._record_snapshot_warmup_measurement(
             snapshot_payload, 80.0
         )
         direct_payload = {"snapshot_profile_key": profile_key}
-        assert remote_modal_app_module._select_gpu_snapshot_for_profile(
+        assert modal_warmup_module._select_gpu_snapshot_for_profile(
             direct_payload, profile_key
         ) is False
-        remote_modal_app_module._record_snapshot_warmup_measurement(
+        modal_warmup_module._record_snapshot_warmup_measurement(
             direct_payload, 50.0
         )
         selected_payload = {"snapshot_profile_key": profile_key}
-        assert remote_modal_app_module._select_gpu_snapshot_for_profile(
+        assert modal_warmup_module._select_gpu_snapshot_for_profile(
             selected_payload, profile_key
         ) is False
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+        modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
     assert store[profile_key]["snapshot_policy"]["selected_variant"] == "direct"
 
 
 def test_post_deploy_seed_registers_a_joinable_profile_future(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Automatic deployment should seed the current important profile before dispatch."""
@@ -2523,18 +2537,19 @@ def test_post_deploy_seed_registers_a_joinable_profile_future(
             return Future()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_warmup_module, "modal", object())
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_warmup_module,
         "_REMOTE_MODAL_WARMUP_EXECUTOR",
         FakeExecutor(),
     )
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "false")
     remote_modal_app_module.get_settings.cache_clear()
-    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+    with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+        modal_warmup_module._PROMPT_WARMUP_STATES.clear()
     try:
-        scheduled = remote_modal_app_module._schedule_post_deploy_runtime_seed(
+        scheduled = modal_warmup_module._schedule_post_deploy_runtime_seed(
             {
                 "prompt_id": "prompt-deploy",
                 "component_id": "llm-component",
@@ -2553,24 +2568,25 @@ def test_post_deploy_seed_registers_a_joinable_profile_future(
     assert scheduled is True
     assert len(submitted_tasks) == 1
     scheduled_function, scheduled_args = submitted_tasks[0]
-    assert scheduled_function is remote_modal_app_module._run_speculative_affinity_prewarm
+    assert scheduled_function is modal_warmup_module._run_speculative_affinity_prewarm
     assert scheduled_args[-1] == "post_deploy_runtime_seed"
-    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-        state = remote_modal_app_module._PROMPT_WARMUP_STATES["prompt-deploy"]
+    with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+        state = modal_warmup_module._PROMPT_WARMUP_STATES["prompt-deploy"]
         assert len(state.speculative_affinity_futures) == 1
-        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
+        modal_warmup_module._PROMPT_WARMUP_STATES.clear()
 
 
 def test_register_exact_component_parallelism_refines_prompt_target(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Mapped fan-out should raise the prompt-wide warmup target once exact item count is known."""
     monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "6")
     remote_modal_app_module.get_settings.cache_clear()
-    with remote_modal_app_module._PROMPT_WARMUP_STATES_LOCK:
-        remote_modal_app_module._PROMPT_WARMUP_STATES.clear()
-        remote_modal_app_module._PROMPT_WARMUP_STATE_ORDER = None
+    with modal_warmup_module._PROMPT_WARMUP_STATES_LOCK:
+        modal_warmup_module._PROMPT_WARMUP_STATES.clear()
+        modal_warmup_module._PROMPT_WARMUP_STATE_ORDER = None
 
     try:
         payload = {
@@ -2584,7 +2600,7 @@ def test_register_exact_component_parallelism_refines_prompt_target(
                 }
             },
         }
-        refined_target = remote_modal_app_module._register_exact_component_parallelism(payload, 5)
+        refined_target = modal_warmup_module._register_exact_component_parallelism(payload, 5)
     finally:
         remote_modal_app_module.get_settings.cache_clear()
 
@@ -6854,6 +6870,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_payload_i
 
 def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -6924,6 +6941,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
         modal_deployment_module,
@@ -6936,7 +6954,7 @@ def test_remote_modal_redeploys_when_deployed_handle_disappears_during_warmup(
     modal_deployment_module._MODAL_AUTO_DEPLOY_STATES.clear()
     modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
     try:
-        response = remote_modal_app_module._invoke_modal_warmup_blocking(
+        response = modal_warmup_module._invoke_modal_warmup_blocking(
             {"component_id": "component-1::warmup:0"},
         )
     finally:
@@ -7396,6 +7414,7 @@ def test_workflow_gpu_changes_expected_remote_runtime_fingerprint(
 
 def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -7481,6 +7500,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
             return nullcontext()
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setattr(
         modal_deployment_module,
@@ -7515,7 +7535,7 @@ def test_remote_modal_auto_deploy_is_shared_across_concurrent_first_run_callers(
             """Invoke the warmup path from one thread."""
             try:
                 warmup_response.append(
-                    remote_modal_app_module._invoke_modal_warmup_blocking(
+                    modal_warmup_module._invoke_modal_warmup_blocking(
                         {"component_id": "component-1", "prompt_id": "prompt-1"},
                     )
                 )
@@ -7718,6 +7738,7 @@ def test_local_gap_components_share_one_affinity_slot(
 
 def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu_snapshots(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -7755,10 +7776,11 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
     payload = {
         "component_id": "component-1",
         "subgraph_prompt": {
@@ -7772,7 +7794,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
         result = modal_deployment_module._lookup_deployed_remote_engine(payload)
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+        modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
     assert result["gpu_snapshot_enabled"] is True
     assert result["snapshot_profile_key"].startswith("loader-profile:")
@@ -7783,6 +7805,7 @@ def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu
 
 def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_when_possible(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -7820,14 +7843,15 @@ def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_w
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
-    expected_snapshot_profile_key = remote_modal_app_module._loader_snapshot_profile_key(
+    modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    expected_snapshot_profile_key = modal_warmup_module._loader_snapshot_profile_key(
         [
             {
-                "signature": remote_modal_app_module._loader_prewarm_plan_signature(
+                "signature": modal_warmup_module._loader_prewarm_plan_signature(
                     "UNETLoader",
                     {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
                 )
@@ -7848,7 +7872,7 @@ def test_lookup_deployed_remote_engine_stores_existing_snapshot_profile_record_w
         result = modal_deployment_module._lookup_deployed_remote_engine(payload)
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+        modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
     assert result["snapshot_profile_key"] == expected_snapshot_profile_key
     assert observed_kwargs == [result]
@@ -7930,6 +7954,7 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
 
 def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
     remote_modal_app_module: Any,
+    modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -7967,10 +7992,11 @@ def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
                 return build_remote_engine
 
     monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_warmup_module, "modal", FakeModal)
     monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
     monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "true")
     remote_modal_app_module.get_settings.cache_clear()
-    remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+    modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
     payload = {
         "component_id": "component-1__mapped",
         "subgraph_prompt": {
@@ -7991,7 +8017,7 @@ def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
         )
     finally:
         remote_modal_app_module.get_settings.cache_clear()
-        remote_modal_app_module._SNAPSHOT_PROFILE_RECORDS.clear()
+        modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
     assert first_result != second_result
     assert first_result["worker_affinity_key"] == "worker-pool:slot:0"
