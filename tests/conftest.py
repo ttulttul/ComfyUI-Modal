@@ -548,6 +548,13 @@ def modal_cloud_module() -> object:
     return importlib.import_module("comfyui_modal_sync_cloud")
 
 
+@pytest.fixture(scope="session")
+def cloud_app_guard_module(modal_cloud_module: object) -> object:
+    """Return the extracted cloud app-existence guard module."""
+    del modal_cloud_module
+    return importlib.import_module("cloud_app_guard")
+
+
 @pytest.fixture(autouse=True)
 def reset_modal_environment(
     monkeypatch: pytest.MonkeyPatch,

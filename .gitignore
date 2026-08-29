@@ -9,6 +9,7 @@
 !/__init__.py
 !/api_intercept.py
 !/cloudflare_oauth.py
+!/cloud_app_guard.py
 !/cloud_runtime_context.py
 !/comfyui_modal_sync_cloud.py
 !/component_planning.py

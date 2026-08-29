@@ -5639,6 +5639,7 @@ def test_modal_cloud_existing_app_guard_allows_missing_sdk_lookup(
 
 def test_modal_cloud_existing_app_guard_falls_back_to_cli_json(
     modal_cloud_module: Any,
+    cloud_app_guard_module: Any,
     monkeypatch: Any,
 ) -> None:
     """SDKs without a non-creating lookup should fall back to `modal app list --json`."""
@@ -5665,8 +5666,10 @@ def test_modal_cloud_existing_app_guard_falls_back_to_cli_json(
         observed_commands.append(command)
         return completed
 
-    monkeypatch.setattr(modal_cloud_module.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(modal_cloud_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        cloud_app_guard_module.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(cloud_app_guard_module.subprocess, "run", fake_run)
     fake_modal = types.SimpleNamespace(App=FakeApp, exception=types.SimpleNamespace(), is_local=lambda: True)
 
     with pytest.raises(modal_cloud_module.ExistingModalAppError):
