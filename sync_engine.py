@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
-import io
 import json
 import logging
 import os
 import threading
 import time
 import uuid
-import zipfile
-from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable
 
 if __package__:
+    from . import sync_backends as _sync_backends
     from .huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
     from .huggingface_discovery import HuggingFaceAssetDiscovery
     from .r2_cache import (
@@ -30,7 +26,48 @@ if __package__:
         R2WorkerPreflightRequest,
     )
     from .settings import ModalSyncSettings, get_settings
+    from .sync_backends import (
+        LocalFileSyncIndex,
+        LocalMirrorVolume,
+        ModalDictSyncIndex,
+        ModalVolumeBackend,
+        _ModalSdkCaller,
+        _modal_volume_worker_count,
+    )
+    from .sync_custom_nodes import CustomNodesSynchronizer, MODEL_FILE_EXTENSIONS
+    from .sync_hashing import SyncHasher, _SKIP_DIRS, _SKIP_FILE_SUFFIXES
+    from .sync_protocols import (
+        AssetSyncRequestCache,
+        CancellationCheck,
+        CancellableHuggingFaceMaterializingBackend,
+        CancellableR2WriteBackBackend,
+        CancellableVolumeBackend,
+        HuggingFaceMaterializingBackend,
+        R2MaterializingBackend,
+        R2WorkerPreflightBackend,
+        SyncCancelledError,
+        SyncIndexBackend,
+        SyncedAsset,
+        SyncStatusCallback,
+        VolumeBackend,
+        _ContentAddressedSyncResult,
+        _ContentAddressedSyncSpec,
+        _CustomNodeAssetSpec,
+        _CustomNodeAssetSyncResult,
+        _CustomNodesArchiveSpec,
+        _CustomNodesArchiveSyncResult,
+        _R2MaterializationOutcome,
+    )
+    from .sync_r2_transfer import (
+        R2TransferManager,
+        R2WriteBackCancelled,
+        R2WriteBackCoordinator,
+        _R2_WRITE_BACK_COORDINATOR,
+        begin_r2_writeback_prompt,
+        finish_r2_writeback_prompt,
+    )
 else:  # pragma: no cover - flat import inside the Modal container.
+    import sync_backends as _sync_backends
     from huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
     from huggingface_discovery import HuggingFaceAssetDiscovery
     from r2_cache import (
@@ -42,54 +79,49 @@ else:  # pragma: no cover - flat import inside the Modal container.
         R2WorkerPreflightRequest,
     )
     from settings import ModalSyncSettings, get_settings
+    from sync_backends import (
+        LocalFileSyncIndex,
+        LocalMirrorVolume,
+        ModalDictSyncIndex,
+        ModalVolumeBackend,
+        _ModalSdkCaller,
+        _modal_volume_worker_count,
+    )
+    from sync_custom_nodes import CustomNodesSynchronizer, MODEL_FILE_EXTENSIONS
+    from sync_hashing import SyncHasher, _SKIP_DIRS, _SKIP_FILE_SUFFIXES
+    from sync_protocols import (
+        AssetSyncRequestCache,
+        CancellationCheck,
+        CancellableHuggingFaceMaterializingBackend,
+        CancellableR2WriteBackBackend,
+        CancellableVolumeBackend,
+        HuggingFaceMaterializingBackend,
+        R2MaterializingBackend,
+        R2WorkerPreflightBackend,
+        SyncCancelledError,
+        SyncIndexBackend,
+        SyncedAsset,
+        SyncStatusCallback,
+        VolumeBackend,
+        _ContentAddressedSyncResult,
+        _ContentAddressedSyncSpec,
+        _CustomNodeAssetSpec,
+        _CustomNodeAssetSyncResult,
+        _CustomNodesArchiveSpec,
+        _CustomNodesArchiveSyncResult,
+        _R2MaterializationOutcome,
+    )
+    from sync_r2_transfer import (
+        R2TransferManager,
+        R2WriteBackCancelled,
+        R2WriteBackCoordinator,
+        _R2_WRITE_BACK_COORDINATOR,
+        begin_r2_writeback_prompt,
+        finish_r2_writeback_prompt,
+    )
 
 logger = logging.getLogger(__name__)
-SyncStatusCallback = Callable[[str, int | None, int | None], None]
-CancellationCheck = Callable[[], bool]
-
 _SYNC_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".gguf", ".pt", ".vae"})
-MODEL_FILE_EXTENSIONS = frozenset(
-    {
-        ".bin",
-        ".ckpt",
-        ".engine",
-        ".gguf",
-        ".onnx",
-        ".pt",
-        ".pth",
-        ".safetensors",
-        ".vae",
-    }
-)
-_SKIP_DIRS = {
-    ".git",
-    ".mypy_cache",
-    ".nox",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    ".venv",
-    "__pycache__",
-    "venv",
-}
-_SKIP_FILE_SUFFIXES = {
-    ".log",
-    ".pyc",
-    ".pyd",
-    ".pyo",
-    ".so",
-    ".swp",
-    ".tmp",
-}
-_CUSTOM_NODES_MANIFEST_VERSION = 2
-_CUSTOM_NODE_ASSET_SUFFIXES = MODEL_FILE_EXTENSIONS
-
-try:
-    import modal  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - exercised when Modal SDK is unavailable.
-    modal = None
-
-
 def resolve_model_path(
     value: str,
     *,
@@ -135,11 +167,6 @@ def _emit_sync_status(
     status_callback(message, current, total)
 
 
-def _never_cancel() -> bool:
-    """Return false for operations without a cooperative cancellation source."""
-    return False
-
-
 def _format_asset_upload_status(
     asset_name: str,
     *,
@@ -183,682 +210,6 @@ def _format_huggingface_discovery_status(
     return f"Identifying Hugging Face source for Vast.ai: {asset_name}"
 
 
-def _format_r2_download_status(
-    asset_name: str,
-    *,
-    item_index: int | None,
-    total_items: int | None,
-) -> str:
-    """Return one queue-time status for worker-side Cloudflare R2 acquisition."""
-    if item_index is not None and total_items is not None and total_items > 1:
-        return (
-            f"Downloading asset {item_index}/{total_items} from Cloudflare R2: "
-            f"{asset_name}"
-        )
-    return f"Downloading asset from Cloudflare R2: {asset_name}"
-
-
-class VolumeBackend(Protocol):
-    """Minimal storage interface needed by the sync engine."""
-
-    def exists(self, remote_path: str) -> bool:
-        """Return whether the remote path already exists."""
-
-    def put_file(self, local_path: Path, remote_path: str) -> None:
-        """Upload a local file into the remote storage backend."""
-
-    def put_bytes(self, payload: bytes, remote_path: str) -> None:
-        """Upload raw bytes into the remote storage backend."""
-
-
-@runtime_checkable
-class HuggingFaceMaterializingBackend(Protocol):
-    """Optional backend capability for direct verified Hugging Face acquisition."""
-
-    def materialize_huggingface_file(
-        self,
-        source: HuggingFaceAssetSource,
-        remote_path: str,
-        *,
-        token: str | None,
-    ) -> bool:
-        """Materialize one immutable file and report whether it succeeded."""
-
-
-@runtime_checkable
-class CancellableVolumeBackend(Protocol):
-    """Optional backend capability for interruptible file uploads."""
-
-    def put_file_cancellable(
-        self,
-        local_path: Path,
-        remote_path: str,
-        *,
-        cancellation_check: CancellationCheck,
-    ) -> None:
-        """Upload a file while cooperatively observing cancellation."""
-
-
-@runtime_checkable
-class CancellableHuggingFaceMaterializingBackend(Protocol):
-    """Optional backend capability for interruptible remote downloads."""
-
-    def materialize_huggingface_file_cancellable(
-        self,
-        source: HuggingFaceAssetSource,
-        remote_path: str,
-        *,
-        token: str | None,
-        cancellation_check: CancellationCheck,
-    ) -> bool:
-        """Materialize one immutable file while observing cancellation."""
-
-
-@runtime_checkable
-class R2MaterializingBackend(Protocol):
-    """Optional backend capability for signed R2 downloads and write-back."""
-
-    def materialize_r2_file(
-        self,
-        request: R2DownloadRequest,
-        remote_path: str,
-        *,
-        cancellation_check: CancellationCheck | None = None,
-    ) -> None:
-        """Download and verify one content-addressed R2 object."""
-
-    def upload_r2_file(
-        self,
-        plan: R2UploadPlan,
-        remote_path: str,
-    ) -> R2UploadResult:
-        """Upload one remote file through a controller-issued signed plan."""
-
-
-@runtime_checkable
-class CancellableR2WriteBackBackend(Protocol):
-    """Optional backend capability for preemptible background R2 uploads."""
-
-    def upload_r2_file_cancellable(
-        self,
-        plan: R2UploadPlan,
-        remote_path: str,
-        *,
-        cancellation_check: CancellationCheck,
-    ) -> R2UploadResult:
-        """Upload one remote file while yielding promptly to workflow activity."""
-
-
-@runtime_checkable
-class R2WorkerPreflightBackend(Protocol):
-    """Optional backend capability for testing effective worker-side R2 access."""
-
-    def preflight_r2_access(
-        self,
-        request: R2WorkerPreflightRequest,
-        *,
-        cancellation_check: CancellationCheck | None = None,
-    ) -> None:
-        """Verify one read-only presigned request from the worker environment."""
-
-
-class SyncCancelledError(RuntimeError):
-    """Raised when queue-time asset preparation is cancelled."""
-
-
-class SyncIndexBackend(Protocol):
-    """Minimal metadata index interface used to deduplicate deterministic uploads."""
-
-    def get(self, key: str) -> dict[str, Any] | None:
-        """Return one stored sync record when it exists."""
-
-    def put(self, key: str, value: dict[str, Any]) -> None:
-        """Persist one sync record under the provided key."""
-
-
-@dataclass(frozen=True)
-class SyncedAsset:
-    """Description of a local asset mirrored into the remote storage root."""
-
-    local_path: Path
-    remote_path: str
-    sha256: str
-    uploaded: bool
-
-
-@dataclass
-class AssetSyncRequestCache:
-    """Deduplicate asset hashing, index lookup, and upload within one queued prompt."""
-
-    planned_paths: tuple[Path, ...]
-    _assets_by_path: dict[Path, SyncedAsset] = field(default_factory=dict)
-    _positions_by_path: dict[Path, int] = field(init=False, default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Index stable request progress positions once."""
-        self._positions_by_path = {
-            path.resolve(): index
-            for index, path in enumerate(self.planned_paths, start=1)
-        }
-
-    def get(self, local_path: Path) -> SyncedAsset | None:
-        """Return a previously synced asset for this request when available."""
-        return self._assets_by_path.get(local_path.resolve())
-
-    def put(self, synced_asset: SyncedAsset) -> None:
-        """Remember one request-scoped sync result by its resolved local path."""
-        self._assets_by_path[synced_asset.local_path.resolve()] = synced_asset
-
-    def progress(self, local_path: Path) -> tuple[int, int]:
-        """Return the stable one-based progress position for a planned asset."""
-        resolved_path = local_path.resolve()
-        return self._positions_by_path[resolved_path], len(self.planned_paths)
-
-    def synced_assets(self) -> tuple[SyncedAsset, ...]:
-        """Return unique sync results in request planning order."""
-        return tuple(
-            self._assets_by_path[path.resolve()]
-            for path in self.planned_paths
-            if path.resolve() in self._assets_by_path
-        )
-
-
-@dataclass(frozen=True)
-class _CustomNodesArchiveSpec:
-    """Deterministic archive spec for one top-level custom_nodes payload slice."""
-
-    entry_name: str
-    display_name: str
-    source_description: str
-    files: tuple[Path, ...]
-    sha256: str
-
-
-@dataclass(frozen=True)
-class _CustomNodesArchiveSyncResult:
-    """Describe the sync result for one top-level custom_nodes archive."""
-
-    entry_name: str
-    display_name: str
-    sha256: str
-    remote_path: str
-    uploaded: bool
-
-
-@dataclass(frozen=True)
-class _CustomNodeAssetSpec:
-    """Describe one package-owned model asset excluded from a code archive."""
-
-    entry_name: str
-    local_path: Path
-    relative_path: str
-    sha256: str
-    size_bytes: int
-
-
-@dataclass(frozen=True)
-class _CustomNodeAssetSyncResult:
-    """Describe one content-addressed package asset and its upload result."""
-
-    entry_name: str
-    relative_path: str
-    sha256: str
-    size_bytes: int
-    remote_path: str
-    uploaded: bool
-
-
-@dataclass(frozen=True)
-class _ContentAddressedSyncResult:
-    """Describe the outcome of one content-addressed file sync decision."""
-
-    remote_path: str
-    uploaded: bool
-
-
-@dataclass(frozen=True)
-class _ContentAddressedSyncSpec:
-    """Collect one file's immutable identity, destination, and progress context."""
-
-    local_path: Path
-    remote_path: str
-    sha256: str
-    sync_key: str
-    source_description: str
-    status_callback: SyncStatusCallback | None
-    upload_status_message: str | None
-    status_current: int | None
-    status_total: int | None
-    huggingface_source: HuggingFaceAssetSource | None
-
-
-@dataclass(frozen=True)
-class _R2MaterializationOutcome:
-    """Return an optional hit and whether failed cached bytes need replacement."""
-
-    result: _ContentAddressedSyncResult | None
-    refresh_required: bool = False
-
-
-def _modal_volume_worker_count() -> int:
-    """Return the worker count used for local Modal volume SDK calls."""
-    return 4
-
-
-def _custom_nodes_sync_worker_count() -> int:
-    """Return the worker count used to package and upload per-package custom_nodes archives."""
-    return max(4, min(16, os.cpu_count() or 1))
-
-
-_MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=_modal_volume_worker_count())
-
-
-class R2WriteBackCancelled(RuntimeError):
-    """Signal that an idle write-back yielded to foreground workflow activity."""
-
-
-@dataclass(frozen=True)
-class _R2WriteBackJob:
-    """Describe one deduplicated best-effort cache population operation."""
-
-    key: tuple[str, ...]
-    callback: Callable[[CancellationCheck], None] = field(compare=False, repr=False)
-
-
-class R2WriteBackCoordinator:
-    """Run cache population only while no remote workflow is active."""
-
-    def __init__(self, *, max_workers: int = 2, max_pending_jobs: int = 1024) -> None:
-        """Start bounded daemon workers for opportunistic write-back jobs."""
-        if max_workers <= 0 or max_pending_jobs <= 0:
-            raise ValueError("R2 write-back coordinator bounds must be positive.")
-        self._condition = threading.Condition()
-        self._pending: OrderedDict[tuple[str, ...], _R2WriteBackJob] = OrderedDict()
-        self._known_keys: set[tuple[str, ...]] = set()
-        self._active_prompts: set[str] = set()
-        self._active_cancellations: set[threading.Event] = set()
-        self._active_jobs = 0
-        self._max_pending_jobs = max_pending_jobs
-        self._workers = tuple(
-            threading.Thread(
-                target=self._worker,
-                name=f"comfy-r2-writeback-{worker_index + 1}",
-                daemon=True,
-            )
-            for worker_index in range(max_workers)
-        )
-        for worker in self._workers:
-            worker.start()
-
-    def begin_prompt(self, prompt_id: str) -> None:
-        """Reserve foreground priority and preempt active cache transfers."""
-        normalized_prompt_id = str(prompt_id).strip()
-        if not normalized_prompt_id:
-            raise ValueError("R2 write-back prompt ID must not be empty.")
-        with self._condition:
-            self._active_prompts.add(normalized_prompt_id)
-            for cancellation in self._active_cancellations:
-                cancellation.set()
-            self._condition.notify_all()
-
-    def finish_prompt(self, prompt_id: str) -> None:
-        """Release one prompt reservation and wake idle cache workers."""
-        normalized_prompt_id = str(prompt_id).strip()
-        if not normalized_prompt_id:
-            return
-        with self._condition:
-            self._active_prompts.discard(normalized_prompt_id)
-            self._condition.notify_all()
-
-    def reset_prompt_reservations_for_tests(self) -> None:
-        """Clear synthetic prompt reservations left by isolated queue tests."""
-        with self._condition:
-            self._active_prompts.clear()
-            for cancellation in self._active_cancellations:
-                cancellation.set()
-            self._condition.notify_all()
-
-    def submit(
-        self,
-        key: tuple[str, ...],
-        callback: Callable[[CancellationCheck], None],
-    ) -> bool:
-        """Queue one deduplicated job without waiting for capacity or execution."""
-        if not key or any(not str(part) for part in key):
-            raise ValueError("R2 write-back job key must contain non-empty values.")
-        with self._condition:
-            if key in self._known_keys:
-                return False
-            if len(self._pending) >= self._max_pending_jobs:
-                logger.warning(
-                    "Dropping R2 write-back because the idle queue reached %d jobs key=%s.",
-                    self._max_pending_jobs,
-                    key[-1],
-                )
-                return False
-            job = _R2WriteBackJob(key=key, callback=callback)
-            self._pending[key] = job
-            self._known_keys.add(key)
-            self._condition.notify()
-            return True
-
-    def wait_for_idle(self, timeout_seconds: float | None = None) -> bool:
-        """Wait until pending and active jobs drain, primarily for tests and shutdown."""
-        deadline = (
-            None if timeout_seconds is None else time.monotonic() + timeout_seconds
-        )
-        with self._condition:
-            while self._pending or self._active_jobs:
-                if deadline is None:
-                    self._condition.wait()
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-    def _worker(self) -> None:
-        """Run queued jobs only during foreground-idle windows."""
-        while True:
-            with self._condition:
-                self._condition.wait_for(
-                    lambda: bool(self._pending) and not self._active_prompts
-                )
-                key, job = self._pending.popitem(last=False)
-                cancellation = threading.Event()
-                self._active_cancellations.add(cancellation)
-                self._active_jobs += 1
-            cancelled = False
-            try:
-                job.callback(cancellation.is_set)
-            except R2WriteBackCancelled:
-                cancelled = True
-            except (
-                AssertionError,
-                KeyError,
-                OSError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                logger.warning(
-                    "Unhandled R2 write-back job failure key=%s: %s",
-                    key[-1],
-                    exc,
-                )
-            finally:
-                with self._condition:
-                    self._active_cancellations.discard(cancellation)
-                    self._active_jobs -= 1
-                    if cancelled:
-                        self._pending.setdefault(key, job)
-                    else:
-                        self._known_keys.discard(key)
-                    self._condition.notify_all()
-
-
-_R2_WRITE_BACK_COORDINATOR = R2WriteBackCoordinator()
-
-
-def begin_r2_writeback_prompt(prompt_id: str) -> None:
-    """Pause opportunistic cache population for one foreground prompt."""
-    _R2_WRITE_BACK_COORDINATOR.begin_prompt(prompt_id)
-
-
-def finish_r2_writeback_prompt(prompt_id: str) -> None:
-    """Resume cache population after one foreground prompt leaves the queue."""
-    _R2_WRITE_BACK_COORDINATOR.finish_prompt(prompt_id)
-
-
-class _ModalSdkCaller:
-    """Shared retry and backoff helper for Modal SDK calls."""
-
-    def __init__(self, *, target_kind: str) -> None:
-        """Initialize shared retry bookkeeping for one Modal SDK target."""
-        self._target_kind = target_kind
-        self._rate_limit_lock = threading.Lock()
-        self._rate_limit_until_monotonic = 0.0
-        self._rate_limit_backoff_seconds = 0.0
-
-    def _resource_exhausted_error_types(self) -> tuple[type[BaseException], ...]:
-        """Return the Modal SDK exception types that indicate transient rate limiting."""
-        if modal is None:
-            return ()
-        exception_namespace = getattr(modal, "exception", None)
-        if exception_namespace is None:
-            return ()
-        error_type = getattr(exception_namespace, "ResourceExhaustedError", None)
-        if isinstance(error_type, type) and issubclass(error_type, BaseException):
-            return (error_type,)
-        return ()
-
-    def _wait_for_shared_rate_limit_backoff(self) -> None:
-        """Pause until the shared Modal backoff window expires."""
-        while True:
-            with self._rate_limit_lock:
-                remaining_seconds = self._rate_limit_until_monotonic - time.monotonic()
-            if remaining_seconds <= 0.0:
-                return
-            time.sleep(remaining_seconds)
-
-    def _record_shared_rate_limit_backoff(self) -> float:
-        """Increase and publish the shared Modal backoff window."""
-        with self._rate_limit_lock:
-            next_backoff_seconds = (
-                0.25
-                if self._rate_limit_backoff_seconds <= 0.0
-                else min(self._rate_limit_backoff_seconds * 2.0, 8.0)
-            )
-            self._rate_limit_backoff_seconds = next_backoff_seconds
-            self._rate_limit_until_monotonic = max(
-                self._rate_limit_until_monotonic,
-                time.monotonic() + next_backoff_seconds,
-            )
-            return next_backoff_seconds
-
-    def _clear_shared_rate_limit_backoff_if_expired(self) -> None:
-        """Reset the shared backoff after the cooldown window has fully elapsed."""
-        with self._rate_limit_lock:
-            if time.monotonic() >= self._rate_limit_until_monotonic:
-                self._rate_limit_backoff_seconds = 0.0
-                self._rate_limit_until_monotonic = 0.0
-
-    def _run_sdk_call(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
-        """Run one Modal SDK call with shared retry and backoff semantics."""
-        retryable_errors = self._resource_exhausted_error_types()
-        max_attempts = 5
-        for attempt_index in range(max_attempts):
-            self._wait_for_shared_rate_limit_backoff()
-            future = _MODAL_VOLUME_EXECUTOR.submit(callback, *args, **kwargs)
-            try:
-                result = future.result()
-                self._clear_shared_rate_limit_backoff_if_expired()
-                return result
-            except retryable_errors:
-                if attempt_index >= max_attempts - 1:
-                    raise
-                backoff_seconds = self._record_shared_rate_limit_backoff()
-                logger.warning(
-                    "Modal %s call %s hit rate limiting on attempt %d/%d; applying shared retry backoff of %.2fs.",
-                    self._target_kind,
-                    getattr(callback, "__name__", repr(callback)),
-                    attempt_index + 1,
-                    max_attempts,
-                    backoff_seconds,
-                )
-        raise RuntimeError("Modal SDK call retry loop exited unexpectedly.")
-
-
-class LocalMirrorVolume:
-    """Simple filesystem-backed volume used for tests and dry runs."""
-
-    def __init__(self, root: Path) -> None:
-        """Initialize the local mirror volume root."""
-        self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
-
-    def exists(self, remote_path: str) -> bool:
-        """Return whether a file already exists in the local mirror."""
-        return self._resolve(remote_path).exists()
-
-    def put_file(self, local_path: Path, remote_path: str) -> None:
-        """Copy a local file into the mirror volume."""
-        target = self._resolve(remote_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(local_path.read_bytes())
-
-    def put_bytes(self, payload: bytes, remote_path: str) -> None:
-        """Write bytes into the mirror volume."""
-        target = self._resolve(remote_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(payload)
-
-    def _resolve(self, remote_path: str) -> Path:
-        """Resolve a remote storage path relative to the mirror root."""
-        return self.root / remote_path.lstrip("/")
-
-
-class LocalFileSyncIndex:
-    """JSON-backed sync index used for local mirrors and tests."""
-
-    def __init__(self, root: Path) -> None:
-        """Initialize the on-disk metadata store."""
-        self._index_path = root / "metadata" / "sync_index.json"
-        self._lock = threading.Lock()
-        self._records = self._load_records()
-
-    def get(self, key: str) -> dict[str, Any] | None:
-        """Return one stored sync record when it exists."""
-        with self._lock:
-            payload = self._records.get(key)
-            return dict(payload) if isinstance(payload, dict) else None
-
-    def put(self, key: str, value: dict[str, Any]) -> None:
-        """Persist one sync record to the local metadata file."""
-        with self._lock:
-            self._records[key] = dict(value)
-            self._save_records()
-
-    def _load_records(self) -> dict[str, dict[str, Any]]:
-        """Load the persisted sync index when available."""
-        if not self._index_path.exists():
-            return {}
-        try:
-            payload = json.loads(self._index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.warning("Sync index at %s is unreadable; rebuilding it from scratch.", self._index_path)
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        return {
-            str(key): value
-            for key, value in payload.items()
-            if isinstance(value, dict)
-        }
-
-    def _save_records(self) -> None:
-        """Write the current sync index to disk."""
-        self._index_path.parent.mkdir(parents=True, exist_ok=True)
-        self._index_path.write_text(json.dumps(self._records, sort_keys=True), encoding="utf-8")
-
-
-class ModalDictSyncIndex(_ModalSdkCaller):
-    """Modal Dict-backed sync index for remote content-addressed uploads."""
-
-    def __init__(self, dict_name: str) -> None:
-        """Resolve a named Modal Dict lazily from the local SDK client."""
-        if modal is None:
-            raise RuntimeError("Modal SDK is required for ModalDictSyncIndex.")
-        super().__init__(target_kind="dict")
-        self._dict = modal.Dict.from_name(dict_name, create_if_missing=True)
-        self._missing = object()
-        self._cache: dict[str, object] = {}
-        self._cache_lock = threading.Lock()
-
-    def get(self, key: str) -> dict[str, Any] | None:
-        """Return one stored sync record when it exists."""
-        with self._cache_lock:
-            cached_value = self._cache.get(key, self._missing)
-        if cached_value is not self._missing:
-            return dict(cached_value) if isinstance(cached_value, dict) else None
-        payload = self._run_sdk_call(self._dict.get, key)
-        normalized_payload = dict(payload) if isinstance(payload, dict) else None
-        with self._cache_lock:
-            self._cache[key] = dict(normalized_payload) if normalized_payload is not None else None
-        return dict(normalized_payload) if normalized_payload is not None else None
-
-    def put(self, key: str, value: dict[str, Any]) -> None:
-        """Persist one sync record to the shared Modal Dict."""
-        normalized_value = dict(value)
-
-        def write_record() -> None:
-            self._dict[key] = normalized_value
-
-        self._run_sdk_call(write_record)
-        with self._cache_lock:
-            self._cache[key] = dict(normalized_value)
-
-
-class ModalVolumeBackend(_ModalSdkCaller):
-    """Modal Volume-backed storage for real remote execution."""
-
-    def __init__(self, volume_name: str) -> None:
-        """Resolve a named Modal volume lazily from the local SDK client."""
-        if modal is None:
-            raise RuntimeError("Modal SDK is required for ModalVolumeBackend.")
-        super().__init__(target_kind="volume")
-        self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
-        self._exists_cache: dict[str, bool] = {}
-        self._exists_cache_lock = threading.Lock()
-
-    def exists(self, remote_path: str) -> bool:
-        """Return whether a file already exists in the Modal volume."""
-        with self._exists_cache_lock:
-            cached_result = self._exists_cache.get(remote_path)
-        if cached_result is not None:
-            return cached_result
-        try:
-            exists = len(self._run_sdk_call(self._volume.listdir, remote_path, recursive=False)) > 0
-        except modal.exception.NotFoundError:
-            exists = False
-        with self._exists_cache_lock:
-            self._exists_cache[remote_path] = exists
-        return exists
-
-    def put_file(self, local_path: Path, remote_path: str) -> None:
-        """Upload a local file into the Modal volume."""
-        def upload() -> None:
-            with self._volume.batch_upload() as batch:
-                batch.put_file(local_path, remote_path)
-
-        try:
-            self._run_sdk_call(upload)
-        except FileExistsError:
-            logger.info(
-                "Treating Modal volume upload for %s as successful because the content-addressed path already exists.",
-                remote_path,
-            )
-        with self._exists_cache_lock:
-            self._exists_cache[remote_path] = True
-
-    def put_bytes(self, payload: bytes, remote_path: str) -> None:
-        """Upload bytes into the Modal volume."""
-        def upload() -> None:
-            with self._volume.batch_upload() as batch:
-                batch.put_file(io.BytesIO(payload), remote_path)
-
-        try:
-            self._run_sdk_call(upload)
-        except FileExistsError:
-            logger.info(
-                "Treating Modal volume byte upload for %s as successful because the content-addressed path already exists.",
-                remote_path,
-            )
-        with self._exists_cache_lock:
-            self._exists_cache[remote_path] = True
-
-
 @dataclass
 class ModalAssetSyncEngine:
     """Content-addressable storage sync engine for files and custom nodes."""
@@ -871,20 +222,49 @@ class ModalAssetSyncEngine:
     r2_cache: R2CacheClient | None = None
     cancellation_check: CancellationCheck | None = None
     r2_writeback_activity: Callable[[], AbstractContextManager[None]] | None = None
-    _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
+    _hasher: SyncHasher = field(init=False)
+    _custom_nodes: CustomNodesSynchronizer = field(init=False)
+    _r2_transfer: R2TransferManager = field(init=False)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
-    _hash_cache_dirty: bool = field(init=False, default=False)
     _sync_scope_prefix_cache: str | None = field(init=False, default=None)
     _sync_scope_prefix_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
-    _custom_nodes_sync_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
-    _custom_nodes_sync_checked: bool = field(init=False, default=False)
-    _custom_nodes_bundle_cache: SyncedAsset | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         """Load persistent metadata caches used to avoid repeated hashing work."""
         if self.sync_index is None:
             self.sync_index = LocalFileSyncIndex(self.settings.local_storage_root)
-        self._hash_cache = self._load_hash_cache()
+        self._hasher = SyncHasher(
+            settings=self.settings,
+            cancellation_check=self.cancellation_check,
+        )
+        self._custom_nodes = CustomNodesSynchronizer(self)
+        self._r2_transfer = R2TransferManager(
+            self,
+            volume=self.volume,
+            r2_cache=self.r2_cache,
+            cancellation_check=self.cancellation_check,
+            r2_writeback_activity=self.r2_writeback_activity,
+        )
+
+    def _hash_file(self, path: Path) -> str:
+        """Return the cached content digest for one file."""
+        return self._hasher._hash_file(path)
+
+    def _hash_directory(self, path: Path) -> str:
+        """Return the cached stable digest for one directory tree."""
+        return self._hasher._hash_directory(path)
+
+    def _hash_file_group(self, root: Path, files: list[Path]) -> str:
+        """Return a stable digest for a selected file group."""
+        return self._hasher._hash_file_group(root, files)
+
+    def _iter_files(self, path: Path) -> list[Path]:
+        """Return syncable files below a directory."""
+        return self._hasher._iter_files(path)
+
+    def _raise_if_cancelled(self) -> None:
+        """Raise when queue-time synchronization has been cancelled."""
+        self._hasher._raise_if_cancelled()
 
     def _destination_label(self) -> str:
         """Return a user-facing destination name for sync progress messages."""
@@ -899,53 +279,45 @@ class ModalAssetSyncEngine:
         *,
         status_callback: SyncStatusCallback | None = None,
     ) -> None:
-        """Fail before asset transfer when a worker cannot use configured R2 URLs."""
-        self._raise_if_cancelled()
-        if self.r2_cache is None or not isinstance(
-            self.volume,
-            R2WorkerPreflightBackend,
-        ):
-            return
-        destination = self._destination_label()
-        _emit_sync_status(
-            status_callback,
-            f"Checking Cloudflare R2 access from {destination}",
+        """Validate effective worker-side R2 access before transfer."""
+        self._r2_transfer.preflight_r2_access(status_callback=status_callback)
+
+    def _materialize_r2_source(
+        self,
+        spec: _ContentAddressedSyncSpec,
+        size_bytes: int,
+    ) -> _R2MaterializationOutcome:
+        """Delegate worker-side R2 read-through materialization."""
+        return self._r2_transfer._materialize_r2_source(spec, size_bytes)
+
+    def _schedule_r2_writeback(
+        self,
+        *,
+        sha256: str,
+        size_bytes: int,
+        remote_path: str,
+        force: bool = False,
+    ) -> None:
+        """Schedule one idle-gated R2 cache population job."""
+        self._r2_transfer._schedule_r2_writeback(
+            sha256=sha256,
+            size_bytes=size_bytes,
+            remote_path=remote_path,
+            force=force,
         )
-        try:
-            request = self.r2_cache.worker_preflight_request()
-        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            raise R2CacheError(
-                "Cloudflare R2 controller validation failed before the worker "
-                f"preflight: {exc}"
-            ) from exc
-        try:
-            self.volume.preflight_r2_access(
-                request,
-                cancellation_check=self.cancellation_check,
-            )
-        except InterruptedError as exc:
-            self._raise_if_cancelled()
-            raise R2CacheError(
-                f"Cloudflare R2 worker preflight was interrupted for {destination}."
-            ) from exc
-        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            diagnostic = str(exc)
-            hint = (
-                " Remove Client IP Address Filtering from the bucket-scoped R2 "
-                "API token; dynamic worker egress addresses cannot be reliably "
-                "allowlisted."
-                if "r2_code=AccessDenied" in diagnostic
-                else ""
-            )
-            raise R2CacheError(
-                f"Cloudflare R2 is reachable from the controller but not from "
-                f"{destination}.{hint} Safe worker diagnostic: {diagnostic}"
-            ) from exc
-        self._raise_if_cancelled()
-        logger.info(
-            "Validated Cloudflare R2 access from %s before asset transfer.",
-            destination,
-        )
+
+    def _r2_writeback_job_prefix(self) -> tuple[str, str, str]:
+        """Return the write-back deduplication namespace."""
+        return self._r2_transfer._r2_writeback_job_prefix()
+
+    def _r2_writeback_enabled(self) -> bool:
+        """Return whether R2 cache population is configured."""
+        return self._r2_transfer._r2_writeback_enabled()
+
+    def wait_for_r2_writebacks(self) -> None:
+        """Wait for this process's queued R2 write-backs to finish."""
+        self._r2_transfer.wait_for_r2_writebacks()
+
 
     @classmethod
     def from_environment(cls, settings: ModalSyncSettings | None = None) -> "ModalAssetSyncEngine":
@@ -953,7 +325,7 @@ class ModalAssetSyncEngine:
         resolved_settings = settings or get_settings()
         backend: VolumeBackend
         sync_index: SyncIndexBackend
-        if resolved_settings.execution_mode == "remote" and modal is not None:
+        if resolved_settings.execution_mode == "remote" and _sync_backends.modal is not None:
             logger.info(
                 "Using Modal volume backend %s and Modal sync index %s for remote asset sync.",
                 resolved_settings.volume_name,
@@ -962,7 +334,7 @@ class ModalAssetSyncEngine:
             backend = ModalVolumeBackend(resolved_settings.volume_name)
             sync_index = ModalDictSyncIndex(resolved_settings.sync_index_dict_name)
         else:
-            if resolved_settings.execution_mode == "remote" and modal is None:
+            if resolved_settings.execution_mode == "remote" and _sync_backends.modal is None:
                 logger.warning(
                     "Modal SDK is unavailable in remote execution mode; falling back to local mirror storage."
                 )
@@ -1092,33 +464,18 @@ class ModalAssetSyncEngine:
                 unique_paths.setdefault(local_path.resolve(), local_path.absolute())
         return AssetSyncRequestCache(planned_paths=tuple(unique_paths.values()))
 
+
+
+
+
     def sync_custom_nodes_directory(
         self,
         *,
         status_callback: SyncStatusCallback | None = None,
     ) -> SyncedAsset | None:
-        """Mirror custom_nodes once per ComfyUI process and reuse that result afterward."""
-        with self._custom_nodes_sync_lock:
-            if self._custom_nodes_sync_checked:
-                logger.info(
-                    "Skipping custom_nodes rescan because this ComfyUI process already resolved it once."
-                )
-                return self._clone_cached_custom_nodes_bundle()
-
-            bundle = self._sync_custom_nodes_directory_uncached(status_callback=status_callback)
-            self._custom_nodes_bundle_cache = bundle
-            self._custom_nodes_sync_checked = True
-            return bundle
-
-    def _clone_cached_custom_nodes_bundle(self) -> SyncedAsset | None:
-        """Return the cached custom_nodes sync result as a no-upload reuse decision."""
-        if self._custom_nodes_bundle_cache is None:
-            return None
-        return SyncedAsset(
-            local_path=self._custom_nodes_bundle_cache.local_path,
-            remote_path=self._custom_nodes_bundle_cache.remote_path,
-            sha256=self._custom_nodes_bundle_cache.sha256,
-            uploaded=False,
+        """Synchronize custom nodes through the dedicated collaborator."""
+        return self._custom_nodes.sync_custom_nodes_directory(
+            status_callback=status_callback
         )
 
     def _sync_custom_nodes_directory_uncached(
@@ -1128,164 +485,72 @@ class ModalAssetSyncEngine:
         revisit_indexed_for_r2: bool = False,
         writeback_cancellation_check: CancellationCheck | None = None,
     ) -> SyncedAsset | None:
-        """Mirror custom_nodes as a manifest plus per-package archives when available."""
-        if writeback_cancellation_check is not None and writeback_cancellation_check():
-            raise R2WriteBackCancelled("Custom-node R2 backfill yielded before scanning.")
-        custom_nodes_dir = self.settings.custom_nodes_dir
-        if custom_nodes_dir is None or not custom_nodes_dir.exists():
-            logger.info("No custom_nodes directory detected for mirroring.")
-            return None
-
-        sync_started_at = time.perf_counter()
-        logger.info("Hashing custom_nodes directory at %s", custom_nodes_dir)
-        directory_hash = self._hash_directory(custom_nodes_dir)
-        if writeback_cancellation_check is not None and writeback_cancellation_check():
-            raise R2WriteBackCancelled("Custom-node R2 backfill yielded after hashing.")
-        logger.info(
-            "Finished hashing custom_nodes directory in %.3fs with digest %s.",
-            time.perf_counter() - sync_started_at,
-            directory_hash,
-        )
-        manifest_sync_key = self._custom_nodes_manifest_sync_index_key(directory_hash)
-        manifest_record = self._lookup_sync_record(manifest_sync_key)
-        if manifest_record is not None and (
-            not self._r2_writeback_enabled() or not revisit_indexed_for_r2
-        ):
-            remote_path = str(manifest_record["remote_path"])
-            if self._r2_writeback_enabled():
-                self._schedule_custom_nodes_r2_backfill(directory_hash)
-            logger.info(
-                "Custom_nodes manifest already mirrored at %s after %.3fs total sync time.",
-                remote_path,
-                time.perf_counter() - sync_started_at,
-            )
-            return SyncedAsset(
-                local_path=custom_nodes_dir,
-                remote_path=remote_path,
-                sha256=directory_hash,
-                uploaded=False,
-            )
-        if manifest_record is not None:
-            logger.info(
-                "Revisiting indexed custom_nodes entries during idle time so R2 "
-                "write-back can backfill missing objects."
-            )
-        remote_path = self._custom_nodes_manifest_remote_path(directory_hash)
-
-        archive_specs, asset_specs = self._custom_nodes_bundle_specs(custom_nodes_dir)
-        if writeback_cancellation_check is not None and writeback_cancellation_check():
-            raise R2WriteBackCancelled("Custom-node R2 backfill yielded after planning.")
-        if not archive_specs:
-            logger.info("Custom_nodes directory %s contained no syncable files.", custom_nodes_dir)
-            return None
-
-        if any(
-            not self._cached_custom_nodes_archive_path(
-                archive_spec.entry_name,
-                archive_spec.sha256,
-            ).exists()
-            for archive_spec in archive_specs
-        ):
-            _emit_sync_status(
-                status_callback,
-                f"Packaging custom-node code for {self._destination_label()}",
-            )
-        _emit_sync_status(
-            status_callback,
-            f"Uploading custom-node code and assets to {self._destination_label()}",
+        """Delegate an uncached custom-node synchronization pass."""
+        return self._custom_nodes._sync_custom_nodes_directory_uncached(
+            status_callback=status_callback,
+            revisit_indexed_for_r2=revisit_indexed_for_r2,
+            writeback_cancellation_check=writeback_cancellation_check,
         )
 
-        archive_results = self._sync_custom_nodes_archives_parallel(
-            custom_nodes_dir=custom_nodes_dir,
-            archive_specs=archive_specs,
-        )
-        asset_results = self._sync_custom_node_assets_parallel(asset_specs)
-        if writeback_cancellation_check is not None and writeback_cancellation_check():
-            raise R2WriteBackCancelled("Custom-node R2 backfill yielded after packaging.")
-        uploaded = any(
-            result.uploaded for result in [*archive_results, *asset_results]
-        )
-        assets_by_entry: dict[str, list[dict[str, Any]]] = {}
-        for asset_result in asset_results:
-            assets_by_entry.setdefault(asset_result.entry_name, []).append(
-                {
-                    "relative_path": asset_result.relative_path,
-                    "sha256": asset_result.sha256,
-                    "size_bytes": asset_result.size_bytes,
-                    "remote_path": asset_result.remote_path,
-                }
-            )
-        manifest_entries = [
-            {
-                "entry_name": archive_result.entry_name,
-                "display_name": archive_result.display_name,
-                "sha256": archive_result.sha256,
-                "remote_path": archive_result.remote_path,
-                "assets": assets_by_entry.get(archive_result.entry_name, []),
-            }
-            for archive_result in archive_results
-        ]
+    def _custom_nodes_archive_specs(
+        self,
+        custom_nodes_dir: Path,
+    ) -> list[_CustomNodesArchiveSpec]:
+        """Return deterministic custom-node archive specifications."""
+        return self._custom_nodes._custom_nodes_archive_specs(custom_nodes_dir)
 
-        manifest_path = self._cached_custom_nodes_manifest_path(directory_hash)
-        if manifest_path.exists():
-            logger.info(
-                "Reusing cached custom_nodes manifest %s for digest %s.",
-                manifest_path,
-                directory_hash,
-            )
-        else:
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "version": _CUSTOM_NODES_MANIFEST_VERSION,
-                        "bundle_sha256": directory_hash,
-                        "entries": manifest_entries,
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-
-        manifest_sync_result = self._sync_content_addressed_file(
-            local_path=manifest_path,
-            remote_path=remote_path,
-            sha256=self._hash_file(manifest_path),
-            sync_key=manifest_sync_key,
-            source_description=str(custom_nodes_dir),
-            upload_status_message=(
-                f"Uploading custom-node manifest to {self._destination_label()}"
-            ),
-        )
-        uploaded = uploaded or manifest_sync_result.uploaded
-
-        logger.info(
-            "Finished custom_nodes sync to %s in %.3fs total.",
-            manifest_sync_result.remote_path,
-            time.perf_counter() - sync_started_at,
-        )
-        return SyncedAsset(
-            local_path=custom_nodes_dir,
-            remote_path=manifest_sync_result.remote_path,
-            sha256=directory_hash,
-            uploaded=uploaded,
+    def _cached_custom_nodes_archive_path(
+        self,
+        entry_name: str,
+        entry_hash: str,
+    ) -> Path:
+        """Return the cached archive path for one custom-node entry."""
+        return self._custom_nodes._cached_custom_nodes_archive_path(
+            entry_name,
+            entry_hash,
         )
 
-    def _schedule_custom_nodes_r2_backfill(self, directory_hash: str) -> None:
-        """Defer indexed custom-node traversal until foreground workflows are idle."""
-        if not self._r2_writeback_enabled():
-            return
-        job_key = (
-            *self._r2_writeback_job_prefix(),
-            "custom-nodes-backfill",
-            directory_hash,
+    def _custom_nodes_manifest_remote_path(self, directory_hash: str) -> str:
+        """Return the remote custom-node manifest path."""
+        return self._custom_nodes._custom_nodes_manifest_remote_path(directory_hash)
+
+    def _custom_nodes_manifest_sync_index_key(self, directory_hash: str) -> str:
+        """Return the scoped custom-node manifest index key."""
+        return self._custom_nodes._custom_nodes_manifest_sync_index_key(directory_hash)
+
+    def _custom_nodes_archive_remote_path(
+        self,
+        entry_name: str,
+        entry_hash: str,
+    ) -> str:
+        """Return the remote path for one custom-node archive."""
+        return self._custom_nodes._custom_nodes_archive_remote_path(
+            entry_name,
+            entry_hash,
         )
-        _R2_WRITE_BACK_COORDINATOR.submit(
-            job_key,
-            lambda cancellation_check: self._sync_custom_nodes_directory_uncached(
-                revisit_indexed_for_r2=True,
-                writeback_cancellation_check=cancellation_check,
-            ),
+
+    def _create_archive_from_files(
+        self,
+        root_path: Path,
+        files: list[Path],
+        archive_path: Path,
+    ) -> Path:
+        """Create one deterministic custom-node archive."""
+        return self._custom_nodes._create_archive_from_files(
+            root_path,
+            files,
+            archive_path,
+        )
+
+    def _sync_custom_nodes_archive_spec(
+        self,
+        custom_nodes_dir: Path,
+        spec: _CustomNodesArchiveSpec,
+    ) -> _CustomNodesArchiveSyncResult:
+        """Synchronize one custom-node archive specification."""
+        return self._custom_nodes._sync_custom_nodes_archive_spec(
+            custom_nodes_dir,
+            spec,
         )
 
     def _sync_content_addressed_file(
@@ -1437,63 +702,6 @@ class ModalAssetSyncEngine:
         except InterruptedError as exc:
             raise SyncCancelledError("Remote workflow preparation was cancelled.") from exc
 
-    def _materialize_r2_source(
-        self,
-        spec: _ContentAddressedSyncSpec,
-        size_bytes: int,
-    ) -> _R2MaterializationOutcome:
-        """Try one signed worker-side R2 download and preserve upload fallback."""
-        if self.r2_cache is None or not isinstance(self.volume, R2MaterializingBackend):
-            return _R2MaterializationOutcome(result=None)
-        request: R2DownloadRequest | None = None
-        try:
-            request = self.r2_cache.download_request(spec.sha256, size_bytes)
-            if request is None:
-                return _R2MaterializationOutcome(result=None)
-            _emit_sync_status(
-                spec.status_callback,
-                _format_r2_download_status(
-                    spec.local_path.name,
-                    item_index=spec.status_current,
-                    total_items=spec.status_total,
-                ),
-                spec.status_current,
-                spec.status_total,
-            )
-            self.volume.materialize_r2_file(
-                request,
-                spec.remote_path,
-                cancellation_check=self.cancellation_check,
-            )
-        except InterruptedError as exc:
-            raise SyncCancelledError("Remote workflow preparation was cancelled.") from exc
-        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            logger.warning(
-                "Cloudflare R2 materialization failed for SHA-256 %s; "
-                "falling back to the existing upload path: %s",
-                spec.sha256,
-                exc,
-            )
-            return _R2MaterializationOutcome(
-                result=None,
-                refresh_required=request is not None,
-            )
-        self._store_sync_record(
-            sync_key=spec.sync_key,
-            remote_path=spec.remote_path,
-            source_description=f"Cloudflare R2 SHA-256 {spec.sha256}",
-        )
-        logger.info(
-            "Materialized SHA-256 %s from Cloudflare R2 at %s.",
-            spec.sha256,
-            spec.remote_path,
-        )
-        return _R2MaterializationOutcome(
-            result=_ContentAddressedSyncResult(
-                remote_path=spec.remote_path,
-                uploaded=True,
-            )
-        )
 
     def _upload_content_addressed_file(
         self,
@@ -1542,119 +750,10 @@ class ModalAssetSyncEngine:
         )
         return _ContentAddressedSyncResult(remote_path=spec.remote_path, uploaded=True)
 
-    def _schedule_r2_writeback(
-        self,
-        *,
-        sha256: str,
-        size_bytes: int,
-        remote_path: str,
-        force: bool = False,
-    ) -> None:
-        """Queue one best-effort R2 write without delaying foreground progress."""
-        if not self._r2_writeback_enabled():
-            return
-        assert self.r2_cache is not None
-        job_key = (
-            *self._r2_writeback_job_prefix(),
-            sha256,
-            str(size_bytes),
-            remote_path,
-            "force" if force else "normal",
-        )
-        _R2_WRITE_BACK_COORDINATOR.submit(
-            job_key,
-            lambda cancellation_check: self._write_back_r2_file(
-                sha256,
-                size_bytes,
-                remote_path,
-                force,
-                cancellation_check=cancellation_check,
-            ),
-        )
 
-    def _r2_writeback_job_prefix(self) -> tuple[str, str, str]:
-        """Return a stable cache namespace used to deduplicate background jobs."""
-        if self.r2_cache is None:
-            raise RuntimeError("R2 write-back job requested without an R2 cache.")
-        configuration = getattr(self.r2_cache, "configuration", None)
-        if configuration is not None:
-            return (
-                str(configuration.endpoint_url),
-                str(configuration.bucket),
-                str(configuration.key_prefix),
-            )
-        return (
-            type(self.r2_cache).__module__,
-            type(self.r2_cache).__qualname__,
-            str(id(self.r2_cache)),
-        )
 
-    def _r2_writeback_enabled(self) -> bool:
-        """Return whether this engine can populate its configured R2 cache."""
-        return bool(
-            self.r2_cache is not None
-            and self.r2_cache.write_back_mode != "off"
-            and isinstance(self.volume, R2MaterializingBackend)
-        )
 
-    def _write_back_r2_file(
-        self,
-        sha256: str,
-        size_bytes: int,
-        remote_path: str,
-        force: bool = False,
-        *,
-        cancellation_check: CancellationCheck = _never_cancel,
-    ) -> None:
-        """Upload one worker-resident file to R2 without exposing permanent keys."""
-        if self.r2_cache is None or not isinstance(
-            self.volume,
-            R2MaterializingBackend,
-        ):
-            return
-        plan: R2UploadPlan | None = None
-        try:
-            if cancellation_check():
-                raise R2WriteBackCancelled("R2 write-back yielded before activity.")
-            activity = (
-                self.r2_writeback_activity()
-                if self.r2_writeback_activity is not None
-                else nullcontext()
-            )
-            with activity:
-                if cancellation_check():
-                    raise R2WriteBackCancelled("R2 write-back yielded before signing.")
-                plan = self.r2_cache.prepare_upload(sha256, size_bytes, force=force)
-                if plan is None:
-                    return
-                if cancellation_check():
-                    raise R2WriteBackCancelled("R2 write-back yielded after signing.")
-                if isinstance(self.volume, CancellableR2WriteBackBackend):
-                    result = self.volume.upload_r2_file_cancellable(
-                        plan,
-                        remote_path,
-                        cancellation_check=cancellation_check,
-                    )
-                else:
-                    result = self.volume.upload_r2_file(plan, remote_path)
-                if cancellation_check():
-                    raise R2WriteBackCancelled(
-                        "R2 write-back yielded before completion."
-                    )
-                self.r2_cache.complete_upload(plan, result)
-                logger.info("Wrote SHA-256 %s back to Cloudflare R2.", sha256)
-        except (InterruptedError, R2WriteBackCancelled) as exc:
-            if plan is not None:
-                self.r2_cache.abort_upload(plan)
-            raise R2WriteBackCancelled(str(exc)) from exc
-        except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            if plan is not None:
-                self.r2_cache.abort_upload(plan)
-            logger.warning("Cloudflare R2 write-back failed for SHA-256 %s: %s", sha256, exc)
 
-    def wait_for_r2_writebacks(self) -> None:
-        """Wait for this engine's currently scheduled R2 writes to finish."""
-        _R2_WRITE_BACK_COORDINATOR.wait_for_idle()
 
     def _huggingface_source_for_asset(
         self,
@@ -1702,134 +801,9 @@ class ModalAssetSyncEngine:
             return None
         return source
 
-    def _sync_custom_nodes_archives_parallel(
-        self,
-        *,
-        custom_nodes_dir: Path,
-        archive_specs: list[_CustomNodesArchiveSpec],
-    ) -> list[_CustomNodesArchiveSyncResult]:
-        """Build and upload per-package custom_nodes archives in parallel."""
-        max_workers = min(len(archive_specs), _custom_nodes_sync_worker_count())
-        if max_workers <= 1:
-            return [
-                self._sync_custom_nodes_archive_spec(custom_nodes_dir, archive_spec)
-                for archive_spec in archive_specs
-            ]
 
-        results_by_entry_name: dict[str, _CustomNodesArchiveSyncResult] = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures_by_entry_name: dict[str, Future[_CustomNodesArchiveSyncResult]] = {
-                archive_spec.entry_name: executor.submit(
-                    self._sync_custom_nodes_archive_spec,
-                    custom_nodes_dir,
-                    archive_spec,
-                )
-                for archive_spec in archive_specs
-            }
-            for entry_name, future in futures_by_entry_name.items():
-                results_by_entry_name[entry_name] = future.result()
-        return [
-            results_by_entry_name[archive_spec.entry_name]
-            for archive_spec in archive_specs
-        ]
 
-    def _sync_custom_nodes_archive_spec(
-        self,
-        custom_nodes_dir: Path,
-        archive_spec: _CustomNodesArchiveSpec,
-    ) -> _CustomNodesArchiveSyncResult:
-        """Build and upload one per-package custom_nodes archive."""
-        archive_path = self._cached_custom_nodes_archive_path(
-            archive_spec.entry_name,
-            archive_spec.sha256,
-        )
-        archive_remote_path = self._custom_nodes_archive_remote_path(
-            archive_spec.entry_name,
-            archive_spec.sha256,
-        )
-        if archive_path.exists():
-            logger.info(
-                "Reusing cached custom_nodes archive %s for entry=%s digest=%s.",
-                archive_path,
-                archive_spec.display_name,
-                archive_spec.sha256,
-            )
-        else:
-            archive_started_at = time.perf_counter()
-            logger.info(
-                "Creating custom_nodes archive for entry=%s from %d files.",
-                archive_spec.display_name,
-                len(archive_spec.files),
-            )
-            self._create_archive_from_files(
-                custom_nodes_dir,
-                list(archive_spec.files),
-                archive_path,
-            )
-            logger.info(
-                "Created custom_nodes archive %s for entry=%s in %.3fs.",
-                archive_path,
-                archive_spec.display_name,
-                time.perf_counter() - archive_started_at,
-            )
 
-        archive_sha256 = self._hash_file(archive_path)
-        entry_uploaded = self._sync_content_addressed_file(
-            local_path=archive_path,
-            remote_path=archive_remote_path,
-            sha256=archive_sha256,
-            sync_key=self._custom_nodes_entry_sync_index_key(
-                archive_spec.entry_name,
-                archive_spec.sha256,
-            ),
-            source_description=archive_spec.source_description,
-        )
-        return _CustomNodesArchiveSyncResult(
-            entry_name=archive_spec.entry_name,
-            display_name=archive_spec.display_name,
-            sha256=archive_sha256,
-            remote_path=entry_uploaded.remote_path,
-            uploaded=entry_uploaded.uploaded,
-        )
-
-    def _sync_custom_node_assets_parallel(
-        self,
-        asset_specs: list[_CustomNodeAssetSpec],
-    ) -> list[_CustomNodeAssetSyncResult]:
-        """Upload package-owned model assets without embedding them in code ZIPs."""
-        if not asset_specs:
-            return []
-        max_workers = min(len(asset_specs), _modal_volume_worker_count())
-        if max_workers <= 1:
-            return [self._sync_custom_node_asset_spec(spec) for spec in asset_specs]
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(self._sync_custom_node_asset_spec, spec)
-                for spec in asset_specs
-            ]
-            return [future.result() for future in futures]
-
-    def _sync_custom_node_asset_spec(
-        self,
-        asset_spec: _CustomNodeAssetSpec,
-    ) -> _CustomNodeAssetSyncResult:
-        """Upload one package-owned model asset to its content-addressed path."""
-        remote_path = self._custom_nodes_asset_remote_path(asset_spec)
-        sync_result = self._sync_content_addressed_file(
-            local_path=asset_spec.local_path,
-            remote_path=remote_path,
-            sha256=asset_spec.sha256,
-            sync_key=self._custom_nodes_asset_sync_index_key(asset_spec.sha256),
-            source_description=str(asset_spec.local_path),
-        )
-        return _CustomNodeAssetSyncResult(
-            entry_name=asset_spec.entry_name,
-            relative_path=asset_spec.relative_path,
-            sha256=asset_spec.sha256,
-            size_bytes=asset_spec.size_bytes,
-            remote_path=sync_result.remote_path,
-            uploaded=sync_result.uploaded,
-        )
 
     def _lookup_sync_record(self, sync_key: str) -> dict[str, Any] | None:
         """Return one normalized sync-index record when the key is present."""
@@ -1864,23 +838,8 @@ class ModalAssetSyncEngine:
         """Return the sync-index key for one content-addressed asset digest."""
         return f"{self._sync_index_scope_prefix()}:asset:{sha256}"
 
-    def _custom_nodes_manifest_sync_index_key(self, directory_hash: str) -> str:
-        """Return the sync-index key for one whole-tree custom_nodes manifest digest."""
-        return (
-            f"{self._sync_index_scope_prefix()}:custom_nodes_manifest:"
-            f"v{_CUSTOM_NODES_MANIFEST_VERSION}:{directory_hash}"
-        )
 
-    def _custom_nodes_entry_sync_index_key(self, entry_name: str, entry_hash: str) -> str:
-        """Return the sync-index key for one top-level custom_nodes entry archive digest."""
-        return (
-            f"{self._sync_index_scope_prefix()}:custom_nodes_entry:"
-            f"{self._custom_nodes_entry_slug(entry_name)}:{entry_hash}"
-        )
 
-    def _custom_nodes_asset_sync_index_key(self, asset_hash: str) -> str:
-        """Return the sync-index key for one package-owned model asset digest."""
-        return f"{self._sync_index_scope_prefix()}:custom_nodes_asset:{asset_hash}"
 
     def _sync_index_scope_prefix(self) -> str:
         """Return the active sync-index scope prefix for this storage backend."""
@@ -1985,330 +944,3 @@ class ModalAssetSyncEngine:
 
         visit(value)
         return collected_paths
-
-    def _hash_file(self, path: Path) -> str:
-        """Compute the SHA256 digest for a file."""
-        self._raise_if_cancelled()
-        resolved_path = path.resolve()
-        stat_result = resolved_path.stat()
-        cache_key = str(resolved_path)
-        cache_entry = self._hash_cache.get(cache_key)
-        if (
-            cache_entry is not None
-            and cache_entry.get("kind") == "file"
-            and cache_entry.get("size") == stat_result.st_size
-            and cache_entry.get("mtime_ns") == stat_result.st_mtime_ns
-        ):
-            return str(cache_entry["sha256"])
-
-        digest = hashlib.sha256()
-        with resolved_path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                self._raise_if_cancelled()
-                digest.update(chunk)
-        sha256 = digest.hexdigest()
-        self._hash_cache[cache_key] = {
-            "kind": "file",
-            "size": stat_result.st_size,
-            "mtime_ns": stat_result.st_mtime_ns,
-            "sha256": sha256,
-        }
-        self._mark_hash_cache_dirty()
-        return sha256
-
-    def _raise_if_cancelled(self) -> None:
-        """Abort queue-time synchronization when its prompt was cancelled."""
-        if self.cancellation_check is not None and self.cancellation_check():
-            raise SyncCancelledError("Remote workflow preparation was cancelled.")
-
-    def _hash_directory(self, path: Path) -> str:
-        """Compute a stable SHA256 digest for a directory tree."""
-        hash_started_at = time.perf_counter()
-        resolved_path = path.resolve()
-        digest = hashlib.sha256()
-        files = sorted(self._iter_files(resolved_path), key=lambda item: item.relative_to(resolved_path).as_posix())
-        logger.info("Hashing %d files under %s", len(files), resolved_path)
-        fingerprint = self._directory_fingerprint(resolved_path, files)
-        cache_key = f"dir::{resolved_path}"
-        cache_entry = self._hash_cache.get(cache_key)
-        if (
-            cache_entry is not None
-            and cache_entry.get("kind") == "dir"
-            and cache_entry.get("fingerprint") == fingerprint
-        ):
-            logger.info(
-                "Reused cached directory hash for %s over %d files in %.3fs.",
-                resolved_path,
-                len(files),
-                time.perf_counter() - hash_started_at,
-            )
-            return str(cache_entry["sha256"])
-
-        for child in files:
-            relative_path = child.relative_to(resolved_path).as_posix()
-            digest.update(relative_path.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(self._hash_file(child).encode("ascii"))
-            digest.update(b"\0")
-        sha256 = digest.hexdigest()
-        self._hash_cache[cache_key] = {
-            "kind": "dir",
-            "fingerprint": fingerprint,
-            "sha256": sha256,
-        }
-        self._mark_hash_cache_dirty()
-        logger.info(
-            "Computed directory hash for %s over %d files in %.3fs.",
-            resolved_path,
-            len(files),
-            time.perf_counter() - hash_started_at,
-        )
-        return sha256
-
-    def _hash_file_group(self, root: Path, files: list[Path]) -> str:
-        """Compute a stable digest for a selected file subset rooted under one directory."""
-        digest = hashlib.sha256()
-        for child in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
-            relative_path = child.relative_to(root).as_posix()
-            digest.update(relative_path.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(self._hash_file(child).encode("ascii"))
-            digest.update(b"\0")
-        return digest.hexdigest()
-
-    def _create_archive(self, path: Path, archive_path: Path) -> Path:
-        """Create a zip archive for the given directory tree."""
-        files = sorted(self._iter_files(path), key=lambda item: item.relative_to(path).as_posix())
-        return self._create_archive_from_files(path, files, archive_path)
-
-    def _create_archive_from_files(
-        self,
-        root_path: Path,
-        files: list[Path],
-        archive_path: Path,
-    ) -> Path:
-        """Create a zip archive from a selected file list rooted under one directory."""
-        archive_started_at = time.perf_counter()
-        archive_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Archiving %d files from %s into %s", len(files), root_path, archive_path)
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for child in sorted(files, key=lambda item: item.relative_to(root_path).as_posix()):
-                archive.write(child, arcname=child.relative_to(root_path))
-
-        logger.info(
-            "Finished archive build for %s in %.3fs.",
-            root_path,
-            time.perf_counter() - archive_started_at,
-        )
-        return archive_path
-
-    def _cached_custom_nodes_archive_path(self, entry_name: str, entry_hash: str) -> Path:
-        """Return the deterministic local path for one digest-keyed custom_nodes slice archive."""
-        return (
-            self.settings.local_storage_root
-            / "custom_nodes_archives"
-            / self._custom_nodes_entry_slug(entry_name)
-            / f"{entry_hash}_{self.settings.custom_nodes_archive_name}"
-        )
-
-    def _cached_custom_nodes_manifest_path(self, directory_hash: str) -> Path:
-        """Return the deterministic local path for a whole-tree custom_nodes manifest."""
-        return (
-            self.settings.local_storage_root
-            / "custom_nodes_manifests"
-            / f"{directory_hash}_custom_nodes_bundle_manifest_v{_CUSTOM_NODES_MANIFEST_VERSION}.json"
-        )
-
-    def _custom_nodes_manifest_remote_path(self, directory_hash: str) -> str:
-        """Return the remote storage path for a whole-tree custom_nodes manifest."""
-        return (
-            f"/custom_nodes/manifests/{directory_hash}_custom_nodes_bundle_"
-            f"manifest_v{_CUSTOM_NODES_MANIFEST_VERSION}.json"
-        )
-
-    def _custom_nodes_archive_remote_path(self, entry_name: str, entry_hash: str) -> str:
-        """Return the remote storage path for one content-addressed custom_nodes slice archive."""
-        return (
-            f"/custom_nodes/entries/{self._custom_nodes_entry_slug(entry_name)}/"
-            f"{entry_hash}_{self.settings.custom_nodes_archive_name}"
-        )
-
-    def _custom_nodes_asset_remote_path(self, asset_spec: _CustomNodeAssetSpec) -> str:
-        """Return the content-addressed remote path for one custom-node model asset."""
-        return (
-            f"/custom_nodes/assets/{self._custom_nodes_entry_slug(asset_spec.entry_name)}/"
-            f"{asset_spec.sha256}_{asset_spec.local_path.name}"
-        )
-
-    def _custom_nodes_entry_slug(self, entry_name: str) -> str:
-        """Return a filesystem-safe slug for one top-level custom_nodes entry name."""
-        normalized_name = entry_name.strip() or "root_files"
-        return "".join(
-            character if character.isalnum() or character in {"-", "_", "."} else "_"
-            for character in normalized_name
-        )
-
-    def _custom_nodes_bundle_specs(
-        self,
-        custom_nodes_dir: Path,
-    ) -> tuple[list[_CustomNodesArchiveSpec], list[_CustomNodeAssetSpec]]:
-        """Split custom-node source archives from package-owned model assets."""
-        resolved_root = custom_nodes_dir.resolve()
-        root_files: list[Path] = []
-        archive_specs: list[_CustomNodesArchiveSpec] = []
-        asset_specs: list[_CustomNodeAssetSpec] = []
-
-        for child in sorted(resolved_root.iterdir(), key=lambda item: item.name):
-            if child.name in _SKIP_DIRS:
-                continue
-            if child.is_file():
-                if child.suffix.lower() in _SKIP_FILE_SUFFIXES:
-                    continue
-                root_files.append(child)
-                continue
-            if child.is_dir():
-                entry_files = sorted(
-                    self._iter_files(child),
-                    key=lambda item: item.relative_to(resolved_root).as_posix(),
-                )
-                code_files, entry_assets = self._partition_custom_node_files(entry_files)
-                if not code_files:
-                    continue
-                archive_specs.append(
-                    _CustomNodesArchiveSpec(
-                        entry_name=child.name,
-                        display_name=child.name,
-                        source_description=str(child),
-                        files=tuple(code_files),
-                        sha256=self._hash_file_group(resolved_root, code_files),
-                    )
-                )
-                asset_specs.extend(
-                    self._custom_node_asset_specs(
-                        resolved_root,
-                        child.name,
-                        entry_assets,
-                    )
-                )
-
-        if root_files:
-            code_files, root_assets = self._partition_custom_node_files(root_files)
-        else:
-            code_files, root_assets = [], []
-        if code_files:
-            archive_specs.append(
-                _CustomNodesArchiveSpec(
-                    entry_name="root_files",
-                    display_name="root files",
-                    source_description=str(resolved_root),
-                    files=tuple(code_files),
-                    sha256=self._hash_file_group(resolved_root, code_files),
-                )
-            )
-            asset_specs.extend(
-                self._custom_node_asset_specs(
-                    resolved_root,
-                    "root_files",
-                    root_assets,
-                )
-            )
-
-        return archive_specs, asset_specs
-
-    def _custom_nodes_archive_specs(self, custom_nodes_dir: Path) -> list[_CustomNodesArchiveSpec]:
-        """Return code-only archive specs for compatibility with existing callers."""
-        archive_specs, _ = self._custom_nodes_bundle_specs(custom_nodes_dir)
-        return archive_specs
-
-    def _partition_custom_node_files(
-        self,
-        files: list[Path],
-    ) -> tuple[list[Path], list[Path]]:
-        """Partition custom-node files into code resources and mounted model assets."""
-        code_files: list[Path] = []
-        asset_files: list[Path] = []
-        for file_path in files:
-            if file_path.suffix.lower() in _CUSTOM_NODE_ASSET_SUFFIXES:
-                asset_files.append(file_path)
-            else:
-                code_files.append(file_path)
-        return code_files, asset_files
-
-    def _custom_node_asset_specs(
-        self,
-        custom_nodes_root: Path,
-        entry_name: str,
-        asset_files: list[Path],
-    ) -> list[_CustomNodeAssetSpec]:
-        """Build deterministic metadata for package-owned model assets."""
-        return [
-            _CustomNodeAssetSpec(
-                entry_name=entry_name,
-                local_path=asset_path,
-                relative_path=asset_path.relative_to(custom_nodes_root).as_posix(),
-                sha256=self._hash_file(asset_path),
-                size_bytes=asset_path.stat().st_size,
-            )
-            for asset_path in asset_files
-        ]
-
-    def _directory_fingerprint(self, root: Path, files: list[Path]) -> str:
-        """Return a metadata-only fingerprint for a directory tree."""
-        digest = hashlib.sha256()
-        for child in files:
-            stat_result = child.stat()
-            digest.update(child.relative_to(root).as_posix().encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(str(stat_result.st_size).encode("ascii"))
-            digest.update(b"\0")
-            digest.update(str(stat_result.st_mtime_ns).encode("ascii"))
-            digest.update(b"\0")
-        return digest.hexdigest()
-
-    def _hash_cache_path(self) -> Path:
-        """Return the on-disk metadata cache path."""
-        return self.settings.local_storage_root / "metadata" / "hash_cache.json"
-
-    def _load_hash_cache(self) -> dict[str, dict[str, Any]]:
-        """Load the persistent hash cache from disk when available."""
-        cache_path = self._hash_cache_path()
-        if not cache_path.exists():
-            return {}
-        try:
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.warning("Hash cache at %s is unreadable; rebuilding it from scratch.", cache_path)
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        return {
-            str(key): value
-            for key, value in payload.items()
-            if isinstance(value, dict)
-        }
-
-    def _mark_hash_cache_dirty(self) -> None:
-        """Persist the hash cache after it changes."""
-        self._hash_cache_dirty = True
-        self._save_hash_cache()
-
-    def _save_hash_cache(self) -> None:
-        """Write the persistent hash cache to disk."""
-        if not self._hash_cache_dirty:
-            return
-        cache_path = self._hash_cache_path()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(self._hash_cache, sort_keys=True), encoding="utf-8")
-        self._hash_cache_dirty = False
-
-    def _iter_files(self, path: Path) -> list[Path]:
-        """Yield files from a directory tree while skipping cache folders."""
-        files: list[Path] = []
-        for root, dirnames, filenames in os.walk(path):
-            dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
-            for filename in filenames:
-                child = Path(root) / filename
-                if child.suffix.lower() in _SKIP_FILE_SUFFIXES:
-                    continue
-                files.append(child)
-        return files

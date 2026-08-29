@@ -520,6 +520,8 @@ The prompt interception layer is organized as a compatibility aggregator over fo
 
 Resident LLM inference uses the same ownership boundaries: `llm_types.py` defines backend-neutral values, `llm_inputs.py` normalizes multimodal and file inputs, `vllm_instrumentation.py` owns process-wide vLLM execution policy and Triton telemetry, and `llm_backend_transformers.py`, `llm_backend_llamacpp.py`, and `llm_backend_vllm.py` isolate backend implementations. `modal_llm_runtime.py` remains the model-residency coordinator, while `local_llm_runtime.py` consumes shared types and input preparation without importing private helpers from the Modal backend.
 
+Asset synchronization is composed from focused collaborators: `sync_protocols.py` holds provider-neutral contracts and values, `sync_backends.py` owns local and Modal persistence adapters, `sync_hashing.py` owns the persistent content-hash cache, `sync_custom_nodes.py` builds and transfers custom-node archives and manifests, and `sync_r2_transfer.py` owns worker preflight plus idle-gated R2 read-through and write-back. `sync_engine.py` coordinates those collaborators and retains compatibility entrypoints.
+
 ### Vast.ai API Simulator
 
 Vast development and CI need no live credentials or billable instances. Start the stateful local simulator:

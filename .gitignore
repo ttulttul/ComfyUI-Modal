@@ -79,6 +79,11 @@
 !/ssh_executor.py
 !/ssh_runtime.py
 !/sync_engine.py
+!/sync_backends.py
+!/sync_custom_nodes.py
+!/sync_hashing.py
+!/sync_protocols.py
+!/sync_r2_transfer.py
 !/vast_api.py
 !/vast_config_node.py
 !/vast_executor.py

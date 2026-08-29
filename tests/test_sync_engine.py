@@ -22,7 +22,7 @@ def test_sync_file_deduplicates_by_hash(
     tmp_path: Path,
 ) -> None:
     """Repeated file syncs should reuse the same remote path and sync-index record."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
 
@@ -65,7 +65,7 @@ def test_request_asset_cache_syncs_repeated_prompt_asset_once(
     tmp_path: Path,
 ) -> None:
     """Repeated references across remote nodes should share one request sync decision."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
     settings = settings_module.ModalSyncSettings(
@@ -121,7 +121,7 @@ def test_sync_file_emits_upload_status(
     tmp_path: Path,
 ) -> None:
     """Uploading a new asset should emit a status message naming the uploaded file."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
     observed_statuses: list[tuple[str, int | None, int | None]] = []
@@ -164,7 +164,7 @@ def test_sync_file_uses_self_hosted_destination_in_ssh_mode(
     tmp_path: Path,
 ) -> None:
     """SSH uploads should not describe the destination as Modal."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
     observed_statuses: list[tuple[str, int | None, int | None]] = []
@@ -501,7 +501,7 @@ def test_sync_custom_nodes_directory_creates_archive(
     tmp_path: Path,
 ) -> None:
     """The sync engine should archive and mirror a custom_nodes directory."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -541,7 +541,7 @@ def test_sync_custom_nodes_directory_only_checks_once_per_engine_lifetime(
     tmp_path: Path,
 ) -> None:
     """The same sync engine should not rescan custom_nodes after the first successful sync."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -595,7 +595,7 @@ def test_sync_custom_nodes_directory_emits_packaging_and_upload_status(
     tmp_path: Path,
 ) -> None:
     """Building a new custom_nodes archive should report packaging and upload stages."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -640,7 +640,7 @@ def test_sync_custom_nodes_directory_concurrent_calls_share_one_initial_sync(
     tmp_path: Path,
 ) -> None:
     """Concurrent first-run calls should serialize behind one custom_nodes sync decision."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -665,7 +665,7 @@ def test_sync_custom_nodes_directory_concurrent_calls_share_one_initial_sync(
     )
 
     engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
-    original_sync = engine._sync_custom_nodes_directory_uncached
+    original_sync = engine._custom_nodes._sync_custom_nodes_directory_uncached
     sync_call_count = 0
     sync_call_count_lock = threading.Lock()
     release_first_sync = threading.Event()
@@ -678,7 +678,11 @@ def test_sync_custom_nodes_directory_concurrent_calls_share_one_initial_sync(
         release_first_sync.wait(timeout=5.0)
         return original_sync(status_callback=status_callback)
 
-    monkeypatch.setattr(engine, "_sync_custom_nodes_directory_uncached", wrapped_sync)
+    monkeypatch.setattr(
+        engine._custom_nodes,
+        "_sync_custom_nodes_directory_uncached",
+        wrapped_sync,
+    )
 
     results: list[Any] = [None, None]
 
@@ -713,7 +717,7 @@ def test_hash_directory_ignores_virtualenv_and_bytecode_artifacts(
     tmp_path: Path,
 ) -> None:
     """Ignored directories and file suffixes should not affect custom_nodes hashing."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -761,7 +765,7 @@ def test_sync_file_reuses_cached_hash_for_unchanged_file(
     tmp_path: Path,
 ) -> None:
     """Unchanged files should reuse the persisted file digest instead of re-reading the payload."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
 
@@ -804,7 +808,7 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
     tmp_path: Path,
 ) -> None:
     """An unchanged custom_nodes tree should reuse its digest-keyed local archive."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -852,7 +856,11 @@ def test_sync_custom_nodes_directory_reuses_cached_archive(
     def fail_create_archive(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("Expected cached custom_nodes archive to be reused.")
 
-    monkeypatch.setattr(second_engine, "_create_archive", fail_create_archive)
+    monkeypatch.setattr(
+        second_engine._custom_nodes,
+        "_create_archive",
+        fail_create_archive,
+    )
     second_bundle = second_engine.sync_custom_nodes_directory()
 
     assert second_bundle is not None
@@ -869,7 +877,7 @@ def test_sync_custom_nodes_separates_code_assets_and_nested_virtualenv(
     tmp_path: Path,
 ) -> None:
     """Code ZIPs should exclude mounted model assets and nested virtual environments."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -927,7 +935,7 @@ def test_sync_file_reuses_sync_index_record_for_existing_remote_payload(
     tmp_path: Path,
 ) -> None:
     """An indexed deterministic asset should be reused without a second upload."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"model-bytes")
 
@@ -986,7 +994,7 @@ def test_sync_custom_nodes_directory_reuses_indexed_remote_bundle(
     tmp_path: Path,
 ) -> None:
     """An indexed hash-named remote custom_nodes bundle should be reused without rebuilding or reuploading."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -1040,7 +1048,7 @@ def test_sync_custom_nodes_directory_reuses_indexed_remote_bundle(
     def fail_create_archive(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("Expected the indexed hash-named remote bundle to be reused.")
 
-    monkeypatch.setattr(engine, "_create_archive", fail_create_archive)
+    monkeypatch.setattr(engine._custom_nodes, "_create_archive", fail_create_archive)
     bundle = engine.sync_custom_nodes_directory()
 
     assert bundle is not None
@@ -1057,7 +1065,7 @@ def test_sync_custom_nodes_directory_only_rebuilds_changed_top_level_archive(
     tmp_path: Path,
 ) -> None:
     """Changing one custom_nodes package should only rebuild that package archive plus the manifest."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_a = custom_nodes_dir / "example_a"
     package_b = custom_nodes_dir / "example_b"
@@ -1107,7 +1115,7 @@ def test_sync_custom_nodes_directory_only_rebuilds_changed_top_level_archive(
         settings=settings,
     )
     rebuilt_entries: list[str] = []
-    original_create_archive = second_engine._create_archive_from_files
+    original_create_archive = second_engine._custom_nodes._create_archive_from_files
 
     def record_create_archive(root_path: Path, files: list[Path], archive_path: Path) -> Path:
         """Record which top-level package archive had to be rebuilt."""
@@ -1115,7 +1123,11 @@ def test_sync_custom_nodes_directory_only_rebuilds_changed_top_level_archive(
         rebuilt_entries.append(files[0].relative_to(custom_nodes_dir).parts[0])
         return original_create_archive(custom_nodes_dir, files, archive_path)
 
-    monkeypatch.setattr(second_engine, "_create_archive_from_files", record_create_archive)
+    monkeypatch.setattr(
+        second_engine._custom_nodes,
+        "_create_archive_from_files",
+        record_create_archive,
+    )
     second_bundle = second_engine.sync_custom_nodes_directory()
 
     assert second_bundle is not None
@@ -1130,7 +1142,7 @@ def test_sync_custom_nodes_directory_builds_multiple_archives_in_parallel(
     tmp_path: Path,
 ) -> None:
     """Fresh per-package custom_nodes archives should build in parallel."""
-    monkeypatch.setattr(sync_engine_module, "modal", None)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", None)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_a = custom_nodes_dir / "example_a"
     package_b = custom_nodes_dir / "example_b"
@@ -1158,7 +1170,7 @@ def test_sync_custom_nodes_directory_builds_multiple_archives_in_parallel(
     )
 
     engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
-    original_create_archive = engine._create_archive_from_files
+    original_create_archive = engine._custom_nodes._create_archive_from_files
     thread_ids: set[int] = set()
     started_count = 0
     started_lock = threading.Lock()
@@ -1177,7 +1189,11 @@ def test_sync_custom_nodes_directory_builds_multiple_archives_in_parallel(
         time.sleep(0.02)
         return original_create_archive(custom_nodes_dir, files, archive_path)
 
-    monkeypatch.setattr(engine, "_create_archive_from_files", record_create_archive)
+    monkeypatch.setattr(
+        engine._custom_nodes,
+        "_create_archive_from_files",
+        record_create_archive,
+    )
     bundle = engine.sync_custom_nodes_directory()
 
     assert bundle is not None
@@ -1249,7 +1265,7 @@ def test_remote_mode_uses_modal_volume_backend_when_sdk_is_available(
                 """Return the fake volume for any lookup."""
                 return fake_volume
 
-    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", FakeModal)
 
     settings = settings_module.ModalSyncSettings(
         app_name="app",
@@ -1361,7 +1377,7 @@ def test_remote_sync_index_discards_stale_volume_epoch_and_reuploads_missing_pay
                 del name, create_if_missing
                 return fake_volume
 
-    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", FakeModal)
     custom_nodes_dir = tmp_path / "custom_nodes"
     package_dir = custom_nodes_dir / "example"
     package_dir.mkdir(parents=True)
@@ -1437,7 +1453,7 @@ def test_modal_volume_backend_treats_missing_path_as_cache_miss(
                 """Return a fake volume that always reports missing paths."""
                 return FakeVolume()
 
-    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", FakeModal)
     backend = sync_engine_module.ModalVolumeBackend("volume")
 
     assert backend.exists("/hashes/missing.done") is False
@@ -1507,7 +1523,7 @@ def test_modal_volume_backend_caches_exists_results_and_uploaded_paths(
                 """Return the fake volume for any lookup."""
                 return fake_volume
 
-    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", FakeModal)
     backend = sync_engine_module.ModalVolumeBackend("volume")
 
     assert backend.exists("/hashes/present.done") is False
@@ -1583,7 +1599,7 @@ def test_modal_volume_backend_ignores_file_exists_upload_race(
                 del name, create_if_missing
                 return fake_volume
 
-    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", FakeModal)
     backend = sync_engine_module.ModalVolumeBackend("volume")
     local_path = tmp_path / "bundle.zip"
     local_path.write_bytes(b"bundle")
@@ -1654,9 +1670,9 @@ def test_modal_volume_backend_retries_rate_limited_calls(
         sleep_calls.append(seconds)
         monotonic_time += seconds
 
-    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", FakeModal)
     monkeypatch.setattr(
-        sync_engine_module,
+        sync_engine_module._sync_backends,
         "time",
         types.SimpleNamespace(sleep=fake_sleep, monotonic=fake_monotonic),
     )
@@ -1715,9 +1731,9 @@ def test_modal_volume_backend_applies_shared_rate_limit_backoff_across_calls(
         sleep_calls.append(seconds)
         monotonic_time += seconds
 
-    monkeypatch.setattr(sync_engine_module, "modal", FakeModal)
+    monkeypatch.setattr(sync_engine_module._sync_backends, "modal", FakeModal)
     monkeypatch.setattr(
-        sync_engine_module,
+        sync_engine_module._sync_backends,
         "time",
         types.SimpleNamespace(sleep=fake_sleep, monotonic=fake_monotonic),
     )

@@ -566,6 +566,30 @@ def sync_engine_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def sync_backends_module(extension_package: object) -> object:
+    """Return local and Modal synchronization backends."""
+    return importlib.import_module(f"{PACKAGE_NAME}.sync_backends")
+
+
+@pytest.fixture(scope="session")
+def sync_hashing_module(extension_package: object) -> object:
+    """Return the persistent synchronization hashing module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.sync_hashing")
+
+
+@pytest.fixture(scope="session")
+def sync_custom_nodes_module(extension_package: object) -> object:
+    """Return the custom-node synchronization module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.sync_custom_nodes")
+
+
+@pytest.fixture(scope="session")
+def sync_r2_transfer_module(extension_package: object) -> object:
+    """Return the R2 transfer and write-back coordination module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.sync_r2_transfer")
+
+
+@pytest.fixture(scope="session")
 def modal_cloud_module() -> object:
     """Return the stable Modal cloud entry module."""
     _ensure_import_paths()
@@ -598,9 +622,9 @@ def reset_modal_environment(
         or request.node.get_closest_marker("live_vast") is not None
     ):
         return
-    sync_engine_module = sys.modules.get(f"{PACKAGE_NAME}.sync_engine")
+    sync_r2_transfer_module = sys.modules.get(f"{PACKAGE_NAME}.sync_r2_transfer")
     coordinator = getattr(
-        sync_engine_module,
+        sync_r2_transfer_module,
         "_R2_WRITE_BACK_COORDINATOR",
         None,
     )
