@@ -522,6 +522,8 @@ Execution scheduling keeps provider-neutral orchestration in `execution_scheduli
 
 Prompt rewriting keeps payload and proxy construction in `prompt_rewrite.py`; downstream frontier discovery, parallel local-branch release, local-gap keepalive, and speculative affinity prewarm decoration live in `prompt_affinity_planning.py`.
 
+Remote graph analysis keeps transportability and component partitioning in `remote_graph_analysis.py`, while recursive saved-workflow traversal and workflow-path-to-queued-prompt resolution live in `workflow_prompt_mapping.py`.
+
 Resident LLM inference uses the same ownership boundaries: `llm_types.py` defines backend-neutral values, `llm_inputs.py` normalizes multimodal and file inputs, `vllm_instrumentation.py` owns process-wide vLLM execution policy and Triton telemetry, and `llm_backend_transformers.py`, `llm_backend_llamacpp.py`, and `llm_backend_vllm.py` isolate backend implementations. `modal_llm_runtime.py` remains the model-residency coordinator, while `local_llm_runtime.py` consumes shared types and input preparation without importing private helpers from the Modal backend. CPU-side staging adapts the general cross-process ownership lock in `snapshot_lease.py` to LLM-specific progress events.
 
 Asset synchronization is composed from focused collaborators: `sync_protocols.py` holds provider-neutral contracts and values, `sync_backends.py` owns local and Modal persistence adapters, `sync_hashing.py` owns the persistent content-hash cache, `sync_custom_nodes.py` builds and transfers custom-node archives and manifests, and `sync_r2_transfer.py` owns worker preflight plus idle-gated R2 read-through and write-back. `sync_engine.py` coordinates those collaborators and retains compatibility entrypoints.

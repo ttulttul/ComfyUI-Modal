@@ -695,3 +695,7 @@ The short-lived R2 bucket-usage cache is plan-reporting state, not scheduler sta
 ## Affinity decoration is downstream graph planning
 
 Parallel local-branch release, local-gap keepalive, and speculative worker prewarm all traverse the rewritten proxy graph after payload construction. Keeping them together in `prompt_affinity_planning.py` gives that post-rewrite graph mutation one owner while leaving `prompt_rewrite.py` focused on constructing payloads and proxy nodes.
+
+## Workflow paths and queued prompt IDs are separate graph identities
+
+Saved workflows may nest reusable subgraph definitions while queued prompt nodes use composed identifiers. `workflow_prompt_mapping.py` owns the recursive traversal and bidirectional resolution between those identities; transportability and component partitioning can then operate only on queued prompt IDs in `remote_graph_analysis.py`.

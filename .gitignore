@@ -124,6 +124,7 @@
 !/scripts/*.py
 
 !/web/
+!/workflow_prompt_mapping.py
 /web/*
 !/web/*.js
 
