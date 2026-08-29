@@ -450,6 +450,12 @@ def modal_billing_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_container_logs_module(extension_package: object) -> object:
+    """Return managed Modal container and log-stream state."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.modal_container_logs")
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")

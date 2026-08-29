@@ -8403,13 +8403,14 @@ def test_emit_local_mapped_lane_progress_start_marks_lane_as_setup_only(
 
 def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
     remote_modal_app_module: Any,
+    modal_container_logs_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Stream consumers should retain and release one container-log watcher per remote payload."""
     log_stream_calls: list[tuple[str, str]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_container_logs_module,
         "get_settings",
         lambda: types.SimpleNamespace(stream_remote_container_logs=True),
     )
@@ -8444,13 +8445,13 @@ def test_remote_modal_consumes_remote_log_stream_events_with_retain_release(
 
 
 def test_list_active_modal_containers_filters_and_classifies_managed_apps(
-    remote_modal_app_module: Any,
+    modal_container_logs_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Container status should include every active GPU app for this ComfyUI instance."""
-    settings = remote_modal_app_module.get_settings()
-    b300_app_name = remote_modal_app_module.modal_deployment_app_name(
-        remote_modal_app_module.settings_for_modal_gpu(settings, "B300")
+    settings = modal_container_logs_module.get_settings()
+    b300_app_name = modal_container_logs_module.modal_deployment_app_name(
+        modal_container_logs_module.settings_for_modal_gpu(settings, "B300")
     )
     request_environment_names: list[str] = []
     request_thread_ids: list[int] = []
@@ -8524,7 +8525,7 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
 
         return blocking_callable
 
-    original_import_module = remote_modal_app_module.importlib.import_module
+    original_import_module = modal_container_logs_module.importlib.import_module
 
     def fake_import_module(name: str) -> Any:
         """Supply the Modal SDK modules used by the container status query."""
@@ -8545,15 +8546,15 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
             )
         return original_import_module(name)
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", object())
-    monkeypatch.setattr(remote_modal_app_module.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(modal_container_logs_module, "modal", object())
+    monkeypatch.setattr(modal_container_logs_module.importlib, "import_module", fake_import_module)
 
     first_containers = asyncio.run(
-        remote_modal_app_module.list_active_modal_containers(settings)
+        modal_container_logs_module.list_active_modal_containers(settings)
     )
-    containers = asyncio.run(remote_modal_app_module.list_active_modal_containers(settings))
+    containers = asyncio.run(modal_container_logs_module.list_active_modal_containers(settings))
     stopped = asyncio.run(
-        remote_modal_app_module.stop_managed_modal_container("ta-running", settings)
+        modal_container_logs_module.stop_managed_modal_container("ta-running", settings)
     )
 
     assert first_containers == containers
@@ -8572,7 +8573,7 @@ def test_list_active_modal_containers_filters_and_classifies_managed_apps(
 
 
 def test_stop_managed_modal_container_verifies_ownership_before_exact_stop(
-    remote_modal_app_module: Any,
+    modal_container_logs_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Container termination must target only a currently listed managed task."""
@@ -8581,7 +8582,7 @@ def test_stop_managed_modal_container_verifies_ownership_before_exact_stop(
     async def fake_list_active(_settings: Any) -> list[Any]:
         """Return one container already filtered to this ComfyUI installation."""
         return [
-            remote_modal_app_module.ModalContainerStatus(
+            modal_container_logs_module.ModalContainerStatus(
                 container_id="ta-managed",
                 app_id="ap-managed",
                 app_name="comfy-modal-sync-B300",
@@ -8601,7 +8602,7 @@ def test_stop_managed_modal_container_verifies_ownership_before_exact_stop(
         """Record the exact task passed to the synchronized SDK bridge."""
         stopped_container_ids.append(container_id)
 
-    original_import_module = remote_modal_app_module.importlib.import_module
+    original_import_module = modal_container_logs_module.importlib.import_module
 
     def fake_import_module(name: str) -> Any:
         """Supply the minimal modules needed after ownership verification."""
@@ -8614,43 +8615,43 @@ def test_stop_managed_modal_container_verifies_ownership_before_exact_stop(
         return original_import_module(name)
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_container_logs_module,
         "list_active_modal_containers",
         fake_list_active,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_container_logs_module,
         "_stop_modal_task_synchronously",
         fake_stop,
     )
-    monkeypatch.setattr(remote_modal_app_module.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(modal_container_logs_module.importlib, "import_module", fake_import_module)
 
     assert asyncio.run(
-        remote_modal_app_module.stop_managed_modal_container(
+        modal_container_logs_module.stop_managed_modal_container(
             "ta-managed",
-            remote_modal_app_module.get_settings(),
+            modal_container_logs_module.get_settings(),
         )
     )
     assert not asyncio.run(
-        remote_modal_app_module.stop_managed_modal_container(
+        modal_container_logs_module.stop_managed_modal_container(
             "ta-unrelated",
-            remote_modal_app_module.get_settings(),
+            modal_container_logs_module.get_settings(),
         )
     )
     assert stopped_container_ids == ["ta-managed"]
 
 
 def test_modal_gpu_estimated_rates_cover_supported_aliases(
-    remote_modal_app_module: Any,
+    modal_container_logs_module: Any,
 ) -> None:
     """Published GPU estimates should cover every selectable billed GPU identity."""
-    rates = remote_modal_app_module.MODAL_GPU_ESTIMATED_USD_PER_SECOND
+    rates = modal_container_logs_module.MODAL_GPU_ESTIMATED_USD_PER_SECOND
 
-    assert set(rates) == set(remote_modal_app_module.MODAL_GPU_TYPES)
+    assert set(rates) == set(modal_container_logs_module.MODAL_GPU_TYPES)
     assert rates["A100"] == rates["A100-40GB"]
     assert rates["H100!"] == rates["H100"]
     assert rates["B200+"] == rates["B200"]
-    assert remote_modal_app_module.MODAL_GPU_PRICING_EFFECTIVE_DATE == "2026-08-13"
+    assert modal_container_logs_module.MODAL_GPU_PRICING_EFFECTIVE_DATE == "2026-08-13"
 
 
 def test_completed_modal_billing_interval_uses_hourly_resolution_and_buffer(
@@ -9026,7 +9027,7 @@ def test_remote_modal_stops_consuming_stream_after_terminal_result(
 
 
 def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
-    remote_modal_app_module: Any,
+    modal_container_logs_module: Any,
     monkeypatch: Any,
 ) -> None:
     """CLI-backed container log streaming should mirror complete prefixed lines into local stderr."""
@@ -9076,10 +9077,10 @@ def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
             self.returncode = 0
 
     stderr_buffer = StringIO()
-    monkeypatch.setattr(remote_modal_app_module.shutil, "which", lambda name: "/usr/bin/modal")
-    monkeypatch.setattr(remote_modal_app_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(modal_container_logs_module.shutil, "which", lambda name: "/usr/bin/modal")
+    monkeypatch.setattr(modal_container_logs_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(
-        remote_modal_app_module.select,
+        modal_container_logs_module.select,
         "select",
         lambda streams, _write, _error, _timeout: (
             streams if streams[0]._index < len(streams[0]._chunks) else [],
@@ -9087,9 +9088,9 @@ def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
             [],
         ),
     )
-    monkeypatch.setattr(remote_modal_app_module.sys, "stderr", stderr_buffer)
+    monkeypatch.setattr(modal_container_logs_module.sys, "stderr", stderr_buffer)
 
-    result = remote_modal_app_module._stream_remote_container_logs_via_modal_cli(
+    result = modal_container_logs_module._stream_remote_container_logs_via_modal_cli(
         "ta-123",
         threading.Event(),
     )
@@ -9102,30 +9103,30 @@ def test_remote_modal_cli_log_stream_mirrors_lines_to_stderr(
 
 
 def test_remote_modal_log_stream_prefers_cli_before_sdk(
-    remote_modal_app_module: Any,
+    modal_container_logs_module: Any,
     monkeypatch: Any,
 ) -> None:
     """The local log watcher should avoid the SDK path when the Modal CLI is available."""
     backend_calls: list[str] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_container_logs_module,
         "_stream_remote_container_logs_via_modal_cli",
         lambda task_id, stop_event: backend_calls.append(f"cli:{task_id}") or True,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        modal_container_logs_module,
         "_stream_remote_container_logs_via_modal_sdk",
         lambda task_id, stop_event: backend_calls.append(f"sdk:{task_id}") or True,
     )
 
-    remote_modal_app_module._run_remote_container_log_stream("ta-123", threading.Event())
+    modal_container_logs_module._run_remote_container_log_stream("ta-123", threading.Event())
 
     assert backend_calls == ["cli:ta-123"]
 
 
 def test_remote_modal_log_stream_survives_short_container_reuse_gap(
-    remote_modal_app_module: Any,
+    modal_container_logs_module: Any,
     monkeypatch: Any,
 ) -> None:
     """A reused task id should keep one watcher and avoid replaying container history."""
@@ -9185,32 +9186,32 @@ def test_remote_modal_log_stream_survives_short_container_reuse_gap(
             if not self.cancelled:
                 self.function(*self.args)
 
-    monkeypatch.setattr(remote_modal_app_module, "_REMOTE_CONTAINER_LOG_STREAMS", {})
-    monkeypatch.setattr(remote_modal_app_module.threading, "Thread", FakeThread)
-    monkeypatch.setattr(remote_modal_app_module.threading, "Timer", FakeTimer)
+    monkeypatch.setattr(modal_container_logs_module, "_REMOTE_CONTAINER_LOG_STREAMS", {})
+    monkeypatch.setattr(modal_container_logs_module.threading, "Thread", FakeThread)
+    monkeypatch.setattr(modal_container_logs_module.threading, "Timer", FakeTimer)
 
-    assert remote_modal_app_module._retain_remote_container_log_stream("ta-reused") == "ta-reused"
-    stream_state = remote_modal_app_module._REMOTE_CONTAINER_LOG_STREAMS["ta-reused"]
-    remote_modal_app_module._release_remote_container_log_stream("ta-reused")
+    assert modal_container_logs_module._retain_remote_container_log_stream("ta-reused") == "ta-reused"
+    stream_state = modal_container_logs_module._REMOTE_CONTAINER_LOG_STREAMS["ta-reused"]
+    modal_container_logs_module._release_remote_container_log_stream("ta-reused")
 
     assert len(created_threads) == 1
     assert len(created_timers) == 1
     assert created_timers[0].daemon is True
     assert stream_state.stop_event.is_set() is False
 
-    remote_modal_app_module._retain_remote_container_log_stream("ta-reused")
+    modal_container_logs_module._retain_remote_container_log_stream("ta-reused")
 
     assert len(created_threads) == 1
     assert created_timers[0].cancelled is True
     assert stream_state.refcount == 1
 
-    remote_modal_app_module._release_remote_container_log_stream("ta-reused")
+    modal_container_logs_module._release_remote_container_log_stream("ta-reused")
     assert len(created_timers) == 2
     created_timers[1].fire()
 
     assert stream_state.stop_event.is_set() is True
     assert stream_state.thread.join_calls == [0.2]
-    assert "ta-reused" not in remote_modal_app_module._REMOTE_CONTAINER_LOG_STREAMS
+    assert "ta-reused" not in modal_container_logs_module._REMOTE_CONTAINER_LOG_STREAMS
 
 
 def test_remote_modal_consumes_streamed_executed_outputs_and_previews(
