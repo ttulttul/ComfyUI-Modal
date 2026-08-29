@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -69,7 +71,8 @@ class VastWorkerImageBuilder:
         status_callback: VastImageBuildStatusCallback | None,
     ) -> str:
         """Execute the image builder and extract its immutable result reference."""
-        command_text = " ".join(VAST_IMAGE_BUILD_COMMAND)
+        command = self._automatic_build_command()
+        command_text = shlex.join(command)
         self._emit(status_callback, "Building the current Vast worker image")
         environment = dict(os.environ if self.environment is None else self.environment)
         environment.setdefault("BUILDKIT_PROGRESS", "plain")
@@ -77,7 +80,7 @@ class VastWorkerImageBuilder:
             environment["COMFYUI_ROOT"] = str(self.comfyui_root)
         try:
             process = subprocess.Popen(
-                VAST_IMAGE_BUILD_COMMAND,
+                command,
                 cwd=self.repo_root,
                 env=environment,
                 stdout=subprocess.PIPE,
@@ -90,7 +93,7 @@ class VastWorkerImageBuilder:
         except OSError as exc:
             raise VastWorkerImageBuildError(
                 self._manual_build_message(
-                    f"Unable to start {VAST_IMAGE_BUILD_COMMAND[0]!r}: {exc}"
+                    f"Unable to start {command[0]!r}: {exc}"
                 )
             ) from exc
         image_reference, recent_output = self._consume_output(
@@ -99,7 +102,7 @@ class VastWorkerImageBuilder:
         )
         return_code = process.wait()
         if return_code != 0:
-            diagnostic = recent_output[-1] if recent_output else "no build output"
+            diagnostic = self._failure_diagnostic(recent_output)
             raise VastWorkerImageBuildError(
                 self._manual_build_message(
                     f"{command_text} exited with status {return_code}: {diagnostic}"
@@ -113,6 +116,27 @@ class VastWorkerImageBuilder:
             )
         self._emit(status_callback, "Published the current Vast worker image")
         return image_reference
+
+    @staticmethod
+    def _automatic_build_command() -> tuple[str, ...]:
+        """Run through uv while bypassing a copied or stale project virtualenv."""
+        return (
+            "uv",
+            "run",
+            "--no-project",
+            "--python",
+            sys.executable,
+            *VAST_IMAGE_BUILD_COMMAND[2:],
+        )
+
+    @staticmethod
+    def _failure_diagnostic(recent_output: tuple[str, ...]) -> str:
+        """Return the last substantive build line instead of traceback footer noise."""
+        ignored_lines = {"<no Python frame>", "[stderr]", "]"}
+        for line in reversed(recent_output):
+            if line not in ignored_lines and not line.startswith("Current thread "):
+                return line
+        return recent_output[-1] if recent_output else "no build output"
 
     def _consume_output(
         self,
@@ -153,9 +177,10 @@ class VastWorkerImageBuilder:
 
     def _manual_build_message(self, cause: str) -> str:
         """Return an actionable error without leaking subprocess environment data."""
+        recovery_command = shlex.join(self._automatic_build_command())
         return (
             f"Automatic Vast worker image publication failed. {cause} Run `"
-            + " ".join(VAST_IMAGE_BUILD_COMMAND)
+            + recovery_command
             + "` from "
             + str(self.repo_root)
             + ", set COMFY_MODAL_VAST_IMAGE to the printed digest, restart ComfyUI, "

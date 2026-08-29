@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +55,16 @@ def test_builder_streams_progress_and_returns_digest(
     result = builder.build_and_push("f" * 64, status_callback=statuses.append)
 
     assert result == digest
-    assert observed["command"] == vast_image_build_module.VAST_IMAGE_BUILD_COMMAND
+    assert observed["command"] == (
+        "uv",
+        "run",
+        "--no-project",
+        "--python",
+        sys.executable,
+        "python",
+        "scripts/build_vast_worker_image.py",
+        "--push",
+    )
     assert observed["cwd"] == tmp_path
     assert observed["env"]["COMFYUI_ROOT"] == str(comfyui_root)
     assert observed["env"]["BUILDKIT_PROGRESS"] == "plain"
@@ -75,7 +85,13 @@ def test_builder_failure_requires_the_documented_manual_command(
     monkeypatch.setattr(
         vast_image_build_module.subprocess,
         "Popen",
-        lambda *_args, **_kwargs: FakeProcess("docker: command not found\n", 127),
+        lambda *_args, **_kwargs: FakeProcess(
+            "Fatal Python error: init_fs_encoding\n"
+            "ModuleNotFoundError: No module named 'encodings'\n"
+            "Current thread 0x00000001 (most recent call first):\n"
+            "<no Python frame>\n",
+            2,
+        ),
     )
     vast_image_build_module._BUILT_IMAGES_BY_FINGERPRINT.clear()
     builder = vast_image_build_module.VastWorkerImageBuilder(
@@ -86,6 +102,9 @@ def test_builder_failure_requires_the_documented_manual_command(
 
     with pytest.raises(
         vast_image_build_module.VastWorkerImageBuildError,
-        match=r"uv run python scripts/build_vast_worker_image\.py --push",
-    ):
+        match=r"uv run --no-project --python .* scripts/build_vast_worker_image\.py --push",
+    ) as raised:
         builder.build_and_push("e" * 64)
+
+    assert "ModuleNotFoundError: No module named 'encodings'" in str(raised.value)
+    assert "<no Python frame> Run" not in str(raised.value)
