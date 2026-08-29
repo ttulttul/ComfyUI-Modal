@@ -555,6 +555,10 @@ def test_worker_dependency_base_is_separate_from_source_overlay(
 
     dependency_dockerfile = manager._dependency_dockerfile()
     overlay_dockerfile = manager._source_overlay_dockerfile(spec)
+    published_overlay = manager._source_overlay_dockerfile(
+        spec,
+        dependency_image="ghcr.io/example/worker@sha256:" + "a" * 64,
+    )
 
     assert "pip install --no-cache-dir runtime-package==1" in dependency_dockerfile
     assert "accelerator-package==1" in dependency_dockerfile
@@ -566,6 +570,64 @@ def test_worker_dependency_base_is_separate_from_source_overlay(
     assert "apt-get" not in overlay_dockerfile
     assert "pip install" not in overlay_dockerfile
     assert "COMFY_MODAL_RUNTIME_FINGERPRINT=source-fingerprint" in overlay_dockerfile
+    assert published_overlay.startswith(
+        "FROM ghcr.io/example/worker@sha256:" + "a" * 64 + "\n"
+    )
+
+
+def test_worker_installs_pinned_torch_before_general_runtime_packages(
+    ssh_runtime_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """General requirements must resolve against the selected pinned Torch stack."""
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "select_remote_torch_build",
+        lambda _gpu: SimpleNamespace(
+            install_layers=(
+                SimpleNamespace(
+                    index_url="https://download.pytorch.org/whl/cu130",
+                    extra_options="",
+                    packages=("torch==2.13.0",),
+                ),
+            ),
+            validation_command=lambda: "validate-torch",
+        ),
+    )
+    monkeypatch.setattr(ssh_runtime_module, "remote_apt_packages", lambda: ())
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_runtime_packages",
+        lambda: ("runtime-package==1",),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_packages",
+        lambda _gpu: (),
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "remote_accelerator_validation_command",
+        lambda _gpu: "validate-accelerator",
+    )
+    monkeypatch.setattr(
+        ssh_runtime_module,
+        "custom_node_runtime_packages",
+        lambda _path: (),
+    )
+    manager = ssh_runtime_module.SshRuntimeManager(
+        controller=SimpleNamespace(),
+        repo_root=SimpleNamespace(),
+        settings=SimpleNamespace(
+            modal_gpu="A100",
+            custom_nodes_dir=Path("/custom_nodes"),
+        ),
+    )
+
+    dockerfile = manager._dependency_dockerfile()
+
+    assert dockerfile.index("torch==2.13.0") < dockerfile.index("runtime-package==1")
+    assert dockerfile.index("validate-torch") < dockerfile.index("runtime-package==1")
 
 
 def test_worker_dockerfile_exposes_triton_compiler_toolchain(

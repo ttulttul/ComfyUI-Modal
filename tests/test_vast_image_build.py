@@ -77,6 +77,130 @@ def test_builder_streams_progress_and_returns_digest(
     ]
 
 
+def test_builder_reuses_current_published_image_without_building(
+    vast_image_build_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Matching registry metadata should avoid both publication and GPU rental delay."""
+    fingerprint = "f" * 64
+    image = "ghcr.io/example/worker@sha256:" + "a" * 64
+    monkeypatch.setattr(
+        vast_image_build_module,
+        "published_runtime_fingerprint",
+        lambda _image: fingerprint,
+    )
+    builder = vast_image_build_module.VastWorkerImageBuilder(
+        repo_root=tmp_path,
+        comfyui_root=None,
+    )
+    monkeypatch.setattr(
+        vast_image_build_module.VastWorkerImageBuilder,
+        "build_and_push",
+        lambda *_args, **_kwargs: pytest.fail("current image was rebuilt"),
+    )
+    statuses: list[str] = []
+
+    result = builder.ensure_published_image(
+        image,
+        fingerprint,
+        status_callback=statuses.append,
+    )
+
+    assert result == image
+    assert statuses == [
+        "Checking the published Vast worker image",
+        "Published Vast worker image is current",
+    ]
+
+
+def test_builder_rebuilds_stale_published_image(
+    vast_image_build_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A mismatched registry label should publish before capacity is requested."""
+    expected = "a" * 64
+    replacement = "ghcr.io/example/worker@sha256:" + "c" * 64
+    monkeypatch.setattr(
+        vast_image_build_module,
+        "published_runtime_fingerprint",
+        lambda _image: "b" * 64,
+    )
+    builder = vast_image_build_module.VastWorkerImageBuilder(
+        repo_root=tmp_path,
+        comfyui_root=None,
+    )
+    requested: list[str] = []
+
+    def fake_build(
+        self: Any,
+        fingerprint: str,
+        *,
+        status_callback: Any,
+    ) -> str:
+        """Record the expected source identity and return a replacement."""
+        del self, status_callback
+        requested.append(fingerprint)
+        return replacement
+
+    monkeypatch.setattr(
+        vast_image_build_module.VastWorkerImageBuilder,
+        "build_and_push",
+        fake_build,
+    )
+    statuses: list[str] = []
+
+    result = builder.ensure_published_image(
+        "ghcr.io/example/worker:v1",
+        expected,
+        status_callback=statuses.append,
+    )
+
+    assert result == replacement
+    assert requested == [expected]
+    assert "stale; rebuilding before requesting capacity" in statuses[-1]
+
+
+def test_builder_publishes_missing_configured_image(
+    vast_image_build_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A first publication should be automatic when the configured tag is absent."""
+    expected = "a" * 64
+    replacement = "ghcr.io/example/worker@sha256:" + "d" * 64
+
+    def missing_image(_image: str) -> str:
+        """Report a registry tag that has not been published yet."""
+        raise vast_image_build_module.VastImageNotFoundError("not found")
+
+    monkeypatch.setattr(
+        vast_image_build_module,
+        "published_runtime_fingerprint",
+        missing_image,
+    )
+    monkeypatch.setattr(
+        vast_image_build_module.VastWorkerImageBuilder,
+        "build_and_push",
+        lambda _self, _fingerprint, *, status_callback: replacement,
+    )
+    builder = vast_image_build_module.VastWorkerImageBuilder(
+        repo_root=tmp_path,
+        comfyui_root=None,
+    )
+    statuses: list[str] = []
+
+    result = builder.ensure_published_image(
+        "ghcr.io/example/worker:v1",
+        expected,
+        status_callback=statuses.append,
+    )
+
+    assert result == replacement
+    assert "missing; building before requesting capacity" in statuses[-1]
+
+
 def test_builder_failure_requires_the_documented_manual_command(
     vast_image_build_module: Any,
     monkeypatch: Any,

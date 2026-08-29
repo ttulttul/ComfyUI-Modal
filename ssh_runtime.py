@@ -63,6 +63,8 @@ _RUNTIME_IMAGE_REPOSITORY = "comfy-remote"
 _DEPENDENCY_IMAGE_REPOSITORY = "comfy-remote-deps"
 _RUNTIME_LABEL = "comfy.remote.runtime-fingerprint"
 _DEPENDENCY_LABEL = "comfy.remote.dependency-fingerprint"
+RUNTIME_FINGERPRINT_LABEL = _RUNTIME_LABEL
+DEPENDENCY_FINGERPRINT_LABEL = _DEPENDENCY_LABEL
 _ENVIRONMENT_LABEL = "comfy.remote.environment-id"
 _WORKER_LABEL = "comfy.remote.worker-index"
 _LARGE_DOWNLOAD_RESUME_RETRIES = 20
@@ -479,10 +481,18 @@ class SshRuntimeManager:
             include_runtime_sources=False,
         )
 
-    def _source_overlay_build_context(self, spec: SshRuntimeSpec) -> bytes:
+    def _source_overlay_build_context(
+        self,
+        spec: SshRuntimeSpec,
+        *,
+        dependency_image: str | None = None,
+    ) -> bytes:
         """Return the current runtime sources layered over a retained dependency image."""
         return self._tar_build_context(
-            dockerfile=self._source_overlay_dockerfile(spec),
+            dockerfile=self._source_overlay_dockerfile(
+                spec,
+                dependency_image=dependency_image,
+            ),
             include_runtime_sources=True,
         )
 
@@ -568,11 +578,16 @@ class SshRuntimeManager:
         """Return a Dockerfile containing only stable worker dependencies."""
         return "\n".join([*self._dependency_dockerfile_lines(), ""])
 
-    def _source_overlay_dockerfile(self, spec: SshRuntimeSpec) -> str:
+    def _source_overlay_dockerfile(
+        self,
+        spec: SshRuntimeSpec,
+        *,
+        dependency_image: str | None = None,
+    ) -> str:
         """Return the small source layer built on a retained dependency image."""
         return "\n".join(
             [
-                f"FROM {self._dependency_image_tag(spec)}",
+                f"FROM {dependency_image or self._dependency_image_tag(spec)}",
                 *self._source_layer_lines(spec),
                 "",
             ]
@@ -602,7 +617,6 @@ class SshRuntimeManager:
                 "/var/lib/apt/lists/*",
             ),
             f"RUN {remote_compiler_validation_command()}",
-            _pip_install(remote_runtime_packages()),
         ]
         for layer in torch_build.install_layers:
             layer_arguments = [
@@ -621,6 +635,7 @@ class SshRuntimeManager:
         lines.extend(
             [
                 f"RUN {torch_build.validation_command()}",
+                _pip_install(remote_runtime_packages()),
                 _pip_install(
                     remote_accelerator_packages(self.settings.modal_gpu),
                     resume_retries=_LARGE_DOWNLOAD_RESUME_RETRIES,
@@ -805,6 +820,42 @@ def export_worker_image_context(
         worker_index=0,
     )
     return manager._build_context(spec)
+
+
+def export_worker_dependency_image_context(
+    *,
+    repo_root: Path,
+    settings: ModalSyncSettings,
+) -> bytes:
+    """Return the stable dependency-only worker build context."""
+    manager = SshRuntimeManager.__new__(SshRuntimeManager)
+    manager.repo_root = repo_root
+    manager.settings = settings
+    return manager._dependency_build_context()
+
+
+def export_worker_source_overlay_context(
+    *,
+    repo_root: Path,
+    settings: ModalSyncSettings,
+    identity: RemoteRuntimeIdentity,
+    dependency_image: str,
+) -> bytes:
+    """Return current worker sources layered over an immutable dependency image."""
+    manager = SshRuntimeManager.__new__(SshRuntimeManager)
+    manager.repo_root = repo_root
+    manager.settings = settings
+    spec = SshRuntimeSpec(
+        identity=identity,
+        image_tag=f"comfy-remote:{identity.fingerprint[:16]}",
+        container_name="context-only",
+        storage_volume_name="context-only",
+        worker_index=0,
+    )
+    return manager._source_overlay_build_context(
+        spec,
+        dependency_image=dependency_image,
+    )
 
 
 def _worker_lifecycle_lock(

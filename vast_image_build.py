@@ -14,6 +14,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+if __package__:
+    from .vast_image_registry import (
+        VastImageNotFoundError,
+        VastImageRegistryError,
+        published_runtime_fingerprint,
+    )
+else:  # pragma: no cover - direct debugging imports.
+    from vast_image_registry import (
+        VastImageNotFoundError,
+        VastImageRegistryError,
+        published_runtime_fingerprint,
+    )
+
 logger = logging.getLogger(__name__)
 
 VAST_IMAGE_BUILD_COMMAND = (
@@ -48,6 +61,58 @@ class VastWorkerImageBuilder:
     comfyui_root: Path | None
     modal_gpu: str | None = None
     environment: Mapping[str, str] | None = None
+
+    def ensure_published_image(
+        self,
+        image: str,
+        expected_fingerprint: str,
+        *,
+        status_callback: VastImageBuildStatusCallback | None = None,
+    ) -> str:
+        """Return a current published image, rebuilding before rental if stale."""
+        self._emit(status_callback, "Checking the published Vast worker image")
+        try:
+            actual_fingerprint = published_runtime_fingerprint(image)
+        except VastImageNotFoundError:
+            self._emit(
+                status_callback,
+                "Published Vast worker image is missing; building before requesting "
+                "capacity",
+            )
+            return self.build_and_push(
+                expected_fingerprint,
+                status_callback=status_callback,
+            )
+        except (VastImageRegistryError, ValueError) as exc:
+            raise VastWorkerImageBuildError(
+                self._manual_build_message(
+                    "Unable to inspect the configured Vast worker image before "
+                    f"renting capacity: {exc} Ensure the image is publicly readable."
+                )
+            ) from exc
+        if actual_fingerprint == expected_fingerprint:
+            self._emit(status_callback, "Published Vast worker image is current")
+            return image
+        actual_summary = (
+            actual_fingerprint[:12]
+            if actual_fingerprint is not None
+            else "missing label"
+        )
+        logger.warning(
+            "Published Vast worker image is stale image=%s expected=%s actual=%s.",
+            image,
+            expected_fingerprint[:12],
+            actual_summary,
+        )
+        self._emit(
+            status_callback,
+            "Published Vast worker image is stale; rebuilding before requesting "
+            "capacity",
+        )
+        return self.build_and_push(
+            expected_fingerprint,
+            status_callback=status_callback,
+        )
 
     def build_and_push(
         self,

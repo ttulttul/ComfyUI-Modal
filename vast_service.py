@@ -445,6 +445,8 @@ class VastService:
         status_callback: Callable[[str], None] | None = None,
     ) -> VastLeaseRecord:
         """Reuse or rent the selected quoted profile capacity slot."""
+        if quote.existing_lease is None:
+            await self._preflight_published_image(status_callback=status_callback)
         if status_callback is not None:
             status_callback("Requesting Vast.ai capacity")
 
@@ -461,6 +463,26 @@ class VastService:
                 emit_instance_status if status_callback is not None else None
             ),
         )
+
+    async def _preflight_published_image(
+        self,
+        *,
+        status_callback: Callable[[str], None] | None,
+    ) -> None:
+        """Publish current runtime source before any billable Vast capacity request."""
+        configured_image = self.runtime_configuration.image
+        expected_fingerprint = self.runtime_configuration.runtime_fingerprint
+        image = await asyncio.to_thread(
+            self.image_builder.ensure_published_image,
+            configured_image,
+            expected_fingerprint,
+            status_callback=status_callback,
+        )
+        if image == configured_image:
+            return
+        self._adopt_runtime_image(image)
+        if status_callback is not None:
+            status_callback("Vast worker image updated before requesting capacity")
 
     async def _acquire_with_replacement(
         self,

@@ -287,6 +287,12 @@ def test_acquire_replaces_lease_when_worker_initialization_fails(
     service.lease_manager = lease_manager
     service.registry = registry
 
+    async def skip_preflight(*, status_callback: Any) -> None:
+        """Keep this test focused on post-rental SSH replacement."""
+        del status_callback
+
+    service._preflight_published_image = skip_preflight
+
     def initialize_runtime(
         lease: Any,
         *,
@@ -306,7 +312,7 @@ def test_acquire_replaces_lease_when_worker_initialization_fails(
 
     acquired = asyncio.run(
         service.acquire(
-            SimpleNamespace(profile=SimpleNamespace()),
+            SimpleNamespace(profile=SimpleNamespace(), existing_lease=None),
             status_callback=messages.append,
         )
     )
@@ -372,6 +378,12 @@ def test_acquire_replaces_instance_that_disappears_before_ssh(
     service.lease_manager = lease_manager
     service.registry = registry
 
+    async def skip_preflight(*, status_callback: Any) -> None:
+        """Keep this test focused on a disappeared provider contract."""
+        del status_callback
+
+    service._preflight_published_image = skip_preflight
+
     def initialize_runtime(
         lease: Any,
         *,
@@ -389,7 +401,7 @@ def test_acquire_replaces_instance_that_disappears_before_ssh(
 
     acquired = asyncio.run(
         service.acquire(
-            SimpleNamespace(profile=SimpleNamespace()),
+            SimpleNamespace(profile=SimpleNamespace(), existing_lease=None),
             status_callback=messages.append,
         )
     )
@@ -473,6 +485,12 @@ def test_acquire_rebuilds_image_and_replaces_fingerprint_drift(
     adopted_images: list[str] = []
     service._adopt_runtime_image = adopted_images.append
 
+    async def skip_preflight(*, status_callback: Any) -> None:
+        """Keep runtime drift as a defense-in-depth behavior in this test."""
+        del status_callback
+
+    service._preflight_published_image = skip_preflight
+
     def initialize_runtime(
         lease: Any,
         *,
@@ -492,7 +510,7 @@ def test_acquire_rebuilds_image_and_replaces_fingerprint_drift(
 
     acquired = asyncio.run(
         service.acquire(
-            SimpleNamespace(profile=SimpleNamespace()),
+            SimpleNamespace(profile=SimpleNamespace(), existing_lease=None),
             status_callback=messages.append,
         )
     )
@@ -505,6 +523,48 @@ def test_acquire_rebuilds_image_and_replaces_fingerprint_drift(
     assert "Building replacement worker" in messages
     assert "Vast worker image updated; requesting fresh capacity" in messages
     assert messages[-1] == "Vast.ai worker is ready"
+
+
+def test_preflight_rebuilds_stale_image_before_capacity_request(
+    vast_service_module: Any,
+) -> None:
+    """Registry drift should be repaired before lease acquisition can begin."""
+
+    class FakeImageBuilder:
+        """Return a replacement digest and record preflight inputs."""
+
+        def __init__(self) -> None:
+            """Initialize the call log."""
+            self.calls: list[tuple[str, str]] = []
+
+        def ensure_published_image(
+            self,
+            image: str,
+            expected_fingerprint: str,
+            *,
+            status_callback: Any,
+        ) -> str:
+            """Simulate a stale registry image replacement."""
+            self.calls.append((image, expected_fingerprint))
+            status_callback("Published Vast worker image is stale")
+            return "ghcr.io/example/worker@sha256:" + "d" * 64
+
+    builder = FakeImageBuilder()
+    service = object.__new__(vast_service_module.VastService)
+    service.runtime_configuration = SimpleNamespace(
+        image="ghcr.io/example/worker:v1",
+        runtime_fingerprint="a" * 64,
+    )
+    service.image_builder = builder
+    adopted: list[str] = []
+    service._adopt_runtime_image = adopted.append
+    messages: list[str] = []
+
+    asyncio.run(service._preflight_published_image(status_callback=messages.append))
+
+    assert builder.calls == [("ghcr.io/example/worker:v1", "a" * 64)]
+    assert adopted == ["ghcr.io/example/worker@sha256:" + "d" * 64]
+    assert messages[-1] == "Vast worker image updated before requesting capacity"
 
 
 def test_proxy_endpoint_promotion_persists_the_working_route(

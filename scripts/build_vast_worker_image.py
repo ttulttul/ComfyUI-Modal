@@ -19,9 +19,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from runtime_environment import build_remote_runtime_identity
+from runtime_environment import (
+    build_remote_runtime_identity,
+    remote_runtime_dependency_fingerprint,
+)
 from settings import get_settings
-from ssh_runtime import export_worker_image_context
+from ssh_runtime import (
+    DEPENDENCY_FINGERPRINT_LABEL,
+    RUNTIME_FINGERPRINT_LABEL,
+    export_worker_dependency_image_context,
+    export_worker_source_overlay_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,12 +227,17 @@ def _validate_tag(tag: str) -> str:
     return normalized
 
 
-def _run(command: Sequence[str], *, input_payload: bytes | None = None) -> str:
-    """Run one local Docker command and return trimmed standard output."""
+def _run(
+    command: Sequence[str],
+    *,
+    input_payload: bytes | None = None,
+    capture_stdout: bool = True,
+) -> str:
+    """Run one Docker command, optionally inheriting stdout for live progress."""
     completed = subprocess.run(
         tuple(command),
         input=input_payload,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.PIPE if capture_stdout else None,
         stderr=None,
         check=False,
     )
@@ -232,23 +245,149 @@ def _run(command: Sequence[str], *, input_payload: bytes | None = None) -> str:
         raise RuntimeError(
             f"Command {command[0]!r} failed with status {completed.returncode}."
         )
+    if completed.stdout is None:
+        return ""
     return completed.stdout.decode("utf-8", errors="replace").strip()
 
 
-def _docker_build_command(image_tag: str, runtime_fingerprint: str) -> tuple[str, ...]:
-    """Return the architecture-pinned Docker command for a Vast worker image."""
-    return (
+def _docker_build_command(
+    image_tag: str,
+    runtime_fingerprint: str,
+    *,
+    dependency_fingerprint: str | None = None,
+    pull: bool = False,
+) -> tuple[str, ...]:
+    """Return the architecture-pinned Docker command for one worker image."""
+    command = [
         "docker",
         "build",
-        "--pull",
         "--platform",
         VAST_WORKER_PLATFORM,
         "--label",
-        f"comfy.remote.runtime-fingerprint={runtime_fingerprint}",
+        f"{RUNTIME_FINGERPRINT_LABEL}={runtime_fingerprint}",
+    ]
+    if dependency_fingerprint is not None:
+        command.extend(
+            ("--label", f"{DEPENDENCY_FINGERPRINT_LABEL}={dependency_fingerprint}")
+        )
+    if pull:
+        command.append("--pull")
+    command.extend(("-t", image_tag, "-"))
+    return tuple(command)
+
+
+def _docker_dependency_build_command(
+    image_tag: str,
+    dependency_fingerprint: str,
+) -> tuple[str, ...]:
+    """Return the Docker command for a stable registry-backed dependency base."""
+    return (
+        "docker",
+        "build",
+        "--platform",
+        VAST_WORKER_PLATFORM,
+        "--pull",
+        "--label",
+        f"{DEPENDENCY_FINGERPRINT_LABEL}={dependency_fingerprint}",
         "-t",
         image_tag,
         "-",
     )
+
+
+def _image_repository(image_tag: str) -> str:
+    """Return an image repository with any tag or digest removed."""
+    without_digest = image_tag.split("@", maxsplit=1)[0]
+    final_slash = without_digest.rfind("/")
+    final_colon = without_digest.rfind(":")
+    return (
+        without_digest[:final_colon]
+        if final_colon > final_slash
+        else without_digest
+    )
+
+
+def _dependency_image_tag(image_tag: str, dependency_fingerprint: str) -> str:
+    """Return the stable registry tag for one dependency manifest."""
+    return f"{_image_repository(image_tag)}:deps-{dependency_fingerprint[:16]}"
+
+
+def _local_image_label(image: str, label: str) -> str | None:
+    """Return one local Docker image label when the image is inspectable."""
+    try:
+        value = _run(
+            (
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                f'{{{{index .Config.Labels "{label}"}}}}',
+                image,
+            )
+        )
+    except RuntimeError:
+        return None
+    return value or None
+
+
+def _pull_current_dependency(image: str, dependency_fingerprint: str) -> bool:
+    """Pull and validate a reusable dependency image from its registry."""
+    logger.info("Checking registry for Vast worker dependency image tag=%s.", image)
+    try:
+        _run(
+            ("docker", "pull", "--platform", VAST_WORKER_PLATFORM, image),
+            capture_stdout=False,
+        )
+    except RuntimeError:
+        logger.info(
+            "No reusable Vast worker dependency image was pulled tag=%s.",
+            image,
+        )
+        return False
+    actual = _local_image_label(image, DEPENDENCY_FINGERPRINT_LABEL)
+    if actual == dependency_fingerprint:
+        logger.info(
+            "Reusing registry-backed Vast worker dependency image tag=%s.",
+            image,
+        )
+        return True
+    logger.warning(
+        "Ignoring Vast dependency image with unexpected label tag=%s expected=%s "
+        "actual=%s.",
+        image,
+        dependency_fingerprint[:12],
+        (actual or "missing")[:12],
+    )
+    return False
+
+
+def _repository_digest(image_tag: str) -> str:
+    """Resolve one pushed or pulled tag to an immutable repository digest."""
+    repository_digests = _run(
+        (
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{join .RepoDigests \"\\n\"}}",
+            image_tag,
+        )
+    )
+    repository = _image_repository(image_tag)
+    digest = next(
+        (
+            line
+            for line in repository_digests.splitlines()
+            if line.startswith(f"{repository}@sha256:")
+        ),
+        None,
+    )
+    if digest is None:
+        raise RuntimeError(
+            "Registry operation succeeded but no repository digest is available "
+            f"for {image_tag}."
+        )
+    return digest
 
 
 def build_image(
@@ -294,44 +433,64 @@ def build_image(
             f"{expected_fingerprint[:12]}, found {identity.fingerprint[:12]}. "
             "Restart ComfyUI before publishing a replacement worker image."
         )
-    context = export_worker_image_context(
+    dependency_fingerprint = remote_runtime_dependency_fingerprint(identity)
+    dependency_tag = _dependency_image_tag(image_tag, dependency_fingerprint)
+    if not _pull_current_dependency(dependency_tag, dependency_fingerprint):
+        dependency_context = export_worker_dependency_image_context(
+            repo_root=repo_root,
+            settings=settings,
+        )
+        logger.info(
+            "Building Vast worker dependency image tag=%s fingerprint=%s "
+            "context_bytes=%d.",
+            dependency_tag,
+            dependency_fingerprint,
+            len(dependency_context),
+        )
+        _run(
+            _docker_dependency_build_command(
+                dependency_tag,
+                dependency_fingerprint,
+            ),
+            input_payload=dependency_context,
+            capture_stdout=False,
+        )
+        if push:
+            logger.info("Pushing Vast worker dependency image tag=%s.", dependency_tag)
+            _run(("docker", "push", dependency_tag), capture_stdout=False)
+    dependency_image = (
+        _repository_digest(dependency_tag) if push else dependency_tag
+    )
+    context = export_worker_source_overlay_context(
         repo_root=repo_root,
         settings=settings,
         identity=identity,
+        dependency_image=dependency_image,
     )
     logger.info(
-        "Building Vast worker image tag=%s fingerprint=%s context_bytes=%d.",
+        "Applying Vast worker source overlay tag=%s fingerprint=%s "
+        "dependency_image=%s context_bytes=%d.",
         image_tag,
         identity.fingerprint,
+        dependency_image,
         len(context),
     )
     _run(
-        _docker_build_command(image_tag, identity.fingerprint),
+        _docker_build_command(
+            image_tag,
+            identity.fingerprint,
+            dependency_fingerprint=dependency_fingerprint,
+        ),
         input_payload=context,
+        capture_stdout=False,
     )
     logger.info("Finished building Vast worker image tag=%s.", image_tag)
     if not push:
         return image_tag
     logger.info("Pushing Vast worker image tag=%s.", image_tag)
-    _run(("docker", "push", image_tag))
+    _run(("docker", "push", image_tag), capture_stdout=False)
     logger.info("Resolving immutable digest for Vast worker image tag=%s.", image_tag)
-    repository_digests = _run(
-        (
-            "docker",
-            "image",
-            "inspect",
-            "--format",
-            "{{join .RepoDigests \"\\n\"}}",
-            image_tag,
-        )
-    )
-    digest = next(
-        (line for line in repository_digests.splitlines() if "@sha256:" in line),
-        None,
-    )
-    if digest is None:
-        raise RuntimeError("Registry push succeeded but no repository digest is available.")
-    return digest
+    return _repository_digest(image_tag)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

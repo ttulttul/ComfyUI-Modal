@@ -126,7 +126,7 @@ def test_build_stops_before_docker_when_expected_source_changed(
     )
     monkeypatch.setattr(
         module,
-        "export_worker_image_context",
+        "export_worker_dependency_image_context",
         lambda **_kwargs: pytest.fail("build context was exported after source drift"),
     )
 
@@ -151,11 +151,111 @@ def test_docker_build_targets_vast_x86_64_platform() -> None:
         "runtime-fingerprint",
     )
 
-    assert command[:5] == (
+    assert command[:4] == (
         "docker",
         "build",
-        "--pull",
         "--platform",
         "linux/amd64",
     )
     assert "comfy.remote.runtime-fingerprint=runtime-fingerprint" in command
+    assert "--pull" not in command
+
+
+def test_dependency_tag_uses_stable_fingerprint_in_same_repository() -> None:
+    """Source builds should share a registry base keyed only by dependencies."""
+    module = _module()
+
+    assert module._dependency_image_tag(
+        "registry.example:5443/team/worker:v1",
+        "cafebabe" * 8,
+    ) == "registry.example:5443/team/worker:deps-cafebabecafebabe"
+
+
+def test_run_can_inherit_stdout_for_live_docker_progress(monkeypatch: Any) -> None:
+    """Push output must not be buffered until the publication process exits."""
+    module = _module()
+    observed: dict[str, Any] = {}
+
+    def fake_run(*args: Any, **kwargs: Any) -> Any:
+        """Record subprocess output routing and report success."""
+        observed.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout=None)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert (
+        module._run(
+            ("docker", "push", "example/worker:v1"),
+            capture_stdout=False,
+        )
+        == ""
+    )
+    assert observed["stdout"] is None
+
+
+def test_build_publishes_dependency_base_then_small_source_overlay(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A missing dependency base should be pushed once and referenced by digest."""
+    module = _module()
+    identity = SimpleNamespace(fingerprint="a" * 64, manifest={})
+    settings = SimpleNamespace(comfyui_root=tmp_path, custom_nodes_dir=tmp_path)
+    calls: list[tuple[tuple[str, ...], bytes | None, bool]] = []
+    overlay_inputs: dict[str, Any] = {}
+    monkeypatch.setattr(module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        module,
+        "build_remote_runtime_identity",
+        lambda **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        module,
+        "remote_runtime_dependency_fingerprint",
+        lambda _identity: "b" * 64,
+    )
+    monkeypatch.setattr(module, "_pull_current_dependency", lambda *_args: False)
+    monkeypatch.setattr(
+        module,
+        "export_worker_dependency_image_context",
+        lambda **_kwargs: b"dependency-context",
+    )
+
+    def overlay_context(**kwargs: Any) -> bytes:
+        """Record the immutable base used by the source overlay."""
+        overlay_inputs.update(kwargs)
+        return b"source-context"
+
+    monkeypatch.setattr(module, "export_worker_source_overlay_context", overlay_context)
+
+    def fake_run(
+        command: Any,
+        *,
+        input_payload: bytes | None = None,
+        capture_stdout: bool = True,
+    ) -> str:
+        """Record Docker calls and synthesize repository digests."""
+        normalized = tuple(command)
+        calls.append((normalized, input_payload, capture_stdout))
+        if normalized[:3] == ("docker", "image", "inspect"):
+            repository = module._image_repository(normalized[-1])
+            return f"{repository}@sha256:" + "c" * 64
+        return ""
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.build_image("ghcr.io/example/worker:v1", push=True)
+
+    dependency_tag = "ghcr.io/example/worker:deps-" + "b" * 16
+    dependency_digest = "ghcr.io/example/worker@sha256:" + "c" * 64
+    assert result == dependency_digest
+    assert overlay_inputs["dependency_image"] == dependency_digest
+    assert calls[0][0] == module._docker_dependency_build_command(
+        dependency_tag,
+        "b" * 64,
+    )
+    assert calls[0][1:] == (b"dependency-context", False)
+    assert ("docker", "push", dependency_tag) in [call[0] for call in calls]
+    overlay_build = next(call for call in calls if call[1] == b"source-context")
+    assert "comfy.remote.runtime-fingerprint=" + "a" * 64 in overlay_build[0]
+    assert overlay_build[2] is False

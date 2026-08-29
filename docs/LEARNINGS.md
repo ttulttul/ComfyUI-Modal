@@ -1,5 +1,14 @@
 # Learnings
 
+## 2026-08-29: Vast publication cost is dominated by stable dependencies
+
+- The observed cold OrbStack publication spent about 274 seconds building and 165 seconds pushing. Runtime/PyTorch/CUDA and vLLM package layers accounted for most build time and bytes; the Ubuntu root layer and source copy were comparatively small. Changing Linux distributions would not materially address this path.
+- Publish the stable dependency stage under a dependency-fingerprint registry tag and build the frequently changing source layer from its immutable digest. The first cold publication still pays the full dependency cost, while subsequent source-only drift avoids reinstalling and repushing roughly six gigabytes of unchanged layers.
+- Install the selected pinned PyTorch/CUDA layers before general ComfyUI and custom-node requirements. Installing them afterward can make the explicit Torch step a misleading no-op because an earlier package already resolved a transitive Torch build.
+- Bump the explicit dependency-layer version when changing installation order or Dockerfile behavior even if package pins are unchanged; otherwise retained SSH dependency images keep the old construction semantics under the same fingerprint.
+- Inspect the public OCI manifest and platform config label before requesting Vast capacity. Manifest/config metadata is only kilobytes, so stale publication can be repaired before a billable GPU is rented without pulling the image locally.
+- Docker build and push subprocesses must inherit the publication script's output streams. The parent process can then forward progress into ComfyUI instead of appearing wedged during a multi-minute push.
+
 ## 2026-08-28: A matching protocol number cannot make a stale Vast worker safe
 
 - A newly rented Vast instance can still report the same old runtime fingerprint as a destroyed instance because `COMFY_MODAL_VAST_IMAGE` is an immutable registry digest; destroying capacity does not rebuild that image.
