@@ -119,6 +119,26 @@ from settings import (  # noqa: E402 - paths are bootstrapped above.
     get_settings,
     modal_deployment_app_name,
 )
+try:  # noqa: E402 - support package and flat Modal-container imports.
+    from .cloud_runtime_context import (
+        interrupt_flag_store,
+        invocation_record_store,
+        node_output_cache_store,
+        register_cloud_runtime_stores,
+        session_bridge_store,
+        snapshot_profile_store,
+        volume_store,
+    )
+except ImportError:  # pragma: no cover - exercised by flat cloud imports.
+    from cloud_runtime_context import (
+        interrupt_flag_store,
+        invocation_record_store,
+        node_output_cache_store,
+        register_cloud_runtime_stores,
+        session_bridge_store,
+        snapshot_profile_store,
+        volume_store,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -411,7 +431,7 @@ def _payload_remote_session_handle(
 
 def _session_bridge_store() -> Any:
     """Return the durable store used to replay session-backed outputs across containers."""
-    shared_store = globals().get("session_bridge_cache")
+    shared_store = session_bridge_store()
     return shared_store if shared_store is not None else _REMOTE_SESSION_BRIDGE_STORE
 
 
@@ -427,7 +447,7 @@ def _durable_object_store() -> FileDurableObjectStore:
         committed_read_callback: Callable[[str], bytes] | None = None
         if _is_modal_container_runtime():
             object_root = Path(settings.remote_storage_root) / "durable_objects"
-            volume = globals().get("vol")
+            volume = volume_store()
             volume_commit = getattr(volume, "commit", None)
             if callable(volume_commit):
                 commit_callback = volume_commit
@@ -451,7 +471,7 @@ def _durable_object_store() -> FileDurableObjectStore:
 
 def _invocation_record_store() -> Any:
     """Return the shared lifecycle store for idempotent remote invocations."""
-    shared_store = globals().get("invocation_records")
+    shared_store = invocation_record_store()
     return shared_store if shared_store is not None else _REMOTE_INVOCATION_STORE
 
 
@@ -948,7 +968,7 @@ def _execute_canary_payload(
 
 def _snapshot_profile_store() -> Any | None:
     """Return the shared store used to look up snapshot loader-prewarm profiles."""
-    return globals().get("snapshot_profiles")
+    return snapshot_profile_store()
 
 
 def _load_loader_snapshot_profile(snapshot_profile_key: str) -> list[dict[str, Any]]:
@@ -2577,8 +2597,9 @@ def _registered_remote_execution(
     try:
         yield control
     finally:
-        if modal is not None and "interrupt_flags" in globals():
-            interrupt_flags.pop(control.interrupt_flag_key, None)
+        interrupt_store = interrupt_flag_store()
+        if modal is not None and interrupt_store is not None:
+            interrupt_store.pop(control.interrupt_flag_key, None)
 
 
 @contextmanager
@@ -3915,7 +3936,7 @@ def _node_output_cache_store() -> Any | None:
     """Return the shared Modal Dict used for persisted transport-safe node outputs."""
     if modal is None:
         return None
-    return globals().get("node_output_cache")
+    return node_output_cache_store()
 
 
 def _node_output_cache_key_preview(
@@ -7745,6 +7766,14 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
     snapshot_profiles = modal.Dict.from_name(
         settings.snapshot_profile_dict_name,
         create_if_missing=True,
+    )
+    register_cloud_runtime_stores(
+        session_bridge_cache=session_bridge_cache,
+        invocation_records=invocation_records,
+        volume=vol,
+        snapshot_profiles=snapshot_profiles,
+        node_output_cache=node_output_cache,
+        interrupt_flags=interrupt_flags,
     )
     custom_node_packages = _custom_node_runtime_packages(settings.custom_nodes_dir)
     torch_build = _select_remote_torch_build(settings.modal_gpu)

@@ -74,7 +74,10 @@ def test_modal_durable_store_reads_committed_object_without_volume_reload(
             raise AssertionError("Volume.reload() must not serve durable object reads.")
 
     volume = FakeVolume()
-    monkeypatch.setattr(runtime_module, "vol", volume, raising=False)
+    if module_fixture_name == "modal_cloud_module":
+        monkeypatch.setattr(runtime_module, "volume_store", lambda: volume)
+    else:
+        monkeypatch.setattr(runtime_module, "vol", volume, raising=False)
     monkeypatch.setattr(runtime_module, "_DURABLE_OBJECT_STORE", None)
     monkeypatch.setenv("COMFY_MODAL_REMOTE_STORAGE_ROOT", str(tmp_path / "storage"))
     if module_fixture_name == "modal_cloud_module":
@@ -98,7 +101,7 @@ def test_cloud_invocation_replays_completed_result_without_reexecution(
 ) -> None:
     """A client retry should receive the first completed result without rerunning work."""
     invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
     execution_count = 0
@@ -134,7 +137,7 @@ def test_cloud_invocation_offloads_large_result_and_retries_failures(
     """Large results should use object storage and failed attempts should remain retryable."""
     invocation_store = modal_cloud_module.InMemoryRemoteInvocationStore()
     object_store = modal_cloud_module.FileDurableObjectStore(tmp_path)
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setenv("COMFY_MODAL_INVOCATION_RESULT_INLINE_MAX_BYTES", "1")
@@ -191,7 +194,7 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
         object_store.put("bridge_outputs", b"bridge-result")
         return serialized_outputs
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(modal_cloud_module, "execute_node_locally", execute_node_locally)
@@ -235,7 +238,7 @@ def test_cloud_stream_logs_result_persistence_and_transport_boundaries(
         "component_id": "component-timing",
     }
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
@@ -278,7 +281,7 @@ def test_cloud_invocation_waits_for_active_attempt_and_replays_result(
         )
     )
     serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 1.0)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_POLL_SECONDS", 0.005)
@@ -356,7 +359,7 @@ def test_cloud_stream_abandonment_cancels_and_retries_failed_attempt(
         finally:
             worker_stopped.set()
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
@@ -410,7 +413,7 @@ def test_cloud_stream_close_after_result_preserves_completed_record(
     serialized_outputs = modal_cloud_module.serialize_node_outputs(("completed",))
     invocation_id = "RIV_close_after_result"
 
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     monkeypatch.setattr(modal_cloud_module, "_DURABLE_OBJECT_STORE", object_store)
     monkeypatch.setattr(
@@ -446,7 +449,7 @@ def test_cloud_invocation_rejects_duplicate_active_attempt(
             updated_at=time.time(),
         )
     )
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", None, raising=False)
+    monkeypatch.setattr(modal_cloud_module, "invocation_record_store", lambda: None)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_STORE", invocation_store)
     monkeypatch.setattr(modal_cloud_module, "_REMOTE_INVOCATION_RETRY_WAIT_SECONDS", 0.0)
 
@@ -552,7 +555,9 @@ def test_cloud_canary_barrier_coordinates_shared_store_members(
     barrier_store: dict[str, Any] = {
         "CANARY_BARRIER:barrier-1:member-b": {"ready_at": time.time()}
     }
-    monkeypatch.setattr(modal_cloud_module, "invocation_records", barrier_store, raising=False)
+    monkeypatch.setattr(
+        modal_cloud_module, "invocation_record_store", lambda: barrier_store
+    )
 
     released_at = modal_cloud_module._wait_for_canary_barrier(
         {

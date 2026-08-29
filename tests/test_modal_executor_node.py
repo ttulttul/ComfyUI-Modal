@@ -14945,7 +14945,9 @@ def test_modal_cloud_registered_execution_preserves_pre_start_interrupt_flags(
 
     interrupt_flags = FakeInterruptFlags()
     monkeypatch.setattr(modal_cloud_module, "modal", object())
-    monkeypatch.setattr(modal_cloud_module, "interrupt_flags", interrupt_flags, raising=False)
+    monkeypatch.setattr(
+        modal_cloud_module, "interrupt_flag_store", lambda: interrupt_flags
+    )
 
     with modal_cloud_module._registered_remote_execution(
         {"prompt_id": "prompt-1", "component_id": "component-2"}
