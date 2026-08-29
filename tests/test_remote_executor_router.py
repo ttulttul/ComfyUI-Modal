@@ -45,6 +45,43 @@ def test_router_rejects_unknown_provider(remote_executor_router_module: Any) -> 
         )
 
 
+def test_router_threads_queue_time_vast_runtime_expectation(
+    remote_executor_router_module: Any,
+    settings_module: Any,
+    vast_service_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-invocation construction should use the fingerprint captured at planning."""
+    fingerprint = "f" * 64
+    image = "ghcr.io/example/worker@sha256:" + "a" * 64
+    observed: dict[str, Any] = {}
+    executor = SimpleNamespace()
+
+    def fake_from_environment(_settings: Any, **kwargs: Any) -> Any:
+        """Capture the explicit runtime expectation and return a fake service."""
+        observed.update(kwargs)
+        return SimpleNamespace(executor=lambda: executor)
+
+    monkeypatch.setattr(settings_module, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        vast_service_module.VastService,
+        "from_environment",
+        fake_from_environment,
+    )
+
+    client = remote_executor_router_module.RemoteExecutorRouterClient()._client_for_payload(
+        {
+            "execution_provider": "vast",
+            "vast_runtime_fingerprint": fingerprint,
+            "vast_worker_image": image,
+        }
+    )
+
+    assert client is executor
+    assert observed["runtime_fingerprint"] == fingerprint
+    assert observed["worker_image"] == image
+
+
 def test_router_records_successful_component_runtime(
     remote_executor_router_module: Any,
     settings_module: Any,

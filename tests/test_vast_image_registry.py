@@ -116,9 +116,10 @@ def test_published_fingerprint_reads_linux_amd64_config_label(
 
     monkeypatch.setattr(module, "urlopen", fake_urlopen)
 
-    actual = module.published_runtime_fingerprint("ghcr.io/team/worker:v1")
+    metadata = module.published_image_metadata("ghcr.io/team/worker:v1")
 
-    assert actual == expected_fingerprint
+    assert metadata.runtime_fingerprint == expected_fingerprint
+    assert metadata.immutable_image == f"ghcr.io/team/worker@{platform_digest}"
     assert len(requested_urls) == 5
 
 

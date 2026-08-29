@@ -172,6 +172,8 @@ def test_vast_provider_metadata_exposes_safe_markdown_fields(
             gpu_ram_mb=143771,
             hourly_cost_usd=3.88,
             idle_retention_seconds=3600,
+            runtime_fingerprint="f" * 64,
+            worker_image="ghcr.io/example/worker@sha256:" + "a" * 64,
         )
     )
 
@@ -184,4 +186,6 @@ def test_vast_provider_metadata_exposes_safe_markdown_fields(
         "vast_gpu_ram_mb": 143771,
         "vast_hourly_cost_usd": 3.88,
         "vast_idle_retention_seconds": 3600,
+        "vast_runtime_fingerprint": "f" * 64,
+        "vast_worker_image": "ghcr.io/example/worker@sha256:" + "a" * 64,
     }

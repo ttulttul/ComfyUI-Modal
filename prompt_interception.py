@@ -488,9 +488,25 @@ def _resolve_vast_service(state: _PromptRewriteState) -> None:
     ):
         return
     try:
+        runtime_fingerprints = {
+            lease.runtime_fingerprint for lease in state.vast_leases.values()
+        }
+        worker_images = {
+            lease.worker_image
+            for lease in state.vast_leases.values()
+            if lease.worker_image is not None
+        }
+        runtime_fingerprint = (
+            next(iter(runtime_fingerprints))
+            if len(runtime_fingerprints) == 1
+            else None
+        )
+        worker_image = next(iter(worker_images)) if len(worker_images) == 1 else None
         state.vast_service = VastService.from_environment(
             state.settings,
             repo_root=Path(__file__).resolve().parent,
+            runtime_fingerprint=runtime_fingerprint,
+            worker_image=worker_image,
         )
         state.vast_leases = {
             assignment.environment_id: state.vast_service.lease_for_environment_id(

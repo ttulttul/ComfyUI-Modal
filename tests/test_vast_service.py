@@ -116,6 +116,43 @@ def test_from_environment_requires_credential_before_other_setup(
         raise AssertionError("Missing Vast credential was accepted.")
 
 
+def test_from_environment_reuses_queue_time_runtime_expectation(
+    vast_service_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Execution construction should not hash a moving local source tree again."""
+    fingerprint = "f" * 64
+    image = "ghcr.io/example/worker@sha256:" + "a" * 64
+    settings = SimpleNamespace(
+        app_name="test-owner",
+        modal_gpu="RTX-PRO-6000",
+        comfyui_root=tmp_path / "ComfyUI",
+        custom_nodes_dir=None,
+    )
+    monkeypatch.setattr(
+        vast_service_module,
+        "discover_comfyui_user_directory",
+        lambda _settings: tmp_path,
+    )
+    monkeypatch.setattr(
+        vast_service_module,
+        "build_vast_runtime_identity",
+        lambda **_kwargs: pytest.fail("runtime identity was recomputed"),
+    )
+
+    service = vast_service_module.VastService.from_environment(
+        settings,
+        repo_root=tmp_path,
+        environment={"VAST_API_KEY": "secret"},
+        runtime_fingerprint=fingerprint,
+        worker_image=image,
+    )
+
+    assert service.runtime_configuration.runtime_fingerprint == fingerprint
+    assert service.runtime_configuration.image == image
+
+
 def test_sync_engine_keeps_vast_lease_active_during_r2_writeback(
     settings_module: Any,
     vast_service_module: Any,
@@ -654,6 +691,35 @@ def test_preflight_rebuilds_stale_image_before_capacity_request(
     assert builder.calls == [("ghcr.io/example/worker:v1", "a" * 64)]
     assert adopted == ["ghcr.io/example/worker@sha256:" + "d" * 64]
     assert messages[-1] == "Vast worker image updated before requesting capacity"
+
+
+def test_acquire_preflights_an_existing_lease(
+    vast_service_module: Any,
+) -> None:
+    """Lease reuse must resolve and validate its immutable image before readiness."""
+    service = object.__new__(vast_service_module.VastService)
+    preflight_calls: list[Any] = []
+    acquired_lease = SimpleNamespace(instance_id=42)
+
+    async def preflight(*, status_callback: Any) -> None:
+        """Record the registry validation that precedes lease reuse."""
+        preflight_calls.append(status_callback)
+
+    async def acquire_with_replacement(*_args: Any, **_kwargs: Any) -> Any:
+        """Return one already quoted lease without provider work."""
+        return acquired_lease
+
+    service._preflight_published_image = preflight
+    service._acquire_with_replacement = acquire_with_replacement
+    quote = SimpleNamespace(
+        profile=SimpleNamespace(),
+        existing_lease=acquired_lease,
+    )
+
+    result = asyncio.run(service.acquire(quote))
+
+    assert result is acquired_lease
+    assert preflight_calls == [None]
 
 
 def test_proxy_endpoint_promotion_persists_the_working_route(

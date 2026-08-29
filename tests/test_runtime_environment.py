@@ -57,6 +57,21 @@ def _runtime_identity(
     )
 
 
+def _vast_runtime_identity(
+    runtime_environment_module: Any,
+    repo_root: Path,
+    comfyui_root: Path,
+    **settings_overrides: Any,
+) -> Any:
+    """Build one Vast image identity from small temporary source trees."""
+    return runtime_environment_module.build_vast_runtime_identity(
+        repo_root=repo_root,
+        comfyui_root=comfyui_root,
+        custom_nodes_dir=None,
+        settings=_runtime_settings(**settings_overrides),
+    )
+
+
 def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> None:
     """The supported Python, ComfyUI, and CUDA environments should not float."""
     apt_packages = runtime_environment_module.remote_apt_packages()
@@ -204,7 +219,7 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
     runtime_environment_module: Any,
     tmp_path: Path,
 ) -> None:
-    """Code or deployment-option changes should produce a different fingerprint."""
+    """Modal code or deployment-option changes should alter its cache key."""
     repo_root = tmp_path / "repo"
     comfyui_root = tmp_path / "ComfyUI"
     repo_root.mkdir()
@@ -216,9 +231,6 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
 
     baseline = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
     assert baseline == _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
-
-    repo_source.write_text("VALUE = 2\n", encoding="utf-8")
-    source_changed = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
     option_changed = _runtime_identity(
         runtime_environment_module,
         repo_root,
@@ -237,6 +249,8 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
         comfyui_root,
         llm_vllm_execution_mode="throughput",
     )
+    repo_source.write_text("VALUE = 2\n", encoding="utf-8")
+    source_changed = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
 
     assert source_changed.fingerprint != baseline.fingerprint
     assert (
@@ -247,13 +261,49 @@ def test_runtime_identity_changes_with_source_and_runtime_options(
             baseline
         )
     )
-    assert option_changed.fingerprint != source_changed.fingerprint
-    assert secret_changed.fingerprint != source_changed.fingerprint
+    assert option_changed.fingerprint != baseline.fingerprint
+    assert secret_changed.fingerprint != baseline.fingerprint
     assert vllm_mode_changed.fingerprint != baseline.fingerprint
     assert baseline.manifest["runtime_options"]["llm_vllm_execution_mode"] == "auto"
     assert secret_changed.manifest["runtime_options"]["modal_secret_name"] == (
         "workflow-credentials"
     )
+
+
+def test_vast_runtime_identity_ignores_modal_only_deployment_options(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+) -> None:
+    """Vast identity should describe image bytes, not Modal orchestration knobs."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    repo_root.mkdir()
+    comfyui_root.mkdir()
+    (repo_root / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    baseline = _vast_runtime_identity(
+        runtime_environment_module,
+        repo_root,
+        comfyui_root,
+    )
+    different_gpu = _vast_runtime_identity(
+        runtime_environment_module,
+        repo_root,
+        comfyui_root,
+        modal_gpu="L40S",
+    )
+    different_modal_settings = _vast_runtime_identity(
+        runtime_environment_module,
+        repo_root,
+        comfyui_root,
+        app_name="another-app",
+        max_containers=8,
+        modal_secret_name="workflow-credentials",
+    )
+
+    assert different_gpu.fingerprint == baseline.fingerprint
+    assert different_modal_settings.fingerprint == baseline.fingerprint
+    assert "runtime_options" not in baseline.manifest
 
 
 def test_runtime_identity_tracks_curated_llm_profile_registry(

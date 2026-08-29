@@ -524,7 +524,7 @@ def _tree_digest(
 
 
 def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
-    """Return deployment settings that materially shape the remote runtime."""
+    """Return deployment settings that shape a configured Modal application."""
     return {
         "app_name": settings.app_name,
         "buffer_containers": settings.buffer_containers,
@@ -534,18 +534,12 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
         "invocation_dict_name": settings.invocation_dict_name,
         "invocation_result_inline_max_bytes": settings.invocation_result_inline_max_bytes,
         "interrupt_dict_name": settings.interrupt_dict_name,
-        "loader_prewarm_workers": getattr(
-            settings,
-            "loader_prewarm_workers",
-            2,
-        ),
+        "loader_prewarm_workers": getattr(settings, "loader_prewarm_workers", 2),
         "max_containers": settings.max_containers,
         "min_containers": settings.min_containers,
         "modal_gpu": settings.modal_gpu,
         "modal_secret_name": getattr(
-            settings,
-            "modal_secret_name",
-            DEFAULT_MODAL_SECRET_NAME,
+            settings, "modal_secret_name", DEFAULT_MODAL_SECRET_NAME
         ),
         "node_output_cache_dict_name": settings.node_output_cache_dict_name,
         "remote_storage_root": settings.remote_storage_root,
@@ -570,23 +564,21 @@ def _runtime_options(settings: RemoteRuntimeSettings) -> dict[str, Any]:
             "auto",
         ),
         "llm_memory_recovery_timeout_seconds": getattr(
-            settings,
-            "llm_memory_recovery_timeout_seconds",
-            15.0,
+            settings, "llm_memory_recovery_timeout_seconds", 15.0
         ),
     }
 
 
-def build_remote_runtime_identity(
+def _remote_image_manifest(
     *,
     repo_root: Path,
     comfyui_root: Path | None,
     custom_nodes_dir: Path | None,
     settings: RemoteRuntimeSettings,
-) -> RemoteRuntimeIdentity:
-    """Build the deterministic identity expected from one deployed Modal runtime."""
+) -> dict[str, Any]:
+    """Return the dependency and source inputs copied into a remote image."""
     torch_build = select_remote_torch_build(settings.modal_gpu)
-    manifest: dict[str, Any] = {
+    return {
         "protocol_version": REMOTE_APP_PROTOCOL_VERSION,
         "dependency_layer_version": REMOTE_RUNTIME_DEPENDENCY_LAYER_VERSION,
         "python_version": REMOTE_PYTHON_VERSION,
@@ -622,8 +614,11 @@ def build_remote_runtime_identity(
             included_top_level_directories=COMFYUI_RUNTIME_SOURCE_DIRECTORIES,
             include_all_files_in_top_level_directories=True,
         ),
-        "runtime_options": _runtime_options(settings),
     }
+
+
+def _identity_for_manifest(manifest: dict[str, Any]) -> RemoteRuntimeIdentity:
+    """Hash one diagnostic manifest into a deterministic runtime identity."""
     canonical_manifest = json.dumps(
         manifest,
         sort_keys=True,
@@ -632,4 +627,40 @@ def build_remote_runtime_identity(
     return RemoteRuntimeIdentity(
         fingerprint=hashlib.sha256(canonical_manifest).hexdigest(),
         manifest=manifest,
+    )
+
+
+def build_remote_runtime_identity(
+    *,
+    repo_root: Path,
+    comfyui_root: Path | None,
+    custom_nodes_dir: Path | None,
+    settings: RemoteRuntimeSettings,
+) -> RemoteRuntimeIdentity:
+    """Build the configured Modal deployment identity."""
+    manifest = _remote_image_manifest(
+        repo_root=repo_root,
+        comfyui_root=comfyui_root,
+        custom_nodes_dir=custom_nodes_dir,
+        settings=settings,
+    )
+    manifest["runtime_options"] = _runtime_options(settings)
+    return _identity_for_manifest(manifest)
+
+
+def build_vast_runtime_identity(
+    *,
+    repo_root: Path,
+    comfyui_root: Path | None,
+    custom_nodes_dir: Path | None,
+    settings: RemoteRuntimeSettings,
+) -> RemoteRuntimeIdentity:
+    """Build the identity of content baked into a Vast worker image."""
+    return _identity_for_manifest(
+        _remote_image_manifest(
+            repo_root=repo_root,
+            comfyui_root=comfyui_root,
+            custom_nodes_dir=custom_nodes_dir,
+            settings=settings,
+        )
     )

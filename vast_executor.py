@@ -36,6 +36,7 @@ if __package__:
         terminate_staging_transport,
     )
     from .vast_leases import VastLeaseRecord, VastLeaseRegistry
+    from .vast_image_reference import vast_worker_images_compatible
     from .vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
     from .vast_ssh import (
         VastSshError,
@@ -65,6 +66,7 @@ else:  # pragma: no cover - direct debugging imports.
         terminate_staging_transport,
     )
     from vast_leases import VastLeaseRecord, VastLeaseRegistry
+    from vast_image_reference import vast_worker_images_compatible
     from vast_runtime import VastRuntimeConfiguration, VastRuntimeManager
     from vast_ssh import VastSshError, VastSshRunner, vast_connection_from_lease
 
@@ -557,6 +559,14 @@ class VastExecutorClient:
         if lease.draining:
             raise VastRemoteInvocationError(
                 f"Assigned Vast lease {instance_id} is draining."
+            )
+        if not vast_worker_images_compatible(
+            self.runtime_configuration.image,
+            lease.worker_image,
+        ):
+            raise VastRemoteInvocationError(
+                f"Assigned Vast lease {instance_id} does not use the expected "
+                "immutable worker image digest."
             )
         runner = (
             self.runner_factory(lease)

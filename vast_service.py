@@ -23,7 +23,7 @@ if __package__:
     )
     from .huggingface_assets import HuggingFaceAssetRegistry
     from .huggingface_discovery import HuggingFaceAssetDiscovery
-    from .runtime_environment import build_remote_runtime_identity
+    from .runtime_environment import build_vast_runtime_identity
     from .r2_cache import R2CacheClient
     from .settings import ModalSyncSettings, discover_comfyui_user_directory
     from .sync_engine import ModalAssetSyncEngine
@@ -34,6 +34,7 @@ if __package__:
         VastWorkerImageBuildError,
         VastWorkerImageBuilder,
     )
+    from .vast_image_reference import vast_worker_images_compatible
     from .vast_leases import (
         VastLeaseManager,
         VastLeaseRecord,
@@ -63,7 +64,7 @@ else:  # pragma: no cover - direct debugging imports.
     )
     from huggingface_assets import HuggingFaceAssetRegistry
     from huggingface_discovery import HuggingFaceAssetDiscovery
-    from runtime_environment import build_remote_runtime_identity
+    from runtime_environment import build_vast_runtime_identity
     from r2_cache import R2CacheClient
     from settings import ModalSyncSettings, discover_comfyui_user_directory
     from sync_engine import ModalAssetSyncEngine
@@ -74,6 +75,7 @@ else:  # pragma: no cover - direct debugging imports.
         VastWorkerImageBuildError,
         VastWorkerImageBuilder,
     )
+    from vast_image_reference import vast_worker_images_compatible
     from vast_leases import (
         VastLeaseManager,
         VastLeaseRecord,
@@ -183,6 +185,8 @@ class VastService:
             modal_gpu=settings.modal_gpu,
         )
         self.update_process_environment = update_process_environment
+        self._published_image_preflight_complete = False
+        self._published_image_preflight_lock = asyncio.Lock()
         self.huggingface_asset_registry = (
             HuggingFaceAssetRegistry.for_user_directory(self.user_directory)
         )
@@ -215,6 +219,8 @@ class VastService:
         *,
         repo_root: Path,
         environment: Mapping[str, str] | None = None,
+        runtime_fingerprint: str | None = None,
+        worker_image: str | None = None,
     ) -> "VastService":
         """Resolve credentials, runtime identity, and local state from the environment."""
         source = os.environ if environment is None else environment
@@ -228,15 +234,19 @@ class VastService:
             raise RuntimeError(
                 "Vast.ai execution requires a persistent ComfyUI user directory."
             )
-        identity = build_remote_runtime_identity(
-            repo_root=repo_root,
-            comfyui_root=settings.comfyui_root,
-            custom_nodes_dir=settings.custom_nodes_dir,
-            settings=settings,
-        )
+        expected_fingerprint = runtime_fingerprint
+        if expected_fingerprint is None:
+            identity = build_vast_runtime_identity(
+                repo_root=repo_root,
+                comfyui_root=settings.comfyui_root,
+                custom_nodes_dir=settings.custom_nodes_dir,
+                settings=settings,
+            )
+            expected_fingerprint = identity.fingerprint
         runtime = VastRuntimeConfiguration.from_environment(
-            identity.fingerprint,
+            expected_fingerprint,
             environment=source,
+            image=worker_image,
         )
         base_url = str(source.get(VAST_API_BASE_URL_ENV) or "").strip()
         api_client = (
@@ -446,8 +456,7 @@ class VastService:
         status_callback: Callable[[str], None] | None = None,
     ) -> VastLeaseRecord:
         """Reuse or rent the selected quoted profile capacity slot."""
-        if quote.existing_lease is None:
-            await self._preflight_published_image(status_callback=status_callback)
+        await self._preflight_published_image(status_callback=status_callback)
         if status_callback is not None:
             status_callback("Requesting Vast.ai capacity")
 
@@ -471,19 +480,32 @@ class VastService:
         status_callback: Callable[[str], None] | None,
     ) -> None:
         """Publish current runtime source before any billable Vast capacity request."""
-        configured_image = self.runtime_configuration.image
-        expected_fingerprint = self.runtime_configuration.runtime_fingerprint
-        image = await asyncio.to_thread(
-            self.image_builder.ensure_published_image,
-            configured_image,
-            expected_fingerprint,
-            status_callback=status_callback,
-        )
-        if image == configured_image:
+        if getattr(self, "_published_image_preflight_complete", False):
             return
-        self._adopt_runtime_image(image)
-        if status_callback is not None:
-            status_callback("Vast worker image updated before requesting capacity")
+        if not hasattr(self, "_published_image_preflight_complete"):
+            self._published_image_preflight_complete = False
+        preflight_lock = getattr(self, "_published_image_preflight_lock", None)
+        if preflight_lock is None:
+            preflight_lock = asyncio.Lock()
+            self._published_image_preflight_lock = preflight_lock
+        async with preflight_lock:
+            if self._published_image_preflight_complete:
+                return
+            configured_image = self.runtime_configuration.image
+            expected_fingerprint = self.runtime_configuration.runtime_fingerprint
+            image = await asyncio.to_thread(
+                self.image_builder.ensure_published_image,
+                configured_image,
+                expected_fingerprint,
+                status_callback=status_callback,
+            )
+            if image != configured_image:
+                self._adopt_runtime_image(image)
+                if status_callback is not None:
+                    status_callback(
+                        "Vast worker image updated before requesting capacity"
+                    )
+            self._published_image_preflight_complete = True
 
     async def _acquire_with_replacement(
         self,
@@ -896,6 +918,14 @@ class VastService:
             lease.instance_id,
             lease.environment_id,
         )
+        if not vast_worker_images_compatible(
+            self.runtime_configuration.image,
+            lease.worker_image,
+        ):
+            raise ValueError(
+                "Vast lease worker image does not match the expected immutable "
+                "image digest."
+            )
         runtime = VastRuntimeManager(
             runner=self._runner(lease),
             configuration=self.runtime_configuration,
@@ -941,7 +971,10 @@ class VastService:
             if lease.owner_id == self.settings.app_name
             and lease.profile_id == profile.profile_id
             and lease.profile_fingerprint == fingerprint
-            and lease.worker_image in {None, self.runtime_configuration.image}
+            and vast_worker_images_compatible(
+                self.runtime_configuration.image,
+                lease.worker_image,
+            )
             and lease.ready_for_work
         ]
         return min(matches, key=lambda lease: lease.created_at_epoch, default=None)

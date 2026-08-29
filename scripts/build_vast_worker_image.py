@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from runtime_environment import (
-    build_remote_runtime_identity,
+    build_vast_runtime_identity,
     remote_runtime_dependency_fingerprint,
 )
 from settings import get_settings
@@ -417,7 +417,7 @@ def build_image(
                 custom_nodes_dir if custom_nodes_dir.is_dir() else None
             ),
         )
-    identity = build_remote_runtime_identity(
+    identity = build_vast_runtime_identity(
         repo_root=repo_root,
         comfyui_root=settings.comfyui_root,
         custom_nodes_dir=settings.custom_nodes_dir,

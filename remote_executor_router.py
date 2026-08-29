@@ -128,6 +128,11 @@ class RemoteExecutorRouterClient:
             return VastService.from_environment(
                 settings,
                 repo_root=Path(__file__).resolve().parent,
+                runtime_fingerprint=_vast_payload_value(
+                    payload,
+                    "vast_runtime_fingerprint",
+                ),
+                worker_image=_vast_payload_value(payload, "vast_worker_image"),
             ).executor()
         if provider != "ssh_docker":
             raise ValueError(f"Unsupported remote execution provider {provider!r}.")
@@ -153,6 +158,13 @@ class RemoteExecutorRouterClient:
 
 _REMOTE_EXECUTOR_CLIENT_FACTORY: Callable[[], RemoteExecutorClient] = RemoteExecutorRouterClient
 
+
+def _vast_payload_value(payload: Mapping[str, Any], key: str) -> str | None:
+    """Return one non-empty queue-time Vast runtime expectation value."""
+    value = str(payload.get(key) or "").strip()
+    return value or None
+
+
 def set_remote_executor_client_factory(
     factory: Callable[[], RemoteExecutorClient] | None,
 ) -> None:
@@ -164,5 +176,3 @@ def set_remote_executor_client_factory(
 def get_remote_executor_client() -> RemoteExecutorClient:
     """Instantiate the configured execution client."""
     return _REMOTE_EXECUTOR_CLIENT_FACTORY()
-
-

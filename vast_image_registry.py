@@ -42,6 +42,14 @@ class OciImageReference:
     reference: str
 
 
+@dataclass(frozen=True)
+class PublishedImageMetadata:
+    """Describe one published platform image and its baked runtime identity."""
+
+    immutable_image: str | None
+    runtime_fingerprint: str | None
+
+
 def parse_oci_image_reference(image: str) -> OciImageReference:
     """Parse a Docker-compatible image reference for registry HTTP requests."""
     normalized = image.strip()
@@ -86,9 +94,21 @@ def published_runtime_fingerprint(
     timeout_seconds: float = 30.0,
 ) -> str | None:
     """Return the runtime label from a public image's linux/amd64 config."""
+    return published_image_metadata(
+        image,
+        timeout_seconds=timeout_seconds,
+    ).runtime_fingerprint
+
+
+def published_image_metadata(
+    image: str,
+    *,
+    timeout_seconds: float = 30.0,
+) -> PublishedImageMetadata:
+    """Resolve an image to its linux/amd64 digest and baked runtime label."""
     reference = parse_oci_image_reference(image)
     token: str | None = None
-    manifest, token = _registry_json(
+    manifest, token, manifest_digest = _registry_json(
         reference,
         resource=f"manifests/{quote(reference.reference, safe=':')}",
         accept=_MANIFEST_ACCEPT,
@@ -97,7 +117,7 @@ def published_runtime_fingerprint(
     )
     selected_digest = _linux_amd64_digest(manifest)
     if selected_digest is not None:
-        manifest, token = _registry_json(
+        manifest, token, _ = _registry_json(
             reference,
             resource=f"manifests/{quote(selected_digest, safe=':')}",
             accept=_MANIFEST_ACCEPT,
@@ -105,7 +125,7 @@ def published_runtime_fingerprint(
             timeout_seconds=timeout_seconds,
         )
     config_digest = _config_digest(manifest)
-    config, _ = _registry_json(
+    config, _, _ = _registry_json(
         reference,
         resource=f"blobs/{quote(config_digest, safe=':')}",
         accept="application/octet-stream",
@@ -115,11 +135,35 @@ def published_runtime_fingerprint(
     labels = _image_labels(config)
     fingerprint = labels.get(RUNTIME_FINGERPRINT_LABEL)
     logger.info(
-        "Inspected published Vast worker image image=%s fingerprint=%s.",
+        "Inspected published Vast worker image image=%s digest=%s fingerprint=%s.",
         image,
+        selected_digest or manifest_digest or "unknown",
         fingerprint[:12] if isinstance(fingerprint, str) else "missing",
     )
-    return fingerprint if isinstance(fingerprint, str) else None
+    configured_digest = (
+        reference.reference
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", reference.reference)
+        else None
+    )
+    resolved_digest = selected_digest or manifest_digest or configured_digest
+    immutable_image = (
+        f"{_image_name(image)}@{resolved_digest}"
+        if resolved_digest is not None
+        else None
+    )
+    return PublishedImageMetadata(
+        immutable_image=immutable_image,
+        runtime_fingerprint=(fingerprint if isinstance(fingerprint, str) else None),
+    )
+
+
+def _image_name(image: str) -> str:
+    """Return the user-provided registry/repository name without tag or digest."""
+    normalized = image.strip()
+    name = normalized.partition("@")[0]
+    final_slash = name.rfind("/")
+    final_colon = name.rfind(":")
+    return name[:final_colon] if final_colon > final_slash else name
 
 
 def _registry_json(
@@ -129,11 +173,12 @@ def _registry_json(
     accept: str,
     token: str | None,
     timeout_seconds: float,
-) -> tuple[Mapping[str, Any], str | None]:
+) -> tuple[Mapping[str, Any], str | None, str | None]:
     """Fetch one JSON registry resource, obtaining an anonymous token if needed."""
     url = f"https://{reference.registry}/v2/{reference.repository}/{resource}"
     try:
-        return _request_json(url, accept, token, timeout_seconds), token
+        document, digest = _request_json(url, accept, token, timeout_seconds)
+        return document, token, digest
     except HTTPError as error:
         if error.code != 401:
             if error.code == 404:
@@ -168,7 +213,7 @@ def _registry_json(
     query_separator = "&" if "?" in realm else "?"
     token_url = f"{realm}{query_separator}{urlencode(query)}" if query else realm
     try:
-        token_payload = _request_json(
+        token_payload, _ = _request_json(
             token_url,
             "application/json",
             None,
@@ -184,7 +229,12 @@ def _registry_json(
             f"Registry {reference.registry} did not return an anonymous pull token."
         )
     try:
-        document = _request_json(url, accept, resolved_token, timeout_seconds)
+        document, digest = _request_json(
+            url,
+            accept,
+            resolved_token,
+            timeout_seconds,
+        )
     except HTTPError as error:
         if error.code == 404:
             raise VastImageNotFoundError(
@@ -193,7 +243,7 @@ def _registry_json(
         raise VastImageRegistryError(
             f"Registry rejected its pull token with HTTP {error.code}."
         ) from error
-    return document, resolved_token
+    return document, resolved_token, digest
 
 
 def _request_json(
@@ -201,7 +251,7 @@ def _request_json(
     accept: str,
     token: str | None,
     timeout_seconds: float,
-) -> Mapping[str, Any]:
+) -> tuple[Mapping[str, Any], str | None]:
     """Perform one bounded registry request and decode its JSON object."""
     headers = {"Accept": accept, "User-Agent": "ComfyUI-Modal/worker-preflight"}
     if token is not None:
@@ -210,6 +260,12 @@ def _request_json(
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read()
+            response_headers = getattr(response, "headers", None)
+            content_digest = (
+                response_headers.get("Docker-Content-Digest")
+                if response_headers is not None
+                else None
+            )
     except HTTPError:
         raise
     except (OSError, URLError) as error:
@@ -226,7 +282,13 @@ def _request_json(
         raise VastImageRegistryError(
             "Worker image registry returned a non-object response."
         )
-    return document
+    normalized_digest = (
+        content_digest
+        if isinstance(content_digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", content_digest)
+        else None
+    )
+    return document, normalized_digest
 
 
 def _bearer_parameters(challenge: str) -> dict[str, str]:
@@ -278,8 +340,10 @@ def _image_labels(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
 __all__ = [
     "RUNTIME_FINGERPRINT_LABEL",
+    "PublishedImageMetadata",
     "VastImageNotFoundError",
     "VastImageRegistryError",
     "parse_oci_image_reference",
+    "published_image_metadata",
     "published_runtime_fingerprint",
 ]

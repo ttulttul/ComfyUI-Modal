@@ -18,13 +18,13 @@ if __package__:
     from .vast_image_registry import (
         VastImageNotFoundError,
         VastImageRegistryError,
-        published_runtime_fingerprint,
+        published_image_metadata,
     )
 else:  # pragma: no cover - direct debugging imports.
     from vast_image_registry import (
         VastImageNotFoundError,
         VastImageRegistryError,
-        published_runtime_fingerprint,
+        published_image_metadata,
     )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ class VastWorkerImageBuilder:
         """Return a current published image, rebuilding before rental if stale."""
         self._emit(status_callback, "Checking the published Vast worker image")
         try:
-            actual_fingerprint = published_runtime_fingerprint(image)
+            published_image = published_image_metadata(image)
         except VastImageNotFoundError:
             self._emit(
                 status_callback,
@@ -90,9 +90,17 @@ class VastWorkerImageBuilder:
                     f"renting capacity: {exc} Ensure the image is publicly readable."
                 )
             ) from exc
+        actual_fingerprint = published_image.runtime_fingerprint
         if actual_fingerprint == expected_fingerprint:
+            if published_image.immutable_image is None:
+                raise VastWorkerImageBuildError(
+                    self._manual_build_message(
+                        "The registry did not return an immutable linux/amd64 digest "
+                        f"for {image!r}."
+                    )
+                )
             self._emit(status_callback, "Published Vast worker image is current")
-            return image
+            return published_image.immutable_image
         actual_summary = (
             actual_fingerprint[:12]
             if actual_fingerprint is not None

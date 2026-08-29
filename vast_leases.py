@@ -29,6 +29,7 @@ if __package__:
         VastOffer,
         VastResourceProfile,
     )
+    from .vast_image_reference import vast_worker_images_compatible
 else:  # pragma: no cover - direct debugging imports.
     from vast_api import (
         VastApiClient,
@@ -42,6 +43,7 @@ else:  # pragma: no cover - direct debugging imports.
         VastOffer,
         VastResourceProfile,
     )
+    from vast_image_reference import vast_worker_images_compatible
 
 logger = logging.getLogger(__name__)
 
@@ -548,13 +550,11 @@ class VastLeaseManager:
             and lease.profile_id == slot_profile_id
             and lease.profile_fingerprint == fingerprint
             and (
-                (
-                    self.worker_image is None
-                    and lease.runtime_fingerprint == self.runtime_fingerprint
-                )
-                or (
-                    self.worker_image is not None
-                    and lease.worker_image in {None, self.worker_image}
+                lease.runtime_fingerprint == self.runtime_fingerprint
+                if self.worker_image is None
+                else vast_worker_images_compatible(
+                    self.worker_image,
+                    lease.worker_image,
                 )
             )
             and not lease.draining
@@ -578,8 +578,8 @@ class VastLeaseManager:
             refreshed = self._refresh_record(lease, instance)
             if refreshed.runtime_fingerprint != self.runtime_fingerprint:
                 logger.info(
-                    "Adopting compatible Vast lease instance_id=%d from runtime=%s "
-                    "to runtime=%s for unchanged worker image.",
+                    "Aligning compatible Vast lease instance_id=%d from runtime=%s "
+                    "to baked runtime=%s for immutable worker image.",
                     refreshed.instance_id,
                     refreshed.runtime_fingerprint[:12],
                     self.runtime_fingerprint[:12],

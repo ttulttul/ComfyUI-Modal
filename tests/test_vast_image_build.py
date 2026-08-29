@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -87,8 +88,11 @@ def test_builder_reuses_current_published_image_without_building(
     image = "ghcr.io/example/worker@sha256:" + "a" * 64
     monkeypatch.setattr(
         vast_image_build_module,
-        "published_runtime_fingerprint",
-        lambda _image: fingerprint,
+        "published_image_metadata",
+        lambda _image: SimpleNamespace(
+            runtime_fingerprint=fingerprint,
+            immutable_image=image,
+        ),
     )
     builder = vast_image_build_module.VastWorkerImageBuilder(
         repo_root=tmp_path,
@@ -124,8 +128,11 @@ def test_builder_rebuilds_stale_published_image(
     replacement = "ghcr.io/example/worker@sha256:" + "c" * 64
     monkeypatch.setattr(
         vast_image_build_module,
-        "published_runtime_fingerprint",
-        lambda _image: "b" * 64,
+        "published_image_metadata",
+        lambda _image: SimpleNamespace(
+            runtime_fingerprint="b" * 64,
+            immutable_image="ghcr.io/example/worker@sha256:" + "b" * 64,
+        ),
     )
     builder = vast_image_build_module.VastWorkerImageBuilder(
         repo_root=tmp_path,
@@ -171,13 +178,13 @@ def test_builder_publishes_missing_configured_image(
     expected = "a" * 64
     replacement = "ghcr.io/example/worker@sha256:" + "d" * 64
 
-    def missing_image(_image: str) -> str:
+    def missing_image(_image: str) -> Any:
         """Report a registry tag that has not been published yet."""
         raise vast_image_build_module.VastImageNotFoundError("not found")
 
     monkeypatch.setattr(
         vast_image_build_module,
-        "published_runtime_fingerprint",
+        "published_image_metadata",
         missing_image,
     )
     monkeypatch.setattr(

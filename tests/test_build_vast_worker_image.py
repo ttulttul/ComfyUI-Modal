@@ -121,7 +121,7 @@ def test_build_stops_before_docker_when_expected_source_changed(
     monkeypatch.setattr(module, "get_settings", lambda: settings)
     monkeypatch.setattr(
         module,
-        "build_remote_runtime_identity",
+        "build_vast_runtime_identity",
         lambda **_kwargs: SimpleNamespace(fingerprint=actual),
     )
     monkeypatch.setattr(
@@ -206,7 +206,7 @@ def test_build_publishes_dependency_base_then_small_source_overlay(
     monkeypatch.setattr(module, "get_settings", lambda: settings)
     monkeypatch.setattr(
         module,
-        "build_remote_runtime_identity",
+        "build_vast_runtime_identity",
         lambda **_kwargs: identity,
     )
     monkeypatch.setattr(

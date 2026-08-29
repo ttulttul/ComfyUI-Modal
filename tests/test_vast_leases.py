@@ -379,14 +379,14 @@ def test_manager_bounds_replacements_when_every_instance_times_out(
     asyncio.run(scenario())
 
 
-def test_manager_adopts_legacy_lease_for_unchanged_worker_image(
+def test_manager_reuses_exact_digest_and_aligns_baked_fingerprint(
     tmp_path: Any,
     vast_api_module: Any,
     vast_leases_module: Any,
     vast_models_module: Any,
     vast_simulator_module: Any,
 ) -> None:
-    """Controller fingerprint drift should not rent again for the same worker image."""
+    """One immutable image should define compatibility across manager instances."""
 
     async def scenario() -> None:
         state = vast_simulator_module.VastSimulatorState(polls_until_running=1)
@@ -396,11 +396,13 @@ def test_manager_adopts_legacy_lease_for_unchanged_worker_image(
             registry = vast_leases_module.VastLeaseRegistry.for_user_directory(tmp_path)
             client = vast_api_module.VastApiClient(state.api_key, base_url=base_url)
             profile = _profile(vast_models_module)
+            worker_image = "ghcr.io/example/worker@sha256:" + "c" * 64
             first_manager = vast_leases_module.VastLeaseManager(
                 api_client=client,
                 registry=registry,
                 owner_id="comfy-owner",
                 runtime_fingerprint="a" * 64,
+                worker_image=worker_image,
                 launch_spec_factory=_launch_factory(vast_models_module),
                 startup_timeout_seconds=2.0,
             )
@@ -410,17 +412,29 @@ def test_manager_adopts_legacy_lease_for_unchanged_worker_image(
                 registry=registry,
                 owner_id="comfy-owner",
                 runtime_fingerprint="b" * 64,
-                worker_image="ghcr.io/example/worker@sha256:same",
+                worker_image=worker_image,
                 launch_spec_factory=_launch_factory(vast_models_module),
                 startup_timeout_seconds=2.0,
             )
 
             second = await second_manager.ensure_lease(profile)
 
+            different_image_manager = vast_leases_module.VastLeaseManager(
+                api_client=client,
+                registry=registry,
+                owner_id="comfy-owner",
+                runtime_fingerprint="c" * 64,
+                worker_image="ghcr.io/example/worker@sha256:" + "d" * 64,
+                launch_spec_factory=_launch_factory(vast_models_module),
+                startup_timeout_seconds=2.0,
+            )
+            different_image = await different_image_manager.ensure_lease(profile)
+
             assert second.instance_id == first.instance_id
             assert second.runtime_fingerprint == "b" * 64
-            assert second.worker_image == "ghcr.io/example/worker@sha256:same"
-            assert len(state.instances) == 1
+            assert second.worker_image == worker_image
+            assert different_image.instance_id != first.instance_id
+            assert len(state.instances) == 2
 
     asyncio.run(scenario())
 

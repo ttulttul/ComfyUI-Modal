@@ -15,11 +15,13 @@ from typing import Any, Callable, Mapping
 if __package__:
     from .remote.vast_watchdog import VastWatchdogSnapshot
     from .vast_leases import VastLeaseRecord
+    from .vast_image_reference import require_immutable_vast_image
     from .vast_models import VastInstanceLaunchSpec, VastResourceProfile
     from .vast_ssh import VastSshError, VastSshRunner, VastSshVolumeBackend
 else:  # pragma: no cover - direct debugging imports.
     from remote.vast_watchdog import VastWatchdogSnapshot
     from vast_leases import VastLeaseRecord
+    from vast_image_reference import require_immutable_vast_image
     from vast_models import VastInstanceLaunchSpec, VastResourceProfile
     from vast_ssh import VastSshError, VastSshRunner, VastSshVolumeBackend
 
@@ -122,23 +124,29 @@ class VastRuntimeConfiguration:
         runtime_fingerprint: str,
         *,
         environment: Mapping[str, str] | None = None,
+        image: str | None = None,
     ) -> "VastRuntimeConfiguration":
         """Resolve the required worker image without inventing an unpublished tag."""
         source = os.environ if environment is None else environment
-        image = str(source.get(VAST_IMAGE_ENV) or "").strip()
-        if not image:
+        resolved_image = (
+            str(source.get(VAST_IMAGE_ENV) or "").strip()
+            if image is None
+            else image.strip()
+        )
+        if not resolved_image:
             raise RuntimeError(
                 f"Set {VAST_IMAGE_ENV} to a published ComfyUI-Modal Vast worker image "
                 "before renting an instance."
             )
-        return cls(image=image, runtime_fingerprint=runtime_fingerprint)
+        return cls(image=resolved_image, runtime_fingerprint=runtime_fingerprint)
 
     def launch_spec(
         self,
         profile: VastResourceProfile,
         label: str,
     ) -> VastInstanceLaunchSpec:
-        """Return one direct-SSH launch with worker and watchdog supervision."""
+        """Return one digest-pinned direct-SSH launch with worker supervision."""
+        immutable_image = require_immutable_vast_image(self.image)
         environment = {
             "COMFY_MODAL_REMOTE_WORKER": "1",
             "COMFY_MODAL_LLM_EXECUTION_TARGET": "vast",
@@ -174,7 +182,7 @@ class VastRuntimeConfiguration:
             )
         )
         return VastInstanceLaunchSpec(
-            image=self.image,
+            image=immutable_image,
             disk_gb=profile.allocated_disk_gb,
             label=label,
             onstart=onstart,

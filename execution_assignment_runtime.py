@@ -186,7 +186,7 @@ def _execution_location_for_assignment(
 
 def _vast_provider_metadata(lease: Any) -> dict[str, Any]:
     """Return credential-free lease details for execution and local status output."""
-    return {
+    metadata = {
         "vast_instance_id": lease.instance_id,
         "vast_profile_id": lease.profile_id,
         "vast_profile_name": lease.profile_name,
@@ -196,6 +196,12 @@ def _vast_provider_metadata(lease: Any) -> dict[str, Any]:
         "vast_hourly_cost_usd": lease.hourly_cost_usd,
         "vast_idle_retention_seconds": lease.idle_retention_seconds,
     }
+    runtime_fingerprint = getattr(lease, "runtime_fingerprint", None)
+    worker_image = getattr(lease, "worker_image", None)
+    if runtime_fingerprint is not None and worker_image is not None:
+        metadata["vast_runtime_fingerprint"] = runtime_fingerprint
+        metadata["vast_worker_image"] = worker_image
+    return metadata
 
 
 def _configured_provider_metadata(

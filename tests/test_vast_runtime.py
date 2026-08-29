@@ -42,7 +42,7 @@ def test_launch_spec_starts_worker_and_watchdog_without_exporting_api_key(
 ) -> None:
     """The launch command should persist only fixed non-secret runtime settings."""
     configuration = vast_runtime_module.VastRuntimeConfiguration(
-        image="ghcr.io/example/worker@sha256:abc",
+        image="ghcr.io/example/worker@sha256:" + "a" * 64,
         runtime_fingerprint="a" * 64,
     )
     profile = vast_models_module.VastResourceProfile(
@@ -71,7 +71,7 @@ def test_launch_spec_repairs_vast_injected_ssh_key_permissions(
 ) -> None:
     """Vast's injected root key must satisfy sshd StrictModes checks."""
     configuration = vast_runtime_module.VastRuntimeConfiguration(
-        image="ghcr.io/example/worker@sha256:abc",
+        image="ghcr.io/example/worker@sha256:" + "a" * 64,
         runtime_fingerprint="a" * 64,
     )
     profile = vast_models_module.VastResourceProfile(
@@ -101,6 +101,24 @@ def test_configuration_requires_explicit_published_image(
             "a" * 64,
             environment={},
         )
+
+
+def test_launch_spec_rejects_mutable_worker_image(
+    vast_models_module: Any,
+    vast_runtime_module: Any,
+) -> None:
+    """A registry tag must be resolved before any Vast instance is launched."""
+    configuration = vast_runtime_module.VastRuntimeConfiguration(
+        image="ghcr.io/example/worker:v1",
+        runtime_fingerprint="a" * 64,
+    )
+    profile = vast_models_module.VastResourceProfile(
+        profile_id="17",
+        profile_name="default",
+    )
+
+    with pytest.raises(ValueError, match="immutable OCI reference"):
+        configuration.launch_spec(profile, "managed-label")
 
 
 def test_runtime_manager_starts_missing_socket_then_verifies_fingerprint(
