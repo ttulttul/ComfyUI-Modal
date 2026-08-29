@@ -444,6 +444,12 @@ def remote_modal_app_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def modal_billing_module(extension_package: object) -> object:
+    """Return Modal billing queries and cache state."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.modal_billing")
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")

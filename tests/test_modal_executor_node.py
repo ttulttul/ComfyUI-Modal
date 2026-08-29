@@ -8654,11 +8654,11 @@ def test_modal_gpu_estimated_rates_cover_supported_aliases(
 
 
 def test_completed_modal_billing_interval_uses_hourly_resolution_and_buffer(
-    remote_modal_app_module: Any,
+    modal_billing_module: Any,
 ) -> None:
     """Billing should use the latest full UTC hour after a collection buffer."""
     interval_start, interval_end, next_refresh_at = (
-        remote_modal_app_module._completed_modal_billing_interval(
+        modal_billing_module._completed_modal_billing_interval(
             datetime(2026, 8, 19, 8, 5, tzinfo=timezone.utc)
         )
     )
@@ -8669,17 +8669,17 @@ def test_completed_modal_billing_interval_uses_hourly_resolution_and_buffer(
 
 
 def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
-    remote_modal_app_module: Any,
+    modal_billing_module: Any,
     monkeypatch: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Hourly billing should quietly select and cache one GPU app/environment."""
-    settings = remote_modal_app_module.get_settings()
-    selected_settings = remote_modal_app_module.settings_for_modal_gpu(
+    settings = modal_billing_module.get_settings()
+    selected_settings = modal_billing_module.settings_for_modal_gpu(
         settings,
         "B300",
     )
-    app_name = remote_modal_app_module.modal_deployment_app_name(selected_settings)
+    app_name = modal_billing_module.modal_deployment_app_name(selected_settings)
     interval_start = datetime(2026, 8, 19, 7, 0, tzinfo=timezone.utc)
     report_calls: list[dict[str, Any]] = []
 
@@ -8710,7 +8710,7 @@ def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
             },
         ]
 
-    original_import_module = remote_modal_app_module.importlib.import_module
+    original_import_module = modal_billing_module.importlib.import_module
 
     def fake_import_module(name: str) -> Any:
         """Supply the public Modal billing and environment SDK surfaces."""
@@ -8726,26 +8726,26 @@ def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
             return types.SimpleNamespace(Error=RuntimeError)
         return original_import_module(name)
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_billing_module, "modal", object())
     monkeypatch.setattr(
-        remote_modal_app_module.importlib,
+        modal_billing_module.importlib,
         "import_module",
         fake_import_module,
     )
-    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
-    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
-    caplog.set_level(logging.INFO, logger=remote_modal_app_module.__name__)
+    modal_billing_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    modal_billing_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+    caplog.set_level(logging.INFO, logger=modal_billing_module.__name__)
     now = datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc)
 
     first_status = asyncio.run(
-        remote_modal_app_module.get_hourly_modal_app_billing(
+        modal_billing_module.get_hourly_modal_app_billing(
             "B300",
             settings,
             now=now,
         )
     )
     cached_status = asyncio.run(
-        remote_modal_app_module.get_hourly_modal_app_billing(
+        modal_billing_module.get_hourly_modal_app_billing(
             "B300",
             settings,
             now=now + timedelta(minutes=30),
@@ -8786,15 +8786,15 @@ def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
 
 
 def test_get_hourly_modal_app_billing_sums_historical_ids_in_default_environment(
-    remote_modal_app_module: Any,
+    modal_billing_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Redeployments within one implicit environment should sum every app ID."""
-    settings = remote_modal_app_module.get_settings()
-    selected_settings = remote_modal_app_module.settings_for_modal_gpu(settings, "L4")
-    app_name = remote_modal_app_module.modal_deployment_app_name(selected_settings)
+    settings = modal_billing_module.get_settings()
+    selected_settings = modal_billing_module.settings_for_modal_gpu(settings, "L4")
+    app_name = modal_billing_module.modal_deployment_app_name(selected_settings)
     interval_start = datetime(2026, 8, 19, 7, 0, tzinfo=timezone.utc)
-    original_import_module = remote_modal_app_module.importlib.import_module
+    original_import_module = modal_billing_module.importlib.import_module
 
     def fake_import_module(name: str) -> Any:
         """Supply an implicit environment with two historical app identities."""
@@ -8825,17 +8825,17 @@ def test_get_hourly_modal_app_billing_sums_historical_ids_in_default_environment
             return types.SimpleNamespace(Error=RuntimeError)
         return original_import_module(name)
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_billing_module, "modal", object())
     monkeypatch.setattr(
-        remote_modal_app_module.importlib,
+        modal_billing_module.importlib,
         "import_module",
         fake_import_module,
     )
-    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
-    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+    modal_billing_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    modal_billing_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
 
     status = asyncio.run(
-        remote_modal_app_module.get_hourly_modal_app_billing(
+        modal_billing_module.get_hourly_modal_app_billing(
             "L4",
             settings,
             now=datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc),
@@ -8848,7 +8848,7 @@ def test_get_hourly_modal_app_billing_sums_historical_ids_in_default_environment
 
 
 def test_modal_hourly_billing_rejects_multiple_implicit_environments(
-    remote_modal_app_module: Any,
+    modal_billing_module: Any,
 ) -> None:
     """An implicit environment should reject only genuinely distinct environments."""
     interval_start = datetime(2026, 8, 19, 7, 0, tzinfo=timezone.utc)
@@ -8870,10 +8870,10 @@ def test_modal_hourly_billing_rejects_multiple_implicit_environments(
     ]
 
     with pytest.raises(
-        remote_modal_app_module.ModalBillingStatusError,
+        modal_billing_module.ModalBillingStatusError,
         match="multiple environments",
     ):
-        remote_modal_app_module._matching_modal_hourly_billing_rows(
+        modal_billing_module._matching_modal_hourly_billing_rows(
             rows,
             app_name="shared-app-name",
             environment_name=None,
@@ -8882,11 +8882,11 @@ def test_modal_hourly_billing_rejects_multiple_implicit_environments(
 
 
 def test_get_hourly_modal_app_billing_reports_zero_for_no_usage(
-    remote_modal_app_module: Any,
+    modal_billing_module: Any,
     monkeypatch: Any,
 ) -> None:
     """An absent app row should render as zero cost for that completed hour."""
-    original_import_module = remote_modal_app_module.importlib.import_module
+    original_import_module = modal_billing_module.importlib.import_module
 
     def fake_import_module(name: str) -> Any:
         """Supply an empty public Modal billing report."""
@@ -8900,17 +8900,17 @@ def test_get_hourly_modal_app_billing_reports_zero_for_no_usage(
             return types.SimpleNamespace(Error=RuntimeError)
         return original_import_module(name)
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_billing_module, "modal", object())
     monkeypatch.setattr(
-        remote_modal_app_module.importlib,
+        modal_billing_module.importlib,
         "import_module",
         fake_import_module,
     )
-    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
-    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+    modal_billing_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    modal_billing_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
 
     status = asyncio.run(
-        remote_modal_app_module.get_hourly_modal_app_billing(
+        modal_billing_module.get_hourly_modal_app_billing(
             "L4",
             now=datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc),
         )
@@ -8923,7 +8923,7 @@ def test_get_hourly_modal_app_billing_reports_zero_for_no_usage(
 
 
 def test_get_hourly_modal_app_billing_caches_report_failures(
-    remote_modal_app_module: Any,
+    modal_billing_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Fast status polling should attempt a failed billing interval only once."""
@@ -8935,7 +8935,7 @@ def test_get_hourly_modal_app_billing_caches_report_failures(
         report_calls += 1
         raise RuntimeError("billing access denied")
 
-    original_import_module = remote_modal_app_module.importlib.import_module
+    original_import_module = modal_billing_module.importlib.import_module
 
     def fake_import_module(name: str) -> Any:
         """Supply a failing public Modal billing report."""
@@ -8951,23 +8951,23 @@ def test_get_hourly_modal_app_billing_caches_report_failures(
             return types.SimpleNamespace(Error=RuntimeError)
         return original_import_module(name)
 
-    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(modal_billing_module, "modal", object())
     monkeypatch.setattr(
-        remote_modal_app_module.importlib,
+        modal_billing_module.importlib,
         "import_module",
         fake_import_module,
     )
-    remote_modal_app_module._MODAL_HOURLY_BILLING_CACHE.clear()
-    remote_modal_app_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
+    modal_billing_module._MODAL_HOURLY_BILLING_CACHE.clear()
+    modal_billing_module._MODAL_HOURLY_BILLING_ERROR_CACHE.clear()
     now = datetime(2026, 8, 19, 8, 15, tzinfo=timezone.utc)
 
     for _attempt in range(2):
         with pytest.raises(
-            remote_modal_app_module.ModalBillingStatusError,
+            modal_billing_module.ModalBillingStatusError,
             match="billing access denied",
         ):
             asyncio.run(
-                remote_modal_app_module.get_hourly_modal_app_billing(
+                modal_billing_module.get_hourly_modal_app_billing(
                     "L4",
                     now=now,
                 )
