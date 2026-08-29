@@ -57,6 +57,9 @@ def _load_modal_app_module() -> types.ModuleType:
 def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None:
     """Mapped lane progress should target the real executing node, not the representative."""
     modal_app = _load_modal_app_module()
+    mapped_execution = sys.modules[
+        f"{TEST_PACKAGE_NAME}.remote.mapped_execution"
+    ]
     emitted_progress: list[dict[str, Any]] = []
 
     def capture_progress(**kwargs: Any) -> None:
@@ -64,6 +67,9 @@ def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None
         emitted_progress.append(kwargs)
 
     monkeypatch.setattr(modal_app, "_emit_local_modal_progress", capture_progress)
+    monkeypatch.setattr(
+        mapped_execution, "_emit_local_modal_progress", capture_progress
+    )
 
     payload = {
         "prompt_id": "prompt-1",
@@ -91,8 +97,8 @@ def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None
         ]
     )
 
-    with modal_app._MAPPED_PROGRESS_NODE_IDS_LOCK:
-        modal_app._MAPPED_PROGRESS_NODE_IDS.clear()
+    with mapped_execution._MAPPED_PROGRESS_NODE_IDS_LOCK:
+        mapped_execution._MAPPED_PROGRESS_NODE_IDS.clear()
 
     modal_app._consume_remote_payload_stream(payload, stream_events)
 
@@ -111,8 +117,8 @@ def test_mapped_stream_progress_preserves_real_node_id(monkeypatch: Any) -> None
             "aggregate_only": False,
         }
     ]
-    with modal_app._MAPPED_PROGRESS_NODE_IDS_LOCK:
-        assert modal_app._MAPPED_PROGRESS_NODE_IDS[
+    with mapped_execution._MAPPED_PROGRESS_NODE_IDS_LOCK:
+        assert mapped_execution._MAPPED_PROGRESS_NODE_IDS[
             ("prompt-1", "component-1", "7")
         ] == "node-b"
 

@@ -8441,13 +8441,14 @@ def test_emit_local_remote_dispatch_status_marks_component_starting(
 
 def test_emit_local_mapped_lane_progress_start_marks_lane_as_setup_only(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     monkeypatch: Any,
 ) -> None:
     """Provisioning a mapped lane should emit a dedicated setup-only lane progress event."""
     emitted_progress: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_emit_local_modal_progress",
         lambda **kwargs: emitted_progress.append(kwargs),
     )
@@ -10262,6 +10263,7 @@ def test_invoke_remote_engine_payload_releases_local_prompt_after_cancel_grace(
 
 def test_invoke_mapped_remote_engine_async_runs_explicit_mapped_phase_items(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -10280,12 +10282,12 @@ def test_invoke_mapped_remote_engine_async_runs_explicit_mapped_phase_items(
         return (f"done:{hydrated_inputs['remote_input_0']}",)
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_execute_subgraph_prompt",
         fake_execute_subgraph_prompt,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_emit_local_modal_progress",
         lambda **kwargs: progress_updates.append(kwargs),
     )
@@ -10594,6 +10596,7 @@ def test_implicit_mapping_propagates_scheduler_list_through_downstream_component
 
 def test_invoke_mapped_remote_engine_async_splits_int_inputs_for_direct_targets(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -10609,7 +10612,7 @@ def test_invoke_mapped_remote_engine_async_splits_int_inputs_for_direct_targets(
         return (f"seed:{hydrated_inputs['remote_input_0']}",)
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_execute_subgraph_prompt",
         fake_execute_subgraph_prompt,
     )
@@ -10692,6 +10695,7 @@ def test_invoke_mapped_remote_engine_async_splits_int_inputs_for_direct_targets(
 
 def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -10723,7 +10727,7 @@ def test_invoke_mapped_remote_engine_async_executes_static_branch_once(
         return (f"mapped:{hydrated_inputs['remote_input_1']}",)
 
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_execute_subgraph_prompt",
         fake_execute_subgraph_prompt,
     )
@@ -12678,6 +12682,7 @@ def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_
 
 def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     session_state_module: Any,
     monkeypatch: Any,
@@ -12688,10 +12693,11 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(mapped_execution_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
     monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_lookup_deployed_remote_engine",
         lambda payload, affinity_key_override=None: (
             f"engine:{affinity_key_override or remote_modal_app_module._remote_worker_affinity_key(payload)}"
@@ -12729,7 +12735,7 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
         fake_invoke_bound_remote_engine_async,
     )
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_emit_local_mapped_lane_progress_start",
         lambda payload, lane_index, item_index=None: observed_lane_setup_starts.append(
             (str(payload["component_id"]), int(lane_index))
@@ -12847,6 +12853,7 @@ def test_implicitly_mapped_subgraph_seeds_remote_lanes_before_item_dispatch(
 
 def test_implicitly_mapped_subgraph_allows_ready_lanes_to_start_before_slowest_seed_finishes(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     session_state_module: Any,
     monkeypatch: Any,
@@ -12856,10 +12863,11 @@ def test_implicitly_mapped_subgraph_allows_ready_lanes_to_start_before_slowest_s
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(mapped_execution_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
     monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_lookup_deployed_remote_engine",
         lambda payload, affinity_key_override=None: (
             f"engine:{affinity_key_override or remote_modal_app_module._remote_worker_affinity_key(payload)}"
@@ -12989,6 +12997,7 @@ def test_implicitly_mapped_subgraph_allows_ready_lanes_to_start_before_slowest_s
 
 def test_implicitly_mapped_subgraph_returns_once_all_items_finish_without_waiting_for_unused_lane(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     session_state_module: Any,
     monkeypatch: Any,
@@ -12998,10 +13007,11 @@ def test_implicitly_mapped_subgraph_returns_once_all_items_finish_without_waitin
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(mapped_execution_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
     monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_lookup_deployed_remote_engine",
         lambda payload, affinity_key_override=None: (
             f"engine:{affinity_key_override or remote_modal_app_module._remote_worker_affinity_key(payload)}"
@@ -13133,6 +13143,7 @@ def test_implicitly_mapped_subgraph_returns_once_all_items_finish_without_waitin
 
 def test_implicitly_mapped_subgraph_ignores_late_lane_failure_after_all_items_complete(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     session_state_module: Any,
     monkeypatch: Any,
@@ -13142,10 +13153,11 @@ def test_implicitly_mapped_subgraph_ignores_late_lane_failure_after_all_items_co
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
     monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(mapped_execution_module, "modal", object())
     monkeypatch.setattr(remote_modal_app_module, "_mapped_execution_parallelism", lambda total_items: 2)
     monkeypatch.setattr(remote_modal_app_module, "ensure_remote_warm_capacity", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
-        remote_modal_app_module,
+        mapped_execution_module,
         "_lookup_deployed_remote_engine",
         lambda payload, affinity_key_override=None: (
             f"engine:{affinity_key_override or remote_modal_app_module._remote_worker_affinity_key(payload)}"
@@ -13271,6 +13283,7 @@ def test_implicitly_mapped_subgraph_ignores_late_lane_failure_after_all_items_co
 
 def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -13288,7 +13301,7 @@ def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets
             }
         },
     )()
-    monkeypatch.setattr(remote_modal_app_module, "_load_nodes_module", lambda: fake_nodes_module)
+    monkeypatch.setattr(mapped_execution_module, "_load_nodes_module", lambda: fake_nodes_module)
 
     async def fake_invoke_remote_engine_async(
         payload: dict[str, Any],
@@ -13359,6 +13372,7 @@ def test_implicitly_mapped_subgraph_skips_outer_fanout_for_input_is_list_targets
 
 def test_invoke_remote_engine_async_bypasses_implicit_mapping_once_for_input_is_list_targets(
     remote_modal_app_module: Any,
+    mapped_execution_module: Any,
     serialization_module: Any,
     monkeypatch: Any,
 ) -> None:
@@ -13376,7 +13390,7 @@ def test_invoke_remote_engine_async_bypasses_implicit_mapping_once_for_input_is_
             }
         },
     )()
-    monkeypatch.setattr(remote_modal_app_module, "_load_nodes_module", lambda: fake_nodes_module)
+    monkeypatch.setattr(mapped_execution_module, "_load_nodes_module", lambda: fake_nodes_module)
 
     def fake_invoke_remote_engine(
         payload: dict[str, Any],

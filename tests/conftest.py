@@ -486,6 +486,12 @@ def modal_warmup_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def mapped_execution_module(extension_package: object) -> object:
+    """Return mapped and implicit-batch execution helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.mapped_execution")
+
+
+@pytest.fixture(scope="session")
 def serialization_module(extension_package: object) -> object:
     """Return the serialization helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.serialization")
