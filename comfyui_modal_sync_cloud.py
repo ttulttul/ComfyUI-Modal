@@ -117,6 +117,8 @@ from settings import (  # noqa: E402 - paths are bootstrapped above.
 )
 
 logger = logging.getLogger(__name__)
+
+# Cloud app and ComfyUI bootstrap state.
 _CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
 _COMFY_RUNTIME_INIT_LOCK = threading.Lock()
 _COMFY_RUNTIME_BASE_INITIALIZED = False
@@ -129,6 +131,8 @@ _FOLDER_PATHS_ORIGINAL_GET_FULL_PATH_OR_RAISE: Callable[[str, str], str] | None 
 _LOADER_CACHE_LOCK = threading.Lock()
 _LOADER_CACHE_WRAPPED_CLASSES: set[str] = set()
 _MODEL_STATE_DICT_COMPAT_WRAPPED = False
+
+# Loader, prewarm, and distributed node-output cache state.
 _LOADER_OUTPUT_CACHE: dict[tuple[str, str], tuple[Any, ...]] = {}
 _LOADER_CACHE_METRICS_LOCK = threading.Lock()
 _LOADER_CACHE_METRICS: dict[str, int] = {"hit": 0, "miss": 0}
@@ -142,13 +146,32 @@ _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
+_PROMPT_EXECUTOR_STATES: dict[str, "_ReusablePromptExecutorState"] = {}
 _DYNAMIC_PROMPT_WRAPPER_LOCK = threading.Lock()
 _PROMPT_METADATA_STATE = threading.local()
+
+# Modal volume reload and poisoned-container retirement state.
 _MODAL_VOLUME_RELOAD_MARKERS_LOCK = threading.Lock()
+_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (
+    0.0,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+)
+_MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT = 256
+_MODAL_VOLUME_RELOAD_MARKERS: queue.SimpleQueue[str] | None = None
+_MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
+_REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS = 1.0
+_CONTAINER_TERMINATION_SCHEDULED = False
 _REMOTE_VOLUME_READTHROUGH_ROOT = (
     Path(tempfile.gettempdir()) / "comfy-modal-volume-readthrough"
 )
+
+# Durable invocation and session-bridge state.
 _REMOTE_SESSION_STORE = InMemoryRemoteSessionStore()
 _REMOTE_SESSION_BRIDGE_STORE = InMemoryRemoteSessionBridgeStore()
 _REMOTE_INVOCATION_STORE = InMemoryRemoteInvocationStore()
@@ -179,6 +202,27 @@ _DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset(
 )
 _DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset(
     {"CLIP", "MODEL", "NOISE", "SAMPLER", "VAE"}
+)
+
+# Prompt widget and Modal image filtering constants.
+_PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
+_COMFYUI_IMAGE_EXCLUDED_SUFFIXES = frozenset(
+    {
+        ".bin",
+        ".ckpt",
+        ".engine",
+        ".gguf",
+        ".log",
+        ".onnx",
+        ".pt",
+        ".pth",
+        ".pyc",
+        ".pyo",
+        ".safetensors",
+        ".swp",
+        ".tmp",
+        ".vae",
+    }
 )
 
 try:
@@ -1798,24 +1842,6 @@ def _record_remote_session_resolution_event(
         return
     if event_name in {"session-value-hit", "bridge-target-hit", "bridge-source-hit"}:
         resolution_stats.live_session_hits += 1
-
-
-_PROMPT_EXECUTOR_STATES: dict[str, _ReusablePromptExecutorState] = {}
-_MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS = (
-    0.0,
-    0.25,
-    0.5,
-    1.0,
-    2.0,
-    4.0,
-    8.0,
-)
-_MODAL_VOLUME_RELOAD_MARKER_CACHE_LIMIT = 256
-_MODAL_VOLUME_RELOAD_MARKERS: queue.SimpleQueue[str] | None = None
-_MODAL_VOLUME_RELOAD_MARKER_SET: set[str] = set()
-_REMOTE_ERROR_CONTAINER_EXIT_DELAY_SECONDS = 1.0
-_CONTAINER_TERMINATION_SCHEDULED = False
-_PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 
 
 @dataclass
@@ -6463,26 +6489,6 @@ def _should_ignore_repo_path(path: Path) -> bool:
     } & parts:
         return True
     return path.suffix.lower() in {".log", ".pyc", ".pyo", ".swp", ".tmp"}
-
-
-_COMFYUI_IMAGE_EXCLUDED_SUFFIXES = frozenset(
-    {
-        ".bin",
-        ".ckpt",
-        ".engine",
-        ".gguf",
-        ".log",
-        ".onnx",
-        ".pt",
-        ".pth",
-        ".pyc",
-        ".pyo",
-        ".safetensors",
-        ".swp",
-        ".tmp",
-        ".vae",
-    }
-)
 
 
 def _comfyui_image_relative_parts(path: Path) -> tuple[str, ...]:

@@ -103,6 +103,8 @@ from ..settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Modal cloud-module loading and deployment state.
 _MODAL_CLOUD_MODULE_NAME = "comfyui_modal_sync_cloud"
 _REMOTE_APP_PROTOCOL_VERSION = REMOTE_APP_PROTOCOL_VERSION
 _MODAL_CLOUD_MODULE_LOCK = threading.Lock()
@@ -110,6 +112,8 @@ _MODAL_CLOUD_SETTINGS_STATE = threading.local()
 _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
 _MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None, str]] = set()
+
+# LLM staging and remote durable-object handles.
 _STAGED_LLM_PROFILES_LOCK = threading.Lock()
 _STAGED_LLM_PROFILES: set[tuple[str, str, str]] = set()
 _STAGED_LLM_PROFILE_RESULTS: dict[tuple[str, str], dict[str, Any]] = {}
@@ -120,6 +124,8 @@ _MODAL_SESSION_BRIDGE_DICTS_LOCK = threading.Lock()
 _MODAL_SESSION_BRIDGE_DICTS: dict[tuple[str, str | None], Any] = {}
 _MODAL_DURABLE_VOLUMES_LOCK = threading.Lock()
 _MODAL_DURABLE_VOLUMES: dict[tuple[str, str | None], Any] = {}
+
+# Mapped execution, warmup, and keepalive state.
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
 _MAPPED_PROGRESS_NODE_IDS: dict[tuple[str, str, str], str] = {}
 _PROMPT_WARMUP_STATES_LOCK = threading.Lock()
@@ -132,14 +138,7 @@ _SNAPSHOT_PROFILE_RECORDS_LOCK = threading.Lock()
 _SNAPSHOT_PROFILE_RECORDS: dict[str, dict[str, Any]] = {}
 _MODAL_STAGE_STREAM_END = object()
 
-
-@dataclass(frozen=True)
-class _ModalStageStreamFailure:
-    """Carry an arbitrary Modal stream exception across a reader thread."""
-
-    error: Exception
-
-
+# Prompt payload constants.
 _PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
     {
@@ -151,6 +150,8 @@ _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
 )
 _SPECULATIVE_PREWARM_TARGET_KEY = "speculative_remote_prewarm_target"
 _BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
+
+# Remote container log and billing state.
 _REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()
 _REMOTE_CONTAINER_LOG_STREAMS: dict[str, "_RemoteContainerLogStreamState"] = {}
 _REMOTE_CONTAINER_LOG_STDERR_LOCK = threading.Lock()
@@ -163,6 +164,8 @@ _MODAL_HOURLY_BILLING_CACHE: dict[
 ] = {}
 _MODAL_HOURLY_BILLING_ERROR_CACHE: dict[tuple[str, str, datetime], str] = {}
 _MODAL_HOURLY_BILLING_CACHE_LIMIT = 64
+
+# Active invocation and local durable-session state.
 _IMPLICIT_BATCH_PRESERVING_TARGETS = frozenset({("CreateVideo", "images")})
 _ACTIVE_REMOTE_INVOCATIONS_LOCK = threading.Lock()
 _ACTIVE_REMOTE_INVOCATIONS_BY_PROMPT: dict[
@@ -177,6 +180,26 @@ _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LOCK = threading.Lock()
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE: dict[str, Any] = {}
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_ORDER: list[str] = []
 _REMOTE_SESSION_BRIDGE_VALUE_CACHE_LIMIT = 32
+_DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset(
+    {
+        "AUDIO",
+        "BOOLEAN",
+        "CONDITIONING",
+        "FLOAT",
+        "IMAGE",
+        "INT",
+        "LATENT",
+        "MASK",
+        "SIGMAS",
+        "STRING",
+        "VIDEO",
+    }
+)
+_DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset(
+    {"CLIP", "MODEL", "NOISE", "SAMPLER", "VAE"}
+)
+
+# Published Modal GPU pricing metadata.
 MODAL_GPU_PRICING_EFFECTIVE_DATE = "2026-08-13"
 MODAL_GPU_ESTIMATED_USD_PER_SECOND: dict[str, float] = {
     "T4": 0.000164,
@@ -194,6 +217,30 @@ MODAL_GPU_ESTIMATED_USD_PER_SECOND: dict[str, float] = {
     "B200+": 0.001736,
     "B300": 0.001972,
 }
+
+
+def _remote_modal_call_worker_count() -> int:
+    """Return the number of local worker threads reserved for blocking Modal calls."""
+    return max(1, int(get_settings().max_inflight_calls))
+
+
+# Blocking Modal call executor state.
+_REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_remote_modal_call_worker_count()
+)
+_REMOTE_MODAL_WARMUP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_remote_modal_call_worker_count()
+)
+_REMOTE_MODAL_KEEPALIVE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_remote_modal_call_worker_count()
+)
+
+
+@dataclass(frozen=True)
+class _ModalStageStreamFailure:
+    """Carry an arbitrary Modal stream exception across a reader thread."""
+
+    error: Exception
 
 
 def _settings_for_payload(payload: Mapping[str, Any]) -> ModalSyncSettings:
@@ -226,26 +273,6 @@ def _modal_cloud_settings_override(settings: ModalSyncSettings) -> Iterator[None
                 pass
         else:
             _MODAL_CLOUD_SETTINGS_STATE.settings = previous_settings
-
-
-_DURABLE_BRIDGE_SERIALIZATION_IO_TYPES = frozenset(
-    {
-        "AUDIO",
-        "BOOLEAN",
-        "CONDITIONING",
-        "FLOAT",
-        "IMAGE",
-        "INT",
-        "LATENT",
-        "MASK",
-        "SIGMAS",
-        "STRING",
-        "VIDEO",
-    }
-)
-_DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset(
-    {"CLIP", "MODEL", "NOISE", "SAMPLER", "VAE"}
-)
 
 
 @dataclass
@@ -322,21 +349,6 @@ class _RemoteSessionBridgeResolutionStats:
     direct_restore_seconds: float = 0.0
     session_restore_writes: int = 0
 
-
-def _remote_modal_call_worker_count() -> int:
-    """Return the number of local worker threads reserved for blocking Modal calls."""
-    return max(1, int(get_settings().max_inflight_calls))
-
-
-_REMOTE_MODAL_CALL_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_remote_modal_call_worker_count()
-)
-_REMOTE_MODAL_WARMUP_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_remote_modal_call_worker_count()
-)
-_REMOTE_MODAL_KEEPALIVE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_remote_modal_call_worker_count()
-)
 
 try:
     import modal  # type: ignore
