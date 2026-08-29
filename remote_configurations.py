@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ else:  # pragma: no cover - direct ComfyUI loading fallback.
     from vast_models import VastResourceProfile
 
 _R2_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,12 @@ class R2StorageBackingConfiguration(StorageBackingConfiguration):
             raise ValueError("Cloudflare R2 jurisdiction is not supported.")
         if self.write_back_mode not in {"async", "off", "sync"}:
             raise ValueError("Cloudflare R2 write-back mode is not supported.")
+        if self.write_back_mode == "sync":
+            logger.warning(
+                "Legacy synchronous R2 write-back configuration %s now uses idle background write-back.",
+                self.configuration_id,
+            )
+            object.__setattr__(self, "write_back_mode", "async")
 
     @property
     def storage_provider(self) -> str:

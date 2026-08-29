@@ -470,6 +470,41 @@ def test_r2_preflight_keeps_signed_url_out_of_ssh_arguments(
     assert b"secret" in materialize_call["input"]
 
 
+def test_r2_writeback_upload_propagates_foreground_cancellation(
+    vast_ssh_module: Any,
+    r2_cache_module: Any,
+) -> None:
+    """A Vast background upload should terminate when foreground work resumes."""
+
+    class CancellingRunner(FakeRunner):
+        """Raise the transport's typed cancellation for cancellible commands."""
+
+        def run(self, remote_argv: Any, **kwargs: Any) -> Any:
+            """Reject the first command that observes the active cancellation."""
+            cancellation_check = kwargs.get("cancellation_check")
+            if cancellation_check is not None and cancellation_check():
+                raise vast_ssh_module.VastSshCancelledError("foreground resumed")
+            return super().run(remote_argv, **kwargs)
+
+    runner = CancellingRunner(vast_ssh_module)
+    backend = vast_ssh_module.VastSshVolumeBackend(runner=runner)
+    plan = r2_cache_module.R2UploadPlan(
+        key=f"cache/{'a' * 64}",
+        sha256="a" * 64,
+        size_bytes=1024,
+        allowed_host="account.r2.cloudflarestorage.com",
+        mode="single",
+        urls=("https://account.r2.cloudflarestorage.com/object?secret=1",),
+    )
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        backend.upload_r2_file_cancellable(
+            plan,
+            "assets/model.safetensors",
+            cancellation_check=lambda: True,
+        )
+
+
 def test_materializer_bundle_is_self_contained_and_executable(
     vast_ssh_module: Any,
     tmp_path: Path,

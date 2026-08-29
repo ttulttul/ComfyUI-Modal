@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
@@ -597,6 +598,20 @@ class SshDockerVolumeBackend:
         remote_path: str,
     ) -> R2UploadResult:
         """Upload one named-volume file through a signed R2 transfer plan."""
+        return self.upload_r2_file_cancellable(
+            plan,
+            remote_path,
+            cancellation_check=lambda: False,
+        )
+
+    def upload_r2_file_cancellable(
+        self,
+        plan: R2UploadPlan,
+        remote_path: str,
+        *,
+        cancellation_check: Callable[[], bool],
+    ) -> R2UploadResult:
+        """Upload one named-volume file while yielding to foreground workflows."""
         normalized_path = _validated_volume_path(remote_path)
         result = self._run_r2_materializer(
             {
@@ -606,6 +621,7 @@ class SshDockerVolumeBackend:
                 "upload": plan.to_dict(),
             },
             size_bytes=plan.size_bytes,
+            cancellation_check=cancellation_check,
         )
         return R2UploadResult.from_dict(result)
 
@@ -614,26 +630,43 @@ class SshDockerVolumeBackend:
         request: Mapping[str, Any],
         *,
         size_bytes: int,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> Mapping[str, object]:
         """Run signed transfers with URLs supplied only through protected stdin."""
         if self.materializer_image is None:
             raise SshDockerError("SSH R2 backing requires a current worker image.")
         self._ensure_materializer_image()
-        result = self.controller.docker(
-            (
-                "run",
-                "--rm",
-                "-i",
-                "--entrypoint",
-                "python",
-                "-v",
-                f"{self.volume_name}:/storage",
-                self.materializer_image,
-                "-m",
-                "remote.r2_materializer",
-            ),
-            input_payload=json.dumps(request, sort_keys=True).encode("utf-8"),
-            timeout_seconds=max(900.0, size_bytes / (2 * _MIB)),
+        container_name = f"comfy-r2-materializer-{uuid.uuid4().hex[:16]}"
+        arguments = (
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "-i",
+            "--entrypoint",
+            "python",
+            "-v",
+            f"{self.volume_name}:/storage",
+            self.materializer_image,
+            "-m",
+            "remote.r2_materializer",
+        )
+        input_payload = json.dumps(request, sort_keys=True).encode("utf-8")
+        timeout_seconds = max(900.0, size_bytes / (2 * _MIB))
+        result = (
+            self._run_cancellable_materializer(
+                arguments,
+                container_name=container_name,
+                input_payload=input_payload,
+                timeout_seconds=timeout_seconds,
+                cancellation_check=cancellation_check,
+            )
+            if cancellation_check is not None
+            else self.controller.docker(
+                arguments,
+                input_payload=input_payload,
+                timeout_seconds=timeout_seconds,
+            )
         )
         try:
             payload = json.loads(result.stdout_text)
@@ -642,6 +675,72 @@ class SshDockerVolumeBackend:
         if not isinstance(payload, Mapping):
             raise SshDockerError("SSH R2 materializer returned a non-object result.")
         return payload
+
+    def _run_cancellable_materializer(
+        self,
+        arguments: Sequence[str],
+        *,
+        container_name: str,
+        input_payload: bytes,
+        timeout_seconds: float,
+        cancellation_check: Callable[[], bool],
+    ) -> SshCommandResult:
+        """Run one named helper container and remove it promptly on cancellation."""
+        if cancellation_check():
+            raise InterruptedError("SSH R2 upload was cancelled.")
+        process = self.controller.docker_popen(arguments)
+        started_at = time.monotonic()
+        payload: bytes | None = input_payload
+        while True:
+            if cancellation_check():
+                self._terminate_materializer(process, container_name)
+                raise InterruptedError("SSH R2 upload was cancelled.")
+            remaining = timeout_seconds - (time.monotonic() - started_at)
+            if remaining <= 0.0:
+                self._terminate_materializer(process, container_name)
+                raise SshDockerError(
+                    f"SSH R2 materializer timed out after {timeout_seconds:.1f} seconds."
+                )
+            try:
+                stdout, stderr = process.communicate(
+                    input=payload,
+                    timeout=min(0.25, remaining),
+                )
+            except subprocess.TimeoutExpired:
+                payload = None
+                continue
+            result = SshCommandResult(
+                stdout=stdout,
+                stderr=stderr,
+                returncode=process.returncode,
+            )
+            if result.returncode != 0:
+                raise SshDockerError(
+                    "SSH R2 materializer failed with exit status "
+                    f"{result.returncode}."
+                )
+            return result
+
+    def _terminate_materializer(
+        self,
+        process: subprocess.Popen[bytes],
+        container_name: str,
+    ) -> None:
+        """Terminate the SSH client and remove its exact named helper container."""
+        process.terminate()
+        try:
+            process.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        try:
+            self.controller.docker(("rm", "-f", container_name), check=False)
+        except SshDockerError as exc:
+            logger.warning(
+                "Unable to remove cancelled SSH R2 helper container=%s: %s",
+                container_name,
+                exc,
+            )
 
     def _ensure_materializer_image(self) -> None:
         """Prepare the R2 helper image once before the first signed transfer."""

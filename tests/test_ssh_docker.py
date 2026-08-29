@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -274,6 +275,76 @@ def test_r2_preflight_uses_worker_image_and_protected_stdin(
     assert input_payload is not None
     assert b'"operation": "preflight"' in input_payload
     assert b"secret" in input_payload
+
+
+def test_r2_writeback_cancellation_removes_exact_helper_container(
+    ssh_docker_module: Any,
+    remote_hosts_module: Any,
+    r2_cache_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Foreground work should stop both SSH and its named Docker upload helper."""
+
+    class FakeProcess:
+        """Remain active until the backend observes cancellation."""
+
+        def __init__(self) -> None:
+            """Initialize one running fake process."""
+            self.returncode = 0
+            self.terminated = False
+            self.communicate_calls = 0
+
+        def communicate(self, *_args: Any, **_kwargs: Any) -> tuple[bytes, bytes]:
+            """Time out while active and finish after termination."""
+            self.communicate_calls += 1
+            if not self.terminated:
+                raise subprocess.TimeoutExpired("ssh", 0.25)
+            return b"", b""
+
+        def terminate(self) -> None:
+            """Record graceful termination."""
+            self.terminated = True
+
+        def kill(self) -> None:
+            """Record forced termination."""
+            self.terminated = True
+
+    runner = _FakeRunner(ssh_docker_module)
+    controller = ssh_docker_module.SshDockerController(
+        _host(remote_hosts_module),
+        runner=runner,
+    )
+    process = FakeProcess()
+    monkeypatch.setattr(controller, "docker_popen", lambda _arguments: process)
+    volume = ssh_docker_module.SshDockerVolumeBackend(
+        controller,
+        "safe-volume",
+        materializer_image="comfy-remote:current",
+    )
+    plan = r2_cache_module.R2UploadPlan(
+        key=f"cache/{'a' * 64}",
+        sha256="a" * 64,
+        size_bytes=1024,
+        allowed_host="account.r2.cloudflarestorage.com",
+        mode="single",
+        urls=("https://account.r2.cloudflarestorage.com/object?secret=1",),
+    )
+    cancellation_checks = iter((False, False, True))
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        volume.upload_r2_file_cancellable(
+            plan,
+            "assets/model.safetensors",
+            cancellation_check=lambda: next(cancellation_checks),
+        )
+
+    assert process.terminated is True
+    remove_command = next(
+        command
+        for command, _payload in runner.calls
+        if command[:3] == ("docker", "rm", "-f")
+    )
+    assert remove_command[3].startswith("comfy-r2-materializer-")
 
 
 def test_managed_worker_status_and_removal_are_label_scoped(

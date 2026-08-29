@@ -130,7 +130,7 @@ def test_environment_configuration_is_opt_in_and_hides_secrets(
 
     assert configuration is not None
     assert configuration.endpoint_host.endswith("r2.cloudflarestorage.com")
-    assert configuration.write_back_mode == "sync"
+    assert configuration.write_back_mode == "async"
     assert "controller-access" not in repr(configuration)
     assert "controller-secret" not in repr(configuration)
 

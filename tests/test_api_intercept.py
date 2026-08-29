@@ -6838,6 +6838,65 @@ def test_jobs_api_interrupt_cancels_remote_preparation(
     assert prompt_queue.native_interrupts == ["native-prompt"]
 
 
+def test_queue_bridge_releases_r2_writeback_reservations(
+    api_intercept_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Completed, deleted, and wiped prompts should release idle cache work."""
+
+    class FakePromptQueue:
+        """Model the native lifecycle methods wrapped by the remote queue bridge."""
+
+        def __init__(self) -> None:
+            """Initialize one running prompt and two queued prompts."""
+            self.currently_running = {
+                7: (0, "prompt-running", {}, {}, [], {}),
+            }
+            self.queue = [
+                (1, "prompt-delete", {}, {}, [], {}),
+                (2, "prompt-wipe", {}, {}, [], {}),
+            ]
+
+        def get_current_queue(self) -> tuple[list[Any], list[Any]]:
+            """Return native running and queued snapshots."""
+            return list(self.currently_running.values()), list(self.queue)
+
+        def task_done(self, item_id: int, *_args: Any, **_kwargs: Any) -> None:
+            """Remove one completed running prompt."""
+            self.currently_running.pop(item_id)
+
+        def delete_queue_item(self, predicate: Any) -> bool:
+            """Delete the first queued item matching a predicate."""
+            for index, item in enumerate(self.queue):
+                if predicate(item):
+                    self.queue.pop(index)
+                    return True
+            return False
+
+        def wipe_queue(self) -> None:
+            """Delete every queued prompt."""
+            self.queue.clear()
+
+    released: list[str] = []
+    monkeypatch.setattr(
+        api_intercept_module,
+        "finish_r2_writeback_prompt",
+        released.append,
+    )
+    prompt_queue = FakePromptQueue()
+    api_intercept_module._install_modal_interrupt_queue_bridge(
+        SimpleNamespace(prompt_queue=prompt_queue)
+    )
+
+    prompt_queue.task_done(7, {})
+    assert prompt_queue.delete_queue_item(
+        lambda item: item[1] == "prompt-delete"
+    ) is True
+    prompt_queue.wipe_queue()
+
+    assert released == ["prompt-running", "prompt-delete", "prompt-wipe"]
+
+
 def test_selected_vast_capacity_streams_setup_status(
     api_intercept_module: Any,
     vast_models_module: Any,

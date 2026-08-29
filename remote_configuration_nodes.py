@@ -129,9 +129,9 @@ def _r2_storage_inputs() -> list[io.Input]:
         ),
         io.Combo.Input(
             "write_back_mode",
-            options=["async", "sync", "off"],
+            options=["async", "off"],
             default="async",
-            tooltip="Populate R2 asynchronously, synchronously, or read-only.",
+            tooltip="Populate R2 during workflow-idle time, or use R2 read-only.",
         ),
         io.String.Input(
             "key_prefix",

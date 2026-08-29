@@ -66,6 +66,8 @@ from .sync_engine import (
     ModalVolumeBackend,
     SyncCancelledError,
     SyncedAsset,
+    begin_r2_writeback_prompt,
+    finish_r2_writeback_prompt,
     modal,
     resolve_model_path,
 )
@@ -8803,6 +8805,9 @@ def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
     original_interrupt_if_running = getattr(
         prompt_queue, "interrupt_if_running", None
     )
+    original_task_done = getattr(prompt_queue, "task_done", None)
+    original_wipe_queue = getattr(prompt_queue, "wipe_queue", None)
+    original_delete_queue_item = getattr(prompt_queue, "delete_queue_item", None)
     if not any(
         callable(method)
         for method in (
@@ -8910,6 +8915,63 @@ def _install_modal_interrupt_queue_bridge(prompt_server: Any) -> None:
             return bool(original_interrupt_if_running(prompt_id))
 
         setattr(prompt_queue, "interrupt_if_running", remote_interrupt_if_running)
+
+    if callable(original_task_done):
+
+        def remote_task_done(item_id: Any, *args: Any, **kwargs: Any) -> Any:
+            """Release background cache work after the whole prompt terminates."""
+            currently_running = getattr(prompt_queue, "currently_running", {})
+            running_item = (
+                currently_running.get(item_id)
+                if isinstance(currently_running, Mapping)
+                else None
+            )
+            prompt_id = (
+                str(running_item[1])
+                if isinstance(running_item, (list, tuple)) and len(running_item) > 1
+                else None
+            )
+            try:
+                return original_task_done(item_id, *args, **kwargs)
+            finally:
+                if prompt_id is not None:
+                    finish_r2_writeback_prompt(prompt_id)
+
+        setattr(prompt_queue, "task_done", remote_task_done)
+
+    if callable(original_wipe_queue):
+
+        def remote_wipe_queue() -> Any:
+            """Release reservations belonging to every discarded queued prompt."""
+            queued_items: list[Any] = []
+            if callable(original_get_current_queue):
+                _running, queued = original_get_current_queue()
+                queued_items = list(queued)
+            try:
+                return original_wipe_queue()
+            finally:
+                for queued_prompt_id in _queue_item_prompt_ids(queued_items):
+                    finish_r2_writeback_prompt(queued_prompt_id)
+
+        setattr(prompt_queue, "wipe_queue", remote_wipe_queue)
+
+    if callable(original_delete_queue_item):
+
+        def remote_delete_queue_item(predicate: Callable[[Any], bool]) -> Any:
+            """Release the exact reservation removed through ComfyUI's queue API."""
+            before_prompt_ids: set[str] = set()
+            if callable(original_get_current_queue):
+                _running, queued = original_get_current_queue()
+                before_prompt_ids = _queue_item_prompt_ids(queued)
+            result = original_delete_queue_item(predicate)
+            if result and callable(original_get_current_queue):
+                _running, queued = original_get_current_queue()
+                after_prompt_ids = _queue_item_prompt_ids(queued)
+                for removed_prompt_id in before_prompt_ids - after_prompt_ids:
+                    finish_r2_writeback_prompt(removed_prompt_id)
+            return result
+
+        setattr(prompt_queue, "delete_queue_item", remote_delete_queue_item)
 
     setattr(prompt_queue, _MODAL_INTERRUPT_QUEUE_BRIDGE_ATTR, True)
     logger.info("Installed remote preparation bridge on ComfyUI prompt queue.")
@@ -9679,6 +9741,8 @@ def setup_modal_queue_route(
         preparation_prompt_id: str | None = None
         preparation_cancellation = threading.Event()
         configurator_node_id: str | None = None
+        r2_writeback_prompt_id: str | None = None
+        prompt_queued = False
         try:
             request_started_at = time.perf_counter()
             json_data = await request.json()
@@ -9717,6 +9781,10 @@ def setup_modal_queue_route(
                     time.perf_counter() - request_started_at,
                 )
                 return response
+
+            if prompt_id is not None:
+                begin_r2_writeback_prompt(prompt_id)
+                r2_writeback_prompt_id = prompt_id
 
             if prompt_id is not None:
                 extra_pnginfo[MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY] = prompt_id
@@ -9965,6 +10033,7 @@ def setup_modal_queue_route(
                     else None
                 ),
             )
+            prompt_queued = response.status < 400
             logger.info(
                 "Modal queue request completed in %.3fs.",
                 time.perf_counter() - request_started_at,
@@ -10048,6 +10117,8 @@ def setup_modal_queue_route(
         finally:
             if preparation_prompt_id is not None:
                 _clear_remote_preparation(prompt_server, preparation_prompt_id)
+            if r2_writeback_prompt_id is not None and not prompt_queued:
+                finish_r2_writeback_prompt(r2_writeback_prompt_id)
 
     _ROUTE_REGISTERED = True
     logger.info(

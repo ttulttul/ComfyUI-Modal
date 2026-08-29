@@ -1,5 +1,14 @@
 # Learnings
 
+## 2026-08-29: Background cache work must yield resources, not only the caller
+
+- Submitting a transfer to `ThreadPoolExecutor` prevents a direct caller wait but still starts network, disk, Docker, and SSH work on the environment that is about to execute the workflow. A cache operation is truly out of the foreground path only when prompt lifecycle state gates its start and can preempt it when new work arrives.
+- ComfyUI's prompt-level terminal boundary is `PromptQueue.task_done`, not the end of an individual remote component invocation. Release idle cache work there so local gaps, multiple remote components, queued prompts, cancellation, and execution errors all keep foreground priority for the full workflow.
+- Queue deletion and wiping are terminal paths too. A lifecycle bridge that reserves cache-idle time must release discarded prompt IDs as well as completed ones or one removed queue entry can starve background work indefinitely.
+- Indexed custom-node backfill can perform expensive hashing and archive packaging before it ever submits an upload. Put the traversal itself on the idle queue; moving only the final PUT to a thread leaves a substantial foreground stall.
+- Vast write-back remains billable activity after workflow execution. Increment lease activity and refresh the worker watchdog around each idle transfer so a zero or short retention deadline cannot destroy the instance during multipart upload.
+- Background R2 uploads must be cancellable and idempotently requeued. Name transient SSH Docker helpers so cancellation can remove the exact container, abort incomplete multipart uploads on the controller, and let content-addressed existence checks collapse any harmless completed single PUT on retry.
+
 ## 2026-08-29: Vast publication cost is dominated by stable dependencies
 
 - The observed cold OrbStack publication spent about 274 seconds building and 165 seconds pushing. Runtime/PyTorch/CUDA and vLLM package layers accounted for most build time and bytes; the Ubuntu root layer and source copy were comparatively small. Changing Linux distributions would not materially address this path.

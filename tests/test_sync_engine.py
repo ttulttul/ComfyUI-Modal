@@ -2048,18 +2048,20 @@ def test_r2_cache_hit_materializes_without_local_upload(
     assert statuses == ["Downloading asset from Cloudflare R2: model.safetensors"]
 
 
-def test_local_upload_writes_back_to_r2_in_sync_mode(
+def test_local_upload_queues_r2_writeback_without_blocking(
     settings_module: Any,
     sync_engine_module: Any,
     r2_cache_module: Any,
     tmp_path: Path,
 ) -> None:
-    """A cache miss should use the existing upload and then populate R2."""
+    """A cache miss should return before background R2 population completes."""
     asset_path = tmp_path / "model.safetensors"
     asset_path.write_bytes(b"new-model")
     sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
     remote_uploads: list[str] = []
     completed_plans: list[Any] = []
+    writeback_started = threading.Event()
+    allow_writeback = threading.Event()
 
     class R2Volume:
         """Record local worker upload and R2 write-back operations."""
@@ -2086,10 +2088,12 @@ def test_local_upload_writes_back_to_r2_in_sync_mode(
         def upload_r2_file(self, plan: Any, remote_path: str) -> Any:
             """Return a successful single-part upload result."""
             assert remote_path == remote_uploads[0]
+            writeback_started.set()
+            assert allow_writeback.wait(timeout=2.0)
             return r2_cache_module.R2UploadResult()
 
     class R2Cache:
-        """Plan and complete one synchronous write-back."""
+        """Expose one legacy sync setting that must migrate to background work."""
 
         write_back_mode = "sync"
 
@@ -2133,11 +2137,74 @@ def test_local_upload_writes_back_to_r2_in_sync_mode(
     )
 
     result = engine.sync_file(asset_path)
+    assert writeback_started.wait(timeout=2.0)
+    assert completed_plans == []
+    allow_writeback.set()
+    engine.wait_for_r2_writebacks()
 
     assert result.sha256 == sha256
     assert len(remote_uploads) == 1
     assert len(completed_plans) == 1
     assert completed_plans[0].sha256 == sha256
+
+
+def test_r2_writeback_coordinator_waits_for_foreground_prompt(
+    sync_engine_module: Any,
+) -> None:
+    """Idle jobs must not start while a remote prompt holds foreground priority."""
+    coordinator = sync_engine_module.R2WriteBackCoordinator(max_workers=1)
+    started = threading.Event()
+    completed = threading.Event()
+    coordinator.begin_prompt("prompt-1")
+
+    def run_writeback(cancellation_check: Any) -> None:
+        """Record one coordinator-controlled cache operation."""
+        assert cancellation_check() is False
+        started.set()
+        completed.set()
+
+    assert coordinator.submit(("cache", "asset"), run_writeback) is True
+    assert started.wait(timeout=0.05) is False
+
+    coordinator.finish_prompt("prompt-1")
+
+    assert completed.wait(timeout=2.0)
+    assert coordinator.wait_for_idle(timeout_seconds=2.0) is True
+
+
+def test_r2_writeback_coordinator_preempts_and_requeues_for_new_prompt(
+    sync_engine_module: Any,
+) -> None:
+    """A newly preparing prompt should cancel and later resume active cache work."""
+    coordinator = sync_engine_module.R2WriteBackCoordinator(max_workers=1)
+    first_started = threading.Event()
+    first_cancelled = threading.Event()
+    completed = threading.Event()
+    attempts = 0
+
+    def run_writeback(cancellation_check: Any) -> None:
+        """Yield the first attempt and complete the retried idle attempt."""
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first_started.set()
+            assert first_cancelled.wait(timeout=2.0)
+            assert cancellation_check() is True
+            raise sync_engine_module.R2WriteBackCancelled("foreground resumed")
+        assert cancellation_check() is False
+        completed.set()
+
+    assert coordinator.submit(("cache", "asset"), run_writeback) is True
+    assert first_started.wait(timeout=2.0)
+    coordinator.begin_prompt("prompt-2")
+    first_cancelled.set()
+    assert completed.wait(timeout=0.05) is False
+
+    coordinator.finish_prompt("prompt-2")
+
+    assert completed.wait(timeout=2.0)
+    assert attempts == 2
+    assert coordinator.wait_for_idle(timeout_seconds=2.0) is True
 
 
 def test_indexed_remote_payload_is_backfilled_to_r2(
@@ -2164,6 +2231,7 @@ def test_indexed_remote_payload_is_backfilled_to_r2(
     )
 
     result = engine.sync_file(asset_path)
+    engine.wait_for_r2_writebacks()
 
     assert result.uploaded is False
     assert result.remote_path == indexed_remote_path
@@ -2255,6 +2323,7 @@ def test_indexed_custom_node_manifest_backfills_archives_and_manifest_to_r2(
         r2_cache=_SynchronousBackfillCache(r2_cache_module),
     )
     backfilled_bundle = backfill_engine.sync_custom_nodes_directory()
+    backfill_engine.wait_for_r2_writebacks()
 
     assert backfilled_bundle is not None
     assert backfilled_bundle.uploaded is False
@@ -2388,5 +2457,6 @@ def test_failed_r2_hit_is_replaced_after_fallback_upload(
     )
 
     engine.sync_file(asset_path)
+    engine.wait_for_r2_writebacks()
 
     assert forced_values == [True]

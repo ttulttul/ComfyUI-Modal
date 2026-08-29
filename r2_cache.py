@@ -165,6 +165,11 @@ class R2CacheConfiguration:
             raise ValueError(
                 "Cloudflare R2 write-back mode must be one of async, sync, or off."
             )
+        if normalized_write_back == "sync":
+            logger.warning(
+                "Cloudflare R2 synchronous write-back is deprecated; using idle background write-back."
+            )
+            normalized_write_back = "async"
         object.__setattr__(self, "write_back_mode", normalized_write_back)
         if not 1 <= self.url_ttl_seconds <= R2_MAX_URL_TTL_SECONDS:
             raise ValueError(
@@ -412,7 +417,7 @@ class R2CacheClient:
 
     @property
     def write_back_mode(self) -> str:
-        """Return off, sync, or async write-back behavior."""
+        """Return idle-background async or read-only off behavior."""
         return self.configuration.write_back_mode
 
     def validate_bucket_access(self) -> None:

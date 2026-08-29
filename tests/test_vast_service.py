@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
@@ -114,6 +114,95 @@ def test_from_environment_requires_credential_before_other_setup(
         assert "VAST_API_KEY" in str(exc)
     else:
         raise AssertionError("Missing Vast credential was accepted.")
+
+
+def test_sync_engine_keeps_vast_lease_active_during_r2_writeback(
+    settings_module: Any,
+    vast_service_module: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Idle R2 transfers should hold lease activity and refresh both watchdog states."""
+    events: list[tuple[str, Any]] = []
+
+    class FakeLeaseManager:
+        """Record the activity lifecycle selected for background write-back."""
+
+        def begin_activity(self, instance_id: int) -> Any:
+            """Return one active lease snapshot."""
+            events.append(("begin", instance_id))
+            return SimpleNamespace(state="active")
+
+        def finish_activity(
+            self,
+            instance_id: int,
+            *,
+            idle_retention_seconds: float,
+        ) -> Any:
+            """Return one idle lease snapshot."""
+            events.append(("finish", (instance_id, idle_retention_seconds)))
+            return SimpleNamespace(state="idle")
+
+    class FakeRuntime:
+        """Record watchdog publications without opening SSH."""
+
+        def __init__(self, **_kwargs: Any) -> None:
+            """Accept the production runtime constructor arguments."""
+
+        def update_watchdog(self, lease: Any) -> None:
+            """Record one active or idle watchdog snapshot."""
+            events.append(("watchdog", lease.state))
+
+    class FakeVolume:
+        """Accept the production Vast storage constructor arguments."""
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            """Initialize the no-op test backend."""
+
+    monkeypatch.setattr(vast_service_module, "VastRuntimeManager", FakeRuntime)
+    monkeypatch.setattr(vast_service_module, "VastSshVolumeBackend", FakeVolume)
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="vast",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=None,
+    )
+    service = SimpleNamespace(
+        settings=settings,
+        runtime_configuration=SimpleNamespace(
+            remote_storage_root=PurePosixPath("/storage")
+        ),
+        lease_manager=FakeLeaseManager(),
+        huggingface_asset_registry=None,
+        huggingface_asset_discovery=None,
+        r2_cache=None,
+        _runner=lambda _lease: object(),
+    )
+    lease = SimpleNamespace(instance_id=42, idle_retention_seconds=90.0)
+
+    engine = vast_service_module.VastService.sync_engine(service, lease)
+    assert engine.r2_writeback_activity is not None
+    with engine.r2_writeback_activity():
+        events.append(("transfer", 42))
+
+    assert events == [
+        ("begin", 42),
+        ("watchdog", "active"),
+        ("transfer", 42),
+        ("finish", (42, 90.0)),
+        ("watchdog", "idle"),
+    ]
 
 
 def test_startup_status_translates_vast_image_progress(

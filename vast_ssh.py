@@ -694,17 +694,34 @@ class VastSshVolumeBackend:
         remote_path: str,
     ) -> R2UploadResult:
         """Upload one Vast-host file through a controller-issued R2 plan."""
-        normalized = _validated_storage_path(remote_path)
-        result = self._run_r2_materializer(
-            {
-                "operation": "upload",
-                "storage_root": str(self.storage_root),
-                "remote_path": normalized,
-                "upload": plan.to_dict(),
-            },
-            size_bytes=plan.size_bytes,
+        return self.upload_r2_file_cancellable(
+            plan,
+            remote_path,
             cancellation_check=lambda: False,
         )
+
+    def upload_r2_file_cancellable(
+        self,
+        plan: R2UploadPlan,
+        remote_path: str,
+        *,
+        cancellation_check: Callable[[], bool],
+    ) -> R2UploadResult:
+        """Upload one Vast-host file while yielding to foreground workflows."""
+        normalized = _validated_storage_path(remote_path)
+        try:
+            result = self._run_r2_materializer(
+                {
+                    "operation": "upload",
+                    "storage_root": str(self.storage_root),
+                    "remote_path": normalized,
+                    "upload": plan.to_dict(),
+                },
+                size_bytes=plan.size_bytes,
+                cancellation_check=cancellation_check,
+            )
+        except VastSshCancelledError as exc:
+            raise InterruptedError("Vast R2 upload was cancelled.") from exc
         return R2UploadResult.from_dict(result)
 
     def _run_r2_materializer(

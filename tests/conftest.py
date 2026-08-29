@@ -438,6 +438,19 @@ def reset_modal_environment(
         or request.node.get_closest_marker("live_vast") is not None
     ):
         return
+    sync_engine_module = sys.modules.get(f"{PACKAGE_NAME}.sync_engine")
+    coordinator = getattr(
+        sync_engine_module,
+        "_R2_WRITE_BACK_COORDINATOR",
+        None,
+    )
+    reset_reservations = getattr(
+        coordinator,
+        "reset_prompt_reservations_for_tests",
+        None,
+    )
+    if callable(reset_reservations):
+        reset_reservations()
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
     monkeypatch.setenv("COMFY_MODAL_APP_NAME", "comfy-modal-sync")
     monkeypatch.setenv("COMFY_MODAL_LOCAL_STORAGE_ROOT", str(tmp_path / "storage"))

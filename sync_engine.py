@@ -11,7 +11,9 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
@@ -118,6 +120,11 @@ def _emit_sync_status(
     if status_callback is None:
         return
     status_callback(message, current, total)
+
+
+def _never_cancel() -> bool:
+    """Return false for operations without a cooperative cancellation source."""
+    return False
 
 
 def _format_asset_upload_status(
@@ -253,6 +260,20 @@ class R2MaterializingBackend(Protocol):
         remote_path: str,
     ) -> R2UploadResult:
         """Upload one remote file through a controller-issued signed plan."""
+
+
+@runtime_checkable
+class CancellableR2WriteBackBackend(Protocol):
+    """Optional backend capability for preemptible background R2 uploads."""
+
+    def upload_r2_file_cancellable(
+        self,
+        plan: R2UploadPlan,
+        remote_path: str,
+        *,
+        cancellation_check: CancellationCheck,
+    ) -> R2UploadResult:
+        """Upload one remote file while yielding promptly to workflow activity."""
 
 
 @runtime_checkable
@@ -417,10 +438,164 @@ def _custom_nodes_sync_worker_count() -> int:
 
 
 _MODAL_VOLUME_EXECUTOR = ThreadPoolExecutor(max_workers=_modal_volume_worker_count())
-_R2_WRITE_BACK_EXECUTOR = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="comfy-r2-writeback",
-)
+
+
+class R2WriteBackCancelled(RuntimeError):
+    """Signal that an idle write-back yielded to foreground workflow activity."""
+
+
+@dataclass(frozen=True)
+class _R2WriteBackJob:
+    """Describe one deduplicated best-effort cache population operation."""
+
+    key: tuple[str, ...]
+    callback: Callable[[CancellationCheck], None] = field(compare=False, repr=False)
+
+
+class R2WriteBackCoordinator:
+    """Run cache population only while no remote workflow is active."""
+
+    def __init__(self, *, max_workers: int = 2, max_pending_jobs: int = 1024) -> None:
+        """Start bounded daemon workers for opportunistic write-back jobs."""
+        if max_workers <= 0 or max_pending_jobs <= 0:
+            raise ValueError("R2 write-back coordinator bounds must be positive.")
+        self._condition = threading.Condition()
+        self._pending: OrderedDict[tuple[str, ...], _R2WriteBackJob] = OrderedDict()
+        self._known_keys: set[tuple[str, ...]] = set()
+        self._active_prompts: set[str] = set()
+        self._active_cancellations: set[threading.Event] = set()
+        self._active_jobs = 0
+        self._max_pending_jobs = max_pending_jobs
+        self._workers = tuple(
+            threading.Thread(
+                target=self._worker,
+                name=f"comfy-r2-writeback-{worker_index + 1}",
+                daemon=True,
+            )
+            for worker_index in range(max_workers)
+        )
+        for worker in self._workers:
+            worker.start()
+
+    def begin_prompt(self, prompt_id: str) -> None:
+        """Reserve foreground priority and preempt active cache transfers."""
+        normalized_prompt_id = str(prompt_id).strip()
+        if not normalized_prompt_id:
+            raise ValueError("R2 write-back prompt ID must not be empty.")
+        with self._condition:
+            self._active_prompts.add(normalized_prompt_id)
+            for cancellation in self._active_cancellations:
+                cancellation.set()
+            self._condition.notify_all()
+
+    def finish_prompt(self, prompt_id: str) -> None:
+        """Release one prompt reservation and wake idle cache workers."""
+        normalized_prompt_id = str(prompt_id).strip()
+        if not normalized_prompt_id:
+            return
+        with self._condition:
+            self._active_prompts.discard(normalized_prompt_id)
+            self._condition.notify_all()
+
+    def reset_prompt_reservations_for_tests(self) -> None:
+        """Clear synthetic prompt reservations left by isolated queue tests."""
+        with self._condition:
+            self._active_prompts.clear()
+            for cancellation in self._active_cancellations:
+                cancellation.set()
+            self._condition.notify_all()
+
+    def submit(
+        self,
+        key: tuple[str, ...],
+        callback: Callable[[CancellationCheck], None],
+    ) -> bool:
+        """Queue one deduplicated job without waiting for capacity or execution."""
+        if not key or any(not str(part) for part in key):
+            raise ValueError("R2 write-back job key must contain non-empty values.")
+        with self._condition:
+            if key in self._known_keys:
+                return False
+            if len(self._pending) >= self._max_pending_jobs:
+                logger.warning(
+                    "Dropping R2 write-back because the idle queue reached %d jobs key=%s.",
+                    self._max_pending_jobs,
+                    key[-1],
+                )
+                return False
+            job = _R2WriteBackJob(key=key, callback=callback)
+            self._pending[key] = job
+            self._known_keys.add(key)
+            self._condition.notify()
+            return True
+
+    def wait_for_idle(self, timeout_seconds: float | None = None) -> bool:
+        """Wait until pending and active jobs drain, primarily for tests and shutdown."""
+        deadline = (
+            None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        )
+        with self._condition:
+            while self._pending or self._active_jobs:
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def _worker(self) -> None:
+        """Run queued jobs only during foreground-idle windows."""
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: bool(self._pending) and not self._active_prompts
+                )
+                key, job = self._pending.popitem(last=False)
+                cancellation = threading.Event()
+                self._active_cancellations.add(cancellation)
+                self._active_jobs += 1
+            cancelled = False
+            try:
+                job.callback(cancellation.is_set)
+            except R2WriteBackCancelled:
+                cancelled = True
+            except (
+                AssertionError,
+                KeyError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                logger.warning(
+                    "Unhandled R2 write-back job failure key=%s: %s",
+                    key[-1],
+                    exc,
+                )
+            finally:
+                with self._condition:
+                    self._active_cancellations.discard(cancellation)
+                    self._active_jobs -= 1
+                    if cancelled:
+                        self._pending.setdefault(key, job)
+                    else:
+                        self._known_keys.discard(key)
+                    self._condition.notify_all()
+
+
+_R2_WRITE_BACK_COORDINATOR = R2WriteBackCoordinator()
+
+
+def begin_r2_writeback_prompt(prompt_id: str) -> None:
+    """Pause opportunistic cache population for one foreground prompt."""
+    _R2_WRITE_BACK_COORDINATOR.begin_prompt(prompt_id)
+
+
+def finish_r2_writeback_prompt(prompt_id: str) -> None:
+    """Resume cache population after one foreground prompt leaves the queue."""
+    _R2_WRITE_BACK_COORDINATOR.finish_prompt(prompt_id)
 
 
 class _ModalSdkCaller:
@@ -682,6 +857,7 @@ class ModalAssetSyncEngine:
     huggingface_asset_discovery: HuggingFaceAssetDiscovery | None = None
     r2_cache: R2CacheClient | None = None
     cancellation_check: CancellationCheck | None = None
+    r2_writeback_activity: Callable[[], AbstractContextManager[None]] | None = None
     _hash_cache: dict[str, dict[str, Any]] = field(init=False, default_factory=dict)
     _path_resolution_cache: dict[str, str | None] = field(init=False, default_factory=dict)
     _hash_cache_dirty: bool = field(init=False, default=False)
@@ -690,8 +866,6 @@ class ModalAssetSyncEngine:
     _custom_nodes_sync_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
     _custom_nodes_sync_checked: bool = field(init=False, default=False)
     _custom_nodes_bundle_cache: SyncedAsset | None = field(init=False, default=None)
-    _r2_writeback_futures: list[Future[None]] = field(init=False, default_factory=list)
-    _r2_writeback_lock: threading.Lock = field(init=False, default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         """Load persistent metadata caches used to avoid repeated hashing work."""
@@ -938,8 +1112,12 @@ class ModalAssetSyncEngine:
         self,
         *,
         status_callback: SyncStatusCallback | None = None,
+        revisit_indexed_for_r2: bool = False,
+        writeback_cancellation_check: CancellationCheck | None = None,
     ) -> SyncedAsset | None:
         """Mirror custom_nodes as a manifest plus per-package archives when available."""
+        if writeback_cancellation_check is not None and writeback_cancellation_check():
+            raise R2WriteBackCancelled("Custom-node R2 backfill yielded before scanning.")
         custom_nodes_dir = self.settings.custom_nodes_dir
         if custom_nodes_dir is None or not custom_nodes_dir.exists():
             logger.info("No custom_nodes directory detected for mirroring.")
@@ -948,6 +1126,8 @@ class ModalAssetSyncEngine:
         sync_started_at = time.perf_counter()
         logger.info("Hashing custom_nodes directory at %s", custom_nodes_dir)
         directory_hash = self._hash_directory(custom_nodes_dir)
+        if writeback_cancellation_check is not None and writeback_cancellation_check():
+            raise R2WriteBackCancelled("Custom-node R2 backfill yielded after hashing.")
         logger.info(
             "Finished hashing custom_nodes directory in %.3fs with digest %s.",
             time.perf_counter() - sync_started_at,
@@ -955,8 +1135,12 @@ class ModalAssetSyncEngine:
         )
         manifest_sync_key = self._custom_nodes_manifest_sync_index_key(directory_hash)
         manifest_record = self._lookup_sync_record(manifest_sync_key)
-        if manifest_record is not None and not self._r2_writeback_enabled():
+        if manifest_record is not None and (
+            not self._r2_writeback_enabled() or not revisit_indexed_for_r2
+        ):
             remote_path = str(manifest_record["remote_path"])
+            if self._r2_writeback_enabled():
+                self._schedule_custom_nodes_r2_backfill(directory_hash)
             logger.info(
                 "Custom_nodes manifest already mirrored at %s after %.3fs total sync time.",
                 remote_path,
@@ -970,12 +1154,14 @@ class ModalAssetSyncEngine:
             )
         if manifest_record is not None:
             logger.info(
-                "Revisiting indexed custom_nodes entries so R2 write-back can "
-                "backfill missing objects."
+                "Revisiting indexed custom_nodes entries during idle time so R2 "
+                "write-back can backfill missing objects."
             )
         remote_path = self._custom_nodes_manifest_remote_path(directory_hash)
 
         archive_specs, asset_specs = self._custom_nodes_bundle_specs(custom_nodes_dir)
+        if writeback_cancellation_check is not None and writeback_cancellation_check():
+            raise R2WriteBackCancelled("Custom-node R2 backfill yielded after planning.")
         if not archive_specs:
             logger.info("Custom_nodes directory %s contained no syncable files.", custom_nodes_dir)
             return None
@@ -1001,6 +1187,8 @@ class ModalAssetSyncEngine:
             archive_specs=archive_specs,
         )
         asset_results = self._sync_custom_node_assets_parallel(asset_specs)
+        if writeback_cancellation_check is not None and writeback_cancellation_check():
+            raise R2WriteBackCancelled("Custom-node R2 backfill yielded after packaging.")
         uploaded = any(
             result.uploaded for result in [*archive_results, *asset_results]
         )
@@ -1068,6 +1256,23 @@ class ModalAssetSyncEngine:
             remote_path=manifest_sync_result.remote_path,
             sha256=directory_hash,
             uploaded=uploaded,
+        )
+
+    def _schedule_custom_nodes_r2_backfill(self, directory_hash: str) -> None:
+        """Defer indexed custom-node traversal until foreground workflows are idle."""
+        if not self._r2_writeback_enabled():
+            return
+        job_key = (
+            *self._r2_writeback_job_prefix(),
+            "custom-nodes-backfill",
+            directory_hash,
+        )
+        _R2_WRITE_BACK_COORDINATOR.submit(
+            job_key,
+            lambda cancellation_check: self._sync_custom_nodes_directory_uncached(
+                revisit_indexed_for_r2=True,
+                writeback_cancellation_check=cancellation_check,
+            ),
         )
 
     def _sync_content_addressed_file(
@@ -1332,22 +1537,44 @@ class ModalAssetSyncEngine:
         remote_path: str,
         force: bool = False,
     ) -> None:
-        """Write one remote file into R2 synchronously or on a bounded executor."""
+        """Queue one best-effort R2 write without delaying foreground progress."""
         if not self._r2_writeback_enabled():
             return
         assert self.r2_cache is not None
-        if self.r2_cache.write_back_mode == "sync":
-            self._write_back_r2_file(sha256, size_bytes, remote_path, force)
-            return
-        future = _R2_WRITE_BACK_EXECUTOR.submit(
-            self._write_back_r2_file,
+        job_key = (
+            *self._r2_writeback_job_prefix(),
             sha256,
-            size_bytes,
+            str(size_bytes),
             remote_path,
-            force,
+            "force" if force else "normal",
         )
-        with self._r2_writeback_lock:
-            self._r2_writeback_futures.append(future)
+        _R2_WRITE_BACK_COORDINATOR.submit(
+            job_key,
+            lambda cancellation_check: self._write_back_r2_file(
+                sha256,
+                size_bytes,
+                remote_path,
+                force,
+                cancellation_check=cancellation_check,
+            ),
+        )
+
+    def _r2_writeback_job_prefix(self) -> tuple[str, str, str]:
+        """Return a stable cache namespace used to deduplicate background jobs."""
+        if self.r2_cache is None:
+            raise RuntimeError("R2 write-back job requested without an R2 cache.")
+        configuration = getattr(self.r2_cache, "configuration", None)
+        if configuration is not None:
+            return (
+                str(configuration.endpoint_url),
+                str(configuration.bucket),
+                str(configuration.key_prefix),
+            )
+        return (
+            type(self.r2_cache).__module__,
+            type(self.r2_cache).__qualname__,
+            str(id(self.r2_cache)),
+        )
 
     def _r2_writeback_enabled(self) -> bool:
         """Return whether this engine can populate its configured R2 cache."""
@@ -1363,6 +1590,8 @@ class ModalAssetSyncEngine:
         size_bytes: int,
         remote_path: str,
         force: bool = False,
+        *,
+        cancellation_check: CancellationCheck = _never_cancel,
     ) -> None:
         """Upload one worker-resident file to R2 without exposing permanent keys."""
         if self.r2_cache is None or not isinstance(
@@ -1372,12 +1601,39 @@ class ModalAssetSyncEngine:
             return
         plan: R2UploadPlan | None = None
         try:
-            plan = self.r2_cache.prepare_upload(sha256, size_bytes, force=force)
-            if plan is None:
-                return
-            result = self.volume.upload_r2_file(plan, remote_path)
-            self.r2_cache.complete_upload(plan, result)
-            logger.info("Wrote SHA-256 %s back to Cloudflare R2.", sha256)
+            if cancellation_check():
+                raise R2WriteBackCancelled("R2 write-back yielded before activity.")
+            activity = (
+                self.r2_writeback_activity()
+                if self.r2_writeback_activity is not None
+                else nullcontext()
+            )
+            with activity:
+                if cancellation_check():
+                    raise R2WriteBackCancelled("R2 write-back yielded before signing.")
+                plan = self.r2_cache.prepare_upload(sha256, size_bytes, force=force)
+                if plan is None:
+                    return
+                if cancellation_check():
+                    raise R2WriteBackCancelled("R2 write-back yielded after signing.")
+                if isinstance(self.volume, CancellableR2WriteBackBackend):
+                    result = self.volume.upload_r2_file_cancellable(
+                        plan,
+                        remote_path,
+                        cancellation_check=cancellation_check,
+                    )
+                else:
+                    result = self.volume.upload_r2_file(plan, remote_path)
+                if cancellation_check():
+                    raise R2WriteBackCancelled(
+                        "R2 write-back yielded before completion."
+                    )
+                self.r2_cache.complete_upload(plan, result)
+                logger.info("Wrote SHA-256 %s back to Cloudflare R2.", sha256)
+        except (InterruptedError, R2WriteBackCancelled) as exc:
+            if plan is not None:
+                self.r2_cache.abort_upload(plan)
+            raise R2WriteBackCancelled(str(exc)) from exc
         except (R2CacheError, OSError, RuntimeError, TypeError, ValueError) as exc:
             if plan is not None:
                 self.r2_cache.abort_upload(plan)
@@ -1385,11 +1641,7 @@ class ModalAssetSyncEngine:
 
     def wait_for_r2_writebacks(self) -> None:
         """Wait for this engine's currently scheduled R2 writes to finish."""
-        with self._r2_writeback_lock:
-            futures = tuple(self._r2_writeback_futures)
-            self._r2_writeback_futures.clear()
-        for future in futures:
-            future.result()
+        _R2_WRITE_BACK_COORDINATOR.wait_for_idle()
 
     def _huggingface_source_for_asset(
         self,

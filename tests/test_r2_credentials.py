@@ -60,7 +60,7 @@ def test_keyring_record_resolves_workflow_r2_configuration(
     assert configuration.secret_access_key == "secret-key"
     assert configuration.endpoint_url == f"https://{'a' * 32}.eu.r2.cloudflarestorage.com"
     assert configuration.key_prefix == "custom/cache"
-    assert configuration.write_back_mode == "sync"
+    assert configuration.write_back_mode == "async"
     status = store.status(storage.credential_id)
     assert status == {
         "connected": True,

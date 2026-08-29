@@ -7,10 +7,11 @@ import json
 import logging
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 if __package__:
     from .execution_environments import (
@@ -764,6 +765,32 @@ class VastService:
     def sync_engine(self, lease: VastLeaseRecord) -> ModalAssetSyncEngine:
         """Build a direct-filesystem content-addressed sync engine for one lease."""
         runner = self._runner(lease)
+        runtime = VastRuntimeManager(
+            runner=runner,
+            configuration=self.runtime_configuration,
+        )
+
+        @contextmanager
+        def writeback_activity() -> Iterator[None]:
+            """Keep the Vast lease alive around one idle cache transfer."""
+            active = self.lease_manager.begin_activity(lease.instance_id)
+            try:
+                runtime.update_watchdog(active)
+                yield
+            finally:
+                try:
+                    finished = self.lease_manager.finish_activity(
+                        lease.instance_id,
+                        idle_retention_seconds=lease.idle_retention_seconds,
+                    )
+                    runtime.update_watchdog(finished)
+                except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                    logger.error(
+                        "Unable to release Vast R2 write-back activity instance=%d: %s",
+                        lease.instance_id,
+                        exc,
+                    )
+
         vast_settings = replace(
             self.settings,
             execution_mode="vast",
@@ -781,6 +808,7 @@ class VastService:
             huggingface_asset_registry=self.huggingface_asset_registry,
             huggingface_asset_discovery=self.huggingface_asset_discovery,
             r2_cache=self.r2_cache,
+            r2_writeback_activity=writeback_activity,
         )
 
     def executor(self) -> VastExecutorClient:
