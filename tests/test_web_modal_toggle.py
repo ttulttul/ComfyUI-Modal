@@ -568,6 +568,10 @@ def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
     assert '"KB/s",' in source
     assert '"TB/s",' in source
     assert "function formatByteRate(bytesPerSecond)" in source
+    assert "function formatByteProgress(value, maxValue)" in source
+    assert 'const BYTE_COUNT_UNITS = Object.freeze(["B", "KB", "MB", "GB", "TB"]);' in source
+    assert "const fractionDigits = unitIndex <= 2 ? 0 : unitIndex === 3 ? 1 : 2;" in source
+    assert "? formatByteProgress(aggregateProgress.value, aggregateProgress.max)" in source
     assert "BYTE_PROGRESS_UNITS.has(normalizedUnit)" in source
     assert "timeToFirstTokenSeconds" in source
     assert "if (state.progress.indeterminate) {" in source

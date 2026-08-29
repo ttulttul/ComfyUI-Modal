@@ -126,7 +126,8 @@ const BYTE_RATE_UNITS = Object.freeze([
   "PB/s",
   "EB/s",
 ]);
-const BYTE_RATE_SCALE = 1000;
+const BYTE_COUNT_UNITS = Object.freeze(["B", "KB", "MB", "GB", "TB"]);
+const BYTE_SCALE = 1000;
 const CONTAINER_STATUS_FAST_POLL_MS = 1500;
 const CONTAINER_STATUS_STABLE_POLL_MS = 5000;
 const CONTAINER_STATUS_HIDDEN_POLL_MS = 15000;
@@ -327,12 +328,31 @@ function progressIterationRate(previousState, value, maxValue, updatedAt) {
 function formatByteRate(bytesPerSecond) {
   let scaledRate = bytesPerSecond;
   let unitIndex = 0;
-  while (scaledRate >= BYTE_RATE_SCALE && unitIndex < BYTE_RATE_UNITS.length - 1) {
-    scaledRate /= BYTE_RATE_SCALE;
+  while (scaledRate >= BYTE_SCALE && unitIndex < BYTE_RATE_UNITS.length - 1) {
+    scaledRate /= BYTE_SCALE;
     unitIndex += 1;
   }
   const fractionDigits = scaledRate < 10 ? 2 : scaledRate < 100 ? 1 : 0;
   return `${scaledRate.toFixed(fractionDigits)} ${BYTE_RATE_UNITS[unitIndex]}`;
+}
+
+/**
+ * Format current and total byte counts in one compact, comparable unit.
+ * @param {number} value
+ * @param {number} maxValue
+ * @returns {string}
+ */
+function formatByteProgress(value, maxValue) {
+  let scaledMaxValue = maxValue;
+  let unitIndex = 0;
+  while (scaledMaxValue >= BYTE_SCALE && unitIndex < BYTE_COUNT_UNITS.length - 1) {
+    scaledMaxValue /= BYTE_SCALE;
+    unitIndex += 1;
+  }
+  const divisor = BYTE_SCALE ** unitIndex;
+  const scaledValue = value / divisor;
+  const fractionDigits = unitIndex <= 2 ? 0 : unitIndex === 3 ? 1 : 2;
+  return `${scaledValue.toFixed(fractionDigits)}/${scaledMaxValue.toFixed(fractionDigits)} ${BYTE_COUNT_UNITS[unitIndex]}`;
 }
 
 /**
@@ -6104,7 +6124,9 @@ function drawModalNodeDecoration(node, ctx) {
     ? "tok"
     : aggregateProgress?.unit || "";
   const headerMetric = aggregateProgress && !aggregateProgress.indeterminate
-    ? `${Math.round(aggregateProgress.value)}/${Math.round(aggregateProgress.max)}${progressUnit ? ` ${progressUnit}` : ""}`
+    ? BYTE_PROGRESS_UNITS.has(String(aggregateProgress.unit ?? "").trim().toLowerCase())
+      ? formatByteProgress(aggregateProgress.value, aggregateProgress.max)
+      : `${Math.round(aggregateProgress.value)}/${Math.round(aggregateProgress.max)}${progressUnit ? ` ${progressUnit}` : ""}`
     : null;
   const headerBaselineY = panelY + panelPaddingY + headerHeight / 2;
   if (headerText) {
