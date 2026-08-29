@@ -73,6 +73,16 @@ def _cloud_prompt_execution_owner() -> Any:
     return importlib.import_module("cloud_prompt_execution")
 
 
+def _cloud_mapped_execution_owner() -> Any:
+    """Return the module that owns cloud mapped execution helpers."""
+    return importlib.import_module("cloud_mapped_execution")
+
+
+def _cloud_execution_control_owner() -> Any:
+    """Return the module that owns active cloud execution registration."""
+    return importlib.import_module("cloud_execution_control")
+
+
 def _cloud_streaming_owner() -> Any:
     """Return the module that owns cloud stream buffering and payload dispatch."""
     return importlib.import_module("cloud_streaming")
@@ -11017,8 +11027,8 @@ def test_modal_cloud_execute_mapped_subgraph_payload_injects_static_bridges(
         return (f"mapped:{hydrated_inputs['remote_input_1']}:{hydrated_inputs['static_input_0']}",)
 
     monkeypatch.setattr(
-        _cloud_prompt_execution_owner(),
-        "_execute_subgraph_prompt",
+        _cloud_mapped_execution_owner(),
+        "_execute_prompt_subgraph",
         fake_execute_subgraph_prompt,
     )
 
@@ -11164,8 +11174,8 @@ def test_modal_cloud_execute_mapped_subgraph_payload_preserves_assigned_lane_id(
         return (f"mapped:{hydrated_inputs['remote_input_1']}",)
 
     monkeypatch.setattr(
-        _cloud_prompt_execution_owner(),
-        "_execute_subgraph_prompt",
+        _cloud_mapped_execution_owner(),
+        "_execute_prompt_subgraph",
         fake_execute_subgraph_prompt,
     )
 
@@ -15071,9 +15081,11 @@ def test_modal_cloud_registered_execution_preserves_pre_start_interrupt_flags(
             return None
 
     interrupt_flags = FakeInterruptFlags()
-    monkeypatch.setattr(modal_cloud_module, "modal", object())
+    monkeypatch.setattr(_cloud_execution_control_owner(), "modal", object())
     monkeypatch.setattr(
-        modal_cloud_module, "interrupt_flag_store", lambda: interrupt_flags
+        _cloud_execution_control_owner(),
+        "interrupt_flag_store",
+        lambda: interrupt_flags,
     )
 
     with modal_cloud_module._registered_remote_execution(

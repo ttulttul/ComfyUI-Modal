@@ -24,8 +24,8 @@ try:
         _execute_payload_with_output_capture,
         _fail_remote_invocation,
     )
+    from .cloud_mapped_execution import _execute_mapped_subgraph_payload
     from .cloud_prompt_execution import (
-        _execute_mapped_subgraph_payload,
         execute_node_locally,
         execute_subgraph_locally,
     )
@@ -50,8 +50,8 @@ except ImportError:  # pragma: no cover - flat Modal-container import.
         _execute_payload_with_output_capture,
         _fail_remote_invocation,
     )
+    from cloud_mapped_execution import _execute_mapped_subgraph_payload
     from cloud_prompt_execution import (
-        _execute_mapped_subgraph_payload,
         execute_node_locally,
         execute_subgraph_locally,
     )
@@ -384,4 +384,3 @@ def _stream_remote_payload_events(
                 event_buffer.dropped_progress_events,
                 payload.get("component_id"),
             )
-

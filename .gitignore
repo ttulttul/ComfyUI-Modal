@@ -12,12 +12,16 @@
 !/cloud_app_guard.py
 !/cloud_comfy_bootstrap.py
 !/cloud_durable_invocation.py
+!/cloud_execution_control.py
 !/cloud_image_env.py
+!/cloud_mapped_execution.py
 !/cloud_node_output_cache.py
 !/cloud_prompt_execution.py
+!/cloud_prompt_validation.py
 !/cloud_prompt_server_shims.py
 !/cloud_prewarm.py
 !/cloud_runtime_context.py
+!/cloud_runtime_logging.py
 !/cloud_session_bridge.py
 !/cloud_streaming.py
 !/cloud_volume_reload.py

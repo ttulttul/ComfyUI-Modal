@@ -18,8 +18,6 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -278,18 +276,26 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         configure_cloud_node_output_cache_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
+    from .cloud_mapped_execution import (
+        _aggregate_mapped_phase_outputs,
+        _build_phase_subgraph_payload,
+        _execute_mapped_subgraph_payload,
+        _mapped_phase_definition,
+        _merge_static_and_mapped_outputs,
+        _merge_static_or_mapped_values,
+        _shared_subgraph_payload_fields,
+        _split_phase_outputs,
+    )
+    from .cloud_prompt_validation import configure_cloud_prompt_validation_error
     from .cloud_prompt_execution import (
         CloudPromptExecutionHooks,
         _ReusablePromptExecutorState,
-        _aggregate_mapped_phase_outputs,
         _apply_boundary_inputs,
         _boundary_input_cache_signature,
-        _build_phase_subgraph_payload,
         _coerce_primitive_prompt_input_value,
         _coerce_prompt_primitive_input_values,
         _collapse_cache_slot,
         _copy_json_safe_prompt_metadata,
-        _execute_mapped_subgraph_payload,
         _execute_node_locally_raw,
         _execute_prompt_executor_compat,
         _execute_subgraph_prompt,
@@ -301,9 +307,6 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
         _invoke_original_node,
         _is_link,
         _log_prompt_executor_failure_details,
-        _mapped_phase_definition,
-        _merge_static_and_mapped_outputs,
-        _merge_static_or_mapped_values,
         _node_input_type_map,
         _node_input_types,
         _node_required_input_names,
@@ -316,9 +319,7 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
         _reset_prompt_executor_request_state,
         _resolve_required_subgraph_nodes,
         _serialize_prompt_executor_cache_scope,
-        _shared_subgraph_payload_fields,
         _short_circuit_restored_session_output_subgraph,
-        _split_phase_outputs,
         _summarize_suspicious_prompt_inputs,
         _temporary_node_mapping,
         _temporary_progress_hook,
@@ -333,18 +334,26 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
         execute_subgraph_locally,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
+    from cloud_mapped_execution import (
+        _aggregate_mapped_phase_outputs,
+        _build_phase_subgraph_payload,
+        _execute_mapped_subgraph_payload,
+        _mapped_phase_definition,
+        _merge_static_and_mapped_outputs,
+        _merge_static_or_mapped_values,
+        _shared_subgraph_payload_fields,
+        _split_phase_outputs,
+    )
+    from cloud_prompt_validation import configure_cloud_prompt_validation_error
     from cloud_prompt_execution import (
         CloudPromptExecutionHooks,
         _ReusablePromptExecutorState,
-        _aggregate_mapped_phase_outputs,
         _apply_boundary_inputs,
         _boundary_input_cache_signature,
-        _build_phase_subgraph_payload,
         _coerce_primitive_prompt_input_value,
         _coerce_prompt_primitive_input_values,
         _collapse_cache_slot,
         _copy_json_safe_prompt_metadata,
-        _execute_mapped_subgraph_payload,
         _execute_node_locally_raw,
         _execute_prompt_executor_compat,
         _execute_subgraph_prompt,
@@ -356,9 +365,6 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         _invoke_original_node,
         _is_link,
         _log_prompt_executor_failure_details,
-        _mapped_phase_definition,
-        _merge_static_and_mapped_outputs,
-        _merge_static_or_mapped_values,
         _node_input_type_map,
         _node_input_types,
         _node_required_input_names,
@@ -371,9 +377,7 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         _reset_prompt_executor_request_state,
         _resolve_required_subgraph_nodes,
         _serialize_prompt_executor_cache_scope,
-        _shared_subgraph_payload_fields,
         _short_circuit_restored_session_output_subgraph,
-        _split_phase_outputs,
         _summarize_suspicious_prompt_inputs,
         _temporary_node_mapping,
         _temporary_progress_hook,
@@ -677,6 +681,20 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
         snapshot_profile_store,
         volume_store,
     )
+    from .cloud_execution_control import (
+        _RemoteExecutionControl,
+        _registered_remote_execution,
+        _remote_execution_key,
+        _remote_interrupt_flag_key,
+    )
+    from .cloud_runtime_logging import (
+        _build_cloud_log_formatter,
+        _cloud_formatter,
+        _emit_cloud_info,
+        _is_modal_container_runtime,
+        _timed_phase,
+        configure_cloud_runtime_logging,
+    )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_runtime_context import (
         interrupt_flag_store,
@@ -687,11 +705,26 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         snapshot_profile_store,
         volume_store,
     )
+    from cloud_execution_control import (
+        _RemoteExecutionControl,
+        _registered_remote_execution,
+        _remote_execution_key,
+        _remote_interrupt_flag_key,
+    )
+    from cloud_runtime_logging import (
+        _build_cloud_log_formatter,
+        _cloud_formatter,
+        _emit_cloud_info,
+        _is_modal_container_runtime,
+        _timed_phase,
+        configure_cloud_runtime_logging,
+    )
 
 logger = logging.getLogger(__name__)
 
 # Cloud app and ComfyUI bootstrap state.
 _CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
+configure_cloud_runtime_logging(logger, _CLOUD_HANDLER_NAME)
 
 # Poisoned-container retirement state.
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
@@ -755,14 +788,6 @@ def _guard_against_existing_modal_app(settings: Any, modal_module: Any) -> None:
         modal_module,
         error_type=ExistingModalAppError,
     )
-
-
-@dataclass
-class _RemoteExecutionControl:
-    """Track interruption state for one active remote payload execution."""
-
-    cancellation_event: threading.Event
-    interrupt_flag_key: str
 
 
 def _meaningful_progress_values(
@@ -924,72 +949,6 @@ def _maybe_schedule_container_termination_on_error(
 
 
 
-def _build_cloud_log_formatter() -> logging.Formatter:
-    """Return the default formatter for remote Modal-Sync logs with timestamps."""
-    return logging.Formatter(
-        fmt="%(asctime)s.%(msecs)03d +%(relativeCreated)07.0fms %(levelname)s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-
-def _configure_cloud_logging() -> logging.Logger:
-    """Install a dedicated timestamped handler for the cloud runtime logger."""
-    logger.setLevel(logging.INFO)
-    for existing_handler in logger.handlers:
-        if getattr(existing_handler, "name", "") == _CLOUD_HANDLER_NAME:
-            return logger
-
-    handler = logging.StreamHandler(sys.stdout)
-    handler.set_name(_CLOUD_HANDLER_NAME)
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(_build_cloud_log_formatter())
-    logger.addHandler(handler)
-    logger.propagate = False
-    return logger
-
-
-def _is_modal_container_runtime() -> bool:
-    """Return whether the current process is executing inside a Modal container."""
-    return os.getenv("MODAL_IS_REMOTE") == "1" or bool(os.getenv("MODAL_TASK_ID"))
-
-
-def _cloud_formatter() -> logging.Formatter:
-    """Return the configured formatter used for cloud phase trace lines."""
-    for existing_handler in logger.handlers:
-        if getattr(existing_handler, "name", "") == _CLOUD_HANDLER_NAME:
-            formatter = existing_handler.formatter
-            if formatter is not None:
-                return formatter
-    return _build_cloud_log_formatter()
-
-
-def _emit_cloud_info(message: str, *args: Any) -> None:
-    """Emit an info line through logging and mirror it to stdout inside Modal containers."""
-    if not _is_modal_container_runtime():
-        logger.info(message, *args)
-        return
-
-    record = logger.makeRecord(
-        logger.name,
-        logging.INFO,
-        __file__,
-        0,
-        message,
-        args,
-        exc_info=None,
-    )
-    print(_cloud_formatter().format(record), file=sys.stdout, flush=True)
-
-
-def _remote_execution_key(payload: dict[str, Any]) -> tuple[str, str]:
-    """Return the registry key for one active remote execution."""
-    prompt_id = str(
-        payload.get("prompt_id") or payload.get("component_id") or "modal-subgraph"
-    )
-    component_id = str(payload.get("component_id") or "single-node")
-    return prompt_id, component_id
-
-
 def _observe_remote_workflow_for_llm_mode(payload: dict[str, Any]) -> None:
     """Record real workflow arrivals for container-local vLLM auto promotion."""
     if payload.get("payload_kind") == "canary":
@@ -1007,50 +966,6 @@ def _observe_remote_workflow_for_llm_mode(payload: dict[str, Any]) -> None:
     observe_modal_workflow_execution(normalized_prompt_id)
 
 
-def _remote_interrupt_flag_key(prompt_id: str, component_id: str) -> str:
-    """Return the shared Modal interrupt-store key for one payload execution."""
-    return f"{prompt_id}:{component_id}"
-
-
-@contextmanager
-def _registered_remote_execution(
-    payload: dict[str, Any],
-) -> Iterator[_RemoteExecutionControl]:
-    """Prepare interruption state for one active remote execution."""
-    prompt_id, component_id = _remote_execution_key(payload)
-    control = _RemoteExecutionControl(
-        cancellation_event=threading.Event(),
-        interrupt_flag_key=_remote_interrupt_flag_key(prompt_id, component_id),
-    )
-    try:
-        yield control
-    finally:
-        interrupt_store = interrupt_flag_store()
-        if modal is not None and interrupt_store is not None:
-            interrupt_store.pop(control.interrupt_flag_key, None)
-
-
-@contextmanager
-def _timed_phase(phase: str, **fields: Any) -> Iterator[None]:
-    """Log a start/finish pair with elapsed time for a named execution phase."""
-    field_suffix = ""
-    if fields:
-        rendered_fields = " ".join(f"{key}={value}" for key, value in fields.items())
-        field_suffix = f" {rendered_fields}"
-    phase_started_at = time.perf_counter()
-    _emit_cloud_info("Starting %s%s", phase, field_suffix)
-    try:
-        yield
-    finally:
-        _emit_cloud_info(
-            "Finished %s in %.3fs%s",
-            phase,
-            time.perf_counter() - phase_started_at,
-            field_suffix,
-        )
-
-
-_configure_cloud_logging()
 
 
 def _stream_remote_payload_events(
@@ -1119,6 +1034,7 @@ configure_cloud_prompt_execution_hooks(
         remote_subgraph_error=RemoteSubgraphExecutionError,
     )
 )
+configure_cloud_prompt_validation_error(RemoteSubgraphExecutionError)
 
 configure_cloud_prompt_server_hooks(
     CloudPromptServerHooks(
