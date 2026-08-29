@@ -17,7 +17,18 @@ from typing import Any, Protocol
 
 from comfy_api.latest import _io as io
 
-from .serialization import deserialize_node_outputs, serialize_node_inputs, split_mapped_value
+if __package__:
+    from .serialization import (
+        deserialize_node_outputs,
+        serialize_node_inputs,
+        split_mapped_value,
+    )
+else:  # pragma: no cover - flat import inside the Modal container.
+    from serialization import (
+        deserialize_node_outputs,
+        serialize_node_inputs,
+        split_mapped_value,
+    )
 
 logger = logging.getLogger(__name__)
 MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"

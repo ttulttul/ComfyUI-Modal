@@ -18,17 +18,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
-from .huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
-from .huggingface_discovery import HuggingFaceAssetDiscovery
-from .r2_cache import (
-    R2CacheClient,
-    R2CacheError,
-    R2DownloadRequest,
-    R2UploadPlan,
-    R2UploadResult,
-    R2WorkerPreflightRequest,
-)
-from .settings import ModalSyncSettings, get_settings
+if __package__:
+    from .huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
+    from .huggingface_discovery import HuggingFaceAssetDiscovery
+    from .r2_cache import (
+        R2CacheClient,
+        R2CacheError,
+        R2DownloadRequest,
+        R2UploadPlan,
+        R2UploadResult,
+        R2WorkerPreflightRequest,
+    )
+    from .settings import ModalSyncSettings, get_settings
+else:  # pragma: no cover - flat import inside the Modal container.
+    from huggingface_assets import HuggingFaceAssetRegistry, HuggingFaceAssetSource
+    from huggingface_discovery import HuggingFaceAssetDiscovery
+    from r2_cache import (
+        R2CacheClient,
+        R2CacheError,
+        R2DownloadRequest,
+        R2UploadPlan,
+        R2UploadResult,
+        R2WorkerPreflightRequest,
+    )
+    from settings import ModalSyncSettings, get_settings
 
 logger = logging.getLogger(__name__)
 SyncStatusCallback = Callable[[str, int | None, int | None], None]

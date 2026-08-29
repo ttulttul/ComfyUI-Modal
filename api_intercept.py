@@ -20,85 +20,166 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from aiohttp import web
 
-from .modal_executor_node import (
-    MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
-    MODAL_ARTIFACT_FINALIZER_NODE_ID,
-    MODAL_COMPONENT_COMPLETION_OUTPUT_NAME,
-    MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
-    MODAL_MAP_INPUT_NODE_ID,
-    MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
-    MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY,
-    ensure_modal_artifact_finalizer_registered,
-    ensure_modal_component_proxy_node_registered,
-    ensure_modal_local_bridge_materializer_registered,
-    ensure_modal_parallel_local_passthrough_registered,
-    register_cache_friendly_proxy_payload,
-    register_modal_map_input_warmup_context,
-    registered_proxy_execution_payload,
-    update_registered_proxy_payload_fields,
-)
-from .session_state import RemoteSessionHandle
-from .settings import (
-    ModalSyncSettings,
-    get_settings,
-    discover_comfyui_user_directory,
-    modal_gpu_from_workflow,
-    settings_for_modal_gpu,
-)
-from .execution_environments import (
-    ComponentResourceRequirements,
-    CostAwareEnvironmentScheduler,
-    EnvironmentCapabilities,
-    EnvironmentHealth,
-    EnvironmentSchedulingState,
-    ExecutionAssignment,
-    ExecutionPolicy,
-    ExecutionProvider,
-    GpuCapability,
-    NoCompatibleExecutionEnvironmentError,
-    WorkflowExecutionPreferences,
-)
-from .execution_history import ExecutionHistory
-from .sync_engine import (
-    AssetSyncRequestCache,
-    MODEL_FILE_EXTENSIONS,
-    ModalAssetSyncEngine,
-    ModalVolumeBackend,
-    SyncCancelledError,
-    SyncedAsset,
-    begin_r2_writeback_prompt,
-    finish_r2_writeback_prompt,
-    modal,
-    resolve_model_path,
-)
-from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
-from .r2_cache import R2CacheClient, R2CacheError, R2StorageUsage
-from .r2_credentials import (
-    R2CredentialError,
-    R2CredentialStore,
-    R2_KEYCHAIN_UNLOCK_REQUIRED_CODE,
-    request_macos_keychain_unlock,
-)
-from .cloudflare_oauth import setup_r2_oauth_routes
-from .remote_configuration_nodes import (
-    REMOTE_CONFIGURATION_NODE_IDS,
-    REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
-    compile_remote_configuration_set,
-)
-from .remote_configurations import (
-    ModalRemoteConfiguration,
-    RemoteConfiguration,
-    RemoteConfigurationSet,
-    R2StorageBackingConfiguration,
-    SshRemoteConfiguration,
-    VastRemoteConfiguration,
-)
-from .ssh_docker import SshDockerController, SshDockerVolumeBackend
-from .ssh_runtime import SshRuntimeManager
-from .vast_config_node import extract_vast_profiles
-from .vast_service import VastProfileQuote, VastSearchRequirements, VastService
-from .vast_api import VastApiClient
-from .vast_leases import VastLeaseManager, VastLeaseRegistry
+if __package__:
+    from .modal_executor_node import (
+        MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
+        MODAL_ARTIFACT_FINALIZER_NODE_ID,
+        MODAL_COMPONENT_COMPLETION_OUTPUT_NAME,
+        MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
+        MODAL_MAP_INPUT_NODE_ID,
+        MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
+        MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY,
+        ensure_modal_artifact_finalizer_registered,
+        ensure_modal_component_proxy_node_registered,
+        ensure_modal_local_bridge_materializer_registered,
+        ensure_modal_parallel_local_passthrough_registered,
+        register_cache_friendly_proxy_payload,
+        register_modal_map_input_warmup_context,
+        registered_proxy_execution_payload,
+        update_registered_proxy_payload_fields,
+    )
+    from .session_state import RemoteSessionHandle
+    from .settings import (
+        ModalSyncSettings,
+        discover_comfyui_user_directory,
+        get_settings,
+        modal_gpu_from_workflow,
+        settings_for_modal_gpu,
+    )
+    from .execution_environments import (
+        ComponentResourceRequirements,
+        CostAwareEnvironmentScheduler,
+        EnvironmentCapabilities,
+        EnvironmentHealth,
+        EnvironmentSchedulingState,
+        ExecutionAssignment,
+        ExecutionPolicy,
+        ExecutionProvider,
+        GpuCapability,
+        NoCompatibleExecutionEnvironmentError,
+        WorkflowExecutionPreferences,
+    )
+    from .execution_history import ExecutionHistory
+    from .sync_engine import (
+        AssetSyncRequestCache,
+        MODEL_FILE_EXTENSIONS,
+        ModalAssetSyncEngine,
+        ModalVolumeBackend,
+        SyncCancelledError,
+        SyncedAsset,
+        begin_r2_writeback_prompt,
+        finish_r2_writeback_prompt,
+        modal,
+        resolve_model_path,
+    )
+    from .remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
+    from .r2_cache import R2CacheClient, R2CacheError, R2StorageUsage
+    from .r2_credentials import (
+        R2CredentialError,
+        R2CredentialStore,
+        R2_KEYCHAIN_UNLOCK_REQUIRED_CODE,
+        request_macos_keychain_unlock,
+    )
+    from .cloudflare_oauth import setup_r2_oauth_routes
+    from .remote_configuration_nodes import (
+        REMOTE_CONFIGURATION_NODE_IDS,
+        REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
+        compile_remote_configuration_set,
+    )
+    from .remote_configurations import (
+        ModalRemoteConfiguration,
+        RemoteConfiguration,
+        RemoteConfigurationSet,
+        R2StorageBackingConfiguration,
+        SshRemoteConfiguration,
+        VastRemoteConfiguration,
+    )
+    from .ssh_docker import SshDockerController, SshDockerVolumeBackend
+    from .ssh_runtime import SshRuntimeManager
+    from .vast_config_node import extract_vast_profiles
+    from .vast_service import VastProfileQuote, VastSearchRequirements, VastService
+    from .vast_api import VastApiClient
+    from .vast_leases import VastLeaseManager, VastLeaseRegistry
+else:  # pragma: no cover - flat import inside the Modal container.
+    from modal_executor_node import (
+        MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS,
+        MODAL_ARTIFACT_FINALIZER_NODE_ID,
+        MODAL_COMPONENT_COMPLETION_OUTPUT_NAME,
+        MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
+        MODAL_MAP_INPUT_NODE_ID,
+        MODAL_PARALLEL_LOCAL_PASSTHROUGH_NODE_ID,
+        MODAL_PROMPT_ID_EXTRA_PNGINFO_KEY,
+        ensure_modal_artifact_finalizer_registered,
+        ensure_modal_component_proxy_node_registered,
+        ensure_modal_local_bridge_materializer_registered,
+        ensure_modal_parallel_local_passthrough_registered,
+        register_cache_friendly_proxy_payload,
+        register_modal_map_input_warmup_context,
+        registered_proxy_execution_payload,
+        update_registered_proxy_payload_fields,
+    )
+    from session_state import RemoteSessionHandle
+    from settings import (
+        ModalSyncSettings,
+        discover_comfyui_user_directory,
+        get_settings,
+        modal_gpu_from_workflow,
+        settings_for_modal_gpu,
+    )
+    from execution_environments import (
+        ComponentResourceRequirements,
+        CostAwareEnvironmentScheduler,
+        EnvironmentCapabilities,
+        EnvironmentHealth,
+        EnvironmentSchedulingState,
+        ExecutionAssignment,
+        ExecutionPolicy,
+        ExecutionProvider,
+        GpuCapability,
+        NoCompatibleExecutionEnvironmentError,
+        WorkflowExecutionPreferences,
+    )
+    from execution_history import ExecutionHistory
+    from sync_engine import (
+        AssetSyncRequestCache,
+        MODEL_FILE_EXTENSIONS,
+        ModalAssetSyncEngine,
+        ModalVolumeBackend,
+        SyncCancelledError,
+        SyncedAsset,
+        begin_r2_writeback_prompt,
+        finish_r2_writeback_prompt,
+        modal,
+        resolve_model_path,
+    )
+    from remote_hosts import RemoteExecutionConfig, RemoteHostRegistry, SshHostConfig
+    from r2_cache import R2CacheClient, R2CacheError, R2StorageUsage
+    from r2_credentials import (
+        R2CredentialError,
+        R2CredentialStore,
+        R2_KEYCHAIN_UNLOCK_REQUIRED_CODE,
+        request_macos_keychain_unlock,
+    )
+    from cloudflare_oauth import setup_r2_oauth_routes
+    from remote_configuration_nodes import (
+        REMOTE_CONFIGURATION_NODE_IDS,
+        REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
+        compile_remote_configuration_set,
+    )
+    from remote_configurations import (
+        ModalRemoteConfiguration,
+        RemoteConfiguration,
+        RemoteConfigurationSet,
+        R2StorageBackingConfiguration,
+        SshRemoteConfiguration,
+        VastRemoteConfiguration,
+    )
+    from ssh_docker import SshDockerController, SshDockerVolumeBackend
+    from ssh_runtime import SshRuntimeManager
+    from vast_config_node import extract_vast_profiles
+    from vast_service import VastProfileQuote, VastSearchRequirements, VastService
+    from vast_api import VastApiClient
+    from vast_leases import VastLeaseManager, VastLeaseRegistry
 
 logger = logging.getLogger(__name__)
 SetupStatusCallback = Callable[[str, int | None, int | None], None]
