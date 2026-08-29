@@ -239,6 +239,8 @@ def test_disabled_auto_placement_preserves_explicit_markers(
 
 def test_remote_environment_routes_save_and_probe_hosts(
     api_intercept_module: Any,
+    routes_r2_module: Any,
+    routes_remote_environments_module: Any,
     remote_hosts_module: Any,
     execution_environments_module: Any,
     settings_module: Any,
@@ -338,12 +340,12 @@ def test_remote_environment_routes_save_and_probe_hosts(
         lambda _settings: registry,
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        routes_remote_environments_module,
         "SshDockerController",
         FakeController,
     )
     monkeypatch.setattr(
-        api_intercept_module,
+        routes_r2_module,
         "_refresh_r2_storage_usage",
         lambda _storage: api_intercept_module.R2StorageUsage(
             size_bytes=7 * 1024**3,
@@ -352,7 +354,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
     )
     unlock_requests: list[bool] = []
     monkeypatch.setattr(
-        api_intercept_module,
+        routes_r2_module,
         "request_macos_keychain_unlock",
         lambda: unlock_requests.append(True),
     )
@@ -408,7 +410,7 @@ def test_remote_environment_routes_save_and_probe_hosts(
     r2_unlock = routes.handlers[("POST", "/remote/storage/r2/keychain/unlock")]
     r2_unlock_response = asyncio.run(r2_unlock(FakeRequest({})))
     monkeypatch.setattr(
-        api_intercept_module,
+        routes_r2_module,
         "_refresh_r2_storage_usage",
         lambda _storage: (_ for _ in ()).throw(
             api_intercept_module.R2CredentialError(

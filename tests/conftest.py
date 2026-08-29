@@ -364,6 +364,18 @@ def prompt_diagnostics_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def routes_r2_module(extension_package: object) -> object:
+    """Return R2 route registration helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.routes_r2")
+
+
+@pytest.fixture(scope="session")
+def routes_remote_environments_module(extension_package: object) -> object:
+    """Return remote-environment route registration helpers."""
+    return importlib.import_module(f"{PACKAGE_NAME}.routes_remote_environments")
+
+
+@pytest.fixture(scope="session")
 def modal_endpoint_module(extension_package: object) -> object:
     """Return the Modal hosted-model endpoint node module."""
     return importlib.import_module(f"{PACKAGE_NAME}.modal_endpoint_node")

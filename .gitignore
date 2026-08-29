@@ -40,6 +40,12 @@
 !/prompt_diagnostics.py
 !/prompt_rewrite.py
 !/queue_bridge.py
+!/route_context.py
+!/routes_r2.py
+!/routes_remote_environments.py
+!/routes_vast.py
+!/routes_modal_containers.py
+!/routes_queue.py
 !/remote_hosts.py
 !/remote_configuration_nodes.py
 !/remote_configurations.py
