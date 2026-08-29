@@ -34,6 +34,7 @@
 !/remote_configuration_nodes.py
 !/remote_configurations.py
 !/remote_protocol.py
+!/remote_plan_types.py
 !/r2_cache.py
 !/r2_credentials.py
 !/runtime_environment.py
