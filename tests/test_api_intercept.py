@@ -5961,9 +5961,10 @@ def test_rewrite_keeps_nested_remote_nodes_remote_when_root_ids_collide(
 
 def test_emit_modal_status_targets_prompt_client(
     api_intercept_module: Any,
+    modal_ui_events_module: Any,
 ) -> None:
     """Modal status events should preserve prompt and component metadata for the UI."""
-    api_intercept_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
+    modal_ui_events_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
 
     class FakePromptServer:
         """Capture websocket events emitted by the queue route."""
@@ -5977,7 +5978,7 @@ def test_emit_modal_status_targets_prompt_client(
             self.messages.append((event, data, sid))
 
     prompt_server = FakePromptServer()
-    api_intercept_module._emit_modal_status(
+    modal_ui_events_module._emit_modal_status(
         prompt_server=prompt_server,
         phase="executing",
         client_id="client-1",
@@ -6030,7 +6031,7 @@ def test_emit_modal_status_targets_prompt_client(
             "client-1",
         )
     ]
-    replay_events = api_intercept_module.modal_ui_events_for_client("client-1")
+    replay_events = modal_ui_events_module.modal_ui_events_for_client("client-1")
     assert replay_events == [
         {
             "event": "modal_status",
@@ -6325,22 +6326,22 @@ def test_workflow_ssh_metadata_preserves_probed_gpu_capabilities(
     assert queued_host.last_error is None
 
 
-def test_modal_ui_event_replay_is_client_scoped(api_intercept_module: Any) -> None:
+def test_modal_ui_event_replay_is_client_scoped(modal_ui_events_module: Any) -> None:
     """Refocus replay should only return events for the requesting ComfyUI client."""
-    api_intercept_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
+    modal_ui_events_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
 
-    api_intercept_module.record_modal_ui_event(
+    modal_ui_events_module.record_modal_ui_event(
         "modal_progress",
         {"prompt_id": "prompt-1", "node_id": "4", "value": 2.0, "max": 10.0},
         "client-1",
     )
-    api_intercept_module.record_modal_ui_event(
+    modal_ui_events_module.record_modal_ui_event(
         "modal_status",
         {"prompt_id": "prompt-2", "phase": "executing", "node_ids": ["9"]},
         "client-2",
     )
 
-    replay_events = api_intercept_module.modal_ui_events_for_client("client-1")
+    replay_events = modal_ui_events_module.modal_ui_events_for_client("client-1")
 
     assert len(replay_events) == 1
     assert replay_events[0]["event"] == "modal_progress"
@@ -6350,7 +6351,7 @@ def test_modal_ui_event_replay_is_client_scoped(api_intercept_module: Any) -> No
         "value": 2.0,
         "max": 10.0,
     }
-    assert api_intercept_module.modal_ui_events_for_client(None) == []
+    assert modal_ui_events_module.modal_ui_events_for_client(None) == []
 
 
 def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) -> None:

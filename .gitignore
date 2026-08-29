@@ -32,6 +32,7 @@
 !/modal_llm_node.py
 !/modal_llm_runtime.py
 !/modal_sdk.py
+!/modal_ui_events.py
 !/output_artifacts.py
 !/remote_hosts.py
 !/remote_configuration_nodes.py
