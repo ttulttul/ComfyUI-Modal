@@ -1,32 +1,23 @@
 """Stable Modal cloud entrypoint for ComfyUI Modal-Sync."""
 
-import asyncio
-import copy
-import gc
-import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
-from io import BytesIO
-import inspect
-import json
 import logging
 import os
 import queue
 import sys
-import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from types import ModuleType
+from typing import Any, Callable, Iterator, Mapping
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _REMOTE_REPO_ROOT = Path("/root/comfyui_modal_sync_repo")
 _LOCAL_COMFYUI_ROOT = (Path.home() / "git" / "ComfyUI").resolve()
 _REMOTE_COMFYUI_ROOT = Path("/root/comfyui_src")
-_REMOTE_LLM_COMPILE_CACHE_ROOT = Path("/root/.cache/comfy-modal-llm")
 for candidate in (
     _REPO_ROOT,
     _REMOTE_REPO_ROOT,
@@ -42,15 +33,10 @@ for candidate in (
         sys.path.insert(0, candidate_str)
 
 from runtime_environment import (  # noqa: E402 - paths are bootstrapped above.
-    COMFYUI_RUNTIME_SOURCE_DIRECTORIES as _COMFYUI_IMAGE_RUNTIME_DIRECTORIES,
-    COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
     REMOTE_APP_PROTOCOL_VERSION as _REMOTE_APP_PROTOCOL_VERSION,
     REMOTE_PYTHON_VERSION,
-    RemoteTorchBuild as _RemoteTorchBuild,
     build_remote_runtime_identity,
     custom_node_runtime_packages as _custom_node_runtime_packages,
-    remote_accelerator_packages as _remote_accelerator_packages,
-    remote_accelerator_validation_command as _remote_accelerator_validation_command,
     remote_apt_packages as _comfyui_apt_packages,
     remote_huggingface_packages as _remote_huggingface_packages,
     remote_huggingface_validation_command as _remote_huggingface_validation_command,
@@ -62,49 +48,12 @@ from llm_recovery import (  # noqa: E402
     is_llm_memory_recovery_exhausted,
 )
 from llm_staging import resolve_and_stage_model_references  # noqa: E402
-from durable_state import (  # noqa: E402 - paths are bootstrapped above.
-    DurableObjectCommitBatch,
-    DurableObjectRef,
-    DurableStateError,
-    FileDurableObjectStore,
-    InMemoryRemoteInvocationStore,
-    RemoteInvocationRecord,
-    new_running_invocation_record,
-    read_modal_volume_file,
-)
-from output_artifacts import (  # noqa: E402 - paths are bootstrapped above.
-    RemoteOutputSnapshot,
-    capture_execution_result,
-    snapshot_output_directory,
-)
-from remote_protocol import (  # noqa: E402 - paths are bootstrapped above.
-    BOUNDARY_INPUT_SIGNATURES_KEY as _BOUNDARY_INPUT_SIGNATURES_KEY,
-    PRIMITIVE_WIDGET_INPUT_TYPES as _PRIMITIVE_WIDGET_INPUT_TYPES,
-)
-
 from serialization import (  # noqa: E402 - paths are bootstrapped above.
-    coerce_serialized_node_outputs,
     deserialize_node_inputs,
-    deserialize_node_outputs,
-    deserialize_value,
-    serialize_mapping,
-    serialize_node_inputs,
     serialize_node_outputs,
-    serialize_value,
 )
 from session_state import (  # noqa: E402 - paths are bootstrapped above.
-    InMemoryRemoteSessionBridgeStore,
-    InMemoryRemoteSessionStore,
-    RemoteSessionBridgeRecord,
-    RemoteSessionBridgeRecoveryKind,
-    RemoteSessionBridgeRef,
-    RemoteSessionHandle,
     RemoteSessionStateError,
-    RemoteSessionValueRef,
-    is_remote_session_bridge_ref_payload,
-    is_remote_session_handle_payload,
-    is_remote_session_value_ref_payload,
-    stable_session_bridge_key,
 )
 from settings import (  # noqa: E402 - paths are bootstrapped above.
     DEFAULT_MODAL_SECRET_NAME,
@@ -114,279 +63,59 @@ from settings import (  # noqa: E402 - paths are bootstrapped above.
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_comfy_bootstrap import (
         CloudComfyBootstrapHooks,
-        _active_comfyui_root,
-        _alias_flux_rms_norm_weight_keys,
-        _build_checkpoint_loader_cache_key,
-        _build_clip_loader_cache_key,
-        _build_dual_clip_loader_cache_key,
-        _build_unet_loader_cache_key,
-        _build_vae_loader_cache_key,
-        _clone_loader_cache_outputs,
         _clone_loader_cache_value,
-        _custom_node_package_for_candidate_file,
         _ensure_comfy_runtime_initialized,
-        _ensure_comfyui_support_packages,
-        _ensure_default_custom_nodes_dir,
-        _ensure_headless_prompt_server_instance,
-        _ensure_prompt_node_classes_registered,
         _extract_custom_nodes_bundle,
-        _force_import_package_from_root,
-        _install_loader_cache_wrappers,
-        _install_model_state_dict_compatibility_wrappers,
-        _iter_custom_nodes_manifest_assets,
-        _iter_missing_class_candidate_files,
-        _load_custom_nodes_manifest,
-        _load_execution_module,
-        _load_nodes_module,
-        _loader_cache_metric_snapshot,
-        _materialize_custom_nodes_manifest_assets,
-        _materialize_remote_asset_path,
-        _missing_node_class_diagnostics,
-        _patched_folder_paths_absolute_lookup,
-        _prompt_missing_node_class_types,
-        _readthrough_cache_path,
-        _record_loader_cache_metric,
-        _register_custom_nodes_root,
-        _register_modal_sync_runtime_nodes,
-        _reload_external_custom_nodes_for_missing_classes,
-        _resolve_custom_nodes_archives,
-        _resolve_custom_nodes_bundle_path,
-        _resolve_runtime_asset_path,
-        _rewrite_modal_asset_references,
-        _serialize_loader_cache_key,
-        _validated_custom_node_asset_relative_path,
-        _wrap_loader_method_with_cache,
         configure_cloud_comfy_bootstrap_hooks,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_comfy_bootstrap import (
         CloudComfyBootstrapHooks,
-        _active_comfyui_root,
-        _alias_flux_rms_norm_weight_keys,
-        _build_checkpoint_loader_cache_key,
-        _build_clip_loader_cache_key,
-        _build_dual_clip_loader_cache_key,
-        _build_unet_loader_cache_key,
-        _build_vae_loader_cache_key,
-        _clone_loader_cache_outputs,
         _clone_loader_cache_value,
-        _custom_node_package_for_candidate_file,
         _ensure_comfy_runtime_initialized,
-        _ensure_comfyui_support_packages,
-        _ensure_default_custom_nodes_dir,
-        _ensure_headless_prompt_server_instance,
-        _ensure_prompt_node_classes_registered,
         _extract_custom_nodes_bundle,
-        _force_import_package_from_root,
-        _install_loader_cache_wrappers,
-        _install_model_state_dict_compatibility_wrappers,
-        _iter_custom_nodes_manifest_assets,
-        _iter_missing_class_candidate_files,
-        _load_custom_nodes_manifest,
-        _load_execution_module,
-        _load_nodes_module,
-        _loader_cache_metric_snapshot,
-        _materialize_custom_nodes_manifest_assets,
-        _materialize_remote_asset_path,
-        _missing_node_class_diagnostics,
-        _patched_folder_paths_absolute_lookup,
-        _prompt_missing_node_class_types,
-        _readthrough_cache_path,
-        _record_loader_cache_metric,
-        _register_custom_nodes_root,
-        _register_modal_sync_runtime_nodes,
-        _reload_external_custom_nodes_for_missing_classes,
-        _resolve_custom_nodes_archives,
-        _resolve_custom_nodes_bundle_path,
-        _resolve_runtime_asset_path,
-        _rewrite_modal_asset_references,
-        _serialize_loader_cache_key,
-        _validated_custom_node_asset_relative_path,
-        _wrap_loader_method_with_cache,
         configure_cloud_comfy_bootstrap_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_node_output_cache import (
         CloudNodeOutputCacheHooks,
-        _NodeOutputCacheLookupResult,
-        _PersistedNodeCacheRestoreState,
-        _await_maybe,
-        _boundary_output_node_ids,
-        _build_node_output_cache_immediate_signature,
-        _build_node_output_cache_signature_from_key_set_async,
-        _build_node_output_cache_signature_from_key_set_sync,
-        _cache_signature_link_output_index,
-        _canonicalize_node_output_cache_key_part,
-        _deserialize_node_output_cache_entry,
-        _emit_restored_node_cache_events,
-        _estimate_node_output_cache_value_size_bytes,
-        _include_unique_id_in_input_signature,
-        _install_prompt_executor_persisted_cache_restore,
-        _is_input_signature_cache_key_set,
-        _node_output_cache_ancestor_ids,
-        _node_output_cache_key,
-        _node_output_cache_key_from_key_set_async,
-        _node_output_cache_key_from_key_set_sync,
-        _node_output_cache_key_preview,
-        _node_output_cache_store,
-        _node_output_cache_store_get,
-        _node_output_cache_store_put,
-        _node_output_cache_value_preview,
-        _persist_node_output_cache_entries,
-        _prompt_executor_cache_get_sync,
-        _restore_persisted_node_output_cache_entries,
-        _restore_persisted_node_output_cache_entries_into_prepared_cache,
-        _serialize_node_output_cache_entry,
-        _tensor_cache_key_digest,
         configure_cloud_node_output_cache_hooks,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_node_output_cache import (
         CloudNodeOutputCacheHooks,
-        _NodeOutputCacheLookupResult,
-        _PersistedNodeCacheRestoreState,
-        _await_maybe,
-        _boundary_output_node_ids,
-        _build_node_output_cache_immediate_signature,
-        _build_node_output_cache_signature_from_key_set_async,
-        _build_node_output_cache_signature_from_key_set_sync,
-        _cache_signature_link_output_index,
-        _canonicalize_node_output_cache_key_part,
-        _deserialize_node_output_cache_entry,
-        _emit_restored_node_cache_events,
-        _estimate_node_output_cache_value_size_bytes,
-        _include_unique_id_in_input_signature,
-        _install_prompt_executor_persisted_cache_restore,
-        _is_input_signature_cache_key_set,
-        _node_output_cache_ancestor_ids,
-        _node_output_cache_key,
-        _node_output_cache_key_from_key_set_async,
-        _node_output_cache_key_from_key_set_sync,
-        _node_output_cache_key_preview,
-        _node_output_cache_store,
-        _node_output_cache_store_get,
-        _node_output_cache_store_put,
-        _node_output_cache_value_preview,
-        _persist_node_output_cache_entries,
-        _prompt_executor_cache_get_sync,
-        _restore_persisted_node_output_cache_entries,
-        _restore_persisted_node_output_cache_entries_into_prepared_cache,
-        _serialize_node_output_cache_entry,
-        _tensor_cache_key_digest,
         configure_cloud_node_output_cache_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_mapped_execution import (
-        _aggregate_mapped_phase_outputs,
-        _build_phase_subgraph_payload,
         _execute_mapped_subgraph_payload,
-        _mapped_phase_definition,
-        _merge_static_and_mapped_outputs,
-        _merge_static_or_mapped_values,
-        _shared_subgraph_payload_fields,
-        _split_phase_outputs,
     )
     from .cloud_prompt_validation import configure_cloud_prompt_validation_error
     from .cloud_prompt_execution import (
         CloudPromptExecutionHooks,
-        _ReusablePromptExecutorState,
-        _apply_boundary_inputs,
-        _boundary_input_cache_signature,
-        _coerce_primitive_prompt_input_value,
-        _coerce_prompt_primitive_input_values,
         _collapse_cache_slot,
-        _copy_json_safe_prompt_metadata,
         _execute_node_locally_raw,
-        _execute_prompt_executor_compat,
         _execute_subgraph_prompt,
-        _extract_prompt_executor_error,
-        _extract_prompt_executor_error_payload,
-        _format_prompt_executor_error_payload,
-        _get_or_create_prompt_executor_state,
-        _install_metadata_safe_dynamic_prompt_wrapper,
-        _invoke_original_node,
         _is_link,
-        _log_prompt_executor_failure_details,
-        _node_input_type_map,
-        _node_input_types,
-        _node_required_input_names,
-        _normalize_link_output_index,
         _normalize_prompt_input_value,
-        _normalize_subgraph_payload,
-        _prompt_executor_cache_config,
-        _prompt_executor_ram_thresholds,
-        _remote_session_ref_cache_signature,
-        _reset_prompt_executor_request_state,
         _resolve_required_subgraph_nodes,
-        _serialize_prompt_executor_cache_scope,
-        _short_circuit_restored_session_output_subgraph,
-        _summarize_suspicious_prompt_inputs,
-        _temporary_node_mapping,
-        _temporary_progress_hook,
-        _temporary_prompt_metadata,
-        _temporary_remote_interrupt_monitor,
-        _trim_subgraph_payload_to_required_nodes,
-        _unwrap_wrapped_prompt_link,
-        _validate_prompt_input_shapes,
-        _validate_required_prompt_inputs,
         configure_cloud_prompt_execution_hooks,
         execute_node_locally,
         execute_subgraph_locally,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_mapped_execution import (
-        _aggregate_mapped_phase_outputs,
-        _build_phase_subgraph_payload,
         _execute_mapped_subgraph_payload,
-        _mapped_phase_definition,
-        _merge_static_and_mapped_outputs,
-        _merge_static_or_mapped_values,
-        _shared_subgraph_payload_fields,
-        _split_phase_outputs,
     )
     from cloud_prompt_validation import configure_cloud_prompt_validation_error
     from cloud_prompt_execution import (
         CloudPromptExecutionHooks,
-        _ReusablePromptExecutorState,
-        _apply_boundary_inputs,
-        _boundary_input_cache_signature,
-        _coerce_primitive_prompt_input_value,
-        _coerce_prompt_primitive_input_values,
         _collapse_cache_slot,
-        _copy_json_safe_prompt_metadata,
         _execute_node_locally_raw,
-        _execute_prompt_executor_compat,
         _execute_subgraph_prompt,
-        _extract_prompt_executor_error,
-        _extract_prompt_executor_error_payload,
-        _format_prompt_executor_error_payload,
-        _get_or_create_prompt_executor_state,
-        _install_metadata_safe_dynamic_prompt_wrapper,
-        _invoke_original_node,
         _is_link,
-        _log_prompt_executor_failure_details,
-        _node_input_type_map,
-        _node_input_types,
-        _node_required_input_names,
-        _normalize_link_output_index,
         _normalize_prompt_input_value,
-        _normalize_subgraph_payload,
-        _prompt_executor_cache_config,
-        _prompt_executor_ram_thresholds,
-        _remote_session_ref_cache_signature,
-        _reset_prompt_executor_request_state,
         _resolve_required_subgraph_nodes,
-        _serialize_prompt_executor_cache_scope,
-        _short_circuit_restored_session_output_subgraph,
-        _summarize_suspicious_prompt_inputs,
-        _temporary_node_mapping,
-        _temporary_progress_hook,
-        _temporary_prompt_metadata,
-        _temporary_remote_interrupt_monitor,
-        _trim_subgraph_payload_to_required_nodes,
-        _unwrap_wrapped_prompt_link,
-        _validate_prompt_input_shapes,
-        _validate_required_prompt_inputs,
         configure_cloud_prompt_execution_hooks,
         execute_node_locally,
         execute_subgraph_locally,
@@ -394,256 +123,89 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_prompt_server_shims import (
         CloudPromptServerHooks,
-        _HeadlessPromptQueue,
-        _HeadlessPromptServerInstance,
-        _NullPromptServer,
-        _TracingPromptServer,
         configure_cloud_prompt_server_hooks,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_prompt_server_shims import (
         CloudPromptServerHooks,
-        _HeadlessPromptQueue,
-        _HeadlessPromptServerInstance,
-        _NullPromptServer,
-        _TracingPromptServer,
         configure_cloud_prompt_server_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_streaming import (
         CloudStreamingErrors,
-        _BoundedStreamEventBuffer,
-        _abandon_streamed_remote_invocation,
         _stream_remote_payload_events as _stream_remote_payload_events_impl,
         configure_cloud_streaming_errors,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_streaming import (
         CloudStreamingErrors,
-        _BoundedStreamEventBuffer,
-        _abandon_streamed_remote_invocation,
         _stream_remote_payload_events as _stream_remote_payload_events_impl,
         configure_cloud_streaming_errors,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_volume_reload import (
         CloudVolumeReloadHooks,
-        _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS,
-        _clear_warm_remote_caches,
-        _custom_nodes_manifest_dependency_paths,
-        _download_committed_volume_path,
         _emit_modal_volume_reload_skip,
-        _has_seen_modal_volume_reload_marker,
-        _hydrate_missing_payload_volume_paths,
-        _is_modal_volume_open_files_error,
-        _iter_payload_input_strings,
-        _log_payload_volume_reload_diagnostics,
         _modal_volume_reload_marker,
-        _payload_uploaded_volume_paths,
-        _payload_uploaded_volume_paths_visible,
-        _payload_volume_paths,
-        _payload_volume_paths_visible,
-        _prepare_for_modal_volume_reload,
-        _record_modal_volume_reload_marker,
         _reload_modal_volume_for_request,
-        _runtime_volume_path_visible,
         _should_reload_modal_volume,
-        _sleep_before_modal_volume_reload_retry,
         configure_cloud_volume_reload_hooks,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_volume_reload import (
         CloudVolumeReloadHooks,
-        _MODAL_VOLUME_RELOAD_OPEN_FILE_RETRY_DELAYS_SECONDS,
-        _clear_warm_remote_caches,
-        _custom_nodes_manifest_dependency_paths,
-        _download_committed_volume_path,
         _emit_modal_volume_reload_skip,
-        _has_seen_modal_volume_reload_marker,
-        _hydrate_missing_payload_volume_paths,
-        _is_modal_volume_open_files_error,
-        _iter_payload_input_strings,
-        _log_payload_volume_reload_diagnostics,
         _modal_volume_reload_marker,
-        _payload_uploaded_volume_paths,
-        _payload_uploaded_volume_paths_visible,
-        _payload_volume_paths,
-        _payload_volume_paths_visible,
-        _prepare_for_modal_volume_reload,
-        _record_modal_volume_reload_marker,
         _reload_modal_volume_for_request,
-        _runtime_volume_path_visible,
         _should_reload_modal_volume,
-        _sleep_before_modal_volume_reload_retry,
         configure_cloud_volume_reload_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_prewarm import (
         CloudPrewarmHooks,
-        _LLMCompileMissCheckpoint,
-        _build_loader_prewarm_payload,
         _commit_actual_llm_compile_cache,
-        _execute_llm_prewarm_plans,
-        _execute_loader_prewarm_plans,
-        _llm_compile_manifest_path,
         _llm_compile_miss_checkpoint,
-        _llm_profiles_in_payload,
-        _llm_prewarm_model_profile,
-        _loader_prewarm_plan_key,
-        _log_compile_cache_memory_maps,
-        _mapped_process_files_under,
         _prepare_warm_container_for_request,
         _prewarm_restored_runtime,
         _prewarm_snapshot_state,
-        _reload_compile_cache_volume,
-        _triton_compile_listener_engine_pids,
-        _triton_compile_miss_signal_size,
-        _write_llm_compile_manifest,
         configure_cloud_prewarm_hooks,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_prewarm import (
         CloudPrewarmHooks,
-        _LLMCompileMissCheckpoint,
-        _build_loader_prewarm_payload,
         _commit_actual_llm_compile_cache,
-        _execute_llm_prewarm_plans,
-        _execute_loader_prewarm_plans,
-        _llm_compile_manifest_path,
         _llm_compile_miss_checkpoint,
-        _llm_profiles_in_payload,
-        _llm_prewarm_model_profile,
-        _loader_prewarm_plan_key,
-        _log_compile_cache_memory_maps,
-        _mapped_process_files_under,
         _prepare_warm_container_for_request,
         _prewarm_restored_runtime,
         _prewarm_snapshot_state,
-        _reload_compile_cache_volume,
-        _triton_compile_listener_engine_pids,
-        _triton_compile_miss_signal_size,
-        _write_llm_compile_manifest,
         configure_cloud_prewarm_hooks,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_session_bridge import (
         CloudSessionBridgeHooks,
-        _RemoteSessionBridgeResolutionStats,
-        _bridge_record_replays_sampling_node,
-        _build_durable_bridge_rehydration_plan,
-        _build_remote_session_bridge_record,
-        _deserialize_remote_session_bridge_producer_inputs,
-        _get_remote_session_bridge_value,
-        _json_payload_size_bytes,
-        _load_loader_snapshot_profile,
-        _load_remote_session_bridge_record,
-        _log_remote_session_resolution_summary,
-        _offload_large_bridge_payloads,
-        _payload_remote_session_handle,
-        _record_remote_session_resolution_event,
-        _rehydrate_remote_session_bridge_value,
-        _remote_session_bridge_recovery_input_names,
-        _remote_session_bridge_replay_stack,
-        _resolve_remote_session_inputs,
-        _restore_planned_remote_session_bridge_value,
-        _restore_serialized_remote_session_bridge_value,
-        _sanitize_payload_for_session_bridge_record,
-        _select_remote_session_bridge_recovery_kind,
-        _serialize_durable_bridge_output,
-        _session_bridge_store,
-        _snapshot_profile_store,
-        _store_remote_session_bridge_record,
-        _store_remote_session_bridge_value,
-        _subgraph_contains_sampling_node,
         configure_cloud_session_bridge_hooks,
-        remote_session_store,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_session_bridge import (
         CloudSessionBridgeHooks,
-        _RemoteSessionBridgeResolutionStats,
-        _bridge_record_replays_sampling_node,
-        _build_durable_bridge_rehydration_plan,
-        _build_remote_session_bridge_record,
-        _deserialize_remote_session_bridge_producer_inputs,
-        _get_remote_session_bridge_value,
-        _json_payload_size_bytes,
-        _load_loader_snapshot_profile,
-        _load_remote_session_bridge_record,
-        _log_remote_session_resolution_summary,
-        _offload_large_bridge_payloads,
-        _payload_remote_session_handle,
-        _record_remote_session_resolution_event,
-        _rehydrate_remote_session_bridge_value,
-        _remote_session_bridge_recovery_input_names,
-        _remote_session_bridge_replay_stack,
-        _resolve_remote_session_inputs,
-        _restore_planned_remote_session_bridge_value,
-        _restore_serialized_remote_session_bridge_value,
-        _sanitize_payload_for_session_bridge_record,
-        _select_remote_session_bridge_recovery_kind,
-        _serialize_durable_bridge_output,
-        _session_bridge_store,
-        _snapshot_profile_store,
-        _store_remote_session_bridge_record,
-        _store_remote_session_bridge_value,
-        _subgraph_contains_sampling_node,
         configure_cloud_session_bridge_hooks,
-        remote_session_store,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_durable_invocation import (
         DurableInvocationErrors,
-        _begin_remote_invocation,
-        _canary_barrier_marker_exists,
-        _canary_barrier_marker_key,
-        _canary_interrupt_requested,
-        _complete_remote_invocation,
-        _durable_object_store,
         _execute_canary_payload,
-        _execute_payload_with_output_capture,
         _execute_with_durable_invocation,
-        _fail_remote_invocation,
-        _invocation_record_store,
-        _load_completed_remote_invocation_result,
-        _load_remote_invocation_record,
-        _put_canary_barrier_marker,
-        _raise_if_canary_interrupted,
-        _remote_comfy_output_directory,
-        _remote_output_snapshot,
-        _store_remote_invocation_record,
-        _wait_for_canary_barrier,
-        _wait_for_running_remote_invocation,
         configure_durable_invocation_errors,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_durable_invocation import (
         DurableInvocationErrors,
-        _begin_remote_invocation,
-        _canary_barrier_marker_exists,
-        _canary_barrier_marker_key,
-        _canary_interrupt_requested,
-        _complete_remote_invocation,
-        _durable_object_store,
         _execute_canary_payload,
-        _execute_payload_with_output_capture,
         _execute_with_durable_invocation,
-        _fail_remote_invocation,
-        _invocation_record_store,
-        _load_completed_remote_invocation_result,
-        _load_remote_invocation_record,
-        _put_canary_barrier_marker,
-        _raise_if_canary_interrupted,
-        _remote_comfy_output_directory,
-        _remote_output_snapshot,
-        _store_remote_invocation_record,
-        _wait_for_canary_barrier,
-        _wait_for_running_remote_invocation,
         configure_durable_invocation_errors,
     )
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_image_env import (
-        _REMOTE_LLM_COMPILE_CACHE_ROOT,
         _install_custom_node_packages,
         _install_remote_accelerator_packages,
         _install_remote_torch_build,
@@ -656,7 +218,6 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_image_env import (
-        _REMOTE_LLM_COMPILE_CACHE_ROOT,
         _install_custom_node_packages,
         _install_remote_accelerator_packages,
         _install_remote_torch_build,
@@ -673,23 +234,12 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_app_guard import guard_against_existing_modal_app
 try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_runtime_context import (
-        interrupt_flag_store,
-        invocation_record_store,
-        node_output_cache_store,
         register_cloud_runtime_stores,
-        session_bridge_store,
-        snapshot_profile_store,
-        volume_store,
     )
     from .cloud_execution_control import (
-        _RemoteExecutionControl,
         _registered_remote_execution,
-        _remote_execution_key,
-        _remote_interrupt_flag_key,
     )
     from .cloud_runtime_logging import (
-        _build_cloud_log_formatter,
-        _cloud_formatter,
         _emit_cloud_info,
         _is_modal_container_runtime,
         _timed_phase,
@@ -697,28 +247,57 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_runtime_context import (
-        interrupt_flag_store,
-        invocation_record_store,
-        node_output_cache_store,
         register_cloud_runtime_stores,
-        session_bridge_store,
-        snapshot_profile_store,
-        volume_store,
     )
     from cloud_execution_control import (
-        _RemoteExecutionControl,
         _registered_remote_execution,
-        _remote_execution_key,
-        _remote_interrupt_flag_key,
     )
     from cloud_runtime_logging import (
-        _build_cloud_log_formatter,
-        _cloud_formatter,
         _emit_cloud_info,
         _is_modal_container_runtime,
         _timed_phase,
         configure_cloud_runtime_logging,
     )
+
+
+_COMPATIBILITY_EXPORT_MODULES: tuple[ModuleType, ...] = tuple(
+    importlib.import_module(module_name)
+    for module_name in (
+        "runtime_environment",
+        "durable_state",
+        "output_artifacts",
+        "remote_protocol",
+        "serialization",
+        "session_state",
+        "cloud_comfy_bootstrap",
+        "cloud_node_output_cache",
+        "cloud_mapped_execution",
+        "cloud_prompt_validation",
+        "cloud_prompt_execution",
+        "cloud_prompt_server_shims",
+        "cloud_streaming",
+        "cloud_volume_reload",
+        "cloud_prewarm",
+        "cloud_session_bridge",
+        "cloud_durable_invocation",
+        "cloud_image_env",
+        "cloud_app_guard",
+        "cloud_runtime_context",
+        "cloud_execution_control",
+        "cloud_runtime_logging",
+    )
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Read legacy private exports from the focused module that now owns them."""
+    for compatibility_module in _COMPATIBILITY_EXPORT_MODULES:
+        try:
+            return getattr(compatibility_module, name)
+        except AttributeError:
+            continue
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 logger = logging.getLogger(__name__)
 

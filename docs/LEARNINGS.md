@@ -719,3 +719,7 @@ Moving a large orchestration function into a focused module improves ownership w
 ## Shared status text belongs with the sync contracts
 
 Upload, Hugging Face discovery, Hugging Face download, and R2 download progress use the same indexed-message grammar. A single parameterized formatter in `sync_protocols.py` preserves the user-facing strings while preventing each transfer backend from slowly developing different progress semantics.
+
+## Compatibility imports can hide an unfinished extraction
+
+Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.
