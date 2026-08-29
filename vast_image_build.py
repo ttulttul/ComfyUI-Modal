@@ -119,14 +119,11 @@ class VastWorkerImageBuilder:
 
     @staticmethod
     def _automatic_build_command() -> tuple[str, ...]:
-        """Run through uv while bypassing a copied or stale project virtualenv."""
+        """Run with the exact interpreter hosting the active ComfyUI process."""
         return (
-            "uv",
-            "run",
-            "--no-project",
-            "--python",
             sys.executable,
-            *VAST_IMAGE_BUILD_COMMAND[2:],
+            "scripts/build_vast_worker_image.py",
+            "--push",
         )
 
     @staticmethod

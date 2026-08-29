@@ -56,12 +56,7 @@ def test_builder_streams_progress_and_returns_digest(
 
     assert result == digest
     assert observed["command"] == (
-        "uv",
-        "run",
-        "--no-project",
-        "--python",
         sys.executable,
-        "python",
         "scripts/build_vast_worker_image.py",
         "--push",
     )
@@ -102,7 +97,7 @@ def test_builder_failure_requires_the_documented_manual_command(
 
     with pytest.raises(
         vast_image_build_module.VastWorkerImageBuildError,
-        match=r"uv run --no-project --python .* scripts/build_vast_worker_image\.py --push",
+        match=r"python.* scripts/build_vast_worker_image\.py --push",
     ) as raised:
         builder.build_and_push("e" * 64)
 
