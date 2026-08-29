@@ -46,3 +46,16 @@ def test_truncated_frame_is_rejected(remote_protocol_module: Any) -> None:
 
     with pytest.raises(remote_protocol_module.RemoteProtocolError, match="outstanding"):
         remote_protocol_module.read_frame(io.BytesIO(encoded[:-2]))
+
+
+def test_protocol_exports_shared_prompt_boundary_constants(
+    remote_protocol_module: Any,
+) -> None:
+    """Local and cloud runtimes must share exact prompt payload wire keys."""
+    assert (
+        remote_protocol_module.BOUNDARY_INPUT_SIGNATURES_KEY
+        == "__comfy_modal_boundary_input_signatures__"
+    )
+    assert remote_protocol_module.PRIMITIVE_WIDGET_INPUT_TYPES == frozenset(
+        {"INT", "FLOAT", "BOOLEAN", "STRING"}
+    )

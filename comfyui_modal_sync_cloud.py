@@ -85,6 +85,10 @@ from output_artifacts import (  # noqa: E402 - paths are bootstrapped above.
     capture_execution_result,
     snapshot_output_directory,
 )
+from remote_protocol import (  # noqa: E402 - paths are bootstrapped above.
+    BOUNDARY_INPUT_SIGNATURES_KEY as _BOUNDARY_INPUT_SIGNATURES_KEY,
+    PRIMITIVE_WIDGET_INPUT_TYPES as _PRIMITIVE_WIDGET_INPUT_TYPES,
+)
 
 from serialization import (  # noqa: E402 - paths are bootstrapped above.
     coerce_serialized_node_outputs,
@@ -143,7 +147,6 @@ _LLM_PREWARM_PLAN_KEYS: set[str] = set()
 _SNAPSHOT_PROFILE_CACHE_LOCK = threading.Lock()
 _SNAPSHOT_PROFILE_CACHE: dict[str, list[dict[str, Any]]] = {}
 _NODE_OUTPUT_CACHE_KEY_PREFIX = "NC_"
-_BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 _NODE_OUTPUT_CACHE_RECORD_VERSION = 1
 _PROMPT_EXECUTOR_STATES_LOCK = threading.Lock()
 _PROMPT_EXECUTOR_STATES: dict[str, "_ReusablePromptExecutorState"] = {}
@@ -204,8 +207,7 @@ _DURABLE_BRIDGE_REHYDRATION_IO_TYPES = frozenset(
     {"CLIP", "MODEL", "NOISE", "SAMPLER", "VAE"}
 )
 
-# Prompt widget and Modal image filtering constants.
-_PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
+# Modal image filtering constants.
 _COMFYUI_IMAGE_EXCLUDED_SUFFIXES = frozenset(
     {
         ".bin",

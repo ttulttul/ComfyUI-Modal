@@ -62,6 +62,10 @@ from ..output_artifacts import (
     materialize_remote_output_artifacts,
     unpack_remote_execution_result,
 )
+from ..remote_protocol import (
+    BOUNDARY_INPUT_SIGNATURES_KEY as _BOUNDARY_INPUT_SIGNATURES_KEY,
+    PRIMITIVE_WIDGET_INPUT_TYPES as _PRIMITIVE_WIDGET_INPUT_TYPES,
+)
 from ..session_state import (
     InMemoryRemoteSessionBridgeStore,
     InMemoryRemoteSessionStore,
@@ -139,7 +143,6 @@ _SNAPSHOT_PROFILE_RECORDS: dict[str, dict[str, Any]] = {}
 _MODAL_STAGE_STREAM_END = object()
 
 # Prompt payload constants.
-_PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
     {
         "CheckpointLoaderSimple",
@@ -149,7 +152,6 @@ _ROOT_LOADER_PREWARM_CLASS_TYPES = frozenset(
     }
 )
 _SPECULATIVE_PREWARM_TARGET_KEY = "speculative_remote_prewarm_target"
-_BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
 
 # Remote container log and billing state.
 _REMOTE_CONTAINER_LOG_STREAMS_LOCK = threading.Lock()

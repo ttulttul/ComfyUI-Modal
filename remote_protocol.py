@@ -9,6 +9,8 @@ from typing import Any, BinaryIO, Mapping
 
 REMOTE_PROTOCOL_MAGIC = b"CRMTRPC1"
 REMOTE_PROTOCOL_VERSION = 1
+BOUNDARY_INPUT_SIGNATURES_KEY = "__comfy_modal_boundary_input_signatures__"
+PRIMITIVE_WIDGET_INPUT_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN", "STRING"})
 _FRAME_HEADER = struct.Struct(">8sBQ")
 _MAX_FRAME_BYTES = 16 * 1024**3
 
