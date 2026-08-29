@@ -9,6 +9,11 @@
 - Vast write-back remains billable activity after workflow execution. Increment lease activity and refresh the worker watchdog around each idle transfer so a zero or short retention deadline cannot destroy the instance during multipart upload.
 - Background R2 uploads must be cancellable and idempotently requeued. Name transient SSH Docker helpers so cancellation can remove the exact container, abort incomplete multipart uploads on the controller, and let content-addressed existence checks collapse any harmless completed single PUT on retry.
 
+## 2026-08-29: Optional Modal imports belong to the module that uses them
+
+- Every module that directly uses the optional Modal SDK owns its own guarded `modal` binding (`try: import modal` / `except ModuleNotFoundError: modal = None`). Do not centralize that binding in a shared compatibility module: local tests and fallback paths need to monkeypatch the exact consumer module without mutating unrelated consumers.
+- Tests must patch `modal` on the module whose function is under test. This remains true after an implementation moves to an extracted module; patching a compatibility re-export on its former module does not change the moved function's globals.
+
 ## 2026-08-29: Vast publication cost is dominated by stable dependencies
 
 - The observed cold OrbStack publication spent about 274 seconds building and 165 seconds pushing. Runtime/PyTorch/CUDA and vLLM package layers accounted for most build time and bytes; the Ubuntu root layer and source copy were comparatively small. Changing Linux distributions would not materially address this path.
