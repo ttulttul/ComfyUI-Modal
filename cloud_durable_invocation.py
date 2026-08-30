@@ -14,6 +14,7 @@ try:
     from .cloud_runtime_context import invocation_record_store, volume_store
     from .durable_state import (
         DurableObjectCommitBatch,
+        DurableObjectRef,
         DurableStateError,
         FileDurableObjectStore,
         InMemoryRemoteInvocationStore,
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover - flat Modal-container import.
     from cloud_runtime_context import invocation_record_store, volume_store
     from durable_state import (
         DurableObjectCommitBatch,
+        DurableObjectRef,
         DurableStateError,
         FileDurableObjectStore,
         InMemoryRemoteInvocationStore,
@@ -234,7 +236,9 @@ def _wait_for_running_remote_invocation(
 
 def _begin_remote_invocation(
     payload: Mapping[str, Any],
-) -> tuple[RemoteInvocationRecord | None, bytes | None]:
+    *,
+    preserve_result_ref: bool = False,
+) -> tuple[RemoteInvocationRecord | None, bytes | DurableObjectRef | None]:
     """Start an invocation attempt or return its already-completed result."""
     invocation_id = str(payload.get("invocation_id") or "").strip()
     if not invocation_id:
@@ -246,6 +250,8 @@ def _begin_remote_invocation(
             invocation_id,
             previous_record.attempt,
         )
+        if preserve_result_ref and previous_record.result_object is not None:
+            return None, previous_record.result_object
         return None, _load_completed_remote_invocation_result(previous_record)
     if previous_record is not None and previous_record.state == "running":
         settings = get_settings()
@@ -261,6 +267,8 @@ def _begin_remote_invocation(
                     invocation_id,
                     previous_record.attempt,
                 )
+                if preserve_result_ref and previous_record.result_object is not None:
+                    return None, previous_record.result_object
                 return None, _load_completed_remote_invocation_result(previous_record)
             if previous_record is not None and previous_record.state == "running":
                 raise _durable_invocation_errors().invocation_in_progress(
@@ -283,7 +291,7 @@ def _complete_remote_invocation(
     serialized_outputs: bytes,
     *,
     pending_batch: DurableObjectCommitBatch | None = None,
-) -> None:
+) -> DurableObjectRef | None:
     """Commit successful object writes before publishing completed metadata."""
     settings = get_settings()
     completion_started_at = time.monotonic()
@@ -346,6 +354,7 @@ def _complete_remote_invocation(
         result_bytes,
         result_storage,
     )
+    return result_object
 
 
 def _fail_remote_invocation(

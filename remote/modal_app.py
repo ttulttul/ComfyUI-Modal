@@ -708,6 +708,7 @@ def _invoke_remote_engine_payload(
             invoke_remote_call=lambda: _consume_remote_payload_stream(
                 payload,
                 stream_method.remote_gen(payload, kwargs_payload),
+                input_transfer_bytes=len(kwargs_payload),
             ),
             interrupt_remote_call=interrupt_remote_call,
             cancellation_event=cancellation_event,

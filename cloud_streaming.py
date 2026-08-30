@@ -29,7 +29,11 @@ try:
         execute_node_locally,
         execute_subgraph_locally,
     )
-    from .durable_state import DurableObjectCommitBatch, RemoteInvocationRecord
+    from .durable_state import (
+        DurableObjectCommitBatch,
+        DurableObjectRef,
+        RemoteInvocationRecord,
+    )
     from .serialization import (
         coerce_serialized_node_outputs,
         deserialize_node_inputs,
@@ -55,7 +59,11 @@ except ImportError:  # pragma: no cover - flat Modal-container import.
         execute_node_locally,
         execute_subgraph_locally,
     )
-    from durable_state import DurableObjectCommitBatch, RemoteInvocationRecord
+    from durable_state import (
+        DurableObjectCommitBatch,
+        DurableObjectRef,
+        RemoteInvocationRecord,
+    )
     from serialization import (
         coerce_serialized_node_outputs,
         deserialize_node_inputs,
@@ -298,9 +306,16 @@ def _stream_remote_payload_events(
     )
     if task_id:
         yield {"kind": "remote_logs", "task_id": task_id}
-    running_record, completed_result = _begin_remote_invocation(payload)
+    preserve_result_ref = str(payload.get("execution_provider") or "modal") == "modal"
+    running_record, completed_result = _begin_remote_invocation(
+        payload,
+        preserve_result_ref=preserve_result_ref,
+    )
     if completed_result is not None:
-        yield {"kind": "result", "outputs": completed_result}
+        if isinstance(completed_result, DurableObjectRef):
+            yield {"kind": "result", "output_ref": completed_result.to_payload()}
+        else:
+            yield {"kind": "result", "outputs": completed_result}
         return
     worker_thread.start()
     invocation_finalized = False
@@ -323,8 +338,9 @@ def _stream_remote_payload_events(
                     bool(pending_batch and pending_batch.wrote_object),
                     event_buffer.queue_size,
                 )
+                result_object: DurableObjectRef | None = None
                 if running_record is not None:
-                    _complete_remote_invocation(
+                    result_object = _complete_remote_invocation(
                         running_record,
                         serialized_outputs,
                         pending_batch=pending_batch,
@@ -343,7 +359,13 @@ def _stream_remote_payload_events(
                     event_buffer.queue_size,
                 )
                 try:
-                    yield {"kind": "result", "outputs": serialized_outputs}
+                    if preserve_result_ref and result_object is not None:
+                        yield {
+                            "kind": "result",
+                            "output_ref": result_object.to_payload(),
+                        }
+                    else:
+                        yield {"kind": "result", "outputs": serialized_outputs}
                 finally:
                     logger.info(
                         "Remote stream result yield released after %.3fs component=%s invocation_id=%s "

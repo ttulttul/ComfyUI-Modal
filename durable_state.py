@@ -323,12 +323,24 @@ class FileDurableObjectStore:
             )
 
 
-def read_modal_volume_file(volume: Any, volume_path: str) -> bytes:
+def read_modal_volume_file(
+    volume: Any,
+    volume_path: str,
+    *,
+    progress_callback: Callable[[int], None] | None = None,
+) -> bytes:
     """Read one committed file through Modal's direct Volume API."""
     read_file = getattr(volume, "read_file", None)
     if not callable(read_file):
         raise DurableStateError("The configured Modal volume does not support read_file().")
-    return b"".join(read_file(volume_path))
+    chunks: list[bytes] = []
+    transferred_bytes = 0
+    for chunk in read_file(volume_path):
+        chunks.append(chunk)
+        transferred_bytes += len(chunk)
+        if progress_callback is not None:
+            progress_callback(transferred_bytes)
+    return b"".join(chunks)
 
 
 @dataclass(frozen=True)

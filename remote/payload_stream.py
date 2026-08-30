@@ -8,11 +8,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+from ..durable_state import DurableObjectRef, is_durable_object_ref_payload
 from ..serialization import (
     coerce_serialized_node_outputs,
     deserialize_value,
 )
 from .local_ui_events import (
+    RemoteTransferProgressReporter,
     _emit_local_executed_output,
     _emit_local_modal_progress,
     _emit_local_modal_status,
@@ -24,6 +26,7 @@ from .local_ui_events import (
     _remote_prompt_ancestor_node_ids,
     _should_forward_suppressed_stream_event,
 )
+from .host_session_bridge import materialize_modal_durable_object
 from .mapped_execution import _remember_mapped_lane_node_id
 from .modal_container_logs import (
     _coerce_modal_task_id,
@@ -522,6 +525,41 @@ def _handle_result_event(
     seconds_since_previous_event: float,
 ) -> None:
     """Validate and retain the final transport-safe result payload."""
+    output_ref_payload = stream_event.get("output_ref")
+    if is_durable_object_ref_payload(output_ref_payload):
+        output_ref = DurableObjectRef.from_payload(output_ref_payload)
+        reporter = RemoteTransferProgressReporter(
+            state.payload,
+            direction="download",
+            total_bytes=output_ref.size_bytes,
+        )
+        reporter.start()
+        download_started_at = time.monotonic()
+        logger.info(
+            "Downloading streamed Modal result object component=%s prompt_id=%s "
+            "invocation_id=%s result_bytes=%d object_path=%s.",
+            state.component_id,
+            state.prompt_id or "none",
+            state.invocation_id,
+            output_ref.size_bytes,
+            output_ref.object_path,
+        )
+        state.result_payload = materialize_modal_durable_object(
+            output_ref,
+            progress_callback=reporter.update,
+        )
+        reporter.complete()
+        logger.info(
+            "Downloaded streamed Modal result object in %.3fs component=%s "
+            "prompt_id=%s invocation_id=%s result_bytes=%d.",
+            time.monotonic() - download_started_at,
+            state.component_id,
+            state.prompt_id or "none",
+            state.invocation_id,
+            len(state.result_payload),
+        )
+        state.should_close_stream = True
+        return
     candidate_outputs = stream_event.get("outputs")
     candidate_bytes = (
         len(candidate_outputs)
@@ -578,17 +616,30 @@ def _close_consumed_payload_stream(
 def _consume_remote_payload_stream(
     payload: dict[str, Any],
     stream_events: Iterator[dict[str, Any]],
+    *,
+    input_transfer_bytes: int = 0,
 ) -> bytes:
     """Forward remote progress events into the local UI and return final bytes."""
     state = _new_payload_stream_state(payload)
+    upload_reporter = RemoteTransferProgressReporter(
+        payload,
+        direction="upload",
+        total_bytes=input_transfer_bytes,
+        indeterminate=True,
+    )
+    upload_reporter.start()
     logger.info(
         "Starting local Modal stream consumption component=%s prompt_id=%s invocation_id=%s.",
         state.component_id,
         state.prompt_id or "none",
         state.invocation_id,
     )
+    upload_completed = False
     try:
         for stream_event in stream_events:
+            if not upload_completed:
+                upload_reporter.complete()
+                upload_completed = True
             event_received_at = time.monotonic()
             seconds_since_previous_event = (
                 event_received_at - state.previous_event_at

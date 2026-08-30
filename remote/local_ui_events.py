@@ -5,11 +5,15 @@ from __future__ import annotations
 from io import BytesIO
 import logging
 import time
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from .local_execution import _iter_prompt_links
 
 logger = logging.getLogger(__name__)
+
+_REMOTE_TRANSFER_PROGRESS_MIN_BYTES = 4 * 1024 * 1024
+_REMOTE_TRANSFER_PROGRESS_MIN_INTERVAL_SECONDS = 0.1
+_REMOTE_TRANSFER_PROGRESS_MAX_UPDATES = 1000
 
 
 def _lookup_local_prompt_server() -> Any | None:
@@ -272,6 +276,114 @@ def _emit_local_modal_progress(
     prompt_server.send_sync("modal_progress", payload, client_id)
 
 
+class RemoteTransferProgressReporter:
+    """Throttle byte-transfer progress while preserving start and completion events."""
+
+    def __init__(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        direction: Literal["upload", "download"],
+        total_bytes: int,
+        indeterminate: bool = False,
+    ) -> None:
+        """Initialize a reporter for one remote payload transfer."""
+        self._payload = payload
+        self._direction = direction
+        self._total_bytes = max(0, int(total_bytes))
+        self._indeterminate = indeterminate
+        self._last_emitted_bytes = -1
+        self._last_emitted_at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether this transfer is large enough to surface in the UI."""
+        return self._total_bytes >= _REMOTE_TRANSFER_PROGRESS_MIN_BYTES
+
+    def start(self) -> None:
+        """Emit the initial transfer state when the payload is large."""
+        self.update(0, force=True)
+
+    def update(self, transferred_bytes: int, *, force: bool = False) -> None:
+        """Emit a throttled transfer update."""
+        if not self.enabled:
+            return
+        current_bytes = min(max(0, int(transferred_bytes)), self._total_bytes)
+        now = time.monotonic()
+        minimum_delta = max(
+            1024 * 1024,
+            self._total_bytes // _REMOTE_TRANSFER_PROGRESS_MAX_UPDATES,
+        )
+        if not force and current_bytes < self._total_bytes:
+            if current_bytes - self._last_emitted_bytes < minimum_delta:
+                return
+            if (
+                now - self._last_emitted_at
+                < _REMOTE_TRANSFER_PROGRESS_MIN_INTERVAL_SECONDS
+            ):
+                return
+        self._last_emitted_bytes = current_bytes
+        self._last_emitted_at = now
+        _emit_local_remote_transfer_progress(
+            self._payload,
+            direction=self._direction,
+            current_bytes=current_bytes,
+            total_bytes=self._total_bytes,
+            indeterminate=self._indeterminate and current_bytes < self._total_bytes,
+        )
+
+    def complete(self) -> None:
+        """Emit a determinate completion update."""
+        self.update(self._total_bytes, force=True)
+
+
+def _emit_local_remote_transfer_progress(
+    payload: Mapping[str, Any],
+    *,
+    direction: Literal["upload", "download"],
+    current_bytes: int,
+    total_bytes: int,
+    indeterminate: bool = False,
+) -> None:
+    """Show one large remote transfer on the component's representative node."""
+    if total_bytes < _REMOTE_TRANSFER_PROGRESS_MIN_BYTES:
+        return
+    extra_data = payload.get("extra_data") or {}
+    client_id = (
+        str(extra_data["client_id"])
+        if isinstance(extra_data, Mapping) and extra_data.get("client_id") is not None
+        else None
+    )
+    node_ids = [
+        str(node_id)
+        for node_id in payload.get("component_node_ids", [])
+        if str(node_id)
+    ]
+    node_id = str(payload.get("component_id") or (node_ids[0] if node_ids else ""))
+    if not node_id:
+        return
+    destination = _remote_execution_destination(payload)
+    action = "Sending inputs to" if direction == "upload" else "Receiving outputs from"
+    _emit_local_modal_progress(
+        prompt_id=(
+            str(payload["prompt_id"])
+            if payload.get("prompt_id") is not None
+            else None
+        ),
+        client_id=client_id,
+        node_id=node_id,
+        value=float(current_bytes),
+        max_value=float(total_bytes),
+        display_node_id=node_id,
+        stage=direction,
+        message=f"{action} {destination}",
+        unit="bytes",
+        indeterminate=indeterminate,
+        pre_gpu=direction == "upload",
+        **_remote_execution_identity(payload),
+    )
+
+
 def _emit_local_executed_output(
     *,
     prompt_id: str | None,
@@ -514,4 +626,3 @@ def _should_stream_remote_progress(payload: dict[str, Any]) -> bool:
         and isinstance(payload.get("component_node_ids"), list)
         and len(payload.get("component_node_ids")) > 0
     )
-

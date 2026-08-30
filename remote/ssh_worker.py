@@ -27,9 +27,9 @@ try:
         RemoteFrameKind,
         RemoteProtocolError,
         decode_json_payload,
-        encode_frame,
         encode_json_frame,
         read_frame,
+        relay_frame,
         write_frame,
     )
 except ImportError:  # pragma: no cover - remote image imports ``remote`` top-level.
@@ -38,9 +38,9 @@ except ImportError:  # pragma: no cover - remote image imports ``remote`` top-le
         RemoteFrameKind,
         RemoteProtocolError,
         decode_json_payload,
-        encode_frame,
         encode_json_frame,
         read_frame,
+        relay_frame,
         write_frame,
     )
 
@@ -574,15 +574,13 @@ def _decode_resolved_profiles(encoded_payload: str | None) -> dict[str, dict[str
 
 def _copy_request_frames(source: BinaryIO, destination: socket.socket) -> None:
     """Copy exactly one request command and its optional input frame."""
-    first_frame = read_frame(source)
-    if first_frame is None:
+    first_kind = relay_frame(source, destination.sendall)
+    if first_kind is None:
         raise RemoteProtocolError("Worker relay received an empty request stream.")
-    destination.sendall(encode_frame(*first_frame))
-    if first_frame[0] is RemoteFrameKind.REQUEST:
-        inputs_frame = read_frame(source)
-        if inputs_frame is None or inputs_frame[0] is not RemoteFrameKind.INPUTS:
+    if first_kind is RemoteFrameKind.REQUEST:
+        inputs_kind = relay_frame(source, destination.sendall)
+        if inputs_kind is not RemoteFrameKind.INPUTS:
             raise RemoteProtocolError("Worker relay request omitted its INPUTS frame.")
-        destination.sendall(encode_frame(*inputs_frame))
     destination.shutdown(socket.SHUT_WR)
 
 
@@ -591,12 +589,11 @@ def _copy_response_frames(source: socket.socket, destination: BinaryIO) -> bool:
     source_file = source.makefile("rb")
     try:
         while True:
-            frame = read_frame(source_file)
-            if frame is None:
+            frame_kind = relay_frame(source_file, destination.write)
+            if frame_kind is None:
                 return False
-            destination.write(encode_frame(*frame))
             destination.flush()
-            if frame[0] in {
+            if frame_kind in {
                 RemoteFrameKind.RESULT,
                 RemoteFrameKind.ERROR,
                 RemoteFrameKind.ACKNOWLEDGEMENT,

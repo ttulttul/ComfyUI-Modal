@@ -24,9 +24,9 @@ if __package__:
         RemoteFrameKind,
         RemoteProtocolError,
         decode_json_payload,
-        encode_frame,
         encode_json_frame,
         read_frame,
+        write_frame,
     )
     from .serialization import deserialize_node_outputs, serialize_node_inputs
     from .settings import ModalSyncSettings, get_settings
@@ -54,9 +54,9 @@ else:  # pragma: no cover - direct debugging imports.
         RemoteFrameKind,
         RemoteProtocolError,
         decode_json_payload,
-        encode_frame,
         encode_json_frame,
         read_frame,
+        write_frame,
     )
     from serialization import deserialize_node_outputs, serialize_node_inputs
     from settings import ModalSyncSettings, get_settings
@@ -465,17 +465,14 @@ class VastExecutorClient:
         inputs_payload: bytes,
     ) -> Iterator[dict[str, Any]]:
         """Start one direct worker relay and yield shared event mappings."""
-        request = b"".join(
-            (
-                encode_json_frame(
-                    RemoteFrameKind.REQUEST,
-                    {
-                        "invocation_id": str(payload["invocation_id"]),
-                        "payload": payload,
-                    },
-                ),
-                encode_frame(RemoteFrameKind.INPUTS, inputs_payload),
-            )
+        from .remote.local_ui_events import RemoteTransferProgressReporter
+
+        request = encode_json_frame(
+            RemoteFrameKind.REQUEST,
+            {
+                "invocation_id": str(payload["invocation_id"]),
+                "payload": payload,
+            },
         )
         process = runner.popen(self._relay_arguments())
         if process.stdin is None or process.stdout is None or process.stderr is None:
@@ -490,12 +487,49 @@ class VastExecutorClient:
             daemon=True,
         )
         stderr_thread.start()
+        upload_reporter = RemoteTransferProgressReporter(
+            payload,
+            direction="upload",
+            total_bytes=len(inputs_payload),
+        )
+        download_reporter: RemoteTransferProgressReporter | None = None
+        upload_reporter.start()
         process.stdin.write(request)
+        write_frame(
+            process.stdin,
+            RemoteFrameKind.INPUTS,
+            inputs_payload,
+            progress_callback=(
+                lambda _kind, current, _total: upload_reporter.update(current)
+            ),
+        )
+        upload_reporter.complete()
         process.stdin.close()
         terminal_received = False
         try:
             while True:
-                frame = read_frame(process.stdout)
+                def report_download(
+                    kind: RemoteFrameKind,
+                    current: int,
+                    total: int,
+                ) -> None:
+                    """Forward RESULT frame byte progress to the local UI."""
+                    nonlocal download_reporter
+                    if kind is not RemoteFrameKind.RESULT:
+                        return
+                    if download_reporter is None:
+                        download_reporter = RemoteTransferProgressReporter(
+                            payload,
+                            direction="download",
+                            total_bytes=total,
+                        )
+                        download_reporter.start()
+                    download_reporter.update(current)
+
+                frame = read_frame(
+                    process.stdout,
+                    progress_callback=report_download,
+                )
                 if frame is None:
                     break
                 kind, frame_payload = frame
@@ -503,6 +537,8 @@ class VastExecutorClient:
                     yield decode_json_payload(frame_payload)
                     continue
                 if kind is RemoteFrameKind.RESULT:
+                    if download_reporter is not None:
+                        download_reporter.complete()
                     terminal_received = True
                     yield {"kind": "result", "outputs": frame_payload}
                     break

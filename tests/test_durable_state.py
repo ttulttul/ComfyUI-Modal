@@ -181,6 +181,31 @@ def test_content_addressed_store_reports_missing_committed_object(
         store.get(object_ref)
 
 
+def test_modal_volume_read_reports_each_download_chunk(
+    durable_state_module: Any,
+) -> None:
+    """Direct Modal Volume downloads should expose cumulative byte progress."""
+
+    class Volume:
+        """Yield deterministic direct-download chunks."""
+
+        def read_file(self, volume_path: str) -> Any:
+            """Return the chunks stored at one expected path."""
+            assert volume_path == "durable/result.bin"
+            return iter((b"abc", b"defg", b"h"))
+
+    transferred: list[int] = []
+
+    result = durable_state_module.read_modal_volume_file(
+        Volume(),
+        "durable/result.bin",
+        progress_callback=transferred.append,
+    )
+
+    assert result == b"abcdefgh"
+    assert transferred == [3, 7, 8]
+
+
 def test_content_addressed_store_validates_direct_committed_read(
     durable_state_module: Any,
     tmp_path: Path,

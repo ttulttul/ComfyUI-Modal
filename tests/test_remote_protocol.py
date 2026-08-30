@@ -48,6 +48,58 @@ def test_truncated_frame_is_rejected(remote_protocol_module: Any) -> None:
         remote_protocol_module.read_frame(io.BytesIO(encoded[:-2]))
 
 
+def test_frame_io_reports_incremental_payload_bytes(remote_protocol_module: Any) -> None:
+    """Large framed transfers should expose byte progress in bounded chunks."""
+    payload = b"x" * (2 * 1024 * 1024 + 17)
+    encoded_stream = io.BytesIO()
+    written: list[tuple[Any, int, int]] = []
+    remote_protocol_module.write_frame(
+        encoded_stream,
+        remote_protocol_module.RemoteFrameKind.RESULT,
+        payload,
+        progress_callback=lambda kind, current, total: written.append(
+            (kind, current, total)
+        ),
+    )
+    read: list[tuple[Any, int, int]] = []
+
+    decoded = remote_protocol_module.read_frame(
+        io.BytesIO(encoded_stream.getvalue()),
+        progress_callback=lambda kind, current, total: read.append(
+            (kind, current, total)
+        ),
+    )
+
+    assert decoded == (remote_protocol_module.RemoteFrameKind.RESULT, payload)
+    assert [current for _kind, current, _total in written] == [
+        1024 * 1024,
+        2 * 1024 * 1024,
+        len(payload),
+    ]
+    assert read == written
+
+
+def test_relay_frame_streams_without_reassembling_payload(
+    remote_protocol_module: Any,
+) -> None:
+    """The SSH relay should forward large frames a chunk at a time."""
+    payload = b"z" * (2 * 1024 * 1024 + 7)
+    encoded = remote_protocol_module.encode_frame(
+        remote_protocol_module.RemoteFrameKind.INPUTS,
+        payload,
+    )
+    forwarded_chunks: list[bytes] = []
+
+    kind = remote_protocol_module.relay_frame(
+        io.BytesIO(encoded),
+        lambda chunk: forwarded_chunks.append(bytes(chunk)),
+    )
+
+    assert kind is remote_protocol_module.RemoteFrameKind.INPUTS
+    assert b"".join(forwarded_chunks) == encoded
+    assert len(forwarded_chunks) == 4
+
+
 def test_protocol_exports_shared_prompt_boundary_constants(
     remote_protocol_module: Any,
 ) -> None:

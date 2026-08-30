@@ -120,6 +120,53 @@ def test_modal_cloud_streams_remote_log_task_id_before_progress(
         },
     ]
 
+
+def test_modal_cloud_returns_large_durable_result_by_reference(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Modal must not place a durable multi-gigabyte result back on its result channel."""
+    cloud_streaming = _cloud_streaming_owner()
+    result_ref = cloud_streaming.DurableObjectRef(
+        object_path="invocation_results/ab/result.bin",
+        sha256="a" * 64,
+        size_bytes=8 * 1024 * 1024,
+    )
+    begin_calls: list[bool] = []
+    monkeypatch.setattr(
+        cloud_streaming,
+        "_begin_remote_invocation",
+        lambda _payload, *, preserve_result_ref=False: (
+            begin_calls.append(preserve_result_ref) or object(),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        cloud_streaming,
+        "_complete_remote_invocation",
+        lambda *_args, **_kwargs: result_ref,
+    )
+    monkeypatch.setattr(
+        cloud_streaming,
+        "execute_node_locally",
+        lambda *_args, **_kwargs: b"serialized-large-result",
+    )
+
+    events = list(
+        modal_cloud_module._stream_remote_payload_events(
+            {
+                "payload_kind": "node",
+                "component_id": "component-large",
+                "invocation_id": "RIV_large",
+                "execution_provider": "modal",
+            },
+            b"{}",
+        )
+    )
+
+    assert begin_calls == [True]
+    assert events == [{"kind": "result", "output_ref": result_ref.to_payload()}]
+
 def test_modal_cloud_streams_tensor_safe_progress_and_result_events(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -341,6 +388,141 @@ def test_remote_stream_first_event_triggers_speculative_prewarm_once(
 
     assert result == b"serialized-outputs"
     assert scheduled_payloads == [(payload, "current_remote_stream_started")]
+
+
+def test_remote_modal_downloads_referenced_result_with_progress(
+    remote_modal_app_module: Any,
+    payload_stream_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A durable Modal result should report download bytes while materializing locally."""
+    expected_result = b"result"
+    reporter_calls: list[tuple[str, int]] = []
+
+    class Reporter:
+        """Capture lifecycle calls made for the referenced result download."""
+
+        def __init__(
+            self,
+            _payload: dict[str, Any],
+            *,
+            direction: str,
+            total_bytes: int,
+            indeterminate: bool = False,
+        ) -> None:
+            """Record the transfer metadata."""
+            del indeterminate
+            reporter_calls.append((direction, total_bytes))
+
+        def start(self) -> None:
+            """Record transfer start."""
+            reporter_calls.append(("start", 0))
+
+        def update(self, transferred_bytes: int, *, force: bool = False) -> None:
+            """Record one cumulative-byte update."""
+            del force
+            reporter_calls.append(("update", transferred_bytes))
+
+        def complete(self) -> None:
+            """Record transfer completion."""
+            reporter_calls.append(("complete", 0))
+
+    def materialize(_ref: Any, *, progress_callback: Any = None) -> bytes:
+        """Simulate a two-chunk Modal Volume download."""
+        progress_callback(3)
+        progress_callback(6)
+        return expected_result
+
+    monkeypatch.setattr(payload_stream_module, "RemoteTransferProgressReporter", Reporter)
+    monkeypatch.setattr(
+        payload_stream_module,
+        "materialize_modal_durable_object",
+        materialize,
+    )
+    output_ref = payload_stream_module.DurableObjectRef(
+        object_path="invocation_results/ab/result.bin",
+        sha256="b" * 64,
+        size_bytes=6,
+    )
+
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        {"component_id": "component-large"},
+        iter([{"kind": "result", "output_ref": output_ref.to_payload()}]),
+    )
+
+    assert result == expected_result
+    assert reporter_calls == [
+        ("upload", 0),
+        ("start", 0),
+        ("complete", 0),
+        ("download", 6),
+        ("start", 0),
+        ("update", 3),
+        ("update", 6),
+        ("complete", 0),
+    ]
+
+
+def test_large_transfer_reporter_emits_byte_ui_metadata(
+    local_ui_events_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Large transfers should use the existing byte-aware node progress UI."""
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        local_ui_events_module,
+        "_emit_local_modal_progress",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+    payload = {
+        "prompt_id": "prompt-transfer",
+        "component_id": "170",
+        "component_node_ids": ["170", "169"],
+        "execution_provider": "vast",
+        "execution_environment_id": "vast:video-worker",
+        "extra_data": {"client_id": "client-transfer"},
+    }
+    reporter = local_ui_events_module.RemoteTransferProgressReporter(
+        payload,
+        direction="download",
+        total_bytes=8 * 1024 * 1024,
+    )
+
+    reporter.start()
+    reporter.complete()
+
+    assert emitted == [
+        {
+            "prompt_id": "prompt-transfer",
+            "client_id": "client-transfer",
+            "node_id": "170",
+            "value": 0.0,
+            "max_value": float(8 * 1024 * 1024),
+            "display_node_id": "170",
+            "stage": "download",
+            "message": "Receiving outputs from vast:video-worker",
+            "unit": "bytes",
+            "indeterminate": False,
+            "pre_gpu": False,
+            "execution_provider": "vast",
+            "execution_environment_id": "vast:video-worker",
+        },
+        {
+            "prompt_id": "prompt-transfer",
+            "client_id": "client-transfer",
+            "node_id": "170",
+            "value": float(8 * 1024 * 1024),
+            "max_value": float(8 * 1024 * 1024),
+            "display_node_id": "170",
+            "stage": "download",
+            "message": "Receiving outputs from vast:video-worker",
+            "unit": "bytes",
+            "indeterminate": False,
+            "pre_gpu": False,
+            "execution_provider": "vast",
+            "execution_environment_id": "vast:video-worker",
+        },
+    ]
 
 def test_emit_local_mapped_lane_progress_start_marks_lane_as_setup_only(
     remote_modal_app_module: Any,

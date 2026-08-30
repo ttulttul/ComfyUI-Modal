@@ -1,5 +1,12 @@
 # Learnings
 
+## 2026-08-30: Progress requires ownership of the transfer loop
+
+- A provider SDK can expose a remote function as finished while its client is still materializing a large return value. Status events around the call cannot measure that hidden transfer; return a small durable object reference and read the object through an explicit chunk iterator instead.
+- Length-prefixed framing is not automatically streaming. Reading the declared payload length in one buffered `read()` and rebuilding each frame in an SSH relay hides all intermediate progress and may allocate another full payload. Cap reads and writes to bounded chunks, and forward the original header plus chunks without reassembly.
+- Emit byte progress only above a materiality threshold and throttle by both bytes and time. Multi-gigabyte results otherwise generate thousands of websocket updates that can become their own UI bottleneck.
+- When an API exposes no upload callback, show an honest indeterminate byte-labeled transfer until the first remote stream event. Do not fabricate a percentage from elapsed time.
+
 ## 2026-08-30: Module compatibility fallback does not populate function globals
 
 - PEP 562 module `__getattr__` preserves callers that read a moved private helper as `module._helper`, but code defined inside that module resolves `_helper` directly from the module globals dictionary and never invokes `__getattr__`. A compatibility-export test can therefore pass while the deployed Modal method raises `NameError`.

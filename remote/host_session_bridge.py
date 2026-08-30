@@ -649,18 +649,28 @@ def _read_local_materialization_bridge_object(
     settings = get_settings()
     if settings.execution_mode != "remote":
         return _durable_object_store().get(object_ref)
+    return materialize_modal_durable_object(object_ref)
+
+
+def materialize_modal_durable_object(
+    object_ref: DurableObjectRef,
+    *,
+    progress_callback: Callable[[int], None] | None = None,
+) -> bytes:
+    """Download and validate one content-addressed object from Modal storage."""
     volume_path = (Path("durable_objects") / object_ref.object_path).as_posix()
     payload = read_modal_volume_file(
         _lookup_modal_durable_volume(),
         volume_path,
+        progress_callback=progress_callback,
     )
     if len(payload) != object_ref.size_bytes:
         raise DurableStateError(
-            f"Durable bridge object {object_ref.object_path!r} has an unexpected size."
+            f"Durable object {object_ref.object_path!r} has an unexpected size."
         )
     if hashlib.sha256(payload).hexdigest() != object_ref.sha256:
         raise DurableStateError(
-            f"Durable bridge object {object_ref.object_path!r} failed its content-address check."
+            f"Durable object {object_ref.object_path!r} failed its content-address check."
         )
     return payload
 

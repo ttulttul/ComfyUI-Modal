@@ -242,9 +242,14 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
         modal_cloud_module.get_settings.cache_clear()
 
     completed_record = invocation_store.get_record("RIV_stream")
-    assert events == [{"kind": "result", "outputs": serialized_outputs}]
     assert completed_record.state == "completed"
     assert completed_record.result_object is not None
+    assert events == [
+        {
+            "kind": "result",
+            "output_ref": completed_record.result_object.to_payload(),
+        }
+    ]
     assert object_store.get(completed_record.result_object) == serialized_outputs
     assert commit_thread_ids == [consumer_thread_id]
     assert "Starting durable object batch commit" in caplog.text
