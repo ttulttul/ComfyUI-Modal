@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import faulthandler
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Mapping, Sequence
 from uuid import uuid4
@@ -46,12 +48,27 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WORKER_SOCKET_PATH = Path("/run/comfy-remote/worker.sock")
 DEFAULT_STORAGE_ROOT = Path("/storage")
+DEFAULT_WORKER_LOG_PATH = DEFAULT_STORAGE_ROOT / "logs" / "vast-worker.log"
+DEFAULT_CGROUP_ROOT = Path("/sys/fs/cgroup")
 _STAGING_OWNER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _STAGING_TERMINATE_GRACE_SECONDS = 5.0
+_WORKER_LOG_DIAGNOSTIC_BYTES = 32 * 1024
+_WORKER_LOG_DIAGNOSTIC_CHARACTERS = 4096
 
 
 class SshWorkerError(RuntimeError):
     """Raised when an SSH worker request cannot be executed."""
+
+
+@dataclass(frozen=True)
+class CgroupMemorySnapshot:
+    """Capture the Linux cgroup memory evidence relevant to worker loss."""
+
+    oom: int | None = None
+    oom_kill: int | None = None
+    memory_current_bytes: int | None = None
+    memory_limit_bytes: int | None = None
+    swap_limit_bytes: int | None = None
 
 
 class WorkerExecutionState:
@@ -217,6 +234,10 @@ def _execution_events(
 
 def serve(socket_path: Path = DEFAULT_WORKER_SOCKET_PATH) -> None:
     """Run the persistent Unix-socket worker until the container stops."""
+    try:
+        faulthandler.enable(all_threads=True)
+    except (OSError, RuntimeError) as exc:
+        logger.warning("Unable to enable Python fatal-signal diagnostics: %s", exc)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     socket_path.unlink(missing_ok=True)
     server = _ThreadingUnixStreamServer(str(socket_path), _WorkerRequestHandler)
@@ -235,12 +256,88 @@ def serve(socket_path: Path = DEFAULT_WORKER_SOCKET_PATH) -> None:
 
 
 def relay_client(socket_path: Path = DEFAULT_WORKER_SOCKET_PATH) -> int:
-    """Relay framed stdin/stdout between ``docker exec`` and the worker socket."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
-        client_socket.connect(str(socket_path))
-        _copy_request_frames(sys.stdin.buffer, client_socket)
-        _copy_response_frames(client_socket, sys.stdout.buffer)
-    return 0
+    """Relay one request and synthesize a postmortem if its worker disappears."""
+    memory_before = read_cgroup_memory_snapshot()
+    relay_error: str | None = None
+    terminal_received = False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
+            client_socket.connect(str(socket_path))
+            _copy_request_frames(sys.stdin.buffer, client_socket)
+            terminal_received = _copy_response_frames(
+                client_socket,
+                sys.stdout.buffer,
+            )
+    except (ConnectionError, OSError, RemoteProtocolError) as exc:
+        relay_error = f"{type(exc).__name__}: {exc}"
+    if terminal_received:
+        return 0
+    memory_after = read_cgroup_memory_snapshot()
+    write_frame(
+        sys.stdout.buffer,
+        RemoteFrameKind.ERROR,
+        json.dumps(
+            worker_failure_payload(
+                memory_before,
+                memory_after,
+                relay_error=relay_error,
+            ),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"),
+    )
+    return 70
+
+
+def read_cgroup_memory_snapshot(
+    cgroup_root: Path = DEFAULT_CGROUP_ROOT,
+) -> CgroupMemorySnapshot:
+    """Read bounded cgroup-v2 memory counters without failing the relay."""
+    events = _read_cgroup_events(cgroup_root / "memory.events")
+    return CgroupMemorySnapshot(
+        oom=events.get("oom"),
+        oom_kill=events.get("oom_kill"),
+        memory_current_bytes=_read_cgroup_integer(cgroup_root / "memory.current"),
+        memory_limit_bytes=_read_cgroup_integer(cgroup_root / "memory.max"),
+        swap_limit_bytes=_read_cgroup_integer(cgroup_root / "memory.swap.max"),
+    )
+
+
+def worker_failure_payload(
+    memory_before: CgroupMemorySnapshot,
+    memory_after: CgroupMemorySnapshot,
+    *,
+    relay_error: str | None = None,
+    worker_log_path: Path = DEFAULT_WORKER_LOG_PATH,
+) -> dict[str, Any]:
+    """Build a structured worker-loss error from cgroup and log evidence."""
+    oom_delta = _counter_delta(memory_before.oom, memory_after.oom)
+    oom_kill_delta = _counter_delta(memory_before.oom_kill, memory_after.oom_kill)
+    worker_log_tail = _read_worker_log_tail(worker_log_path)
+    out_of_memory = bool((oom_kill_delta or 0) > 0 or (oom_delta or 0) > 0)
+    if out_of_memory:
+        error_type = "WorkerOutOfMemoryError"
+        message = _out_of_memory_message(memory_after, oom_kill_delta)
+    else:
+        error_type = "WorkerProcessLostError"
+        message = (
+            "Vast worker process exited unexpectedly without returning a result. "
+            "The container OOM counters did not increase during this invocation."
+        )
+    if relay_error:
+        message = f"{message} Relay observed {relay_error}."
+    if worker_log_tail:
+        message = f"{message}\nLast Vast worker log lines:\n{worker_log_tail}"
+    return {
+        "error_type": error_type,
+        "message": message,
+        "failure_kind": "out_of_memory" if out_of_memory else "worker_process_lost",
+        "oom_delta": oom_delta,
+        "oom_kill_delta": oom_kill_delta,
+        "memory_current_bytes": memory_after.memory_current_bytes,
+        "memory_limit_bytes": memory_after.memory_limit_bytes,
+        "swap_limit_bytes": memory_after.swap_limit_bytes,
+    }
 
 
 def runtime_info() -> dict[str, Any]:
@@ -489,14 +586,14 @@ def _copy_request_frames(source: BinaryIO, destination: socket.socket) -> None:
     destination.shutdown(socket.SHUT_WR)
 
 
-def _copy_response_frames(source: socket.socket, destination: BinaryIO) -> None:
-    """Copy response frames from the worker socket until terminal state."""
+def _copy_response_frames(source: socket.socket, destination: BinaryIO) -> bool:
+    """Copy response frames and report whether a terminal frame arrived."""
     source_file = source.makefile("rb")
     try:
         while True:
             frame = read_frame(source_file)
             if frame is None:
-                return
+                return False
             destination.write(encode_frame(*frame))
             destination.flush()
             if frame[0] in {
@@ -505,9 +602,94 @@ def _copy_response_frames(source: socket.socket, destination: BinaryIO) -> None:
                 RemoteFrameKind.ACKNOWLEDGEMENT,
                 RemoteFrameKind.RUNTIME_INFO,
             }:
-                return
+                return True
     finally:
         source_file.close()
+
+
+def _read_cgroup_events(path: Path) -> dict[str, int]:
+    """Read integer counters from one cgroup events file when available."""
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return {}
+    events: dict[str, int] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            events[fields[0]] = int(fields[1])
+        except ValueError:
+            continue
+    return events
+
+
+def _read_cgroup_integer(path: Path) -> int | None:
+    """Read one cgroup integer while treating ``max`` as unlimited."""
+    try:
+        raw_value = path.read_text(encoding="ascii").strip()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+    if raw_value == "max":
+        return None
+    try:
+        return int(raw_value)
+    except ValueError:
+        return None
+
+
+def _counter_delta(before: int | None, after: int | None) -> int | None:
+    """Return a non-negative counter delta when both samples are present."""
+    if before is None or after is None:
+        return None
+    return max(0, after - before)
+
+
+def _out_of_memory_message(
+    memory: CgroupMemorySnapshot,
+    oom_kill_delta: int | None,
+) -> str:
+    """Describe an evidenced cgroup out-of-memory worker termination."""
+    details: list[str] = []
+    if memory.memory_limit_bytes is not None:
+        details.append(
+            f"instance RAM limit {_format_binary_gibibytes(memory.memory_limit_bytes)}"
+        )
+    if memory.swap_limit_bytes == 0:
+        details.append("swap disabled")
+    if oom_kill_delta is not None:
+        details.append(f"OOM kills during this invocation {oom_kill_delta}")
+    suffix = f" ({'; '.join(details)})" if details else ""
+    return (
+        "Vast worker was killed because the instance ran out of host RAM "
+        f"(container cgroup OOM){suffix}."
+    )
+
+
+def _format_binary_gibibytes(byte_count: int) -> str:
+    """Format a byte count in GiB for one concise diagnostic."""
+    return f"{byte_count / 1024**3:.1f} GiB"
+
+
+def _read_worker_log_tail(path: Path) -> str:
+    """Return a bounded, UTF-8-safe tail from the durable worker log."""
+    try:
+        with path.open("rb") as log_file:
+            log_file.seek(0, os.SEEK_END)
+            length = log_file.tell()
+            log_file.seek(max(0, length - _WORKER_LOG_DIAGNOSTIC_BYTES))
+            payload = log_file.read(_WORKER_LOG_DIAGNOSTIC_BYTES)
+    except (FileNotFoundError, OSError):
+        return ""
+    text = payload.decode("utf-8", errors="replace")
+    if length > _WORKER_LOG_DIAGNOSTIC_BYTES:
+        text = text.partition("\n")[2]
+    fatal_offset = text.rfind("Fatal Python error:")
+    if fatal_offset >= 0:
+        text = text[fatal_offset:]
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-40:])[-_WORKER_LOG_DIAGNOSTIC_CHARACTERS:]
 
 
 def _required_string(payload: Mapping[str, Any], key: str) -> str:

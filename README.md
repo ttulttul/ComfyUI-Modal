@@ -494,6 +494,7 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 - **Boundary validation fails on `MODEL`, `CLIP`, `VAE`, `CONDITIONING`, or similar**: include the upstream producer in the remote region, or use `Enable on Upstream Nodes`.
 - **`Dependency cycle detected` after rewrite**: inspect local `comfy.log` for the proxy-graph diagnostics and cycle path.
 - **Cancellation finishes locally while the back-end is still busy**: the local prompt is released after the grace window; remote cleanup or worker retirement may still be completing.
+- **A Vast worker disappears during execution**: current worker images compare Linux cgroup memory counters around every relayed invocation and return a structured postmortem with the RAM limit, OOM-kill delta, and bounded tail of `/storage/logs/vast-worker.log`. An evidenced host-RAM OOM is terminal and is not retried on the same undersized instance; a process loss without an OOM delta is retried once after a worker restart. Rebuild the Vast worker image if an older lease reports that no structured postmortem was available.
 - **Remote behavior does not reflect a local code update**: redeploy the configured Modal app, or rebuild the SSH/Vast worker image, so remote workers use the current code.
 
 ## Development

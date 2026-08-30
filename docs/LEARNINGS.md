@@ -1,5 +1,12 @@
 # Learnings
 
+## 2026-08-29: A surviving relay can explain a vanished GPU worker
+
+- OpenSSH writes Vast's generic login greeting to stderr on every successful connection. When a remote stream ends without a terminal frame, that greeting is transport context, not a failure cause, and must never be promoted into the user-facing exception.
+- The lightweight per-invocation relay normally survives when Linux kills the memory-heavy persistent worker. Sampling cgroup-v2 `memory.events` before opening the worker socket and after unexpected EOF provides invocation-scoped evidence: an `oom` or `oom_kill` delta identifies host-RAM exhaustion without guessing from the last model log line.
+- A relay that loses its worker should synthesize a normal structured error frame containing the cgroup delta, RAM and swap limits, and a bounded durable worker-log tail. The existing controller protocol can then classify an evidenced OOM as terminal while retaining one automatic worker restart for a non-OOM native crash.
+- Native failures do not always become Python exceptions. Enable `faulthandler` in the persistent worker so fatal Python/native signals that can be handled leave stack evidence in the durable log; SIGKILL still cannot be caught, which is why the independent cgroup evidence is necessary.
+
 ## 2026-08-29: Background cache work must yield resources, not only the caller
 
 - Submitting a transfer to `ThreadPoolExecutor` prevents a direct caller wait but still starts network, disk, Docker, and SSH work on the environment that is about to execute the workflow. A cache operation is truly out of the foreground path only when prompt lifecycle state gates its start and can preempt it when new work arrives.

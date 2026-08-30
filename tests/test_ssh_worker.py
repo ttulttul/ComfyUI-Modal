@@ -183,3 +183,78 @@ def test_worker_request_relay_preserves_framed_binary_payload(
     finally:
         left.close()
         right.close()
+
+
+def test_cgroup_memory_snapshot_reads_v2_limits_and_events(
+    ssh_worker_module: Any,
+    tmp_path: Path,
+) -> None:
+    """The relay should retain the cgroup evidence needed to identify an OOM."""
+    (tmp_path / "memory.events").write_text(
+        "low 0\nhigh 0\nmax 42\noom 3\noom_kill 2\n",
+        encoding="ascii",
+    )
+    (tmp_path / "memory.current").write_text("1073741824\n", encoding="ascii")
+    (tmp_path / "memory.max").write_text("94623498240\n", encoding="ascii")
+    (tmp_path / "memory.swap.max").write_text("0\n", encoding="ascii")
+
+    snapshot = ssh_worker_module.read_cgroup_memory_snapshot(tmp_path)
+
+    assert snapshot.oom == 3
+    assert snapshot.oom_kill == 2
+    assert snapshot.memory_current_bytes == 1024**3
+    assert snapshot.memory_limit_bytes == 94623498240
+    assert snapshot.swap_limit_bytes == 0
+
+
+def test_worker_failure_payload_identifies_oom_and_includes_log_tail(
+    ssh_worker_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A cgroup OOM delta should become the primary user-facing failure."""
+    worker_log = tmp_path / "vast-worker.log"
+    worker_log.write_text(
+        "loaded text encoder\nRequested to load MiniMaxH3\n",
+        encoding="utf-8",
+    )
+    before = ssh_worker_module.CgroupMemorySnapshot(oom=0, oom_kill=0)
+    after = ssh_worker_module.CgroupMemorySnapshot(
+        oom=1,
+        oom_kill=1,
+        memory_limit_bytes=94623498240,
+        swap_limit_bytes=0,
+    )
+
+    payload = ssh_worker_module.worker_failure_payload(
+        before,
+        after,
+        worker_log_path=worker_log,
+    )
+
+    assert payload["error_type"] == "WorkerOutOfMemoryError"
+    assert payload["failure_kind"] == "out_of_memory"
+    assert payload["oom_kill_delta"] == 1
+    assert "container cgroup OOM" in payload["message"]
+    assert "88.1 GiB" in payload["message"]
+    assert "swap disabled" in payload["message"]
+    assert "Requested to load MiniMaxH3" in payload["message"]
+
+
+def test_worker_failure_payload_distinguishes_non_oom_process_loss(
+    ssh_worker_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A vanished worker without an OOM delta should be reported as a crash."""
+    snapshot = ssh_worker_module.CgroupMemorySnapshot(oom=4, oom_kill=2)
+
+    payload = ssh_worker_module.worker_failure_payload(
+        snapshot,
+        snapshot,
+        relay_error="ConnectionResetError: reset by peer",
+        worker_log_path=tmp_path / "missing.log",
+    )
+
+    assert payload["error_type"] == "WorkerProcessLostError"
+    assert payload["failure_kind"] == "worker_process_lost"
+    assert "OOM counters did not increase" in payload["message"]
+    assert "reset by peer" in payload["message"]

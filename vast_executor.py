@@ -88,6 +88,10 @@ class VastRemoteTransportError(VastRemoteInvocationError):
     """Raised when the direct SSH relay ends without an application result."""
 
 
+class VastRemoteResourceError(VastRemoteInvocationError):
+    """Raised when remote resource evidence explains a terminated invocation."""
+
+
 class VastLeaseActivityManager(Protocol):
     """Track activity and retention for one managed Vast lease."""
 
@@ -275,8 +279,8 @@ class VastExecutorClient:
                 transport_error = exc
             if attempt >= 2:
                 raise VastRemoteTransportError(
-                    "Vast worker transport failed after one recovery attempt: "
-                    f"{transport_error}"
+                    "Vast worker failed again after one automatic restart. "
+                    f"Latest failure: {transport_error}"
                 ) from transport_error
             logger.warning(
                 "Recovering Vast worker transport instance=%d error=%s.",
@@ -505,10 +509,7 @@ class VastExecutorClient:
                 if kind is RemoteFrameKind.ERROR:
                     terminal_received = True
                     error = decode_json_payload(frame_payload)
-                    raise VastRemoteInvocationError(
-                        f"Vast worker {error.get('error_type', 'Error')}: "
-                        f"{error.get('message', 'remote execution failed')}"
-                    )
+                    raise _vast_invocation_error(error)
                 raise RemoteProtocolError(
                     f"Unexpected Vast worker response frame {kind.name}."
                 )
@@ -530,12 +531,15 @@ class VastExecutorClient:
                     .strip(),
                 )
         if not terminal_received:
-            diagnostics = (
-                b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+            diagnostics = _useful_ssh_stderr(
+                b"".join(stderr_chunks).decode("utf-8", errors="replace")
             )
+            detail = f" SSH diagnostic: {diagnostics}" if diagnostics else ""
             raise VastRemoteTransportError(
-                "Vast worker stream ended without a result: "
-                f"{diagnostics or 'no diagnostics'}."
+                "Vast worker process exited without returning a result "
+                f"(SSH relay status {returncode}). No structured worker postmortem "
+                "was available. Rebuild the configured Vast worker image to enable "
+                f"resource and crash diagnostics.{detail}"
             )
 
     def _runtime(
@@ -590,6 +594,32 @@ class VastExecutorClient:
     def _relay_arguments() -> tuple[str, ...]:
         """Return the direct worker binary relay command."""
         return ("python", "-m", "remote.ssh_worker", "client")
+
+
+def _vast_invocation_error(error: Mapping[str, Any]) -> VastRemoteInvocationError:
+    """Map a structured worker error to retryable or terminal controller state."""
+    error_type = str(error.get("error_type") or "Error")
+    message = str(error.get("message") or "remote execution failed")
+    if error_type == "WorkerOutOfMemoryError":
+        return VastRemoteResourceError(message)
+    if error_type == "WorkerProcessLostError":
+        return VastRemoteTransportError(message)
+    return VastRemoteInvocationError(f"Vast worker {error_type}: {message}")
+
+
+def _useful_ssh_stderr(stderr: str) -> str:
+    """Remove Vast's generic login greeting from actionable relay stderr."""
+    diagnostic = stderr
+    for greeting in (
+        "Welcome to vast.ai.",
+        "If authentication fails, try again after a few seconds, and double check "
+        "your ssh key.",
+        "Have fun!.",
+        "Have fun!",
+    ):
+        diagnostic = diagnostic.replace(greeting, "")
+    normalized = " ".join(diagnostic.split())
+    return normalized if normalized.strip(".! ") else ""
 
 
 def _payload_instance_id(payload: Mapping[str, Any]) -> int:
@@ -656,5 +686,6 @@ __all__ = [
     "VastExecutorClient",
     "VastLeaseActivityManager",
     "VastRemoteInvocationError",
+    "VastRemoteResourceError",
     "VastRemoteTransportError",
 ]
