@@ -51,3 +51,14 @@ def test_stable_cloud_entrypoint_exports_host_runtime_surface(
     for exception_name in _CLOUD_EXCEPTION_NAMES:
         exception_type = getattr(cloud_module, exception_name)
         assert exception_type.__module__ == "comfyui_modal_sync_cloud"
+
+
+def test_cloud_entrypoint_eagerly_imports_volume_hydration_helper(
+    extension_package: object,
+) -> None:
+    """Method globals must not depend on the module compatibility fallback."""
+    del extension_package
+    cloud_module = importlib.import_module("comfyui_modal_sync_cloud")
+
+    assert "_hydrate_missing_payload_volume_paths" in vars(cloud_module)
+    assert callable(vars(cloud_module)["_hydrate_missing_payload_volume_paths"])

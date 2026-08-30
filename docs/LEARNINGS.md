@@ -1,5 +1,10 @@
 # Learnings
 
+## 2026-08-30: Module compatibility fallback does not populate function globals
+
+- PEP 562 module `__getattr__` preserves callers that read a moved private helper as `module._helper`, but code defined inside that module resolves `_helper` directly from the module globals dictionary and never invokes `__getattr__`. A compatibility-export test can therefore pass while the deployed Modal method raises `NameError`.
+- Stable cloud entrypoints must explicitly import every extracted helper referenced by their own function bodies. Regression tests for such names should inspect `vars(module)` rather than use `hasattr` or `getattr`, because those APIs exercise the compatibility fallback and mask the missing global binding.
+
 ## 2026-08-29: A surviving relay can explain a vanished GPU worker
 
 - OpenSSH writes Vast's generic login greeting to stderr on every successful connection. When a remote stream ends without a terminal frame, that greeting is transport context, not a failure cause, and must never be promoted into the user-facing exception.

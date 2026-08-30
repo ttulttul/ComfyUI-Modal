@@ -146,6 +146,7 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_volume_reload import (
         CloudVolumeReloadHooks,
         _emit_modal_volume_reload_skip,
+        _hydrate_missing_payload_volume_paths,
         _modal_volume_reload_marker,
         _reload_modal_volume_for_request,
         _should_reload_modal_volume,
@@ -155,6 +156,7 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     from cloud_volume_reload import (
         CloudVolumeReloadHooks,
         _emit_modal_volume_reload_skip,
+        _hydrate_missing_payload_volume_paths,
         _modal_volume_reload_marker,
         _reload_modal_volume_for_request,
         _should_reload_modal_volume,
