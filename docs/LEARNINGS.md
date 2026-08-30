@@ -1,5 +1,12 @@
 # Learnings
 
+## 2026-08-30: Resource telemetry belongs inside the shared execution kernel
+
+- Modal, SSH, and Vast converge on the same streamed cloud execution surface inside their workers. Sampling there produces one telemetry schema and cadence for every provider while provider clients remain transport adapters.
+- CPU memory must include recursive child processes: inference engines frequently move substantial allocations into spawned workers, so sampling only the Python coordinator's RSS materially understates use. Visible-device used memory (`total - free`) likewise captures CUDA allocations outside PyTorch's allocator.
+- Environment-level telemetry needs a source identity. Aggregate current usage only across active component/location sources, retain the maximum observed aggregate and per-source peak, and mark the terminal sample inactive so a finished worker does not remain in the live total.
+- Periodic telemetry can crowd important status events out of a bounded browser-refocus buffer. Coalesce samples by prompt, environment, location, and component while retaining the newest cumulative peak for each source.
+
 ## 2026-08-30: Progress requires ownership of the transfer loop
 
 - A provider SDK can expose a remote function as finished while its client is still materializing a large return value. Status events around the call cannot measure that hidden transfer; return a small durable object reference and read the object through an explicit chunk iterator instead.

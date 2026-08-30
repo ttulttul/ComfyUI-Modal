@@ -150,6 +150,57 @@ def _emit_local_remote_dispatch_status(payload: dict[str, Any]) -> None:
     )
 
 
+def _emit_local_remote_resource_telemetry(
+    payload: Mapping[str, Any],
+    telemetry: Mapping[str, Any],
+    *,
+    modal_task_id: str | None = None,
+) -> None:
+    """Forward one remote memory sample to the Configurator UI."""
+    extra_data = payload.get("extra_data") or {}
+    client_id = (
+        str(extra_data["client_id"])
+        if isinstance(extra_data, Mapping) and extra_data.get("client_id") is not None
+        else None
+    )
+    if client_id is None:
+        return
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+    event_payload: dict[str, Any] = {
+        "event_type": "resource_telemetry",
+        "prompt_id": (
+            str(payload["prompt_id"])
+            if payload.get("prompt_id") is not None
+            else None
+        ),
+        "component_id": str(payload.get("component_id") or "payload"),
+        "node_ids": [
+            str(node_id) for node_id in payload.get("component_node_ids", [])
+        ],
+        "active": bool(telemetry.get("active", True)),
+        **_remote_execution_identity(payload, modal_task_id),
+    }
+    for field_name in (
+        "sample_sequence",
+        "cpu_memory_bytes",
+        "cpu_memory_peak_bytes",
+        "cpu_memory_total_bytes",
+        "gpu_memory_bytes",
+        "gpu_memory_peak_bytes",
+        "gpu_memory_total_bytes",
+    ):
+        field_value = telemetry.get(field_name)
+        if isinstance(field_value, int) and not isinstance(field_value, bool):
+            event_payload[field_name] = max(0, field_value)
+    sampled_at = telemetry.get("sampled_at")
+    if isinstance(sampled_at, int | float) and not isinstance(sampled_at, bool):
+        event_payload["sampled_at"] = float(sampled_at)
+    _record_local_modal_ui_event("modal_telemetry", event_payload, client_id)
+    prompt_server.send_sync("modal_telemetry", event_payload, client_id)
+
+
 def _emit_local_remote_startup_status(
     payload: Mapping[str, Any],
     *,

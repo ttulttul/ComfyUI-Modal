@@ -1747,6 +1747,8 @@ function replayModalUiEvent(eventRecord) {
       handleModalStatus({ detail: payload });
     } else if (eventName === "modal_progress") {
       handleModalProgress({ detail: payload });
+    } else if (eventName === "modal_telemetry") {
+      handleModalTelemetry({ detail: payload });
     }
   } finally {
     modalReplayedEventUpdatedAtMs = null;
@@ -3584,6 +3586,9 @@ function createRemoteConfiguratorEnvironmentRow(environmentId, label) {
   statusText.className = "remote-configurator-environment-status";
   statusText.textContent = "Waiting";
   heading.append(dot, labelElement, statusText);
+  const resourceText = document.createElement("div");
+  resourceText.className = "remote-configurator-environment-resources";
+  resourceText.hidden = true;
   const progress = document.createElement("div");
   progress.className = "remote-configurator-environment-progress";
   const progressFill = document.createElement("span");
@@ -3591,16 +3596,40 @@ function createRemoteConfiguratorEnvironmentRow(environmentId, label) {
   const progressValue = document.createElement("span");
   progressValue.className = "remote-configurator-environment-progress-value";
   progress.append(progressFill, progressValue);
-  root.append(heading, progress);
+  root.append(heading, resourceText, progress);
   return {
     environmentId,
     root,
     label: labelElement,
     statusText,
+    resourceText,
     progress,
     progressFill,
     progressValue,
   };
+}
+
+/** Return the Configurator readout for current and peak remote memory usage. */
+function remoteConfiguratorResourceUsageLabel(state) {
+  const labels = [];
+  const hasActiveSamples = Number(state?.resourceActiveCount ?? 0) > 0;
+  if (Boolean(state?.gpuMemoryObserved)) {
+    const peak = remoteStorageSizeLabel(Number(state?.gpuMemoryPeakBytes ?? 0));
+    labels.push(
+      hasActiveSamples
+        ? `GPU ${remoteStorageSizeLabel(Number(state?.gpuMemoryBytes ?? 0))} now · ${peak} peak`
+        : `Peak GPU ${peak}`,
+    );
+  }
+  if (Boolean(state?.cpuMemoryObserved)) {
+    const peak = remoteStorageSizeLabel(Number(state?.cpuMemoryPeakBytes ?? 0));
+    labels.push(
+      hasActiveSamples
+        ? `CPU RAM ${remoteStorageSizeLabel(Number(state?.cpuMemoryBytes ?? 0))} now · ${peak} peak`
+        : `Peak CPU RAM ${peak}`,
+    );
+  }
+  return labels.join("  |  ");
 }
 
 /**
@@ -3615,6 +3644,9 @@ function renderRemoteConfiguratorEnvironmentStatus(row, state) {
   const phase = String(state?.phase ?? "idle");
   row.root.dataset.phase = phase;
   row.statusText.textContent = remoteConfiguratorStatusMessage(state);
+  const resourceLabel = remoteConfiguratorResourceUsageLabel(state);
+  row.resourceText.hidden = !resourceLabel;
+  row.resourceText.textContent = resourceLabel;
   const total = Math.max(0, Number(state?.statusTotal ?? 0));
   const current = Math.max(0, Math.min(total, Number(state?.statusCurrent ?? 0)));
   row.progress.hidden = total <= 1;
@@ -3622,6 +3654,72 @@ function renderRemoteConfiguratorEnvironmentStatus(row, state) {
   row.progressValue.textContent = total > 1
     ? `${Math.round(current)}/${Math.round(total)}`
     : "";
+}
+
+/** Merge one component/location memory sample into environment-level telemetry. */
+function remoteConfiguratorTelemetryPatch(existing, detail) {
+  if (String(detail?.event_type ?? "") !== "resource_telemetry") {
+    return {};
+  }
+  const samples = new Map(
+    existing?.resourceTelemetryBySource instanceof Map
+      ? existing.resourceTelemetryBySource
+      : [],
+  );
+  const sourceKey = [
+    String(detail?.execution_location ?? ""),
+    String(detail?.component_id ?? "payload"),
+  ].join("|");
+  samples.set(sourceKey, {
+    active: detail?.active !== false,
+    cpuMemoryBytes: Math.max(0, Number(detail?.cpu_memory_bytes ?? 0)),
+    cpuMemoryPeakBytes: Math.max(0, Number(detail?.cpu_memory_peak_bytes ?? 0)),
+    cpuMemoryTotalBytes: Math.max(0, Number(detail?.cpu_memory_total_bytes ?? 0)),
+    gpuMemoryBytes: Math.max(0, Number(detail?.gpu_memory_bytes ?? 0)),
+    gpuMemoryPeakBytes: Math.max(0, Number(detail?.gpu_memory_peak_bytes ?? 0)),
+    gpuMemoryTotalBytes: Math.max(0, Number(detail?.gpu_memory_total_bytes ?? 0)),
+  });
+  const activeSamples = Array.from(samples.values()).filter((sample) => sample.active);
+  const cpuMemoryBytes = activeSamples.reduce(
+    (total, sample) => total + sample.cpuMemoryBytes,
+    0,
+  );
+  const gpuMemoryBytes = activeSamples.reduce(
+    (total, sample) => total + sample.gpuMemoryBytes,
+    0,
+  );
+  const sourceCpuPeakBytes = Math.max(
+    0,
+    ...Array.from(samples.values(), (sample) => sample.cpuMemoryPeakBytes),
+  );
+  const sourceGpuPeakBytes = Math.max(
+    0,
+    ...Array.from(samples.values(), (sample) => sample.gpuMemoryPeakBytes),
+  );
+  return {
+    resourceTelemetryBySource: samples,
+    resourceActiveCount: activeSamples.length,
+    cpuMemoryBytes,
+    cpuMemoryPeakBytes: Math.max(
+      Number(existing?.cpuMemoryPeakBytes ?? 0),
+      sourceCpuPeakBytes,
+      cpuMemoryBytes,
+    ),
+    cpuMemoryObserved:
+      Boolean(existing?.cpuMemoryObserved) ||
+      Array.from(samples.values()).some(
+        (sample) => sample.cpuMemoryBytes > 0 || sample.cpuMemoryTotalBytes > 0,
+      ),
+    gpuMemoryBytes,
+    gpuMemoryPeakBytes: Math.max(
+      Number(existing?.gpuMemoryPeakBytes ?? 0),
+      sourceGpuPeakBytes,
+      gpuMemoryBytes,
+    ),
+    gpuMemoryObserved:
+      Boolean(existing?.gpuMemoryObserved) ||
+      Array.from(samples.values()).some((sample) => sample.gpuMemoryTotalBytes > 0),
+  };
 }
 
 /**
@@ -4386,7 +4484,7 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
   panel.minHeight =
     118 +
     Math.max(31, planHeight) +
-    panel.environmentRows.size * 52 +
+    panel.environmentRows.size * 66 +
     panel.storageHeight +
     panel.capacityHeight +
     panel.keychainUnlockHeight;
@@ -4525,14 +4623,17 @@ function updateRemoteConfiguratorEnvironmentStatus(promptId, detail) {
     promoteProvisionalVastEnvironment(panel, promptState, environmentId);
   }
   const existing = promptState.remoteEnvironmentStatuses.get(environmentId) ?? {};
+  const telemetryPatch = remoteConfiguratorTelemetryPatch(existing, detail);
   const state = {
+    ...existing,
+    ...telemetryPatch,
     phase: String(detail?.phase ?? existing.phase ?? STATE_SETUP),
     statusMessage:
       detail?.status_message ?? detail?.message ?? detail?.stage ?? existing.statusMessage ?? null,
     statusCurrent:
       detail?.status_current ?? detail?.value ?? existing.statusCurrent ?? null,
     statusTotal: detail?.status_total ?? detail?.max ?? existing.statusTotal ?? null,
-    updatedAt: nowMs(),
+    updatedAt: progressEventTimestampMs(),
   };
   promptState.remoteEnvironmentStatuses.set(environmentId, state);
   if (!panel || panel.promptId !== promptId) {
@@ -4548,7 +4649,7 @@ function updateRemoteConfiguratorEnvironmentStatus(promptId, detail) {
     panel.environmentRows.set(environmentId, row);
     panel.environments.appendChild(row.root);
     panel.environments.hidden = false;
-    panel.minHeight += 52;
+    panel.minHeight += 66;
     panel.node.setSize?.([
       Math.max(Number(panel.node.size?.[0]) || 0, 500),
       Math.max(Number(panel.node.size?.[1]) || 0, panel.minHeight),
@@ -6718,6 +6819,19 @@ function handleModalProgress(event) {
   );
 }
 
+/** Apply remote CPU/GPU memory telemetry without changing execution phase. */
+function handleModalTelemetry(event) {
+  const detail = eventDetail(event);
+  const promptId = String(detail?.prompt_id ?? "");
+  if (!promptId || isPromptTerminal(promptId)) {
+    return;
+  }
+  if (!ensurePromptState(promptId)) {
+    return;
+  }
+  updateRemoteConfiguratorEnvironmentStatus(promptId, detail);
+}
+
 /**
  * Update remote component visuals from a native ComfyUI execution event.
  * @param {CustomEvent} event
@@ -7002,6 +7116,7 @@ function registerExecutionListeners() {
 
   api.addEventListener("modal_status", handleModalStatus);
   api.addEventListener("modal_progress", handleModalProgress);
+  api.addEventListener("modal_telemetry", handleModalTelemetry);
   api.addEventListener("executing", (event) => handleExecutionPhase(event, EXECUTION_PHASE));
   api.addEventListener("executed", (event) => {
     handleExecutionPhase(event, STATE_COMPLETE);
@@ -7580,6 +7695,14 @@ function installGlobalStatusStyles() {
       overflow: hidden;
       color: #94a3b8;
       font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-environment-resources {
+      overflow: hidden;
+      color: #cbd5e1;
+      font: 600 8px/11px ui-monospace, SFMono-Regular, monospace;
       text-overflow: ellipsis;
       white-space: nowrap;
     }

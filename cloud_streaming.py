@@ -40,6 +40,7 @@ try:
         serialize_mapping,
         serialize_node_outputs,
     )
+    from .resource_telemetry import RemoteResourceTelemetrySampler
     from .settings import get_settings
 except ImportError:  # pragma: no cover - flat Modal-container import.
     from cloud_comfy_bootstrap import (
@@ -70,6 +71,7 @@ except ImportError:  # pragma: no cover - flat Modal-container import.
         serialize_mapping,
         serialize_node_outputs,
     )
+    from resource_telemetry import RemoteResourceTelemetrySampler
     from settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -263,14 +265,18 @@ def _stream_remote_payload_events(
     def execute_payload() -> None:
         """Run compute in a worker thread while deferring Modal volume commits."""
         pending_batch: DurableObjectCommitBatch | None = None
+        telemetry_sampler = RemoteResourceTelemetrySampler(publish_status)
+        telemetry_sampler.start()
         try:
             with object_store.batch_commits(commit_on_exit=False) as pending_batch:
                 outputs = _execute_payload_with_output_capture(payload, execute_once)
         except (
             Exception
         ) as exc:  # pragma: no cover - exercised through generator consumer tests.
+            telemetry_sampler.stop()
             event_buffer.publish_terminal("error", (exc, pending_batch))
         else:
+            telemetry_sampler.stop()
             result_bytes = len(outputs)
             pending_object_write = bool(pending_batch and pending_batch.wrote_object)
             logger.info(

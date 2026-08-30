@@ -4,6 +4,17 @@ from __future__ import annotations
 
 from modal_executor_test_support import *  # noqa: F401,F403
 
+
+def _without_resource_telemetry(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return stream events unrelated to periodic memory telemetry."""
+    return [
+        event
+        for event in events
+        if event.get("event_type") != "resource_telemetry"
+    ]
+
 def test_modal_cloud_streams_progress_and_result_events(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -52,7 +63,11 @@ def test_modal_cloud_streams_progress_and_result_events(
     )
 
     assert progress_callbacks == [{"component_id": "component-1", "kwargs": b"{}"}]
-    assert events == [
+    telemetry_events = [
+        event for event in events if event.get("event_type") == "resource_telemetry"
+    ]
+    assert [event["active"] for event in telemetry_events] == [True, False]
+    assert _without_resource_telemetry(events) == [
         {
             "kind": "progress",
             "phase": "executing",
@@ -108,7 +123,7 @@ def test_modal_cloud_streams_remote_log_task_id_before_progress(
     )
 
     assert events[0] == {"kind": "remote_logs", "task_id": "ta-remote-123"}
-    assert events[1:] == [
+    assert _without_resource_telemetry(events[1:]) == [
         {
             "kind": "progress",
             "phase": "executing",
@@ -165,7 +180,9 @@ def test_modal_cloud_returns_large_durable_result_by_reference(
     )
 
     assert begin_calls == [True]
-    assert events == [{"kind": "result", "output_ref": result_ref.to_payload()}]
+    assert _without_resource_telemetry(events) == [
+        {"kind": "result", "output_ref": result_ref.to_payload()}
+    ]
 
 def test_modal_cloud_streams_tensor_safe_progress_and_result_events(
     modal_cloud_module: Any,
@@ -204,15 +221,18 @@ def test_modal_cloud_streams_tensor_safe_progress_and_result_events(
         )
     )
 
-    assert events[0]["kind"] == "progress"
-    assert events[0]["phase"] == "executing"
+    execution_events = _without_resource_telemetry(events)
+    assert execution_events[0]["kind"] == "progress"
+    assert execution_events[0]["phase"] == "executing"
     assert torch.equal(
-        serialization_module.deserialize_value(events[0]["preview_tensor"]),
+        serialization_module.deserialize_value(execution_events[0]["preview_tensor"]),
         tensor,
     )
 
-    assert events[1]["kind"] == "result"
-    decoded_outputs = serialization_module.deserialize_node_outputs(events[1]["outputs"])
+    assert execution_events[1]["kind"] == "result"
+    decoded_outputs = serialization_module.deserialize_node_outputs(
+        execution_events[1]["outputs"]
+    )
     assert len(decoded_outputs) == 1
     assert torch.equal(decoded_outputs[0], tensor)
 
@@ -522,6 +542,89 @@ def test_large_transfer_reporter_emits_byte_ui_metadata(
             "execution_provider": "vast",
             "execution_environment_id": "vast:video-worker",
         },
+    ]
+
+
+def test_remote_resource_telemetry_reaches_local_websocket(
+    remote_modal_app_module: Any,
+    local_ui_events_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Provider-neutral memory samples should retain identity and peak fields."""
+
+    class PromptServer:
+        """Capture telemetry forwarded to the ComfyUI client."""
+
+        def __init__(self) -> None:
+            """Initialize the captured message list."""
+            self.messages: list[tuple[str, dict[str, Any], str]] = []
+
+        def send_sync(self, event: str, data: dict[str, Any], sid: str) -> None:
+            """Record one websocket event."""
+            self.messages.append((event, data, sid))
+
+    prompt_server = PromptServer()
+    monkeypatch.setattr(
+        local_ui_events_module,
+        "_lookup_local_prompt_server",
+        lambda: prompt_server,
+    )
+    payload = {
+        "prompt_id": "prompt-memory",
+        "component_id": "170",
+        "component_node_ids": ["170", "169"],
+        "execution_provider": "modal",
+        "execution_environment_id": "modal:gpu-a",
+        "extra_data": {"client_id": "client-memory"},
+    }
+
+    result = remote_modal_app_module._consume_remote_payload_stream(
+        payload,
+        iter(
+            [
+                {"kind": "remote_logs", "task_id": "ta-memory"},
+                {
+                    "kind": "progress",
+                    "event_type": "resource_telemetry",
+                    "active": False,
+                    "sample_sequence": 4,
+                    "sampled_at": 123.5,
+                    "cpu_memory_bytes": 200,
+                    "cpu_memory_peak_bytes": 350,
+                    "cpu_memory_total_bytes": 1000,
+                    "gpu_memory_bytes": 500,
+                    "gpu_memory_peak_bytes": 800,
+                    "gpu_memory_total_bytes": 2000,
+                },
+                {"kind": "result", "outputs": b"outputs"},
+            ]
+        ),
+    )
+
+    assert result == b"outputs"
+    assert prompt_server.messages == [
+        (
+            "modal_telemetry",
+            {
+                "event_type": "resource_telemetry",
+                "prompt_id": "prompt-memory",
+                "component_id": "170",
+                "node_ids": ["170", "169"],
+                "active": False,
+                "execution_provider": "modal",
+                "execution_environment_id": "modal:gpu-a",
+                "execution_location": "ta-memory",
+                "sample_sequence": 4,
+                "cpu_memory_bytes": 200,
+                "cpu_memory_peak_bytes": 350,
+                "cpu_memory_total_bytes": 1000,
+                "gpu_memory_bytes": 500,
+                "gpu_memory_peak_bytes": 800,
+                "gpu_memory_total_bytes": 2000,
+                "sampled_at": 123.5,
+            },
+            "client-memory",
+        )
     ]
 
 def test_emit_local_mapped_lane_progress_start_marks_lane_as_setup_only(

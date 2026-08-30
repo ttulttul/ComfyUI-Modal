@@ -632,6 +632,12 @@ def runtime_environment_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def resource_telemetry_module(extension_package: object) -> object:
+    """Return the backend-neutral resource telemetry module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.resource_telemetry")
+
+
+@pytest.fixture(scope="session")
 def sync_engine_module(extension_package: object) -> object:
     """Return the sync engine module."""
     return importlib.import_module(f"{PACKAGE_NAME}.sync_engine")

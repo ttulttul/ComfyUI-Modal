@@ -137,6 +137,52 @@ def test_modal_ui_event_replay_is_client_scoped(modal_ui_events_module: Any) -> 
     }
     assert modal_ui_events_module.modal_ui_events_for_client(None) == []
 
+
+def test_modal_telemetry_replay_coalesces_each_execution_source(
+    modal_ui_events_module: Any,
+) -> None:
+    """Periodic samples must not evict durable status events from replay history."""
+    modal_ui_events_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
+    base_payload = {
+        "prompt_id": "prompt-memory",
+        "execution_environment_id": "modal:gpu-a",
+        "execution_location": "ta-one",
+        "component_id": "170",
+    }
+    modal_ui_events_module.record_modal_ui_event(
+        "modal_telemetry",
+        {**base_payload, "cpu_memory_peak_bytes": 100},
+        "client-memory",
+    )
+    modal_ui_events_module.record_modal_ui_event(
+        "modal_status",
+        {"prompt_id": "prompt-memory", "phase": "executing"},
+        "client-memory",
+    )
+    modal_ui_events_module.record_modal_ui_event(
+        "modal_telemetry",
+        {**base_payload, "cpu_memory_peak_bytes": 300},
+        "client-memory",
+    )
+    modal_ui_events_module.record_modal_ui_event(
+        "modal_telemetry",
+        {**base_payload, "component_id": "171", "cpu_memory_peak_bytes": 200},
+        "client-memory",
+    )
+
+    replay_events = modal_ui_events_module.modal_ui_events_for_client("client-memory")
+
+    assert [event["event"] for event in replay_events] == [
+        "modal_status",
+        "modal_telemetry",
+        "modal_telemetry",
+    ]
+    assert [
+        event["payload"]["cpu_memory_peak_bytes"]
+        for event in replay_events
+        if event["event"] == "modal_telemetry"
+    ] == [300, 200]
+
 def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) -> None:
     """The frontend should have a stable sibling route for Modal UI replay."""
     assert api_intercept_module._progress_state_route_path("/modal/queue_prompt") == (
@@ -166,4 +212,3 @@ def test_modal_reset_route_paths_are_queue_route_siblings(api_intercept_module: 
     assert api_intercept_module._delete_modal_volume_route_path("/custom/modal") == (
         "/custom/modal/delete_volume"
     )
-

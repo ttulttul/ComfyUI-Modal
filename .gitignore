@@ -82,6 +82,7 @@
 !/remote_executor_router.py
 !/remote_protocol.py
 !/remote_plan_types.py
+!/resource_telemetry.py
 !/r2_cache.py
 !/r2_credentials.py
 !/runtime_environment.py

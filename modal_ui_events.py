@@ -110,8 +110,42 @@ def record_modal_ui_event(
             client_id,
             deque(maxlen=_MODAL_UI_EVENT_LIMIT_PER_CLIENT),
         )
+        _discard_replaced_telemetry_event_locked(client_events, event_record)
         client_events.append(event_record)
         _prune_modal_ui_events_locked(client_events)
+
+
+def _discard_replaced_telemetry_event_locked(
+    client_events: deque[dict[str, Any]],
+    event_record: Mapping[str, Any],
+) -> None:
+    """Retain only the newest replay sample for one prompt execution source."""
+    if event_record.get("event") != "modal_telemetry":
+        return
+    payload = event_record.get("payload")
+    if not isinstance(payload, Mapping):
+        return
+    replacement_key = (
+        str(payload.get("prompt_id") or ""),
+        str(payload.get("execution_environment_id") or ""),
+        str(payload.get("execution_location") or ""),
+        str(payload.get("component_id") or ""),
+    )
+    for existing_record in tuple(client_events):
+        existing_payload = existing_record.get("payload")
+        if existing_record.get("event") != "modal_telemetry" or not isinstance(
+            existing_payload, Mapping
+        ):
+            continue
+        existing_key = (
+            str(existing_payload.get("prompt_id") or ""),
+            str(existing_payload.get("execution_environment_id") or ""),
+            str(existing_payload.get("execution_location") or ""),
+            str(existing_payload.get("component_id") or ""),
+        )
+        if existing_key == replacement_key:
+            client_events.remove(existing_record)
+            return
 
 
 def modal_ui_events_for_client(client_id: str | None) -> list[dict[str, Any]]:

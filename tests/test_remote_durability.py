@@ -28,6 +28,17 @@ def _cloud_streaming_owner() -> Any:
     return importlib.import_module("cloud_streaming")
 
 
+def _without_resource_telemetry(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return durable-stream events unrelated to memory sampling."""
+    return [
+        event
+        for event in events
+        if event.get("event_type") != "resource_telemetry"
+    ]
+
+
 def _patch_cloud_durable_state(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
@@ -244,7 +255,7 @@ def test_cloud_stream_commits_durable_outputs_on_consumer_thread(
     completed_record = invocation_store.get_record("RIV_stream")
     assert completed_record.state == "completed"
     assert completed_record.result_object is not None
-    assert events == [
+    assert _without_resource_telemetry(events) == [
         {
             "kind": "result",
             "output_ref": completed_record.result_object.to_payload(),
@@ -290,7 +301,9 @@ def test_cloud_stream_logs_result_persistence_and_transport_boundaries(
         modal_cloud_module._stream_remote_payload_events(payload, b"inputs")
     )
 
-    assert events == [{"kind": "result", "outputs": serialized_outputs}]
+    assert _without_resource_telemetry(events) == [
+        {"kind": "result", "outputs": serialized_outputs}
+    ]
     assert "Remote stream worker produced result component=component-timing" in caplog.text
     assert "Finished publishing remote stream result to event buffer" in caplog.text
     assert "Remote stream consumer received buffered result" in caplog.text
@@ -466,7 +479,8 @@ def test_cloud_stream_close_after_result_preserves_completed_record(
         b"inputs",
     )
 
-    assert next(stream) == {"kind": "result", "outputs": serialized_outputs}
+    result_event = next(event for event in stream if event.get("kind") == "result")
+    assert result_event == {"kind": "result", "outputs": serialized_outputs}
     stream.close()
 
     completed_record = invocation_store.get_record(invocation_id)

@@ -606,6 +606,22 @@ def test_mixed_remote_environments_render_clipped_runtime_locations() -> None:
     assert "const llmTimingLabel = aggregateProgress?.timeToFirstTokenSeconds" in source
 
 
+def test_configurator_renders_current_and_peak_remote_memory() -> None:
+    """The Configurator should aggregate telemetry and retain terminal peaks."""
+    source = _modal_toggle_source()
+
+    assert 'api.addEventListener("modal_telemetry", handleModalTelemetry);' in source
+    assert 'eventName === "modal_telemetry"' in source
+    assert "function remoteConfiguratorTelemetryPatch(existing, detail)" in source
+    assert "resourceTelemetryBySource: samples" in source
+    assert "resourceActiveCount: activeSamples.length" in source
+    assert "function remoteConfiguratorResourceUsageLabel(state)" in source
+    assert "CPU RAM ${remoteStorageSizeLabel" in source
+    assert "Peak CPU RAM ${peak}" in source
+    assert "Peak GPU ${peak}" in source
+    assert 'resourceText.className = "remote-configurator-environment-resources";' in source
+
+
 def test_modal_canvas_animation_loop_is_selective_and_throttled() -> None:
     """Static progress data should not keep an unbounded canvas rAF loop alive."""
     source = _modal_toggle_source()

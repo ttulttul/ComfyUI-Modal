@@ -20,6 +20,7 @@ from .local_ui_events import (
     _emit_local_modal_status,
     _emit_local_preview_boundary_output,
     _emit_local_preview_image,
+    _emit_local_remote_resource_telemetry,
     _progress_stream_event_metadata,
     _remote_execution_destination,
     _remote_execution_identity,
@@ -509,12 +510,25 @@ def _handle_progress_stream_event(
         "preview": _handle_preview_event,
         "boundary_output": _handle_boundary_output_event,
         "node_cached": _handle_cached_node_event,
+        "resource_telemetry": _handle_resource_telemetry_event,
     }
     handler = handlers.get(event_type)
     if handler is not None:
         handler(state, stream_event)
         return
     _handle_status_event(state, stream_event)
+
+
+def _handle_resource_telemetry_event(
+    state: _PayloadStreamState,
+    stream_event: dict[str, Any],
+) -> None:
+    """Forward one provider-neutral remote memory sample to the local UI."""
+    _emit_local_remote_resource_telemetry(
+        state.payload,
+        stream_event,
+        modal_task_id=state.active_remote_task_id,
+    )
 
 
 def _handle_result_event(
