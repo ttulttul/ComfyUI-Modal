@@ -146,6 +146,24 @@ def remote_configuration_nodes_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def subrosa_credentials_module(extension_package: object) -> object:
+    """Return the Subrosa OS-keyring credential module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.subrosa_credentials")
+
+
+@pytest.fixture(scope="session")
+def subrosa_executor_module(extension_package: object) -> object:
+    """Return the Subrosa relay executor module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.subrosa_executor")
+
+
+@pytest.fixture(scope="session")
+def subrosa_sync_module(extension_package: object) -> object:
+    """Return the milestone Subrosa sync module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.subrosa_sync")
+
+
+@pytest.fixture(scope="session")
 def r2_credentials_module(extension_package: object) -> object:
     """Return secure Cloudflare R2 credential persistence helpers."""
     return importlib.import_module(f"{PACKAGE_NAME}.r2_credentials")

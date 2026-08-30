@@ -224,6 +224,21 @@ def _assignment_hardware_payload(
         return _capabilities_hardware_payload(
             host.capabilities if host is not None else None
         )
+    if assignment.provider is ExecutionProvider.SUBROSA:
+        pool = str(_configuration_field(configuration, "pool") or "managed")
+        return {
+            "machine_type": (
+                "NVIDIA GeForce RTX 4090"
+                if pool == "mock-4090"
+                else f"Subrosa pool {pool}"
+            ),
+            "gpu_count": 1,
+            "gpu_memory_kind": "VRAM",
+            "gpu_memory_bytes_per_device": 24 * 1024**3,
+            "gpu_memory_bytes_total": 24 * 1024**3,
+            "ram_bytes": 64 * 1024**3,
+            "ram_available_bytes": 64 * 1024**3,
+        }
     lease = vast_leases_by_environment.get(assignment.environment_id)
     if lease is not None:
         return _vast_hardware_payload(lease)
@@ -236,5 +251,4 @@ def _assignment_hardware_payload(
         None,
     )
     return _vast_hardware_payload(resource) if resource is not None else None
-
 

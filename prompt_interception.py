@@ -612,6 +612,13 @@ def _sync_engine_for_assignment(
         sync_engine = state.vast_service.sync_engine(lease)
         sync_engine.cancellation_check = cancellation_check
         return sync_engine
+    if assignment.provider is ExecutionProvider.SUBROSA:
+        if __package__:
+            from .subrosa_sync import subrosa_noop_sync_engine
+        else:  # pragma: no cover - flat Modal-container import.
+            from subrosa_sync import subrosa_noop_sync_engine
+
+        return subrosa_noop_sync_engine(state.settings, cancellation_check)
     host = state.ssh_hosts.get(assignment.environment_id)
     if host is None:
         raise ModalPromptValidationError(

@@ -20,6 +20,7 @@ if __package__:
         R2StorageBackingConfiguration,
         RemoteConfigurationSet,
         SshRemoteConfiguration,
+        SubrosaRemoteConfiguration,
     )
     from .remote_hosts import SshHostConfig
     from .remote_plan_types import ComponentExecutionPlan, ModalPromptValidationError
@@ -40,6 +41,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
         R2StorageBackingConfiguration,
         RemoteConfigurationSet,
         SshRemoteConfiguration,
+        SubrosaRemoteConfiguration,
     )
     from remote_hosts import SshHostConfig
     from remote_plan_types import ComponentExecutionPlan, ModalPromptValidationError
@@ -180,6 +182,8 @@ def _execution_location_for_assignment(
         if lease is not None:
             return str(lease.ssh_host or lease.gpu_name)
         return assignment.environment_id
+    if assignment.provider is ExecutionProvider.SUBROSA:
+        return assignment.environment_id
     host = ssh_hosts_by_id.get(assignment.environment_id)
     return _ssh_hostname(host.ssh_target) if host is not None else assignment.environment_id
 
@@ -237,6 +241,12 @@ def _configured_provider_metadata(
             "remote_configuration_id": configuration.configuration_id,
             "remote_configuration_name": configuration.display_name,
             "ssh_host_config": portable_host.to_dict(),
+        }
+    if isinstance(configuration, SubrosaRemoteConfiguration):
+        return {
+            "relay_url": configuration.relay_url,
+            "pool": configuration.pool,
+            "configuration_id": configuration.configuration_id,
         }
     return None
 

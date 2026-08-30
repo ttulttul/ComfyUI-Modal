@@ -7,6 +7,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 if __package__:
     from .execution_environments import ExecutionProvider
@@ -241,6 +242,49 @@ class SshRemoteConfiguration(RemoteConfiguration):
 
 
 @dataclass(frozen=True)
+class SubrosaRemoteConfiguration(RemoteConfiguration):
+    """Declare one Subrosa relay pool without embedding its extension token."""
+
+    relay_url: str
+    pool: str
+    maximum_workers: int = 1
+
+    def __post_init__(self) -> None:
+        """Validate portable relay settings and capacity."""
+        super().__post_init__()
+        parsed_url = urlsplit(self.relay_url)
+        if parsed_url.scheme not in {"ws", "wss"} or not parsed_url.netloc:
+            raise ValueError("Subrosa relay_url must be an absolute ws:// or wss:// URL.")
+        if parsed_url.query or parsed_url.fragment:
+            raise ValueError("Subrosa relay_url must not contain a query or fragment.")
+        if not self.pool.strip():
+            raise ValueError("Subrosa pool must not be empty.")
+        if self.maximum_workers <= 0:
+            raise ValueError("Subrosa maximum_workers must be positive.")
+
+    @property
+    def provider(self) -> ExecutionProvider:
+        """Return the Subrosa provider identifier."""
+        return ExecutionProvider.SUBROSA
+
+    @property
+    def capacity_limit(self) -> int:
+        """Return the configured relay-pool concurrency ceiling."""
+        return self.maximum_workers
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        """Return portable relay metadata containing no extension token."""
+        return {
+            "configuration_id": self.configuration_id,
+            "display_name": self.display_name,
+            "provider": self.provider.value,
+            "relay_url": self.relay_url,
+            "pool": self.pool,
+            "maximum_workers": self.maximum_workers,
+        }
+
+
+@dataclass(frozen=True)
 class RemoteConfigurationSet:
     """Hold the authoritative capacity and storage declaration for a workflow."""
 
@@ -269,7 +313,7 @@ class RemoteConfigurationSet:
         ):
             raise ValueError(
                 "Remote Execution Configurator requires at least one Modal, Vast.ai, "
-                "or SSH capacity configuration."
+                "SSH, or Subrosa capacity configuration."
             )
         modal_gpu_types = [
             configuration.gpu_type
@@ -288,6 +332,15 @@ class RemoteConfigurationSet:
         if len(ssh_targets) != len(set(ssh_targets)):
             raise ValueError(
                 "Each SSH destination may appear in only one remote configuration."
+            )
+        subrosa_targets = [
+            (configuration.relay_url, configuration.pool)
+            for configuration in self.configurations
+            if isinstance(configuration, SubrosaRemoteConfiguration)
+        ]
+        if len(subrosa_targets) != len(set(subrosa_targets)):
+            raise ValueError(
+                "Each Subrosa relay pool may appear in only one remote configuration."
             )
         storage_providers = [
             configuration.storage_provider
@@ -333,6 +386,7 @@ __all__ = [
     "RemoteExecutionConfiguration",
     "R2StorageBackingConfiguration",
     "SshRemoteConfiguration",
+    "SubrosaRemoteConfiguration",
     "StorageBackingConfiguration",
     "VastRemoteConfiguration",
 ]

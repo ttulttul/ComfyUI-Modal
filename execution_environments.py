@@ -19,6 +19,7 @@ class ExecutionProvider(str, Enum):
 
     MODAL = "modal"
     SSH_DOCKER = "ssh_docker"
+    SUBROSA = "subrosa"
     VAST = "vast"
 
 

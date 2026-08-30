@@ -3,18 +3,19 @@
 ## Breaking Change: Remote Execution Configurator Required
 
 > [!IMPORTANT]
-> Starting with version 0.4.0, every workflow that uses remote execution must include a **Remote Execution Configurator** connected to at least one **Modal Configuration**, **Vast.ai Configuration**, or **SSH Configuration** node. Existing workflows that relied only on the legacy workflow-wide provider and GPU settings must add and connect these nodes before they can run remotely. Optional storage backends, including **R2 Storage Configuration**, connect to the same Configurator.
+> Starting with version 0.4.0, every workflow that uses remote execution must include a **Remote Execution Configurator** connected to at least one **Modal Configuration**, **Vast.ai Configuration**, **SSH Configuration**, or **Subrosa Configuration** node. Existing workflows that relied only on the legacy workflow-wide provider and GPU settings must add and connect these nodes before they can run remotely. Optional storage backends, including **R2 Storage Configuration**, connect to the same Configurator.
 
 > [!WARNING]
 > This project is still alpha. Expect missing features, rough edges, and breaking changes.
 
 ComfyUI Modal-Sync is a ComfyUI custom node extension that runs selected parts of a workflow on remote GPUs. Mark the expensive nodes for remote execution — or let the planner place them automatically — and queue the workflow as usual. The extension partitions the graph, syncs the required models and custom nodes, executes the remote portions on the back-end of your choice, and streams progress, previews, and outputs back into your local ComfyUI session.
 
-Three execution back-ends are supported today:
+Four execution back-ends are supported today:
 
 - **Modal** — serverless GPU containers with automatic deployment and scale-to-zero
 - **Self-hosted SSH hosts** — your own machines, reached over plain SSH and running fingerprinted Docker workers
 - **Vast.ai** — marketplace GPU instances rented automatically, priced and selected per workflow
+- **Subrosa** — relay-managed GPU pools reached through an authenticated outbound WebSocket
 
 The back-end layer is pluggable. Each provider implements only host discovery, provisioning, and transport; graph partitioning, cost-aware scheduling, asset sync, serialization, progress streaming, cancellation, and output handling are shared across all providers. This makes it practical to add more back-ends in the future. (The project began as a Modal integration — hence the name — and Modal is now one provider among several.)
 
@@ -47,7 +48,7 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 ## Highlights
 
 - A `Run Remotely` node toggle, workflow-scoped provider capacity, and optional fully automatic node placement
-- Three interchangeable back-ends — Modal, self-hosted SSH hosts, and Vast.ai — behind one shared planner and transport layer
+- Four interchangeable back-ends — Modal, self-hosted SSH hosts, Vast.ai, and Subrosa — behind one shared planner and transport layer
 - Capability- and cost-aware scheduling: the planner checks VRAM/RAM requirements against each candidate and picks the lowest predicted total cost
 - Automatic sync of referenced model files and, optionally, your `custom_nodes/` packages
 - Streamed remote status, sampler progress, preview images, and UI payloads rendered live on the local canvas
@@ -101,13 +102,15 @@ export COMFY_MODAL_EXECUTION_MODE=remote
 New workflows declare every available remote capacity pool explicitly:
 
 1. Add a **Remote Execution Configurator** node.
-2. Add any number of **Modal Configuration**, **Vast.ai Configuration**, and **SSH Configuration** nodes.
+2. Add any number of **Modal Configuration**, **Vast.ai Configuration**, **SSH Configuration**, and **Subrosa Configuration** nodes.
 3. Optionally add an **R2 Storage Configuration** node to provide shared object storage to Vast.ai and SSH targets.
 4. Connect every capacity and storage node's `REMOTE_CONFIGURATION` output to the configurator's growing input group.
 
 The connected graph is authoritative. Connecting only Modal configurations produces a Modal-only plan; connecting several providers lets the planner choose among all of them. Each capacity configuration has its own name and limit, so one workflow can offer several Modal GPU types, several independent Vast marketplace searches, and several SSH hosts at the same time. Storage configurations are sibling values in the same configurator but never become scheduler targets or contribute capacity. All configuration nodes are concrete ComfyUI v3 data nodes, so the branch remains valid when ComfyUI executes it after queue-time planning.
 
-Capacity limits are concurrency ceilings, not eager provisioning requests. Modal containers scale as work needs them, Vast instances are quoted during planning and rented only for selected slots, and SSH worker containers are prepared lazily on the declared host. Sequential components can reuse one slot; parallel components consume distinct slots or wait when that is cheaper than another environment.
+Capacity limits are concurrency ceilings, not eager provisioning requests. Modal containers scale as work needs them, Vast instances are quoted during planning and rented only for selected slots, SSH worker containers are prepared lazily on the declared host, and Subrosa jobs wait for workers in the configured relay pool. Sequential components can reuse one slot; parallel components consume distinct slots or wait when that is cheaper than another environment.
+
+Subrosa support currently targets the relay mock-worker milestone. A **Subrosa Configuration** declares a `ws://`/`wss://` relay base URL, pool, and concurrency limit; its configuration ID is the opaque OS-keyring reference, and the `srk_` extension token is never stored in the workflow or queue payload. The client waits for a claimed worker, transports the existing CRMTRPC1 request/input stream in 512 KiB lane-0 messages, streams progress back to the canvas, reports relay settlement and centicredits, and sends cancellation over lane 1 on the same socket. Model, LoRA, and custom-node synchronization is deliberately disabled for this milestone and must not be relied on until the relay-managed R2 backend lands.
 
 The planner compiles configuration inputs before ordinary ComfyUI node execution, resolves the complete component DAG, and assigns every component before it performs a billable Vast acquisition. Hard provider, VRAM, RAM, and architecture constraints are applied before cost ranking. The `REMOTE_CONFIGURATION_SET` output is also available to local graph consumers for inspection.
 

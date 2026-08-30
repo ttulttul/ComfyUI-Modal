@@ -93,6 +93,9 @@
 !/ssh_docker.py
 !/ssh_executor.py
 !/ssh_runtime.py
+!/subrosa_credentials.py
+!/subrosa_executor.py
+!/subrosa_sync.py
 !/sync_engine.py
 !/sync_backends.py
 !/sync_custom_nodes.py

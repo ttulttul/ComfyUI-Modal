@@ -16,6 +16,7 @@ if __package__:
         RemoteExecutionConfiguration,
         R2StorageBackingConfiguration,
         SshRemoteConfiguration,
+        SubrosaRemoteConfiguration,
         VastRemoteConfiguration,
     )
     from .remote_hosts import SshHostConfig
@@ -29,6 +30,7 @@ else:  # pragma: no cover - direct ComfyUI loading fallback.
         RemoteExecutionConfiguration,
         R2StorageBackingConfiguration,
         SshRemoteConfiguration,
+        SubrosaRemoteConfiguration,
         VastRemoteConfiguration,
     )
     from remote_hosts import SshHostConfig
@@ -43,6 +45,7 @@ REMOTE_EXECUTION_CONFIGURATOR_NODE_ID = "RemoteExecutionConfigurator"
 MODAL_REMOTE_CONFIGURATION_NODE_ID = "ModalRemoteConfiguration"
 VAST_REMOTE_CONFIGURATION_NODE_ID = "VastRemoteConfiguration"
 SSH_REMOTE_CONFIGURATION_NODE_ID = "SshRemoteConfiguration"
+SUBROSA_REMOTE_CONFIGURATION_NODE_ID = "SubrosaRemoteConfiguration"
 R2_STORAGE_CONFIGURATION_NODE_ID = "R2StorageBackingConfiguration"
 REMOTE_CONFIGURATION_INPUT_GROUP = "configurations"
 REMOTE_CONFIGURATION_INPUT_PREFIX = "configuration_"
@@ -54,6 +57,7 @@ REMOTE_CONFIGURATION_NODE_IDS = frozenset(
         MODAL_REMOTE_CONFIGURATION_NODE_ID,
         VAST_REMOTE_CONFIGURATION_NODE_ID,
         SSH_REMOTE_CONFIGURATION_NODE_ID,
+        SUBROSA_REMOTE_CONFIGURATION_NODE_ID,
         R2_STORAGE_CONFIGURATION_NODE_ID,
     }
 )
@@ -319,6 +323,61 @@ class SshConfiguration(io.ComfyNode):
         return io.NodeOutput(ssh_configuration_from_inputs(configuration_id, inputs))
 
 
+class SubrosaConfiguration(io.ComfyNode):
+    """Declare one workflow-scoped Subrosa relay capacity pool."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        """Expose credential-free relay and scheduling controls."""
+        return io.Schema(
+            node_id=SUBROSA_REMOTE_CONFIGURATION_NODE_ID,
+            display_name="Subrosa Configuration",
+            category="Remote Execution/Configuration",
+            description=(
+                "Contribute one Subrosa GPU pool. The extension token is resolved "
+                "from the local operating-system keyring."
+            ),
+            inputs=[
+                io.String.Input(
+                    "configuration_name",
+                    default="subrosa-mock-4090",
+                    tooltip="Unique workflow-local name for this relay pool.",
+                ),
+                io.String.Input(
+                    "relay_url",
+                    default="wss://staging.subrosa.red",
+                    tooltip="Subrosa relay base WebSocket URL.",
+                ),
+                io.String.Input(
+                    "pool",
+                    default="mock-4090",
+                    tooltip="Relay pool that should claim these jobs.",
+                ),
+                io.Int.Input(
+                    "maximum_workers",
+                    default=1,
+                    min=1,
+                    max=32,
+                    step=1,
+                    tooltip="Maximum concurrent jobs contributed by this pool.",
+                ),
+            ],
+            outputs=[RemoteConfigurationType.Output()],
+            hidden=[io.Hidden.unique_id],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, **inputs: Any) -> io.NodeOutput:
+        """Build one validated credential-reference-only Subrosa configuration."""
+        configuration_id = _hidden_unique_id(cls) or str(
+            inputs.pop("unique_id", "subrosa-configuration")
+        )
+        return io.NodeOutput(
+            subrosa_configuration_from_inputs(configuration_id, inputs)
+        )
+
+
 class RemoteExecutionConfigurator(io.ComfyNode):
     """Anchor and validate the complete remote capacity declaration."""
 
@@ -336,7 +395,7 @@ class RemoteExecutionConfigurator(io.ComfyNode):
             display_name="Remote Execution Configurator",
             category="Remote Execution/Configuration",
             description=(
-                "Collect the Modal, Vast.ai, and SSH capacity pools plus shared "
+                "Collect the Modal, Vast.ai, SSH, and Subrosa capacity pools plus shared "
                 "storage backings available to this workflow's remote execution "
                 "planner."
             ),
@@ -410,6 +469,25 @@ def ssh_configuration_from_inputs(
         configuration_id=host.environment_id,
         display_name=host.display_name,
         host=host,
+    )
+
+
+def subrosa_configuration_from_inputs(
+    configuration_id: str,
+    inputs: Mapping[str, Any],
+) -> SubrosaRemoteConfiguration:
+    """Build one Subrosa configuration from queued credential-free inputs."""
+    normalized_id = str(configuration_id).strip()
+    return SubrosaRemoteConfiguration(
+        configuration_id=normalized_id,
+        display_name=str(
+            inputs.get("configuration_name") or "subrosa-mock-4090"
+        ).strip(),
+        relay_url=str(
+            inputs.get("relay_url") or "wss://staging.subrosa.red"
+        ).strip().rstrip("/"),
+        pool=str(inputs.get("pool") or "mock-4090").strip(),
+        maximum_workers=int(inputs.get("maximum_workers", 1)),
     )
 
 
@@ -592,6 +670,8 @@ def _configuration_from_prompt_node(
         return vast_configuration_from_inputs(node_id, inputs)
     if class_type == SSH_REMOTE_CONFIGURATION_NODE_ID:
         return ssh_configuration_from_inputs(node_id, inputs)
+    if class_type == SUBROSA_REMOTE_CONFIGURATION_NODE_ID:
+        return subrosa_configuration_from_inputs(node_id, inputs)
     if class_type == R2_STORAGE_CONFIGURATION_NODE_ID:
         return r2_storage_configuration_from_inputs(node_id, inputs)
     raise ValueError(
@@ -647,6 +727,8 @@ __all__ = [
     "R2StorageConfiguration",
     "SSH_REMOTE_CONFIGURATION_NODE_ID",
     "SshConfiguration",
+    "SUBROSA_REMOTE_CONFIGURATION_NODE_ID",
+    "SubrosaConfiguration",
     "StorageBackingConfigurationNode",
     "VAST_REMOTE_CONFIGURATION_NODE_ID",
     "VastConfiguration",
@@ -655,5 +737,6 @@ __all__ = [
     "modal_configuration_from_inputs",
     "r2_storage_configuration_from_inputs",
     "ssh_configuration_from_inputs",
+    "subrosa_configuration_from_inputs",
     "vast_configuration_from_inputs",
 ]

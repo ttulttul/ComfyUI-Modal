@@ -747,6 +747,14 @@ Moving a large orchestration function into a focused module improves ownership w
 
 Upload, Hugging Face discovery, Hugging Face download, and R2 download progress use the same indexed-message grammar. A single parameterized formatter in `sync_protocols.py` preserves the user-facing strings while preventing each transfer backend from slowly developing different progress semantics.
 
+## 2026-08-30: WebSocket relays need two independent framing layers
+
+- A lane-framed WebSocket is a message transport, while CRMTRPC1 is a byte stream. Reassemble lane-0 bytes independently of WebSocket message boundaries and parse complete 17-byte protocol headers before exposing frames; never assume one WebSocket message equals one protocol frame.
+- Cancellation belongs to the active relay connection's event loop. Retain only the loop and socket by invocation ID, then use a thread-safe coroutine submission from synchronous cancellation paths so a second connection cannot target the wrong job.
+- A terminal worker frame and relay settlement are distinct completion facts. Continue reading briefly after RESULT or ERROR, retain the authoritative billing record, and only then expose the terminal event to the existing stream consumer.
+- Queue-time provider metadata is the dispatch contract. A new executor should preserve the provider stamped by scheduling, and credential lookup should use only an opaque keyring reference carried beside safe relay routing fields.
+- Provider switch statements with an SSH fall-through are especially hazardous. Add an explicit branch for a relay provider before constructing any SSH runtime or sync backend, even when the first milestone intentionally uses a no-op asset engine.
+
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.

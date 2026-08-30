@@ -65,6 +65,7 @@ if __package__:
         RemoteConfiguration,
         RemoteConfigurationSet,
         SshRemoteConfiguration,
+        SubrosaRemoteConfiguration,
         VastRemoteConfiguration,
     )
     from .remote_graph_analysis import _component_execution_stages
@@ -140,6 +141,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
         RemoteConfiguration,
         RemoteConfigurationSet,
         SshRemoteConfiguration,
+        SubrosaRemoteConfiguration,
         VastRemoteConfiguration,
     )
     from remote_graph_analysis import _component_execution_stages
@@ -1179,6 +1181,42 @@ def _configured_candidate_environment(
                 state.environment_id,
             )
         return state, None
+    if isinstance(configuration, SubrosaRemoteConfiguration):
+        vram_bytes = 24 * 1024**3
+        capabilities = EnvironmentCapabilities(
+            architecture="x86_64",
+            operating_system="linux",
+            cpu_count=16,
+            total_ram_bytes=64 * 1024**3,
+            available_ram_bytes=64 * 1024**3,
+            available_disk_bytes=None,
+            docker_version="subrosa-managed",
+            docker_rootless=False,
+            nvidia_container_runtime=True,
+            gpus=(
+                GpuCapability(
+                    uuid=f"subrosa-pool:{configuration.pool}",
+                    name=(
+                        "NVIDIA GeForce RTX 4090"
+                        if configuration.pool == "mock-4090"
+                        else f"Subrosa pool {configuration.pool}"
+                    ),
+                    total_vram_bytes=vram_bytes,
+                    free_vram_bytes=vram_bytes,
+                ),
+            ),
+        )
+        return EnvironmentSchedulingState(
+            environment_id=f"subrosa:{configuration.configuration_id}",
+            provider=ExecutionProvider.SUBROSA,
+            enabled=True,
+            health=EnvironmentHealth.READY,
+            cost_usd_per_second=None,
+            capabilities=capabilities,
+            configuration_id=configuration.configuration_id,
+            display_name=configuration.display_name,
+            maximum_workers=configuration.capacity_limit,
+        ), None
     if not isinstance(configuration, VastRemoteConfiguration):
         raise TypeError(
             f"Unsupported remote configuration type {type(configuration).__name__}."

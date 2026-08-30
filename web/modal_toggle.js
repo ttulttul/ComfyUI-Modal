@@ -30,6 +30,7 @@ const LOCAL_MODAL_NODE_IDS = new Set([
   "ModalRemoteConfiguration",
   "VastRemoteConfiguration",
   "SshRemoteConfiguration",
+  "SubrosaRemoteConfiguration",
   "R2StorageBackingConfiguration",
   "RemoteExecutionConfigurator",
 ]);

@@ -57,6 +57,7 @@ try:
         R2StorageConfiguration,
         RemoteExecutionConfigurator,
         SshConfiguration,
+        SubrosaConfiguration,
         VastConfiguration,
     )
     from .vast_config_node import VastAILeaseConfiguration
@@ -72,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     R2StorageConfiguration = None  # type: ignore[assignment]
     RemoteExecutionConfigurator = None  # type: ignore[assignment]
     SshConfiguration = None  # type: ignore[assignment]
+    SubrosaConfiguration = None  # type: ignore[assignment]
     VastConfiguration = None  # type: ignore[assignment]
     VastAILeaseConfiguration = None  # type: ignore[assignment]
 
@@ -101,6 +103,7 @@ else:
                 ModalConfiguration,
                 VastConfiguration,
                 SshConfiguration,
+                SubrosaConfiguration,
                 R2StorageConfiguration,
                 RemoteExecutionConfigurator,
                 VastAILeaseConfiguration,
@@ -123,6 +126,7 @@ __all__ = [
     "RemoteExecutionConfigurator",
     "R2StorageConfiguration",
     "SshConfiguration",
+    "SubrosaConfiguration",
     "VastConfiguration",
     "VastAILeaseConfiguration",
     "WEB_DIRECTORY",

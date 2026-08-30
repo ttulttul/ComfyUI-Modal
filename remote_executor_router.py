@@ -134,6 +134,11 @@ class RemoteExecutorRouterClient:
                 ),
                 worker_image=_vast_payload_value(payload, "vast_worker_image"),
             ).executor()
+        if provider == "subrosa":
+            from .settings import get_settings
+            from .subrosa_executor import SubrosaExecutorClient
+
+            return SubrosaExecutorClient(settings=get_settings())
         if provider != "ssh_docker":
             raise ValueError(f"Unsupported remote execution provider {provider!r}.")
 
