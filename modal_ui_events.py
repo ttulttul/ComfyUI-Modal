@@ -31,6 +31,7 @@ def _emit_modal_status(
     active_node_class_type: str | None = None,
     active_node_role: str | None = None,
     error_message: str | None = None,
+    error_code: str | None = None,
     status_message: str | None = None,
     status_current: int | None = None,
     status_total: int | None = None,
@@ -73,6 +74,8 @@ def _emit_modal_status(
         payload["active_node_role"] = active_node_role
     if error_message is not None:
         payload["error_message"] = error_message
+    if error_code is not None:
+        payload["error_code"] = error_code
     if status_message is not None:
         payload["status_message"] = status_message
     if status_current is not None:

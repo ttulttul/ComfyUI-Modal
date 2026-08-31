@@ -56,6 +56,21 @@ def test_queue_failure_highlights_attributed_configuration_node() -> None:
     assert "setNodesPhase([failedNodeId], STATE_ERROR" in source
 
 
+def test_queue_materializes_subrosa_widget_credential_reference() -> None:
+    """Default-valued widgets must use the same credential ID as status checks."""
+    source = _modal_toggle_source()
+
+    function_start = source.index("function materializeSubrosaCredentialIds(prompt)")
+    queue_start = source.index("api.queuePrompt = async function modalQueuePrompt")
+    materialize_call = source.index("materializeSubrosaCredentialIds(prompt);", queue_start)
+
+    assert function_start < queue_start < materialize_call
+    assert 'candidate?.name === "credential_id"' in source[function_start:queue_start]
+    assert "widgetValue || serializedValue || String(serializedNodeId)" in source
+    assert 'window.addEventListener("subrosa-authentication-status"' in source
+    assert "clearAttributedNodeFailure(event.detail.node_id)" in source
+
+
 def test_global_modal_status_badge_is_installed() -> None:
     """The frontend should expose a dedicated global Modal activity indicator."""
     source = _modal_toggle_source()

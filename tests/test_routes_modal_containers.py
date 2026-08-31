@@ -162,10 +162,12 @@ def test_modal_status_preserves_attributed_failure_node(
         prompt_id="prompt-1",
         node_ids=["7"],
         failed_node_id="42",
+        error_code="subrosa_login_required",
         error_message="Click Login again.",
     )
 
     assert prompt_server.messages[0][1]["failed_node_id"] == "42"
+    assert prompt_server.messages[0][1]["error_code"] == "subrosa_login_required"
 
 
 def test_modal_telemetry_replay_coalesces_each_execution_source(

@@ -5,7 +5,11 @@ const SUBROSA_NODE_ID = "SubrosaRemoteConfiguration";
 const CREDENTIAL_IMPORT_ROUTE = "/remote/subrosa/credentials";
 const CREDENTIAL_STATUS_ROUTE = "/remote/subrosa/status";
 const LOGIN_MESSAGE_TYPE = "subrosa-comfyui-login";
+const LOGIN_REQUIRED_CODE = "subrosa_login_required";
+const AUTHENTICATION_STATUS_EVENT = "subrosa-authentication-status";
+const AUTHENTICATE_LABEL = "Click to Authenticate";
 const pendingLogins = new Map();
+const statusRevisions = new WeakMap();
 
 /** Return JSON or raise one credential-safe local diagnostic. */
 async function requestJson(route, options = {}) {
@@ -24,7 +28,7 @@ function widget(node, name) {
 
 /** Return the workflow's non-secret keyring reference. */
 function credentialId(node) {
-  return String(widget(node, "credential_id")?.value ?? "").trim();
+  return String(widget(node, "credential_id")?.value ?? "").trim() || String(node?.id ?? "");
 }
 
 /** Return the configured relay URL. */
@@ -54,6 +58,28 @@ function setLoginState(node, label) {
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
+/** Invalidate older status requests and return the new node-local revision. */
+function nextStatusRevision(node) {
+  const revision = (statusRevisions.get(node) ?? 0) + 1;
+  statusRevisions.set(node, revision);
+  return revision;
+}
+
+/** Keep authentication-required state visible until a newer whoami succeeds. */
+function requireAuthentication(node) {
+  nextStatusRevision(node);
+  setLoginState(node, AUTHENTICATE_LABEL);
+}
+
+/** Publish a verified connection and clear any older queue-failure decoration. */
+function markAuthenticated(node) {
+  nextStatusRevision(node);
+  setLoginState(node, "Subrosa: Connected");
+  window.dispatchEvent(new CustomEvent(AUTHENTICATION_STATUS_EVENT, {
+    detail: { node_id: String(node.id), connected: true },
+  }));
+}
+
 /** Resolve one live Subrosa node by graph ID. */
 function subrosaNodeById(nodeId) {
   return (app.graph?._nodes ?? []).find(
@@ -63,6 +89,7 @@ function subrosaNodeById(nodeId) {
 
 /** Ask the local backend whether the saved token still authenticates. */
 async function refreshLoginStatus(node) {
+  const revision = nextStatusRevision(node);
   const id = credentialId(node);
   if (!id) {
     setLoginState(node, "Subrosa: credential_id required");
@@ -72,8 +99,11 @@ async function refreshLoginStatus(node) {
   try {
     const route = `${CREDENTIAL_STATUS_ROUTE}?credential_id=${encodeURIComponent(id)}&relay_url=${encodeURIComponent(relayUrl(node))}`;
     const status = await requestJson(route);
-    setLoginState(node, status.connected ? "Subrosa: Connected" : "Login to Subrosa");
+    if (statusRevisions.get(node) !== revision) return;
+    if (status.connected) markAuthenticated(node);
+    else requireAuthentication(node);
   } catch (error) {
+    if (statusRevisions.get(node) !== revision) return;
     setLoginState(node, `Subrosa: ${String(error?.message ?? error)}`);
   }
 }
@@ -131,9 +161,9 @@ async function handleLoginResult(event) {
   try {
     setLoginState(node, "Subrosa: Validating…");
     await savePortalToken(node, token);
-    setLoginState(node, "Subrosa: Connected");
+    markAuthenticated(node);
   } catch (error) {
-    setLoginState(node, `Subrosa: ${String(error?.message ?? error)}`);
+    requireAuthentication(node);
   } finally {
     token = "";
   }
@@ -144,7 +174,7 @@ function decorateSubrosaNode(node) {
   if (node?.comfyClass !== SUBROSA_NODE_ID || node.__subrosaLoginWidget) return;
   const loginWidget = node.addWidget(
     "button",
-    "Login to Subrosa",
+    AUTHENTICATE_LABEL,
     null,
     () => startSubrosaLogin(node),
     { serialize: false },
@@ -154,11 +184,20 @@ function decorateSubrosaNode(node) {
   void refreshLoginStatus(node);
 }
 
+/** Apply a queue-time authentication failure to the exact Subrosa node. */
+function handleModalStatus(event) {
+  const detail = event?.detail ?? event ?? {};
+  if (detail.phase !== "error" || detail.error_code !== LOGIN_REQUIRED_CODE) return;
+  const node = subrosaNodeById(detail.failed_node_id);
+  if (node) requireAuthentication(node);
+}
+
 app.registerExtension({
   name: "Comfy.RemoteExecution.SubrosaLogin",
 
   async init() {
     window.addEventListener("message", (event) => void handleLoginResult(event));
+    api.addEventListener("modal_status", handleModalStatus);
   },
 
   async nodeCreated(node) {

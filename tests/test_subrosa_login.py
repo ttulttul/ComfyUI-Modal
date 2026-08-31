@@ -120,7 +120,7 @@ def test_rejected_token_uses_concise_login_again_error(
 
     with pytest.raises(
         subrosa_login_module.SubrosaLoginRequiredError,
-        match="Click.*Login to Subrosa",
+        match="Click.*Authenticate",
     ):
         asyncio.run(
             subrosa_login_module.validate_subrosa_token(
@@ -171,7 +171,7 @@ def test_queue_preflight_attributes_rejected_token_to_subrosa_node(
 
     with pytest.raises(
         subrosa_login_module.SubrosaConfigurationValidationError,
-        match="Click.*Login to Subrosa",
+        match="Click.*Authenticate",
     ) as exc_info:
         asyncio.run(
             subrosa_login_module.preflight_subrosa_configurations(

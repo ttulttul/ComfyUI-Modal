@@ -198,7 +198,7 @@ def test_missing_workflow_token_instructs_user_to_click_login(
 
     with pytest.raises(
         subrosa_login_module.SubrosaLoginRequiredError,
-        match="Click.*Login to Subrosa",
+        match="Click.*Authenticate",
     ):
         subrosa_login_module.require_saved_subrosa_token(
             store,
@@ -742,7 +742,7 @@ def test_run_relay_rejects_invalid_token_before_opening_job_socket(
 
     with pytest.raises(
         subrosa_login_module.SubrosaLoginRequiredError,
-        match="Click.*Login to Subrosa",
+        match="Click.*Authenticate",
     ):
         asyncio.run(
             client._run_relay(

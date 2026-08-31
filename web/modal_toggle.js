@@ -3437,6 +3437,22 @@ function serializedRemoteConfiguratorNodeId(prompt) {
   return matches.length === 1 ? String(matches[0][0]) : null;
 }
 
+/** Materialize the effective keyring reference omitted for default-valued widgets. */
+function materializeSubrosaCredentialIds(prompt) {
+  for (const [serializedNodeId, promptNode] of Object.entries(prompt ?? {})) {
+    if (promptNode?.class_type !== "SubrosaRemoteConfiguration") continue;
+    const liveNode = allWorkflowNodes().find(
+      (candidate) => nodeId(candidate) === String(serializedNodeId),
+    );
+    const widgetValue = String(
+      (liveNode?.widgets ?? []).find((candidate) => candidate?.name === "credential_id")?.value ?? "",
+    ).trim();
+    const serializedValue = String(promptNode?.inputs?.credential_id ?? "").trim();
+    promptNode.inputs ||= {};
+    promptNode.inputs.credential_id = widgetValue || serializedValue || String(serializedNodeId);
+  }
+}
+
 /**
  * Resolve and lazily mount the configurator panel for one serialized node id.
  * @param {string | null | undefined} configuratorNodeId
@@ -6991,6 +7007,19 @@ function markQueueFailure(remoteNodeIds, promptId, error) {
   setNodesPhase(remoteNodeIds, STATE_ERROR, promptId, queueErrorMessage(error));
 }
 
+/** Clear a stale provider-node failure after fresh authentication succeeds. */
+function clearAttributedNodeFailure(nodeIdValue) {
+  const safeNodeId = String(nodeIdValue ?? "");
+  const state = modalNodeStates.get(safeNodeId);
+  if (!safeNodeId || state?.phase !== STATE_ERROR) return;
+  clearNodeTimer(safeNodeId);
+  clearNodeProgress(safeNodeId, state.promptId);
+  clearNodeCached(safeNodeId, state.promptId);
+  modalNodeStates.delete(safeNodeId);
+  stopAnimationLoopIfIdle();
+  refreshNodeDecorations();
+}
+
 /**
  * Preserve an actionable server queue failure when PromptExecutionError is generic.
  * @param {Error | any} error
@@ -7171,6 +7200,11 @@ function registerExecutionListeners() {
   }
   if (typeof window !== "undefined") {
     window.addEventListener("focus", refreshModalUiAfterVisibilityChange);
+    window.addEventListener("subrosa-authentication-status", (event) => {
+      if (event?.detail?.connected === true) {
+        clearAttributedNodeFailure(event.detail.node_id);
+      }
+    });
   }
   api.__modalExecutionListenersRegistered = true;
 }
@@ -7185,6 +7219,7 @@ function patchQueuePrompt() {
 
   api.queuePrompt = async function modalQueuePrompt(number, data, options) {
     const { output: prompt, workflow } = data;
+    materializeSubrosaCredentialIds(prompt);
     stampModalGpuOnWorkflow(workflow);
     const modalGpu = selectedModalGpu(workflow);
     const configuratorNodeId = serializedRemoteConfiguratorNodeId(prompt);

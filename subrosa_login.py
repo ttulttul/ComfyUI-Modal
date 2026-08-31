@@ -39,8 +39,8 @@ SUBROSA_CREDENTIAL_IMPORT_ROUTE = "/remote/subrosa/credentials"
 SUBROSA_CREDENTIAL_STATUS_ROUTE = "/remote/subrosa/status"
 SUBROSA_LOGIN_REQUIRED_CODE = "subrosa_login_required"
 SUBROSA_LOGIN_REQUIRED_MESSAGE = (
-    'Subrosa login is missing or no longer valid. Click "Login to Subrosa" on '
-    "the Subrosa Configuration node, then queue the workflow again."
+    'Subrosa authentication required. Click the Subrosa Configuration node\'s '
+    '"Click to Authenticate" button, then queue the workflow again.'
 )
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

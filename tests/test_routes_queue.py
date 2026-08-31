@@ -41,13 +41,16 @@ def test_attributed_queue_error_targets_subrosa_configuration_node(
     payload = json.loads(response.text)
 
     assert payload["error"]["type"] == "subrosa_login_required"
+    assert payload["error"]["message"] == (
+        subrosa_login_module.SUBROSA_LOGIN_REQUIRED_MESSAGE
+    )
     assert payload["error"]["extra_info"]["node_id"] == "42"
     assert payload["node_errors"] == {
         "42": {
             "errors": [
                 {
                     "type": "subrosa_login_required",
-                    "message": "Subrosa Configuration failed validation",
+                    "message": "Subrosa authentication required",
                     "details": subrosa_login_module.SUBROSA_LOGIN_REQUIRED_MESSAGE,
                     "extra_info": {},
                 }
@@ -57,6 +60,7 @@ def test_attributed_queue_error_targets_subrosa_configuration_node(
         }
     }
     assert emitted[0]["failed_node_id"] == "42"
+    assert emitted[0]["error_code"] == "subrosa_login_required"
 
 
 def test_invalid_subrosa_token_stops_before_rewrite_and_comfyui_execution(

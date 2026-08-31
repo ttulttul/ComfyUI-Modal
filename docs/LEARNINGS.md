@@ -785,6 +785,14 @@ request. Run this preflight before prompt rewriting and before handing the
 prompt to ComfyUI; a configuration node's ordinary execution order is not an
 adequate barrier for independent graph branches.
 
+An advanced widget's visible default is not guaranteed to appear in ComfyUI's
+serialized prompt. If browser status uses the live widget while backend
+execution applies an omitted-field compatibility fallback, they can validate
+different keyring entries and report contradictory states. Materialize the
+effective non-secret reference before submission, and feed queue-time auth
+failures back into the provider node's own state. A stale asynchronous status
+response must not overwrite a newer authentication-required event.
+
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.

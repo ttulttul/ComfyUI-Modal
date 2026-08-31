@@ -12,7 +12,7 @@ def test_subrosa_login_is_direct_nonce_bound_and_non_serialized() -> None:
     )
 
     assert '"SubrosaRemoteConfiguration"' in source
-    assert '"Login to Subrosa"' in source
+    assert '"Click to Authenticate"' in source
     assert 'serialize: false' in source
     assert 'window.open(' in source
     assert '"about:blank"' in source
@@ -20,6 +20,13 @@ def test_subrosa_login_is_direct_nonce_bound_and_non_serialized() -> None:
     assert "globalThis.crypto.randomUUID()" in source
     assert "event.origin !== pending.origin" in source
     assert "event.source !== pending.popup" in source
+    assert 'api.addEventListener("modal_status", handleModalStatus)' in source
+    assert 'detail.error_code !== LOGIN_REQUIRED_CODE' in source
+    assert "requireAuthentication(node)" in source
+    assert '"subrosa-authentication-status"' in source
+    assert "markAuthenticated(node)" in source
+    assert "statusRevisions.get(node) !== revision" in source
+    assert '|| String(node?.id ?? "")' in source
     assert 'hostname.endsWith(".subrosa.red")' in source
     assert "/remote/subrosa/credentials" in source
     assert "/remote/subrosa/status" in source

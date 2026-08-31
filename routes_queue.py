@@ -408,6 +408,7 @@ def _queue_error_response(
             configurator_node_id=state.configurator_node_id,
             modal_gpu=state.request_modal_gpu,
             failed_node_id=failed_node_id or None,
+            error_code=getattr(exc, "code", None),
             **{key: value for key, value in kwargs.items() if value is not None},
         )
     node_errors = _queue_node_errors(state, exc, failed_node_id)
@@ -415,8 +416,8 @@ def _queue_error_response(
     if failed_node_id:
         error = {
             "type": getattr(exc, "code", None) or "provider_configuration_invalid",
-            "message": "Subrosa Configuration failed validation",
-            "details": str(exc),
+            "message": str(exc),
+            "details": "",
             "extra_info": {"node_id": failed_node_id},
         }
     return web.json_response(
@@ -441,7 +442,11 @@ def _queue_node_errors(
     class_type = str(prompt_node.get("class_type") or "SubrosaRemoteConfiguration")
     reason = {
         "type": getattr(exc, "code", None) or "provider_configuration_invalid",
-        "message": "Subrosa Configuration failed validation",
+        "message": (
+            "Subrosa authentication required"
+            if getattr(exc, "code", None) == "subrosa_login_required"
+            else "Subrosa Configuration failed validation"
+        ),
         "details": str(exc),
         "extra_info": {},
     }
@@ -499,7 +504,7 @@ async def _handle_modal_queue_prompt(
             prompt_server, ctx, state, exc, phase="error", status=400
         )
     except SubrosaConfigurationValidationError as exc:
-        logger.info(
+        logger.debug(
             "Subrosa configuration credential preflight failed node_id=%s: %s",
             exc.configuration_id,
             exc,
