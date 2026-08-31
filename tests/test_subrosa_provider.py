@@ -222,6 +222,79 @@ def test_subrosa_candidate_has_schedulable_mock_capabilities(
     assert state.capabilities.maximum_vram_bytes == 24 * 1024**3
 
 
+def test_subrosa_b300_pool_admits_large_vram_component(
+    execution_scheduling_module: Any,
+    execution_environments_module: Any,
+    remote_configurations_module: Any,
+    settings_module: Any,
+) -> None:
+    """The B300 pool should admit work above the default 24 GiB VRAM ceiling."""
+    configuration = remote_configurations_module.SubrosaRemoteConfiguration(
+        configuration_id="43",
+        display_name="Subrosa B300",
+        relay_url="wss://staging.subrosa.red",
+        pool="mock-B300",
+        credential_id="subrosa-default",
+    )
+    requirements = execution_environments_module.ComponentResourceRequirements(
+        minimum_vram_bytes=25 * 1024**3
+    )
+
+    state, quote = execution_scheduling_module._configured_candidate_environment(
+        configuration=configuration,
+        requirements=requirements,
+        settings=settings_module.get_settings(),
+        ssh_hosts_by_id={},
+        vast_service=None,
+        vast_unavailable_reason=None,
+    )
+
+    assert quote is None
+    assert state is not None
+    assert state.capabilities is not None
+    assert state.capabilities.cpu_count == 128
+    assert state.capabilities.total_ram_bytes == 1024 * 1024**3
+    assert state.capabilities.maximum_vram_bytes == 288 * 1024**3
+    assert state.capabilities.gpus[0].name == "NVIDIA B300"
+    assignment = execution_environments_module.CostAwareEnvironmentScheduler().choose(
+        [state], requirements
+    )
+    assert assignment.environment_id == "subrosa:43"
+
+
+def test_unknown_subrosa_pool_uses_default_synthetic_capabilities(
+    execution_scheduling_module: Any,
+    execution_environments_module: Any,
+    remote_configurations_module: Any,
+    settings_module: Any,
+) -> None:
+    """An unrecognized pool should retain the conservative generic profile."""
+    configuration = remote_configurations_module.SubrosaRemoteConfiguration(
+        configuration_id="44",
+        display_name="Private Subrosa pool",
+        relay_url="wss://staging.subrosa.red",
+        pool="private-pool",
+        credential_id="subrosa-default",
+    )
+
+    state, quote = execution_scheduling_module._configured_candidate_environment(
+        configuration=configuration,
+        requirements=execution_environments_module.ComponentResourceRequirements(),
+        settings=settings_module.get_settings(),
+        ssh_hosts_by_id={},
+        vast_service=None,
+        vast_unavailable_reason=None,
+    )
+
+    assert quote is None
+    assert state is not None
+    assert state.capabilities is not None
+    assert state.capabilities.cpu_count == 16
+    assert state.capabilities.total_ram_bytes == 64 * 1024**3
+    assert state.capabilities.maximum_vram_bytes == 24 * 1024**3
+    assert state.capabilities.gpus[0].name == "Subrosa pool private-pool"
+
+
 def test_connected_subrosa_configuration_plans_without_provider_side_effects(
     execution_scheduling_module: Any,
     execution_environments_module: Any,

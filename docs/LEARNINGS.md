@@ -759,6 +759,10 @@ Upload, Hugging Face discovery, Hugging Face download, and R2 download progress 
 
 A keyring reference is useful only when it remains stable across graph copies and workflow rebuilds. Random per-node references work when an integrated Login flow immediately writes the secret under that generated ID; without such a save flow, default to a fixed, human-chooseable reference so an operator can store the credential once and reuse it safely. Keep the reference in workflow metadata, keep the secret exclusively in the OS keyring, and retain legacy lookup fallbacks only for already-queued workflows.
 
+## Synthetic relay capabilities belong in a pool catalog
+
+Admission control must derive synthetic hardware from the selected relay pool instead of applying one profile to every pool. Keep known profiles explicit, use a conservative fallback for unknown names, and distinguish authoritative limits from plausible planning assumptions. Capability fields that the scheduler cannot represent—such as memory bandwidth and bus width—should remain provider-side notes rather than being approximated as unrelated fields.
+
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.

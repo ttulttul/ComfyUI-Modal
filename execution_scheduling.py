@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -171,6 +171,40 @@ EnvironmentSetupStatusCallback = Callable[
 ExecutionPlanStatusCallback = Callable[
     [dict[str, dict[str, Any]], list[dict[str, Any]]], None
 ]
+
+
+@dataclass(frozen=True)
+class SubrosaPoolCapability:
+    """Describe the synthetic hardware advertised for one Subrosa relay pool."""
+
+    gpu_name: str
+    total_vram_bytes: int
+    cpu_count: int
+    total_ram_bytes: int
+
+
+_SUBROSA_DEFAULT_POOL_CAPABILITY = SubrosaPoolCapability(
+    gpu_name="",
+    total_vram_bytes=24 * 1024**3,
+    cpu_count=16,
+    total_ram_bytes=64 * 1024**3,
+)
+
+_SUBROSA_POOL_CAPABILITIES: Mapping[str, SubrosaPoolCapability] = {
+    "mock-4090": SubrosaPoolCapability(
+        gpu_name="NVIDIA GeForce RTX 4090",
+        total_vram_bytes=24 * 1024**3,
+        cpu_count=16,
+        total_ram_bytes=64 * 1024**3,
+    ),
+    "mock-B300": SubrosaPoolCapability(
+        gpu_name="NVIDIA B300",
+        total_vram_bytes=288 * 1024**3,
+        cpu_count=128,
+        total_ram_bytes=1024 * 1024**3,
+    ),
+}
+
 
 def _modal_environment_state(settings: ModalSyncSettings) -> EnvironmentSchedulingState:
     """Return the scheduler-facing state of the selected Modal GPU target."""
@@ -1182,13 +1216,16 @@ def _configured_candidate_environment(
             )
         return state, None
     if isinstance(configuration, SubrosaRemoteConfiguration):
-        vram_bytes = 24 * 1024**3
+        capability = _SUBROSA_POOL_CAPABILITIES.get(
+            configuration.pool, _SUBROSA_DEFAULT_POOL_CAPABILITY
+        )
+        gpu_name = capability.gpu_name or f"Subrosa pool {configuration.pool}"
         capabilities = EnvironmentCapabilities(
             architecture="x86_64",
             operating_system="linux",
-            cpu_count=16,
-            total_ram_bytes=64 * 1024**3,
-            available_ram_bytes=64 * 1024**3,
+            cpu_count=capability.cpu_count,
+            total_ram_bytes=capability.total_ram_bytes,
+            available_ram_bytes=capability.total_ram_bytes,
             available_disk_bytes=None,
             docker_version="subrosa-managed",
             docker_rootless=False,
@@ -1196,13 +1233,9 @@ def _configured_candidate_environment(
             gpus=(
                 GpuCapability(
                     uuid=f"subrosa-pool:{configuration.pool}",
-                    name=(
-                        "NVIDIA GeForce RTX 4090"
-                        if configuration.pool == "mock-4090"
-                        else f"Subrosa pool {configuration.pool}"
-                    ),
-                    total_vram_bytes=vram_bytes,
-                    free_vram_bytes=vram_bytes,
+                    name=gpu_name,
+                    total_vram_bytes=capability.total_vram_bytes,
+                    free_vram_bytes=capability.total_vram_bytes,
                 ),
             ),
         )
