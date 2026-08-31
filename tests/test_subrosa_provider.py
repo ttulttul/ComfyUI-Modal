@@ -222,6 +222,37 @@ def test_subrosa_candidate_has_schedulable_mock_capabilities(
     assert state.capabilities.maximum_vram_bytes == 24 * 1024**3
 
 
+def test_subrosa_l40s_pool_advertises_48_gib(
+    execution_scheduling_module: Any,
+    execution_environments_module: Any,
+    remote_configurations_module: Any,
+    settings_module: Any,
+) -> None:
+    """The L40S pool should advertise the card's real 48 GiB VRAM."""
+    configuration = remote_configurations_module.SubrosaRemoteConfiguration(
+        configuration_id="44",
+        display_name="Subrosa L40S",
+        relay_url="wss://staging.subrosa.red",
+        pool="L40S",
+        credential_id="subrosa-default",
+    )
+
+    state, quote = execution_scheduling_module._configured_candidate_environment(
+        configuration=configuration,
+        requirements=execution_environments_module.ComponentResourceRequirements(),
+        settings=settings_module.get_settings(),
+        ssh_hosts_by_id={},
+        vast_service=None,
+        vast_unavailable_reason=None,
+    )
+
+    assert quote is None
+    assert state is not None
+    assert state.capabilities is not None
+    assert state.capabilities.maximum_vram_bytes == 48 * 1024**3
+    assert state.capabilities.gpus[0].name == "NVIDIA L40S"
+
+
 def test_subrosa_b300_pool_admits_large_vram_component(
     execution_scheduling_module: Any,
     execution_environments_module: Any,
