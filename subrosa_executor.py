@@ -386,7 +386,7 @@ class SubrosaExecutorClient:
         relay_url = _required_payload_string(payload, "relay_url").rstrip("/")
         pool = _required_payload_string(payload, "pool")
         credential_id = str(
-            payload.get("configuration_id") or ""
+            payload.get("credential_id") or payload.get("configuration_id") or ""
         ).strip()
         token = self.credential_store.require(credential_id)
         invocation_id = _required_payload_string(payload, "invocation_id")

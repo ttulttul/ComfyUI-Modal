@@ -755,6 +755,10 @@ Upload, Hugging Face discovery, Hugging Face download, and R2 download progress 
 - Queue-time provider metadata is the dispatch contract. A new executor should preserve the provider stamped by scheduling, and credential lookup should use only an opaque keyring reference carried beside safe relay routing fields.
 - Provider switch statements with an SSH fall-through are especially hazardous. Add an explicit branch for a relay provider before constructing any SSH runtime or sync backend, even when the first milestone intentionally uses a no-op asset engine.
 
+## Stable credential references must match their save flow
+
+A keyring reference is useful only when it remains stable across graph copies and workflow rebuilds. Random per-node references work when an integrated Login flow immediately writes the secret under that generated ID; without such a save flow, default to a fixed, human-chooseable reference so an operator can store the credential once and reuse it safely. Keep the reference in workflow metadata, keep the secret exclusively in the OS keyring, and retain legacy lookup fallbacks only for already-queued workflows.
+
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.

@@ -247,6 +247,7 @@ class SubrosaRemoteConfiguration(RemoteConfiguration):
 
     relay_url: str
     pool: str
+    credential_id: str
     maximum_workers: int = 1
 
     def __post_init__(self) -> None:
@@ -259,6 +260,8 @@ class SubrosaRemoteConfiguration(RemoteConfiguration):
             raise ValueError("Subrosa relay_url must not contain a query or fragment.")
         if not self.pool.strip():
             raise ValueError("Subrosa pool must not be empty.")
+        if not self.credential_id.strip():
+            raise ValueError("Subrosa credential_id must not be empty.")
         if self.maximum_workers <= 0:
             raise ValueError("Subrosa maximum_workers must be positive.")
 
@@ -280,6 +283,7 @@ class SubrosaRemoteConfiguration(RemoteConfiguration):
             "provider": self.provider.value,
             "relay_url": self.relay_url,
             "pool": self.pool,
+            "credential_id": self.credential_id,
             "maximum_workers": self.maximum_workers,
         }
 

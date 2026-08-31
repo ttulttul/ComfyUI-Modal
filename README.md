@@ -110,7 +110,21 @@ The connected graph is authoritative. Connecting only Modal configurations produ
 
 Capacity limits are concurrency ceilings, not eager provisioning requests. Modal containers scale as work needs them, Vast instances are quoted during planning and rented only for selected slots, SSH worker containers are prepared lazily on the declared host, and Subrosa jobs wait for workers in the configured relay pool. Sequential components can reuse one slot; parallel components consume distinct slots or wait when that is cheaper than another environment.
 
-Subrosa support currently targets the relay mock-worker milestone. A **Subrosa Configuration** declares a `ws://`/`wss://` relay base URL, pool, and concurrency limit; its configuration ID is the opaque OS-keyring reference, and the `srk_` extension token is never stored in the workflow or queue payload. The client waits for a claimed worker, transports the existing CRMTRPC1 request/input stream in 512 KiB lane-0 messages, streams progress back to the canvas, reports relay settlement and centicredits, and sends cancellation over lane 1 on the same socket. Model, LoRA, and custom-node synchronization is deliberately disabled for this milestone and must not be relied on until the relay-managed R2 backend lands.
+Subrosa support currently targets the relay mock-worker milestone. A **Subrosa Configuration** declares a `ws://`/`wss://` relay base URL, pool, concurrency limit, and advanced `credential_id` widget. The keyring reference defaults to the stable, human-readable `subrosa-default`, so one saved token can serve every workflow; changing it intentionally selects a different local token. The `srk_` extension token itself is never stored in the workflow or queue payload. The client waits for a claimed worker, transports the existing CRMTRPC1 request/input stream in 512 KiB lane-0 messages, streams progress back to the canvas, reports relay settlement and centicredits, and sends cancellation over lane 1 on the same socket. Model, LoRA, and custom-node synchronization is deliberately disabled for this milestone and must not be relied on until the relay-managed R2 backend lands.
+
+Save the extension token once from an unlocked macOS GUI login session. The command prompts securely instead of placing the token in shell history:
+
+```bash
+security add-generic-password -U -s comfyui-modal-sync-subrosa -a subrosa-default -w
+```
+
+Verify that the reference exists without printing the token:
+
+```bash
+uv run python -c "import keyring; print(bool(keyring.get_password('comfyui-modal-sync-subrosa','subrosa-default')))"
+```
+
+Non-interactive and SSH sessions may receive macOS `errSecInteractionNotAllowed` (`-25308`); unlock the login keychain in the active GUI session before retrying.
 
 The planner compiles configuration inputs before ordinary ComfyUI node execution, resolves the complete component DAG, and assigns every component before it performs a billable Vast acquisition. Hard provider, VRAM, RAM, and architecture constraints are applied before cost ranking. The `REMOTE_CONFIGURATION_SET` output is also available to local graph consumers for inspection.
 

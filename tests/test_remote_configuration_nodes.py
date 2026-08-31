@@ -27,6 +27,7 @@ def test_configuration_nodes_expose_typed_outputs_and_autogrow_sink(
         module.ModalConfiguration,
         module.VastConfiguration,
         module.SshConfiguration,
+        module.SubrosaConfiguration,
         module.R2StorageConfiguration,
     ):
         schema = node_class.define_schema()
@@ -44,6 +45,20 @@ def test_configuration_nodes_expose_typed_outputs_and_autogrow_sink(
         configurator_schema.outputs[0].io_type
         == module.REMOTE_CONFIGURATION_SET_IO_TYPE
     )
+
+
+def test_subrosa_configuration_uses_stable_default_credential_reference(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """New Subrosa nodes should share the human-storable default keyring entry."""
+    schema = remote_configuration_nodes_module.SubrosaConfiguration.define_schema()
+    credential_input = next(
+        input_value
+        for input_value in schema.inputs
+        if input_value.id == "credential_id"
+    )
+
+    assert credential_input.default == "subrosa-default"
 
 
 def test_r2_configuration_executes_through_locked_v3_clone(

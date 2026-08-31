@@ -361,6 +361,16 @@ class SubrosaConfiguration(io.ComfyNode):
                     step=1,
                     tooltip="Maximum concurrent jobs contributed by this pool.",
                 ),
+                io.String.Input(
+                    "credential_id",
+                    default="subrosa-default",
+                    advanced=True,
+                    tooltip=(
+                        "Local OS-keyring reference for the srk_ extension token. "
+                        "Not a credential. Workflows sharing this name share one "
+                        "saved token."
+                    ),
+                ),
             ],
             outputs=[RemoteConfigurationType.Output()],
             hidden=[io.Hidden.unique_id],
@@ -487,6 +497,7 @@ def subrosa_configuration_from_inputs(
             inputs.get("relay_url") or "wss://staging.subrosa.red"
         ).strip().rstrip("/"),
         pool=str(inputs.get("pool") or "mock-4090").strip(),
+        credential_id=str(inputs.get("credential_id") or normalized_id).strip(),
         maximum_workers=int(inputs.get("maximum_workers", 1)),
     )
 

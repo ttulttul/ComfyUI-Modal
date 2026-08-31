@@ -46,6 +46,13 @@ class _FakeWebSocket:
         del timeout
         return self.messages.pop(0)
 
+    async def __aenter__(self) -> Self:
+        """Enter the fake socket context."""
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        """Exit the fake socket context."""
+
     async def send_bytes(self, payload: bytes) -> None:
         """Capture one client binary message."""
         self.sent.append(payload)
@@ -78,6 +85,7 @@ def test_subrosa_configuration_is_credential_free_and_compiles(
                 "relay_url": "wss://staging.subrosa.red/",
                 "pool": "mock-4090",
                 "maximum_workers": 2,
+                "credential_id": "subrosa-default",
             },
         },
         "99": {
@@ -95,7 +103,40 @@ def test_subrosa_configuration_is_credential_free_and_compiles(
     assert configuration.relay_url == "wss://staging.subrosa.red"
     safe = configuration.to_safe_dict()
     assert safe["configuration_id"] == "42"
+    assert safe["credential_id"] == "subrosa-default"
     assert "token" not in json.dumps(safe).casefold()
+
+
+@pytest.mark.parametrize("credential_inputs", [{}, {"credential_id": ""}])
+def test_subrosa_omitted_or_blank_credential_id_falls_back_to_node_id(
+    remote_configuration_nodes_module: Any,
+    credential_inputs: dict[str, str],
+) -> None:
+    """Legacy queued prompts should retain their graph ID as a lookup fallback."""
+    configuration = remote_configuration_nodes_module.subrosa_configuration_from_inputs(
+        "42",
+        {
+            "relay_url": "wss://staging.subrosa.red",
+            "pool": "mock-4090",
+            **credential_inputs,
+        },
+    )
+
+    assert configuration.credential_id == "42"
+
+
+def test_subrosa_configuration_rejects_empty_credential_id(
+    remote_configurations_module: Any,
+) -> None:
+    """Direct configuration construction must reject unusable keyring references."""
+    with pytest.raises(ValueError, match="credential_id must not be empty"):
+        remote_configurations_module.SubrosaRemoteConfiguration(
+            configuration_id="42",
+            display_name="Subrosa staging",
+            relay_url="wss://staging.subrosa.red",
+            pool="mock-4090",
+            credential_id="  ",
+        )
 
 
 def test_subrosa_credential_store_never_serializes_token(
@@ -158,6 +199,7 @@ def test_subrosa_candidate_has_schedulable_mock_capabilities(
         display_name="Subrosa staging",
         relay_url="wss://staging.subrosa.red",
         pool="mock-4090",
+        credential_id="subrosa-default",
         maximum_workers=3,
     )
 
@@ -244,6 +286,7 @@ def test_subrosa_provider_metadata_contains_relay_reference_only(
         display_name="Subrosa staging",
         relay_url="wss://staging.subrosa.red",
         pool="mock-4090",
+        credential_id="subrosa-default",
     )
     assignment = execution_environments_module.ExecutionAssignment(
         environment_id="subrosa:42",
@@ -264,6 +307,7 @@ def test_subrosa_provider_metadata_contains_relay_reference_only(
         "relay_url": "wss://staging.subrosa.red",
         "pool": "mock-4090",
         "configuration_id": "42",
+        "credential_id": "subrosa-default",
     }
     assert "srk_" not in json.dumps(metadata)
 
@@ -425,6 +469,90 @@ def test_prepare_payload_preserves_queue_time_provider(
 
     assert prepared["execution_provider"] == "subrosa"
     assert str(prepared["invocation_id"]).startswith("RIV_")
+
+
+def test_run_relay_uses_stable_credential_id_instead_of_configuration_id(
+    subrosa_executor_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatch must query the human-stable reference, never the graph node ID."""
+    module = subrosa_executor_module
+    websocket = _FakeWebSocket()
+    queried_ids: list[str] = []
+
+    class CredentialStore:
+        """Return a token only for the stable keyring account name."""
+
+        def require(self, credential_id: str) -> str:
+            """Record the exact keyring reference used by dispatch."""
+            queried_ids.append(credential_id)
+            if credential_id != "subrosa-default":
+                raise AssertionError(f"Unexpected credential lookup {credential_id!r}")
+            return "srk_test"
+
+    class FakeSession:
+        """Provide a context-managed fake relay connection."""
+
+        def __init__(self, *, timeout: Any) -> None:
+            """Accept the executor's client timeout."""
+            del timeout
+
+        async def __aenter__(self) -> Self:
+            """Enter the fake client session."""
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            """Exit the fake client session."""
+
+        def ws_connect(self, *_args: Any, **_kwargs: Any) -> _FakeWebSocket:
+            """Return the fake active relay socket."""
+            return websocket
+
+    client = module.SubrosaExecutorClient(
+        credential_store=CredentialStore(),
+        settings=SimpleNamespace(execution_timeout_seconds=60),
+    )
+
+    async def wait_until_ready(_websocket: Any) -> None:
+        """Skip the already-covered ready handshake."""
+
+    async def send_request_frames(
+        _websocket: Any,
+        _payload: Any,
+        _inputs_payload: bytes,
+    ) -> None:
+        """Skip the already-covered request framing."""
+
+    async def receive_response(
+        _websocket: Any,
+        _payload: Any,
+        _emit: Any,
+    ) -> tuple[dict[str, Any], None]:
+        """Return one deterministic terminal response."""
+        return {"kind": "result", "outputs": b"outputs"}, None
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(client, "_wait_until_ready", wait_until_ready)
+    monkeypatch.setattr(client, "_send_request_frames", send_request_frames)
+    monkeypatch.setattr(client, "_receive_response", receive_response)
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(
+        client._run_relay(
+            {
+                "invocation_id": "RIV_stable-credential",
+                "relay_url": "wss://staging.subrosa.red",
+                "pool": "mock-4090",
+                "configuration_id": "42",
+                "credential_id": "subrosa-default",
+            },
+            b"inputs",
+            events.append,
+        )
+    )
+
+    assert queried_ids == ["subrosa-default"]
+    assert events == [{"kind": "result", "outputs": b"outputs"}]
 
 
 def test_cancel_uses_the_active_relay_socket(

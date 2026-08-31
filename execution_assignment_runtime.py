@@ -247,6 +247,7 @@ def _configured_provider_metadata(
             "relay_url": configuration.relay_url,
             "pool": configuration.pool,
             "configuration_id": configuration.configuration_id,
+            "credential_id": configuration.credential_id,
         }
     return None
 
