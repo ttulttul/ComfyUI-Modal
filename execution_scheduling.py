@@ -191,6 +191,12 @@ _SUBROSA_DEFAULT_POOL_CAPABILITY = SubrosaPoolCapability(
 )
 
 _SUBROSA_POOL_CAPABILITIES: Mapping[str, SubrosaPoolCapability] = {
+    "RTX-PRO-6000": SubrosaPoolCapability(
+        gpu_name="NVIDIA RTX PRO 6000 Blackwell",
+        total_vram_bytes=96 * 1024**3,
+        cpu_count=16,
+        total_ram_bytes=128 * 1024**3,
+    ),
     "L40S": SubrosaPoolCapability(
         gpu_name="NVIDIA L40S",
         total_vram_bytes=48 * 1024**3,

@@ -222,6 +222,37 @@ def test_subrosa_candidate_has_schedulable_mock_capabilities(
     assert state.capabilities.maximum_vram_bytes == 24 * 1024**3
 
 
+def test_subrosa_rtx_pro_6000_pool_advertises_96_gib(
+    execution_scheduling_module: Any,
+    execution_environments_module: Any,
+    remote_configurations_module: Any,
+    settings_module: Any,
+) -> None:
+    """The RTX PRO 6000 pool should advertise the card's real 96 GiB VRAM."""
+    configuration = remote_configurations_module.SubrosaRemoteConfiguration(
+        configuration_id="45",
+        display_name="Subrosa RTX PRO 6000",
+        relay_url="wss://staging.subrosa.red",
+        pool="RTX-PRO-6000",
+        credential_id="subrosa-default",
+    )
+
+    state, quote = execution_scheduling_module._configured_candidate_environment(
+        configuration=configuration,
+        requirements=execution_environments_module.ComponentResourceRequirements(),
+        settings=settings_module.get_settings(),
+        ssh_hosts_by_id={},
+        vast_service=None,
+        vast_unavailable_reason=None,
+    )
+
+    assert quote is None
+    assert state is not None
+    assert state.capabilities is not None
+    assert state.capabilities.maximum_vram_bytes == 96 * 1024**3
+    assert state.capabilities.gpus[0].name == "NVIDIA RTX PRO 6000 Blackwell"
+
+
 def test_subrosa_l40s_pool_advertises_48_gib(
     execution_scheduling_module: Any,
     execution_environments_module: Any,

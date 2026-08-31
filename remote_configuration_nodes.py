@@ -340,7 +340,7 @@ class SubrosaConfiguration(io.ComfyNode):
             inputs=[
                 io.String.Input(
                     "configuration_name",
-                    default="subrosa-l40s",
+                    default="subrosa-rtx-pro-6000",
                     tooltip="Unique workflow-local name for this relay pool.",
                 ),
                 io.String.Input(
@@ -350,7 +350,7 @@ class SubrosaConfiguration(io.ComfyNode):
                 ),
                 io.String.Input(
                     "pool",
-                    default="L40S",
+                    default="RTX-PRO-6000",
                     tooltip="Relay pool that should claim these jobs.",
                 ),
                 io.Int.Input(
@@ -491,12 +491,12 @@ def subrosa_configuration_from_inputs(
     return SubrosaRemoteConfiguration(
         configuration_id=normalized_id,
         display_name=str(
-            inputs.get("configuration_name") or "subrosa-l40s"
+            inputs.get("configuration_name") or "subrosa-rtx-pro-6000"
         ).strip(),
         relay_url=str(
             inputs.get("relay_url") or "wss://staging.subrosa.red"
         ).strip().rstrip("/"),
-        pool=str(inputs.get("pool") or "L40S").strip(),
+        pool=str(inputs.get("pool") or "RTX-PRO-6000").strip(),
         credential_id=str(inputs.get("credential_id") or normalized_id).strip(),
         maximum_workers=int(inputs.get("maximum_workers", 1)),
     )
