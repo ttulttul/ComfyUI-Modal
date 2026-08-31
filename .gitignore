@@ -95,6 +95,7 @@
 !/ssh_runtime.py
 !/subrosa_credentials.py
 !/subrosa_executor.py
+!/subrosa_login.py
 !/subrosa_sync.py
 !/sync_engine.py
 !/sync_backends.py

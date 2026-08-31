@@ -763,6 +763,20 @@ A keyring reference is useful only when it remains stable across graph copies an
 
 Admission control must derive synthetic hardware from the selected relay pool instead of applying one profile to every pool. Keep known profiles explicit, use a conservative fallback for unknown names, and distinguish authoritative limits from plausible planning assumptions. Capability fields that the scheduler cannot represent—such as memory bandwidth and bus width—should remain provider-side notes rather than being approximated as unrelated fields.
 
+## Browser Login should hand secrets to a local vault, not a workflow
+
+A provider portal can own passkey or recovery-code authentication and one-time
+token minting without becoming the credential store. Bind its popup result to a
+random state and the exact trusted portal origin, transfer the token without a
+URL, then let a local ComfyUI route validate and write it to the OS keyring. The
+node should expose only status and a stable credential reference. Revalidate at
+workflow start as well as on node load, because a token can be revoked after a
+workflow is opened; all missing and HTTP-401 paths should converge on one clear
+“click Login again” instruction. Treat the workflow's relay URL as untrusted
+input: both the browser handoff and backend validation must restrict token
+delivery to service-owned HTTPS origins (with an explicit loopback development
+exception).
+
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.

@@ -187,6 +187,25 @@ def test_subrosa_credential_store_reports_locked_macos_keychain(
     assert caught.value.code == "keychain_unlock_required"
 
 
+def test_missing_workflow_token_instructs_user_to_click_login(
+    subrosa_login_module: Any,
+    subrosa_credentials_module: Any,
+) -> None:
+    """Missing keyring state should use the concise node recovery instruction."""
+    store = subrosa_credentials_module.SubrosaCredentialStore(
+        password_store=_MemoryPasswordStore()
+    )
+
+    with pytest.raises(
+        subrosa_login_module.SubrosaLoginRequiredError,
+        match="Click.*Login to Subrosa",
+    ):
+        subrosa_login_module.require_saved_subrosa_token(
+            store,
+            "subrosa-default",
+        )
+
+
 def test_subrosa_candidate_has_schedulable_mock_capabilities(
     execution_scheduling_module: Any,
     execution_environments_module: Any,
@@ -667,6 +686,11 @@ def test_run_relay_uses_stable_credential_id_instead_of_configuration_id(
         return {"kind": "result", "outputs": b"outputs"}, None
 
     monkeypatch.setattr(module.aiohttp, "ClientSession", FakeSession)
+    async def validate_token(_relay_url: str, _token: str) -> dict[str, Any]:
+        """Accept the synthetic token without reaching staging."""
+        return {"account_number": "acct_test", "status": "active"}
+
+    monkeypatch.setattr(module, "validate_subrosa_token", validate_token)
     monkeypatch.setattr(client, "_wait_until_ready", wait_until_ready)
     monkeypatch.setattr(client, "_send_request_frames", send_request_frames)
     monkeypatch.setattr(client, "_receive_response", receive_response)
@@ -688,6 +712,51 @@ def test_run_relay_uses_stable_credential_id_instead_of_configuration_id(
 
     assert queried_ids == ["subrosa-default"]
     assert events == [{"kind": "result", "outputs": b"outputs"}]
+
+
+def test_run_relay_rejects_invalid_token_before_opening_job_socket(
+    subrosa_executor_module: Any,
+    subrosa_login_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every workflow run must preflight auth and point failures to Login."""
+    module = subrosa_executor_module
+
+    async def reject_token(_relay_url: str, _token: str) -> dict[str, Any]:
+        """Model a revoked or expired extension token."""
+        raise subrosa_login_module.SubrosaLoginRequiredError()
+
+    class NoWebSocketSession:
+        """Fail if invalid authentication proceeds to relay allocation."""
+
+        def __init__(self, *, timeout: Any) -> None:
+            """Reject unexpected relay session construction."""
+            del timeout
+            raise AssertionError("Invalid auth must stop before WebSocket creation.")
+
+    monkeypatch.setattr(module, "validate_subrosa_token", reject_token)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", NoWebSocketSession)
+    client = module.SubrosaExecutorClient(
+        credential_store=SimpleNamespace(require=lambda _credential_id: "srk_revoked")
+    )
+
+    with pytest.raises(
+        subrosa_login_module.SubrosaLoginRequiredError,
+        match="Click.*Login to Subrosa",
+    ):
+        asyncio.run(
+            client._run_relay(
+                {
+                    "invocation_id": "RIV_invalid-login",
+                    "relay_url": "wss://staging.subrosa.red",
+                    "pool": "mock-4090",
+                    "configuration_id": "42",
+                    "credential_id": "subrosa-default",
+                },
+                b"inputs",
+                lambda _event: None,
+            )
+        )
 
 
 def test_cancel_uses_the_active_relay_socket(
@@ -720,44 +789,13 @@ def test_whoami_uses_browser_user_agent_and_keyring_token(
     module = subrosa_executor_module
     observed: dict[str, Any] = {}
 
-    class FakeResponse:
-        """Return one successful whoami response."""
+    async def validate_token(relay_url: str, token: str) -> dict[str, Any]:
+        """Capture the credential selected by the public validation method."""
+        observed["relay_url"] = relay_url
+        observed["token"] = token
+        return {"account_number": "acct_test", "balance": 100, "status": "active"}
 
-        status = 200
-
-        async def __aenter__(self) -> Self:
-            """Enter the response context."""
-            return self
-
-        async def __aexit__(self, *_args: object) -> None:
-            """Exit the response context."""
-
-        async def json(self, *, content_type: Any = None) -> dict[str, Any]:
-            """Return safe account metadata."""
-            del content_type
-            return {"account_number": "acct_test", "balance": 100, "status": "active"}
-
-    class FakeSession:
-        """Capture the REST URL and headers."""
-
-        def __init__(self, *, timeout: Any) -> None:
-            """Record the configured timeout."""
-            observed["timeout"] = timeout
-
-        async def __aenter__(self) -> Self:
-            """Enter the session context."""
-            return self
-
-        async def __aexit__(self, *_args: object) -> None:
-            """Exit the session context."""
-
-        def get(self, url: str, *, headers: Mapping[str, str]) -> FakeResponse:
-            """Capture one request and return a successful response context."""
-            observed["url"] = url
-            observed["headers"] = dict(headers)
-            return FakeResponse()
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(module, "validate_subrosa_token", validate_token)
     client = module.SubrosaExecutorClient(
         credential_store=SimpleNamespace(require=lambda _credential_id: "srk_test")
     )
@@ -767,9 +805,10 @@ def test_whoami_uses_browser_user_agent_and_keyring_token(
     )
 
     assert account["status"] == "active"
-    assert observed["url"] == "https://staging.subrosa.red/api/v1/extension/whoami"
-    assert observed["headers"]["Authorization"] == "Bearer srk_test"
-    assert observed["headers"]["User-Agent"].startswith("Mozilla/5.0")
+    assert observed == {
+        "relay_url": "wss://staging.subrosa.red/",
+        "token": "srk_test",
+    }
 
 
 def test_router_constructs_subrosa_client(

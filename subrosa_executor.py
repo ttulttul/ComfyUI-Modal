@@ -28,6 +28,11 @@ if __package__:
     from .serialization import deserialize_node_outputs, serialize_node_inputs
     from .settings import ModalSyncSettings, get_settings
     from .subrosa_credentials import SubrosaCredentialStore
+    from .subrosa_login import (
+        SubrosaLoginRequiredError,
+        require_saved_subrosa_token,
+        validate_subrosa_token,
+    )
 else:  # pragma: no cover - direct ComfyUI loading fallback.
     from durable_state import stable_remote_invocation_id
     from remote_protocol import (
@@ -41,6 +46,11 @@ else:  # pragma: no cover - direct ComfyUI loading fallback.
     from serialization import deserialize_node_outputs, serialize_node_inputs
     from settings import ModalSyncSettings, get_settings
     from subrosa_credentials import SubrosaCredentialStore
+    from subrosa_login import (
+        SubrosaLoginRequiredError,
+        require_saved_subrosa_token,
+        validate_subrosa_token,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -239,34 +249,8 @@ class SubrosaExecutorClient:
         credential_id: str,
     ) -> dict[str, Any]:
         """Validate a keyring-backed configuration against the relay REST API."""
-        token = self.credential_store.require(credential_id)
-        url = _http_base_url(relay_url) + "/api/v1/extension/whoami"
-        timeout = aiohttp.ClientTimeout(total=30.0)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": _USER_AGENT,
-        }
-        try:
-            async with (
-                aiohttp.ClientSession(timeout=timeout) as session,
-                session.get(url, headers=headers) as response,
-            ):
-                body = await response.json(content_type=None)
-                if response.status != 200:
-                    detail = _safe_error_message(body)
-                    raise SubrosaRelayRejectedError(
-                        f"Subrosa configuration validation failed with HTTP "
-                        f"{response.status}: {detail}"
-                    )
-        except (aiohttp.ClientError, TimeoutError) as exc:
-            raise SubrosaRemoteTransportError(
-                f"Subrosa configuration validation could not reach the relay: {exc}"
-            ) from exc
-        if not isinstance(body, dict):
-            raise SubrosaRemoteTransportError(
-                "Subrosa whoami returned an invalid response object."
-            )
-        return dict(body)
+        token = require_saved_subrosa_token(self.credential_store, credential_id)
+        return await validate_subrosa_token(relay_url, token)
 
     def _prepare_payload(
         self,
@@ -388,7 +372,8 @@ class SubrosaExecutorClient:
         credential_id = str(
             payload.get("credential_id") or payload.get("configuration_id") or ""
         ).strip()
-        token = self.credential_store.require(credential_id)
+        token = require_saved_subrosa_token(self.credential_store, credential_id)
+        await validate_subrosa_token(relay_url, token)
         invocation_id = _required_payload_string(payload, "invocation_id")
         headers = {
             "Authorization": f"Bearer {token}",
@@ -428,7 +413,9 @@ class SubrosaExecutorClient:
                     with self._active_relays_lock:
                         self._active_relays.pop(invocation_id, None)
         except aiohttp.WSServerHandshakeError as exc:
-            if exc.status in {401, 402, 404}:
+            if exc.status == 401:
+                raise SubrosaLoginRequiredError() from exc
+            if exc.status in {402, 404}:
                 raise SubrosaRelayRejectedError(
                     _handshake_rejection_message(exc.status)
                 ) from exc
@@ -656,16 +643,6 @@ def _required_payload_string(payload: Mapping[str, Any], key: str) -> str:
     return value
 
 
-def _http_base_url(relay_url: str) -> str:
-    """Convert one WebSocket relay base URL to its HTTP API base."""
-    normalized = relay_url.strip().rstrip("/")
-    if normalized.startswith("wss://"):
-        return "https://" + normalized.removeprefix("wss://")
-    if normalized.startswith("ws://"):
-        return "http://" + normalized.removeprefix("ws://")
-    raise ValueError("Subrosa relay_url must use ws:// or wss://.")
-
-
 def _safe_error_message(payload: Any) -> str:
     """Return a bounded error string without echoing credential-bearing fields."""
     if isinstance(payload, Mapping):
@@ -678,7 +655,6 @@ def _safe_error_message(payload: Any) -> str:
 def _handshake_rejection_message(status: int) -> str:
     """Return a credential-safe explanation for a relay upgrade rejection."""
     messages = {
-        401: "Subrosa rejected the extension token (HTTP 401).",
         402: "Subrosa account balance is insufficient for this pool (HTTP 402).",
         404: "Subrosa does not recognize the configured pool (HTTP 404).",
     }

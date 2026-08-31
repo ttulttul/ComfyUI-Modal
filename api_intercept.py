@@ -80,6 +80,7 @@ if __package__:
         request_macos_keychain_unlock,
     )
     from .cloudflare_oauth import setup_r2_oauth_routes
+    from .subrosa_login import setup_subrosa_login_routes
     from .remote_configuration_nodes import (
         REMOTE_CONFIGURATION_NODE_IDS,
         REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
@@ -257,6 +258,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
         request_macos_keychain_unlock,
     )
     from cloudflare_oauth import setup_r2_oauth_routes
+    from subrosa_login import setup_subrosa_login_routes
     from remote_configuration_nodes import (
         REMOTE_CONFIGURATION_NODE_IDS,
         REMOTE_EXECUTION_CONFIGURATOR_NODE_ID,
@@ -912,6 +914,7 @@ def setup_modal_queue_route(
         return
 
     setup_r2_oauth_routes(prompt_server)
+    setup_subrosa_login_routes(prompt_server)
     resolved_sync_engine = sync_engine or ModalAssetSyncEngine.from_environment(
         resolved_settings
     )
