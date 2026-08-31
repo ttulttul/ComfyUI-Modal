@@ -13,12 +13,20 @@ import aiohttp
 from aiohttp import web
 
 if __package__:
+    from .remote_configurations import (
+        RemoteConfigurationSet,
+        SubrosaRemoteConfiguration,
+    )
     from .subrosa_credentials import (
         SUBROSA_KEYCHAIN_UNLOCK_REQUIRED_CODE,
         SubrosaCredentialError,
         SubrosaCredentialStore,
     )
 else:  # pragma: no cover - direct ComfyUI loading fallback.
+    from remote_configurations import (
+        RemoteConfigurationSet,
+        SubrosaRemoteConfiguration,
+    )
     from subrosa_credentials import (
         SUBROSA_KEYCHAIN_UNLOCK_REQUIRED_CODE,
         SubrosaCredentialError,
@@ -58,6 +66,19 @@ class SubrosaLoginRequiredError(SubrosaLoginError):
             SUBROSA_LOGIN_REQUIRED_MESSAGE,
             code=SUBROSA_LOGIN_REQUIRED_CODE,
         )
+
+
+class SubrosaConfigurationValidationError(SubrosaLoginError):
+    """Attribute one queue-time credential failure to its configuration node."""
+
+    def __init__(
+        self,
+        configuration_id: str,
+        cause: SubrosaCredentialError | SubrosaLoginError,
+    ) -> None:
+        """Preserve the safe error and originating serialized node ID."""
+        super().__init__(str(cause), code=getattr(cause, "code", None))
+        self.configuration_id = configuration_id
 
 
 SessionFactory = Callable[..., Any]
@@ -159,6 +180,34 @@ def require_saved_subrosa_token(
         if exc.code == SUBROSA_KEYCHAIN_UNLOCK_REQUIRED_CODE:
             raise
         raise SubrosaLoginRequiredError() from exc
+
+
+async def preflight_subrosa_configurations(
+    configuration_set: RemoteConfigurationSet,
+    *,
+    credential_store: SubrosaCredentialStore | None = None,
+    session_factory: SessionFactory = aiohttp.ClientSession,
+) -> None:
+    """Validate connected Subrosa credentials before ComfyUI starts execution."""
+    store = credential_store or SubrosaCredentialStore()
+    for configuration in configuration_set.capacity_configurations:
+        if not isinstance(configuration, SubrosaRemoteConfiguration):
+            continue
+        try:
+            token = require_saved_subrosa_token(
+                store,
+                configuration.credential_id,
+            )
+            await validate_subrosa_token(
+                configuration.relay_url,
+                token,
+                session_factory=session_factory,
+            )
+        except (SubrosaCredentialError, SubrosaLoginError) as exc:
+            raise SubrosaConfigurationValidationError(
+                configuration.configuration_id,
+                exc,
+            ) from exc
 
 
 def setup_subrosa_login_routes(
@@ -278,9 +327,11 @@ __all__ = [
     "SUBROSA_CREDENTIAL_STATUS_ROUTE",
     "SUBROSA_LOGIN_REQUIRED_CODE",
     "SUBROSA_LOGIN_REQUIRED_MESSAGE",
+    "SubrosaConfigurationValidationError",
     "SubrosaLoginError",
     "SubrosaLoginRequiredError",
     "SubrosaLoginService",
+    "preflight_subrosa_configurations",
     "require_saved_subrosa_token",
     "setup_subrosa_login_routes",
     "validate_subrosa_token",

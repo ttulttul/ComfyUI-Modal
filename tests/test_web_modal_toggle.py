@@ -46,6 +46,16 @@ def test_remote_queue_returns_before_capacity_preparation_finishes() -> None:
     assert "if (remoteNodeIds.length === 0)" in source
 
 
+def test_queue_failure_highlights_attributed_configuration_node() -> None:
+    """A provider preflight error should not paint an unrelated workflow node red."""
+    source = _modal_toggle_source()
+
+    assert "error?.modalQueueResponse?.node_errors" in source
+    assert "attributedNodeIds.length > 0 ? attributedNodeIds : remoteNodeIds" in source
+    assert 'String(detail.failed_node_id ?? "")' in source
+    assert "setNodesPhase([failedNodeId], STATE_ERROR" in source
+
+
 def test_global_modal_status_badge_is_installed() -> None:
     """The frontend should expose a dedicated global Modal activity indicator."""
     source = _modal_toggle_source()

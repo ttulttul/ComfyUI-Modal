@@ -138,6 +138,36 @@ def test_modal_ui_event_replay_is_client_scoped(modal_ui_events_module: Any) -> 
     assert modal_ui_events_module.modal_ui_events_for_client(None) == []
 
 
+def test_modal_status_preserves_attributed_failure_node(
+    modal_ui_events_module: Any,
+) -> None:
+    """Queue failures should tell the frontend which configuration to highlight."""
+
+    class FakePromptServer:
+        """Capture one status event."""
+
+        def __init__(self) -> None:
+            """Initialize the event sink."""
+            self.messages: list[tuple[str, dict[str, Any], str | None]] = []
+
+        def send_sync(self, event: str, data: dict[str, Any], sid: str | None) -> None:
+            """Record an emitted websocket message."""
+            self.messages.append((event, data, sid))
+
+    prompt_server = FakePromptServer()
+    modal_ui_events_module._emit_modal_status(
+        prompt_server=prompt_server,
+        phase="error",
+        client_id="client-1",
+        prompt_id="prompt-1",
+        node_ids=["7"],
+        failed_node_id="42",
+        error_message="Click Login again.",
+    )
+
+    assert prompt_server.messages[0][1]["failed_node_id"] == "42"
+
+
 def test_modal_telemetry_replay_coalesces_each_execution_source(
     modal_ui_events_module: Any,
 ) -> None:

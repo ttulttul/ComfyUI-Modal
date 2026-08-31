@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 from aiohttp import web
 
@@ -20,13 +20,22 @@ if __package__:
         _queued_ssh_environment_ids,
         _set_remote_preparation,
     )
+    from .remote_configuration_nodes import compile_remote_configuration_set
     from .remote_graph_analysis import (
         analyze_remote_node_selection,
         requested_remote_node_ids,
     )
     from .remote_plan_types import ModalPromptValidationError, RewriteSummary
     from .route_context import RouteContext
-    from .settings import ModalSyncSettings, modal_gpu_from_workflow, settings_for_modal_gpu
+    from .settings import (
+        ModalSyncSettings,
+        modal_gpu_from_workflow,
+        settings_for_modal_gpu,
+    )
+    from .subrosa_login import (
+        SubrosaConfigurationValidationError,
+        preflight_subrosa_configurations,
+    )
     from .sync_engine import (
         SyncCancelledError,
         begin_r2_writeback_prompt,
@@ -41,13 +50,22 @@ else:  # pragma: no cover - flat import inside the Modal container.
         _queued_ssh_environment_ids,
         _set_remote_preparation,
     )
+    from remote_configuration_nodes import compile_remote_configuration_set
     from remote_graph_analysis import (
         analyze_remote_node_selection,
         requested_remote_node_ids,
     )
     from remote_plan_types import ModalPromptValidationError, RewriteSummary
     from route_context import RouteContext
-    from settings import ModalSyncSettings, modal_gpu_from_workflow, settings_for_modal_gpu
+    from settings import (
+        ModalSyncSettings,
+        modal_gpu_from_workflow,
+        settings_for_modal_gpu,
+    )
+    from subrosa_login import (
+        SubrosaConfigurationValidationError,
+        preflight_subrosa_configurations,
+    )
     from sync_engine import (
         SyncCancelledError,
         begin_r2_writeback_prompt,
@@ -152,6 +170,19 @@ def _resolve_queue_settings(ctx: RouteContext, state: _QueueRequestState) -> Non
         else state.request_settings.modal_gpu
     )
     state.request_modal_gpu = state.status_modal_gpu
+
+
+async def _preflight_queue_credentials(state: _QueueRequestState) -> None:
+    """Validate connected provider credentials before prompt rewriting or execution."""
+    assert state.json_data is not None
+    try:
+        configuration_set = compile_remote_configuration_set(
+            state.json_data.get("prompt", {})
+        )
+    except (TypeError, ValueError) as exc:
+        raise ModalPromptValidationError(str(exc)) from exc
+    if configuration_set is not None:
+        await preflight_subrosa_configurations(configuration_set)
 
 
 def _emit_setup_status(
@@ -358,6 +389,9 @@ def _queue_error_response(
     status: int,
 ) -> web.Response:
     """Emit request-scoped UI failure state and return a JSON error response."""
+    failed_node_id = str(
+        getattr(exc, "configuration_id", "") or ""
+    ).strip()
     if state.json_data is not None:
         kwargs = {
             "status_message": str(exc)
@@ -373,16 +407,51 @@ def _queue_error_response(
             node_ids=state.remote_node_ids,
             configurator_node_id=state.configurator_node_id,
             modal_gpu=state.request_modal_gpu,
+            failed_node_id=failed_node_id or None,
             **{key: value for key, value in kwargs.items() if value is not None},
         )
+    node_errors = _queue_node_errors(state, exc, failed_node_id)
+    error: str | dict[str, Any] = str(exc)
+    if failed_node_id:
+        error = {
+            "type": getattr(exc, "code", None) or "provider_configuration_invalid",
+            "message": "Subrosa Configuration failed validation",
+            "details": str(exc),
+            "extra_info": {"node_id": failed_node_id},
+        }
     return web.json_response(
         {
-            "error": str(exc),
-            "node_errors": [],
+            "error": error,
+            "node_errors": node_errors,
             **({"cancelled": True} if phase == "execution_interrupted" else {}),
         },
         status=status,
     )
+
+
+def _queue_node_errors(
+    state: _QueueRequestState,
+    exc: BaseException,
+    failed_node_id: str,
+) -> dict[str, Any]:
+    """Build ComfyUI-compatible validation errors for an attributed queue failure."""
+    if not failed_node_id or state.json_data is None:
+        return {}
+    prompt_node = state.json_data.get("prompt", {}).get(failed_node_id, {})
+    class_type = str(prompt_node.get("class_type") or "SubrosaRemoteConfiguration")
+    reason = {
+        "type": getattr(exc, "code", None) or "provider_configuration_invalid",
+        "message": "Subrosa Configuration failed validation",
+        "details": str(exc),
+        "extra_info": {},
+    }
+    return {
+        failed_node_id: {
+            "errors": [reason],
+            "dependent_outputs": [],
+            "class_type": class_type,
+        }
+    }
 
 
 async def _handle_modal_queue_prompt(
@@ -402,6 +471,7 @@ async def _handle_modal_queue_prompt(
                 "No workflow nodes are marked for Modal execution; forwarding prompt without Modal status or rewrite."
             )
             return await _queue_prompt_json(prompt_server, state.json_data)
+        await _preflight_queue_credentials(state)
         _reserve_queue_preparation(prompt_server, state)
         _resolve_queue_settings(ctx, state)
         if "prompt" in state.json_data:
@@ -425,6 +495,15 @@ async def _handle_modal_queue_prompt(
         )
     except ModalPromptValidationError as exc:
         logger.exception("Modal prompt validation failed.")
+        return _queue_error_response(
+            prompt_server, ctx, state, exc, phase="error", status=400
+        )
+    except SubrosaConfigurationValidationError as exc:
+        logger.info(
+            "Subrosa configuration credential preflight failed node_id=%s: %s",
+            exc.configuration_id,
+            exc,
+        )
         return _queue_error_response(
             prompt_server, ctx, state, exc, phase="error", status=400
         )

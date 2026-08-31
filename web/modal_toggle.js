@@ -6592,6 +6592,10 @@ function handleModalStatus(event) {
     setRemoteConfiguratorTerminalStatus(promptId, STATE_ERROR, errorMessage);
     setTimeout(() => clearGlobalStatusPhase(promptId), ERROR_CLEAR_DELAY_MS);
     clearPromptRemoteNodeVisuals(promptId);
+    const failedNodeId = String(detail.failed_node_id ?? "");
+    if (failedNodeId) {
+      setNodesPhase([failedNodeId], STATE_ERROR, promptId, errorMessage);
+    }
     markPromptTerminal(promptId, STATE_ERROR);
     return;
   }
@@ -7019,9 +7023,10 @@ function reportBackgroundQueueFailure(remoteNodeIds, promptId, error) {
     return;
   }
   const message = queueErrorMessage(error);
+  const attributedNodeIds = Object.keys(error?.modalQueueResponse?.node_errors ?? {});
   clearPromptQueued(promptId);
   endSyntheticExecutionUi(promptId, true, message);
-  markQueueFailure(remoteNodeIds, promptId, error);
+  markQueueFailure(attributedNodeIds.length > 0 ? attributedNodeIds : remoteNodeIds, promptId, error);
   setRemoteConfiguratorTerminalStatus(promptId, STATE_ERROR, message);
   console.error(`Remote queue submission failed for prompt ${promptId}.`, error);
 }

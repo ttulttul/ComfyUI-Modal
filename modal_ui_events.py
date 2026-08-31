@@ -35,6 +35,7 @@ def _emit_modal_status(
     status_current: int | None = None,
     status_total: int | None = None,
     execution_environment_id: str | None = None,
+    failed_node_id: str | None = None,
     remote_execution_assignments: Mapping[str, Mapping[str, Any]] | None = None,
     remote_execution_configurations: Sequence[Mapping[str, Any]] | None = None,
 ) -> None:
@@ -80,6 +81,8 @@ def _emit_modal_status(
         payload["status_total"] = int(status_total)
     if execution_environment_id is not None:
         payload["execution_environment_id"] = execution_environment_id
+    if failed_node_id is not None:
+        payload["failed_node_id"] = failed_node_id
     if remote_execution_assignments is not None:
         payload["remote_execution_assignments"] = copy.deepcopy(
             dict(remote_execution_assignments)

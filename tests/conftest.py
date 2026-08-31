@@ -164,6 +164,12 @@ def subrosa_login_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def routes_queue_module(extension_package: object) -> object:
+    """Return the queue interception route boundary."""
+    return importlib.import_module(f"{PACKAGE_NAME}.routes_queue")
+
+
+@pytest.fixture(scope="session")
 def subrosa_sync_module(extension_package: object) -> object:
     """Return the milestone Subrosa sync module."""
     return importlib.import_module(f"{PACKAGE_NAME}.subrosa_sync")

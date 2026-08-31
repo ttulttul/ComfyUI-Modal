@@ -24,6 +24,10 @@ class _CredentialStore:
         """Load one token by reference."""
         return self.values.get(credential_id)
 
+    def require(self, credential_id: str) -> str:
+        """Load one required token by reference."""
+        return self.values[credential_id]
+
 
 class _Response:
     """Return one configured whoami response."""
@@ -146,6 +150,40 @@ def test_token_validation_rejects_an_untrusted_relay_before_sending(
         )
 
     assert _Session.requests == []
+
+
+def test_queue_preflight_attributes_rejected_token_to_subrosa_node(
+    subrosa_login_module: Any,
+    remote_configurations_module: Any,
+) -> None:
+    """Credential rejection before queueing should retain its configuration ID."""
+    _Session.response = _Response(401, {"error": "invalid token"})
+    configuration = remote_configurations_module.SubrosaRemoteConfiguration(
+        configuration_id="42",
+        display_name="Subrosa staging",
+        relay_url="wss://staging.subrosa.red",
+        pool="RTX-PRO-6000",
+        credential_id="subrosa-default",
+    )
+    configuration_set = remote_configurations_module.RemoteConfigurationSet(
+        (configuration,)
+    )
+
+    with pytest.raises(
+        subrosa_login_module.SubrosaConfigurationValidationError,
+        match="Click.*Login to Subrosa",
+    ) as exc_info:
+        asyncio.run(
+            subrosa_login_module.preflight_subrosa_configurations(
+                configuration_set,
+                credential_store=_CredentialStore(
+                    {"subrosa-default": "srk_rejected"}
+                ),
+                session_factory=_Session,
+            )
+        )
+
+    assert exc_info.value.configuration_id == "42"
 
 
 def test_import_validates_before_saving_and_never_returns_token(

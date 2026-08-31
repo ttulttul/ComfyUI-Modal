@@ -4,6 +4,142 @@ from __future__ import annotations
 
 from api_intercept_test_support import *  # noqa: F401,F403
 
+
+def test_attributed_queue_error_targets_subrosa_configuration_node(
+    routes_queue_module: Any,
+    subrosa_login_module: Any,
+) -> None:
+    """Queue credential failures should use ComfyUI's node-error shape."""
+    emitted: list[dict[str, Any]] = []
+    context = SimpleNamespace(emit_status=lambda **kwargs: emitted.append(kwargs))
+    state = routes_queue_module._QueueRequestState(
+        json_data={
+            "prompt": {
+                "42": {
+                    "class_type": "SubrosaRemoteConfiguration",
+                    "inputs": {},
+                }
+            }
+        },
+        remote_node_ids=["7"],
+        client_id="client-1",
+        prompt_id="prompt-1",
+    )
+    error = subrosa_login_module.SubrosaConfigurationValidationError(
+        "42",
+        subrosa_login_module.SubrosaLoginRequiredError(),
+    )
+
+    response = routes_queue_module._queue_error_response(
+        object(),
+        context,
+        state,
+        error,
+        phase="error",
+        status=400,
+    )
+    payload = json.loads(response.text)
+
+    assert payload["error"]["type"] == "subrosa_login_required"
+    assert payload["error"]["extra_info"]["node_id"] == "42"
+    assert payload["node_errors"] == {
+        "42": {
+            "errors": [
+                {
+                    "type": "subrosa_login_required",
+                    "message": "Subrosa Configuration failed validation",
+                    "details": subrosa_login_module.SUBROSA_LOGIN_REQUIRED_MESSAGE,
+                    "extra_info": {},
+                }
+            ],
+            "dependent_outputs": [],
+            "class_type": "SubrosaRemoteConfiguration",
+        }
+    }
+    assert emitted[0]["failed_node_id"] == "42"
+
+
+def test_invalid_subrosa_token_stops_before_rewrite_and_comfyui_execution(
+    routes_queue_module: Any,
+    subrosa_login_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The queue boundary must reject credentials before handing off the prompt."""
+
+    class FakeRequest:
+        """Return one remote prompt with a connected Subrosa configuration."""
+
+        async def json(self) -> dict[str, Any]:
+            """Return the serialized queue body."""
+            return {
+                "prompt_id": "prompt-1",
+                "client_id": "client-1",
+                "prompt": {
+                    "7": {"class_type": "NextSeeds", "inputs": {}},
+                    "42": {
+                        "class_type": "SubrosaRemoteConfiguration",
+                        "inputs": {
+                            "configuration_name": "Subrosa staging",
+                            "relay_url": "wss://staging.subrosa.red",
+                            "pool": "RTX-PRO-6000",
+                            "credential_id": "subrosa-default",
+                        },
+                    },
+                    "99": {
+                        "class_type": "RemoteExecutionConfigurator",
+                        "inputs": {"configuration_0": ["42", 0]},
+                    },
+                },
+                "extra_data": {},
+            }
+
+    async def reject_preflight(_configuration_set: Any) -> None:
+        """Model one invalid saved extension token."""
+        raise subrosa_login_module.SubrosaConfigurationValidationError(
+            "42",
+            subrosa_login_module.SubrosaLoginRequiredError(),
+        )
+
+    async def fail_queue(*_args: Any, **_kwargs: Any) -> None:
+        """Fail if the prompt reaches ComfyUI's execution queue."""
+        raise AssertionError("invalid credentials must stop before ComfyUI execution")
+
+    async def fail_rewrite(*_args: Any, **_kwargs: Any) -> None:
+        """Fail if credential validation occurs after prompt rewriting."""
+        raise AssertionError("invalid credentials must stop before prompt rewriting")
+
+    emitted: list[dict[str, Any]] = []
+    context = SimpleNamespace(
+        settings=object(),
+        configurator_node_id=lambda _prompt: "99",
+        emit_status=lambda **kwargs: emitted.append(kwargs),
+        rewrite_prompt=fail_rewrite,
+    )
+    monkeypatch.setattr(
+        routes_queue_module,
+        "requested_remote_node_ids",
+        lambda **_kwargs: {"7"},
+    )
+    monkeypatch.setattr(
+        routes_queue_module,
+        "preflight_subrosa_configurations",
+        reject_preflight,
+    )
+    monkeypatch.setattr(routes_queue_module, "_queue_prompt_json", fail_queue)
+
+    response = asyncio.run(
+        routes_queue_module._handle_modal_queue_prompt(
+            FakeRequest(),
+            object(),
+            context,
+        )
+    )
+    payload = json.loads(response.text)
+
+    assert response.status == 400
+    assert list(payload["node_errors"]) == ["42"]
+    assert emitted[0]["failed_node_id"] == "42"
+
 def test_queue_prompt_route_does_not_warm_modal_at_queue_time(
     api_intercept_module: Any,
     prompt_interception_module: Any,
@@ -316,4 +452,3 @@ def test_cancel_preparation_route_is_queue_route_sibling(
     assert api_intercept_module._container_status_route_path("/custom/modal") == (
         "/custom/modal/container_status"
     )
-

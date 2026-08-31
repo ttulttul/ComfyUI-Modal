@@ -777,6 +777,14 @@ input: both the browser handoff and backend validation must restrict token
 delivery to service-owned HTTPS origins (with an explicit loopback development
 exception).
 
+Queue-time provider validation should retain the serialized configuration node
+ID. Returning ComfyUI's normal `node_errors` shape and carrying the same ID in
+out-of-band setup status lets the frontend mark the provider configuration,
+rather than whichever downstream proxy happens to make the first authenticated
+request. Run this preflight before prompt rewriting and before handing the
+prompt to ComfyUI; a configuration node's ordinary execution order is not an
+adequate barrier for independent graph branches.
+
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.
