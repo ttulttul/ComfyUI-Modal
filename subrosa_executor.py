@@ -380,6 +380,9 @@ class SubrosaExecutorClient:
             "X-Subrosa-Pool": pool,
             "User-Agent": _USER_AGENT,
         }
+        asset_manifest_id = str(payload.get("asset_manifest_id") or "").strip()
+        if asset_manifest_id:
+            headers["X-Subrosa-Asset-Manifest"] = asset_manifest_id
         timeout = aiohttp.ClientTimeout(total=None, connect=30.0, sock_read=None)
         try:
             async with (

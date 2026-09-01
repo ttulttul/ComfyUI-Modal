@@ -796,3 +796,11 @@ response must not overwrite a newer authentication-required event.
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.
+
+## A static service worker needs a dynamic asset plane, not dynamic deploys
+
+A single deployed Modal app can serve arbitrary ComfyUI workflows when its image is treated as the stable ABI and user models, custom-node archives, and Python requirements are treated as an authenticated runtime manifest. Reuse the existing content-addressed scanner and path rewriting, but replace provider-specific Volume writes with short-lived exact-object uploads; the relay payload should contain only an opaque manifest reference.
+
+Custom nodes are arbitrary code, so cache design and process lifecycle are one security decision. A globally mounted plaintext Volume, a secret-bearing child environment, or a warm kernel reused across accounts defeats account authorization even if the manifest API itself is correct. Stage into a hashed account subpath, mount only that subpath, remove service credentials from the child environment, and drop the kernel to an unprivileged UID. The worker affinity boundary must be account plus immutable manifest rather than one relay job: split proxy jobs need the same kernel for live session bridges, while a different workflow manifest must never enter it. Dependency caches must use the same account boundary and a reproducible fingerprint rather than copying a platform-specific local virtual environment.
+
+Model sizes also make transport limits part of correctness. A content-addressed service that supports only one presigned PUT silently excludes checkpoints above the object store's single-request ceiling. Negotiate multipart uploads, sign each exact part, require ordered ETags at completion, and verify SHA-256 plus byte size again before publishing the manifest or worker cache path.

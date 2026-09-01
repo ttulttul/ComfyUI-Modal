@@ -227,6 +227,12 @@ def _prepare_environment_assets(
                 status_callback=environment_callback,
             )
         )
+        finalize_manifest = getattr(sync_engine, "finalize_manifest", None)
+        asset_manifest_id = (
+            str(finalize_manifest()).strip()
+            if callable(finalize_manifest)
+            else None
+        )
     if environment_callback is not None:
         environment_callback(completion_message, None, None)
     logger.info(
@@ -241,6 +247,7 @@ def _prepare_environment_assets(
         custom_nodes_bundle=custom_nodes_bundle,
         component_prompts=component_prompts,
         assets_by_component_id=assets_by_component_id,
+        asset_manifest_id=asset_manifest_id,
     )
 
 
@@ -369,6 +376,7 @@ class _PromptRewriteState:
         default_factory=dict
     )
     mapped_proxy_component_ids: set[str] = field(default_factory=set)
+    asset_manifest_ids_by_environment: dict[str, str] = field(default_factory=dict)
 
 
 def _analyze_remote_components(
@@ -614,11 +622,29 @@ def _sync_engine_for_assignment(
         return sync_engine
     if assignment.provider is ExecutionProvider.SUBROSA:
         if __package__:
-            from .subrosa_sync import subrosa_noop_sync_engine
+            from .remote_configurations import SubrosaRemoteConfiguration
+            from .subrosa_sync import subrosa_asset_sync_engine
         else:  # pragma: no cover - flat Modal-container import.
-            from subrosa_sync import subrosa_noop_sync_engine
+            from remote_configurations import SubrosaRemoteConfiguration
+            from subrosa_sync import subrosa_asset_sync_engine
 
-        return subrosa_noop_sync_engine(state.settings, cancellation_check)
+        if state.execution_plan is None or assignment.configuration_id is None:
+            raise ModalPromptValidationError(
+                "Subrosa assignment has no compiled configuration."
+            )
+        configuration = state.execution_plan.configurations_by_id.get(
+            assignment.configuration_id
+        )
+        if not isinstance(configuration, SubrosaRemoteConfiguration):
+            raise ModalPromptValidationError(
+                "Subrosa assignment references an invalid configuration."
+            )
+        return subrosa_asset_sync_engine(
+            state.settings,
+            cancellation_check,
+            relay_url=configuration.relay_url,
+            credential_id=configuration.credential_id,
+        )
     host = state.ssh_hosts.get(assignment.environment_id)
     if host is None:
         raise ModalPromptValidationError(
@@ -649,6 +675,11 @@ def _record_environment_preparations(
     preparations: dict[str, _EnvironmentAssetPreparationResult],
 ) -> None:
     """Record custom-node bundles, synced component prompts, and unique assets."""
+    state.asset_manifest_ids_by_environment = {
+        environment_id: preparation.asset_manifest_id
+        for environment_id, preparation in preparations.items()
+        if preparation.asset_manifest_id
+    }
     if state.settings.sync_custom_nodes:
         state.summary.custom_nodes_bundles_by_environment = {
             environment_id: preparation.custom_nodes_bundle
@@ -694,6 +725,11 @@ def _prepare_rewrite_assets(
     environment_status_callback: EnvironmentSetupStatusCallback | None,
 ) -> None:
     """Prepare all environment assets and record their component-scoped results."""
+    if __package__:
+        from .subrosa_sync import SubrosaAssetSyncError
+    else:  # pragma: no cover - flat Modal-container import.
+        from subrosa_sync import SubrosaAssetSyncError
+
     if status_callback is not None:
         status_callback("Preparing assets for remote execution", None, None)
     try:
@@ -706,7 +742,7 @@ def _prepare_rewrite_assets(
             status_callback=status_callback,
             environment_status_callback=environment_status_callback,
         )
-    except R2CacheError as exc:
+    except (R2CacheError, SubrosaAssetSyncError) as exc:
         raise ModalPromptValidationError(str(exc)) from exc
     _record_environment_preparations(state, preparations)
 
@@ -802,6 +838,11 @@ def _build_stamped_component_payload(
             vast_leases_by_environment=state.vast_leases,
         ),
     )
+    asset_manifest_id = state.asset_manifest_ids_by_environment.get(
+        assignment.environment_id
+    )
+    if asset_manifest_id is not None:
+        payload["asset_manifest_id"] = asset_manifest_id
     implicitly_mapped_sources = _implicitly_mapped_boundary_output_sources(
         component=component,
         original_prompt=state.prompt,

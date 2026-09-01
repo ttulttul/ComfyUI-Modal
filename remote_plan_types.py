@@ -180,6 +180,7 @@ class _EnvironmentAssetPreparationResult:
     custom_nodes_bundle: SyncedAsset | None
     component_prompts: dict[str, dict[str, Any]]
     assets_by_component_id: dict[str, list[SyncedAsset]]
+    asset_manifest_id: str | None = None
 
 
 @dataclass(frozen=True)

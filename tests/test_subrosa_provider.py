@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -466,22 +467,245 @@ def test_subrosa_provider_metadata_contains_relay_reference_only(
     assert "srk_" not in json.dumps(metadata)
 
 
-def test_subrosa_noop_sync_preserves_inputs(
+def test_subrosa_sync_uploads_content_and_creates_manifest(
     subrosa_sync_module: Any,
     settings_module: Any,
+    tmp_path: Any,
 ) -> None:
-    """The mock milestone must skip uploads without rewriting model paths."""
-    engine = subrosa_sync_module.subrosa_noop_sync_engine(
-        settings_module.get_settings(),
-        None,
+    """Subrosa should reuse discovery while uploading and manifesting exact bytes."""
+    from dataclasses import replace
+
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    class Response:
+        """Provide the small requests.Response surface used by the asset API."""
+
+        def __init__(
+            self,
+            status_code: int,
+            payload: dict[str, Any],
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            """Retain one deterministic status and JSON object."""
+            self.status_code = status_code
+            self.payload = payload
+            self.headers = headers or {}
+
+        def json(self) -> dict[str, Any]:
+            """Return the configured JSON object."""
+            return self.payload
+
+    def request(method: str, url: str, **kwargs: Any) -> Response:
+        """Model prepare, presigned upload, and immutable manifest creation."""
+        calls.append((method, url, kwargs))
+        if url.endswith("/objects/prepare"):
+            return Response(
+                200,
+                {
+                    "exists": False,
+                    "upload_url": "https://r2.test/exact-object?signature=test",
+                    "upload_headers": {"x-amz-meta-sha256": kwargs["json"]["sha256"]},
+                },
+            )
+        if url.endswith("/manifests"):
+            return Response(201, {"manifest_id": "manifest-test"})
+        return Response(200, {})
+
+    local_path = tmp_path / "model.safetensors"
+    local_path.write_bytes(b"model bytes")
+    api = subrosa_sync_module.SubrosaAssetApi(
+        relay_url="wss://beta.subrosa.red",
+        token="srk_test",
+        request=request,
     )
-    inputs = {"ckpt_name": "models/checkpoint.safetensors", "seed": 7}
+    backend = subrosa_sync_module.SubrosaAssetVolumeBackend(api)
+    engine = subrosa_sync_module.SubrosaAssetSyncEngine(
+        volume=backend,
+        settings=replace(
+            settings_module.get_settings(),
+            custom_nodes_dir=None,
+            local_storage_root=tmp_path / "cache",
+        ),
+        cancellation_check=None,
+    )
 
-    rewritten, assets = engine.sync_prompt_inputs(inputs)
+    asset = engine.sync_file(local_path)
+    manifest_id = engine.finalize_manifest()
 
-    assert rewritten == inputs
-    assert assets == []
-    assert engine.volume.exists("/anything") is True
+    assert asset.remote_path.endswith("_model.safetensors")
+    assert manifest_id == "manifest-test"
+    put_call = next(call for call in calls if call[1].startswith("https://r2.test/"))
+    assert put_call[2]["headers"]["Content-Length"] == str(len(b"model bytes"))
+    manifest_call = next(call for call in calls if call[1].endswith("/manifests"))
+    assert manifest_call[2]["headers"]["Authorization"] == "Bearer srk_test"
+    assert manifest_call[2]["json"]["assets"] == [
+        {
+            "remote_path": asset.remote_path,
+            "sha256": asset.sha256,
+            "size_bytes": len(b"model bytes"),
+            "kind": "model",
+        }
+    ]
+
+
+def test_subrosa_sync_multipart_uploads_large_asset_parts(
+    subrosa_sync_module: Any,
+    tmp_path: Any,
+) -> None:
+    """Files above the service threshold must complete through ordered R2 parts."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    class Response:
+        """Provide deterministic JSON and ETag response metadata."""
+
+        def __init__(
+            self,
+            status_code: int,
+            payload: dict[str, Any],
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            """Retain one fake HTTP response."""
+            self.status_code = status_code
+            self.payload = payload
+            self.headers = headers or {}
+
+        def json(self) -> dict[str, Any]:
+            """Return the configured JSON object."""
+            return self.payload
+
+    part_capabilities = iter(("https://r2.test/part-1", "https://r2.test/part-2"))
+
+    def request(method: str, url: str, **kwargs: Any) -> Response:
+        """Model a two-part upload and completion."""
+        calls.append((method, url, kwargs))
+        if url.endswith("/objects/prepare"):
+            return Response(
+                200,
+                {
+                    "exists": False,
+                    "multipart": {
+                        "upload_id": "upload-test",
+                        "part_size_bytes": 3,
+                        "part_count": 2,
+                    },
+                },
+            )
+        if url.endswith("/multipart/part"):
+            return Response(200, {"upload_url": next(part_capabilities)})
+        if url.endswith("/multipart/complete"):
+            return Response(200, {"completed": True})
+        part_number = url.rsplit("-", maxsplit=1)[-1]
+        return Response(200, {}, {"ETag": f'"etag-{part_number}"'})
+
+    local_path = tmp_path / "large.safetensors"
+    local_path.write_bytes(b"abcdef")
+    api = subrosa_sync_module.SubrosaAssetApi(
+        relay_url="wss://beta.subrosa.red",
+        token="srk_test",
+        request=request,
+    )
+
+    assert api.upload_file(
+        local_path,
+        "/assets/large.safetensors",
+        sha256=hashlib.sha256(b"abcdef").hexdigest(),
+    ) is True
+    part_puts = [call for call in calls if call[1].startswith("https://r2.test/part-")]
+    assert [call[2]["data"] for call in part_puts] == [b"abc", b"def"]
+    completion = next(call for call in calls if call[1].endswith("/multipart/complete"))
+    assert completion[2]["json"]["parts"] == [
+        {"part_number": 1, "etag": '"etag-1"'},
+        {"part_number": 2, "etag": '"etag-2"'},
+    ]
+
+
+def test_subrosa_sync_aborts_failed_multipart_upload(
+    subrosa_sync_module: Any,
+    tmp_path: Any,
+) -> None:
+    """A failed part must release its incomplete R2 multipart upload."""
+    calls: list[str] = []
+
+    class Response:
+        """Provide the response fields exercised by multipart cleanup."""
+
+        def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+            """Retain one deterministic status and payload."""
+            self.status_code = status_code
+            self.payload = payload
+            self.headers: dict[str, str] = {}
+
+        def json(self) -> dict[str, Any]:
+            """Return the configured payload."""
+            return self.payload
+
+    def request(method: str, url: str, **_kwargs: Any) -> Response:
+        """Fail the part PUT and accept the subsequent abort."""
+        calls.append(url)
+        if url.endswith("/objects/prepare"):
+            return Response(
+                200,
+                {
+                    "exists": False,
+                    "multipart": {
+                        "upload_id": "upload-failed",
+                        "part_size_bytes": 3,
+                        "part_count": 1,
+                    },
+                },
+            )
+        if url.endswith("/multipart/part"):
+            return Response(200, {"upload_url": "https://r2.test/failed-part"})
+        if url.endswith("/multipart/abort"):
+            return Response(200, {"aborted": True})
+        return Response(500, {})
+
+    local_path = tmp_path / "failed.safetensors"
+    local_path.write_bytes(b"abc")
+    api = subrosa_sync_module.SubrosaAssetApi(
+        relay_url="wss://beta.subrosa.red",
+        token="srk_test",
+        request=request,
+    )
+
+    with pytest.raises(subrosa_sync_module.SubrosaAssetSyncError):
+        api.upload_file(
+            local_path,
+            "/assets/failed.safetensors",
+            sha256=hashlib.sha256(b"abc").hexdigest(),
+        )
+
+    assert any(url.endswith("/multipart/abort") for url in calls)
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "private-node @ file:///Users/example/private-node",
+        "private-node @ ../private-node",
+        "private-node @ https://user:secret@example.test/node.whl",
+        "private-node @ https://example.test/node.whl?token=secret",
+        "private-node==${PRIVATE_NODE_VERSION}",
+    ],
+)
+def test_subrosa_sync_rejects_private_or_local_requirements(
+    subrosa_sync_module: Any,
+    requirement: str,
+) -> None:
+    """Dependency metadata must not leak local paths or credentials to Subrosa."""
+    with pytest.raises(subrosa_sync_module.SubrosaAssetSyncError):
+        subrosa_sync_module._validated_remote_requirements((requirement,))
+
+
+def test_subrosa_sync_accepts_public_https_direct_requirement(
+    subrosa_sync_module: Any,
+) -> None:
+    """Public immutable package URLs remain available to custom nodes."""
+    requirement = "public-node @ https://example.test/public-node.whl"
+
+    assert subrosa_sync_module._validated_remote_requirements((requirement,)) == (
+        requirement,
+    )
 
 
 def test_lane_zero_decoder_reassembles_arbitrary_chunks(
@@ -633,6 +857,7 @@ def test_run_relay_uses_stable_credential_id_instead_of_configuration_id(
     module = subrosa_executor_module
     websocket = _FakeWebSocket()
     queried_ids: list[str] = []
+    websocket_headers: dict[str, str] = {}
 
     class CredentialStore:
         """Return a token only for the stable keyring account name."""
@@ -658,8 +883,9 @@ def test_run_relay_uses_stable_credential_id_instead_of_configuration_id(
         async def __aexit__(self, *_args: object) -> None:
             """Exit the fake client session."""
 
-        def ws_connect(self, *_args: Any, **_kwargs: Any) -> _FakeWebSocket:
+        def ws_connect(self, *_args: Any, **kwargs: Any) -> _FakeWebSocket:
             """Return the fake active relay socket."""
+            websocket_headers.update(kwargs["headers"])
             return websocket
 
     client = module.SubrosaExecutorClient(
@@ -704,6 +930,7 @@ def test_run_relay_uses_stable_credential_id_instead_of_configuration_id(
                 "pool": "mock-4090",
                 "configuration_id": "42",
                 "credential_id": "subrosa-default",
+                "asset_manifest_id": "manifest-test",
             },
             b"inputs",
             events.append,
@@ -711,6 +938,7 @@ def test_run_relay_uses_stable_credential_id_instead_of_configuration_id(
     )
 
     assert queried_ids == ["subrosa-default"]
+    assert websocket_headers["X-Subrosa-Asset-Manifest"] == "manifest-test"
     assert events == [{"kind": "result", "outputs": b"outputs"}]
 
 

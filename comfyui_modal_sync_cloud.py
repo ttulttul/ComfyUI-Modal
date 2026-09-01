@@ -626,7 +626,11 @@ configure_cloud_prompt_server_hooks(
 )
 
 
-if modal is not None:  # pragma: no branch - remote entrypoint configuration.
+if modal is not None and os.getenv("COMFY_MODAL_SUPPRESS_ENTRYPOINT") != "1":
+    # Subprocess workers reuse the provider-neutral execution kernel inside an
+    # already-running Modal function. They must not construct a second Modal
+    # app or shared Dict handles, especially when executing untrusted custom
+    # nodes under a stripped local environment.
     settings = globals().get("__comfy_modal_settings_override__") or get_settings()
     __comfy_modal_gpu__ = settings.modal_gpu
     __comfy_modal_app_name__ = modal_deployment_app_name(settings)
