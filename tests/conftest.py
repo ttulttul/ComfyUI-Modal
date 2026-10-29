@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import importlib
-import importlib.machinery
 import importlib.util
 import os
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -30,58 +28,6 @@ def _comfyui_root() -> Path:
 
 def _ensure_import_paths() -> None:
     """Add the repository and local ComfyUI checkout to sys.path when present."""
-    if "av" not in sys.modules:
-        av_module = types.ModuleType("av")
-        av_module.__spec__ = importlib.machinery.ModuleSpec("av", loader=None)
-        av_module.__path__ = []
-        av_module.open = lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("The av stub should not be used in tests.")
-        )
-        av_module.time_base = 1
-        av_module.VideoStream = type("VideoStream", (), {})
-        av_module.AVError = RuntimeError
-        av_module.FFmpegError = RuntimeError
-        av_module.logging = types.SimpleNamespace(
-            ERROR="ERROR",
-            set_level=lambda *args, **kwargs: None,
-        )
-        av_module.video = types.SimpleNamespace(
-            frame=types.SimpleNamespace(
-                VideoFrame=type("VideoFrame", (), {"pict_type": None})
-            )
-        )
-
-        av_container_module = types.ModuleType("av.container")
-        av_container_module.InputContainer = type("InputContainer", (), {})
-
-        av_subtitles_module = types.ModuleType("av.subtitles")
-        av_subtitles_stream_module = types.ModuleType("av.subtitles.stream")
-        av_subtitles_stream_module.SubtitleStream = type("SubtitleStream", (), {})
-        av_video_module = types.ModuleType("av.video")
-        av_video_reformatter_module = types.ModuleType("av.video.reformatter")
-        av_video_reformatter_module.ColorPrimaries = type(
-            "ColorPrimaries", (), {"BT2020": 9, "BT709": 1}
-        )
-        av_video_reformatter_module.ColorRange = type(
-            "ColorRange", (), {"JPEG": 2, "MPEG": 1}
-        )
-        av_video_reformatter_module.ColorTrc = type(
-            "ColorTrc",
-            (),
-            {
-                "ARIB_STD_B67": 18,
-                "BT709": 1,
-                "IEC61966_2_1": 13,
-                "SMPTE2084": 16,
-            },
-        )
-
-        sys.modules["av"] = av_module
-        sys.modules["av.container"] = av_container_module
-        sys.modules["av.subtitles"] = av_subtitles_module
-        sys.modules["av.subtitles.stream"] = av_subtitles_stream_module
-        sys.modules["av.video"] = av_video_module
-        sys.modules["av.video.reformatter"] = av_video_reformatter_module
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     comfyui_root = _comfyui_root()
@@ -665,7 +611,9 @@ def sync_r2_transfer_module(extension_package: object) -> object:
 def modal_cloud_module() -> object:
     """Return the stable Modal cloud entry module."""
     _ensure_import_paths()
-    return importlib.import_module("comfyui_modal_sync_cloud")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, "modal", None)
+        return importlib.import_module("comfyui_modal_sync_cloud")
 
 
 @pytest.fixture(scope="session")

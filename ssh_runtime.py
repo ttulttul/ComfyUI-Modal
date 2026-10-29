@@ -277,6 +277,10 @@ class SshRuntimeManager:
         status_callback: Callable[[str], None] | None = None,
     ) -> None:
         """Build a stable dependency image and apply the current source overlay."""
+        builder_context = self.controller.docker(("context", "show")).stdout_text.strip()
+        if not builder_context:
+            raise SshDockerError("Remote Docker did not report its active context.")
+        logger.info("Building SSH worker with Docker context %s.", builder_context)
         self._remove_stale_runtime_images(
             spec,
             status_callback=status_callback,
@@ -300,6 +304,7 @@ class SshRuntimeManager:
             )
             self.controller.docker(
                 self._buildx_arguments(
+                    builder_context=builder_context,
                     image_tag=dependency_image_tag,
                     labels={_DEPENDENCY_LABEL: dependency_fingerprint},
                     pull=True,
@@ -328,6 +333,7 @@ class SshRuntimeManager:
         )
         self.controller.docker(
             self._buildx_arguments(
+                builder_context=builder_context,
                 image_tag=spec.image_tag,
                 labels={
                     _RUNTIME_LABEL: spec.identity.fingerprint,
@@ -453,12 +459,13 @@ class SshRuntimeManager:
     def _buildx_arguments(
         self,
         *,
+        builder_context: str,
         image_tag: str,
         labels: dict[str, str],
         pull: bool,
     ) -> tuple[str, ...]:
-        """Return a build command pinned to Docker's persistent local builder."""
-        arguments = ["buildx", "build", "--builder", "default"]
+        """Use the active context's local builder for the worker's Docker daemon."""
+        arguments = ["buildx", "build", "--builder", builder_context]
         if pull:
             arguments.append("--pull")
         arguments.append("--load")
