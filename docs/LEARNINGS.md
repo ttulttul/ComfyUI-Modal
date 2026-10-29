@@ -736,3 +736,11 @@ Upload, Hugging Face discovery, Hugging Face download, and R2 download progress 
 ## Compatibility imports can hide an unfinished extraction
 
 Moving behavior and mutable state out of a stable entrypoint does not make the entrypoint thin if it still eagerly imports every extracted private helper. Import only the hooks and operations used by production glue, then resolve legacy read-only private access through the focused owner modules. This preserves a migration surface without creating hundreds of stale bindings or obscuring which module actually owns execution.
+
+## SSH builds must use the active Docker context
+
+Docker's built-in Buildx builders are named after their contexts. Forcing `--builder default` fails when the active context is `rootless`; switching only the build to another context would also put the image in a different daemon from subsequent worker commands. Use `docker context show` to select the builder for both dependency and source-overlay images.
+
+## Keep worker and test dependencies aligned with ComfyUI
+
+ComfyUI 0.43 requires `comfy-aimdo==0.6.0` for `comfy_aimdo.storage` and `comfy-kitchen==0.2.40` for `comfy_kitchen.int8_decode`. Validate these APIs at image-build time. Tests need real PyAV rather than a partial module stub that breaks whenever ComfyUI imports another video API. Import the cloud entrypoint with Modal unavailable in unit tests so installing the optional SDK cannot trigger authenticated resource lookup. Registry-initialization tests that stub ComfyUI dependencies must also isolate the server import.

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from pathlib import Path
 from types import ModuleType
+
+import pytest
 
 from conftest import PACKAGE_NAME, REPO_ROOT
 
@@ -27,9 +30,11 @@ def _root_module_names(repo_root: Path) -> tuple[str, ...]:
 
 def test_root_modules_support_package_and_flat_imports(
     extension_package: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every shipped root module must load locally and in the flat cloud layout."""
     del extension_package
+    monkeypatch.setitem(sys.modules, "modal", None)
     module_names = _root_module_names(REPO_ROOT)
 
     for module_name in module_names:
@@ -39,11 +44,10 @@ def test_root_modules_support_package_and_flat_imports(
 
 
 def test_stable_cloud_entrypoint_exports_host_runtime_surface(
-    extension_package: object,
+    modal_cloud_module: ModuleType,
 ) -> None:
     """The stable flat cloud module must retain every name read by the host."""
-    del extension_package
-    cloud_module = importlib.import_module("comfyui_modal_sync_cloud")
+    cloud_module = modal_cloud_module
 
     assert isinstance(cloud_module, ModuleType)
     assert hasattr(cloud_module, "app")
@@ -54,11 +58,10 @@ def test_stable_cloud_entrypoint_exports_host_runtime_surface(
 
 
 def test_cloud_entrypoint_eagerly_imports_volume_hydration_helper(
-    extension_package: object,
+    modal_cloud_module: ModuleType,
 ) -> None:
     """Method globals must not depend on the module compatibility fallback."""
-    del extension_package
-    cloud_module = importlib.import_module("comfyui_modal_sync_cloud")
+    cloud_module = modal_cloud_module
 
     assert "_hydrate_missing_payload_volume_paths" in vars(cloud_module)
     assert callable(vars(cloud_module)["_hydrate_missing_payload_volume_paths"])

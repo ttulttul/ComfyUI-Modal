@@ -53,8 +53,8 @@ _REMOTE_RUNTIME_PACKAGES = (
     REMOTE_AV_SPEC,
     "blake3==1.0.9",
     "comfy-angle==0.1.0",
-    "comfy-aimdo==0.4.13",
-    "comfy-kitchen==0.2.31",
+    "comfy-aimdo==0.6.0",
+    "comfy-kitchen==0.2.40",
     "einops==0.8.2",
     "kornia==0.8.2",
     REMOTE_NUMPY_SPEC,
@@ -253,9 +253,11 @@ def remote_runtime_packages() -> tuple[str, ...]:
 
 
 def remote_runtime_validation_command() -> str:
-    """Return a build-time check for ComfyUI's required PyAV API."""
+    """Return a build-time check for ComfyUI's required video and storage APIs."""
     validation_script = (
         "from importlib import metadata; "
+        "import comfy_aimdo.storage; "
+        "from comfy_kitchen.int8_decode import Int8DecodeCache; "
         "from av.video.reformatter import ColorPrimaries; "
         f"expected_av={REMOTE_AV_SPEC.split('==', maxsplit=1)[1]!r}; "
         "actual_av=metadata.version('av'); "

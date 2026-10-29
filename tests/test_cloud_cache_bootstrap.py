@@ -1378,6 +1378,7 @@ def test_modal_cloud_initializes_remote_comfy_runtime_once_per_custom_node_root(
         )
     )
 
+    monkeypatch.setitem(sys.modules, "server", types.SimpleNamespace())
     monkeypatch.setitem(sys.modules, "nodes", fake_nodes_module)
     monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths_module)
 

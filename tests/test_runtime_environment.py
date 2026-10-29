@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shlex
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -87,8 +88,8 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert len(runtime_packages) == len(set(runtime_packages))
     assert "blake3==1.0.9" in runtime_packages
     assert "comfy-angle==0.1.0" in runtime_packages
-    assert "comfy-aimdo==0.4.13" in runtime_packages
-    assert "comfy-kitchen==0.2.31" in runtime_packages
+    assert "comfy-aimdo==0.6.0" in runtime_packages
+    assert "comfy-kitchen==0.2.40" in runtime_packages
     assert "pyopengl==3.1.10" in runtime_packages
     assert "pypdf==6.16.1" in runtime_packages
     assert "numpy==2.3.5" in runtime_packages
@@ -100,6 +101,15 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert "simpleeval==1.0.7" in runtime_packages
 
 
+def test_test_group_matches_worker_support_libraries(runtime_environment_module: Any) -> None:
+    """Local tests must exercise the same ComfyUI support APIs as worker images."""
+    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    test_packages = project["dependency-groups"]["test"]
+    for package in runtime_environment_module.remote_runtime_packages():
+        if package.startswith(("av==", "comfy-aimdo==", "comfy-kitchen==")):
+            assert package in test_packages
+
+
 def test_remote_video_stack_is_pinned_and_validated(
     runtime_environment_module: Any,
 ) -> None:
@@ -109,6 +119,8 @@ def test_remote_video_stack_is_pinned_and_validated(
     assert runtime_environment_module.REMOTE_AV_SPEC == "av==18.1.0"
     assert command.startswith("python -c ")
     assert "ColorPrimaries" in command
+    assert "import comfy_aimdo.storage" in command
+    assert "from comfy_kitchen.int8_decode import Int8DecodeCache" in command
     assert "Expected PyAV" in command
     assert "18.1.0" in command
 

@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 
 def test_worker_lifecycle_reports_build_and_readiness_status(
     ssh_runtime_module: Any,
@@ -95,9 +97,11 @@ def test_image_only_preparation_builds_before_storage_helpers_run(
     ]
 
 
+@pytest.mark.parametrize("docker_context", ["default", "rootless"])
 def test_worker_build_loads_image_into_the_remote_daemon(
     ssh_runtime_module: Any,
     monkeypatch: Any,
+    docker_context: str,
 ) -> None:
     """BuildKit docker-container drivers must export the image for docker run."""
     calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
@@ -105,6 +109,8 @@ def test_worker_build_loads_image_into_the_remote_daemon(
     def docker(arguments: tuple[str, ...], **kwargs: Any) -> Any:
         """Record one remote Docker invocation."""
         calls.append((arguments, kwargs))
+        if arguments == ("context", "show"):
+            return SimpleNamespace(returncode=0, stdout_text=f"{docker_context}\n")
         if arguments[:2] == ("image", "inspect"):
             return SimpleNamespace(returncode=1, stdout_text="")
         return None
@@ -144,23 +150,24 @@ def test_worker_build_loads_image_into_the_remote_daemon(
 
     manager._build_image(spec)
 
-    assert calls[0][0][:2] == ("image", "inspect")
-    dependency_arguments, dependency_kwargs = calls[1]
+    assert calls[0][0] == ("context", "show")
+    assert calls[1][0][:2] == ("image", "inspect")
+    dependency_arguments, dependency_kwargs = calls[2]
     assert dependency_arguments[:6] == (
         "buildx",
         "build",
         "--builder",
-        "default",
+        docker_context,
         "--pull",
         "--load",
     )
     assert dependency_kwargs["input_payload"] == b"dependencies"
-    overlay_arguments, overlay_kwargs = calls[2]
+    overlay_arguments, overlay_kwargs = calls[3]
     assert overlay_arguments[:5] == (
         "buildx",
         "build",
         "--builder",
-        "default",
+        docker_context,
         "--load",
     )
     assert "--pull" not in overlay_arguments
@@ -177,6 +184,8 @@ def test_worker_build_reuses_retained_dependency_image(
     def docker(arguments: tuple[str, ...], **kwargs: Any) -> Any:
         """Report a current dependency image and record the overlay build."""
         calls.append((arguments, kwargs))
+        if arguments == ("context", "show"):
+            return SimpleNamespace(returncode=0, stdout_text="rootless\n")
         if arguments[:2] == ("image", "inspect"):
             return SimpleNamespace(
                 returncode=0,
@@ -220,16 +229,17 @@ def test_worker_build_reuses_retained_dependency_image(
 
     manager._build_image(spec)
 
-    assert len(calls) == 2
-    assert calls[0][0][:2] == ("image", "inspect")
-    assert calls[1][0][:5] == (
+    assert len(calls) == 3
+    assert calls[0][0] == ("context", "show")
+    assert calls[1][0][:2] == ("image", "inspect")
+    assert calls[2][0][:5] == (
         "buildx",
         "build",
         "--builder",
-        "default",
+        "rootless",
         "--load",
     )
-    assert calls[1][1]["input_payload"] == b"52MB-source-overlay"
+    assert calls[2][1]["input_payload"] == b"52MB-source-overlay"
 
 
 def test_worker_build_reclaims_only_superseded_managed_images(
