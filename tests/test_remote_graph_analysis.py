@@ -4,6 +4,35 @@ from __future__ import annotations
 
 from api_intercept_test_support import *  # noqa: F401,F403
 
+
+def test_dynamic_match_type_output_resolves_from_linked_image(
+    remote_graph_analysis_module: Any,
+) -> None:
+    """V3 dynamic resize outputs should cross boundaries as their concrete image type."""
+    class ImageSource:
+        RETURN_TYPES = ("IMAGE",)
+
+    class DynamicResize:
+        RETURN_TYPES = ("COMFY_MATCHTYPE_V3",)
+
+    prompt = {
+        "1": {"class_type": "ImageSource", "inputs": {}},
+        "2": {"class_type": "ResizeImageMaskNode", "inputs": {"input": ["1", 0]}},
+    }
+    nodes_module = SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "ImageSource": ImageSource,
+            "ResizeImageMaskNode": DynamicResize,
+        }
+    )
+
+    assert remote_graph_analysis_module._remote_output_io_type(
+        prompt=prompt,
+        node_id="2",
+        output_index=0,
+        nodes_module=nodes_module,
+    ) == "IMAGE"
+
 def test_remote_partition_preserves_dag_around_ssh_only_llm(
     api_intercept_module: Any,
     remote_graph_analysis_module: Any,

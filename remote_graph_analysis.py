@@ -578,7 +578,24 @@ def _remote_output_io_type(
     output_types, _, _ = _normalize_output_metadata(node_class)
     if output_index < 0 or output_index >= len(output_types):
         return None
-    return str(output_types[output_index])
+    io_type = str(output_types[output_index])
+    if io_type != "COMFY_MATCHTYPE_V3":
+        return io_type
+
+    # V3 dynamic nodes expose a generic output in their class metadata. Resolve
+    # the concrete type from the linked input before validating a component edge.
+    for input_value in (prompt_node.get("inputs") or {}).values():
+        if not _is_link(input_value):
+            continue
+        resolved_type = _remote_output_io_type(
+            prompt=prompt,
+            node_id=str(input_value[0]),
+            output_index=int(input_value[1]),
+            nodes_module=nodes_module,
+        )
+        if resolved_type is not None and resolved_type != "COMFY_MATCHTYPE_V3":
+            return resolved_type
+    return io_type
 
 
 def _remote_output_is_list(
