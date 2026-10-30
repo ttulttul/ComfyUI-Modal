@@ -579,7 +579,7 @@ def _remote_output_io_type(
     if output_index < 0 or output_index >= len(output_types):
         return None
     io_type = str(output_types[output_index])
-    if io_type != "COMFY_MATCHTYPE_V3":
+    if io_type not in {"*", "COMFY_MATCHTYPE_V3"}:
         return io_type
 
     # V3 dynamic nodes expose a generic output in their class metadata. Resolve
