@@ -178,10 +178,16 @@ def _build_component_plan(
             if source in boundary_outputs_by_source:
                 continue
             output_name = output_names[output_index]
+            effective_io_type = _remote_output_io_type(
+                prompt=prompt,
+                node_id=node_id,
+                output_index=output_index,
+                nodes_module=nodes_module,
+            ) or str(io_type)
             boundary_outputs_by_source[source] = BoundaryOutputSpec(
                 proxy_output_name=f"{node_id}_{output_name}",
                 source=source,
-                io_type=str(io_type),
+                io_type=effective_io_type,
                 is_list=bool(output_is_list[output_index]),
                 preview_target_node_ids=_preview_target_node_ids(
                     prompt=prompt,
