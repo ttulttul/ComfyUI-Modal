@@ -32,6 +32,9 @@ def test_dynamic_match_type_output_resolves_from_linked_image(
         output_index=0,
         nodes_module=nodes_module,
     ) == "IMAGE"
+    assert remote_graph_analysis_module._is_transportable_output_type(
+        "COMFY_MATCHTYPE_V3"
+    )
 
 def test_remote_partition_preserves_dag_around_ssh_only_llm(
     api_intercept_module: Any,

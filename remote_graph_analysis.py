@@ -85,6 +85,7 @@ _LOCAL_ONLY_REMOTE_CLASS_TYPES = frozenset(
 _TRANSPORTABLE_OUTPUT_TYPES = frozenset(
     {
         "*",
+        "COMFY_MATCHTYPE_V3",
         "AUDIO",
         "BOOLEAN",
         "FLOAT",
