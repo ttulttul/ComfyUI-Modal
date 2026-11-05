@@ -11,10 +11,12 @@ from typing import Any
 if __package__:
     from .execution_environments import ExecutionProvider
     from .remote_hosts import SshHostConfig
+    from .settings import ModalCooldownPolicy
     from .vast_models import VastResourceProfile
 else:  # pragma: no cover - direct ComfyUI loading fallback.
     from execution_environments import ExecutionProvider
     from remote_hosts import SshHostConfig
+    from settings import ModalCooldownPolicy
     from vast_models import VastResourceProfile
 
 _R2_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
@@ -131,14 +133,20 @@ class ModalRemoteConfiguration(RemoteConfiguration):
 
     gpu_type: str
     instance_count: int = 1
+    cooldown: ModalCooldownPolicy = ModalCooldownPolicy()
 
     def __post_init__(self) -> None:
-        """Validate Modal capacity fields."""
+        """Validate Modal capacity and cooldown fields."""
         super().__post_init__()
         if not self.gpu_type.strip():
             raise ValueError("Modal gpu_type must not be empty.")
         if self.instance_count <= 0:
             raise ValueError("Modal instance_count must be positive.")
+        if self.cooldown.reserve_cooldown_count > self.instance_count:
+            raise ValueError(
+                f"Modal reserve_cooldown_count ({self.cooldown.reserve_cooldown_count}) "
+                f"must not exceed instance_count ({self.instance_count})."
+            )
 
     @property
     def provider(self) -> ExecutionProvider:
@@ -158,6 +166,9 @@ class ModalRemoteConfiguration(RemoteConfiguration):
             "provider": self.provider.value,
             "gpu_type": self.gpu_type,
             "instance_count": self.instance_count,
+            "global_cooldown_seconds": self.cooldown.global_cooldown_seconds,
+            "reserve_cooldown_count": self.cooldown.reserve_cooldown_count,
+            "reserve_cooldown_seconds": self.cooldown.reserve_cooldown_seconds,
         }
 
 

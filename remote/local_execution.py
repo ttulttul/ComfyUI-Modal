@@ -1047,6 +1047,67 @@ def _execute_subgraph_with_mapping(
     return tuple(outputs)
 
 
+_NESTED_PROMPT_EXECUTOR_CACHE_ARGS: dict[str, float] = {
+    "lru": 0,
+    "ram": 0.0,
+    "ram_inactive": 0.0,
+}
+_MEMORY_MANAGEMENT_MODULE_NAME = "comfy.memory_management"
+
+
+@contextmanager
+def _preserved_ram_cache_release_state() -> Iterator[None]:
+    """Restore ComfyUI's global RAM-cache release state after a nested executor run.
+
+    ``PromptExecutor.execute`` installs its own cache release callback and headroom
+    as module globals; a nested executor must not leave the host executor's
+    RAM-pressure eviction disabled once it returns.
+    """
+    memory_management = sys.modules.get(_MEMORY_MANAGEMENT_MODULE_NAME)
+    setter = getattr(memory_management, "set_ram_cache_release_state", None)
+    if setter is None:
+        yield
+        return
+    saved_callback = getattr(memory_management, "extra_ram_release_callback", None)
+    saved_headroom = getattr(memory_management, "RAM_CACHE_HEADROOM", 0)
+    try:
+        yield
+    finally:
+        setter(saved_callback, saved_headroom)
+        logger.debug(
+            "Restored host RAM cache release state headroom=%s callback_set=%s.",
+            saved_headroom,
+            saved_callback is not None,
+        )
+
+
+def _run_nested_prompt_executor(
+    execution: Any,
+    *,
+    prompt: dict[str, Any],
+    prompt_id: str,
+    extra_data: dict[str, Any],
+    execute_outputs: list[str],
+) -> Any:
+    """Run a headless classic-cache PromptExecutor inside the host ComfyUI process.
+
+    Current ComfyUI reads ``cache_args["ram"]`` and ``["ram_inactive"]`` on every
+    execute, so the nested executor needs explicit values even with classic caching.
+    """
+    executor = execution.PromptExecutor(
+        _NullPromptServer(),
+        cache_args=dict(_NESTED_PROMPT_EXECUTOR_CACHE_ARGS),
+    )
+    with _preserved_ram_cache_release_state():
+        executor.execute(
+            prompt=prompt,
+            prompt_id=prompt_id,
+            extra_data=extra_data,
+            execute_outputs=execute_outputs,
+        )
+    return executor
+
+
 def _execute_subgraph_prompt(
     payload: dict[str, Any],
     hydrated_inputs: dict[str, Any],
@@ -1118,14 +1179,14 @@ def _execute_subgraph_prompt(
     _validate_required_prompt_inputs(prompt, resolved_node_mapping)
 
     with _temporary_node_mapping(node_mapping):
-        executor = execution.PromptExecutor(_NullPromptServer())
         execution_started_at = time.perf_counter()
         logger.info(
             "Starting PromptExecutor for remote subgraph %s with execute targets %s.",
             payload.get("component_id"),
             normalized_payload.get("execute_node_ids", []),
         )
-        executor.execute(
+        executor = _run_nested_prompt_executor(
+            execution,
             prompt=prompt,
             prompt_id=str(
                 payload.get("prompt_id")

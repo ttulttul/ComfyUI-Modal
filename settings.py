@@ -258,14 +258,135 @@ Any payload derived from another (warmups, prewarm targets, mapped phases) must
 copy these, or it will expect a different fingerprint for the same Modal app.
 """
 
+MODAL_GLOBAL_COOLDOWN_FIELD = "modal_global_cooldown_seconds"
+MODAL_RESERVE_COOLDOWN_COUNT_FIELD = "modal_reserve_cooldown_count"
+MODAL_RESERVE_COOLDOWN_FIELD = "modal_reserve_cooldown_seconds"
+MODAL_RESERVE_COOLDOWN_POOL_FIELD = "modal_reserve_cooldown_pool"
+MODAL_COOLDOWN_PAYLOAD_FIELDS = (
+    MODAL_GLOBAL_COOLDOWN_FIELD,
+    MODAL_RESERVE_COOLDOWN_COUNT_FIELD,
+    MODAL_RESERVE_COOLDOWN_FIELD,
+    MODAL_RESERVE_COOLDOWN_POOL_FIELD,
+)
+"""Payload fields carrying the workflow's per-slot Modal cooldown policy.
+
+They are applied per call through ``with_options`` and never change the
+deployed app's fingerprint, but derived payloads must still inherit them.
+"""
+
+MODAL_INHERITED_PAYLOAD_FIELDS = (
+    *MODAL_DEPLOYMENT_PAYLOAD_FIELDS,
+    *MODAL_COOLDOWN_PAYLOAD_FIELDS,
+)
+
+MODAL_WORKER_POOL_MAPPED = "mapped"
+MODAL_WORKER_POOL_COMFY = "comfy"
+MODAL_WORKER_POOL_LLM = "llm"
+MODAL_WORKER_POOLS = (
+    MODAL_WORKER_POOL_MAPPED,
+    MODAL_WORKER_POOL_COMFY,
+    MODAL_WORKER_POOL_LLM,
+)
+"""Independent Modal worker-slot namespaces.
+
+Mapped lanes use ``worker-pool:slot:N``; ordinary components use
+``worker-pool:<comfy|llm>:slot:N``. Slot N in different pools is a different
+container, so the reserve cooldown must target exactly one pool per prompt.
+"""
+
+MODAL_COOLDOWN_MIN_SECONDS = 2
+MODAL_COOLDOWN_MAX_SECONDS = 3600
+DEFAULT_MODAL_GLOBAL_COOLDOWN_SECONDS = 60
+DEFAULT_MODAL_RESERVE_COOLDOWN_COUNT = 0
+DEFAULT_MODAL_RESERVE_COOLDOWN_SECONDS = 300
+
 
 def modal_deployment_payload_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the deployment-identity fields present on one payload."""
+    """Return the deployment-identity and cooldown fields present on one payload."""
     return {
         field_name: payload[field_name]
-        for field_name in MODAL_DEPLOYMENT_PAYLOAD_FIELDS
+        for field_name in MODAL_INHERITED_PAYLOAD_FIELDS
         if payload.get(field_name) is not None
     }
+
+
+def _validate_cooldown_seconds(name: str, value: int) -> None:
+    """Reject a cooldown that Modal's autoscaler would not accept."""
+    if not MODAL_COOLDOWN_MIN_SECONDS <= value <= MODAL_COOLDOWN_MAX_SECONDS:
+        raise ValueError(
+            f"Modal {name} must be between {MODAL_COOLDOWN_MIN_SECONDS} and "
+            f"{MODAL_COOLDOWN_MAX_SECONDS} seconds; got {value}."
+        )
+
+
+@dataclass(frozen=True)
+class ModalCooldownPolicy:
+    """Assign Modal idle cooldowns to reusable worker-pool slots.
+
+    Slots ``0 .. reserve_cooldown_count - 1`` keep the longer reserve cooldown so
+    a small set of workers stays warm; every other slot uses the global cooldown.
+    """
+
+    global_cooldown_seconds: int = DEFAULT_MODAL_GLOBAL_COOLDOWN_SECONDS
+    reserve_cooldown_count: int = DEFAULT_MODAL_RESERVE_COOLDOWN_COUNT
+    reserve_cooldown_seconds: int = DEFAULT_MODAL_RESERVE_COOLDOWN_SECONDS
+
+    def __post_init__(self) -> None:
+        """Validate cooldown bounds and the reserved slot count."""
+        _validate_cooldown_seconds("global_cooldown", self.global_cooldown_seconds)
+        _validate_cooldown_seconds("reserve_cooldown", self.reserve_cooldown_seconds)
+        if self.reserve_cooldown_count < 0:
+            raise ValueError("Modal reserve_cooldown_count must not be negative.")
+
+    def scaledown_window_for_worker(
+        self,
+        *,
+        worker_pool: str | None,
+        slot_index: int | None,
+        reserve_pool: str,
+    ) -> int:
+        """Return one worker's idle cooldown.
+
+        Only the first ``reserve_cooldown_count`` slots of ``reserve_pool`` keep the
+        reserve cooldown; every other worker, including unslotted ones, is global.
+        """
+        if (
+            worker_pool == reserve_pool
+            and slot_index is not None
+            and 0 <= slot_index < self.reserve_cooldown_count
+        ):
+            return self.reserve_cooldown_seconds
+        return self.global_cooldown_seconds
+
+    def to_payload_fields(self) -> dict[str, int]:
+        """Return the payload fields that carry this policy to remote dispatch."""
+        return {
+            MODAL_GLOBAL_COOLDOWN_FIELD: self.global_cooldown_seconds,
+            MODAL_RESERVE_COOLDOWN_COUNT_FIELD: self.reserve_cooldown_count,
+            MODAL_RESERVE_COOLDOWN_FIELD: self.reserve_cooldown_seconds,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> ModalCooldownPolicy | None:
+        """Return the policy carried by a payload, or None when it carries none."""
+        raw_global = payload.get(MODAL_GLOBAL_COOLDOWN_FIELD)
+        if raw_global is None:
+            return None
+        return cls(
+            global_cooldown_seconds=int(raw_global),
+            reserve_cooldown_count=int(
+                payload.get(
+                    MODAL_RESERVE_COOLDOWN_COUNT_FIELD,
+                    DEFAULT_MODAL_RESERVE_COOLDOWN_COUNT,
+                )
+            ),
+            reserve_cooldown_seconds=int(
+                payload.get(
+                    MODAL_RESERVE_COOLDOWN_FIELD,
+                    DEFAULT_MODAL_RESERVE_COOLDOWN_SECONDS,
+                )
+            ),
+        )
 
 
 def _read_path_env(name: str) -> Path | None:

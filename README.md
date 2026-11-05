@@ -138,6 +138,16 @@ Each ComfyUI installation gets its own persistent Modal app name, derived from a
 
 Each **Modal Configuration** selects a GPU type and maximum concurrent container count. Every GPU target gets its own deployed app, so several configurations can contribute different Modal GPU types to the same plan. First-run auto-deploy is enabled by default and also replaces stale or incompatible deployments; after upgrading this node pack, redeploy once (or leave `COMFY_MODAL_AUTO_DEPLOY=true`) so remote workers pick up the new code. Warm containers reuse loaded models across compatible requests and scale down to zero after an idle window (`COMFY_MODAL_SCALEDOWN_WINDOW`, default 600 seconds).
 
+The Modal Configuration node's advanced settings control how long idle workers stay warm:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `global_cooldown` | `60` | Idle seconds before any Modal worker in this pool scales down. |
+| `reserve_cooldown_count` | `0` | How many workers use `reserve_cooldown` instead (at most `instance_count`). They are the first N slots of one worker pool per prompt: the mapped lanes when the prompt has mapped work, otherwise the ordinary ComfyUI workers, otherwise the LLM workers. |
+| `reserve_cooldown` | `300` | Idle seconds before a reserved worker scales down. |
+
+Set a small `reserve_cooldown_count` with a long `reserve_cooldown` to keep a few always-warm workers while the rest of the pool releases its GPUs quickly. Cooldowns apply per call (Modal `with_options(scaledown_window=...)`), so changing them never redeploys the app. They override `COMFY_MODAL_SCALEDOWN_WINDOW` for workflows that use a Modal Configuration node; local-gap pools still stay warm for at least the local keepalive window.
+
 ### Self-Hosted SSH Hosts
 
 Self-hosted execution runs the same workers on machines you control, reached over SSH and managed through Docker. Add one **SSH Configuration** per machine and connect it to the configurator. The extension deliberately stores no passwords or private-key paths — authentication, jump hosts, ports, and key selection stay in your normal SSH agent and `~/.ssh/config`.

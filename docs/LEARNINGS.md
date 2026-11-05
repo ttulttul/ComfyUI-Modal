@@ -766,3 +766,43 @@ generation streams with an empty `modal.exception.RemoteError`. Fixes:
   copy `settings.MODAL_DEPLOYMENT_PAYLOAD_FIELDS` through
   `modal_deployment_payload_fields()`; add any new fingerprint-shaping payload
   field there.
+
+## Per-slot Modal cooldowns (reserve vs. global)
+
+Modal's `scaledown_window` is an autoscaler setting, not a per-container one, so
+"keep N workers warm longer" is implemented on the worker-pool slots that already
+give each `worker-pool:...slot:N` affinity key its own parametrized container pool.
+`_lookup_deployed_remote_engine` parses the slot from the affinity key and calls
+`Cls.with_options(scaledown_window=...)`: slots `0..reserve_cooldown_count-1` get
+`reserve_cooldown`, every other slot (and unslotted keys such as LLM recovery
+workers) gets `global_cooldown`. Because it is per call, the cooldown fields are
+deliberately *not* fingerprint-shaping (they are kept out of
+`_settings_for_payload`), yet derived payloads must still inherit them so warmups
+and mapped phases hit the same pool as the real call. They live in
+`settings.MODAL_COOLDOWN_PAYLOAD_FIELDS`, and `modal_deployment_payload_fields()`
+now copies `MODAL_INHERITED_PAYLOAD_FIELDS` (deployment + cooldown).
+
+
+## Nested local PromptExecutor needs explicit RAM cache args
+
+ComfyUI `5aa5ccc9` made `PromptExecutor.execute_async` read
+`cache_args["ram"]` and `cache_args["ram_inactive"]` unconditionally, then call
+`comfy.memory_management.set_ram_cache_release_state(...)`, which sets
+*module globals*. Local fallback execution (`execution_mode=local`) builds a
+nested executor inside the host's running prompt, so it now passes zeroed
+classic-cache `cache_args`. It also restores the host's release callback and
+headroom afterwards; otherwise the nested run would silently switch off the
+host executor's RAM-pressure eviction for the rest of the outer prompt.
+
+### Reserve cooldown must target one worker pool
+
+Worker slots live in separate namespaces: mapped lanes use `worker-pool:slot:N`,
+while ordinary components use `worker-pool:comfy:slot:N` or `worker-pool:llm:slot:N`.
+Each is its own Modal container. The first cooldown version keyed only on the
+trailing `slot:N`, so in a hybrid static+mapped prompt both the static
+`comfy:slot:0` worker and mapped lane `slot:0` held the 300s reserve: two idle
+GPUs for `reserve_cooldown_count=1`, and five containers for `instance_count=4`.
+`_configure_reserve_cooldown_pools` now stamps one `modal_reserve_cooldown_pool`
+per Modal environment (mapped > comfy > llm), and the lookup gives the reserve
+cooldown only to slots in that pool.
+

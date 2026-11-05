@@ -1178,6 +1178,196 @@ def test_lookup_deployed_remote_engine_extends_local_gap_pool_scaledown(
     assert observed_kwargs == [result]
     assert result["worker_affinity_key"] == "worker-pool:slot:0"
 
+def _install_option_recording_modal(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> list[dict[str, Any]]:
+    """Install a fake Modal SDK that records ``with_options`` overrides."""
+    observed_options: list[dict[str, Any]] = []
+
+    class FakeRemoteCls:
+        """Minimal deployed class supporting Modal runtime option overrides."""
+
+        def with_options(self, **kwargs: Any) -> "FakeRemoteCls":
+            """Record the per-call autoscaler configuration."""
+            observed_options.append(kwargs)
+            return self
+
+        def __call__(self, **kwargs: Any) -> dict[str, Any]:
+            """Return the parametrized class instance identity."""
+            return kwargs
+
+    class FakeModal:
+        """Minimal Modal SDK double for deployed class lookup."""
+
+        class Cls:
+            """Namespace for deployed class lookups."""
+
+            @staticmethod
+            def from_name(app_name: str, class_name: str) -> FakeRemoteCls:
+                """Return a fresh fake deployed class."""
+                del app_name, class_name
+                return FakeRemoteCls()
+
+    monkeypatch.setattr(remote_modal_app_module, "modal", FakeModal)
+    monkeypatch.setattr(modal_deployment_module, "modal", FakeModal)
+    return observed_options
+
+
+_COOLDOWN_PAYLOAD_FIELDS = {
+    "modal_global_cooldown_seconds": 45,
+    "modal_reserve_cooldown_count": 2,
+    "modal_reserve_cooldown_seconds": 900,
+}
+
+
+@pytest.mark.parametrize(
+    ("lane_index", "expected_window"),
+    [(0, 900), (1, 900), (2, 45), (3, 45)],
+)
+def test_lookup_deployed_remote_engine_applies_reserve_cooldown_by_slot(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+    lane_index: int,
+    expected_window: int,
+) -> None:
+    """The first reserve_cooldown_count slots keep the reserve cooldown."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+    payload = {"component_id": "component-1", **_COOLDOWN_PAYLOAD_FIELDS}
+
+    result = modal_deployment_module._lookup_deployed_remote_engine(
+        payload,
+        affinity_key_override=modal_deployment_module._mapped_lane_affinity_key(
+            payload, lane_index
+        ),
+    )
+
+    assert observed_options == [{"scaledown_window": expected_window}]
+    assert result["worker_affinity_key"] == f"worker-pool:slot:{lane_index}"
+
+
+@pytest.mark.parametrize(
+    ("reserve_pool", "affinity_key", "expected_window"),
+    [
+        ("mapped", "worker-pool:slot:0", 900),
+        ("mapped", "worker-pool:comfy:slot:0", 45),
+        ("mapped", "worker-pool:llm:slot:0", 45),
+        ("comfy", "worker-pool:comfy:slot:0", 900),
+        ("comfy", "worker-pool:comfy:slot:2", 45),
+        ("comfy", "worker-pool:slot:0", 45),
+        ("llm", "worker-pool:llm:slot:1", 900),
+        ("llm", "worker-pool:comfy:slot:0", 45),
+    ],
+)
+def test_lookup_deployed_remote_engine_reserves_only_the_prompt_reserve_pool(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+    reserve_pool: str,
+    affinity_key: str,
+    expected_window: int,
+) -> None:
+    """Slot N in a different worker pool is a different container and stays global."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+
+    modal_deployment_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            **_COOLDOWN_PAYLOAD_FIELDS,
+            "modal_reserve_cooldown_pool": reserve_pool,
+        },
+        affinity_key_override=affinity_key,
+    )
+
+    assert observed_options == [{"scaledown_window": expected_window}]
+
+
+def test_lookup_deployed_remote_engine_static_phase_of_mapped_prompt_is_global(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A hybrid prompt's static comfy worker must not hold a second reserved GPU."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+
+    result = modal_deployment_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "1",
+            "remote_worker_affinity_group": "comfy",
+            **_COOLDOWN_PAYLOAD_FIELDS,
+            "modal_reserve_cooldown_pool": "mapped",
+        }
+    )
+
+    assert result["worker_affinity_key"] == "worker-pool:comfy:slot:0"
+    assert observed_options == [{"scaledown_window": 45}]
+
+
+def test_lookup_deployed_remote_engine_uses_global_cooldown_for_unslotted_keys(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Ad-hoc affinity keys (e.g. fresh LLM recovery workers) use the global cooldown."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+
+    modal_deployment_module._lookup_deployed_remote_engine(
+        {"component_id": "component-1", **_COOLDOWN_PAYLOAD_FIELDS},
+        affinity_key_override="llm-recovery:abc123",
+    )
+
+    assert observed_options == [{"scaledown_window": 45}]
+
+
+def test_lookup_deployed_remote_engine_keeps_deployed_cooldown_without_policy(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Payloads without a workflow cooldown policy keep the deployed default."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+
+    modal_deployment_module._lookup_deployed_remote_engine(
+        {"component_id": "component-1"}
+    )
+
+    assert observed_options == []
+
+
+def test_lookup_deployed_remote_engine_local_gap_pool_never_shortens_keepalive(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Local-gap pools keep at least the local keepalive even with a short cooldown."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+
+    modal_deployment_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            "remote_local_gap_pool": True,
+            **_COOLDOWN_PAYLOAD_FIELDS,
+            "modal_reserve_cooldown_count": 0,
+        }
+    )
+
+    assert observed_options == [{"scaledown_window": 900}]
+
+
 def test_lookup_deployed_remote_engine_passes_snapshot_profile_parameter_for_gpu_snapshots(
     remote_modal_app_module: Any,
     modal_warmup_module: Any,
