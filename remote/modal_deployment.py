@@ -634,6 +634,47 @@ def _mark_modal_deploy_state_not_ready(deploy_key: tuple[str, str | None]) -> No
         deploy_state.last_error = None
         deploy_state.condition.notify_all()
 
+def _fingerprint_validated_by_this_process(
+    deploy_key: tuple[str, str | None],
+    remote_fingerprint: str | None,
+) -> bool:
+    """Return whether this process already deployed or validated the remote fingerprint."""
+    if remote_fingerprint is None:
+        return False
+    with _MODAL_AUTO_DEPLOY_LOCK:
+        return (*deploy_key, remote_fingerprint) in _MODAL_REMOTE_APP_VERSION_OK
+
+
+def _refuse_replacing_sibling_validated_app(
+    payload: Mapping[str, Any],
+    deploy_key: tuple[str, str | None],
+    remote_fingerprint: str | None,
+    local_fingerprint: str,
+) -> None:
+    """Refuse to stop an app that another caller in this process deployed or validated.
+
+    Two callers that resolve different settings for the same app name would
+    otherwise stop each other's deployment in a loop, killing in-flight work.
+    """
+    if not _fingerprint_validated_by_this_process(deploy_key, remote_fingerprint):
+        return
+    logger.error(
+        "Refusing to replace Modal app %s for component=%s: its fingerprint=%s was "
+        "deployed or validated by this process, but this caller expects fingerprint=%s. "
+        "The caller's payload resolves different deployment settings.",
+        deploy_key[0],
+        payload.get("component_id"),
+        remote_fingerprint,
+        local_fingerprint,
+    )
+    raise ModalRemoteAppOutOfDateError(
+        f"Modal app {deploy_key[0]!r} is running fingerprint {remote_fingerprint!r}, "
+        f"which this process deployed or validated, but component "
+        f"{payload.get('component_id')!r} expects {local_fingerprint!r}. Refusing to "
+        "stop an app that other requests may be using."
+    )
+
+
 def _replace_outdated_modal_app(
     payload: dict[str, Any],
     remote_engine: Any,
@@ -654,6 +695,12 @@ def _replace_outdated_modal_app(
     )
     remote_fingerprint = _runtime_fingerprint_from_payload(version_payload)
     local_fingerprint = _expected_remote_runtime_fingerprint(payload)
+    _refuse_replacing_sibling_validated_app(
+        payload,
+        deploy_key,
+        remote_fingerprint,
+        local_fingerprint,
+    )
     logger.warning(
         "Deployed Modal app %s is out of date for component=%s remote_protocol=%s local_protocol=%s remote_fingerprint=%s local_fingerprint=%s; stopping and replacing it.",
         deployment_app_name,

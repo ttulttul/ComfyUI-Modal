@@ -49,6 +49,7 @@ _SPECULATIVE_PREWARM_PAYLOAD_FIELDS = frozenset(
         "component_id",
         "prompt_id",
         "modal_gpu",
+        "modal_max_containers",
         "execution_provider",
         "execution_environment_id",
         "remote_worker_affinity_group",

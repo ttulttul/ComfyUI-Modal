@@ -1577,3 +1577,49 @@ def test_invoke_remote_engine_releases_prompt_when_cancelled_during_deploy(
     assert len(observed_cancellation_events) == 1
     assert observed_cancellation_events[0].is_set()
     assert [payload["component_id"] for payload in remote_interrupt_payloads] == ["component-1"]
+
+def test_remote_modal_refuses_to_stop_app_validated_by_this_process(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A caller with divergent settings must not stop an app a sibling caller deployed."""
+    stop_calls: list[str] = []
+    deploy_calls: list[dict[str, Any]] = []
+    sibling_payload = {"component_id": "component-1", "modal_max_containers": 4}
+    warmup_payload = {"component_id": "component-1::warmup:0", "warmup_only": True}
+    sibling_version_payload = _current_remote_runtime_payload(remote_modal_app_module)
+    monkeypatch.setattr(
+        modal_deployment_module,
+        "_stop_modal_app_for_replacement",
+        stop_calls.append,
+    )
+    monkeypatch.setattr(
+        modal_deployment_module,
+        "_auto_deploy_modal_app",
+        lambda payload, error: deploy_calls.append(payload),
+    )
+    remote_modal_app_module.get_settings.cache_clear()
+    modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+    try:
+        sibling_key = modal_deployment_module._modal_runtime_cache_key(sibling_payload)
+        sibling_version_payload["runtime_fingerprint"] = sibling_key[2]
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.add(sibling_key)
+        assert sibling_key != modal_deployment_module._modal_runtime_cache_key(
+            warmup_payload
+        )
+        with pytest.raises(
+            modal_deployment_module.ModalRemoteAppOutOfDateError,
+            match="Refusing to stop",
+        ):
+            modal_deployment_module._replace_outdated_modal_app(
+                warmup_payload,
+                None,
+                version_payload=sibling_version_payload,
+            )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+        modal_deployment_module._MODAL_REMOTE_APP_VERSION_OK.clear()
+
+    assert stop_calls == []
+    assert deploy_calls == []

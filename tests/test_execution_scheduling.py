@@ -1172,3 +1172,23 @@ def test_selected_vast_capacity_preserves_intentional_cancellation(
             vast_service=CancelledVastService(),
         )
 
+
+
+def test_speculative_prewarm_target_keeps_modal_max_containers(
+    prompt_affinity_planning_module: Any,
+) -> None:
+    """Speculative prewarm targets must keep every field that shapes the deployed fingerprint."""
+    target = prompt_affinity_planning_module._speculative_prewarm_target_payload(
+        {
+            "component_id": "component-1",
+            "modal_gpu": "RTX-PRO-6000",
+            "modal_max_containers": 4,
+            "unrelated_field": "dropped",
+        }
+    )
+
+    assert target == {
+        "component_id": "component-1",
+        "modal_gpu": "RTX-PRO-6000",
+        "modal_max_containers": 4,
+    }

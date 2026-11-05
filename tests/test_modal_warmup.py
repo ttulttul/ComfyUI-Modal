@@ -1781,3 +1781,48 @@ def test_modal_cloud_interrupt_monitor_schedules_container_restart_after_cancel(
     assert scheduled_restarts[0]["exit_code"] == 0
     assert scheduled_restarts[0]["cancel_event"].is_set()
     assert "component=component-2" in scheduled_restarts[0]["reason"]
+
+
+def test_warmup_slot_payload_preserves_dispatch_runtime_fingerprint(
+    modal_warmup_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Warmup must expect the same deployed fingerprint as the dispatch it prepares for."""
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_LOADER_PREWARM", "true")
+    monkeypatch.setenv("COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT", "false")
+    modal_warmup_module.get_settings.cache_clear()
+    dispatch_payload = {
+        "prompt_id": "prompt-1",
+        "component_id": "component-1",
+        "modal_gpu": "B300",
+        "modal_max_containers": 7,
+        "subgraph_prompt": {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "model-a.safetensors", "weight_dtype": "default"},
+            },
+        },
+    }
+    try:
+        warmup_request = modal_warmup_module._build_prompt_warmup_request(
+            dispatch_payload
+        )
+        slot_payload = modal_warmup_module._warmup_slot_payload(warmup_request, 0)
+        dispatch_fingerprint = (
+            modal_deployment_module._expected_remote_runtime_fingerprint(dispatch_payload)
+        )
+        warmup_fingerprint = (
+            modal_deployment_module._expected_remote_runtime_fingerprint(slot_payload)
+        )
+        default_fingerprint = (
+            modal_deployment_module._expected_remote_runtime_fingerprint(
+                {"modal_gpu": "B300"}
+            )
+        )
+    finally:
+        modal_warmup_module.get_settings.cache_clear()
+
+    assert slot_payload["modal_max_containers"] == 7
+    assert warmup_fingerprint == dispatch_fingerprint
+    assert default_fingerprint != dispatch_fingerprint
