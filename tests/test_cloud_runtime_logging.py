@@ -97,3 +97,15 @@ def test_cloud_project_module_names_lists_flat_modules(
     names = cloud_runtime_logging_module.cloud_project_module_names(tmp_path)
 
     assert names == ("cloud_durable_invocation", "settings")
+
+
+def test_shipped_cloud_module_names_come_from_the_repo_copy(
+    cloud_runtime_logging_module: Any,
+) -> None:
+    """Module discovery must not depend on where Modal places the entrypoint file."""
+    names = cloud_runtime_logging_module.shipped_cloud_module_names()
+
+    assert "cloud_durable_invocation" in names
+    assert "cloud_session_bridge" in names
+    assert "comfyui_modal_sync_cloud" in names
+    assert "__init__" not in names

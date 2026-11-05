@@ -74,6 +74,15 @@ def cloud_project_module_names(repo_root: Path) -> tuple[str, ...]:
     )
 
 
+def shipped_cloud_module_names() -> tuple[str, ...]:
+    """Return the flat project modules that sit beside this helper module.
+
+    Modal may run the deployed entrypoint from outside the repo copy, while this
+    module is always imported from the shipped repo directory itself.
+    """
+    return cloud_project_module_names(Path(__file__).resolve().parent)
+
+
 def _cloud_module_handler(
     module_loggers: Iterable[logging.Logger],
 ) -> logging.Handler:
@@ -107,7 +116,11 @@ def configure_cloud_module_loggers(module_names: Iterable[str]) -> tuple[str, ..
             module_logger.addHandler(handler)
         module_logger.propagate = False
     configured_names = tuple(module_logger.name for module_logger in module_loggers)
-    logger.debug("Configured cloud module loggers: %s", configured_names)
+    _emit_cloud_info(
+        "Configured %d cloud module loggers for INFO output from %s.",
+        len(configured_names),
+        Path(__file__).resolve().parent,
+    )
     return configured_names
 
 

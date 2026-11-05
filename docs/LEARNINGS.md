@@ -819,3 +819,11 @@ In practice this hid a 28s gap between `execute_subgraph_locally` finishing and
 handler, in the container only. That handler prints to the *current*
 `sys.stdout` at emit time, because memory-snapshot restores can replace stdout,
 which is also why `_emit_cloud_info` prints instead of using a stream handler.
+
+Follow-up: the first version found the modules to configure from the entrypoint's
+own directory, and configured nothing. Modal runs the deployed entrypoint from
+outside the repo copy (`/root/comfyui_modal_sync_cloud.py`, while the repo is at
+`/root/comfyui_modal_sync_repo`). The modules are now listed from the directory of
+`cloud_runtime_logging.py`, which is always imported from the repo copy. One
+container INFO line reports how many loggers were configured and from which directory.
+
