@@ -43,7 +43,7 @@ from .modal_warmup import (
     _prompt_warmup_head_start_seconds,
     boost_mapped_component_warmup,
 )
-from ..settings import get_settings
+from ..settings import get_settings, modal_deployment_payload_fields
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,7 @@ def _shared_subgraph_payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
             payload.get("terminate_container_on_error", True)
         ),
         "custom_nodes_bundle": payload.get("custom_nodes_bundle"),
+        **modal_deployment_payload_fields(payload),
     }
     snapshot_profile_key = payload.get("snapshot_profile_key")
     if isinstance(snapshot_profile_key, str) and snapshot_profile_key.strip():

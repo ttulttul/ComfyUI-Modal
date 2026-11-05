@@ -2532,3 +2532,60 @@ def test_trim_subgraph_payload_to_required_nodes_drops_unrelated_mapped_branch(
     assert trimmed_payload["execute_node_ids"] == ["3"]
     assert trimmed_payload["mapped_execute_node_ids"] == []
     assert trimmed_payload["static_execute_node_ids"] == ["3"]
+
+
+def test_mapped_phase_payloads_preserve_parent_runtime_fingerprint(
+    mapped_execution_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Static, mapped, and cleanup phases must expect the parent's deployed fingerprint."""
+    phase_definition = {
+        "component_node_ids": ["9"],
+        "subgraph_prompt": {},
+        "boundary_inputs": [],
+        "boundary_outputs": [],
+        "execute_node_ids": ["9"],
+    }
+    parent_payload = {
+        "payload_kind": "mapped_subgraph",
+        "component_id": "1",
+        "modal_gpu": "B300",
+        "modal_max_containers": 4,
+        "static_phase": phase_definition,
+        "mapped_phase": phase_definition,
+        "remote_session": {"session_id": "session-1"},
+        "clear_remote_session": True,
+    }
+    derived_payloads = [
+        mapped_execution_module._build_phase_subgraph_payload(
+            parent_payload, "static_phase", "1"
+        ),
+        mapped_execution_module._build_phase_subgraph_payload(
+            parent_payload, "mapped_phase", "1__mapped"
+        ),
+    ]
+    monkeypatch.setattr(
+        mapped_execution_module,
+        "is_remote_session_handle_payload",
+        lambda remote_session: True,
+    )
+    derived_payloads.append(
+        mapped_execution_module._build_remote_session_cleanup_payload(parent_payload)
+    )
+    parent_fingerprint = modal_deployment_module._expected_remote_runtime_fingerprint(
+        parent_payload
+    )
+
+    assert parent_fingerprint != (
+        modal_deployment_module._expected_remote_runtime_fingerprint(
+            {"modal_gpu": "B300"}
+        )
+    )
+    for derived_payload in derived_payloads:
+        assert derived_payload["modal_gpu"] == "B300"
+        assert derived_payload["modal_max_containers"] == 4
+        assert (
+            modal_deployment_module._expected_remote_runtime_fingerprint(derived_payload)
+            == parent_fingerprint
+        )
