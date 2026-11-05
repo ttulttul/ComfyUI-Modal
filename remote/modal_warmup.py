@@ -543,6 +543,7 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | No
             )
         ),
         "modal_gpu": settings.modal_gpu,
+        "modal_max_containers": payload.get("modal_max_containers"),
         "remote_worker_affinity_group": payload.get(
             "remote_worker_affinity_group"
         ),

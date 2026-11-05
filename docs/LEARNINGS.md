@@ -744,3 +744,18 @@ Docker's built-in Buildx builders are named after their contexts. Forcing `--bui
 ## Keep worker and test dependencies aligned with ComfyUI
 
 ComfyUI 0.43 requires `comfy-aimdo==0.6.0` for `comfy_aimdo.storage` and `comfy-kitchen==0.2.40` for `comfy_kitchen.int8_decode`. Validate these APIs at image-build time. Tests need real PyAV rather than a partial module stub that breaks whenever ComfyUI imports another video API. Import the cloud entrypoint with Modal unavailable in unit tests so installing the optional SDK cannot trigger authenticated resource lookup. Registry-initialization tests that stub ComfyUI dependencies must also isolate the server import.
+
+## Derived payloads must carry every fingerprint-shaping field (2026-11-05)
+
+The Modal runtime fingerprint includes resolved settings such as `max_containers`,
+but the deployed app name does not. `_settings_for_payload` resolves
+`modal_gpu` and `modal_max_containers` from each payload, so any derived payload
+(warmup requests, speculative prewarm targets) that drops `modal_max_containers`
+expects a *different* fingerprint for the *same* app. The warmup then judged the
+freshly deployed app "out of date" and stopped it, which killed in-flight mapped
+generation streams with an empty `modal.exception.RemoteError`. Fixes:
+- `_build_prompt_warmup_request` and `_SPECULATIVE_PREWARM_PAYLOAD_FIELDS` keep
+  `modal_max_containers`.
+- `_replace_outdated_modal_app` refuses to stop an app whose remote fingerprint
+  this process already deployed or validated, so divergent callers can no longer
+  stop each other's deployments.
