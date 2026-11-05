@@ -782,3 +782,14 @@ and mapped phases hit the same pool as the real call. They live in
 `settings.MODAL_COOLDOWN_PAYLOAD_FIELDS`, and `modal_deployment_payload_fields()`
 now copies `MODAL_INHERITED_PAYLOAD_FIELDS` (deployment + cooldown).
 
+
+## Nested local PromptExecutor needs explicit RAM cache args
+
+ComfyUI `5aa5ccc9` made `PromptExecutor.execute_async` read
+`cache_args["ram"]` and `cache_args["ram_inactive"]` unconditionally, then call
+`comfy.memory_management.set_ram_cache_release_state(...)`, which sets
+*module globals*. Local fallback execution (`execution_mode=local`) builds a
+nested executor inside the host's running prompt, so it now passes zeroed
+classic-cache `cache_args`. It also restores the host's release callback and
+headroom afterwards; otherwise the nested run would silently switch off the
+host executor's RAM-pressure eviction for the rest of the outer prompt.
