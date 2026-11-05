@@ -806,3 +806,16 @@ GPUs for `reserve_cooldown_count=1`, and five containers for `instance_count=4`.
 per Modal environment (mapped > comfy > llm), and the lookup gives the reserve
 cooldown only to slots in that pool.
 
+
+## Remote container logs dropped INFO from every module but the entrypoint
+
+Inside the Modal container the project imports its modules flat, so their loggers
+are named `cloud_durable_invocation`, `cloud_session_bridge`, and so on. Only
+`comfyui_modal_sync_cloud` had a handler. The others fell through to the root
+logger's WARNING-level handler, so their INFO timing lines silently disappeared.
+In practice this hid a 28s gap between `execute_subgraph_locally` finishing and
+`remote_engine_execute_payload` returning (the durable-result step).
+`configure_cloud_module_loggers` now gives every shipped top-level module an INFO
+handler, in the container only. That handler prints to the *current*
+`sys.stdout` at emit time, because memory-snapshot restores can replace stdout,
+which is also why `_emit_cloud_info` prints instead of using a stream handler.
