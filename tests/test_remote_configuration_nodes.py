@@ -417,3 +417,89 @@ def test_extension_registers_all_remote_configuration_nodes(
         extension_package.RemoteExecutionConfigurator
         is module.RemoteExecutionConfigurator
     )
+
+
+def test_modal_configuration_exposes_advanced_cooldown_widgets(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """The Modal node should expose three advanced cooldown widgets with defaults."""
+    schema = remote_configuration_nodes_module.ModalConfiguration.define_schema()
+    inputs_by_id = {node_input.id: node_input for node_input in schema.inputs}
+
+    expected_defaults = {
+        "global_cooldown": 60,
+        "reserve_cooldown_count": 0,
+        "reserve_cooldown": 300,
+    }
+    for input_id, default in expected_defaults.items():
+        assert inputs_by_id[input_id].default == default
+        assert inputs_by_id[input_id].advanced is True
+
+
+def test_modal_configuration_defaults_cooldowns_for_older_workflows(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """Workflows saved before the cooldown widgets existed keep working."""
+    configuration = remote_configuration_nodes_module.modal_configuration_from_inputs(
+        "10",
+        {"configuration_name": "modal", "gpu_type": "T4", "instance_count": 2},
+    )
+
+    assert configuration.cooldown.global_cooldown_seconds == 60
+    assert configuration.cooldown.reserve_cooldown_count == 0
+    assert configuration.cooldown.reserve_cooldown_seconds == 300
+
+
+def test_modal_configuration_parses_cooldown_widgets(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """Configured cooldown widgets should become the configuration's policy."""
+    configuration = remote_configuration_nodes_module.modal_configuration_from_inputs(
+        "10",
+        {
+            "configuration_name": "modal",
+            "gpu_type": "T4",
+            "instance_count": 4,
+            "global_cooldown": 30,
+            "reserve_cooldown_count": 2,
+            "reserve_cooldown": 1200,
+        },
+    )
+
+    assert configuration.cooldown.global_cooldown_seconds == 30
+    assert configuration.cooldown.reserve_cooldown_count == 2
+    assert configuration.cooldown.reserve_cooldown_seconds == 1200
+    assert configuration.to_safe_dict()["reserve_cooldown_count"] == 2
+
+
+def test_modal_configuration_rejects_reserve_count_above_instance_count(
+    remote_configuration_nodes_module: Any,
+) -> None:
+    """More reserved workers than the pool can hold is a configuration error."""
+    with pytest.raises(ValueError, match="reserve_cooldown_count"):
+        remote_configuration_nodes_module.modal_configuration_from_inputs(
+            "10",
+            {
+                "configuration_name": "modal",
+                "gpu_type": "T4",
+                "instance_count": 1,
+                "reserve_cooldown_count": 2,
+            },
+        )
+
+
+@pytest.mark.parametrize("cooldown", [0, 1, 3601])
+def test_modal_configuration_rejects_out_of_range_cooldowns(
+    remote_configuration_nodes_module: Any,
+    cooldown: int,
+) -> None:
+    """Cooldowns outside Modal's accepted scaledown range should fail early."""
+    with pytest.raises(ValueError, match="global_cooldown"):
+        remote_configuration_nodes_module.modal_configuration_from_inputs(
+            "10",
+            {
+                "configuration_name": "modal",
+                "gpu_type": "T4",
+                "global_cooldown": cooldown,
+            },
+        )

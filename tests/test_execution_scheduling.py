@@ -1192,3 +1192,19 @@ def test_speculative_prewarm_target_keeps_modal_max_containers(
         "modal_gpu": "RTX-PRO-6000",
         "modal_max_containers": 4,
     }
+
+
+def test_speculative_prewarm_target_keeps_modal_cooldown_policy(
+    prompt_affinity_planning_module: Any,
+) -> None:
+    """Speculative prewarms must land in the same cooldown pool as the real call."""
+    cooldown_fields = {
+        "modal_global_cooldown_seconds": 45,
+        "modal_reserve_cooldown_count": 1,
+        "modal_reserve_cooldown_seconds": 900,
+    }
+    target = prompt_affinity_planning_module._speculative_prewarm_target_payload(
+        {"component_id": "component-1", **cooldown_fields}
+    )
+
+    assert target == {"component_id": "component-1", **cooldown_fields}

@@ -225,6 +225,7 @@ def _configured_provider_metadata(
             "remote_configuration_name": configuration.display_name,
             "modal_gpu": configuration.gpu_type,
             "modal_max_containers": configuration.instance_count,
+            **configuration.cooldown.to_payload_fields(),
         }
     if isinstance(configuration, SshRemoteConfiguration):
         host = execution_plan.ssh_hosts_by_id[configuration.configuration_id]

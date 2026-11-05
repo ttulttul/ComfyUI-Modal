@@ -766,3 +766,19 @@ generation streams with an empty `modal.exception.RemoteError`. Fixes:
   copy `settings.MODAL_DEPLOYMENT_PAYLOAD_FIELDS` through
   `modal_deployment_payload_fields()`; add any new fingerprint-shaping payload
   field there.
+
+## Per-slot Modal cooldowns (reserve vs. global)
+
+Modal's `scaledown_window` is an autoscaler setting, not a per-container one, so
+"keep N workers warm longer" is implemented on the worker-pool slots that already
+give each `worker-pool:...slot:N` affinity key its own parametrized container pool.
+`_lookup_deployed_remote_engine` parses the slot from the affinity key and calls
+`Cls.with_options(scaledown_window=...)`: slots `0..reserve_cooldown_count-1` get
+`reserve_cooldown`, every other slot (and unslotted keys such as LLM recovery
+workers) gets `global_cooldown`. Because it is per call, the cooldown fields are
+deliberately *not* fingerprint-shaping (they are kept out of
+`_settings_for_payload`), yet derived payloads must still inherit them so warmups
+and mapped phases hit the same pool as the real call. They live in
+`settings.MODAL_COOLDOWN_PAYLOAD_FIELDS`, and `modal_deployment_payload_fields()`
+now copies `MODAL_INHERITED_PAYLOAD_FIELDS` (deployment + cooldown).
+

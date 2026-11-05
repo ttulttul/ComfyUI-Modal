@@ -2552,6 +2552,9 @@ def test_mapped_phase_payloads_preserve_parent_runtime_fingerprint(
         "component_id": "1",
         "modal_gpu": "B300",
         "modal_max_containers": 4,
+        "modal_global_cooldown_seconds": 45,
+        "modal_reserve_cooldown_count": 1,
+        "modal_reserve_cooldown_seconds": 900,
         "static_phase": phase_definition,
         "mapped_phase": phase_definition,
         "remote_session": {"session_id": "session-1"},
@@ -2585,6 +2588,9 @@ def test_mapped_phase_payloads_preserve_parent_runtime_fingerprint(
     for derived_payload in derived_payloads:
         assert derived_payload["modal_gpu"] == "B300"
         assert derived_payload["modal_max_containers"] == 4
+        assert derived_payload["modal_global_cooldown_seconds"] == 45
+        assert derived_payload["modal_reserve_cooldown_count"] == 1
+        assert derived_payload["modal_reserve_cooldown_seconds"] == 900
         assert (
             modal_deployment_module._expected_remote_runtime_fingerprint(derived_payload)
             == parent_fingerprint

@@ -19,7 +19,16 @@ if __package__:
         VastRemoteConfiguration,
     )
     from .remote_hosts import SshHostConfig
-    from .settings import MODAL_GPU_TYPES, normalize_modal_gpu_selection
+    from .settings import (
+        DEFAULT_MODAL_GLOBAL_COOLDOWN_SECONDS,
+        DEFAULT_MODAL_RESERVE_COOLDOWN_COUNT,
+        DEFAULT_MODAL_RESERVE_COOLDOWN_SECONDS,
+        MODAL_COOLDOWN_MAX_SECONDS,
+        MODAL_COOLDOWN_MIN_SECONDS,
+        MODAL_GPU_TYPES,
+        ModalCooldownPolicy,
+        normalize_modal_gpu_selection,
+    )
     from .vast_config_node import VastAILeaseConfiguration, profile_from_inputs
 else:  # pragma: no cover - direct ComfyUI loading fallback.
     from remote_configurations import (
@@ -32,7 +41,16 @@ else:  # pragma: no cover - direct ComfyUI loading fallback.
         VastRemoteConfiguration,
     )
     from remote_hosts import SshHostConfig
-    from settings import MODAL_GPU_TYPES, normalize_modal_gpu_selection
+    from settings import (
+        DEFAULT_MODAL_GLOBAL_COOLDOWN_SECONDS,
+        DEFAULT_MODAL_RESERVE_COOLDOWN_COUNT,
+        DEFAULT_MODAL_RESERVE_COOLDOWN_SECONDS,
+        MODAL_COOLDOWN_MAX_SECONDS,
+        MODAL_COOLDOWN_MIN_SECONDS,
+        MODAL_GPU_TYPES,
+        ModalCooldownPolicy,
+        normalize_modal_gpu_selection,
+    )
     from vast_config_node import VastAILeaseConfiguration, profile_from_inputs
 
 logger = logging.getLogger(__name__)
@@ -185,6 +203,7 @@ class ModalConfiguration(io.ComfyNode):
                     step=1,
                     tooltip="Maximum concurrent Modal containers for this pool.",
                 ),
+                *_modal_cooldown_inputs(),
             ],
             outputs=[RemoteConfigurationType.Output()],
             hidden=[io.Hidden.unique_id],
@@ -198,6 +217,49 @@ class ModalConfiguration(io.ComfyNode):
             inputs.pop("unique_id", "modal-configuration")
         )
         return io.NodeOutput(modal_configuration_from_inputs(configuration_id, inputs))
+
+
+def _modal_cooldown_inputs() -> list[io.Input]:
+    """Return advanced widgets controlling how long idle Modal workers stay warm."""
+    return [
+        io.Int.Input(
+            "global_cooldown",
+            default=DEFAULT_MODAL_GLOBAL_COOLDOWN_SECONDS,
+            min=MODAL_COOLDOWN_MIN_SECONDS,
+            max=MODAL_COOLDOWN_MAX_SECONDS,
+            step=1,
+            advanced=True,
+            tooltip=(
+                "Seconds an idle Modal worker stays warm before scaling down. "
+                "Applies to every worker not covered by reserve_cooldown_count."
+            ),
+        ),
+        io.Int.Input(
+            "reserve_cooldown_count",
+            default=DEFAULT_MODAL_RESERVE_COOLDOWN_COUNT,
+            min=0,
+            max=32,
+            step=1,
+            advanced=True,
+            tooltip=(
+                "Number of Modal workers (the first N worker slots) that use "
+                "reserve_cooldown instead of global_cooldown. Must not exceed "
+                "instance_count."
+            ),
+        ),
+        io.Int.Input(
+            "reserve_cooldown",
+            default=DEFAULT_MODAL_RESERVE_COOLDOWN_SECONDS,
+            min=MODAL_COOLDOWN_MIN_SECONDS,
+            max=MODAL_COOLDOWN_MAX_SECONDS,
+            step=1,
+            advanced=True,
+            tooltip=(
+                "Seconds the reserved Modal workers stay warm while idle. Set it "
+                "longer than global_cooldown to keep a small always-warm set."
+            ),
+        ),
+    ]
 
 
 class VastConfiguration(io.ComfyNode):
@@ -367,6 +429,24 @@ def modal_configuration_from_inputs(
         display_name=str(inputs.get("configuration_name") or "modal-default").strip(),
         gpu_type=normalize_modal_gpu_selection(inputs.get("gpu_type", "RTX-PRO-6000")),
         instance_count=int(inputs.get("instance_count", 1)),
+        cooldown=modal_cooldown_policy_from_inputs(inputs),
+    )
+
+
+def modal_cooldown_policy_from_inputs(
+    inputs: Mapping[str, Any],
+) -> ModalCooldownPolicy:
+    """Build the Modal cooldown policy, defaulting widgets absent from older workflows."""
+    return ModalCooldownPolicy(
+        global_cooldown_seconds=int(
+            inputs.get("global_cooldown", DEFAULT_MODAL_GLOBAL_COOLDOWN_SECONDS)
+        ),
+        reserve_cooldown_count=int(
+            inputs.get("reserve_cooldown_count", DEFAULT_MODAL_RESERVE_COOLDOWN_COUNT)
+        ),
+        reserve_cooldown_seconds=int(
+            inputs.get("reserve_cooldown", DEFAULT_MODAL_RESERVE_COOLDOWN_SECONDS)
+        ),
     )
 
 
@@ -653,6 +733,7 @@ __all__ = [
     "compile_remote_configuration_set",
     "configuration_set_from_values",
     "modal_configuration_from_inputs",
+    "modal_cooldown_policy_from_inputs",
     "r2_storage_configuration_from_inputs",
     "ssh_configuration_from_inputs",
     "vast_configuration_from_inputs",

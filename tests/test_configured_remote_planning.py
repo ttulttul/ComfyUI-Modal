@@ -630,6 +630,9 @@ def test_rewrite_stamps_selected_modal_configuration_on_proxy_payload(
                 "configuration_name": "modal-t4",
                 "gpu_type": "T4",
                 "instance_count": 2,
+                "global_cooldown": 45,
+                "reserve_cooldown_count": 1,
+                "reserve_cooldown": 900,
             },
         },
         "99": {
@@ -660,6 +663,9 @@ def test_rewrite_stamps_selected_modal_configuration_on_proxy_payload(
     assert payload["remote_configuration_name"] == "modal-t4"
     assert payload["modal_gpu"] == "T4"
     assert payload["modal_max_containers"] == 2
+    assert payload["modal_global_cooldown_seconds"] == 45
+    assert payload["modal_reserve_cooldown_count"] == 1
+    assert payload["modal_reserve_cooldown_seconds"] == 900
     assert summary.remote_configurations == [
         {
             "configuration_id": "10",
@@ -667,5 +673,8 @@ def test_rewrite_stamps_selected_modal_configuration_on_proxy_payload(
             "provider": "modal",
             "gpu_type": "T4",
             "instance_count": 2,
+            "global_cooldown_seconds": 45,
+            "reserve_cooldown_count": 1,
+            "reserve_cooldown_seconds": 900,
         }
     ]
