@@ -143,7 +143,7 @@ The Modal Configuration node's advanced settings control how long idle workers s
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `global_cooldown` | `60` | Idle seconds before any Modal worker in this pool scales down. |
-| `reserve_cooldown_count` | `0` | How many workers (the first N worker slots, at most `instance_count`) use `reserve_cooldown` instead. |
+| `reserve_cooldown_count` | `0` | How many workers use `reserve_cooldown` instead (at most `instance_count`). They are the first N slots of one worker pool per prompt: the mapped lanes when the prompt has mapped work, otherwise the ordinary ComfyUI workers, otherwise the LLM workers. |
 | `reserve_cooldown` | `300` | Idle seconds before a reserved worker scales down. |
 
 Set a small `reserve_cooldown_count` with a long `reserve_cooldown` to keep a few always-warm workers while the rest of the pool releases its GPUs quickly. Cooldowns apply per call (Modal `with_options(scaledown_window=...)`), so changing them never redeploys the app. They override `COMFY_MODAL_SCALEDOWN_WINDOW` for workflows that use a Modal Configuration node; local-gap pools still stay warm for at least the local keepalive window.

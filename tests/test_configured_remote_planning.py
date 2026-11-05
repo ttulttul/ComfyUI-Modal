@@ -666,6 +666,7 @@ def test_rewrite_stamps_selected_modal_configuration_on_proxy_payload(
     assert payload["modal_global_cooldown_seconds"] == 45
     assert payload["modal_reserve_cooldown_count"] == 1
     assert payload["modal_reserve_cooldown_seconds"] == 900
+    assert payload["modal_reserve_cooldown_pool"] == "comfy"
     assert summary.remote_configurations == [
         {
             "configuration_id": "10",

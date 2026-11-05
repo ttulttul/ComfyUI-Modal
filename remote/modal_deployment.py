@@ -27,6 +27,8 @@ from ..runtime_environment import (
     build_remote_runtime_identity,
 )
 from ..settings import (
+    MODAL_RESERVE_COOLDOWN_POOL_FIELD,
+    MODAL_WORKER_POOL_MAPPED,
     ModalCooldownPolicy,
     ModalSyncSettings,
     get_settings,
@@ -54,7 +56,9 @@ _MODAL_AUTO_DEPLOY_LOCK = threading.Lock()
 _MODAL_AUTO_DEPLOY_STATES: dict[tuple[str, str | None], "_ModalAutoDeployState"] = {}
 _MODAL_REMOTE_APP_VERSION_OK: set[tuple[str, str | None, str]] = set()
 _MODAL_APP_STOP_TIMEOUT_SECONDS = 120.0
-_AFFINITY_SLOT_PATTERN = re.compile(r"(?:^|:)slot:(\d+)$")
+_AFFINITY_SLOT_PATTERN = re.compile(
+    r"^worker-pool:(?:(?P<pool>[a-z]+):)?slot:(?P<slot>\d+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -199,12 +203,15 @@ def _mapped_lane_affinity_key(payload: dict[str, Any], lane_index: int) -> str |
     del payload
     return _remote_worker_pool_affinity_key(lane_index)
 
-def _affinity_key_slot_index(worker_affinity_key: str) -> int | None:
-    """Return the worker-pool slot encoded in an affinity key, if it has one."""
-    match = _AFFINITY_SLOT_PATTERN.search(worker_affinity_key)
+def _affinity_key_worker(worker_affinity_key: str) -> tuple[str | None, int | None]:
+    """Return the (worker pool, slot) encoded in an affinity key, or (None, None).
+
+    Plain ``worker-pool:slot:N`` keys belong to the mapped-lane pool.
+    """
+    match = _AFFINITY_SLOT_PATTERN.fullmatch(worker_affinity_key)
     if match is None:
-        return None
-    return int(match.group(1))
+        return None, None
+    return match.group("pool") or MODAL_WORKER_POOL_MAPPED, int(match.group("slot"))
 
 def _scaledown_window_override(
     payload: Mapping[str, Any],
@@ -213,14 +220,21 @@ def _scaledown_window_override(
 ) -> int | None:
     """Return the per-call scaledown window, or None to keep the deployed default.
 
-    A workflow cooldown policy picks the reserve or global cooldown by worker
-    slot; local-gap pools are additionally held for the local keepalive window.
+    A workflow cooldown policy gives the reserve cooldown only to the leading
+    slots of the prompt's reserve pool; local-gap pools are additionally held for
+    the local keepalive window.
     """
     cooldown_policy = ModalCooldownPolicy.from_payload(payload)
     scaledown_window: int | None = None
     if cooldown_policy is not None:
-        scaledown_window = cooldown_policy.scaledown_window_for_slot(
-            _affinity_key_slot_index(worker_affinity_key)
+        worker_pool, slot_index = _affinity_key_worker(worker_affinity_key)
+        scaledown_window = cooldown_policy.scaledown_window_for_worker(
+            worker_pool=worker_pool,
+            slot_index=slot_index,
+            reserve_pool=str(
+                payload.get(MODAL_RESERVE_COOLDOWN_POOL_FIELD)
+                or MODAL_WORKER_POOL_MAPPED
+            ),
         )
     if bool(payload.get("remote_local_gap_pool")):
         scaledown_window = max(

@@ -261,10 +261,12 @@ copy these, or it will expect a different fingerprint for the same Modal app.
 MODAL_GLOBAL_COOLDOWN_FIELD = "modal_global_cooldown_seconds"
 MODAL_RESERVE_COOLDOWN_COUNT_FIELD = "modal_reserve_cooldown_count"
 MODAL_RESERVE_COOLDOWN_FIELD = "modal_reserve_cooldown_seconds"
+MODAL_RESERVE_COOLDOWN_POOL_FIELD = "modal_reserve_cooldown_pool"
 MODAL_COOLDOWN_PAYLOAD_FIELDS = (
     MODAL_GLOBAL_COOLDOWN_FIELD,
     MODAL_RESERVE_COOLDOWN_COUNT_FIELD,
     MODAL_RESERVE_COOLDOWN_FIELD,
+    MODAL_RESERVE_COOLDOWN_POOL_FIELD,
 )
 """Payload fields carrying the workflow's per-slot Modal cooldown policy.
 
@@ -276,6 +278,21 @@ MODAL_INHERITED_PAYLOAD_FIELDS = (
     *MODAL_DEPLOYMENT_PAYLOAD_FIELDS,
     *MODAL_COOLDOWN_PAYLOAD_FIELDS,
 )
+
+MODAL_WORKER_POOL_MAPPED = "mapped"
+MODAL_WORKER_POOL_COMFY = "comfy"
+MODAL_WORKER_POOL_LLM = "llm"
+MODAL_WORKER_POOLS = (
+    MODAL_WORKER_POOL_MAPPED,
+    MODAL_WORKER_POOL_COMFY,
+    MODAL_WORKER_POOL_LLM,
+)
+"""Independent Modal worker-slot namespaces.
+
+Mapped lanes use ``worker-pool:slot:N``; ordinary components use
+``worker-pool:<comfy|llm>:slot:N``. Slot N in different pools is a different
+container, so the reserve cooldown must target exactly one pool per prompt.
+"""
 
 MODAL_COOLDOWN_MIN_SECONDS = 2
 MODAL_COOLDOWN_MAX_SECONDS = 3600
@@ -321,9 +338,23 @@ class ModalCooldownPolicy:
         if self.reserve_cooldown_count < 0:
             raise ValueError("Modal reserve_cooldown_count must not be negative.")
 
-    def scaledown_window_for_slot(self, slot_index: int | None) -> int:
-        """Return the idle cooldown for one worker slot; unslotted workers are global."""
-        if slot_index is not None and 0 <= slot_index < self.reserve_cooldown_count:
+    def scaledown_window_for_worker(
+        self,
+        *,
+        worker_pool: str | None,
+        slot_index: int | None,
+        reserve_pool: str,
+    ) -> int:
+        """Return one worker's idle cooldown.
+
+        Only the first ``reserve_cooldown_count`` slots of ``reserve_pool`` keep the
+        reserve cooldown; every other worker, including unslotted ones, is global.
+        """
+        if (
+            worker_pool == reserve_pool
+            and slot_index is not None
+            and 0 <= slot_index < self.reserve_cooldown_count
+        ):
             return self.reserve_cooldown_seconds
         return self.global_cooldown_seconds
 

@@ -24,7 +24,14 @@ if __package__:
         _node_output_refs,
     )
     from .remote_plan_types import InputTarget, LinkedOutputRef
-    from .settings import MODAL_INHERITED_PAYLOAD_FIELDS
+    from .settings import (
+        MODAL_GLOBAL_COOLDOWN_FIELD,
+        MODAL_INHERITED_PAYLOAD_FIELDS,
+        MODAL_RESERVE_COOLDOWN_POOL_FIELD,
+        MODAL_WORKER_POOL_COMFY,
+        MODAL_WORKER_POOL_LLM,
+        MODAL_WORKER_POOL_MAPPED,
+    )
 else:  # pragma: no cover - flat import inside the Modal container.
     from component_planning import _component_ancestors_of_local_source
     from execution_environments import ExecutionProvider
@@ -41,7 +48,14 @@ else:  # pragma: no cover - flat import inside the Modal container.
         _node_output_refs,
     )
     from remote_plan_types import InputTarget, LinkedOutputRef
-    from settings import MODAL_INHERITED_PAYLOAD_FIELDS
+    from settings import (
+        MODAL_GLOBAL_COOLDOWN_FIELD,
+        MODAL_INHERITED_PAYLOAD_FIELDS,
+        MODAL_RESERVE_COOLDOWN_POOL_FIELD,
+        MODAL_WORKER_POOL_COMFY,
+        MODAL_WORKER_POOL_LLM,
+        MODAL_WORKER_POOL_MAPPED,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +397,93 @@ def _speculative_prewarm_target_payload(
         for field_name in _SPECULATIVE_PREWARM_PAYLOAD_FIELDS
         if field_name in payload
     }
+
+
+def _reserve_cooldown_pool(
+    component_ids: list[str],
+    payloads_by_component_id: Mapping[str, Mapping[str, Any]],
+    mapped_component_ids: set[str],
+) -> str:
+    """Pick the single worker pool whose leading slots keep the reserve cooldown.
+
+    Mapped lanes do the bulk of the work when present; otherwise ordinary ComfyUI
+    workers, and LLM workers only when nothing else runs on this Modal target.
+    """
+    if any(component_id in mapped_component_ids for component_id in component_ids):
+        return MODAL_WORKER_POOL_MAPPED
+    affinity_groups = {
+        str(
+            payloads_by_component_id[component_id].get("remote_worker_affinity_group")
+            or MODAL_WORKER_POOL_COMFY
+        )
+        .strip()
+        .lower()
+        for component_id in component_ids
+    }
+    if MODAL_WORKER_POOL_COMFY in affinity_groups:
+        return MODAL_WORKER_POOL_COMFY
+    return MODAL_WORKER_POOL_LLM
+
+
+def _cooldown_payloads_by_environment(
+    rewritten_prompt: dict[str, Any],
+    component_ids: list[str],
+) -> tuple[dict[str, Mapping[str, Any]], dict[str, list[str]]]:
+    """Return Modal payloads carrying a cooldown policy, grouped by environment."""
+    payloads_by_component_id: dict[str, Mapping[str, Any]] = {}
+    component_ids_by_environment: dict[str, list[str]] = {}
+    for component_id in component_ids:
+        payload = _remote_proxy_payload(rewritten_prompt, component_id)
+        if (
+            payload is None
+            or payload.get("execution_provider") != ExecutionProvider.MODAL.value
+            or payload.get(MODAL_GLOBAL_COOLDOWN_FIELD) is None
+        ):
+            continue
+        payloads_by_component_id[component_id] = payload
+        environment_id = str(payload.get("execution_environment_id") or "")
+        component_ids_by_environment.setdefault(environment_id, []).append(
+            component_id
+        )
+    return payloads_by_component_id, component_ids_by_environment
+
+
+def _configure_reserve_cooldown_pools(
+    *,
+    rewritten_prompt: dict[str, Any],
+    component_ids: list[str],
+    mapped_component_ids: set[str],
+) -> None:
+    """Stamp each Modal payload with the one pool that holds reserved workers.
+
+    Without this, slot 0 of the static ``comfy`` pool and slot 0 of the mapped
+    lanes would both keep the reserve cooldown, doubling the idle GPUs paid for.
+    """
+    payloads_by_component_id, component_ids_by_environment = (
+        _cooldown_payloads_by_environment(rewritten_prompt, component_ids)
+    )
+    for environment_id, environment_component_ids in (
+        component_ids_by_environment.items()
+    ):
+        reserve_pool = _reserve_cooldown_pool(
+            environment_component_ids,
+            payloads_by_component_id,
+            mapped_component_ids,
+        )
+        for component_id in environment_component_ids:
+            rewritten_prompt[component_id]["inputs"][
+                "original_node_data"
+            ] = update_registered_proxy_payload_fields(
+                component_id,
+                payloads_by_component_id[component_id],
+                {MODAL_RESERVE_COOLDOWN_POOL_FIELD: reserve_pool},
+            )
+        logger.info(
+            "Assigned Modal reserve cooldown pool=%s environment=%s components=%s.",
+            reserve_pool,
+            environment_id or "<default>",
+            environment_component_ids,
+        )
 
 
 def _configure_speculative_affinity_prewarm_payloads(

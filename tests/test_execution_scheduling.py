@@ -1202,9 +1202,39 @@ def test_speculative_prewarm_target_keeps_modal_cooldown_policy(
         "modal_global_cooldown_seconds": 45,
         "modal_reserve_cooldown_count": 1,
         "modal_reserve_cooldown_seconds": 900,
+        "modal_reserve_cooldown_pool": "mapped",
     }
     target = prompt_affinity_planning_module._speculative_prewarm_target_payload(
         {"component_id": "component-1", **cooldown_fields}
     )
 
     assert target == {"component_id": "component-1", **cooldown_fields}
+
+
+@pytest.mark.parametrize(
+    ("component_groups", "mapped_ids", "expected_pool"),
+    [
+        ({"1": "comfy", "1__mapped": "comfy"}, {"1__mapped"}, "mapped"),
+        ({"1": "llm", "2__mapped": "comfy"}, {"2__mapped"}, "mapped"),
+        ({"1": "comfy", "2": "llm"}, set(), "comfy"),
+        ({"1": None}, set(), "comfy"),
+        ({"1": "llm"}, set(), "llm"),
+    ],
+)
+def test_reserve_cooldown_pool_targets_one_pool_per_prompt(
+    prompt_affinity_planning_module: Any,
+    component_groups: dict[str, str | None],
+    mapped_ids: set[str],
+    expected_pool: str,
+) -> None:
+    """Exactly one worker pool per Modal target keeps the reserve cooldown."""
+    payloads = {
+        component_id: {"remote_worker_affinity_group": group}
+        for component_id, group in component_groups.items()
+    }
+
+    pool = prompt_affinity_planning_module._reserve_cooldown_pool(
+        list(component_groups), payloads, mapped_ids
+    )
+
+    assert pool == expected_pool

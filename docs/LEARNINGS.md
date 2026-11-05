@@ -793,3 +793,16 @@ nested executor inside the host's running prompt, so it now passes zeroed
 classic-cache `cache_args`. It also restores the host's release callback and
 headroom afterwards; otherwise the nested run would silently switch off the
 host executor's RAM-pressure eviction for the rest of the outer prompt.
+
+### Reserve cooldown must target one worker pool
+
+Worker slots live in separate namespaces: mapped lanes use `worker-pool:slot:N`,
+while ordinary components use `worker-pool:comfy:slot:N` or `worker-pool:llm:slot:N`.
+Each is its own Modal container. The first cooldown version keyed only on the
+trailing `slot:N`, so in a hybrid static+mapped prompt both the static
+`comfy:slot:0` worker and mapped lane `slot:0` held the 300s reserve: two idle
+GPUs for `reserve_cooldown_count=1`, and five containers for `instance_count=4`.
+`_configure_reserve_cooldown_pools` now stamps one `modal_reserve_cooldown_pool`
+per Modal environment (mapped > comfy > llm), and the lookup gives the reserve
+cooldown only to slots in that pool.
+

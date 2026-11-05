@@ -1250,6 +1250,67 @@ def test_lookup_deployed_remote_engine_applies_reserve_cooldown_by_slot(
     assert result["worker_affinity_key"] == f"worker-pool:slot:{lane_index}"
 
 
+@pytest.mark.parametrize(
+    ("reserve_pool", "affinity_key", "expected_window"),
+    [
+        ("mapped", "worker-pool:slot:0", 900),
+        ("mapped", "worker-pool:comfy:slot:0", 45),
+        ("mapped", "worker-pool:llm:slot:0", 45),
+        ("comfy", "worker-pool:comfy:slot:0", 900),
+        ("comfy", "worker-pool:comfy:slot:2", 45),
+        ("comfy", "worker-pool:slot:0", 45),
+        ("llm", "worker-pool:llm:slot:1", 900),
+        ("llm", "worker-pool:comfy:slot:0", 45),
+    ],
+)
+def test_lookup_deployed_remote_engine_reserves_only_the_prompt_reserve_pool(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+    reserve_pool: str,
+    affinity_key: str,
+    expected_window: int,
+) -> None:
+    """Slot N in a different worker pool is a different container and stays global."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+
+    modal_deployment_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "component-1",
+            **_COOLDOWN_PAYLOAD_FIELDS,
+            "modal_reserve_cooldown_pool": reserve_pool,
+        },
+        affinity_key_override=affinity_key,
+    )
+
+    assert observed_options == [{"scaledown_window": expected_window}]
+
+
+def test_lookup_deployed_remote_engine_static_phase_of_mapped_prompt_is_global(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A hybrid prompt's static comfy worker must not hold a second reserved GPU."""
+    observed_options = _install_option_recording_modal(
+        remote_modal_app_module, modal_deployment_module, monkeypatch
+    )
+
+    result = modal_deployment_module._lookup_deployed_remote_engine(
+        {
+            "component_id": "1",
+            "remote_worker_affinity_group": "comfy",
+            **_COOLDOWN_PAYLOAD_FIELDS,
+            "modal_reserve_cooldown_pool": "mapped",
+        }
+    )
+
+    assert result["worker_affinity_key"] == "worker-pool:comfy:slot:0"
+    assert observed_options == [{"scaledown_window": 45}]
+
+
 def test_lookup_deployed_remote_engine_uses_global_cooldown_for_unslotted_keys(
     remote_modal_app_module: Any,
     modal_deployment_module: Any,
