@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Mapping
 
 if __package__:
     from .instance_identity import (
@@ -248,6 +249,23 @@ def modal_deployment_app_name(settings: ModalSyncSettings) -> str:
     prefix_length = _MODAL_APP_NAME_MAX_LENGTH - len(suffix) - len(digest) - 1
     prefix = settings.app_name[:prefix_length].rstrip("-_.") or "app"
     return f"{prefix}-{digest}{suffix}"
+
+
+MODAL_DEPLOYMENT_PAYLOAD_FIELDS = ("modal_gpu", "modal_max_containers")
+"""Payload fields that select deployment settings and so shape the runtime fingerprint.
+
+Any payload derived from another (warmups, prewarm targets, mapped phases) must
+copy these, or it will expect a different fingerprint for the same Modal app.
+"""
+
+
+def modal_deployment_payload_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the deployment-identity fields present on one payload."""
+    return {
+        field_name: payload[field_name]
+        for field_name in MODAL_DEPLOYMENT_PAYLOAD_FIELDS
+        if payload.get(field_name) is not None
+    }
 
 
 def _read_path_env(name: str) -> Path | None:

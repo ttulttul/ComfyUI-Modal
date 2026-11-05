@@ -16,7 +16,11 @@ import threading
 import time
 from typing import Any, Callable, Iterator, Mapping
 
-from ..settings import get_settings, modal_deployment_app_name
+from ..settings import (
+    get_settings,
+    modal_deployment_app_name,
+    modal_deployment_payload_fields,
+)
 from .local_execution import _is_link, _resolve_required_subgraph_nodes
 from .modal_deployment import (
     ModalRemoteInvocationError,
@@ -542,8 +546,8 @@ def _build_prompt_warmup_request(payload: dict[str, Any]) -> dict[str, Any] | No
                 payload.get("component_id", "modal-warmup"),
             )
         ),
+        **modal_deployment_payload_fields(payload),
         "modal_gpu": settings.modal_gpu,
-        "modal_max_containers": payload.get("modal_max_containers"),
         "remote_worker_affinity_group": payload.get(
             "remote_worker_affinity_group"
         ),

@@ -24,6 +24,7 @@ if __package__:
         _node_output_refs,
     )
     from .remote_plan_types import InputTarget, LinkedOutputRef
+    from .settings import MODAL_DEPLOYMENT_PAYLOAD_FIELDS
 else:  # pragma: no cover - flat import inside the Modal container.
     from component_planning import _component_ancestors_of_local_source
     from execution_environments import ExecutionProvider
@@ -40,6 +41,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
         _node_output_refs,
     )
     from remote_plan_types import InputTarget, LinkedOutputRef
+    from settings import MODAL_DEPLOYMENT_PAYLOAD_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +50,7 @@ _SPECULATIVE_PREWARM_PAYLOAD_FIELDS = frozenset(
     {
         "component_id",
         "prompt_id",
-        "modal_gpu",
-        "modal_max_containers",
+        *MODAL_DEPLOYMENT_PAYLOAD_FIELDS,
         "execution_provider",
         "execution_environment_id",
         "remote_worker_affinity_group",

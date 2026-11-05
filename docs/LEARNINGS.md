@@ -759,3 +759,10 @@ generation streams with an empty `modal.exception.RemoteError`. Fixes:
 - `_replace_outdated_modal_app` refuses to stop an app whose remote fingerprint
   this process already deployed or validated, so divergent callers can no longer
   stop each other's deployments.
+- Follow-up: hybrid mapped execution builds its static, mapped, and cleanup phase
+  payloads in `_shared_subgraph_payload_fields`, which also dropped `modal_gpu` and
+  `modal_max_containers`. The refusal above caught it, raising
+  `ModalRemoteAppOutOfDateError` instead of killing jobs. All derived payloads now
+  copy `settings.MODAL_DEPLOYMENT_PAYLOAD_FIELDS` through
+  `modal_deployment_payload_fields()`; add any new fingerprint-shaping payload
+  field there.
