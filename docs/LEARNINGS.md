@@ -860,3 +860,33 @@ where its snapshot was captured (`origin_*`, `same_host`, `same_gpu`,
 `snapshot_age_seconds`). `kind` comes from Modal's `/__modal/restore-state.json`,
 which exists only after a restore. Use these lines to explain misses where a
 snapshot existed: placement versus a separate bound function.
+
+A booting container that captures a snapshot is resumed in place from it, so
+Modal writes `restore-state.json` for the creator too. A restore whose origin task
+is the container's own task is therefore reported as `kind=snapshot-created`, not
+`restore`.
+
+First controlled test (2026-11-06): one run after a deploy, then every container
+stopped with `modal container stop -y`, then a second run.
+- Pooling worked. Only two bound functions existed (the 30 s Comfy pool and the
+  300 s reserve lane). Four containers served five lanes because the static phase's
+  container went on to take mapped items.
+- Snapshots restore across regions. A 30 s-pool container in `us-east` restored the
+  snapshot captured in `us-central` six minutes earlier, and was serving 18 s after
+  dispatch. Full boots took 29–42 s.
+- Both containers placed on AWS (`us-west`, `eu-south`) booted fully even though the
+  pool had a snapshot. Every snapshot in run 1 came from non-AWS hosts
+  (`cloud=CLOUD_PROVIDER_UNSPECIFIED`). The `us-west` container then captured an
+  AWS snapshot of its own. Working hypothesis: snapshots do not cross cloud
+  providers. Pinning the pool with `with_options(cloud=..., region=...)` would test
+  this, but it narrows GPU capacity.
+- The reserve lane missed its non-AWS snapshot once (one sample, unexplained).
+- Separately, durable volume commits of 18.8 MB tensor results took 22–41 s on that
+  run's reserve container, against 2–7 s everywhere else. The same pattern showed up
+  on the reserve lane two runs earlier. Investigate commit placement before blaming
+  cooldown code.
+
+Container logs reach `comfyui.log` only when ComfyUI starts with
+`COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS=true`. Otherwise use
+`modal container logs <ta-id> --since 1h`, which works only while the container
+is still listed.
