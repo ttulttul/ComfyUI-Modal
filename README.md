@@ -55,7 +55,7 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 1. Clone this repository into ComfyUI's `custom_nodes/` directory (see [Installation](#installation)).
 2. Authenticate Modal once: `<comfyui-venv>/bin/python -m modal setup`.
 3. If remote nodes need API keys, create the `comfy` secret collection from your `.env` (see [Modal](#modal)).
-4. Start ComfyUI with `COMFY_MODAL_EXECUTION_MODE=remote`. The default, `local`, runs every component inside the local ComfyUI process.
+4. Restart ComfyUI. Remote execution is the default; leave `COMFY_MODAL_EXECUTION_MODE` unset or set it to `remote`.
 5. In the workflow, add a **Remote Execution Configurator** and a **Modal Configuration** (choose the GPU and how many containers may run at once), and connect them.
 6. Enable `Run Remotely` on the expensive nodes, or use `Enable on Upstream Nodes`, then queue the workflow as usual.
 
@@ -103,13 +103,9 @@ cd ~/git/ComfyUI/custom_nodes
 git clone <this-repo-url> ComfyUI-Modal
 ```
 
-Set remote mode to run components on a real back-end. Set it in the environment that launches ComfyUI, because the default is `local`:
+Remote execution is the default, so marked components run on the configured back-ends without extra setup. On first start in remote mode, Modal-Sync installs the pinned Modal SDK if it is missing.
 
-```bash
-export COMFY_MODAL_EXECUTION_MODE=remote
-```
-
-Local mode is mainly for developing the extension itself. It runs the full pipeline (marker resolution, prompt rewrite, sync planning, serialization, and proxy execution), but executes the rewritten components inside the local ComfyUI process, so it needs no credentials:
+Local mode is only for developing the extension itself. It runs the full pipeline (marker resolution, prompt rewrite, sync planning, serialization, and proxy execution), but executes the rewritten components inside the local ComfyUI process, so it needs no credentials. Opt in explicitly in the environment that launches ComfyUI:
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=local
@@ -494,7 +490,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `COMFY_MODAL_EXECUTION_MODE` | `local` | Set to `remote` for remote execution. |
+| `COMFY_MODAL_EXECUTION_MODE` | `remote` | Set to `local` to run rewritten components inside the local ComfyUI process (development only). Remote workers set `local` for themselves. |
 | `MODAL_ENVIRONMENT` | active Modal profile or workspace default | Modal environment used for app deployment, lookup, status, and billing. |
 | `COMFY_MODAL_APP_NAME` | `comfy-modal-sync-<instance_id>` | Explicit Modal app name override; otherwise derived from the persistent per-installation identity. |
 | `COMFY_MODAL_INSTANCE_ID_PATH` | `<ComfyUI user directory>/.comfy-modal-sync-instance-id` | Override the persistent identity file location. |
@@ -570,7 +566,7 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 
 - **App not found or deleted**: leave `COMFY_MODAL_AUTO_DEPLOY=true` so the next lookup deploys the app again.
 - **Changed the workflow GPU**: just queue the next remote run — Modal-Sync looks up or builds the GPU-specific app without touching the previous one.
-- **Remote mode still uses local mirror storage**: restart ComfyUI with `COMFY_MODAL_EXECUTION_MODE=remote` and the Modal SDK available so sync and invocation resolve the same mode.
+- **Remote mode still uses local mirror storage**: check that `COMFY_MODAL_EXECUTION_MODE` is not set to `local` in the environment that launches ComfyUI, then restart with the Modal SDK available so sync and invocation resolve the same mode.
 - **Missing custom node class on the remote worker**: ensure custom-node sync is enabled, check the worker logs for import failures, and confirm the package's Python dependencies are listed in its `requirements.txt`.
 - **`UNETLoader` reports `Could not detect model type` for a synced Flux-style model**: Modal-Sync aliases saved RMSNorm `.weight` keys to ComfyUI's `.scale` form before remote model detection, but the model still has to be supported by the ComfyUI checkout packaged into the worker.
 - **Boundary validation fails on `MODEL`, `CLIP`, `VAE`, `CONDITIONING`, or similar**: include the upstream producer in the remote region, or use `Enable on Upstream Nodes`.

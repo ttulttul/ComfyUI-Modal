@@ -518,6 +518,22 @@ def discover_comfyui_user_directory(
     return _discover_comfyui_user_directory(resolved_settings.comfyui_root)
 
 
+DEFAULT_EXECUTION_MODE = "remote"
+"""Execution mode used when COMFY_MODAL_EXECUTION_MODE is unset.
+
+Remote is the default because local mode only exists for developing the extension:
+it runs rewritten components inside the local ComfyUI process. Remote workers
+(Modal containers, SSH and Vast workers) set ``local`` explicitly for their own
+nested execution.
+"""
+
+
+def configured_execution_mode() -> str:
+    """Return the configured execution mode, defaulting to remote when unset or blank."""
+    configured = (os.getenv("COMFY_MODAL_EXECUTION_MODE") or "").strip().lower()
+    return configured or DEFAULT_EXECUTION_MODE
+
+
 def _resolve_modal_app_name(comfyui_root: Path | None, execution_mode: str) -> str:
     """Return the explicit or persistent per-ComfyUI Modal app name."""
     configured_name = os.getenv("COMFY_MODAL_APP_NAME")
@@ -561,7 +577,7 @@ def _get_settings_cached(
     repo_root = _discover_repo_root()
     comfyui_root = _discover_comfyui_root(repo_root)
     custom_nodes_dir = _discover_custom_nodes_dir(repo_root, comfyui_root)
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local").strip().lower()
+    execution_mode = configured_execution_mode()
     app_name = _resolve_modal_app_name(comfyui_root, execution_mode)
     sync_custom_nodes = _read_bool_env("COMFY_MODAL_SYNC_CUSTOM_NODES")
     if sync_custom_nodes is None:

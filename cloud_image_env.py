@@ -184,6 +184,8 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
             "/storage",
         ),
         "COMFY_MODAL_REMOTE_WORKER": "1",
+        # Workers run their components in-process; never inherit the host default.
+        "COMFY_MODAL_EXECUTION_MODE": "local",
         "COMFY_MODAL_LLM_VLLM_EXECUTION_MODE": str(
             getattr(settings, "llm_vllm_execution_mode", "auto")
         ),
