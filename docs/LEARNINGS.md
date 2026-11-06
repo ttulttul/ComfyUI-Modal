@@ -827,3 +827,36 @@ outside the repo copy (`/root/comfyui_modal_sync_cloud.py`, while the repo is at
 `cloud_runtime_logging.py`, which is always imported from the repo copy. One
 container INFO line reports how many loggers were configured and from which directory.
 
+
+## Lane slots must not be Modal class parameters (one snapshot per parameter set)
+
+Modal binds every distinct `RemoteEngine` parameter set, *and* every distinct
+`with_options(...)` override, to its own function (`FunctionBindParams` returns a
+`bound_function_id`). Each bound function has its own container pool and its own
+memory snapshot. Passing the lane key (`worker-pool:slot:N`,
+`worker-pool:comfy:slot:N`) as the `worker_affinity_key` parameter therefore made
+five independent snapshots for one 4-lane workflow. Live logs proved it: a restored
+container's `+relativeCreated` origin matched, to the millisecond, the boot of a
+container in the same slot, never a different one. Each slot had to be cold-booted
+after every deploy and could miss on its own.
+
+`_container_pool_key` now collapses slot keys to `worker-pool:comfy` (mapped and
+ordinary Comfy lanes) or `worker-pool:llm`. One-use keys such as LLM memory recovery
+still get their own pool. The full slot key still drives planning, warmup dedupe,
+and the reserve/global cooldown, so the reserve lane is still its own pool through
+`with_options(scaledown_window=reserve)`. That leaves two Comfy snapshot identities
+instead of five. Lanes no longer pin a container. A phase that lands on a container
+without the prompt's session restores it from durable bridges, which is the same path
+a lane seed already takes. This partly reverses the earlier "affinity must be a class
+parameter" lesson. That lesson was about prompt-scoped keys defeating cross-prompt
+reuse, and pool keys are still stable across prompts.
+
+Expect a full boot (about 45–50s on an RTX PRO 6000) for each pool on its first run
+after any deploy, because a deploy invalidates every snapshot.
+
+Containers now log one `Modal container startup kind=boot|restore` line with region,
+cloud, host, GPU UUID/driver, and the bound `function` id. A restore also reports
+where its snapshot was captured (`origin_*`, `same_host`, `same_gpu`,
+`snapshot_age_seconds`). `kind` comes from Modal's `/__modal/restore-state.json`,
+which exists only after a restore. Use these lines to explain misses where a
+snapshot existed: placement versus a separate bound function.

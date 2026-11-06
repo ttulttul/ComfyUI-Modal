@@ -241,6 +241,11 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
     from .cloud_execution_control import (
         _registered_remote_execution,
     )
+    from .cloud_container_placement import (
+        describe_container_startup,
+        log_container_startup,
+        record_snapshot_origin,
+    )
     from .cloud_runtime_logging import (
         _emit_cloud_info,
         _is_modal_container_runtime,
@@ -255,6 +260,11 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
     )
     from cloud_execution_control import (
         _registered_remote_execution,
+    )
+    from cloud_container_placement import (
+        describe_container_startup,
+        log_container_startup,
+        record_snapshot_origin,
     )
     from cloud_runtime_logging import (
         _emit_cloud_info,
@@ -896,6 +906,10 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
                     gpu_snapshot_enabled=bool(self.gpu_snapshot_enabled),
                     snapshot_profile_key=self.snapshot_profile_key,
                 )
+                record_snapshot_origin(
+                    worker_affinity_key=self.worker_affinity_key,
+                    snapshot_profile_key=self.snapshot_profile_key,
+                )
                 logger.info(
                     "RemoteEngine snapshot setup complete for snapshot_profile_key=%s gpu_snapshot_enabled=%s worker_affinity=%s.",
                     self.snapshot_profile_key or None,
@@ -907,6 +921,13 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
         def setup_restored_runtime(self) -> None:
             """Prepare request-serving runtime state after a fresh boot or snapshot restore."""
             with _timed_phase("remote_engine_setup_restored"):
+                log_container_startup(
+                    describe_container_startup(
+                        worker_affinity_key=self.worker_affinity_key,
+                        snapshot_profile_key=self.snapshot_profile_key,
+                        gpu_snapshot_enabled=bool(self.gpu_snapshot_enabled),
+                    )
+                )
                 _prewarm_restored_runtime(llm_compile_cache_vol)
                 logger.info(
                     "RemoteEngine restored-runtime setup complete for snapshot_profile_key=%s.",
