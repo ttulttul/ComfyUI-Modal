@@ -897,3 +897,10 @@ Container logs reach `comfyui.log` only when ComfyUI starts with
 `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS=true`. Otherwise use
 `modal container logs <ta-id> --since 1h`, which works only while the container
 is still listed.
+
+
+## Remote is the default execution mode
+
+`COMFY_MODAL_EXECUTION_MODE` used to default to `local`. That mode runs rewritten components inside the local ComfyUI process, and users who forgot to set the variable kept landing in it. They saw confusing failures, such as `/assets/...` model paths that only exist in remote storage. `settings.configured_execution_mode()` now owns the default (`remote`), and every host-side reader goes through it.
+
+Modal containers never set the variable, so their code relied on the old default to behave as local in-process workers: custom-node sync off, no nested Modal dispatch. The Modal image environment now pins `COMFY_MODAL_EXECUTION_MODE=local` explicitly, as SSH and Vast workers already did. Any new worker runtime must do the same, or it inherits the host default and may try to dispatch remotely from inside a worker.

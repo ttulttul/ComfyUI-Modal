@@ -599,3 +599,36 @@ def test_settings_reads_terminate_container_on_error_override(
         settings_module.get_settings.cache_clear()
 
     assert settings.terminate_container_on_error is False
+
+
+def test_execution_mode_defaults_to_remote_when_unset(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Without an explicit mode the extension runs components remotely."""
+    monkeypatch.delenv("COMFY_MODAL_EXECUTION_MODE", raising=False)
+    assert settings_module.configured_execution_mode() == "remote"
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "  ")
+    assert settings_module.configured_execution_mode() == "remote"
+
+
+def test_execution_mode_respects_explicit_local(
+    settings_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Developers and remote workers can still opt into in-process local mode."""
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", " Local ")
+    assert settings_module.configured_execution_mode() == "local"
+
+
+def test_modal_sdk_bootstrap_requests_remote_by_default(
+    modal_sdk_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Startup installs or checks the Modal SDK unless local mode is chosen explicitly."""
+    monkeypatch.delenv("COMFY_MODAL_EXECUTION_MODE", raising=False)
+    assert modal_sdk_module._remote_execution_requested() is True
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
+    assert modal_sdk_module._remote_execution_requested() is False

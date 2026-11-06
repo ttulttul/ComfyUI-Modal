@@ -28,9 +28,11 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 - [Execution Back-Ends](#execution-back-ends)
   - [Workflow Capacity Configuration](#workflow-capacity-configuration)
   - [Modal](#modal)
+    - [Example: A Modal Workflow](#example-a-modal-workflow)
     - [Cooldowns](#cooldowns)
     - [Cold Starts And Snapshots](#cold-starts-and-snapshots)
   - [Self-Hosted SSH Hosts](#self-hosted-ssh-hosts)
+    - [Example: A Linux Workstation Over SSH](#example-a-linux-workstation-over-ssh)
   - [Vast.ai](#vastai)
   - [Cost- And Capability-Aware Scheduling](#cost--and-capability-aware-scheduling)
 - [Using It In ComfyUI](#using-it-in-comfyui)
@@ -53,11 +55,15 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 1. Clone this repository into ComfyUI's `custom_nodes/` directory (see [Installation](#installation)).
 2. Authenticate Modal once: `<comfyui-venv>/bin/python -m modal setup`.
 3. If remote nodes need API keys, create the `comfy` secret collection from your `.env` (see [Modal](#modal)).
-4. Start ComfyUI with `COMFY_MODAL_EXECUTION_MODE=remote`. The default, `local`, runs every component inside the local ComfyUI process.
+4. Restart ComfyUI. Remote execution is the default; leave `COMFY_MODAL_EXECUTION_MODE` unset or set it to `remote`.
 5. In the workflow, add a **Remote Execution Configurator** and a **Modal Configuration** (choose the GPU and how many containers may run at once), and connect them.
 6. Enable `Run Remotely` on the expensive nodes, or use `Enable on Upstream Nodes`, then queue the workflow as usual.
 
 The first run deploys the Modal app and boots its containers from scratch. Later cold starts restore from memory snapshots and are much faster; see [Cold Starts And Snapshots](#cold-starts-and-snapshots).
+
+A minimal Modal workflow looks like this. The eight blue-bordered nodes have `Run Remotely` enabled and run as one remote component. **Save Image** stays local, and the **Modal Configuration** feeds the **Remote Execution Configurator**, which shows the plan once you queue:
+
+![A minimal text-to-image workflow configured for Modal](docs/images/modal-setup.png)
 
 ## Highlights
 
@@ -97,13 +103,9 @@ cd ~/git/ComfyUI/custom_nodes
 git clone <this-repo-url> ComfyUI-Modal
 ```
 
-Set remote mode to run components on a real back-end. Set it in the environment that launches ComfyUI, because the default is `local`:
+Remote execution is the default, so marked components run on the configured back-ends without extra setup. On first start in remote mode, Modal-Sync installs the pinned Modal SDK if it is missing.
 
-```bash
-export COMFY_MODAL_EXECUTION_MODE=remote
-```
-
-Local mode is mainly for developing the extension itself. It runs the full pipeline (marker resolution, prompt rewrite, sync planning, serialization, and proxy execution), but executes the rewritten components inside the local ComfyUI process, so it needs no credentials:
+Local mode is only for developing the extension itself. It runs the full pipeline (marker resolution, prompt rewrite, sync planning, serialization, and proxy execution), but executes the rewritten components inside the local ComfyUI process, so it needs no credentials. Opt in explicitly in the environment that launches ComfyUI:
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=local
@@ -152,6 +154,16 @@ Every key in the collection is available to remote custom nodes through `os.envi
 Each ComfyUI installation gets its own persistent Modal app name, derived from an identity file in the ComfyUI user directory, so multiple installations do not collide. Set `COMFY_MODAL_APP_NAME` to share or externally manage a deployment.
 
 Each **Modal Configuration** selects a GPU type and maximum concurrent container count. Every GPU target gets its own deployed app, so several configurations can contribute different Modal GPU types to the same plan. First-run auto-deploy is enabled by default and also replaces stale or incompatible deployments; after upgrading this node pack, redeploy once (or leave `COMFY_MODAL_AUTO_DEPLOY=true`) so remote workers pick up the new code. Warm containers reuse loaded models across compatible requests and scale down to zero after an idle window. That window comes from the Modal Configuration node's cooldowns below, or from `COMFY_MODAL_SCALEDOWN_WINDOW` (default 600 seconds) for workflows without one.
+
+#### Example: A Modal Workflow
+
+While the remote component runs, the sampling node turns purple and the Configurator shows the live plan: the selected GPU, predicted time and cost, and the running container with its **KILL** button.
+
+![The Modal example while the sampler runs on an RTX PRO 6000](docs/images/modal-running.png)
+
+When the run finishes, the image is downloaded into the local `output/` directory and appears in the local **Save Image** node:
+
+![The Modal example after a successful run](docs/images/modal-finished.png)
 
 #### Cooldowns
 
@@ -204,6 +216,18 @@ The host form also controls placement:
 - **Tags**, **Enabled**, and **Drain** — placement metadata and safe admission controls. Draining blocks new components without killing a running worker.
 
 **Refresh workers** and **Stop workers** operate only on containers carrying this extension's ownership label, so they cannot touch unrelated Docker workloads. Worker images are immutable and fingerprinted from the node-pack source, ComfyUI source, custom-node requirements, and runtime settings; a fingerprint change replaces the worker while its named storage volume is retained. All traffic travels over the existing SSH connection — no daemon TCP port, worker port, or inbound firewall rule is required.
+
+#### Example: A Linux Workstation Over SSH
+
+The same graph runs on a self-hosted Linux machine by swapping the **Modal Configuration** for an **SSH Configuration**. Here `ssh_target` is an alias from `~/.ssh/config` for a workstation with an RTX 4090. The models are the 8-bit Flux Klein and Qwen3-VL-4B encoder, which fit within the card's 24 GB.
+
+![A minimal workflow configured for a Linux host over SSH](docs/images/linux-setup.png)
+
+On the first run, the nodes turn orange while the referenced models upload to the host. Later runs reuse the content-addressed copies already stored there.
+
+![The SSH example while models upload to the host](docs/images/linux-syncing.png)
+
+![The SSH example after a successful run](docs/images/linux-finished.png)
 
 Worker environment secrets are administrator-managed: the optional **Remote Docker env file** field names a file that already exists on the host and is passed to Docker's `--env-file`. Its contents never cross the API or enter the workflow.
 
@@ -466,7 +490,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, and `off`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `COMFY_MODAL_EXECUTION_MODE` | `local` | Set to `remote` for remote execution. |
+| `COMFY_MODAL_EXECUTION_MODE` | `remote` | Set to `local` to run rewritten components inside the local ComfyUI process (development only). Remote workers set `local` for themselves. |
 | `MODAL_ENVIRONMENT` | active Modal profile or workspace default | Modal environment used for app deployment, lookup, status, and billing. |
 | `COMFY_MODAL_APP_NAME` | `comfy-modal-sync-<instance_id>` | Explicit Modal app name override; otherwise derived from the persistent per-installation identity. |
 | `COMFY_MODAL_INSTANCE_ID_PATH` | `<ComfyUI user directory>/.comfy-modal-sync-instance-id` | Override the persistent identity file location. |
@@ -542,7 +566,7 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 
 - **App not found or deleted**: leave `COMFY_MODAL_AUTO_DEPLOY=true` so the next lookup deploys the app again.
 - **Changed the workflow GPU**: just queue the next remote run — Modal-Sync looks up or builds the GPU-specific app without touching the previous one.
-- **Remote mode still uses local mirror storage**: restart ComfyUI with `COMFY_MODAL_EXECUTION_MODE=remote` and the Modal SDK available so sync and invocation resolve the same mode.
+- **Remote mode still uses local mirror storage**: check that `COMFY_MODAL_EXECUTION_MODE` is not set to `local` in the environment that launches ComfyUI, then restart with the Modal SDK available so sync and invocation resolve the same mode.
 - **Missing custom node class on the remote worker**: ensure custom-node sync is enabled, check the worker logs for import failures, and confirm the package's Python dependencies are listed in its `requirements.txt`.
 - **`UNETLoader` reports `Could not detect model type` for a synced Flux-style model**: Modal-Sync aliases saved RMSNorm `.weight` keys to ComfyUI's `.scale` form before remote model detection, but the model still has to be supported by the ComfyUI checkout packaged into the worker.
 - **Boundary validation fails on `MODEL`, `CLIP`, `VAE`, `CONDITIONING`, or similar**: include the upstream producer in the remote region, or use `Enable on Upstream Nodes`.

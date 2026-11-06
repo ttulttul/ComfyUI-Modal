@@ -6,7 +6,6 @@ import asyncio
 import copy
 from dataclasses import dataclass
 import logging
-import os
 import threading
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -43,7 +42,11 @@ from .modal_warmup import (
     _prompt_warmup_head_start_seconds,
     boost_mapped_component_warmup,
 )
-from ..settings import get_settings, modal_deployment_payload_fields
+from ..settings import (
+    configured_execution_mode,
+    get_settings,
+    modal_deployment_payload_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1066,7 +1069,7 @@ async def _invoke_implicitly_mapped_subgraph_async(
         mapped_execute_node_ids,
     )
     cleanup_payload = _build_remote_session_cleanup_payload(hybrid_payload)
-    execution_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
+    execution_mode = configured_execution_mode()
     use_seeded_remote_lanes = (
         execution_mode != "local"
         and modal is not None

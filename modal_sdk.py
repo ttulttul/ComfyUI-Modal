@@ -5,11 +5,15 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
-import os
 import shlex
 import shutil
 import subprocess
 import sys
+
+try:  # Package import inside ComfyUI; flat import inside workers and tests.
+    from .settings import configured_execution_mode
+except ImportError:  # pragma: no cover - exercised by flat imports.
+    from settings import configured_execution_mode
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +23,9 @@ _INSTALL_TIMEOUT_SECONDS = 300
 
 def _remote_execution_requested(execution_mode: str | None = None) -> bool:
     """Return whether startup configuration requests Modal-backed execution."""
-    resolved_mode = execution_mode
-    if resolved_mode is None:
-        resolved_mode = os.getenv("COMFY_MODAL_EXECUTION_MODE", "local")
-    return resolved_mode.strip().lower() == "remote"
+    if execution_mode is None:
+        return configured_execution_mode() == "remote"
+    return execution_mode.strip().lower() == "remote"
 
 
 def _build_install_command() -> list[str] | None:
