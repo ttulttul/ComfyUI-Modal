@@ -11,6 +11,10 @@ from typing import Any, Iterable, Mapping
 if __package__:
     from .execution_environments import ExecutionAssignment, ExecutionProvider
     from .modal_executor_node import MODAL_MAP_INPUT_NODE_ID
+    from .progressive_preview import (
+        PROGRESSIVE_PREVIEW_NODE_ID,
+        PROGRESSIVE_PREVIEW_TARGETS_KEY,
+    )
     from .remote_graph_analysis import (
         _build_consumer_map,
         _build_remote_components,
@@ -36,6 +40,10 @@ if __package__:
 else:  # pragma: no cover - flat import inside the Modal container.
     from execution_environments import ExecutionAssignment, ExecutionProvider
     from modal_executor_node import MODAL_MAP_INPUT_NODE_ID
+    from progressive_preview import (
+        PROGRESSIVE_PREVIEW_NODE_ID,
+        PROGRESSIVE_PREVIEW_TARGETS_KEY,
+    )
     from remote_graph_analysis import (
         _build_consumer_map,
         _build_remote_components,
@@ -192,6 +200,12 @@ def _build_component_plan(
                 preview_target_node_ids=_preview_target_node_ids(
                     prompt=prompt,
                     local_consumers=local_consumers,
+                ),
+                progressive_preview_target_node_ids=(
+                    _progressive_preview_target_node_ids(
+                        prompt=prompt,
+                        local_consumers=local_consumers,
+                    )
                 ),
             )
 
@@ -416,21 +430,57 @@ def _subset_component_prompt(
     }
 
 
+def _local_consumer_node_ids_of_class(
+    *,
+    prompt: dict[str, Any],
+    local_consumers: list[InputTarget],
+    class_type: str,
+) -> list[str]:
+    """Return direct local consumers of one boundary output with a given class."""
+    node_ids: set[str] = set()
+    for local_consumer in local_consumers:
+        consumer_prompt_node = prompt.get(local_consumer.node_id)
+        if consumer_prompt_node is None:
+            continue
+        if str(consumer_prompt_node.get("class_type")) != class_type:
+            continue
+        node_ids.add(str(local_consumer.node_id))
+    return sorted(node_ids)
+
+
 def _preview_target_node_ids(
     *,
     prompt: dict[str, Any],
     local_consumers: list[InputTarget],
 ) -> list[str]:
     """Return direct local PreviewImage consumers for one remote boundary output."""
-    preview_target_node_ids: set[str] = set()
-    for local_consumer in local_consumers:
-        consumer_prompt_node = prompt.get(local_consumer.node_id)
-        if consumer_prompt_node is None:
-            continue
-        if str(consumer_prompt_node.get("class_type")) != "PreviewImage":
-            continue
-        preview_target_node_ids.add(str(local_consumer.node_id))
-    return sorted(preview_target_node_ids)
+    return _local_consumer_node_ids_of_class(
+        prompt=prompt, local_consumers=local_consumers, class_type="PreviewImage"
+    )
+
+
+def _progressive_preview_target_node_ids(
+    *,
+    prompt: dict[str, Any],
+    local_consumers: list[InputTarget],
+) -> list[str]:
+    """Return direct local progressive preview consumers for one boundary output."""
+    return _local_consumer_node_ids_of_class(
+        prompt=prompt,
+        local_consumers=local_consumers,
+        class_type=PROGRESSIVE_PREVIEW_NODE_ID,
+    )
+
+
+def _is_progressive_preview_consumer(
+    prompt: Mapping[str, Any],
+    consumer: InputTarget,
+) -> bool:
+    """Return whether one consumer materializes remote bridge refs by itself."""
+    prompt_node = prompt.get(consumer.node_id)
+    return isinstance(prompt_node, Mapping) and (
+        str(prompt_node.get("class_type")) == PROGRESSIVE_PREVIEW_NODE_ID
+    )
 
 
 def _component_downstream_closure(
@@ -1093,6 +1143,11 @@ def _mark_remote_to_remote_session_boundaries(
             boundary_output.session_consumer_node_ids = sorted(
                 {consumer.node_id for consumer in remote_consumers}
             )
+            non_returning_local_consumers = [
+                consumer
+                for consumer in non_returning_local_consumers
+                if not _is_progressive_preview_consumer(prompt, consumer)
+            ]
             if non_returning_local_consumers:
                 materializer_node_id = (
                     f"__ModalLocalBridgeMaterializer__"
@@ -1171,6 +1226,10 @@ def _boundary_output_payload(
         "is_list": boundary_output.is_list,
         "preview_target_node_ids": list(boundary_output.preview_target_node_ids),
     }
+    if boundary_output.progressive_preview_target_node_ids:
+        payload[PROGRESSIVE_PREVIEW_TARGETS_KEY] = list(
+            boundary_output.progressive_preview_target_node_ids
+        )
     if boundary_output.session_output:
         payload["session_output"] = True
     if mapped_output is not None:

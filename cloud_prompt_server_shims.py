@@ -42,6 +42,11 @@ def _collapse_cache_slot(slot_values: Any, is_list: bool) -> Any:
     return _prompt_server_hooks().collapse_cache_slot(slot_values, is_list)
 
 
+def _boundary_target_node_ids(boundary_output: dict[str, Any], key: str) -> list[str]:
+    """Return the non-empty local target node ids listed under one boundary key."""
+    return [str(node_id) for node_id in boundary_output.get(key, []) or [] if str(node_id)]
+
+
 def _emit_cloud_info(message: str, *args: Any) -> None:
     """Delegate timestamped cloud logging to the stable entrypoint."""
     _prompt_server_hooks().emit_cloud_info(message, *args)
@@ -295,12 +300,13 @@ class _TracingPromptServer(_NullPromptServer):
         """Configure streamed remote boundary-output publication for this execution."""
         outputs_by_node_id: dict[str, list[dict[str, Any]]] = {}
         for boundary_output in boundary_outputs:
-            preview_target_node_ids = [
-                str(node_id)
-                for node_id in boundary_output.get("preview_target_node_ids", [])
-                if str(node_id)
-            ]
-            if not preview_target_node_ids:
+            preview_target_node_ids = _boundary_target_node_ids(
+                boundary_output, "preview_target_node_ids"
+            )
+            progressive_target_node_ids = _boundary_target_node_ids(
+                boundary_output, "progressive_preview_target_node_ids"
+            )
+            if not preview_target_node_ids and not progressive_target_node_ids:
                 continue
             if str(boundary_output.get("io_type")) != "IMAGE":
                 continue
@@ -340,28 +346,32 @@ class _TracingPromptServer(_NullPromptServer):
             if output_index >= len(cache_outputs):
                 continue
 
-            preview_target_node_ids = [
-                str(target_node_id)
-                for target_node_id in boundary_output.get("preview_target_node_ids", [])
-                if str(target_node_id)
-            ]
-            if not preview_target_node_ids:
+            preview_target_node_ids = _boundary_target_node_ids(
+                boundary_output, "preview_target_node_ids"
+            )
+            progressive_target_node_ids = _boundary_target_node_ids(
+                boundary_output, "progressive_preview_target_node_ids"
+            )
+            if not preview_target_node_ids and not progressive_target_node_ids:
                 continue
 
-            self._status_callback(
-                {
-                    "event_type": "boundary_output",
-                    "node_id": str(node_id),
-                    "output_index": output_index,
-                    "io_type": str(boundary_output.get("io_type", "")),
-                    "is_list": bool(boundary_output.get("is_list", False)),
-                    "preview_target_node_ids": preview_target_node_ids,
-                    "value": _collapse_cache_slot(
-                        slot_values=cache_outputs[output_index],
-                        is_list=bool(boundary_output.get("is_list", False)),
-                    ),
-                }
-            )
+            boundary_event: dict[str, Any] = {
+                "event_type": "boundary_output",
+                "node_id": str(node_id),
+                "output_index": output_index,
+                "io_type": str(boundary_output.get("io_type", "")),
+                "is_list": bool(boundary_output.get("is_list", False)),
+                "preview_target_node_ids": preview_target_node_ids,
+                "value": _collapse_cache_slot(
+                    slot_values=cache_outputs[output_index],
+                    is_list=bool(boundary_output.get("is_list", False)),
+                ),
+            }
+            if progressive_target_node_ids:
+                boundary_event["progressive_preview_target_node_ids"] = (
+                    progressive_target_node_ids
+                )
+            self._status_callback(boundary_event)
             self._published_boundary_outputs.add(publication_key)
 
     def send_sync(

@@ -52,6 +52,7 @@ try:
         ModalMapInput,
         ModalUniversalExecutor,
     )
+    from .progressive_preview_node import RemoteProgressivePreview
     from .remote_configuration_nodes import (
         ModalConfiguration,
         R2StorageConfiguration,
@@ -68,6 +69,7 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     ModalEndpointChat = None  # type: ignore[assignment]
     ModalLLM = None  # type: ignore[assignment]
     ModalUniversalExecutor = None  # type: ignore[assignment]
+    RemoteProgressivePreview = None  # type: ignore[assignment]
     ModalConfiguration = None  # type: ignore[assignment]
     R2StorageConfiguration = None  # type: ignore[assignment]
     RemoteExecutionConfigurator = None  # type: ignore[assignment]
@@ -96,6 +98,7 @@ else:
                 ModalUniversalExecutor,
                 ModalMapInput,
                 ModalArtifactFinalizer,
+                RemoteProgressivePreview,
                 ModalEndpointChat,
                 ModalLLM,
                 ModalConfiguration,
@@ -121,6 +124,7 @@ __all__ = [
     "ModalConfiguration",
     "ModalUniversalExecutor",
     "RemoteExecutionConfigurator",
+    "RemoteProgressivePreview",
     "R2StorageConfiguration",
     "SshConfiguration",
     "VastConfiguration",

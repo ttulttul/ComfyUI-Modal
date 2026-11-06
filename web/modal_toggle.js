@@ -1747,6 +1747,8 @@ function replayModalUiEvent(eventRecord) {
       handleModalStatus({ detail: payload });
     } else if (eventName === "modal_progress") {
       handleModalProgress({ detail: payload });
+    } else if (eventName === "modal_progressive_preview") {
+      api.dispatchEvent?.(new CustomEvent(eventName, { detail: payload }));
     }
   } finally {
     modalReplayedEventUpdatedAtMs = null;

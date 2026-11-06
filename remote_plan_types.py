@@ -64,6 +64,7 @@ class BoundaryOutputSpec:
     io_type: str
     is_list: bool
     preview_target_node_ids: list[str] = field(default_factory=list)
+    progressive_preview_target_node_ids: list[str] = field(default_factory=list)
     session_output: bool = False
     session_consumer_node_ids: list[str] = field(default_factory=list)
     local_materializer_node_id: str | None = None

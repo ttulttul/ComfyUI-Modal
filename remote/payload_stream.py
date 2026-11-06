@@ -18,6 +18,7 @@ from .local_ui_events import (
     _emit_local_modal_status,
     _emit_local_preview_boundary_output,
     _emit_local_preview_image,
+    _emit_local_progressive_preview_slot,
     _progress_stream_event_metadata,
     _remote_execution_destination,
     _remote_execution_identity,
@@ -348,25 +349,47 @@ def _handle_boundary_output_event(
     stream_event: dict[str, Any],
 ) -> None:
     """Forward one streamed boundary value to its local preview targets."""
-    target_node_ids = [
-        str(node_id)
-        for node_id in stream_event.get("preview_target_node_ids", [])
-        if str(node_id)
-    ]
-    if not target_node_ids:
+    target_node_ids = _stream_event_node_ids(stream_event, "preview_target_node_ids")
+    progressive_node_ids = _stream_event_node_ids(
+        stream_event, "progressive_preview_target_node_ids"
+    )
+    if not target_node_ids and not progressive_node_ids:
         return
     logger.debug(
-        "Forwarding streamed Modal boundary output previews for component=%s source_node=%s targets=%s.",
+        "Forwarding streamed Modal boundary output previews for component=%s source_node=%s targets=%s progressive_targets=%s.",
         state.payload.get("component_id"),
         stream_event.get("node_id"),
         target_node_ids,
+        progressive_node_ids,
     )
-    _emit_local_preview_boundary_output(
-        prompt_id=state.prompt_id,
-        client_id=state.client_id,
-        preview_target_node_ids=target_node_ids,
-        image_value=deserialize_value(stream_event.get("value")),
-    )
+    image_value = deserialize_value(stream_event.get("value"))
+    if progressive_node_ids:
+        _emit_local_progressive_preview_slot(
+            prompt_id=state.prompt_id,
+            client_id=state.client_id,
+            node_ids=progressive_node_ids,
+            slot_index=_optional_payload_int(state.payload, "map_item_index") or 0,
+            slot_count=_optional_payload_int(state.payload, "map_item_count"),
+            image_value=image_value,
+        )
+    if target_node_ids:
+        _emit_local_preview_boundary_output(
+            prompt_id=state.prompt_id,
+            client_id=state.client_id,
+            preview_target_node_ids=target_node_ids,
+            image_value=image_value,
+        )
+
+
+def _stream_event_node_ids(stream_event: dict[str, Any], key: str) -> list[str]:
+    """Return the non-empty node ids listed under one stream event key."""
+    return [str(node_id) for node_id in stream_event.get(key, []) or [] if str(node_id)]
+
+
+def _optional_payload_int(payload: dict[str, Any], key: str) -> int | None:
+    """Return one optional integer payload field."""
+    value = payload.get(key)
+    return int(value) if value is not None else None
 
 
 def _handle_cached_node_event(

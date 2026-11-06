@@ -396,6 +396,113 @@ def _emit_local_preview_boundary_output(
         )
 
 
+def _progressive_preview_module() -> Any:
+    """Return the shared progressive preview module for package or flat imports."""
+    try:
+        from .. import progressive_preview
+    except ImportError:
+        import progressive_preview  # type: ignore[no-redef]
+    return progressive_preview
+
+
+def _send_progressive_preview_event(
+    *,
+    client_id: str | None,
+    payload: dict[str, Any],
+) -> None:
+    """Send and record one progressive preview websocket event."""
+    if client_id is None:
+        return
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+    event_name = _progressive_preview_module().PROGRESSIVE_PREVIEW_EVENT
+    prompt_server.send_sync(event_name, payload, client_id)
+    _record_local_modal_ui_event(event_name, payload, client_id)
+
+
+def _emit_local_progressive_preview_start(
+    *,
+    prompt_id: str | None,
+    client_id: str | None,
+    node_ids: list[str],
+    slot_count: int,
+) -> None:
+    """Announce the number of empty slots each progressive preview should show."""
+    if not prompt_id or not node_ids:
+        return
+    registry = _progressive_preview_module().PROGRESSIVE_PREVIEW_REGISTRY
+    for node_id in node_ids:
+        registry.begin(prompt_id, node_id, slot_count)
+        logger.info(
+            "Initialized progressive preview prompt=%s node=%s slots=%d.",
+            prompt_id,
+            node_id,
+            slot_count,
+        )
+        _send_progressive_preview_event(
+            client_id=client_id,
+            payload={
+                "phase": "start",
+                "prompt_id": prompt_id,
+                "node": node_id,
+                "slot_count": int(slot_count),
+            },
+        )
+
+
+def _emit_local_progressive_preview_slot(
+    *,
+    prompt_id: str | None,
+    client_id: str | None,
+    node_ids: list[str],
+    slot_index: int,
+    slot_count: int | None,
+    image_value: Any,
+) -> None:
+    """Save one streamed IMAGE value and fill its slot on each progressive preview."""
+    if not prompt_id or not node_ids:
+        return
+    preview_module = _progressive_preview_module()
+    try:
+        images = preview_module.save_temp_preview_images(image_value)
+    except ModuleNotFoundError:
+        logger.warning(
+            "Progressive preview is unavailable because ComfyUI nodes could not be imported."
+        )
+        return
+    if not images:
+        logger.warning(
+            "Progressive preview slot %d for prompt=%s carried no images.",
+            slot_index,
+            prompt_id,
+        )
+        return
+    for node_id in node_ids:
+        state = preview_module.PROGRESSIVE_PREVIEW_REGISTRY.fill(
+            prompt_id, node_id, slot_index, images, slot_count
+        )
+        logger.info(
+            "Filled progressive preview prompt=%s node=%s slot=%d/%d images=%d.",
+            prompt_id,
+            node_id,
+            slot_index + 1,
+            state.effective_slot_count(),
+            len(images),
+        )
+        _send_progressive_preview_event(
+            client_id=client_id,
+            payload={
+                "phase": "slot",
+                "prompt_id": prompt_id,
+                "node": node_id,
+                "slot_index": int(slot_index),
+                "slot_count": state.effective_slot_count(),
+                "images": [image.as_ui() for image in images],
+            },
+        )
+
+
 def _allowed_suppressed_stream_node_ids(payload: dict[str, Any]) -> set[str]:
     """Return the node ids that may surface UI events for a suppressed mapped/static stream."""
     allowed_node_ids = {
