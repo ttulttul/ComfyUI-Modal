@@ -148,6 +148,21 @@ await extensions[0].beforeRegisterNodeDef(nodeType, { name: "RemoteProgressivePr
 nodeType.prototype.onExecuted.call(node, { images: [] });
 assert.equal(originalCalled, true);
 assert.equal(panel.visible, false);
+assert.equal(panel.root.style.display, "none");
 assert.equal(widgets[0].options.getMinHeight(), 0);
+
+// Replayed events for the finished prompt (browser refocus) must not resurrect the panel.
+assert.equal(handler({ detail: { phase: "start", prompt_id: "p3", node: "7", slot_count: 3 } }), false);
+assert.equal(
+  handler({ detail: { phase: "slot", prompt_id: "p3", node: "7", slot_index: 0, images: [{ filename: "a.png" }] } }),
+  false,
+);
+assert.equal(panel.visible, false);
+
+// The next prompt shows the panel again.
+assert.equal(handler({ detail: { phase: "start", prompt_id: "p4", node: "7", slot_count: 2 } }), true);
+assert.equal(panel.visible, true);
+assert.equal(panel.root.style.display, "");
+assert.equal(panel.grid.children.length, 2);
 
 console.log("progressive preview frontend checks passed");

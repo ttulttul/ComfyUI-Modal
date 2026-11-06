@@ -15,7 +15,8 @@ const progressivePreviewPanels = new WeakMap();
  * @typedef {{filename: string, subfolder?: string, type?: string}} PreviewImage
  * @typedef {{promptId: string|null, slotCount: number, slots: Map<number, PreviewImage[]>}} SlotState
  * @typedef {{node: object, root: HTMLElement, header: HTMLElement, grid: HTMLElement,
- *   cells: HTMLElement[], state: SlotState, visible: boolean, widget: object|null}} ProgressivePreviewPanel
+ *   cells: HTMLElement[], state: SlotState, visible: boolean, widget: object|null,
+ *   finishedPromptId: string|null}} ProgressivePreviewPanel
  */
 
 /**
@@ -206,6 +207,7 @@ function ensureProgressivePreviewPanel(node) {
   const root = document.createElement("div");
   root.className = "comfy-progressive-preview";
   root.hidden = true;
+  root.style.display = "none";
   const header = document.createElement("div");
   header.className = "comfy-progressive-preview-header";
   const grid = document.createElement("div");
@@ -213,7 +215,17 @@ function ensureProgressivePreviewPanel(node) {
   root.appendChild(header);
   root.appendChild(grid);
   /** @type {ProgressivePreviewPanel} */
-  const panel = { node, root, header, grid, cells: [], state: createSlotState(), visible: false, widget: null };
+  const panel = {
+    node,
+    root,
+    header,
+    grid,
+    cells: [],
+    state: createSlotState(),
+    visible: false,
+    widget: null,
+    finishedPromptId: null,
+  };
   try {
     panel.widget = node.addDOMWidget(PROGRESSIVE_PREVIEW_WIDGET_NAME, "progressive-preview", root, {
       serialize: false,
@@ -310,6 +322,7 @@ function setProgressivePreviewVisible(panel, visible) {
   }
   panel.visible = visible;
   panel.root.hidden = !visible;
+  panel.root.style.display = visible ? "" : "none";
   const node = panel.node;
   if (visible) {
     node.imgs = undefined;
@@ -334,7 +347,10 @@ function handleProgressivePreviewEvent(event) {
     return false;
   }
   const panel = ensureProgressivePreviewPanel(node);
-  if (!panel || !applyProgressivePreviewEvent(panel.state, detail)) {
+  if (!panel || isFinishedProgressivePreviewEvent(panel, detail)) {
+    return false;
+  }
+  if (!applyProgressivePreviewEvent(panel.state, detail)) {
     return false;
   }
   renderProgressivePreviewPanel(panel);
@@ -344,12 +360,25 @@ function handleProgressivePreviewEvent(event) {
 }
 
 /**
+ * Return whether an event belongs to a prompt whose final images were already shown.
+ * Replayed events after a browser refocus must not resurrect a finished panel.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {Record<string, any>} detail
+ * @returns {boolean}
+ */
+function isFinishedProgressivePreviewEvent(panel, detail) {
+  const promptId = detail?.prompt_id == null ? null : String(detail.prompt_id);
+  return promptId !== null && promptId === panel.finishedPromptId;
+}
+
+/**
  * Hide a node's progressive panel once ComfyUI delivers its final images.
  * @param {object} node
  */
 function finishProgressivePreview(node) {
   const panel = progressivePreviewPanels.get(node);
   if (panel) {
+    panel.finishedPromptId = panel.state.promptId;
     setProgressivePreviewVisible(panel, false);
   }
 }
