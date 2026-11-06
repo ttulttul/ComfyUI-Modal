@@ -1084,13 +1084,13 @@ def test_lookup_deployed_remote_engine_uses_affinity_as_modal_class_parameter(
 
     assert result == {
         "gpu_snapshot_enabled": False,
-        "worker_affinity_key": "worker-pool:slot:0",
+        "worker_affinity_key": "worker-pool:comfy",
     }
     assert probe_result == {"gpu_snapshot_enabled": False}
     assert observed_kwargs == [
         {
             "gpu_snapshot_enabled": False,
-            "worker_affinity_key": "worker-pool:slot:0",
+            "worker_affinity_key": "worker-pool:comfy",
         },
         {"gpu_snapshot_enabled": False},
     ]
@@ -1124,7 +1124,7 @@ def test_lookup_deployed_remote_engine_uses_workflow_gpu_app_identity(
 
     assert result == {
         "gpu_snapshot_enabled": False,
-        "worker_affinity_key": "worker-pool:slot:0",
+        "worker_affinity_key": "worker-pool:comfy",
     }
     assert observed_lookups == [("comfy-modal-sync-gpu-b300", "RemoteEngine")]
 
@@ -1176,7 +1176,7 @@ def test_lookup_deployed_remote_engine_extends_local_gap_pool_scaledown(
 
     assert observed_options == [{"scaledown_window": 900}]
     assert observed_kwargs == [result]
-    assert result["worker_affinity_key"] == "worker-pool:slot:0"
+    assert result["worker_affinity_key"] == "worker-pool:comfy"
 
 def _install_option_recording_modal(
     remote_modal_app_module: Any,
@@ -1247,7 +1247,7 @@ def test_lookup_deployed_remote_engine_applies_reserve_cooldown_by_slot(
     )
 
     assert observed_options == [{"scaledown_window": expected_window}]
-    assert result["worker_affinity_key"] == f"worker-pool:slot:{lane_index}"
+    assert result["worker_affinity_key"] == "worker-pool:comfy"
 
 
 @pytest.mark.parametrize(
@@ -1307,7 +1307,7 @@ def test_lookup_deployed_remote_engine_static_phase_of_mapped_prompt_is_global(
         }
     )
 
-    assert result["worker_affinity_key"] == "worker-pool:comfy:slot:0"
+    assert result["worker_affinity_key"] == "worker-pool:comfy"
     assert observed_options == [{"scaledown_window": 45}]
 
 
@@ -1564,30 +1564,30 @@ def test_lookup_deployed_remote_engine_reuses_worker_pool_slots_across_prompt_se
 
     assert first_result == {
         "gpu_snapshot_enabled": False,
-        "worker_affinity_key": "worker-pool:slot:0",
+        "worker_affinity_key": "worker-pool:comfy",
     }
     assert second_result == {
         "gpu_snapshot_enabled": False,
-        "worker_affinity_key": "worker-pool:slot:0",
+        "worker_affinity_key": "worker-pool:comfy",
     }
     assert observed_kwargs == [
         {
             "gpu_snapshot_enabled": False,
-            "worker_affinity_key": "worker-pool:slot:0",
+            "worker_affinity_key": "worker-pool:comfy",
         },
         {
             "gpu_snapshot_enabled": False,
-            "worker_affinity_key": "worker-pool:slot:0",
+            "worker_affinity_key": "worker-pool:comfy",
         },
     ]
 
-def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
+def test_lookup_deployed_remote_engine_shares_one_snapshot_pool_across_lanes(
     remote_modal_app_module: Any,
     modal_warmup_module: Any,
     modal_deployment_module: Any,
     monkeypatch: Any,
 ) -> None:
-    """Lane-specific affinity overrides should create stable separate Modal identities."""
+    """Lanes of one runtime kind must share a Modal class identity, so they share one snapshot."""
     observed_kwargs: list[dict[str, Any]] = []
     snapshot_profiles: dict[str, Any] = {}
 
@@ -1648,9 +1648,8 @@ def test_lookup_deployed_remote_engine_isolates_profiled_lane_overrides(
         remote_modal_app_module.get_settings.cache_clear()
         modal_warmup_module._SNAPSHOT_PROFILE_RECORDS.clear()
 
-    assert first_result != second_result
-    assert first_result["worker_affinity_key"] == "worker-pool:slot:0"
-    assert second_result["worker_affinity_key"] == "worker-pool:slot:3"
+    assert first_result == second_result
+    assert first_result["worker_affinity_key"] == "worker-pool:comfy"
     assert first_result["snapshot_profile_key"].startswith("loader-profile:")
     assert observed_kwargs == [first_result, second_result]
 
@@ -1813,3 +1812,30 @@ def test_remote_modal_refuses_to_stop_app_validated_by_this_process(
 
     assert stop_calls == []
     assert deploy_calls == []
+
+
+@pytest.mark.parametrize(
+    ("worker_affinity_key", "expected_pool_key"),
+    [
+        ("worker-pool:slot:0", "worker-pool:comfy"),
+        ("worker-pool:slot:3", "worker-pool:comfy"),
+        ("worker-pool:comfy:slot:0", "worker-pool:comfy"),
+        ("worker-pool:comfy:slot:2", "worker-pool:comfy"),
+        ("worker-pool:llm:slot:0", "worker-pool:llm"),
+        ("worker-pool:llm:slot:1", "worker-pool:llm"),
+        (
+            "worker-pool:llm:slot:0:llm-memory-recovery:abc",
+            "worker-pool:llm:slot:0:llm-memory-recovery:abc",
+        ),
+    ],
+)
+def test_container_pool_key_shares_snapshots_per_runtime_kind(
+    modal_deployment_module: Any,
+    worker_affinity_key: str,
+    expected_pool_key: str,
+) -> None:
+    """Comfy lanes share one pool, LLM lanes another, and one-use keys stay unique."""
+    assert (
+        modal_deployment_module._container_pool_key(worker_affinity_key)
+        == expected_pool_key
+    )

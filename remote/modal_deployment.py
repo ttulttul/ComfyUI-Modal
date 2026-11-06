@@ -28,6 +28,7 @@ from ..runtime_environment import (
 )
 from ..settings import (
     MODAL_RESERVE_COOLDOWN_POOL_FIELD,
+    MODAL_WORKER_POOL_LLM,
     MODAL_WORKER_POOL_MAPPED,
     ModalCooldownPolicy,
     ModalSyncSettings,
@@ -212,6 +213,26 @@ def _affinity_key_worker(worker_affinity_key: str) -> tuple[str | None, int | No
     if match is None:
         return None, None
     return match.group("pool") or MODAL_WORKER_POOL_MAPPED, int(match.group("slot"))
+
+MODAL_COMFY_CONTAINER_POOL_KEY = "worker-pool:comfy"
+MODAL_LLM_CONTAINER_POOL_KEY = "worker-pool:llm"
+
+
+def _container_pool_key(worker_affinity_key: str) -> str:
+    """Return the ``RemoteEngine`` parameter that selects a Modal container pool.
+
+    Modal gives every distinct class-parameter set its own containers and its own
+    memory snapshot. Lane slots therefore share one pool per runtime kind: every
+    Comfy lane (mapped or ordinary) restores the same snapshot, and LLM lanes keep
+    their own pool so their GPU memory needs stay isolated. Keys that are not
+    reusable slots, such as one-use recovery keys, still select a dedicated pool.
+    """
+    worker_pool, _ = _affinity_key_worker(worker_affinity_key)
+    if worker_pool is None:
+        return worker_affinity_key
+    if worker_pool == MODAL_WORKER_POOL_LLM:
+        return MODAL_LLM_CONTAINER_POOL_KEY
+    return MODAL_COMFY_CONTAINER_POOL_KEY
 
 def _scaledown_window_override(
     payload: Mapping[str, Any],
@@ -426,7 +447,14 @@ def _lookup_deployed_remote_engine(
     if snapshot_profile_key:
         remote_engine_kwargs["snapshot_profile_key"] = snapshot_profile_key
     if not protocol_probe:
-        remote_engine_kwargs["worker_affinity_key"] = worker_affinity_key
+        container_pool_key = _container_pool_key(worker_affinity_key)
+        remote_engine_kwargs["worker_affinity_key"] = container_pool_key
+        logger.info(
+            "Routing component=%s lane=%s to Modal container pool=%s.",
+            payload.get("component_id"),
+            worker_affinity_key,
+            container_pool_key,
+        )
     else:
         logger.info(
             "Probing deployed RemoteEngine protocol without affinity parameters component=%s.",
