@@ -349,7 +349,8 @@ Mapped progress is summarized on the global status pill and a representative nod
 
 - When a mapped component starts, the node shows one empty slot per item.
 - As each remote item finishes, its images are streamed straight to the host and fill that item's slot. Slots fill in completion order, not item order. This does not wait for ComfyUI's scheduler, which only hands a node its input after every item has finished.
-- When ComfyUI finally runs the node, it reuses the images it already received instead of downloading them again, and the node switches to the normal ComfyUI image preview.
+- When ComfyUI finally runs the node, it reuses the images it already received instead of downloading them again. The final images fill the same grid, which remains the node's only display; ComfyUI's own image preview is not drawn below it. The images still appear in the queue and history.
+- Click any slot to enlarge it to fill the node. Use the ‹ › buttons or the ← → keys to move between items; navigation wraps around. Press Esc, click the image, or use ✕ to return to the grid. An enlarged slot that is still waiting shows its image as soon as it arrives.
 
 Use it in place of `PreviewImage` when the same remote output also feeds later remote nodes. That output stays in remote session storage, and the progressive node handles the session references itself, so no separate local download step is added. Only a slot that was never streamed is downloaded at the end. On SSH and Vast.ai back-ends, the host cannot read remote session storage, so the final value is delivered through ComfyUI as usual. Streamed slots still fill in progressively there.
 
