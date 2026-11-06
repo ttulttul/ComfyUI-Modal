@@ -15,11 +15,13 @@ const progressivePreviewPanels = new WeakMap();
  * @typedef {{filename: string, subfolder?: string, type?: string}} PreviewImage
  * @typedef {{promptId: string|null, slotCount: number, slots: Map<number, PreviewImage[]>}} SlotState
  * @typedef {{stage: HTMLElement, image: HTMLImageElement, waiting: HTMLElement,
- *   counter: HTMLElement, root: HTMLElement}} ProgressivePreviewViewer
+ *   counter: HTMLElement, root: HTMLElement,
+ *   actionButtons: Record<string, HTMLButtonElement>}} ProgressivePreviewViewer
  * @typedef {{node: object, root: HTMLElement, header: HTMLElement, grid: HTMLElement,
  *   cells: HTMLElement[], viewer: ProgressivePreviewViewer, state: SlotState,
- *   viewerIndex: number|null, visible: boolean, widget: object|null,
- *   finishedPromptId: string|null}} ProgressivePreviewPanel
+ *   viewerIndex: number|null, focusSlotIndex: number|null, visible: boolean,
+ *   widget: object|null, finishedPromptId: string|null,
+ *   imageElements: Map<string, HTMLImageElement>}} ProgressivePreviewPanel
  */
 
 /**
@@ -240,6 +242,13 @@ function installProgressivePreviewStyles() {
     .comfy-progressive-preview-nav.is-next { right: 6px; }
     .comfy-progressive-preview-close { top: 6px; right: 6px; width: 24px; height: 24px;
       font-size: 13px; }
+    .comfy-progressive-preview-actions { position: absolute; top: 6px; left: 6px; display: flex;
+      gap: 4px; }
+    .comfy-progressive-preview-action { width: 26px; height: 24px; border: 0; border-radius: 5px;
+      background: rgba(0, 0, 0, 0.55); color: #fff; cursor: pointer; font-size: 13px;
+      pointer-events: auto; touch-action: manipulation; opacity: 0.8; }
+    .comfy-progressive-preview-action:hover { opacity: 1; }
+    .comfy-progressive-preview-action:disabled { opacity: 0.3; cursor: default; }
     .comfy-progressive-preview-counter { position: absolute; bottom: 6px; left: 50%;
       transform: translateX(-50%); padding: 1px 8px; border-radius: 8px; font-size: 11px;
       background: rgba(0, 0, 0, 0.55); color: #fff; }
@@ -299,17 +308,30 @@ function createProgressivePreviewViewer(panel) {
   const next = createPreviewElement("button", "comfy-progressive-preview-nav is-next", "›");
   const close = createPreviewElement("button", "comfy-progressive-preview-close", "✕");
   const counter = createPreviewElement("div", "comfy-progressive-preview-counter");
+  const actions = createPreviewElement("div", "comfy-progressive-preview-actions");
+  const actionButtons = {
+    open: createPreviewElement("button", "comfy-progressive-preview-action", "↗"),
+    save: createPreviewElement("button", "comfy-progressive-preview-action", "⤓"),
+    copy: createPreviewElement("button", "comfy-progressive-preview-action", "⧉"),
+  };
+  actionButtons.open.title = "Open image in a new tab";
+  actionButtons.save.title = "Save image";
+  actionButtons.copy.title = "Copy image";
+  for (const [name, button] of Object.entries(actionButtons)) {
+    actions.appendChild(button);
+    button.addEventListener("click", () => void runProgressivePreviewAction(panel, name, button));
+  }
   prev.title = "Previous image (←)";
   next.title = "Next image (→)";
   close.title = "Back to all images (Esc)";
-  for (const child of [stage, prev, next, close, counter]) {
+  for (const child of [stage, prev, next, close, actions, counter]) {
     root.appendChild(child);
   }
   stage.addEventListener("click", () => closeProgressivePreviewViewer(panel));
   close.addEventListener("click", () => closeProgressivePreviewViewer(panel));
   prev.addEventListener("click", () => stepProgressivePreviewViewer(panel, -1));
   next.addEventListener("click", () => stepProgressivePreviewViewer(panel, 1));
-  return { root, stage, image, waiting, counter };
+  return { root, stage, image, waiting, counter, actionButtons };
 }
 
 /**
@@ -348,7 +370,7 @@ function ensureProgressivePreviewPanel(node) {
   if (typeof document === "undefined" || typeof node?.addDOMWidget !== "function") {
     return null;
   }
-  node.hideOutputImages = true;
+  suppressNativeImagePreview(node);
   const root = createPreviewElement("div", "comfy-progressive-preview");
   root.tabIndex = 0;
   root.hidden = true;
@@ -367,9 +389,11 @@ function ensureProgressivePreviewPanel(node) {
     viewer: /** @type {any} */ (null),
     state: createSlotState(),
     viewerIndex: null,
+    focusSlotIndex: null,
     visible: false,
     widget: null,
     finishedPromptId: null,
+    imageElements: new Map(),
   };
   panel.viewer = createProgressivePreviewViewer(panel);
   root.appendChild(panel.viewer.root);
@@ -403,6 +427,7 @@ function progressivePreviewCell(panel, index) {
   if (!cell) {
     cell = createPreviewElement("button", "comfy-progressive-preview-cell");
     cell.addEventListener("click", () => openProgressivePreviewViewer(panel, index));
+    cell.addEventListener("pointerenter", () => focusProgressivePreviewSlot(panel, index));
     panel.cells[index] = cell;
   }
   return cell;
@@ -459,6 +484,9 @@ function renderProgressivePreviewViewer(panel) {
   viewer.waiting.textContent = image ? "" : `Waiting for item ${viewerIndex + 1}…`;
   viewer.waiting.style.display = image ? "none" : "";
   viewer.counter.textContent = `${viewerIndex + 1} / ${state.slotCount}`;
+  for (const button of Object.values(viewer.actionButtons)) {
+    button.disabled = !image;
+  }
 }
 
 /**
@@ -481,6 +509,7 @@ function renderProgressivePreviewPanel(panel) {
     panel.viewerIndex = null;
   }
   renderProgressivePreviewViewer(panel);
+  syncProgressivePreviewMenuImages(panel);
 }
 
 /**
@@ -494,6 +523,7 @@ function openProgressivePreviewViewer(panel, index) {
   }
   panel.viewerIndex = index;
   renderProgressivePreviewViewer(panel);
+  syncProgressivePreviewMenuImages(panel);
   panel.root.focus?.({ preventScroll: true });
   panel.node.setDirtyCanvas?.(true, true);
 }
@@ -509,6 +539,7 @@ function stepProgressivePreviewViewer(panel, delta) {
   }
   panel.viewerIndex = stepSlotIndex(panel.state, panel.viewerIndex, delta);
   renderProgressivePreviewViewer(panel);
+  syncProgressivePreviewMenuImages(panel);
 }
 
 /**
@@ -518,6 +549,7 @@ function stepProgressivePreviewViewer(panel, delta) {
 function closeProgressivePreviewViewer(panel) {
   panel.viewerIndex = null;
   renderProgressivePreviewViewer(panel);
+  syncProgressivePreviewMenuImages(panel);
   panel.node.setDirtyCanvas?.(true, true);
 }
 
@@ -549,8 +581,143 @@ function setProgressivePreviewVisible(panel, visible) {
  */
 function suppressNativeImagePreview(node) {
   node.hideOutputImages = true;
-  node.imgs = undefined;
-  node.imageIndex = null;
+  if (!node.__progressivePreviewDrawSuppressed) {
+    node.onDrawBackground = function skipNativeImagePreview() {};
+    node.__progressivePreviewDrawSuppressed = true;
+  }
+}
+
+/**
+ * Return the first image of one slot, if it has arrived.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {number|null} index
+ * @returns {PreviewImage|null}
+ */
+function progressivePreviewSlotImage(panel, index) {
+  return index === null ? null : (panel.state.slots.get(index) ?? [])[0] ?? null;
+}
+
+/**
+ * Return a cached <img> element for one preview URL.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {string} url
+ * @returns {HTMLImageElement}
+ */
+function progressivePreviewImageElement(panel, url) {
+  let element = panel.imageElements.get(url);
+  if (!element) {
+    element = new Image();
+    element.src = url;
+    panel.imageElements.set(url, element);
+  }
+  return element;
+}
+
+/**
+ * Expose the slot images through node.imgs so ComfyUI's Open/Copy/Save Image menu works.
+ * The selected image is the enlarged one, else the last hovered slot, else the first.
+ * @param {ProgressivePreviewPanel} panel
+ */
+function syncProgressivePreviewMenuImages(panel) {
+  const slotIndices = [];
+  const elements = [];
+  for (let index = 0; index < panel.state.slotCount; index += 1) {
+    const image = progressivePreviewSlotImage(panel, index);
+    if (image) {
+      slotIndices.push(index);
+      elements.push(progressivePreviewImageElement(panel, progressivePreviewImageUrl(image)));
+    }
+  }
+  const node = panel.node;
+  node.imgs = elements.length ? elements : undefined;
+  const selectedSlot = panel.viewerIndex ?? panel.focusSlotIndex;
+  const position = slotIndices.indexOf(selectedSlot);
+  node.imageIndex = elements.length ? Math.max(0, position) : null;
+}
+
+/**
+ * Remember the hovered slot as the context-menu target.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {number} index
+ */
+function focusProgressivePreviewSlot(panel, index) {
+  panel.focusSlotIndex = index;
+  syncProgressivePreviewMenuImages(panel);
+}
+
+/**
+ * Return a PNG blob for an image URL, converting other formats through a canvas.
+ * @param {string} url
+ * @returns {Promise<Blob>}
+ */
+async function fetchProgressivePreviewPng(url) {
+  const response = await fetch(url);
+  const blob = await response.blob();
+  if (blob.type === "image/png") {
+    return blob;
+  }
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d").drawImage(bitmap, 0, 0);
+  return await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+}
+
+/**
+ * Open, save, or copy one preview image.
+ * @param {PreviewImage} image
+ * @param {"open"|"save"|"copy"} action
+ * @returns {Promise<void>}
+ */
+async function performProgressivePreviewImageAction(image, action) {
+  const url = progressivePreviewImageUrl(image);
+  if (action === "open") {
+    window.open(url, "_blank");
+    return;
+  }
+  if (action === "save") {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = String(image.filename ?? "image.png");
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    return;
+  }
+  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) {
+    throw new Error("Image clipboard access is unavailable in this browser context.");
+  }
+  const png = await fetchProgressivePreviewPng(url);
+  await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+}
+
+/**
+ * Run one viewer toolbar action on the enlarged image and flash the result.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {"open"|"save"|"copy"} action
+ * @param {HTMLElement} button
+ * @returns {Promise<boolean>} Whether the action succeeded.
+ */
+async function runProgressivePreviewAction(panel, action, button) {
+  const image = progressivePreviewSlotImage(panel, panel.viewerIndex);
+  if (!image) {
+    return false;
+  }
+  const label = button.textContent;
+  try {
+    await performProgressivePreviewImageAction(image, action);
+    button.textContent = "✓";
+    return true;
+  } catch (error) {
+    console.error(`Remote progressive preview could not ${action} the image.`, error);
+    button.textContent = "!";
+    return false;
+  } finally {
+    setTimeout(() => {
+      button.textContent = label;
+    }, 1200);
+  }
 }
 
 /**

@@ -60,11 +60,41 @@ class FakeElement {
   }
 }
 
+const createdElements = [];
 globalThis.document = {
   head: new FakeElement("head"),
-  createElement: (tagName) => new FakeElement(tagName),
+  body: new FakeElement("body"),
+  createElement: (tagName) => {
+    const element = new FakeElement(tagName);
+    createdElements.push(element);
+    element.click = () => {
+      element.clicked = true;
+    };
+    element.remove = () => {
+      element.removed = true;
+    };
+    return element;
+  },
   getElementById: () => null,
 };
+globalThis.Image = class Image {
+  constructor() {
+    this.src = "";
+  }
+};
+const openedUrls = [];
+globalThis.window = { open: (url) => openedUrls.push(url) };
+const clipboardWrites = [];
+globalThis.ClipboardItem = class ClipboardItem {
+  constructor(items) {
+    this.items = items;
+  }
+};
+Object.defineProperty(globalThis, "navigator", {
+  value: { clipboard: { write: async (items) => clipboardWrites.push(items) } },
+  configurable: true,
+});
+globalThis.fetch = async (url) => ({ blob: async () => ({ type: "image/png", url }) });
 
 const listeners = new Map();
 const extensions = [];
@@ -91,7 +121,7 @@ runInThisContext(
     "  applyProgressivePreviewEvent, applyFinalPreviewImages, createSlotState, stepSlotIndex,",
     "  slotGridColumns, filledSlotCount, progressivePreviewHeaderText, progressivePreviewImageUrl,",
     "  resolveProgressivePreviewNode, handleProgressivePreviewEvent, finishProgressivePreview,",
-    "  restoreStoredProgressivePreview, progressivePreviewPanels,",
+    "  restoreStoredProgressivePreview, progressivePreviewPanels, runProgressivePreviewAction,",
     "};",
   ].join("\n"),
   { filename: sourcePath },
@@ -168,6 +198,9 @@ assert.equal(handler({ detail: { phase: "start", prompt_id: "p3", node: "7", slo
 const panel = preview.progressivePreviewPanels.get(node);
 assert.equal(node.hideOutputImages, true);
 assert.equal(node.imgs, undefined);
+assert.equal(node.imageIndex, null);
+assert.equal(typeof node.onDrawBackground, "function");
+assert.equal(node.onDrawBackground(), undefined);
 assert.equal(panel.visible, true);
 assert.equal(widgets[0].options.getMinHeight() > 0, true);
 assert.equal(panel.grid.children.length, 3);
@@ -183,6 +216,10 @@ assert.equal(filledCell.tagName, "button");
 assert.equal(filledCell.children[0].src, viewUrl("b.png"));
 assert.equal(filledCell.children[1].textContent, "×2");
 assert.equal(panel.header.textContent, "Remote preview · 1/3 received");
+// ComfyUI's Open/Copy/Save Image menu reads node.imgs[node.imageIndex].
+assert.equal(node.imgs.length, 1);
+assert.equal(node.imgs[0].src, viewUrl("b.png"));
+assert.equal(node.imageIndex, 0);
 assert.equal(handler({ detail: { phase: "start", prompt_id: "p3", node: "99", slot_count: 3 } }), false);
 
 // Clicking a slot enlarges it; buttons and keys navigate with wrap-around; Esc returns to the grid.
@@ -211,8 +248,34 @@ panel.root.dispatch("keydown", { key: "ArrowRight" });
 handler({ detail: { phase: "slot", prompt_id: "p3", node: "7", slot_index: 2, slot_count: 3, images: [{ filename: "c.png" }] } });
 assert.equal(panel.viewer.image.src, viewUrl("c.png"));
 assert.equal(panel.viewer.image.style.display, "");
+// The context menu targets the enlarged image.
+assert.equal(node.imgs[node.imageIndex].src, viewUrl("c.png"));
+// Viewer toolbar: open, save, and copy act on the enlarged image.
+const actions = panel.viewer.actionButtons;
+assert.equal(actions.save.disabled, false);
+assert.equal(await preview.runProgressivePreviewAction(panel, "open", actions.open), true);
+assert.deepEqual(openedUrls, [viewUrl("c.png")]);
+assert.equal(await preview.runProgressivePreviewAction(panel, "save", actions.save), true);
+const downloadLink = createdElements.filter((element) => element.tagName === "a").at(-1);
+assert.equal(downloadLink.href, viewUrl("c.png"));
+assert.equal(downloadLink.download, "c.png");
+assert.equal(downloadLink.clicked, true);
+assert.equal(await preview.runProgressivePreviewAction(panel, "copy", actions.copy), true);
+assert.equal(clipboardWrites.length, 1);
+assert.equal(clipboardWrites[0][0].items["image/png"].url, viewUrl("c.png"));
+assert.equal(actions.copy.textContent, "✓");
+panel.root.dispatch("keydown", { key: "ArrowLeft" });
+assert.equal(actions.save.disabled, false);
+panel.root.dispatch("keydown", { key: "ArrowLeft" });
+assert.equal(actions.save.disabled, true);
+assert.equal(await preview.runProgressivePreviewAction(panel, "save", actions.save), false);
 panel.root.dispatch("keydown", { key: "Escape" });
 assert.equal(panel.viewerIndex, null);
+// Hovering a grid slot makes it the context-menu target.
+panel.grid.children[2].dispatch("pointerenter");
+assert.equal(node.imgs[node.imageIndex].src, viewUrl("c.png"));
+panel.grid.children[1].dispatch("pointerenter");
+assert.equal(node.imgs[node.imageIndex].src, viewUrl("b.png"));
 assert.equal(panel.viewer.root.style.display, "none");
 assert.equal(panel.root.dispatch("keydown", { key: "ArrowRight" }).stopped, false);
 // Pointer gestures on interactive controls do not drag the node.
@@ -231,7 +294,8 @@ nodeType.prototype.onExecuted.call(node, {
   images: [{ filename: "f1.png", type: "temp" }, { filename: "f2.png", type: "temp" }, { filename: "f3.png", type: "temp" }],
 });
 assert.equal(originalCalled, true);
-assert.equal(node.imgs, undefined);
+assert.equal(node.imgs.length, 3);
+assert.equal(node.imgs[2].src, viewUrl("f3.png"));
 assert.equal(panel.visible, true);
 assert.equal(panel.root.style.display, "");
 assert.equal(panel.header.textContent, "Remote preview · all 3 received");
