@@ -28,9 +28,11 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 - [Execution Back-Ends](#execution-back-ends)
   - [Workflow Capacity Configuration](#workflow-capacity-configuration)
   - [Modal](#modal)
+    - [Example: A Modal Workflow](#example-a-modal-workflow)
     - [Cooldowns](#cooldowns)
     - [Cold Starts And Snapshots](#cold-starts-and-snapshots)
   - [Self-Hosted SSH Hosts](#self-hosted-ssh-hosts)
+    - [Example: A Linux Workstation Over SSH](#example-a-linux-workstation-over-ssh)
   - [Vast.ai](#vastai)
   - [Cost- And Capability-Aware Scheduling](#cost--and-capability-aware-scheduling)
 - [Using It In ComfyUI](#using-it-in-comfyui)
@@ -58,6 +60,10 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 6. Enable `Run Remotely` on the expensive nodes, or use `Enable on Upstream Nodes`, then queue the workflow as usual.
 
 The first run deploys the Modal app and boots its containers from scratch. Later cold starts restore from memory snapshots and are much faster; see [Cold Starts And Snapshots](#cold-starts-and-snapshots).
+
+A minimal Modal workflow looks like this. The eight blue-bordered nodes have `Run Remotely` enabled and run as one remote component. **Save Image** stays local, and the **Modal Configuration** feeds the **Remote Execution Configurator**, which shows the plan once you queue:
+
+![A minimal text-to-image workflow configured for Modal](docs/images/modal-setup.png)
 
 ## Highlights
 
@@ -153,6 +159,16 @@ Each ComfyUI installation gets its own persistent Modal app name, derived from a
 
 Each **Modal Configuration** selects a GPU type and maximum concurrent container count. Every GPU target gets its own deployed app, so several configurations can contribute different Modal GPU types to the same plan. First-run auto-deploy is enabled by default and also replaces stale or incompatible deployments; after upgrading this node pack, redeploy once (or leave `COMFY_MODAL_AUTO_DEPLOY=true`) so remote workers pick up the new code. Warm containers reuse loaded models across compatible requests and scale down to zero after an idle window. That window comes from the Modal Configuration node's cooldowns below, or from `COMFY_MODAL_SCALEDOWN_WINDOW` (default 600 seconds) for workflows without one.
 
+#### Example: A Modal Workflow
+
+While the remote component runs, the sampling node turns purple and the Configurator shows the live plan: the selected GPU, predicted time and cost, and the running container with its **KILL** button.
+
+![The Modal example while the sampler runs on an RTX PRO 6000](docs/images/modal-running.png)
+
+When the run finishes, the image is downloaded into the local `output/` directory and appears in the local **Save Image** node:
+
+![The Modal example after a successful run](docs/images/modal-finished.png)
+
 #### Cooldowns
 
 The Modal Configuration node's advanced settings control how long idle workers stay warm:
@@ -204,6 +220,18 @@ The host form also controls placement:
 - **Tags**, **Enabled**, and **Drain** — placement metadata and safe admission controls. Draining blocks new components without killing a running worker.
 
 **Refresh workers** and **Stop workers** operate only on containers carrying this extension's ownership label, so they cannot touch unrelated Docker workloads. Worker images are immutable and fingerprinted from the node-pack source, ComfyUI source, custom-node requirements, and runtime settings; a fingerprint change replaces the worker while its named storage volume is retained. All traffic travels over the existing SSH connection — no daemon TCP port, worker port, or inbound firewall rule is required.
+
+#### Example: A Linux Workstation Over SSH
+
+The same graph runs on a self-hosted Linux machine by swapping the **Modal Configuration** for an **SSH Configuration**. Here `ssh_target` is an alias from `~/.ssh/config` for a workstation with an RTX 4090. The models are the 8-bit Flux Klein and Qwen3-VL-4B encoder, which fit within the card's 24 GB.
+
+![A minimal workflow configured for a Linux host over SSH](docs/images/linux-setup.png)
+
+On the first run, the nodes turn orange while the referenced models upload to the host. Later runs reuse the content-addressed copies already stored there.
+
+![The SSH example while models upload to the host](docs/images/linux-syncing.png)
+
+![The SSH example after a successful run](docs/images/linux-finished.png)
 
 Worker environment secrets are administrator-managed: the optional **Remote Docker env file** field names a file that already exists on the host and is passed to Docker's `--env-file`. Its contents never cross the API or enter the workflow.
 
