@@ -134,3 +134,28 @@ def test_booted_container_ignores_its_own_snapshot_origin(
     assert startup.origin is None
     assert startup.snapshot_age_seconds is None
     assert caplog.records[-1].getMessage().endswith("origin=none.")
+
+
+def test_container_that_created_its_snapshot_is_not_a_restore(
+    placement_module: Any, tmp_path: Path
+) -> None:
+    """Modal resumes a snapshotting boot in place; its own snapshot is not a restore."""
+    placement = _placement(placement_module, host="host-a", gpu_uuid="GPU-a", task="ta-1")
+    placement_module.record_snapshot_origin(
+        worker_affinity_key="worker-pool:comfy",
+        snapshot_profile_key="",
+        placement=placement,
+    )
+    restore_state = tmp_path / "restore-state.json"
+    restore_state.write_text("{}", encoding="utf-8")
+
+    startup = placement_module.describe_container_startup(
+        worker_affinity_key="worker-pool:comfy",
+        snapshot_profile_key="",
+        gpu_snapshot_enabled=True,
+        restore_state_path=restore_state,
+        placement=placement,
+    )
+
+    assert startup.kind == "snapshot-created"
+    assert startup.origin is None
