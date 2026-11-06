@@ -21,18 +21,22 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 ## Table of Contents
 
 - [Breaking Change: Remote Execution Configurator Required](#breaking-change-remote-execution-configurator-required)
+- [Quick Start (Modal)](#quick-start-modal)
 - [Highlights](#highlights)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
 - [Execution Back-Ends](#execution-back-ends)
-  - [Workflow Provider Policy](#workflow-provider-policy)
+  - [Workflow Capacity Configuration](#workflow-capacity-configuration)
   - [Modal](#modal)
+    - [Cooldowns](#cooldowns)
+    - [Cold Starts And Snapshots](#cold-starts-and-snapshots)
   - [Self-Hosted SSH Hosts](#self-hosted-ssh-hosts)
   - [Vast.ai](#vastai)
   - [Cost- And Capability-Aware Scheduling](#cost--and-capability-aware-scheduling)
 - [Using It In ComfyUI](#using-it-in-comfyui)
   - [Marking Nodes For Remote Execution](#marking-nodes-for-remote-execution)
   - [Canvas State](#canvas-state)
+  - [Remote Execution Configurator Panel](#remote-execution-configurator-panel)
   - [Batched And Mapped Workflows](#batched-and-mapped-workflows)
 - [LLM Nodes](#llm-nodes)
   - [Modal LLM](#modal-llm)
@@ -43,6 +47,17 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 - [Current Limitations](#current-limitations)
+
+## Quick Start (Modal)
+
+1. Clone this repository into ComfyUI's `custom_nodes/` directory (see [Installation](#installation)).
+2. Authenticate Modal once: `<comfyui-venv>/bin/python -m modal setup`.
+3. If remote nodes need API keys, create the `comfy` secret collection from your `.env` (see [Modal](#modal)).
+4. Start ComfyUI with `COMFY_MODAL_EXECUTION_MODE=remote`. The default, `local`, runs every component inside the local ComfyUI process.
+5. In the workflow, add a **Remote Execution Configurator** and a **Modal Configuration** (choose the GPU and how many containers may run at once), and connect them.
+6. Enable `Run Remotely` on the expensive nodes, or use `Enable on Upstream Nodes`, then queue the workflow as usual.
+
+The first run deploys the Modal app and boots its containers from scratch. Later cold starts restore from memory snapshots and are much faster; see [Cold Starts And Snapshots](#cold-starts-and-snapshots).
 
 ## Highlights
 
@@ -82,16 +97,16 @@ cd ~/git/ComfyUI/custom_nodes
 git clone <this-repo-url> ComfyUI-Modal
 ```
 
-Start with local mode while building or debugging workflows. Local mode exercises the full pipeline — marker resolution, prompt rewrite, sync planning, serialization, and proxy execution — but runs the rewritten components in the local ComfyUI process, so it needs no credentials:
-
-```bash
-export COMFY_MODAL_EXECUTION_MODE=local
-```
-
-Switch to remote mode when you are ready to run on a real back-end:
+Set remote mode to run components on a real back-end. Set it in the environment that launches ComfyUI, because the default is `local`:
 
 ```bash
 export COMFY_MODAL_EXECUTION_MODE=remote
+```
+
+Local mode is mainly for developing the extension itself. It runs the full pipeline (marker resolution, prompt rewrite, sync planning, serialization, and proxy execution), but executes the rewritten components inside the local ComfyUI process, so it needs no credentials:
+
+```bash
+export COMFY_MODAL_EXECUTION_MODE=local
 ```
 
 ## Execution Back-Ends
@@ -136,7 +151,9 @@ Every key in the collection is available to remote custom nodes through `os.envi
 
 Each ComfyUI installation gets its own persistent Modal app name, derived from an identity file in the ComfyUI user directory, so multiple installations do not collide. Set `COMFY_MODAL_APP_NAME` to share or externally manage a deployment.
 
-Each **Modal Configuration** selects a GPU type and maximum concurrent container count. Every GPU target gets its own deployed app, so several configurations can contribute different Modal GPU types to the same plan. First-run auto-deploy is enabled by default and also replaces stale or incompatible deployments; after upgrading this node pack, redeploy once (or leave `COMFY_MODAL_AUTO_DEPLOY=true`) so remote workers pick up the new code. Warm containers reuse loaded models across compatible requests and scale down to zero after an idle window (`COMFY_MODAL_SCALEDOWN_WINDOW`, default 600 seconds).
+Each **Modal Configuration** selects a GPU type and maximum concurrent container count. Every GPU target gets its own deployed app, so several configurations can contribute different Modal GPU types to the same plan. First-run auto-deploy is enabled by default and also replaces stale or incompatible deployments; after upgrading this node pack, redeploy once (or leave `COMFY_MODAL_AUTO_DEPLOY=true`) so remote workers pick up the new code. Warm containers reuse loaded models across compatible requests and scale down to zero after an idle window. That window comes from the Modal Configuration node's cooldowns below, or from `COMFY_MODAL_SCALEDOWN_WINDOW` (default 600 seconds) for workflows without one.
+
+#### Cooldowns
 
 The Modal Configuration node's advanced settings control how long idle workers stay warm:
 
@@ -148,7 +165,16 @@ The Modal Configuration node's advanced settings control how long idle workers s
 
 Set a small `reserve_cooldown_count` with a long `reserve_cooldown` to keep a few always-warm workers while the rest of the pool releases its GPUs quickly. Cooldowns apply per call (Modal `with_options(scaledown_window=...)`), so changing them never redeploys the app. They override `COMFY_MODAL_SCALEDOWN_WINDOW` for workflows that use a Modal Configuration node; local-gap pools still stay warm for at least the local keepalive window.
 
-All ComfyUI lanes share one Modal container pool and memory snapshot (LLM lanes use a second pool), so any lane can restore the same snapshot. Reserved workers are a separate pool because their cooldown differs. Each pool's first container after a deploy boots fully (about 45–50s) and creates the snapshot that later containers restore from.
+#### Cold Starts And Snapshots
+
+Modal-Sync uses Modal's CPU and GPU memory snapshots. A new container resumes with ComfyUI initialized and the workflow's model loaders already in GPU memory, instead of booting from scratch.
+
+- **One snapshot per pool.** Every ComfyUI lane, including static phases and mapped lanes, shares one container pool and therefore one snapshot. LLM lanes use a second pool. Reserved workers form their own pool, because Modal treats each cooldown override as a separate function.
+- **Deploys reset snapshots.** After a deploy, each pool's first container boots fully (roughly 30–50 s on an RTX PRO 6000) and captures a new snapshot.
+- **Snapshots follow the cloud provider, not the region.** A snapshot restores in any region on the same cloud provider. When Modal places a container on a provider the pool has not used since the deploy, that container boots fully and captures a snapshot for the provider. After that, restored lanes typically start work 5–15 s after dispatch.
+- **GPU capacity still matters.** A container can wait for Modal to find a free GPU of the requested type, and no snapshot avoids that wait.
+
+Each container logs one line describing how it started: `Modal container startup kind=boot|snapshot-created|restore`, with the region, cloud provider, GPU, and bound Modal function. A restore also names where its snapshot was captured. Set `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS=true` to mirror these lines into the local ComfyUI log, or read them with `modal container logs <container-id>`.
 
 ### Self-Hosted SSH Hosts
 
@@ -191,11 +217,16 @@ Marketplace searches for the distinct effective resource profiles in one plan ru
 
 At queue time the planner raises **Any** or lower VRAM and RAM floors to whatever the workflow's models actually require, queries current on-demand offers, and revalidates every enabled constraint locally. Cross-provider selection compares Vast's effective hourly compute price over the predicted execution time; configured idle retention is tracked as a separate billing estimate and does not make Vast appear more expensive than Modal or SSH during placement. Numeric memory constraints use GiB, matching the existing scheduler and Vast offer-capacity calculations. Vast's marketed GPU names do not always equal their reported capacity exactly; for example, a reported 95.x GiB card does not satisfy a literal 96 GiB floor. The default idle retention is 24 hours, after which an in-instance watchdog destroys the idle lease.
 
+<details>
+<summary>How Vast startup, retries, cancellation, and worker-image freshness work</summary>
+
 Vast startup uses every available lifecycle field instead of relying only on `actual_status`. Legitimate image-download and loading states retain the full configured readiness window, while an instance that continuously reports no lifecycle state, provider message, or SSH host fails after a two-minute grace period. When Vast publishes both a direct public mapping for container port 22 and an SSH proxy, the controller uses the same direct endpoint shown in the Vast console; this avoids stale proxy endpoints that close every handshake. Vast's SSH launch mode injects the account key before running the configured `onstart` script; that script normalizes `/root`, `.ssh`, and `authorized_keys` ownership and modes before starting the worker, preventing `sshd` StrictModes failures inherited from a custom image. Before every worker-readiness SSH probe, the controller rechecks that the exact Vast contract still exists. A contract that disappears during provider startup or worker initialization is removed from the local registry immediately, its marketplace offer is excluded, and the next compatible offer is cold-started as a replacement. A contract that remains non-SSH-ready for the configured startup window, or cannot initialize its worker afterward, is marked unusable and terminated through the Vast API before the controller cold-starts one replacement from a different offer. A reused contract consumes only the remainder of its original startup window, so restarting ComfyUI cannot restart the full wait. If the replacement also fails, acquisition stops with the failed instance IDs, cleanup outcome, and final provider/setup cause instead of entering an unbounded rental loop. Worker-readiness polling makes one connection per interval rather than nesting the normal command retry budget inside every probe. Commands on an established worker and interrupted asset transfers still retry transient connection closures.
 
 Direct Vast SSH operations tolerate bounded connection-level closures, resets, and handshake interruptions with jittered exponential retries. Worker-readiness SSH probes start one second apart and multiply the interval by 1.5 after every unsuccessful attempt, with each failure and next delay streamed to the workflow UI. Vast's direct public port mapping remains preferred, but the controller also retains the provider's `ssh*.vast.ai` proxy endpoint; if the direct readiness probe fails while the proxy succeeds, the proxy becomes the persisted endpoint for staging, execution, transfers, and watchdog updates. Authentication rejection and deterministic remote-command failures remain immediate. Streamed uploads reopen the local source from byte zero on every attempt, and the remote atomic writer verifies the expected byte count before publishing, so a killed connection cannot leave a truncated file at the content-addressed destination.
 
 Cancelling a workflow also cancels queue-time remote preparation. Intentional cancellation remains an interrupted workflow while Vast capacity is being requested or initialized; it is not recast as a provider-acquisition validation failure. File hashing checks the prompt-scoped cancellation signal between chunks, and active Vast SSH uploads or Hugging Face downloads terminate their local SSH process instead of continuing behind ComfyUI's cancelling status. Vast Hugging Face acquisition runs from a small content-addressed tool bundle uploaded by the controller, so an older worker image cannot force a multi-gigabyte fallback upload merely because it lacks the newest materializer module. The launch environment does not overwrite the runtime fingerprint baked into the published worker image. The Vast fingerprint hashes only content that ships in the image: pinned dependency inputs, the extension source digest, and the curated ComfyUI source digest. Modal-only settings such as GPU selection, app and dictionary names, and container counts do not invalidate a functionally identical Vast image. Planning captures this fingerprint once and carries it, together with the selected worker digest, through lease reuse and every invocation instead of hashing the live source tree again during dispatch. Before requesting or reusing billable capacity, the controller reads the public image's OCI manifest and small config blob, selects its `linux/amd64` variant, and compares the baked runtime-fingerprint label without pulling any filesystem layers. The selected platform manifest is resolved to an immutable digest; lease reuse requires that exact digest, and every Vast instance launch uses it rather than a mutable tag. A mismatch is never accepted solely because the protocol number matches: the controller runs the image-build script once for the current fingerprint with the exact Python interpreter hosting ComfyUI, streams build and push output through ComfyUI's remote-preparation progress, adopts the returned immutable digest for the current process, and only then requests capacity. Worker-side validation remains as defense in depth; if it still finds drift, the stale lease is terminated before one replacement attempt. Invoking `sys.executable` directly avoids assumptions about virtualenv location or activation and prevents an obsolete copied `.venv` from hijacking the build. The build subprocess must report the same source fingerprint captured by the parent; if image content changed afterward, publication stops before Docker work or another rental and asks for a restart. Concurrent workflows share the completed publication. This automatic path requires a running Docker service and registry push credentials on the ComfyUI host; if any prerequisite or publication step fails, the workflow stops with the exact manual recovery command instead of executing on stale source. Stale registry entries are discarded whether Vast reports a missing contract through HTTP 404 or its v0 `instances: null` response.
+
+</details>
 
 Set credentials and the worker image in the ComfyUI process environment. Neither value is written to workflows, the lease registry, API responses, or logs:
 
@@ -258,13 +289,24 @@ Active remote nodes show a small progress panel with a Modal, SSH terminal, or V
 
 Remote planning and capacity acquisition count as active queue work even though they happen before the rewritten prompt enters ComfyUI's native execution queue. During Vast startup, the canvas receives readable updates for rental, worker-image download, SSH readiness, and runtime initialization. A provider-side terminal image-pull failure is reported immediately rather than appearing as an empty queue until the startup timeout expires. A rental that never produces an SSH-usable worker is marked unusable and destroyed after the bounded initialization wait so a later workflow cannot silently reuse it.
 
-For workflows using a **Remote Execution Configurator**, that node is also the primary planning surface. As soon as scheduling finishes, the scheduler result is streamed to the panel before any Vast rental or SSH-readiness wait begins. The browser retains that plan across late node-panel mounts, a full page refresh, tab refocus, queue failure, and extension reloads, while removing any orphaned prior panel before remounting. The panel follows the node's current width as it is resized, including shrinking within narrow layouts instead of retaining its initial DOM-widget width. The execution plan is grouped into one section per concrete target, with labeled components beneath it and the best-known machine type, GPU/HBM or VRAM capacity, system RAM, predicted completion time, and predicted cost. Modal system RAM is explicitly shown as provider-managed because it is assigned dynamically rather than inferred as a fixed machine capacity. Configuration names and selected targets therefore remain inspectable even when capacity never becomes ready. The **Managed capacity** area independently lists every lease or container owned by this installation, including idle leftovers from earlier workflows, with provider, resource ID, lifecycle state, activity, GPU/RAM, and hourly price where available. Its **Reload** button refreshes the list, while each exact Vast lease or Modal container has a destructive **KILL** button with confirmation; ownership is revalidated by the server, and killing active capacity is explicitly allowed because the confirmation warns that its workflow will fail. A successful Vast kill clears the entire retained execution plan because removing capacity invalidates all of its scheduling assumptions; delayed events from that prompt cannot restore it. These controls opt into pointer handling inside ComfyUI's otherwise click-through canvas overlay, provide immediate pressed/loading feedback, and isolate their pointer gestures from node dragging. Connected storage backends are summarized beneath the execution plan rather than presented as scheduler targets; an R2 summary includes its bucket, current storage use and object count, jurisdiction, cache policy, and optional key prefix without exposing credentials. Bucket usage is read through the existing bucket-scoped S3 credential and cached for five minutes so repeated workflow submissions do not repeatedly enumerate the bucket. The storage area's **Reload** button bypasses that cache, retrieves fresh aggregate state, and updates the retained plan without queueing a workflow. On macOS, an R2 read rejected with `errSecInteractionNotAllowed` reveals an orange **Unlock Keychain** button at the bottom-left of the Configurator. That explicit action asks the system `security` tool to display its own login-keychain dialog without putting a password in ComfyUI or a command argument, then retries the R2 refresh and hides itself after access is restored. Each selected environment has its own status and progress lane, so parallel Vast, Modal, and self-hosted setup or execution updates cannot overwrite each other; once a newer prompt owns the panel, delayed events from an older prompt remain isolated. Planned environments begin in a waiting state. When a planned Vast configuration resolves to a concrete lease, its existing lane is promoted in place so the configuration and instance identities do not briefly appear as duplicate capacity. Vast capacity then reports rental, worker-image download, initialization, and asset preparation before becoming ready. SSH rows distinguish completed asset synchronization from worker readiness and stream the later runtime check, image build, container start, and health wait; they report ready only after the worker socket answers with the expected fingerprint. A bounded controller pool prepares custom nodes and prompt assets concurrently across distinct environments, while preserving component order and request-cache reuse within each environment. A prompt-wide failure persistently terminates every environment lane and clears its in-progress meter, including when a later plan render or panel remount occurs. Live preparation and execution status use the same durable event stream. Queue-history reconciliation reads the prompt's actual terminal result, preserving a failure or interruption in the Configurator and replacing stale submission text when the prompt is no longer executing. Legacy workflows without a configurator continue to use the global status pill.
-
 Queue-time preparation appears in ComfyUI's queue through the server-side preparation bridge, including the native job metadata required by the queue panel, while the Configurator panel and global status pill show its detailed phase. The frontend acknowledges the prompt immediately so ComfyUI owns a visible, cancellable job while remote capacity is still starting; ComfyUI's standard Jobs cancellation also signals the prompt's preparation task. Preparation deliberately does not emit fake native node-execution events: doing so starts ComfyUI's execution watchdog, which can incorrectly mark a node as stalled or failed during a healthy multi-minute asset download. A preparation failure remains a queue/setup error with its original message rather than being recast as a node execution crash.
 
 While a Modal workflow is active, the global status pill lists this instance's active containers, an estimated accumulated GPU cost with the current burn rate (based on Modal's published GPU prices; excludes CPU, memory, storage, credits, and reservations), and — where the workspace plan allows billing-report access — Modal's actual metered app cost at hourly resolution.
 
 Cancelling a local prompt propagates a targeted interrupt to the active remote work. If the back-end is slow to observe it, the local prompt is released after a grace period while remote cleanup continues.
+
+### Remote Execution Configurator Panel
+
+For workflows that use a **Remote Execution Configurator**, the node itself is the main planning surface.
+
+- **Execution plan.** The scheduler result streams to the panel as soon as planning finishes, before any Vast rental or SSH-readiness wait. The plan has one section per concrete target, listing its components and the best-known machine type, GPU/HBM or VRAM capacity, system RAM, predicted completion time, and predicted cost. Modal system RAM is shown as provider-managed because Modal assigns it dynamically. Configuration names and selected targets stay visible even if capacity never becomes ready.
+- **Persistence.** The browser keeps the plan across late node-panel mounts, a full page refresh, tab refocus, queue failure, and extension reloads, and removes any orphaned earlier panel before remounting. The panel follows the node's width as it is resized, including shrinking in narrow layouts.
+- **Managed capacity.** Every lease or container this installation owns is listed, including idle leftovers from earlier workflows, with provider, resource ID, lifecycle state, activity, GPU/RAM, and hourly price where available. **Reload** refreshes the list. Each Vast lease or Modal container has a **KILL** button with confirmation. The server revalidates ownership first, and killing active capacity is allowed because the confirmation warns that its workflow will fail. A successful Vast kill clears the whole retained plan, because its scheduling assumptions no longer hold, and late events from that prompt cannot restore it. These controls receive pointer events inside ComfyUI's otherwise click-through canvas overlay, show pressed and loading feedback, and do not drag the node.
+- **Storage.** Connected storage backends are summarized beneath the plan, not shown as scheduler targets. An R2 summary shows the bucket, current storage use and object count, jurisdiction, cache policy, and optional key prefix, but never credentials. Usage is read with the bucket-scoped S3 credential and cached for five minutes; the storage **Reload** button bypasses that cache without queueing a workflow. On macOS, an R2 read rejected with `errSecInteractionNotAllowed` shows an orange **Unlock Keychain** button at the bottom-left. It asks the system `security` tool to show its own login-keychain dialog, so no password passes through ComfyUI or a command argument, then retries the R2 refresh and hides itself once access is restored.
+- **Per-environment progress.** Each selected environment has its own status and progress lane, so parallel Vast, Modal, and self-hosted updates cannot overwrite each other. Once a newer prompt owns the panel, late events from an older prompt stay isolated. Planned environments start in a waiting state. A planned Vast configuration that resolves to a concrete lease is promoted in place instead of appearing twice. Vast lanes report rental, worker-image download, initialization, and asset preparation before becoming ready. SSH lanes separate completed asset sync from worker readiness and stream the runtime check, image build, container start, and health wait. They report ready only after the worker socket answers with the expected fingerprint. A bounded controller pool prepares custom nodes and prompt assets concurrently across environments, while keeping component order and request-cache reuse within each environment.
+- **Failures and reconciliation.** A prompt-wide failure ends every environment lane and clears its meter, including after a later plan render or remount. Live preparation and execution status share one durable event stream. Queue-history reconciliation reads the prompt's actual terminal result, so the Configurator keeps a failure or interruption and replaces stale submission text once the prompt has stopped.
+
+Legacy workflows without a configurator use the global status pill instead.
 
 ### Batched And Mapped Workflows
 
@@ -466,7 +508,7 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 | `COMFY_MODAL_GPU` | `RTX-PRO-6000` | Fallback Modal GPU for workflows or API clients without `workflow.extra.comfy_modal.gpu`; the context-menu selection is authoritative for normal UI runs. |
 | `COMFY_MODAL_ENABLE_MEMORY_SNAPSHOT` | `true` | Enable Modal CPU memory snapshots. |
 | `COMFY_MODAL_ENABLE_GPU_MEMORY_SNAPSHOT` | `true` | Enable Modal GPU memory snapshots for profiled loader states. |
-| `COMFY_MODAL_SCALEDOWN_WINDOW` | `600` | Seconds to keep idle Modal containers warm. |
+| `COMFY_MODAL_SCALEDOWN_WINDOW` | `600` | Seconds to keep idle Modal containers warm when the workflow's Modal Configuration does not set cooldowns. |
 | `COMFY_MODAL_LOCAL_GAP_KEEPALIVE_SECONDS` | `900` | Maximum time to retain a matching worker slot across a remote → local → remote workflow gap; `0` disables pulses. |
 | `COMFY_MODAL_LOCAL_GAP_KEEPALIVE_INTERVAL_SECONDS` | `15` | Seconds between worker-retention pulses during a local gap. |
 | `COMFY_MODAL_MIN_CONTAINERS` | `0` | Minimum warm containers. |
@@ -494,7 +536,7 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 | --- | --- | --- |
 | `COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS` | `2.0` | How long the local proxy waits after propagating cancellation before releasing the local prompt. |
 | `COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS` | `1.0` | How long a remote worker waits after observing cancellation before exiting if execution is still stuck. |
-| `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS` | `false` | Mirror live Modal container logs into local ComfyUI stderr during streamed executions. |
+| `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS` | `false` | Mirror live Modal container logs, including each container's startup and snapshot line, into local ComfyUI stderr during streamed executions. |
 
 ## Troubleshooting
 
@@ -507,6 +549,9 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 - **`Dependency cycle detected` after rewrite**: inspect local `comfy.log` for the proxy-graph diagnostics and cycle path.
 - **Cancellation finishes locally while the back-end is still busy**: the local prompt is released after the grace window; remote cleanup or worker retirement may still be completing.
 - **A Vast worker disappears during execution**: current worker images compare Linux cgroup memory counters around every relayed invocation and return a structured postmortem with the RAM limit, OOM-kill delta, and bounded tail of `/storage/logs/vast-worker.log`. An evidenced host-RAM OOM is terminal and is not retried on the same undersized instance; a process loss without an OOM delta is retried once after a worker restart. Rebuild the Vast worker image if an older lease reports that no structured postmortem was available.
+- **A run finishes almost instantly with no new images**: ComfyUI reused cached outputs because every input, including seeds, matched an earlier run. Seeds set to `randomize` change only after a prompt is queued, so a freshly loaded workflow repeats its saved seeds once.
+- **Cold starts are slow**: check the `Modal container startup` lines (see [Cold Starts And Snapshots](#cold-starts-and-snapshots)). `kind=boot` is expected on the first run after a deploy and the first time a pool lands on a new cloud provider. A container that is slow to appear at all is usually waiting for Modal GPU capacity.
+- **Remote container logs are missing from the local log**: start ComfyUI with `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS=true`, or fetch them with `<comfyui-venv>/bin/python -m modal container logs <container-id> --since 1h` while the container is still listed by `modal container list`.
 - **Remote behavior does not reflect a local code update**: redeploy the configured Modal app, or rebuild the SSH/Vast worker image, so remote workers use the current code.
 
 ## Development
@@ -531,23 +576,7 @@ COMFYUI_ROOT=/tmp/comfyui-modal-test/ComfyUI \
 
 For full local development including the remote and Apple-local extras, use `uv sync --extra remote --extra local-apple --group test`.
 
-The prompt interception layer is organized as a compatibility aggregator over focused modules: planning values, graph analysis, component planning, prompt rewriting, execution scheduling, queue lifecycle, diagnostics, and HTTP route domains each have a dedicated owner. Route handlers share an immutable `RouteContext`, while `api_intercept.py` retains only registration and compatibility re-exports. Host-side remote execution follows the same ownership model: deployment loading, runtime compatibility checks, and auto-deploy state live in `remote/modal_deployment.py`; proactive warmup, snapshot profiles, and local-gap keepalive state live in `remote/modal_warmup.py`; mapped or implicit-batch lane scheduling lives in `remote/mapped_execution.py`; and CPU ModelStager state lives in `remote/modal_llm_profile_staging.py`. Adjacent invocation and staging callbacks are injected by the `remote/modal_app.py` orchestrator. Blocking Modal executors are constructed lazily on first use, and importing the host orchestrator no longer constructs a vestigial Modal app or volume. Cloud helpers receive tail-created Modal dictionaries and volumes through `cloud_runtime_context.py`, active request cleanup through `cloud_execution_control.py`, and timestamped phase reporting through `cloud_runtime_logging.py`, allowing focused cloud subsystems to move without reaching back into entry-module globals; pre-deploy app collision checks live in `cloud_app_guard.py`, image filters and worker construction policy live in `cloud_image_env.py`, durable invocation replay and live-canary coordination live in `cloud_durable_invocation.py`, session-bridge storage and replay live in `cloud_session_bridge.py`, headless ComfyUI server compatibility plus progress tracing live in `cloud_prompt_server_shims.py`, ComfyUI initialization, custom-node loading, asset path translation, compatibility patches, and warm loader caches live in `cloud_comfy_bootstrap.py`, distributed node-output key construction, serialization, restore, and write-back live in `cloud_node_output_cache.py`, prompt schema validation and normalization live in `cloud_prompt_validation.py`, reusable executor management and local subgraph execution live in `cloud_prompt_execution.py`, mapped/phased cloud execution lives in `cloud_mapped_execution.py`, bounded progress/result delivery plus abandoned invocation cleanup live in `cloud_streaming.py`, mounted-volume visibility and reload recovery live in `cloud_volume_reload.py`, and snapshot, loader, LLM, and request prewarming live in `cloud_prewarm.py`. Container placement and snapshot-restore diagnostics (`Modal container startup kind=boot|restore ...`) live in `cloud_container_placement.py`. The stable `comfyui_modal_sync_cloud.py` entrypoint imports only the hooks and operations it executes; legacy reads of extracted private names resolve lazily to their owning module. Root modules support both package imports used by ComfyUI and flat imports used by the Modal container; `tests/test_import_shapes.py` guards both layouts and the stable cloud surface. The integration tests mirror those ownership boundaries in focused files and keep shared doubles and builders in non-collected `*_test_support.py` modules.
-
-Execution scheduling keeps provider-neutral orchestration in `execution_scheduling.py` while resource estimation and history signatures live in `execution_resource_estimates.py`, credential-safe plan rendering and its R2 usage cache live in `execution_plan_reporting.py`, and runtime backend construction plus assignment stamping live in `execution_assignment_runtime.py`.
-
-Prompt rewriting keeps proxy construction in `prompt_rewrite.py`, while `prompt_payload_building.py` owns the ordered, hybrid, and single-phase payload builders; downstream frontier discovery, parallel local-branch release, local-gap keepalive, and speculative affinity prewarm decoration live in `prompt_affinity_planning.py`.
-
-Remote graph analysis keeps transportability and component partitioning in `remote_graph_analysis.py`, while recursive saved-workflow traversal and workflow-path-to-queued-prompt resolution live in `workflow_prompt_mapping.py`.
-
-The stable `api_intercept.py` entrypoint now limits itself to compatibility exports, route context construction, and route registration. Queue-time selection, capacity planning coordination, bounded per-environment asset preparation, and proxy rewrite orchestration live in `prompt_interception.py`.
-
-The host-side Modal orchestrator delegates prompt cancellation state and propagation to `remote/modal_interrupts.py`, and streamed remote event decoding plus local UI forwarding to `remote/payload_stream.py`. `remote/modal_app.py` retains invocation, recovery, materialization, and public entrypoint coordination.
-
-Resident LLM inference uses the same ownership boundaries: `llm_types.py` defines backend-neutral values, `llm_inputs.py` normalizes multimodal and file inputs, `vllm_instrumentation.py` owns process-wide vLLM execution policy and Triton telemetry, and `llm_backend_transformers.py`, `llm_backend_llamacpp.py`, and `llm_backend_vllm.py` isolate backend implementations. `modal_llm_runtime.py` remains the model-residency coordinator, while `local_llm_runtime.py` consumes shared types and input preparation without importing private helpers from the Modal backend. CPU-side staging adapts the general cross-process ownership lock in `snapshot_lease.py` to LLM-specific progress events.
-
-Asset synchronization is composed from focused collaborators: `sync_protocols.py` holds provider-neutral contracts and values, `sync_backends.py` owns local and Modal persistence adapters, `sync_hashing.py` owns the persistent content-hash cache, `sync_custom_nodes.py` builds and transfers custom-node archives and manifests, and `sync_r2_transfer.py` owns worker preflight plus idle-gated R2 read-through and write-back. `sync_engine.py` coordinates those collaborators and retains compatibility entrypoints.
-
-Proxy execution separates provider routing (`remote_executor_router.py`), run-scoped payload normalization and cache-safe registries (`proxy_payloads.py`), and dynamic v3 proxy class construction (`proxy_node_factory.py`). `modal_executor_node.py` retains workflow concurrency gates and the five static ComfyUI node classes, then injects those residual execution hooks into the factory.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) maps each subsystem to the module that owns it. [docs/LEARNINGS.md](docs/LEARNINGS.md) records design decisions and lessons learned from live runs.
 
 ### Vast.ai API Simulator
 
