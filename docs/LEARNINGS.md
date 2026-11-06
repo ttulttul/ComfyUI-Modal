@@ -917,3 +917,11 @@ ComfyUI only runs a node once the upstream node has produced its entire output. 
 
 Related bug found while investigating (not yet fixed): `_rewrite_hybrid_split_proxies` ignores `local_materializer_node_id` and session routes. A plain `PreviewImage` beside a remote continuation of a hybrid static/mapped component therefore receives bridge-ref dicts and fails in `save_images` with `KeyError: 0`. The progressive node avoids this because the planner exempts it from materializers and it materializes refs itself.
 
+
+## Mapped items silently reused one item's output (2026-11-06)
+
+`_short_circuit_restored_session_output_subgraph` (cloud and host fallback) skips execution when the remote session already holds a value for every session-backed boundary output. It looks that value up by `(session_id, node_id, output_index)`. It was added for per-lane static seed phases, whose outputs really are identical. Mapped items, however, share one remote session by design. Once one item on a container had produced node 9's IMAGE, every later item on that container found that value, skipped sampling (about 2 s instead of 30 s, with zero progress events) and returned the earlier item's image under its own, distinct bridge key. Downstream remote consumers, such as per-item SaveImage, and local previews all received duplicates. It surfaced only because the progressive preview showed streamed slots that differed from the final images.
+
+Symptoms to look for: per-item stream summaries with `progress_event_count=0` and short durations, and the container log line `Skipping prompt_executor_execute ... session-backed outputs were restored`. The fix: payloads that carry `map_item_index` never take the shortcut. Seed payloads carry no item index and keep it.
+
+Separately, a DOM widget's `hidden` attribute can lose to inline styles set by the frontend's widget wrapper. The progressive panel now hides itself with an inline `display: none`, and it ignores replayed events for a prompt it has already finalized.
