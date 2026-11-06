@@ -419,7 +419,7 @@ def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
     assert payload["boundary_inputs"] == [
         {
             "proxy_input_name": "remote_input_0",
-            "io_type": "*",
+            "io_type": "STRING",
             "targets": [{"node_id": "3", "input_name": "text"}],
         }
     ]
@@ -431,7 +431,7 @@ def test_rewrite_marks_local_modal_map_source_as_mapped_subgraph(
         "boundary_inputs": [
             {
                 "proxy_input_name": "remote_input_0",
-                "io_type": "*",
+                "io_type": "STRING",
                 "targets": [{"node_id": "3", "input_name": "text"}],
             }
         ],

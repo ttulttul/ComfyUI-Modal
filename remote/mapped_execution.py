@@ -31,7 +31,10 @@ from .local_execution import (
     _node_input_type_map,
     _resolve_required_subgraph_nodes,
 )
-from .local_ui_events import _emit_local_modal_progress
+from .local_ui_events import (
+    _emit_local_modal_progress,
+    _emit_local_progressive_preview_start,
+)
 from .modal_deployment import (
     ModalRemoteInvocationError,
     _lookup_deployed_remote_engine,
@@ -168,6 +171,7 @@ def _build_phase_subgraph_payload(
     suppress_status_stream: bool = False,
     lane_id: str | None = None,
     item_index: int | None = None,
+    item_count: int | None = None,
 ) -> dict[str, Any]:
     """Return one explicit static or mapped subgraph payload."""
     phase_definition = _mapped_phase_definition(payload, phase_key)
@@ -201,6 +205,8 @@ def _build_phase_subgraph_payload(
         )
     if item_index is not None:
         phase_payload["map_item_index"] = int(item_index)
+    if item_count is not None:
+        phase_payload["map_item_count"] = int(item_count)
     return phase_payload
 
 
@@ -290,6 +296,7 @@ def _execute_mapped_subgraph_payload(
 
     total_items = len(mapped_items)
     _emit_local_mapped_progress(payload, 0, total_items)
+    _emit_mapped_progressive_preview_start(payload, total_items)
     per_item_outputs: list[tuple[Any, ...]] = []
     for item_index, item_value in enumerate(mapped_items):
         if _local_processing_interrupted():
@@ -302,9 +309,12 @@ def _execute_mapped_subgraph_payload(
                 suppress_status_stream=True,
                 lane_id="0",
                 item_index=item_index,
+                item_count=total_items,
             )
         else:
-            item_payload = _build_mapped_item_payload(payload, item_index, 0)
+            item_payload = _build_mapped_item_payload(
+                payload, item_index, 0, item_count=total_items
+            )
         item_inputs = dict(broadcast_inputs)
         item_inputs[mapped_input_name] = item_value
         logger.info(
@@ -356,6 +366,7 @@ def _build_mapped_item_payload(
     payload: dict[str, Any],
     item_index: int,
     lane_index: int,
+    item_count: int | None = None,
 ) -> dict[str, Any]:
     """Return one per-item subgraph payload derived from a mapped remote component payload."""
     if _mapped_phase_definition(payload, "mapped_phase") is not None:
@@ -366,6 +377,7 @@ def _build_mapped_item_payload(
             suppress_status_stream=True,
             lane_id=str(lane_index),
             item_index=item_index,
+            item_count=item_count,
         )
     item_payload = copy.deepcopy(payload)
     item_payload["payload_kind"] = "subgraph"
@@ -375,6 +387,8 @@ def _build_mapped_item_payload(
     item_payload["mapped_input"] = None
     item_payload["suppress_status_stream"] = True
     item_payload["map_item_index"] = item_index
+    if item_count is not None:
+        item_payload["map_item_count"] = int(item_count)
     item_payload["mapped_progress_lane_id"] = str(lane_index)
     item_payload["mapped_progress_display_node_id"] = str(
         payload.get("component_id", "modal-subgraph")
@@ -555,6 +569,52 @@ def _emit_local_mapped_progress(
         max_value=float(total_items),
         display_node_id=display_node_id,
         aggregate_only=True,
+    )
+
+
+def _mapped_progressive_preview_targets(payload: dict[str, Any]) -> list[str]:
+    """Return progressive preview nodes fed by this payload's per-item outputs."""
+    try:
+        from ..progressive_preview import progressive_preview_targets
+    except ImportError:
+        from progressive_preview import progressive_preview_targets  # type: ignore[no-redef]
+
+    candidate_outputs = [
+        boundary_output
+        for boundary_output in payload.get("boundary_outputs", []) or []
+        if _is_mapped_boundary_output(boundary_output, payload)
+    ]
+    mapped_phase = _mapped_phase_definition(payload, "mapped_phase")
+    if mapped_phase is not None:
+        candidate_outputs.extend(mapped_phase.get("boundary_outputs", []) or [])
+    target_node_ids: list[str] = []
+    for boundary_output in candidate_outputs:
+        for node_id in progressive_preview_targets(boundary_output):
+            if node_id not in target_node_ids:
+                target_node_ids.append(node_id)
+    return target_node_ids
+
+
+def _emit_mapped_progressive_preview_start(
+    payload: dict[str, Any],
+    total_items: int,
+) -> None:
+    """Lay out one empty progressive preview slot per mapped item before dispatch."""
+    target_node_ids = _mapped_progressive_preview_targets(payload)
+    if not target_node_ids:
+        return
+    extra_data = payload.get("extra_data") or {}
+    _emit_local_progressive_preview_start(
+        prompt_id=(
+            str(payload["prompt_id"]) if payload.get("prompt_id") is not None else None
+        ),
+        client_id=(
+            str(extra_data["client_id"])
+            if extra_data.get("client_id") is not None
+            else None
+        ),
+        node_ids=target_node_ids,
+        slot_count=total_items,
     )
 
 
@@ -1068,6 +1128,7 @@ async def _invoke_implicitly_mapped_subgraph_async(
         payload,
         mapped_execute_node_ids,
     )
+    _emit_mapped_progressive_preview_start(hybrid_payload, total_items)
     cleanup_payload = _build_remote_session_cleanup_payload(hybrid_payload)
     execution_mode = configured_execution_mode()
     use_seeded_remote_lanes = (
@@ -1167,7 +1228,10 @@ async def _invoke_implicitly_mapped_subgraph_async(
                     raise_if_local_interrupted()
                     try:
                         item_payload = _build_mapped_item_payload(
-                            hybrid_payload, item_index, lane_index
+                            hybrid_payload,
+                            item_index,
+                            lane_index,
+                            item_count=total_items,
                         )
                         item_inputs = dict(broadcast_inputs)
                         for input_name, items in split_inputs.items():

@@ -1278,6 +1278,23 @@ def _execute_subgraph_prompt(
     )
 
 
+def _payload_is_mapped_item(payload: Mapping[str, Any]) -> bool:
+    """Return whether a payload runs one item of a mapped component.
+
+    Mapped items share one remote session, so a session output already stored
+    under the same node id belongs to a different item and must never be
+    reused in place of executing this item.
+    """
+    if payload.get("map_item_index") is None:
+        return False
+    logger.info(
+        "Executing mapped item component=%s instead of restoring session outputs "
+        "that earlier items stored in the shared session.",
+        payload.get("component_id", "modal-subgraph"),
+    )
+    return True
+
+
 def _short_circuit_restored_session_output_subgraph(
     *,
     payload: dict[str, Any],
@@ -1288,6 +1305,8 @@ def _short_circuit_restored_session_output_subgraph(
     """Return session-backed outputs directly when bridge restoration already satisfied them all."""
     boundary_outputs = list(payload.get("boundary_outputs", []))
     if session_handle is None or not boundary_outputs:
+        return None
+    if _payload_is_mapped_item(payload):
         return None
     if resolution_stats.input_ref_count <= 0 or resolution_stats.replay_count > 0:
         return None

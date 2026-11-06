@@ -66,6 +66,8 @@
 !/prompt_affinity_planning.py
 !/prompt_interception.py
 !/prompt_rewrite.py
+!/progressive_preview.py
+!/progressive_preview_node.py
 !/proxy_node_factory.py
 !/proxy_payloads.py
 !/queue_bridge.py
@@ -136,6 +138,7 @@
 !/tests/
 /tests/*
 !/tests/*.py
+!/tests/*.mjs
 !/tests/fixtures/
 /tests/fixtures/*
 !/tests/fixtures/*.json

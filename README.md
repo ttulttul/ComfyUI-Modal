@@ -40,6 +40,7 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
   - [Canvas State](#canvas-state)
   - [Remote Execution Configurator Panel](#remote-execution-configurator-panel)
   - [Batched And Mapped Workflows](#batched-and-mapped-workflows)
+  - [Remote Progressive Preview](#remote-progressive-preview)
 - [LLM Nodes](#llm-nodes)
   - [Modal LLM](#modal-llm)
   - [Modal Endpoint Chat](#modal-endpoint-chat)
@@ -341,6 +342,18 @@ Mapped execution supports scalar primitives (as one-item maps), Python lists, `I
 Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary, and semantic batches destined for aggregate consumers (for example the frame sequence feeding `CreateVideo`) stay intact instead of being split per item.
 
 Mapped progress is summarized on the global status pill and a representative node with counts such as `3/16`. Fan-out is clamped to `COMFY_MODAL_MAX_INFLIGHT_CALLS`.
+
+### Remote Progressive Preview
+
+`Remote Progressive Preview` (category `Modal`) is a drop-in replacement for `PreviewImage` on the output of remote work. Connect it directly to a remote `IMAGE` output and keep it local.
+
+- When a mapped component starts, the node shows one empty slot per item.
+- As each remote item finishes, its images are streamed straight to the host and fill that item's slot. Slots fill in completion order, not item order. This does not wait for ComfyUI's scheduler, which only hands a node its input after every item has finished.
+- When ComfyUI finally runs the node, it reuses the images it already received instead of downloading them again, and the node switches to the normal ComfyUI image preview.
+
+Use it in place of `PreviewImage` when the same remote output also feeds later remote nodes. That output stays in remote session storage, and the progressive node handles the session references itself, so no separate local download step is added. Only a slot that was never streamed is downloaded at the end. On SSH and Vast.ai back-ends, the host cannot read remote session storage, so the final value is delivered through ComfyUI as usual. Streamed slots still fill in progressively there.
+
+A non-mapped remote component fills a single slot when it finishes. The node must be wired directly to the remote output; slots are not streamed through intermediate local nodes.
 
 ## LLM Nodes
 

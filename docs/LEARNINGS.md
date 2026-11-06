@@ -904,3 +904,24 @@ is still listed.
 `COMFY_MODAL_EXECUTION_MODE` used to default to `local`. That mode runs rewritten components inside the local ComfyUI process, and users who forgot to set the variable kept landing in it. They saw confusing failures, such as `/assets/...` model paths that only exist in remote storage. `settings.configured_execution_mode()` now owns the default (`remote`), and every host-side reader goes through it.
 
 Modal containers never set the variable, so their code relied on the old default to behave as local in-process workers: custom-node sync off, no nested Modal dispatch. The Modal image environment now pins `COMFY_MODAL_EXECUTION_MODE=local` explicitly, as SSH and Vast workers already did. Any new worker runtime must do the same, or it inherits the host default and may try to dispatch remotely from inside a worker.
+
+
+## Progressive previews bypass ComfyUI's list scheduling (2026-11-06)
+
+ComfyUI only runs a node once the upstream node has produced its entire output. A mapped proxy finishes only after every item, so no downstream node can show per-item results while the mapped run is in progress. Progressive display must ride the remote stream, not ComfyUI's data flow. The remote shim already published `boundary_output` stream events as each node finished, and mapped item payloads already carried `map_item_index`. `RemoteProgressivePreview` builds on that:
+
+- Planning records direct consumers as `progressive_preview_target_node_ids` on the boundary output. The key is serialized only when non-empty, so payload fingerprints and exact-payload tests are unchanged for workflows that do not use the node.
+- Mapped dispatch sends a `start` event with the item count before any item runs. Item payloads carry `map_item_count`.
+- The host saves each streamed IMAGE to temp, records it in `PROGRESSIVE_PREVIEW_REGISTRY` keyed by `(prompt_id, node_id)`, and sends a `modal_progressive_preview` websocket event.
+- The node is `is_input_list=True`, so one call sees every item. It gets the prompt id from `comfy_execution.utils.get_executing_context()`. ComfyUI v3 hidden inputs expose the prompt dict, not its id.
+
+Related bug found while investigating (not yet fixed): `_rewrite_hybrid_split_proxies` ignores `local_materializer_node_id` and session routes. A plain `PreviewImage` beside a remote continuation of a hybrid static/mapped component therefore receives bridge-ref dicts and fails in `save_images` with `KeyError: 0`. The progressive node avoids this because the planner exempts it from materializers and it materializes refs itself.
+
+
+## Mapped items silently reused one item's output (2026-11-06)
+
+`_short_circuit_restored_session_output_subgraph` (cloud and host fallback) skips execution when the remote session already holds a value for every session-backed boundary output. It looks that value up by `(session_id, node_id, output_index)`. It was added for per-lane static seed phases, whose outputs really are identical. Mapped items, however, share one remote session by design. Once one item on a container had produced node 9's IMAGE, every later item on that container found that value, skipped sampling (about 2 s instead of 30 s, with zero progress events) and returned the earlier item's image under its own, distinct bridge key. Downstream remote consumers, such as per-item SaveImage, and local previews all received duplicates. It surfaced only because the progressive preview showed streamed slots that differed from the final images.
+
+Symptoms to look for: per-item stream summaries with `progress_event_count=0` and short durations, and the container log line `Skipping prompt_executor_execute ... session-backed outputs were restored`. The fix: payloads that carry `map_item_index` never take the shortcut. Seed payloads carry no item index and keep it.
+
+Separately, a DOM widget's `hidden` attribute can lose to inline styles set by the frontend's widget wrapper. The progressive panel now hides itself with an inline `display: none`, and it ignores replayed events for a prompt it has already finalized.
