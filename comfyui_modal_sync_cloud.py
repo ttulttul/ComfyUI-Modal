@@ -245,6 +245,8 @@ try:  # noqa: E402 - support package and flat Modal-container imports.
         _emit_cloud_info,
         _is_modal_container_runtime,
         _timed_phase,
+        shipped_cloud_module_names,
+        configure_cloud_module_loggers,
         configure_cloud_runtime_logging,
     )
 except ImportError:  # pragma: no cover - exercised by flat cloud imports.
@@ -258,6 +260,8 @@ except ImportError:  # pragma: no cover - exercised by flat cloud imports.
         _emit_cloud_info,
         _is_modal_container_runtime,
         _timed_phase,
+        shipped_cloud_module_names,
+        configure_cloud_module_loggers,
         configure_cloud_runtime_logging,
     )
 
@@ -306,6 +310,8 @@ logger = logging.getLogger(__name__)
 # Cloud app and ComfyUI bootstrap state.
 _CLOUD_HANDLER_NAME = "comfyui-modal-sync-cloud-timestamped"
 configure_cloud_runtime_logging(logger, _CLOUD_HANDLER_NAME)
+if _is_modal_container_runtime():
+    configure_cloud_module_loggers(shipped_cloud_module_names())
 
 # Poisoned-container retirement state.
 _CONTAINER_TERMINATION_LOCK = threading.Lock()
