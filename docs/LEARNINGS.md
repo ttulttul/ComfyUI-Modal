@@ -881,6 +881,13 @@ stopped with `modal container stop -y`, then a second run.
   providers. Pinning the pool with `with_options(cloud=..., region=...)` would test
   this, but it narrows GPU capacity.
 - The reserve lane missed its non-AWS snapshot once (one sample, unexplained).
+- A third cold run (all containers stopped first) confirmed the cloud-provider
+  split. All four containers restored. Three AWS containers in `us-west`,
+  `us-east`, and `eu-south` restored the single AWS snapshot captured in `us-west`,
+  and the non-AWS reserve container restored its own pool's snapshot. Lanes were
+  serving 5–15 s after dispatch, against 18–42 s in the previous run. A pool
+  therefore needs one snapshot per cloud provider, not one per region. Expect a
+  miss the first time a pool lands on a provider it has not seen since the deploy.
 - Separately, durable volume commits of 18.8 MB tensor results took 22–41 s on that
   run's reserve container, against 2–7 s everywhere else. The same pattern showed up
   on the reserve lane two runs earlier. Investigate commit placement before blaming
