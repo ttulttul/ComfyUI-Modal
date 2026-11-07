@@ -925,3 +925,10 @@ Related bug found while investigating (not yet fixed): `_rewrite_hybrid_split_pr
 Symptoms to look for: per-item stream summaries with `progress_event_count=0` and short durations, and the container log line `Skipping prompt_executor_execute ... session-backed outputs were restored`. The fix: payloads that carry `map_item_index` never take the shortcut. Seed payloads carry no item index and keep it.
 
 Separately, a DOM widget's `hidden` attribute can lose to inline styles set by the frontend's widget wrapper. The progressive panel now hides itself with an inline `display: none`, and it ignores replayed events for a prompt it has already finalized.
+
+
+## ModalMapInput never fanned out on SSH or Vast (2026-11-06)
+
+The host-side split of zipped mapped inputs into per-item payloads, done by `_invoke_implicitly_mapped_subgraph_async`, lived only inside `remote.modal_app.invoke_remote_engine_async`. `RemoteExecutorRouterClient` sends SSH and Vast payloads straight to their provider clients. Those workers execute exactly the payload they receive, so a `ModalMapInput` list reached the first node as a single value. On SSH this failed as `CLIPTextEncode: 'list' object has no attribute 'startswith'`.
+
+The fan-out now accepts a provider `invoker`. When the payload is a `subgraph` whose boundary inputs split, the router uses it for every non-Modal provider: static phase, items, and session cleanup all go through the provider client. Provider fan-out runs items one at a time (parallelism 1), with no Modal warmup or seeded affinity lanes, because the component's remote session lives on the single worker the planner assigned. Item payloads still carry `map_item_index` and `map_item_count`, so mapped progress and the Remote Progressive Preview work unchanged.
