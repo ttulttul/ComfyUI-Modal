@@ -963,6 +963,57 @@ def test_implicit_mapping_preserves_create_video_frame_sequence(
     assert "target sockets consume the complete tensor batch" in caplog.text
     assert "105:91.images" in caplog.text
 
+def test_mapped_phase_latent_bridge_refs_split_per_item_in_next_phase(
+    remote_modal_app_module: Any,
+    session_state_module: Any,
+) -> None:
+    """A later ordered phase should receive each earlier item's own LATENT ref."""
+    refs = [
+        session_state_module.RemoteSessionBridgeRef(
+            bridge_key=f"RSB_item_{index}", node_id="8", output_index=0
+        ).to_payload()
+        for index in range(4)
+    ]
+    producer_payload = {
+        "boundary_outputs": [
+            {
+                "proxy_output_name": "phase_bridge_3",
+                "io_type": "LATENT",
+                "is_list": False,
+                "scheduler_is_list": True,
+                "session_output": True,
+            }
+        ]
+    }
+    (aggregated_latent,) = remote_modal_app_module._aggregate_mapped_outputs(
+        [(ref,) for ref in refs], producer_payload
+    )
+    consumer_payload = {
+        "payload_kind": "subgraph",
+        "subgraph_prompt": {
+            "44": {"class_type": "KSampler", "inputs": {"latent_image": ["8", 0]}}
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "phase_bridge_3",
+                "io_type": "LATENT",
+                "targets": [{"node_id": "44", "input_name": "latent_image"}],
+            }
+        ],
+    }
+
+    split = remote_modal_app_module._split_batch_boundary_inputs(
+        consumer_payload, {"phase_bridge_3": aggregated_latent}
+    )
+
+    assert split is not None
+    split_inputs, item_count = split
+    assert item_count == 4
+    assert [ref["bridge_key"] for ref in split_inputs["phase_bridge_3"]] == [
+        f"RSB_item_{index}" for index in range(4)
+    ]
+
+
 def test_implicitly_mapped_subgraph_shared_model_keeps_unbatched_sampler_single_run(
     remote_modal_app_module: Any,
     serialization_module: Any,

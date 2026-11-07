@@ -338,6 +338,35 @@ def test_join_mapped_latents_falls_back_to_list_when_shapes_differ(
     assert rejoined[1]["samples"].shape == (1, 4, 35, 35)
 
 
+def _latent_bridge_refs(session_state_module: Any, count: int) -> list[dict[str, Any]]:
+    """Return one distinct durable bridge ref per mapped item for LATENT node 8."""
+    return [
+        session_state_module.RemoteSessionBridgeRef(
+            bridge_key=f"RSB_item_{index}",
+            node_id="8",
+            output_index=0,
+            session_id="shared-session",
+        ).to_payload()
+        for index in range(count)
+    ]
+
+
+def test_join_mapped_latent_session_refs_keeps_every_item(
+    serialization_module: Any,
+    session_state_module: Any,
+) -> None:
+    """Per-item LATENT bridge refs must not collapse into the first item's ref."""
+    refs = _latent_bridge_refs(session_state_module, 16)
+
+    rejoined = serialization_module.join_mapped_values_for_scheduler(
+        refs, "LATENT", is_list=False, scheduler_is_list=True
+    )
+
+    assert [ref["bridge_key"] for ref in rejoined] == [
+        f"RSB_item_{index}" for index in range(16)
+    ]
+
+
 def test_join_mapped_latents_adapts_batches_to_scheduler_list_contract(
     serialization_module: Any,
 ) -> None:
