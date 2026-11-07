@@ -62,6 +62,9 @@ _IMPLICIT_BATCH_PRESERVING_TARGETS = frozenset({("CreateVideo", "images")})
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
 _MAPPED_PROGRESS_NODE_IDS: dict[tuple[str, str, str], str] = {}
 
+RemotePayloadInvoker = Callable[[dict[str, Any], bytes], Awaitable[bytes]]
+"""Provider callback that executes one serialized payload and returns serialized outputs."""
+
 
 @dataclass(frozen=True)
 class MappedExecutionHooks:
@@ -1057,10 +1060,67 @@ def _log_detached_mapped_lane_result(
         )
 
 
-async def _invoke_implicitly_mapped_subgraph_async(
-    payload: dict[str, Any], kwargs_payload: bytes
+async def _invoke_payload_without_mapping(
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    invoker: RemotePayloadInvoker | None,
 ) -> bytes:
-    """Fan out one ordinary subgraph payload when batchable boundary inputs arrive zipped."""
+    """Execute one payload as-is through the provider invoker or the Modal host path."""
+    if invoker is not None:
+        return await invoker(payload, kwargs_payload)
+    return await invoke_remote_engine_async(
+        payload,
+        kwargs_payload,
+        allow_implicit_mapping=False,
+    )
+
+
+async def _plan_implicit_mapped_parallelism(
+    payload: dict[str, Any],
+    total_items: int,
+    invoker: RemotePayloadInvoker | None,
+) -> tuple[int, int]:
+    """Return local lane parallelism and prompt warmup target for one implicit fan-out.
+
+    Provider invokers (SSH, Vast) run items sequentially on the single worker that
+    holds the component's remote session, so Modal warmup bookkeeping is skipped.
+    """
+    if invoker is not None:
+        return 1, 0
+    parallelism, refined_prompt_warmup_target = boost_mapped_component_warmup(
+        payload,
+        total_items=total_items,
+        reason="implicit_mapped_component_exact_parallelism",
+    )
+    prompt_id = (
+        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
+    )
+    if prompt_id is not None:
+        await _await_prompt_warmup_slots(
+            prompt_id,
+            list(range(refined_prompt_warmup_target)),
+            _prompt_warmup_head_start_seconds(),
+        )
+    return parallelism, refined_prompt_warmup_target
+
+
+async def _invoke_implicitly_mapped_subgraph_async(
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    *,
+    invoker: RemotePayloadInvoker | None = None,
+) -> bytes:
+    """Fan out one ordinary subgraph payload when batchable boundary inputs arrive zipped.
+
+    When ``invoker`` is given, every phase, item, and cleanup payload is executed
+    through it instead of the Modal host path, which lets non-Modal providers reuse
+    the same mapped orchestration.
+    """
+    invoke_payload: RemotePayloadInvoker = invoker or (
+        lambda phase_payload, phase_inputs: invoke_remote_engine_async(
+            phase_payload, phase_inputs
+        )
+    )
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
     split_batch_inputs = _split_batch_boundary_inputs(payload, hydrated_inputs)
     if split_batch_inputs is None:
@@ -1079,26 +1139,11 @@ async def _invoke_implicitly_mapped_subgraph_async(
             payload.get("component_id"),
             input_is_list_target_node_ids,
         )
-        return await invoke_remote_engine_async(
-            payload,
-            kwargs_payload,
-            allow_implicit_mapping=False,
-        )
+        return await _invoke_payload_without_mapping(payload, kwargs_payload, invoker)
 
-    parallelism, refined_prompt_warmup_target = boost_mapped_component_warmup(
-        payload,
-        total_items=total_items,
-        reason="implicit_mapped_component_exact_parallelism",
+    parallelism, refined_prompt_warmup_target = await _plan_implicit_mapped_parallelism(
+        payload, total_items, invoker
     )
-    prompt_id = (
-        str(payload.get("prompt_id")) if payload.get("prompt_id") is not None else None
-    )
-    if prompt_id is not None:
-        await _await_prompt_warmup_slots(
-            prompt_id,
-            list(range(refined_prompt_warmup_target)),
-            _prompt_warmup_head_start_seconds(),
-        )
     logger.info(
         "Scheduling implicitly mapped Modal component=%s for %d item(s) with local parallelism=%d prompt_warmup_target=%d across inputs=%s.",
         payload.get("component_id"),
@@ -1132,7 +1177,8 @@ async def _invoke_implicitly_mapped_subgraph_async(
     cleanup_payload = _build_remote_session_cleanup_payload(hybrid_payload)
     execution_mode = configured_execution_mode()
     use_seeded_remote_lanes = (
-        execution_mode != "local"
+        invoker is None
+        and execution_mode != "local"
         and modal is not None
         and _payload_remote_session_handle(hybrid_payload) is not None
         and _mapped_phase_definition(hybrid_payload, "static_phase") is not None
@@ -1176,7 +1222,7 @@ async def _invoke_implicitly_mapped_subgraph_async(
                 seeded_lane_indices.add(lane_index)
 
         elif static_execute_node_ids:
-            static_response = await invoke_remote_engine_async(
+            static_response = await invoke_payload(
                 _build_static_mapped_payload(hybrid_payload),
                 serialize_node_inputs(broadcast_inputs),
             )
@@ -1243,7 +1289,7 @@ async def _invoke_implicitly_mapped_subgraph_async(
                                 serialize_node_inputs(item_inputs),
                             )
                         else:
-                            item_response = await invoke_remote_engine_async(
+                            item_response = await invoke_payload(
                                 item_payload,
                                 serialize_node_inputs(item_inputs),
                             )
@@ -1369,7 +1415,7 @@ async def _invoke_implicitly_mapped_subgraph_async(
                     )
                 )
             else:
-                await invoke_remote_engine_async(
+                await invoke_payload(
                     cleanup_payload,
                     serialize_node_inputs({}),
                 )

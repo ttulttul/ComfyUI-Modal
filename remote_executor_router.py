@@ -4,14 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 if __package__:
-    from .serialization import deserialize_node_outputs, serialize_node_inputs
+    from .serialization import (
+        deserialize_node_inputs,
+        deserialize_node_outputs,
+        serialize_node_inputs,
+        serialize_node_outputs,
+    )
 else:  # pragma: no cover - flat import inside the Modal container.
-    from serialization import deserialize_node_outputs, serialize_node_inputs
+    from serialization import (
+        deserialize_node_inputs,
+        deserialize_node_outputs,
+        serialize_node_inputs,
+        serialize_node_outputs,
+    )
+
+logger = logging.getLogger(__name__)
 
 class RemoteExecutorClient(Protocol):
     """Execution client interface used by Modal proxy nodes."""
@@ -60,7 +73,10 @@ class RemoteExecutorRouterClient:
         """Execute one payload through Modal or an assigned SSH Docker host."""
         client = self._client_for_payload(payload)
         started_at = time.monotonic()
-        result = client.execute_payload(payload, kwargs)
+        if _requires_provider_mapped_fan_out(client, payload, kwargs):
+            result = asyncio.run(_execute_provider_mapped_fan_out(client, payload, kwargs))
+        else:
+            result = client.execute_payload(payload, kwargs)
         self._record_success(payload, time.monotonic() - started_at)
         return result
 
@@ -72,14 +88,10 @@ class RemoteExecutorRouterClient:
         """Execute one payload asynchronously through its selected provider."""
         client = self._client_for_payload(payload)
         started_at = time.monotonic()
-        execute_async = getattr(client, "execute_payload_async", None)
-        if callable(execute_async):
-            result = execute_async(payload, kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            self._record_success(payload, time.monotonic() - started_at)
-            return result
-        result = await asyncio.to_thread(client.execute_payload, payload, kwargs)
+        if _requires_provider_mapped_fan_out(client, payload, kwargs):
+            result = await _execute_provider_mapped_fan_out(client, payload, kwargs)
+        else:
+            result = await _execute_client_payload_async(client, payload, kwargs)
         self._record_success(payload, time.monotonic() - started_at)
         return result
 
@@ -154,6 +166,71 @@ class RemoteExecutorRouterClient:
             repo_root=Path(__file__).resolve().parent,
             settings=settings,
         )
+
+
+def _requires_provider_mapped_fan_out(
+    client: RemoteExecutorClient,
+    payload: Mapping[str, Any],
+    kwargs: Mapping[str, Any],
+) -> bool:
+    """Return whether a non-Modal provider must fan out zipped mapped inputs on the host.
+
+    The Modal client performs this fan-out inside ``invoke_remote_engine_async``.
+    SSH and Vast workers execute exactly the payload they receive, so without a
+    host-side split a ``ModalMapInput`` list would reach one node as a single value.
+    """
+    if isinstance(client, ModalRemoteExecutorClient):
+        return False
+    if payload.get("payload_kind") != "subgraph":
+        return False
+    from .remote.modal_app import _split_batch_boundary_inputs
+
+    return _split_batch_boundary_inputs(dict(payload), dict(kwargs)) is not None
+
+
+async def _execute_provider_mapped_fan_out(
+    client: RemoteExecutorClient,
+    payload: Mapping[str, Any],
+    kwargs: Mapping[str, Any],
+) -> Sequence[Any]:
+    """Run the shared mapped orchestration with every phase executed by ``client``."""
+    from .remote.modal_app import _invoke_implicitly_mapped_subgraph_async
+
+    async def invoke_with_client(phase_payload: dict[str, Any], phase_inputs: bytes) -> bytes:
+        """Execute one phase, item, or cleanup payload on the provider client."""
+        outputs = await _execute_client_payload_async(
+            client,
+            phase_payload,
+            deserialize_node_inputs(phase_inputs),
+        )
+        return serialize_node_outputs(tuple(outputs))
+
+    logger.info(
+        "Fanning out mapped component=%s on provider=%s through the host orchestrator.",
+        payload.get("component_id"),
+        payload.get("execution_provider"),
+    )
+    response = await _invoke_implicitly_mapped_subgraph_async(
+        dict(payload),
+        serialize_node_inputs(kwargs),
+        invoker=invoke_with_client,
+    )
+    return deserialize_node_outputs(response)
+
+
+async def _execute_client_payload_async(
+    client: RemoteExecutorClient,
+    payload: Mapping[str, Any],
+    kwargs: Mapping[str, Any],
+) -> Sequence[Any]:
+    """Execute one payload on a client, adapting synchronous clients to a thread."""
+    execute_async = getattr(client, "execute_payload_async", None)
+    if callable(execute_async):
+        result = execute_async(payload, kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    return await asyncio.to_thread(client.execute_payload, payload, kwargs)
 
 
 _REMOTE_EXECUTOR_CLIENT_FACTORY: Callable[[], RemoteExecutorClient] = RemoteExecutorRouterClient

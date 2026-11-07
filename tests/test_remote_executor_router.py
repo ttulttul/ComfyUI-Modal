@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -125,3 +126,132 @@ def test_router_records_successful_component_runtime(
     ).estimates("signature", ("modal:L40S",))
     assert result == ["output"]
     assert estimates["modal:L40S"].sample_count == 1
+
+
+def _ssh_mapped_text_payload() -> dict[str, Any]:
+    """Return the SSH ``1__mapped`` shape from a ModalMapInput prompt workflow."""
+    return {
+        "payload_kind": "subgraph",
+        "component_id": "1__mapped",
+        "prompt_id": "prompt-ssh",
+        "execution_provider": "ssh_docker",
+        "execution_environment_id": "lambda",
+        "execute_node_ids": ["5"],
+        "subgraph_prompt": {
+            "5": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": ["remote_input_0", 0],
+                    "clip": ["static_input_0", 0],
+                },
+            }
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "STRING",
+                "targets": [{"node_id": "5", "input_name": "text"}],
+            },
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "CLIP",
+                "targets": [{"node_id": "5", "input_name": "clip"}],
+            },
+        ],
+        "boundary_outputs": [{"node_id": "5", "io_type": "STRING", "is_list": False}],
+        "extra_data": {"client_id": "client-1"},
+    }
+
+
+class _RecordingProviderClient:
+    """Fake SSH client that records each payload and echoes its text input."""
+
+    def __init__(self) -> None:
+        """Start with no recorded calls."""
+        self.calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    async def execute_payload_async(
+        self,
+        payload: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> list[str]:
+        """Reject list-valued text, which is the original SSH failure mode."""
+        self.calls.append((dict(payload), dict(kwargs)))
+        text = kwargs["remote_input_0"]
+        assert isinstance(text, str), f"mapped item received {type(text).__name__}"
+        clip = kwargs["static_input_0"]
+        if isinstance(clip, list):
+            assert len(clip) == 1, "broadcast inputs must stay singleton lists"
+            clip = clip[0]
+        return [f"{text}|{clip}"]
+
+
+def test_router_fans_out_mapped_inputs_for_ssh_provider(
+    remote_executor_router_module: Any,
+    remote_modal_app_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSH workers must receive one ModalMapInput item per invocation, not the whole list."""
+    provider_client = _RecordingProviderClient()
+    router = remote_executor_router_module.RemoteExecutorRouterClient()
+    monkeypatch.setattr(router, "_client_for_payload", lambda _payload: provider_client)
+    monkeypatch.setattr(router, "_record_success", lambda *_args: None)
+
+    async def forbid_modal_invocation(*_args: Any, **_kwargs: Any) -> bytes:
+        """Fail if the SSH fan-out leaks into the Modal invocation path."""
+        raise AssertionError("SSH mapped items must not dispatch through Modal.")
+
+    monkeypatch.setattr(
+        remote_modal_app_module,
+        "invoke_remote_engine_async",
+        forbid_modal_invocation,
+    )
+
+    result = asyncio.run(
+        router.execute_payload_async(
+            _ssh_mapped_text_payload(),
+            {
+                "remote_input_0": ["prompt-a", "prompt-b", "prompt-c"],
+                "static_input_0": ["clip-ref"],
+            },
+        )
+    )
+
+    item_calls = [
+        (payload, kwargs)
+        for payload, kwargs in provider_client.calls
+        if payload.get("map_item_index") is not None
+    ]
+    assert [payload["map_item_index"] for payload, _ in item_calls] == [0, 1, 2]
+    assert all(payload["map_item_count"] == 3 for payload, _ in item_calls)
+    assert all(payload["execution_provider"] == "ssh_docker" for payload, _ in item_calls)
+    assert [kwargs["remote_input_0"] for _, kwargs in item_calls] == [
+        "prompt-a",
+        "prompt-b",
+        "prompt-c",
+    ]
+    assert list(result) == [
+        ["prompt-a|clip-ref", "prompt-b|clip-ref", "prompt-c|clip-ref"]
+    ]
+
+
+def test_router_leaves_unbatched_ssh_payloads_unchanged(
+    remote_executor_router_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-value SSH subgraph should still execute as exactly one invocation."""
+    provider_client = _RecordingProviderClient()
+    router = remote_executor_router_module.RemoteExecutorRouterClient()
+    monkeypatch.setattr(router, "_client_for_payload", lambda _payload: provider_client)
+    monkeypatch.setattr(router, "_record_success", lambda *_args: None)
+
+    result = asyncio.run(
+        router.execute_payload_async(
+            _ssh_mapped_text_payload(),
+            {"remote_input_0": "only-prompt", "static_input_0": "clip-ref"},
+        )
+    )
+
+    assert len(provider_client.calls) == 1
+    assert "map_item_index" not in provider_client.calls[0][0]
+    assert result == ["only-prompt|clip-ref"]
