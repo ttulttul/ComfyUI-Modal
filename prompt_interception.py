@@ -40,6 +40,7 @@ if __package__:
     from .prompt_affinity_planning import (
         _configure_local_gap_keepalive_payloads,
         _configure_reserve_cooldown_pools,
+        _configure_shared_snapshot_profiles,
         _configure_speculative_affinity_prewarm_payloads,
         _parallelize_non_returning_local_branches,
     )
@@ -104,6 +105,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
     from prompt_affinity_planning import (
         _configure_local_gap_keepalive_payloads,
         _configure_reserve_cooldown_pools,
+        _configure_shared_snapshot_profiles,
         _configure_speculative_affinity_prewarm_payloads,
         _parallelize_non_returning_local_branches,
     )
@@ -975,6 +977,10 @@ def _finalize_rewritten_prompt(state: _PromptRewriteState) -> None:
     )
     execution_stages = _component_execution_stages(
         state.rewritten_prompt, proxy_groups
+    )
+    _configure_shared_snapshot_profiles(
+        rewritten_prompt=state.rewritten_prompt,
+        component_ids=list(state.summary.remote_component_ids),
     )
     _configure_reserve_cooldown_pools(
         rewritten_prompt=state.rewritten_prompt,

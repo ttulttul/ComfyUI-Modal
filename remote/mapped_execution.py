@@ -830,7 +830,7 @@ def _split_batch_boundary_inputs(
                 io_type,
             )
         except (TypeError, ValueError) as exc:
-            logger.info(
+            logger.debug(
                 "Broadcasting boundary input %s io_type=%s unsplit because it is not a "
                 "splittable batch: %s",
                 proxy_input_name,

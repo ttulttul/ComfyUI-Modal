@@ -166,6 +166,13 @@ When the run finishes, the image is downloaded into the local `output/` director
 
 ![The Modal example after a successful run](docs/images/modal-finished.png)
 
+#### Instance count
+
+`instance_count` is a hard ceiling on the GPU containers one Modal Configuration uses. Two mechanisms enforce it together:
+
+- **One container pool per workflow.** Modal gives each distinct `RemoteEngine` parameter set (loader snapshot profile, snapshot mode, pool) its own containers and its own `max_containers`. Remote components that load no models, such as a remote Save Image, therefore inherit the workflow's loader snapshot profile and run in the same containers as the samplers, instead of opening a second pool.
+- **A host-side slot limit.** Every Modal call from ComfyUI holds one of `instance_count` slots for its deployed app while it runs. Mapped components that run side by side share those slots, so busy containers never exceed the limit, even when a workflow mixes several loader profiles. In that mixed case, idle containers from an earlier profile can stay warm until their cooldown ends; the planner logs a warning when this can happen.
+
 #### Cooldowns
 
 The Modal Configuration node's advanced settings control how long idle workers stay warm:

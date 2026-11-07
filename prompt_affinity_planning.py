@@ -486,6 +486,133 @@ def _configure_reserve_cooldown_pools(
         )
 
 
+def _comfy_pool_modal_payloads_by_environment(
+    rewritten_prompt: dict[str, Any],
+    component_ids: list[str],
+) -> dict[str, dict[str, Mapping[str, Any]]]:
+    """Return Comfy-pool Modal payloads grouped by environment and component."""
+    payloads_by_environment: dict[str, dict[str, Mapping[str, Any]]] = {}
+    for component_id in component_ids:
+        payload = _remote_proxy_payload(rewritten_prompt, component_id)
+        if (
+            payload is None
+            or payload.get("execution_provider") != ExecutionProvider.MODAL.value
+        ):
+            continue
+        affinity_group = (
+            str(payload.get("remote_worker_affinity_group") or MODAL_WORKER_POOL_COMFY)
+            .strip()
+            .lower()
+        )
+        if affinity_group == MODAL_WORKER_POOL_LLM:
+            continue
+        environment_id = str(payload.get("execution_environment_id") or "")
+        payloads_by_environment.setdefault(environment_id, {})[component_id] = payload
+    return payloads_by_environment
+
+
+def _payload_snapshot_profile_key(payload: Mapping[str, Any]) -> str:
+    """Return the loader snapshot profile stamped on one payload, or an empty string."""
+    return str(payload.get("snapshot_profile_key") or "").strip()
+
+
+def _shared_snapshot_profile_key(payloads: list[Mapping[str, Any]]) -> str:
+    """Return the most common loader profile among payloads, preferring the lowest key on ties."""
+    counts: dict[str, int] = {}
+    for payload in payloads:
+        profile_key = _payload_snapshot_profile_key(payload)
+        if profile_key:
+            counts[profile_key] = counts.get(profile_key, 0) + 1
+    if not counts:
+        return ""
+    return min(counts, key=lambda profile_key: (-counts[profile_key], profile_key))
+
+
+def _with_snapshot_profile_on_unprofiled_payloads(
+    payload: Mapping[str, Any], snapshot_profile_key: str
+) -> dict[str, Any]:
+    """Return a payload copy whose profile-less levels inherit the shared profile."""
+    updated_payload = dict(payload)
+    if not _payload_snapshot_profile_key(updated_payload):
+        updated_payload["snapshot_profile_key"] = snapshot_profile_key
+    split_proxy_payloads = updated_payload.get("split_proxy_payloads")
+    if isinstance(split_proxy_payloads, dict):
+        updated_payload["split_proxy_payloads"] = {
+            key: _with_snapshot_profile_on_unprofiled_payloads(phase, snapshot_profile_key)
+            if isinstance(phase, Mapping)
+            else phase
+            for key, phase in split_proxy_payloads.items()
+        }
+    elif isinstance(split_proxy_payloads, list):
+        updated_payload["split_proxy_payloads"] = [
+            _with_snapshot_profile_on_unprofiled_payloads(phase, snapshot_profile_key)
+            if isinstance(phase, Mapping)
+            else phase
+            for phase in split_proxy_payloads
+        ]
+    return updated_payload
+
+
+def _configure_shared_snapshot_profiles(
+    *,
+    rewritten_prompt: dict[str, Any],
+    component_ids: list[str],
+) -> None:
+    """Route profile-less Comfy components into the environment's loader-profile pool.
+
+    Modal scales every distinct ``RemoteEngine`` parameter set independently, each
+    with its own ``max_containers``. A component without loaders (for example a
+    remote SaveImage) would otherwise open a second container pool beside the
+    samplers and double the GPU containers beyond the configured instance count.
+    """
+    for environment_id, payloads_by_component_id in (
+        _comfy_pool_modal_payloads_by_environment(rewritten_prompt, component_ids).items()
+    ):
+        shared_profile_key = _shared_snapshot_profile_key(
+            list(payloads_by_component_id.values())
+        )
+        if not shared_profile_key:
+            continue
+        distinct_profile_keys = sorted(
+            {
+                _payload_snapshot_profile_key(payload)
+                for payload in payloads_by_component_id.values()
+            }
+            - {""}
+        )
+        if len(distinct_profile_keys) > 1:
+            logger.warning(
+                "Modal environment=%s uses %d loader snapshot profiles %s; each opens its "
+                "own container pool, so only the in-flight call limit caps them jointly.",
+                environment_id or "<default>",
+                len(distinct_profile_keys),
+                distinct_profile_keys,
+            )
+        unprofiled_component_ids = [
+            component_id
+            for component_id, payload in payloads_by_component_id.items()
+            if not _payload_snapshot_profile_key(payload)
+        ]
+        for component_id in unprofiled_component_ids:
+            rewritten_prompt[component_id]["inputs"][
+                "original_node_data"
+            ] = update_registered_proxy_payload_fields(
+                component_id,
+                payloads_by_component_id[component_id],
+                _with_snapshot_profile_on_unprofiled_payloads(
+                    payloads_by_component_id[component_id], shared_profile_key
+                ),
+            )
+        if unprofiled_component_ids:
+            logger.info(
+                "Sharing Modal loader snapshot profile %s with profile-less components=%s "
+                "in environment=%s so they reuse the same container pool.",
+                shared_profile_key,
+                unprofiled_component_ids,
+                environment_id or "<default>",
+            )
+
+
 def _configure_speculative_affinity_prewarm_payloads(
     *,
     rewritten_prompt: dict[str, Any],

@@ -100,6 +100,10 @@ from .modal_billing import (
     _prune_modal_hourly_billing_cache,
     get_hourly_modal_app_billing,
 )
+from .modal_container_limit import (
+    MODAL_CONTAINER_SLOTS,
+    ModalContainerSlotWaitCancelled,
+)
 from .modal_container_logs import (
     MODAL_GPU_ESTIMATED_USD_PER_SECOND,
     MODAL_GPU_PRICING_EFFECTIVE_DATE,
@@ -696,6 +700,29 @@ def _invoke_remote_engine_payload(
             "Remote Modal payload dispatch was cancelled before the remote call started."
         )
 
+    settings = _settings_for_payload(payload)
+    try:
+        with MODAL_CONTAINER_SLOTS.slot(
+            modal_deployment_app_name(settings),
+            settings.max_containers,
+            cancellation_event=cancellation_event,
+            label=str(payload.get("component_id")),
+        ):
+            return _invoke_remote_engine_payload_in_slot(
+                remote_engine, payload, kwargs_payload, cancellation_event
+            )
+    except ModalContainerSlotWaitCancelled as exc:
+        _request_remote_interrupt(payload)
+        raise ModalRemoteInvocationError(str(exc)) from exc
+
+
+def _invoke_remote_engine_payload_in_slot(
+    remote_engine: Any,
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+    cancellation_event: threading.Event | None,
+) -> bytes:
+    """Run one Modal call, streaming progress when available, while holding a container slot."""
     stream_method = getattr(remote_engine, "execute_payload_stream", None)
     interrupt_remote_call = _build_remote_interrupt_callback(remote_engine, payload)
     if _should_stream_remote_progress(payload) and hasattr(stream_method, "remote_gen"):
