@@ -37,6 +37,24 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS = 60.0
+DEFAULT_SSH_CONTROL_PATH = "~/.ssh/comfy-modal-cm-%C"
+DEFAULT_SSH_CONTROL_PERSIST = "10m"
+SSH_CONNECTION_FAILURE_EXIT_STATUS = 255
+SSH_RETRY_INITIAL_DELAY_SECONDS = 1.0
+SSH_RETRY_MAX_DELAY_SECONDS = 30.0
+_RETRYABLE_SSH_FAILURE_MARKERS = (
+    "agent refused operation",
+    "permission denied (publickey",
+    "connection refused",
+    "connection timed out",
+    "operation timed out",
+    "connection closed by",
+    "connection reset by",
+    "kex_exchange_identification",
+    "could not resolve hostname",
+    "control socket connect",
+    "mux_client_",
+)
 DEFAULT_VOLUME_HELPER_IMAGE = "busybox:1.37.0"
 _MIB = 1024 * 1024
 _ACTIVE_MANAGED_WORKER_PROCESS_MARKERS = (
@@ -92,14 +110,43 @@ class SshManagedWorkerStatus:
         }
 
 
+def exponential_backoff_delays(
+    initial_delay_seconds: float = SSH_RETRY_INITIAL_DELAY_SECONDS,
+    max_delay_seconds: float = SSH_RETRY_MAX_DELAY_SECONDS,
+) -> tuple[float, ...]:
+    """Return doubling retry delays, stopping before a delay exceeds the maximum."""
+    if initial_delay_seconds <= 0:
+        raise ValueError("initial_delay_seconds must be positive.")
+    delays: list[float] = []
+    delay = initial_delay_seconds
+    while delay <= max_delay_seconds:
+        delays.append(delay)
+        delay *= 2
+    return tuple(delays)
+
+
+def is_retryable_ssh_failure(result: SshCommandResult) -> bool:
+    """Return whether SSH failed before or while establishing the session."""
+    if result.returncode != SSH_CONNECTION_FAILURE_EXIT_STATUS:
+        return False
+    stderr_text = result.stderr_text.lower()
+    return any(marker in stderr_text for marker in _RETRYABLE_SSH_FAILURE_MARKERS)
+
+
 @dataclass
 class SshCommandRunner:
-    """Run fixed remote commands through the system SSH client."""
+    """Run fixed remote commands through a multiplexed system SSH client."""
 
     ssh_target: str
     connect_timeout_seconds: int = DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS
     command_timeout_seconds: float = DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS
     ssh_binary: str = "ssh"
+    control_path: str = DEFAULT_SSH_CONTROL_PATH
+    control_persist: str = DEFAULT_SSH_CONTROL_PERSIST
+    retry_delays_seconds: tuple[float, ...] = field(
+        default_factory=exponential_backoff_delays
+    )
+    sleep: Callable[[float], None] = time.sleep
 
     def command(self, remote_argv: Sequence[str]) -> list[str]:
         """Return the local SSH argv for one remote argv sequence."""
@@ -116,6 +163,12 @@ class SshCommandRunner:
             "ClearAllForwardings=yes",
             "-o",
             f"ConnectTimeout={self.connect_timeout_seconds}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={self.control_path}",
+            "-o",
+            f"ControlPersist={self.control_persist}",
             "--",
             self.ssh_target,
             remote_command,
@@ -129,7 +182,37 @@ class SshCommandRunner:
         timeout_seconds: float | None = None,
         check: bool = True,
     ) -> SshCommandResult:
-        """Execute an argv-safe remote command through SSH."""
+        """Execute an argv-safe remote command, retrying SSH connection failures."""
+        result = self._run_once(remote_argv, input_payload, timeout_seconds)
+        for attempt, delay in enumerate(self.retry_delays_seconds, start=1):
+            if not is_retryable_ssh_failure(result):
+                break
+            logger.warning(
+                "SSH connection to %s failed for command=%s; retry %d/%d in %.0fs: %s",
+                self.ssh_target,
+                remote_argv[0],
+                attempt,
+                len(self.retry_delays_seconds),
+                delay,
+                result.stderr_text.strip(),
+            )
+            self.sleep(delay)
+            result = self._run_once(remote_argv, input_payload, timeout_seconds)
+        if check and result.returncode != 0:
+            error_text = result.stderr_text.strip() or result.stdout_text.strip()
+            raise SshDockerError(
+                f"SSH command {remote_argv[0]!r} failed on {self.ssh_target!r} "
+                f"with exit status {result.returncode}: {error_text or 'no error output'}"
+            )
+        return result
+
+    def _run_once(
+        self,
+        remote_argv: Sequence[str],
+        input_payload: bytes | None,
+        timeout_seconds: float | None,
+    ) -> SshCommandResult:
+        """Execute one SSH attempt and capture its result without checking it."""
         command = self.command(remote_argv)
         started_at = time.monotonic()
         try:
@@ -166,12 +249,6 @@ class SshCommandRunner:
             result.returncode,
             time.monotonic() - started_at,
         )
-        if check and result.returncode != 0:
-            error_text = result.stderr_text.strip() or result.stdout_text.strip()
-            raise SshDockerError(
-                f"SSH command {remote_argv[0]!r} failed on {self.ssh_target!r} "
-                f"with exit status {result.returncode}: {error_text or 'no error output'}"
-            )
         return result
 
     def popen(self, remote_argv: Sequence[str]) -> subprocess.Popen[bytes]:

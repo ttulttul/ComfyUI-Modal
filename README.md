@@ -220,6 +220,8 @@ The host form also controls placement:
 
 **Refresh workers** and **Stop workers** operate only on containers carrying this extension's ownership label, so they cannot touch unrelated Docker workloads. Worker images are immutable and fingerprinted from the node-pack source, ComfyUI source, custom-node requirements, and runtime settings; a fingerprint change replaces the worker while its named storage volume is retained. All traffic travels over the existing SSH connection — no daemon TCP port, worker port, or inbound firewall rule is required.
 
+SSH commands share one persistent connection per host (`ControlMaster=auto`, `ControlPersist=10m`, socket at `~/.ssh/comfy-modal-cm-%C`). A run therefore authenticates once instead of once per Docker command, which matters for agents that prompt or rate-limit, such as 1Password. If SSH itself fails to connect or authenticate (exit status 255 with an auth or connection error), the command is retried after 1, 2, 4, 8 and 16 seconds before the error is raised. Failures of the remote command itself are never retried.
+
 #### Example: A Linux Workstation Over SSH
 
 The same graph runs on a self-hosted Linux machine by swapping the **Modal Configuration** for an **SSH Configuration**. Here `ssh_target` is an alias from `~/.ssh/config` for a workstation with an RTX 4090. The models are the 8-bit Flux Klein and Qwen3-VL-4B encoder, which fit within the card's 24 GB.

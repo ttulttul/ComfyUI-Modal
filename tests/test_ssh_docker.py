@@ -129,6 +129,121 @@ def test_ssh_command_disables_configured_forwardings(ssh_docker_module: Any) -> 
     assert command[-3:] == ["--", "gpu-host-alias", "docker info"]
 
 
+def test_ssh_command_multiplexes_connections(ssh_docker_module: Any) -> None:
+    """Every SSH call should reuse one persistent control master per destination."""
+    runner = ssh_docker_module.SshCommandRunner("gpu-host-alias")
+
+    command = runner.command(("docker", "info"))
+
+    for option in (
+        "ControlMaster=auto",
+        "ControlPath=~/.ssh/comfy-modal-cm-%C",
+        "ControlPersist=10m",
+    ):
+        assert command[command.index(option) - 1] == "-o"
+    assert command.index("ControlPersist=10m") < command.index("--")
+
+
+def test_exponential_backoff_doubles_until_exceeding_max(
+    ssh_docker_module: Any,
+) -> None:
+    """Default retry delays should double from one second and stop past thirty."""
+    assert ssh_docker_module.exponential_backoff_delays() == (1.0, 2.0, 4.0, 8.0, 16.0)
+    with pytest.raises(ValueError):
+        ssh_docker_module.exponential_backoff_delays(0.0)
+
+
+class _ScriptedSubprocess:
+    """Return scripted completed processes in order and record each invocation."""
+
+    def __init__(self, outcomes: list[tuple[int, bytes]]) -> None:
+        """Store (returncode, stderr) pairs to replay."""
+        self.outcomes = list(outcomes)
+        self.inputs: list[bytes | None] = []
+
+    def __call__(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        """Return the next scripted outcome for one SSH attempt."""
+        self.inputs.append(kwargs.get("input"))
+        returncode, stderr = self.outcomes.pop(0)
+        stdout = b"ok" if returncode == 0 else b""
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+_AGENT_REFUSED = (
+    b'sign_and_send_pubkey: signing failed for ED25519 "id" from agent: '
+    b"agent refused operation\nuser@host: Permission denied (publickey).\n"
+)
+
+
+def _retrying_runner(
+    ssh_docker_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[tuple[int, bytes]],
+) -> tuple[Any, _ScriptedSubprocess, list[float]]:
+    """Build a runner whose subprocess calls and sleeps are scripted and recorded."""
+    scripted = _ScriptedSubprocess(outcomes)
+    sleeps: list[float] = []
+    monkeypatch.setattr(ssh_docker_module.subprocess, "run", scripted)
+    runner = ssh_docker_module.SshCommandRunner("gpu-host-alias", sleep=sleeps.append)
+    return runner, scripted, sleeps
+
+
+def test_ssh_run_retries_agent_refusal_with_backoff(
+    ssh_docker_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient SSH authentication failures should retry with doubling delays."""
+    runner, scripted, sleeps = _retrying_runner(
+        ssh_docker_module,
+        monkeypatch,
+        [(255, _AGENT_REFUSED), (255, _AGENT_REFUSED), (0, b"")],
+    )
+
+    result = runner.run(("docker", "volume", "create", "v"), input_payload=b"data")
+
+    assert result.stdout == b"ok"
+    assert sleeps == [1.0, 2.0]
+    assert scripted.inputs == [b"data", b"data", b"data"]
+
+
+def test_ssh_run_gives_up_after_final_backoff_step(
+    ssh_docker_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent SSH failures should raise once every backoff step is spent."""
+    runner, scripted, sleeps = _retrying_runner(
+        ssh_docker_module, monkeypatch, [(255, _AGENT_REFUSED)] * 6
+    )
+
+    with pytest.raises(ssh_docker_module.SshDockerError, match="agent refused"):
+        runner.run(("docker", "info"))
+
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert scripted.outcomes == []
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr"),
+    [(1, b"Error response from daemon: no such volume"), (255, b"remote exited 255")],
+)
+def test_ssh_run_does_not_retry_remote_command_failures(
+    ssh_docker_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stderr: bytes,
+) -> None:
+    """Failures of the remote command itself must not be replayed."""
+    runner, scripted, sleeps = _retrying_runner(
+        ssh_docker_module, monkeypatch, [(returncode, stderr)]
+    )
+
+    result = runner.run(("docker", "volume", "rm", "v"), check=False)
+
+    assert result.returncode == returncode
+    assert sleeps == []
+    assert scripted.outcomes == []
+
+
 def test_probe_discovers_host_docker_memory_and_gpu(
     ssh_docker_module: Any,
     remote_hosts_module: Any,
