@@ -690,6 +690,11 @@ def _join_latent_batches(values: Sequence[Any]) -> Any:
     return merged
 
 
+def _is_latent_mapping(value: Any) -> bool:
+    """Return whether one value is a ComfyUI LATENT mapping with a samples tensor."""
+    return isinstance(value, Mapping) and "samples" in value
+
+
 def _join_mapped_values_as_list(values: Sequence[Any]) -> list[Any]:
     """Return mapped outputs as an ordered Python list."""
     return list(values)
@@ -718,6 +723,13 @@ def join_mapped_values(values: Sequence[Any], io_type: str, is_list: bool) -> An
         return flattened
 
     if normalized_io_type == "LATENT":
+        if not all(_is_latent_mapping(value) for value in values):
+            logger.info(
+                "Keeping %d mapped LATENT outputs as an ordered list because they are "
+                "not all latent mappings (for example remote session refs).",
+                len(values),
+            )
+            return _join_mapped_values_as_list(values)
         try:
             return _join_latent_batches(values)
         except RuntimeError as exc:

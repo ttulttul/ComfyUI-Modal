@@ -1238,3 +1238,86 @@ def test_reserve_cooldown_pool_targets_one_pool_per_prompt(
     )
 
     assert pool == expected_pool
+
+
+def _modal_proxy_node(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wrap one Modal payload as a rewritten proxy prompt node."""
+    return {
+        "class_type": "ModalUniversalExecutor",
+        "inputs": {
+            "original_node_data": {
+                "execution_provider": "modal",
+                "execution_environment_id": "modal:21:RTX-PRO-6000",
+                **payload,
+            }
+        },
+    }
+
+
+def test_profile_less_modal_components_share_the_loader_profile_pool(
+    prompt_affinity_planning_module: Any,
+) -> None:
+    """A SaveImage-like component must reuse the samplers' container pool."""
+    rewritten_prompt = {
+        "9": _modal_proxy_node({"component_id": "9", "snapshot_profile_key": "profile-a"}),
+        "45": _modal_proxy_node({"component_id": "45", "snapshot_profile_key": "profile-a"}),
+        "40": _modal_proxy_node({"component_id": "40"}),
+        "50": _modal_proxy_node(
+            {"component_id": "50", "remote_worker_affinity_group": "llm"}
+        ),
+    }
+
+    prompt_affinity_planning_module._configure_shared_snapshot_profiles(
+        rewritten_prompt=rewritten_prompt,
+        component_ids=["9", "45", "40", "50"],
+    )
+
+    def profile(component_id: str) -> Any:
+        """Return the execution payload's profile for one component."""
+        return prompt_affinity_planning_module.registered_proxy_execution_payload(
+            component_id, rewritten_prompt[component_id]["inputs"]["original_node_data"]
+        ).get("snapshot_profile_key")
+
+    assert profile("40") == "profile-a"
+    assert profile("9") == "profile-a"
+    assert profile("50") is None
+
+
+def test_shared_snapshot_profile_prefers_the_most_common_key(
+    prompt_affinity_planning_module: Any,
+) -> None:
+    """The shared profile should be the one most components already use."""
+    payloads = [
+        {"snapshot_profile_key": "profile-b"},
+        {"snapshot_profile_key": "profile-a"},
+        {"snapshot_profile_key": "profile-b"},
+        {},
+    ]
+
+    assert (
+        prompt_affinity_planning_module._shared_snapshot_profile_key(payloads)
+        == "profile-b"
+    )
+    assert prompt_affinity_planning_module._shared_snapshot_profile_key([{}]) == ""
+
+
+def test_shared_snapshot_profile_fills_profile_less_split_phases(
+    prompt_affinity_planning_module: Any,
+) -> None:
+    """Nested phase payloads without a profile should inherit the shared one."""
+    payload = {
+        "split_proxy_payloads": [
+            {"component_id": "a"},
+            {"component_id": "b", "snapshot_profile_key": "profile-x"},
+        ]
+    }
+
+    updated = prompt_affinity_planning_module._with_snapshot_profile_on_unprofiled_payloads(
+        payload, "profile-a"
+    )
+
+    assert updated["snapshot_profile_key"] == "profile-a"
+    assert [phase["snapshot_profile_key"] for phase in updated["split_proxy_payloads"]] == [
+        "profile-a",
+        "profile-x",
+    ]
