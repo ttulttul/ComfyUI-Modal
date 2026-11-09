@@ -76,6 +76,29 @@ globalThis.document = {
     return element;
   },
   getElementById: () => null,
+  visibilityState: "visible",
+  listeners: new Map(),
+  addEventListener(name, handler) {
+    this.listeners.set(name, handler);
+  },
+};
+const observedRoots = new Set();
+let intersectionCallback = null;
+globalThis.IntersectionObserver = class IntersectionObserver {
+  constructor(callback) {
+    intersectionCallback = callback;
+  }
+
+  observe(element) {
+    observedRoots.add(element);
+  }
+
+  unobserve(element) {
+    observedRoots.delete(element);
+  }
+};
+const setOnScreen = (element, isIntersecting) => {
+  intersectionCallback([{ target: element, isIntersecting }]);
 };
 globalThis.Image = class Image {
   constructor() {
@@ -320,5 +343,53 @@ preview.restoreStoredProgressivePreview(reloadedNode);
 const reloadedPanel = preview.progressivePreviewPanels.get(reloadedNode);
 assert.equal(reloadedPanel.visible, true);
 assert.equal(reloadedPanel.grid.children[0].children[0].src, viewUrl("r.png"));
+
+// Slots that arrive while the panel is off-screen are repainted when it scrolls back into view.
+const offscreenNode = makeNode(9);
+graphNodes.set("9", offscreenNode);
+handler({ detail: { phase: "start", prompt_id: "p5", node: "9", slot_count: 2 } });
+const offscreenPanel = preview.progressivePreviewPanels.get(offscreenNode);
+assert.equal(observedRoots.has(offscreenPanel.root), true);
+setOnScreen(offscreenPanel.root, true);
+assert.equal(offscreenPanel.stale, false);
+setOnScreen(offscreenPanel.root, false);
+handler({ detail: { phase: "slot", prompt_id: "p5", node: "9", slot_index: 0, slot_count: 2, images: [{ filename: "o.png" }] } });
+assert.equal(offscreenPanel.stale, true);
+const offscreenImage = offscreenPanel.grid.children[0].children[0];
+assert.equal(offscreenImage.src, viewUrl("o.png"));
+setOnScreen(offscreenPanel.root, true);
+assert.equal(offscreenPanel.stale, false);
+const repaintedImage = offscreenPanel.grid.children[0].children[0];
+assert.notEqual(repaintedImage, offscreenImage);
+assert.equal(repaintedImage.src, viewUrl("o.png"));
+assert.equal(offscreenPanel.header.textContent, "Remote preview · 1/2 received");
+// An on-screen update does not need a repaint.
+handler({ detail: { phase: "slot", prompt_id: "p5", node: "9", slot_index: 1, slot_count: 2, images: [{ filename: "o2.png" }] } });
+assert.equal(offscreenPanel.stale, false);
+
+// Updates while the browser tab is hidden are repainted when the tab becomes visible.
+document.visibilityState = "hidden";
+handler({ detail: { phase: "start", prompt_id: "p6", node: "9", slot_count: 1 } });
+handler({ detail: { phase: "slot", prompt_id: "p6", node: "9", slot_index: 0, slot_count: 1, images: [{ filename: "h.png" }] } });
+assert.equal(offscreenPanel.stale, true);
+const hiddenTabImage = offscreenPanel.grid.children[0].children[0];
+document.listeners.get("visibilitychange")();
+assert.equal(offscreenPanel.stale, true);
+document.visibilityState = "visible";
+document.listeners.get("visibilitychange")();
+assert.equal(offscreenPanel.stale, false);
+assert.notEqual(offscreenPanel.grid.children[0].children[0], hiddenTabImage);
+assert.equal(offscreenPanel.grid.children[0].children[0].src, viewUrl("h.png"));
+
+// The enlarged viewer image is reassigned on repaint too.
+offscreenPanel.grid.children[0].dispatch("click");
+setOnScreen(offscreenPanel.root, false);
+handler({ detail: { phase: "slot", prompt_id: "p6", node: "9", slot_index: 0, slot_count: 1, images: [{ filename: "h2.png" }] } });
+setOnScreen(offscreenPanel.root, true);
+assert.equal(offscreenPanel.viewer.image.src, viewUrl("h2.png"));
+
+// Removing the node stops observing its panel.
+offscreenNode.onRemoved();
+assert.equal(observedRoots.has(offscreenPanel.root), false);
 
 console.log("progressive preview frontend checks passed");
