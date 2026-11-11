@@ -45,12 +45,12 @@ def _channel_prompt(*, with_channel: bool = True) -> dict[str, Any]:
         "5": {"class_type": "SeedList", "inputs": {}, "_meta": {"title": "Seeds"}},
         "2": {
             "class_type": "ModalMapInput",
-            "inputs": {"value": ["1", 0], "name": "prompts"},
+            "inputs": {"value": ["1", 0]},
             "_meta": {"title": "Map prompts"},
         },
         "6": {
             "class_type": "ModalMapInput",
-            "inputs": {"value": ["5", 0], "name": "seeds"},
+            "inputs": {"value": ["5", 0]},
             "_meta": {"title": "Map seeds"},
         },
         "3": {
@@ -65,7 +65,11 @@ def _channel_prompt(*, with_channel: bool = True) -> dict[str, Any]:
         },
     }
     if with_channel:
-        prompt["7"] = {"class_type": "ModalInputChannel", "inputs": {}, "_meta": {}}
+        prompt["7"] = {
+            "class_type": "ModalInputChannel",
+            "inputs": {"name": " portraits "},
+            "_meta": {},
+        }
         prompt["2"]["inputs"]["channel"] = ["7", 0]
         prompt["6"]["inputs"]["channel"] = ["7", 0]
     return prompt
@@ -159,15 +163,30 @@ def test_resolve_channels_rejects_non_channel_source(channels_module: Any) -> No
         channels_module.resolve_modal_map_channels(prompt)
 
 
-def test_marker_label_uses_optional_name(channels_module: Any) -> None:
-    """Labels use the name input when set and fall back to the node id."""
-    prompt = _channel_prompt()
-    prompt["6"]["inputs"]["name"] = "  "
+def test_marker_label_uses_shared_channel_name(channels_module: Any) -> None:
+    """Every marker on a channel is labelled with the channel's shared name."""
+    resolved = channels_module.resolve_modal_map_channels(_channel_prompt())
 
-    assert channels_module.modal_map_input_label(prompt, "2") == (
-        '"prompts" (Modal Map Input 2)'
+    assert channels_module.modal_map_channel_name(resolved["2"]) == "portraits"
+    assert channels_module.modal_map_input_label(resolved, "2") == (
+        'Modal Map Input 2 on "portraits" (channel 7)'
     )
-    assert channels_module.modal_map_input_label(prompt, "6") == "Modal Map Input 6"
+    assert channels_module.modal_map_input_label(resolved, "6") == (
+        'Modal Map Input 6 on "portraits" (channel 7)'
+    )
+
+
+def test_marker_label_without_channel_name(channels_module: Any) -> None:
+    """Unnamed channels and unchanneled markers fall back to node ids."""
+    prompt = _channel_prompt()
+    prompt["7"]["inputs"]["name"] = "   "
+    resolved = channels_module.resolve_modal_map_channels(prompt)
+    unchanneled = _channel_prompt(with_channel=False)
+
+    assert channels_module.modal_map_input_label(resolved, "2") == (
+        "Modal Map Input 2 on channel 7"
+    )
+    assert channels_module.modal_map_input_label(unchanneled, "2") == "Modal Map Input 2"
 
 
 def test_rewrite_zips_channel_markers_into_one_mapped_payload(
@@ -192,12 +211,11 @@ def test_rewrite_zips_channel_markers_into_one_mapped_payload(
     mapped_inputs = {
         mapped_input["label"]: mapped_input for mapped_input in payload["mapped_inputs"]
     }
-    assert set(mapped_inputs) == {
-        '"prompts" (Modal Map Input 2)',
-        '"seeds" (Modal Map Input 6)',
-    }
-    assert mapped_inputs['"prompts" (Modal Map Input 2)']["io_type"] == "STRING"
-    assert mapped_inputs['"seeds" (Modal Map Input 6)']["io_type"] == "INT"
+    prompts_label = 'Modal Map Input 2 on "portraits" (channel 7)'
+    seeds_label = 'Modal Map Input 6 on "portraits" (channel 7)'
+    assert set(mapped_inputs) == {prompts_label, seeds_label}
+    assert mapped_inputs[prompts_label]["io_type"] == "STRING"
+    assert mapped_inputs[seeds_label]["io_type"] == "INT"
     assert {mapped_input["channel_id"] for mapped_input in mapped_inputs.values()} == {
         "7"
     }
@@ -351,20 +369,25 @@ def test_channel_anchor_nodes_cover_local_and_remote_markers(
     assert anchors == {"7": ["3", "6"]}
 
 
-def test_modal_map_input_schema_exposes_channel_and_name(
+def test_schemas_put_shared_name_on_channel_node(
     modal_executor_module: Any,
 ) -> None:
-    """The marker gains optional channel and name inputs; the channel node is a source."""
+    """The marker gains an optional channel input; the channel node owns the shared name."""
     marker_inputs = {
         item.id: item for item in modal_executor_module.ModalMapInput.define_schema().inputs
     }
     channel_outputs = modal_executor_module.ModalInputChannel.define_schema().outputs
 
-    assert set(marker_inputs) == {"value", "channel", "name"}
+    channel_inputs = {
+        item.id: item
+        for item in modal_executor_module.ModalInputChannel.define_schema().inputs
+    }
+
+    assert set(marker_inputs) == {"value", "channel"}
     assert marker_inputs["channel"].optional
-    assert marker_inputs["name"].optional
+    assert set(channel_inputs) == {"name"}
+    assert channel_inputs["name"].optional
     assert channel_outputs[0].io_type == "MODAL_INPUT_CHANNEL"
-    assert modal_executor_module.ModalInputChannel.define_schema().inputs == []
 
 
 def test_cloud_mapped_execution_zips_channel_inputs_per_item(

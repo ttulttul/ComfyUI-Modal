@@ -28,8 +28,9 @@ MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
 MODAL_INPUT_CHANNEL_NODE_ID = "ModalInputChannel"
 MODAL_INPUT_CHANNEL_IO_TYPE = "MODAL_INPUT_CHANNEL"
 MODAL_MAP_INPUT_CHANNEL_INPUT_NAME = "channel"
-MODAL_MAP_INPUT_NAME_INPUT_NAME = "name"
+MODAL_INPUT_CHANNEL_NAME_INPUT_NAME = "name"
 MODAL_MAP_CHANNEL_META_KEY = "modal_map_channel"
+MODAL_MAP_CHANNEL_NAME_META_KEY = "modal_map_channel_name"
 
 
 def _is_prompt_link(value: Any) -> bool:
@@ -95,7 +96,20 @@ def _bind_marker_channel(
         )
     marker = prompt[marker_id]
     marker["inputs"].pop(MODAL_MAP_INPUT_CHANNEL_INPUT_NAME, None)
-    marker.setdefault("_meta", {})[MODAL_MAP_CHANNEL_META_KEY] = channel_node_id
+    marker_meta = marker.setdefault("_meta", {})
+    marker_meta[MODAL_MAP_CHANNEL_META_KEY] = channel_node_id
+    channel_name = _channel_node_name(prompt, channel_node_id)
+    if channel_name:
+        marker_meta[MODAL_MAP_CHANNEL_NAME_META_KEY] = channel_name
+
+
+def _channel_node_name(prompt: Mapping[str, Any], channel_node_id: str) -> str:
+    """Return the trimmed ``name`` widget of one channel node, or an empty string."""
+    channel_node = prompt.get(channel_node_id)
+    if not isinstance(channel_node, Mapping):
+        return ""
+    raw_name = (channel_node.get("inputs") or {}).get(MODAL_INPUT_CHANNEL_NAME_INPUT_NAME)
+    return raw_name.strip() if isinstance(raw_name, str) else ""
 
 
 def resolve_modal_map_channels(prompt: Mapping[str, Any]) -> dict[str, Any]:
@@ -133,10 +147,11 @@ def resolve_modal_map_channels(prompt: Mapping[str, Any]) -> dict[str, Any]:
         resolved.pop(channel_node_id, None)
     if channel_node_ids:
         logger.info(
-            "Resolved Modal Input Channels %s into marker metadata: %s.",
-            channel_node_ids,
+            "Resolved Modal Input Channels into marker metadata: %s.",
             {
-                channel_id: modal_map_channel_members(resolved, channel_id)
+                modal_map_channel_display(
+                    channel_id, _channel_node_name(prompt, channel_id)
+                ): modal_map_channel_members(resolved, channel_id)
                 for channel_id in channel_node_ids
             },
         )
@@ -164,17 +179,30 @@ def modal_map_channel_members(prompt: Mapping[str, Any], channel_id: str) -> lis
     )
 
 
+def modal_map_channel_name(prompt_node: Mapping[str, Any] | None) -> str:
+    """Return the channel name recorded on one ``ModalMapInput`` prompt node."""
+    if not isinstance(prompt_node, Mapping):
+        return ""
+    meta = prompt_node.get("_meta")
+    if not isinstance(meta, Mapping):
+        return ""
+    return str(meta.get(MODAL_MAP_CHANNEL_NAME_META_KEY) or "")
+
+
+def modal_map_channel_display(channel_id: str, channel_name: str = "") -> str:
+    """Return a channel's user-facing name, for example ``"portraits" (channel 7)``."""
+    return f'"{channel_name}" (channel {channel_id})' if channel_name else f"channel {channel_id}"
+
+
 def modal_map_input_label(prompt: Mapping[str, Any], node_id: str) -> str:
     """Return a human-readable label for one ``ModalMapInput`` marker.
 
-    Uses the optional ``name`` input when set, for example
-    ``"seeds" (Modal Map Input 301)``, otherwise ``Modal Map Input 301``.
+    Markers on a channel carry the channel's shared name, for example
+    ``Modal Map Input 301 on "portraits" (channel 7)``.
     """
     prompt_node = prompt.get(node_id)
-    name = ""
-    if isinstance(prompt_node, Mapping):
-        raw_name = (prompt_node.get("inputs") or {}).get(MODAL_MAP_INPUT_NAME_INPUT_NAME)
-        if isinstance(raw_name, str):
-            name = raw_name.strip()
     base = f"Modal Map Input {node_id}"
-    return f'"{name}" ({base})' if name else base
+    channel_id = modal_map_channel(prompt_node)
+    if channel_id is None:
+        return base
+    return f"{base} on {modal_map_channel_display(channel_id, modal_map_channel_name(prompt_node))}"

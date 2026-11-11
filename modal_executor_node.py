@@ -17,9 +17,9 @@ from comfy_api.latest import _io as io
 if __package__:
     from .modal_map_channels import (
         MODAL_INPUT_CHANNEL_IO_TYPE,
+        MODAL_INPUT_CHANNEL_NAME_INPUT_NAME,
         MODAL_INPUT_CHANNEL_NODE_ID,
         MODAL_MAP_INPUT_CHANNEL_INPUT_NAME,
-        MODAL_MAP_INPUT_NAME_INPUT_NAME,
         MODAL_MAP_INPUT_NODE_ID,
     )
     from .serialization import (
@@ -73,9 +73,9 @@ if __package__:
 else:  # pragma: no cover - flat import inside the Modal container.
     from modal_map_channels import (
         MODAL_INPUT_CHANNEL_IO_TYPE,
+        MODAL_INPUT_CHANNEL_NAME_INPUT_NAME,
         MODAL_INPUT_CHANNEL_NODE_ID,
         MODAL_MAP_INPUT_CHANNEL_INPUT_NAME,
-        MODAL_MAP_INPUT_NAME_INPUT_NAME,
         MODAL_MAP_INPUT_NODE_ID,
     )
     from serialization import (
@@ -533,12 +533,6 @@ class ModalMapInput(io.ComfyNode):
                         "to zip their lists: mapped item i receives item i of every input."
                     ),
                 ),
-                io.String.Input(
-                    MODAL_MAP_INPUT_NAME_INPUT_NAME,
-                    optional=True,
-                    default="",
-                    tooltip="Optional label shown in logs and mapped-input errors.",
-                ),
             ],
             outputs=[io.AnyType.Output(display_name="value")],
             hidden=[io.Hidden.unique_id],
@@ -550,12 +544,11 @@ class ModalMapInput(io.ComfyNode):
         cls,
         value: Any,
         channel: Any = None,
-        name: str | None = None,
         unique_id: str | None = None,
     ) -> io.NodeOutput:
         """Pass the input value through unchanged at runtime.
 
-        ``channel`` and ``name`` only steer queue-time planning and diagnostics.
+        ``channel`` only steers queue-time planning.
         """
         _boost_modal_map_input_warmup(
             _normalize_prompt_id(unique_id),
@@ -579,14 +572,26 @@ class ModalInputChannel(io.ComfyNode):
                 "Their lists are zipped so each mapped item receives the matching item "
                 "of every input, for example prompt i with seed i."
             ),
-            inputs=[],
+            inputs=[
+                io.String.Input(
+                    MODAL_INPUT_CHANNEL_NAME_INPUT_NAME,
+                    optional=True,
+                    default="",
+                    tooltip=(
+                        "Optional name shared by every Modal Map Input on this channel; "
+                        "used as their label in logs and mapped-input errors."
+                    ),
+                ),
+            ],
             outputs=[ModalInputChannelType.Output(display_name="channel")],
             hidden=[io.Hidden.unique_id],
             is_experimental=True,
         )
 
     @classmethod
-    def execute(cls, unique_id: str | None = None) -> io.NodeOutput:
+    def execute(
+        cls, name: str | None = None, unique_id: str | None = None
+    ) -> io.NodeOutput:
         """Return this channel's node id as an opaque grouping token."""
         return io.NodeOutput(str(unique_id or MODAL_INPUT_CHANNEL_NODE_ID))
 

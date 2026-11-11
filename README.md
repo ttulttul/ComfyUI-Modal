@@ -355,13 +355,13 @@ Mapped execution supports scalar primitives (as one-item maps), Python lists, `I
 To pair several lists item by item (for example prompt *i* with seed *i*), give each list its own `Modal Map Input` and connect every marker's optional `channel` input to one `Modal Input Channel` node:
 
 ```
-Modal Input Channel ──┬────────────────────────┐
-                      ▼                        ▼
-seed list ──► Modal Map Input (name: seeds) ──► KSampler.seed
-prompt list ──► Modal Map Input (name: prompts) ──► CLIPTextEncode.text
+Modal Input Channel (name: portraits) ──┬─────────────┐
+                                        ▼             ▼
+seed list   ──► Modal Map Input ──► KSampler.seed
+prompt list ──► Modal Map Input ──► CLIPTextEncode.text
 ```
 
-Markers on one channel map the same remote component together: mapped item *i* receives item *i* of every marker's list, and a single-item input is shared by every item. The lists must otherwise have the same length. When they don't, the error names each marker and its item count. Each marker's optional `name` is used as its label in logs and errors. Without a channel, a component accepts only one `Modal Map Input`; two unchanneled markers feeding one component are rejected at queue time. The channel only steers planning: it is removed before the prompt runs and never crosses the remote boundary.
+Markers on one channel map the same remote component together: mapped item *i* receives item *i* of every marker's list, and a single-item input is shared by every item. The lists must otherwise have the same length. When they don't, the error names each marker and its item count. The channel's optional `name` is shared by all of its markers and labels them in logs and errors, for example `Modal Map Input 12 on "portraits" (channel 7)`. Without a channel, a component accepts only one `Modal Map Input`; two unchanneled markers feeding one component are rejected at queue time. The channel only steers planning: it is removed before the prompt runs and never crosses the remote boundary.
 
 Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary, and semantic batches destined for aggregate consumers (for example the frame sequence feeding `CreateVideo`) stay intact instead of being split per item.
 

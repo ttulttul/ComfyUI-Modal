@@ -1412,7 +1412,9 @@ def _validate_mapped_boundary_channels(
     if None not in channel_ids and len(channel_ids) == 1:
         return
     described = "; ".join(
-        f"{mapped_spec.label} on channel {mapped_spec.channel_id or '(none)'}"
+        mapped_spec.label
+        if mapped_spec.channel_id is not None
+        else f"{mapped_spec.label} (no channel)"
         for _boundary, mapped_spec, _io in entries
     )
     raise ModalPromptValidationError(

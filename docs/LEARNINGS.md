@@ -957,7 +957,7 @@ Users saw the Remote Progressive Preview keep stale content when slots streamed 
 
 ## Zipped Modal Map Input channels (2026-11-11)
 
-`ModalMapInput` now takes an optional `channel` input (from a new `ModalInputChannel` node) and an optional `name` label. The planner previously allowed one mapped boundary per component and passed every other input whole to each item, so two lists could not be paired item by item. Implicit zipping already paired same-length list inputs, but only by accident of type and only for ordinary subgraph payloads.
+`ModalMapInput` now takes an optional `channel` input from a new `ModalInputChannel` node. The channel carries an optional `name` shared by all of its markers; it is copied into each marker's `_meta["modal_map_channel_name"]` before the channel node is removed, and it labels the markers in logs and errors. The planner previously allowed one mapped boundary per component and passed every other input whole to each item, so two lists could not be paired item by item. Implicit zipping already paired same-length list inputs, but only by accident of type and only for ordinary subgraph payloads.
 
 Design points:
 - `resolve_modal_map_channels` runs first in `rewrite_prompt_for_modal`. It writes each marker's channel id into `_meta["modal_map_channel"]` and deletes the channel links and channel nodes. The custom `MODAL_INPUT_CHANNEL` type therefore never meets transport validation, remote partitioning, or the remote executor.
