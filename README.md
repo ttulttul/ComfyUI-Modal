@@ -605,6 +605,7 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 | `COMFY_MODAL_REMOTE_CANCEL_GRACE_SECONDS` | `2.0` | How long the local proxy waits after propagating cancellation before releasing the local prompt. |
 | `COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS` | `1.0` | How long a remote worker waits after observing cancellation before exiting if execution is still stuck. |
 | `COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS` | `false` | Mirror live Modal container logs, including each container's startup and snapshot line, into local ComfyUI stderr during streamed executions. |
+| `COMFY_MODAL_CUDNN_AUTOTUNE` | `true` | Let cuDNN time its exact convolution algorithms once per input shape and keep the fastest, which mainly speeds up VAE decoding on remote workers. Images are unchanged. Lossy ComfyUI `--fast` options (SageAttention, fp8 matmul, fp16 accumulation) are never enabled. Changing it redeploys the Modal app. |
 
 ## Troubleshooting
 

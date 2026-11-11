@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 def test_settings_discovers_comfyui_root_from_custom_nodes_install_path(
     settings_module: Any,
@@ -632,3 +634,27 @@ def test_modal_sdk_bootstrap_requests_remote_by_default(
 
     monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "local")
     assert modal_sdk_module._remote_execution_requested() is False
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [(None, True), ("true", True), ("0", False), ("off", False)],
+)
+def test_settings_enable_cudnn_autotune_by_default(
+    settings_module: Any,
+    monkeypatch: Any,
+    env_value: str | None,
+    expected: bool,
+) -> None:
+    """cuDNN autotune leaves images unchanged, so workers enable it unless told not to."""
+    if env_value is None:
+        monkeypatch.delenv("COMFY_MODAL_CUDNN_AUTOTUNE", raising=False)
+    else:
+        monkeypatch.setenv("COMFY_MODAL_CUDNN_AUTOTUNE", env_value)
+    settings_module.get_settings.cache_clear()
+    try:
+        settings = settings_module.get_settings()
+    finally:
+        settings_module.get_settings.cache_clear()
+
+    assert settings.cudnn_autotune is expected

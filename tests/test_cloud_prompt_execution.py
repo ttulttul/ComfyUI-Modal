@@ -54,6 +54,7 @@ def test_modal_cloud_image_environment_preserves_unique_app_name(
     assert image_environment["COMFY_MODAL_LLM_RESERVE_FREE_GB"] == "24.0"
     assert image_environment["COMFY_MODAL_SECRET_NAME"] == "workflow-credentials"
     assert image_environment["COMFY_MODAL_RUNTIME_FINGERPRINT"] == "fingerprint-1"
+    assert image_environment["COMFY_MODAL_CUDNN_AUTOTUNE"] == "1"
 
 def test_modal_cloud_observes_distinct_workflows_for_llm_auto_mode(
     modal_cloud_module: Any,
@@ -2064,3 +2065,59 @@ def test_collect_boundary_outputs_tags_multi_item_session_slots(
     assert stored_item_counts == {"136": 3, "147:5": None}
     assert outputs[0]["value"] == ["latent-0", "latent-1", "latent-2"]
     assert outputs[1]["value"] == "cond"
+
+
+def _install_fake_comfy_performance_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> types.SimpleNamespace:
+    """Install fake ``comfy.cli_args`` and ``comfy.model_management`` modules."""
+    import enum
+
+    class PerformanceFeature(enum.Enum):
+        """Mirror ComfyUI's --fast option names used by the worker."""
+
+        Fp16Accumulation = "fp16_accumulation"
+        AutoTune = "autotune"
+
+    state = types.SimpleNamespace(benchmark_calls=0)
+    args = types.SimpleNamespace(fast=set())
+    cli_args = types.ModuleType("comfy.cli_args")
+    cli_args.PerformanceFeature = PerformanceFeature
+    cli_args.args = args
+    model_management = types.ModuleType("comfy.model_management")
+
+    def set_cudnn_benchmark() -> None:
+        """Record that ComfyUI re-read the --fast options."""
+        state.benchmark_calls += 1
+
+    model_management.set_cudnn_benchmark = set_cudnn_benchmark
+    comfy_package = types.ModuleType("comfy")
+    comfy_package.cli_args = cli_args
+    comfy_package.model_management = model_management
+    monkeypatch.setitem(sys.modules, "comfy", comfy_package)
+    monkeypatch.setitem(sys.modules, "comfy.cli_args", cli_args)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", model_management)
+    state.args = args
+    state.feature = PerformanceFeature
+    return state
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_worker_enables_only_cudnn_autotune_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    """The worker turns on cuDNN autotune and no lossy --fast option."""
+    bootstrap = _cloud_comfy_bootstrap_owner()
+    fake = _install_fake_comfy_performance_modules(monkeypatch)
+    monkeypatch.setattr(
+        bootstrap,
+        "get_settings",
+        lambda: types.SimpleNamespace(cudnn_autotune=enabled),
+    )
+
+    bootstrap._apply_output_neutral_speedups()
+
+    expected = {fake.feature.AutoTune} if enabled else set()
+    assert fake.args.fast == expected
+    assert fake.benchmark_calls == (1 if enabled else 0)
