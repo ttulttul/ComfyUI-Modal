@@ -1071,3 +1071,82 @@ def test_rewrite_still_splits_unmapped_chain_at_local_preview_taps(
     )
 
     assert len(summary.remote_component_ids) > 1
+
+
+class _FakeLocalStringEchoNode:
+    """Fake local node that transforms a remote STRING and returns it to remote work."""
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_IS_LIST = (False,)
+
+
+def test_rewrite_keeps_ordered_phases_when_mapped_chain_reenters_through_local_node(
+    api_intercept_module: Any,
+    settings_module: Any,
+    sync_engine_module: Any,
+    tmp_path: Path,
+) -> None:
+    """A local node between two mapped remote nodes still needs a phase boundary."""
+    settings = settings_module.ModalSyncSettings(
+        app_name="app",
+        auto_deploy=True,
+        allow_ephemeral_fallback=False,
+        enable_memory_snapshot=True,
+        enable_gpu_memory_snapshot=False,
+        execution_mode="local",
+        sync_custom_nodes=False,
+        volume_name="volume",
+        route_path="/modal/queue_prompt",
+        marker_property="is_modal_remote",
+        local_storage_root=tmp_path / "storage",
+        remote_storage_root="/storage",
+        custom_nodes_archive_name="custom_nodes_bundle.zip",
+        comfyui_root=None,
+        custom_nodes_dir=tmp_path / "custom_nodes",
+    )
+    settings.custom_nodes_dir.mkdir()
+    sync_engine = sync_engine_module.ModalAssetSyncEngine.from_environment(settings)
+    fake_nodes_module = type(
+        "FakeNodesModule",
+        (),
+        {
+            "NODE_CLASS_MAPPINGS": {
+                "PromptList": _FakePromptListNode,
+                "ModalMapInput": _FakeModalMapInputNode,
+                "RemoteStringEcho": _FakeRemoteStringEchoNode,
+                "LocalStringEcho": _FakeLocalStringEchoNode,
+                "LocalStringSink": _FakeLocalStringSinkNode,
+            },
+            "NODE_DISPLAY_NAME_MAPPINGS": {},
+        },
+    )()
+    workflow = {
+        "nodes": [
+            {"id": node_id, "properties": {"is_modal_remote": node_id in {3, 5}}}
+            for node_id in (1, 2, 3, 4, 5, 6)
+        ]
+    }
+    prompt = {
+        "1": {"class_type": "PromptList", "inputs": {}},
+        "2": {"class_type": "ModalMapInput", "inputs": {"value": ["1", 0]}},
+        "3": {"class_type": "RemoteStringEcho", "inputs": {"text": ["2", 0]}},
+        "4": {"class_type": "LocalStringEcho", "inputs": {"text": ["3", 0]}},
+        "5": {
+            "class_type": "RemoteStringEcho",
+            "inputs": {"text": ["4", 0], "prefix": ["3", 0]},
+        },
+        "6": {"class_type": "LocalStringSink", "inputs": {"text": ["5", 0]}},
+    }
+
+    rewritten_prompt, summary = api_intercept_module.rewrite_prompt_for_modal(
+        prompt=prompt,
+        workflow=workflow,
+        sync_engine=sync_engine,
+        settings=settings,
+        nodes_module=fake_nodes_module,
+    )
+
+    assert summary.remote_component_ids == ["3", "5"]
+    assert rewritten_prompt["4"]["inputs"]["text"][0] == "3"
+    assert rewritten_prompt["6"]["inputs"]["text"][0] == "5"
