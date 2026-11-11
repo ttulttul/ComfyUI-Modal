@@ -831,6 +831,7 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
                 _install_model_state_dict_compatibility_wrappers()
                 _install_loader_cache_wrappers()
                 _register_modal_sync_runtime_nodes(nodes_module)
+                _apply_output_neutral_speedups()
                 _COMFY_RUNTIME_BASE_INITIALIZED = True
                 if custom_nodes_root_key is not None:
                     _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
@@ -861,6 +862,33 @@ def _ensure_comfy_runtime_initialized(custom_nodes_root: Path | None) -> None:
             _install_loader_cache_wrappers()
             _register_modal_sync_runtime_nodes(nodes_module)
             _COMFY_RUNTIME_CUSTOM_NODE_ROOTS.add(custom_nodes_root_key)
+
+
+def _apply_output_neutral_speedups() -> None:
+    """Turn on ComfyUI speed-ups that leave generated images unchanged.
+
+    Only cuDNN autotune qualifies. It times the exact convolution algorithms once
+    per input shape and keeps the fastest, which mainly speeds up VAE decoding.
+    ComfyUI enables it only from ``main.py``, which the worker never runs. Lossy
+    options (SageAttention, fp8 matmul, fp16 accumulation) stay off.
+    """
+    if not get_settings().cudnn_autotune:
+        logger.info("Leaving cuDNN autotune off because COMFY_MODAL_CUDNN_AUTOTUNE is false.")
+        return
+    try:
+        from comfy.cli_args import PerformanceFeature, args
+        import comfy.model_management as model_management
+    except ImportError as exc:
+        logger.warning("Skipping cuDNN autotune because ComfyUI could not be imported: %s", exc)
+        return
+    autotune = getattr(PerformanceFeature, "AutoTune", None)
+    set_cudnn_benchmark = getattr(model_management, "set_cudnn_benchmark", None)
+    if autotune is None or set_cudnn_benchmark is None:
+        logger.warning("Skipping cuDNN autotune because this ComfyUI version does not support it.")
+        return
+    args.fast = set(args.fast or ()) | {autotune}
+    set_cudnn_benchmark()
+    logger.info("Enabled cuDNN autotune for remote ComfyUI execution.")
 
 
 def _register_modal_sync_runtime_nodes(nodes_module: Any) -> None:

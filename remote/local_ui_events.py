@@ -39,6 +39,17 @@ def _record_local_modal_ui_event(
     record_modal_ui_event(event, payload, client_id)
 
 
+def _emit_local_gpu_usage(client_id: str | None, usage: Mapping[str, Any]) -> None:
+    """Send one prompt's running GPU-time totals to the configurator panel."""
+    if client_id is None:
+        return
+    prompt_server = _lookup_local_prompt_server()
+    if prompt_server is None:
+        return
+    _record_local_modal_ui_event("modal_gpu_usage", usage, client_id)
+    prompt_server.send_sync("modal_gpu_usage", dict(usage), client_id)
+
+
 def _emit_local_modal_status(
     *,
     prompt_id: str | None,

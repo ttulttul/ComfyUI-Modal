@@ -1747,6 +1747,8 @@ function replayModalUiEvent(eventRecord) {
       handleModalStatus({ detail: payload });
     } else if (eventName === "modal_progress") {
       handleModalProgress({ detail: payload });
+    } else if (eventName === "modal_gpu_usage") {
+      handleModalGpuUsage({ detail: payload });
     } else if (eventName === "modal_progressive_preview") {
       api.dispatchEvent?.(new CustomEvent(eventName, { detail: payload }));
     }
@@ -4391,7 +4393,8 @@ function renderRemoteConfiguratorPlan(panel, assignments, configurations) {
     panel.environmentRows.size * 52 +
     panel.storageHeight +
     panel.capacityHeight +
-    panel.keychainUnlockHeight;
+    panel.keychainUnlockHeight +
+    (panel.gpuUsageHeight ?? 0);
   const currentWidth = Number(panel.node.size?.[0]) || 0;
   const currentHeight = Number(panel.node.size?.[1]) || 0;
   panel.node.setSize?.([
@@ -4437,6 +4440,7 @@ function registerPromptConfigurator(promptId, configuratorNodeId) {
       phase: STATE_SETUP,
       statusMessage: "Preparing remote workflow",
     });
+    renderRemoteConfiguratorGpuUsage(panel, modalGpuUsageByPrompt.get(promptId) ?? null);
   }
 }
 
@@ -4577,6 +4581,7 @@ function restoreRemoteConfiguratorPanel(panel) {
     promptState.remoteExecutionConfigurations,
   );
   renderRemoteConfiguratorStatus(panel, modalGlobalStatusStates.get(promptId) ?? {});
+  renderRemoteConfiguratorGpuUsage(panel, modalGpuUsageByPrompt.get(promptId) ?? null);
 }
 
 /**
@@ -4701,6 +4706,185 @@ function makeRemoteConfiguratorWidgetResponsive(widget) {
  * Mount the non-serialized planning and status surface on the configurator node.
  * @param {LGraphNode} node
  */
+const MODAL_GPU_USAGE_PROMPT_LIMIT = 16;
+const MODAL_GPU_USAGE_VISIBLE_NODES = 8;
+const modalGpuUsageByPrompt = new Map();
+
+/**
+ * Format a GPU duration compactly, for example "45s", "3m 05s" or "1h 02m".
+ * @param {number} seconds
+ * @returns {string}
+ */
+function formatGpuDuration(seconds) {
+  const safeSeconds = Math.max(0, Math.round(Number(seconds) || 0));
+  if (safeSeconds < 60) {
+    return `${safeSeconds}s`;
+  }
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  }
+  return `${minutes}m ${String(safeSeconds % 60).padStart(2, "0")}s`;
+}
+
+/**
+ * Return the configurator panel currently showing one prompt, if any.
+ * @param {string} promptId
+ * @returns {Record<string, any> | null}
+ */
+function remoteConfiguratorPanelForPrompt(promptId) {
+  const promptState = modalPromptStates.get(promptId);
+  const panel =
+    remoteConfiguratorPanel(promptState?.configuratorNodeId) ??
+    Array.from(remoteConfiguratorPanels.values()).find(
+      (candidate) => candidate?.promptId === promptId,
+    );
+  return panel?.promptId === promptId ? panel : null;
+}
+
+/**
+ * Store one prompt's running GPU-time totals and redraw its configurator panel.
+ * Usage is kept apart from prompt state, which is discarded once a prompt ends,
+ * because session cleanup calls still report after that.
+ * @param {{ detail?: Record<string, any> }} event
+ */
+function handleModalGpuUsage(event) {
+  const usage = event?.detail;
+  const promptId = String(usage?.prompt_id ?? "");
+  if (!promptId) {
+    return;
+  }
+  modalGpuUsageByPrompt.delete(promptId);
+  modalGpuUsageByPrompt.set(promptId, usage);
+  while (modalGpuUsageByPrompt.size > MODAL_GPU_USAGE_PROMPT_LIMIT) {
+    modalGpuUsageByPrompt.delete(modalGpuUsageByPrompt.keys().next().value);
+  }
+  const panel = remoteConfiguratorPanelForPrompt(promptId);
+  if (panel) {
+    renderRemoteConfiguratorGpuUsage(panel, usage);
+  }
+}
+
+/**
+ * Build the summary chips under the GPU-time total.
+ * @param {Record<string, any>} usage
+ * @returns {HTMLElement[]}
+ */
+function gpuUsageBreakdownChips(usage) {
+  const chips = [
+    ["Nodes", usage.node_seconds, "GPU time spent running workflow nodes."],
+    [
+      "Setup",
+      usage.setup_seconds,
+      "Time before the first node runs: restoring session values and downloading inputs.",
+    ],
+    [
+      "Returning results",
+      usage.return_seconds,
+      "Time after the last node: uploading and transferring outputs back to ComfyUI.",
+    ],
+    [
+      "Waiting for containers",
+      usage.wait_seconds,
+      "Time calls waited for a container. Not included in busy time; cold starts are still billed.",
+    ],
+  ];
+  return chips
+    .filter(([, seconds]) => Number(seconds) > 0)
+    .map(([label, seconds, title]) => {
+      const chip = document.createElement("span");
+      chip.textContent = `${label} ${formatGpuDuration(seconds)}`;
+      chip.title = title;
+      return chip;
+    });
+}
+
+/**
+ * Build one row of the per-node GPU-time table.
+ * @param {Record<string, any>} node
+ * @param {number} busySeconds
+ * @returns {HTMLElement}
+ */
+function gpuUsageNodeRow(node, busySeconds) {
+  const seconds = Number(node?.seconds) || 0;
+  const share = busySeconds > 0 ? (seconds / busySeconds) * 100 : 0;
+  const row = document.createElement("div");
+  row.className = "remote-configurator-gpu-usage-node";
+  const label = document.createElement("span");
+  label.className = "remote-configurator-gpu-usage-node-label";
+  label.textContent = String(node?.label ?? node?.node_id ?? "Node");
+  label.title = String(node?.class_type ?? "");
+  const bar = document.createElement("span");
+  bar.className = "remote-configurator-gpu-usage-node-bar";
+  const fill = document.createElement("span");
+  fill.style.width = `${Math.min(100, share).toFixed(1)}%`;
+  bar.appendChild(fill);
+  const value = document.createElement("span");
+  value.className = "remote-configurator-gpu-usage-node-value";
+  const runs = Number(node?.runs) || 0;
+  value.textContent =
+    `${formatGpuDuration(seconds)} · ${Math.round(share)}%` + (runs > 1 ? ` · ×${runs}` : "");
+  row.append(label, bar, value);
+  return row;
+}
+
+/**
+ * Show one prompt's busy GPU time, its cost estimate, and the costliest nodes.
+ * @param {Record<string, any>} panel
+ * @param {Record<string, any> | null} usage
+ */
+function renderRemoteConfiguratorGpuUsage(panel, usage) {
+  if (!panel?.gpuUsage) {
+    return;
+  }
+  const busySeconds = Number(usage?.busy_seconds) || 0;
+  let height = 0;
+  if (!usage || busySeconds <= 0) {
+    panel.gpuUsage.hidden = true;
+    panel.gpuUsageNodes.replaceChildren();
+    panel.gpuUsageBreakdown.replaceChildren();
+  } else {
+    const cost = usage.estimated_cost_usd;
+    panel.gpuUsageTotal.textContent =
+      `${formatGpuDuration(busySeconds)} busy` +
+      (cost != null ? ` · ≈ ${formatEstimatedModalUsd(cost)}` : "");
+    panel.gpuUsageTotal.title =
+      `${usage.invocation_count ?? 0} remote call(s)` +
+      (usage.failed_invocation_count ? `, ${usage.failed_invocation_count} failed` : "") +
+      ". Cost uses list prices for busy time only; idle and cold-start time is billed separately.";
+    panel.gpuUsageBreakdown.replaceChildren(...gpuUsageBreakdownChips(usage));
+    const nodes = Array.isArray(usage.nodes) ? usage.nodes : [];
+    const visibleNodes = nodes.slice(0, MODAL_GPU_USAGE_VISIBLE_NODES);
+    const rows = visibleNodes.map((node) => gpuUsageNodeRow(node, busySeconds));
+    const hiddenNodes = nodes.slice(MODAL_GPU_USAGE_VISIBLE_NODES);
+    if (hiddenNodes.length > 0) {
+      const more = document.createElement("div");
+      more.className = "remote-configurator-gpu-usage-more";
+      const hiddenSeconds = hiddenNodes.reduce(
+        (total, node) => total + (Number(node?.seconds) || 0),
+        0,
+      );
+      more.textContent =
+        `+${hiddenNodes.length} more node(s) · ${formatGpuDuration(hiddenSeconds)}`;
+      rows.push(more);
+    }
+    panel.gpuUsageNodes.replaceChildren(...rows);
+    panel.gpuUsage.hidden = false;
+    height = 48 + rows.length * 17;
+  }
+  const previousHeight = panel.gpuUsageHeight ?? 0;
+  panel.gpuUsageHeight = height;
+  if (height !== previousHeight) {
+    panel.minHeight += height - previousHeight;
+    panel.node?.setSize?.([
+      Math.max(Number(panel.node.size?.[0]) || 0, 500),
+      Math.max(Number(panel.node.size?.[1]) || 0, panel.minHeight),
+    ]);
+  }
+  panel.node?.graph?.setDirtyCanvas?.(true, true);
+}
+
 function mountRemoteExecutionConfiguratorPanel(node) {
   const safeNodeId = nodeId(node);
   if (
@@ -4727,6 +4911,14 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     <div class="remote-configurator-plan-title">Execution plan</div>
     <div class="remote-configurator-empty">The selected environments will appear here after planning.</div>
     <div class="remote-configurator-targets" hidden></div>
+    <div class="remote-configurator-gpu-usage" hidden>
+      <div class="remote-configurator-gpu-usage-header">
+        <div class="remote-configurator-plan-title">GPU time</div>
+        <div class="remote-configurator-gpu-usage-total"></div>
+      </div>
+      <div class="remote-configurator-gpu-usage-breakdown"></div>
+      <div class="remote-configurator-gpu-usage-nodes"></div>
+    </div>
     <div class="remote-configurator-capacity">
       <div class="remote-configurator-capacity-header">
         <div class="remote-configurator-capacity-title">Managed capacity</div>
@@ -4774,6 +4966,11 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     environmentRows: new Map(),
     emptyText: root.querySelector(".remote-configurator-empty"),
     targets: root.querySelector(".remote-configurator-targets"),
+    gpuUsageHeight: 0,
+    gpuUsage: root.querySelector(".remote-configurator-gpu-usage"),
+    gpuUsageTotal: root.querySelector(".remote-configurator-gpu-usage-total"),
+    gpuUsageBreakdown: root.querySelector(".remote-configurator-gpu-usage-breakdown"),
+    gpuUsageNodes: root.querySelector(".remote-configurator-gpu-usage-nodes"),
     capacity: root.querySelector(".remote-configurator-capacity"),
     capacityList: root.querySelector(".remote-configurator-capacity-list"),
     capacityEmpty: root.querySelector(".remote-configurator-capacity-empty"),
@@ -7004,6 +7201,7 @@ function registerExecutionListeners() {
 
   api.addEventListener("modal_status", handleModalStatus);
   api.addEventListener("modal_progress", handleModalProgress);
+  api.addEventListener("modal_gpu_usage", handleModalGpuUsage);
   api.addEventListener("executing", (event) => handleExecutionPhase(event, EXECUTION_PHASE));
   api.addEventListener("executed", (event) => {
     handleExecutionPhase(event, STATE_COMPLETE);
@@ -7740,6 +7938,92 @@ function installGlobalStatusStyles() {
     .remote-configurator-component-estimate {
       flex: 0 0 auto;
       color: #cbd5e1;
+      font: 600 9px/1.25 ui-monospace, SFMono-Regular, monospace;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-gpu-usage {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 5px;
+      padding-top: 2px;
+    }
+
+    .remote-configurator-gpu-usage[hidden] {
+      display: none;
+    }
+
+    .remote-configurator-gpu-usage-header {
+      display: flex;
+      min-width: 0;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .remote-configurator-gpu-usage-total {
+      color: #e2e8f0;
+      font: 650 10px/1.25 ui-monospace, SFMono-Regular, monospace;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-gpu-usage-breakdown {
+      display: flex;
+      min-width: 0;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .remote-configurator-gpu-usage-breakdown span {
+      padding: 2px 5px;
+      border-radius: 4px;
+      color: #cbd5e1;
+      background: rgba(51, 65, 85, 0.62);
+      font: 600 9px/1.25 ui-monospace, SFMono-Regular, monospace;
+    }
+
+    .remote-configurator-gpu-usage-nodes {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .remote-configurator-gpu-usage-node {
+      display: grid;
+      min-width: 0;
+      grid-template-columns: minmax(0, 1.4fr) minmax(40px, 1fr) auto;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .remote-configurator-gpu-usage-node-label {
+      min-width: 0;
+      overflow: hidden;
+      color: #e2e8f0;
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remote-configurator-gpu-usage-node-bar {
+      position: relative;
+      height: 6px;
+      overflow: hidden;
+      border-radius: 3px;
+      background: rgba(15, 23, 42, 0.94);
+    }
+
+    .remote-configurator-gpu-usage-node-bar span {
+      position: absolute;
+      inset: 0 auto 0 0;
+      background: linear-gradient(90deg, #3b82f6, #a855f7);
+    }
+
+    .remote-configurator-gpu-usage-node-value,
+    .remote-configurator-gpu-usage-more {
+      color: #94a3b8;
       font: 600 9px/1.25 ui-monospace, SFMono-Regular, monospace;
       white-space: nowrap;
     }

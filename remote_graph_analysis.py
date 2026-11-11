@@ -757,6 +757,9 @@ def _remote_component_partition_groups(
         parent[merged_root] = canonical_root
         return True
 
+    mapped_region_node_ids = _modal_mapped_region_node_ids(
+        prompt, remote_node_ids, consumers, nodes_module
+    )
     for node_id in sorted(remote_node_ids):
         prompt_node = prompt.get(node_id)
         if prompt_node is None:
@@ -818,6 +821,15 @@ def _remote_component_partition_groups(
                     if downstream_provider is not None
                     else "any",
                 )
+                continue
+            if upstream_node_id in mapped_region_node_ids and node_id in mapped_region_node_ids:
+                logger.info(
+                    "Co-locating mapped remote nodes %s -> %s so each Modal Map Input "
+                    "item runs the whole chain without waiting for other items.",
+                    upstream_node_id,
+                    node_id,
+                )
+                union(node_id, upstream_node_id)
                 continue
             if _output_supports_parallel_local_materialization(
                 prompt=prompt,
@@ -886,6 +898,77 @@ def _remote_component_partition_groups(
     for node_id in sorted(remote_node_ids):
         groups[find(node_id)].add(node_id)
     return groups
+
+
+def _modal_map_anchor_node_ids(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+) -> set[str]:
+    """Return the remote nodes where any Modal Map Input marker enters remote work.
+
+    A remote marker anchors itself; a local marker anchors the remote nodes it feeds.
+    """
+    anchor_node_ids: set[str] = set()
+    for node_id, prompt_node in prompt.items():
+        if not isinstance(prompt_node, Mapping):
+            continue
+        if str(prompt_node.get("class_type")) != MODAL_MAP_INPUT_NODE_ID:
+            continue
+        marker_id = str(node_id)
+        if marker_id in remote_node_ids:
+            anchor_node_ids.add(marker_id)
+            continue
+        anchor_node_ids.update(
+            target.node_id
+            for target in consumers.get(
+                LinkedOutputRef(node_id=marker_id, output_index=0), []
+            )
+            if target.node_id in remote_node_ids
+        )
+    return anchor_node_ids
+
+
+def _node_consumes_whole_lists(prompt: dict[str, Any], node_id: str, nodes_module: Any) -> bool:
+    """Return whether one prompt node's class reduces whole input lists in one call."""
+    prompt_node = prompt.get(node_id)
+    if not isinstance(prompt_node, Mapping):
+        return False
+    node_class = getattr(nodes_module, "NODE_CLASS_MAPPINGS", {}).get(
+        str(prompt_node.get("class_type"))
+    )
+    return bool(getattr(node_class, "INPUT_IS_LIST", False))
+
+
+def _modal_mapped_region_node_ids(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+    nodes_module: Any,
+) -> set[str]:
+    """Return remote nodes that run once per Modal Map Input item.
+
+    The region starts at every marker anchor and follows remote-to-remote links
+    downstream. It stops before nodes that consume whole lists (``INPUT_IS_LIST``),
+    because those reduce every item in one call rather than running per item.
+    """
+    downstream_by_node_id: dict[str, set[str]] = defaultdict(set)
+    for source, targets in consumers.items():
+        for target in targets:
+            downstream_by_node_id[source.node_id].add(target.node_id)
+    region: set[str] = set()
+    pending = deque(
+        sorted(_modal_map_anchor_node_ids(prompt, remote_node_ids, consumers))
+    )
+    while pending:
+        node_id = pending.popleft()
+        if node_id in region or node_id not in remote_node_ids:
+            continue
+        if _node_consumes_whole_lists(prompt, node_id, nodes_module):
+            continue
+        region.add(node_id)
+        pending.extend(sorted(downstream_by_node_id.get(node_id, set()) - region))
+    return region
 
 
 def _modal_map_channel_anchor_node_ids(

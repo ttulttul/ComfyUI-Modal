@@ -213,6 +213,9 @@ def _modal_image_environment(settings: Any, runtime_fingerprint: str) -> dict[st
             settings.execution_timeout_seconds
         ),
         "COMFY_MODAL_STARTUP_TIMEOUT_SECONDS": str(settings.startup_timeout_seconds),
+        "COMFY_MODAL_CUDNN_AUTOTUNE": (
+            "1" if getattr(settings, "cudnn_autotune", True) else "0"
+        ),
         "COMFY_MODAL_LLM_MAX_RESIDENT_MODELS": str(
             getattr(settings, "llm_max_resident_models", 2)
         ),

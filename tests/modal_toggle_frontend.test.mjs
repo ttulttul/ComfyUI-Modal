@@ -69,6 +69,10 @@ class FakeElement {
       ".remote-configurator-environments",
       ".remote-configurator-empty",
       ".remote-configurator-targets",
+      ".remote-configurator-gpu-usage",
+      ".remote-configurator-gpu-usage-total",
+      ".remote-configurator-gpu-usage-breakdown",
+      ".remote-configurator-gpu-usage-nodes",
       ".remote-configurator-capacity",
       ".remote-configurator-capacity-list",
       ".remote-configurator-capacity-empty",
@@ -162,6 +166,8 @@ const transformedSource = `${[
   "  resolveComponentNodeIds,",
   "  handleModalProgress,",
   "  handleModalStatus,",
+  "  handleModalGpuUsage,",
+  "  formatGpuDuration,",
   "  handleExecutionPhase,",
   "  handlePromptInterruption,",
   "  markPromptTerminal,",
@@ -1793,6 +1799,47 @@ assert.deepEqual(
   ),
   ["Component 1", "Nodes #14, #15"],
 );
+assert.equal(retainedPanel.gpuUsage.hidden, true);
+const panelHeightBeforeGpuUsage = retainedPanel.minHeight;
+modalToggle.handleModalGpuUsage({
+  detail: {
+    prompt_id: "plan-before-capacity",
+    busy_seconds: 754,
+    node_seconds: 690,
+    setup_seconds: 40,
+    return_seconds: 24,
+    wait_seconds: 65,
+    invocation_count: 13,
+    failed_invocation_count: 0,
+    estimated_cost_usd: 0.6349,
+    nodes: [
+      { node_id: "116", label: "KSampler #116", class_type: "KSampler", seconds: 500, runs: 12 },
+      ...Array.from({ length: 9 }, (_, index) => ({
+        node_id: `n${index}`,
+        label: `Node #n${index}`,
+        class_type: "VAEDecode",
+        seconds: 10,
+        runs: 1,
+      })),
+    ],
+  },
+});
+assert.equal(retainedPanel.gpuUsage.hidden, false);
+assert.equal(retainedPanel.gpuUsageTotal.textContent, "12m 34s busy · ≈ $0.635");
+assert.deepEqual(
+  retainedPanel.gpuUsageBreakdown.children.map((chip) => chip.textContent),
+  ["Nodes 11m 30s", "Setup 40s", "Returning results 24s", "Waiting for containers 1m 05s"],
+);
+assert.equal(retainedPanel.gpuUsageNodes.children.length, 9);
+assert.deepEqual(
+  retainedPanel.gpuUsageNodes.children[0].children.map((child) => child.textContent),
+  ["KSampler #116", "", "8m 20s · 66% · ×12"],
+);
+assert.equal(retainedPanel.gpuUsageNodes.children[8].textContent, "+2 more node(s) · 20s");
+assert.equal(retainedPanel.minHeight, panelHeightBeforeGpuUsage + 48 + 9 * 17);
+modalToggle.handleModalGpuUsage({ detail: { prompt_id: "other-prompt", busy_seconds: 5 } });
+assert.equal(retainedPanel.gpuUsageNodes.children.length, 9, "other prompts must not repaint");
+assert.equal(modalToggle.formatGpuDuration(3725), "1h 02m");
 assert.equal(retainedPanel.storage.hidden, false);
 assert.equal(retainedPanel.storageList.children.length, 1);
 assert.equal(typeof retainedPanel.storageReload.listeners.get("click"), "function");

@@ -482,7 +482,11 @@ def test_hybrid_mapped_output_streams_to_progressive_preview(
     sync_engine_module: Any,
     tmp_path: Path,
 ) -> None:
-    """The logged failure shape: a mapped output feeding a remote save and a local preview."""
+    """The logged failure shape: a mapped output feeding a remote save and a local preview.
+
+    The remote save runs inside the same per-item execution, so the preview output
+    is returned directly rather than through a session bridge.
+    """
     import json
 
     from test_modal_test_workflow import (
@@ -557,7 +561,8 @@ def test_hybrid_mapped_output_streams_to_progressive_preview(
     ]
     assert producer_id.endswith("__mapped")
     assert progressive_outputs, producer_payload["boundary_outputs"]
-    assert progressive_outputs[0]["session_output"] is True
+    assert "session_output" not in progressive_outputs[0]
+    assert "9" in producer_payload["component_node_ids"]
     assert not any(
         prompt_node["class_type"]
         == api_intercept_module.MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID

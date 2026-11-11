@@ -528,6 +528,12 @@ def modal_interrupts_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def gpu_usage_module(extension_package: object) -> object:
+    """Return the per-prompt remote GPU time ledger."""
+    return importlib.import_module(f"{PACKAGE_NAME}.remote.gpu_usage")
+
+
+@pytest.fixture(scope="session")
 def payload_stream_module(extension_package: object) -> object:
     """Return Modal stream-to-local-UI forwarding helpers."""
     return importlib.import_module(f"{PACKAGE_NAME}.remote.payload_stream")

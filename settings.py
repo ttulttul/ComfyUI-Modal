@@ -99,6 +99,7 @@ _SETTINGS_ENV_KEYS = (
     "COMFY_MODAL_REMOTE_CANCEL_RESTART_SECONDS",
     "COMFY_MODAL_STREAM_EVENT_QUEUE_MAXSIZE",
     "COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS",
+    "COMFY_MODAL_CUDNN_AUTOTUNE",
     "COMFY_MODAL_LLM_MAX_RESIDENT_MODELS",
     "COMFY_MODAL_LLM_RESERVE_FREE_GB",
     "COMFY_MODAL_LLM_COMPILE_CACHE_VOLUME_NAME",
@@ -157,6 +158,7 @@ class ModalSyncSettings:
     remote_cancel_restart_seconds: float = 1.0
     stream_event_queue_maxsize: int = 256
     stream_remote_container_logs: bool = False
+    cudnn_autotune: bool = True
     llm_max_resident_models: int = 2
     llm_reserve_free_vram_gb: float = 24.0
     llm_compile_cache_volume_name: str = "comfy-universal-storage-llm-compile-cache"
@@ -705,6 +707,7 @@ def _get_settings_cached(
         ),
         stream_remote_container_logs=_read_bool_env("COMFY_MODAL_STREAM_REMOTE_CONTAINER_LOGS")
         or False,
+        cudnn_autotune=_read_bool_env("COMFY_MODAL_CUDNN_AUTOTUNE") is not False,
         llm_max_resident_models=max(
             1,
             _read_int_env("COMFY_MODAL_LLM_MAX_RESIDENT_MODELS", 2),
