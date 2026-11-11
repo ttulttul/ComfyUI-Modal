@@ -350,6 +350,19 @@ Legacy workflows without a configurator use the global status pill instead.
 
 Mapped execution supports scalar primitives (as one-item maps), Python lists, `IMAGE` batches, `LATENT` batches, and other batched tensors split on dimension 0. One `Modal Map Input` boundary is supported per remote component; non-mapped boundary inputs are broadcast unchanged to every item, and mapped outputs are reassembled in item order — concatenated where shapes allow, otherwise returned as an ordered list so downstream nodes execute once per item. Mapped components can mix one-time work (a shared model loader) with per-item work (a fanned-out sampler); the shared work runs once.
 
+#### Zipping several mapped inputs with a Modal Input Channel
+
+To pair several lists item by item (for example prompt *i* with seed *i*), give each list its own `Modal Map Input` and connect every marker's optional `channel` input to one `Modal Input Channel` node:
+
+```
+Modal Input Channel (name: portraits) ──┬─────────────┐
+                                        ▼             ▼
+seed list   ──► Modal Map Input ──► KSampler.seed
+prompt list ──► Modal Map Input ──► CLIPTextEncode.text
+```
+
+Markers on one channel map the same remote component together: mapped item *i* receives item *i* of every marker's list, and a single-item input is shared by every item. The lists must otherwise have the same length. When they don't, the error names each marker and its item count. The channel's optional `name` is shared by all of its markers and labels them in logs and errors, for example `Modal Map Input 12 on "portraits" (channel 7)`. Without a channel, a component accepts only one `Modal Map Input`; two unchanneled markers feeding one component are rejected at queue time. The channel only steers planning: it is removed before the prompt runs and never crosses the remote boundary.
+
 Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary, and semantic batches destined for aggregate consumers (for example the frame sequence feeding `CreateVideo`) stay intact instead of being split per item.
 
 ComfyUI-native lists made inside a remote component (for example several `UNETLoader` models joined by `CreateList` into one sampler chain) keep working when the component is split into ordered phases. Each phase-bridge output that holds several list items records its item count, and the next phase fans out once per item, as if a `Modal Map Input` were in place.

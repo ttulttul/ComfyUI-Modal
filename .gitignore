@@ -11,6 +11,7 @@
 !/cloudflare_oauth.py
 !/cloud_app_guard.py
 !/cloud_comfy_bootstrap.py
+!/cloud_container_placement.py
 !/cloud_durable_invocation.py
 !/cloud_execution_control.py
 !/cloud_image_env.py
@@ -52,6 +53,7 @@
 !/llm_types.py
 !/local_llm_runtime.py
 !/modal_executor_node.py
+!/modal_map_channels.py
 !/modal_admin_ops.py
 !/modal_hardware.py
 !/modal_endpoint_node.py
@@ -94,6 +96,7 @@
 !/ssh_docker.py
 !/ssh_executor.py
 !/ssh_runtime.py
+!/staging_process.py
 !/sync_engine.py
 !/sync_backends.py
 !/sync_custom_nodes.py
@@ -104,6 +107,7 @@
 !/vast_config_node.py
 !/vast_executor.py
 !/vast_image_build.py
+!/vast_image_reference.py
 !/vast_image_registry.py
 !/vast_leases.py
 !/vast_models.py

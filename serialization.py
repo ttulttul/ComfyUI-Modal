@@ -665,6 +665,87 @@ def split_mapped_value(value: Any, io_type: str) -> list[Any]:
     )
 
 
+class MappedInputLengthError(ValueError):
+    """Raised when zipped Modal Map Input lists have different item counts."""
+
+
+def payload_mapped_input_specs(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return every mapped input of one payload: the channel list, else the single input."""
+    mapped_inputs = payload.get("mapped_inputs")
+    if isinstance(mapped_inputs, list) and mapped_inputs:
+        return [dict(mapped_input) for mapped_input in mapped_inputs]
+    mapped_input = payload.get("mapped_input")
+    return [dict(mapped_input)] if isinstance(mapped_input, Mapping) else []
+
+
+def _mapped_input_label(spec: Mapping[str, Any]) -> str:
+    """Return the user-facing label of one mapped input spec."""
+    return str(spec.get("label") or spec.get("proxy_input_name") or "mapped input")
+
+
+def _zipped_item_count(
+    items_by_name: Mapping[str, list[Any]],
+    specs: Sequence[Mapping[str, Any]],
+) -> int:
+    """Return the shared item count; single-item inputs are broadcast to every item."""
+    counts = {
+        str(spec["proxy_input_name"]): len(items_by_name[str(spec["proxy_input_name"])])
+        for spec in specs
+    }
+    multi_item_counts = {count for count in counts.values() if count > 1}
+    if len(multi_item_counts) > 1:
+        described = ", ".join(
+            f"{_mapped_input_label(spec)} has {counts[str(spec['proxy_input_name'])]} items"
+            for spec in specs
+        )
+        raise MappedInputLengthError(
+            "Zipped Modal Map Input lists must have the same number of items "
+            f"(or exactly one item to share): {described}."
+        )
+    return next(iter(multi_item_counts)) if multi_item_counts else 1
+
+
+def split_zipped_mapped_inputs(
+    hydrated_inputs: Mapping[str, Any],
+    specs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Split every mapped input and zip them into one input mapping per item.
+
+    Item ``i`` receives item ``i`` of every mapped input; an input with a single
+    item is shared by every item.
+    """
+    if not specs:
+        raise ValueError("Mapped remote payloads must define at least one mapped input.")
+    items_by_name: dict[str, list[Any]] = {}
+    for spec in specs:
+        input_name = str(spec.get("proxy_input_name") or "")
+        if not input_name:
+            raise ValueError("Mapped remote payload inputs must define proxy_input_name.")
+        if input_name not in hydrated_inputs:
+            raise KeyError(f"Mapped remote payload input {input_name!r} was not provided.")
+        items = split_mapped_value(hydrated_inputs[input_name], str(spec.get("io_type", "*")))
+        if not items:
+            raise ValueError(
+                f"Mapped input {_mapped_input_label(spec)} requires at least one item."
+            )
+        items_by_name[input_name] = items
+    item_count = _zipped_item_count(items_by_name, specs)
+    if len(specs) > 1:
+        logger.info(
+            "Zipped %d mapped inputs into %d items: %s.",
+            len(specs),
+            item_count,
+            {_mapped_input_label(spec): len(items_by_name[str(spec["proxy_input_name"])]) for spec in specs},
+        )
+    return [
+        {
+            input_name: items[item_index] if len(items) > 1 else items[0]
+            for input_name, items in items_by_name.items()
+        }
+        for item_index in range(item_count)
+    ]
+
+
 def _join_latent_batches(values: Sequence[Any]) -> Any:
     """Reassemble ordered per-item LATENT mappings into one batched latent mapping."""
     torch = _import_torch()

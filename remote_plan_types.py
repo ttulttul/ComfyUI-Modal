@@ -83,6 +83,27 @@ class StaticToMappedBoundarySpec:
 
 
 @dataclass(frozen=True)
+class MappedBoundaryInputSpec:
+    """One boundary input that a Modal Map Input marker splits per mapped item."""
+
+    proxy_input_name: str
+    io_type: str
+    label: str
+    marker_node_id: str
+    channel_id: str | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        """Serialize this mapped input for remote payloads."""
+        return {
+            "proxy_input_name": self.proxy_input_name,
+            "io_type": self.io_type,
+            "label": self.label,
+            "marker_node_id": self.marker_node_id,
+            "channel_id": self.channel_id,
+        }
+
+
+@dataclass(frozen=True)
 class ProducedPhaseOutputSpec:
     """Describe one output published by an earlier split-proxy phase."""
 
@@ -106,6 +127,7 @@ class RemoteComponentPlan:
     mapped_boundary_input_name: str | None = None
     mapped_boundary_input_io_type: str | None = None
     mapped_boundary_source_node_id: str | None = None
+    mapped_boundary_inputs: list[MappedBoundaryInputSpec] = field(default_factory=list)
     static_node_ids: list[str] = field(default_factory=list)
     mapped_node_ids: list[str] = field(default_factory=list)
     mapped_execute_node_ids: list[str] = field(default_factory=list)

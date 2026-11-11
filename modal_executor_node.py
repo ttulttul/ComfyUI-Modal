@@ -15,6 +15,13 @@ from typing import Any
 from comfy_api.latest import _io as io
 
 if __package__:
+    from .modal_map_channels import (
+        MODAL_INPUT_CHANNEL_IO_TYPE,
+        MODAL_INPUT_CHANNEL_NAME_INPUT_NAME,
+        MODAL_INPUT_CHANNEL_NODE_ID,
+        MODAL_MAP_INPUT_CHANNEL_INPUT_NAME,
+        MODAL_MAP_INPUT_NODE_ID,
+    )
     from .serialization import (
         deserialize_node_outputs,
         serialize_node_inputs,
@@ -64,6 +71,13 @@ if __package__:
         set_remote_executor_client_factory,
     )
 else:  # pragma: no cover - flat import inside the Modal container.
+    from modal_map_channels import (
+        MODAL_INPUT_CHANNEL_IO_TYPE,
+        MODAL_INPUT_CHANNEL_NAME_INPUT_NAME,
+        MODAL_INPUT_CHANNEL_NODE_ID,
+        MODAL_MAP_INPUT_CHANNEL_INPUT_NAME,
+        MODAL_MAP_INPUT_NODE_ID,
+    )
     from serialization import (
         deserialize_node_outputs,
         serialize_node_inputs,
@@ -114,7 +128,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
     )
 
 logger = logging.getLogger(__name__)
-MODAL_MAP_INPUT_NODE_ID = "ModalMapInput"
+ModalInputChannelType = io.Custom(MODAL_INPUT_CHANNEL_IO_TYPE)
 MODAL_ARTIFACT_FINALIZER_MAX_COMPONENTS = 100
 
 
@@ -509,20 +523,77 @@ class ModalMapInput(io.ComfyNode):
                 "When used inside a remote-marked component, list inputs and batched tensors "
                 "can fan out across multiple Modal executions and reassemble automatically."
             ),
-            inputs=[io.AnyType.Input("value")],
+            inputs=[
+                io.AnyType.Input("value"),
+                ModalInputChannelType.Input(
+                    MODAL_MAP_INPUT_CHANNEL_INPUT_NAME,
+                    optional=True,
+                    tooltip=(
+                        "Connect several Modal Map Input nodes to one Modal Input Channel "
+                        "to zip their lists: mapped item i receives item i of every input."
+                    ),
+                ),
+            ],
             outputs=[io.AnyType.Output(display_name="value")],
             hidden=[io.Hidden.unique_id],
             is_experimental=True,
         )
 
     @classmethod
-    def execute(cls, value: Any, unique_id: str | None = None) -> io.NodeOutput:
-        """Pass the input value through unchanged at runtime."""
+    def execute(
+        cls,
+        value: Any,
+        channel: Any = None,
+        unique_id: str | None = None,
+    ) -> io.NodeOutput:
+        """Pass the input value through unchanged at runtime.
+
+        ``channel`` only steers queue-time planning.
+        """
         _boost_modal_map_input_warmup(
             _normalize_prompt_id(unique_id),
             value,
         )
         return io.NodeOutput(value)
+
+
+class ModalInputChannel(io.ComfyNode):
+    """Group several Modal Map Input nodes into one zipped bundle of mapped inputs."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        """Expose a source-only node whose output links Modal Map Input nodes together."""
+        return io.Schema(
+            node_id=MODAL_INPUT_CHANNEL_NODE_ID,
+            display_name="Modal Input Channel",
+            category="Modal",
+            description=(
+                "Connect this to the channel input of several Modal Map Input nodes. "
+                "Their lists are zipped so each mapped item receives the matching item "
+                "of every input, for example prompt i with seed i."
+            ),
+            inputs=[
+                io.String.Input(
+                    MODAL_INPUT_CHANNEL_NAME_INPUT_NAME,
+                    optional=True,
+                    default="",
+                    tooltip=(
+                        "Optional name shared by every Modal Map Input on this channel; "
+                        "used as their label in logs and mapped-input errors."
+                    ),
+                ),
+            ],
+            outputs=[ModalInputChannelType.Output(display_name="channel")],
+            hidden=[io.Hidden.unique_id],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(
+        cls, name: str | None = None, unique_id: str | None = None
+    ) -> io.NodeOutput:
+        """Return this channel's node id as an opaque grouping token."""
+        return io.NodeOutput(str(unique_id or MODAL_INPUT_CHANNEL_NODE_ID))
 
 
 class ModalArtifactFinalizer(io.ComfyNode):

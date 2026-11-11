@@ -49,6 +49,7 @@ try:
     from .modal_llm_node import ModalLLM
     from .modal_executor_node import (
         ModalArtifactFinalizer,
+        ModalInputChannel,
         ModalMapInput,
         ModalUniversalExecutor,
     )
@@ -65,6 +66,7 @@ except ModuleNotFoundError:  # pragma: no cover - used during local non-Comfy im
     ComfyExtension = object  # type: ignore[assignment]
     io = None  # type: ignore[assignment]
     ModalMapInput = None  # type: ignore[assignment]
+    ModalInputChannel = None  # type: ignore[assignment]
     ModalArtifactFinalizer = None  # type: ignore[assignment]
     ModalEndpointChat = None  # type: ignore[assignment]
     ModalLLM = None  # type: ignore[assignment]
@@ -97,6 +99,7 @@ else:
             return [
                 ModalUniversalExecutor,
                 ModalMapInput,
+                ModalInputChannel,
                 ModalArtifactFinalizer,
                 RemoteProgressivePreview,
                 ModalEndpointChat,
@@ -121,6 +124,7 @@ __all__ = [
     "ModalEndpointChat",
     "ModalLLM",
     "ModalMapInput",
+    "ModalInputChannel",
     "ModalConfiguration",
     "ModalUniversalExecutor",
     "RemoteExecutionConfigurator",

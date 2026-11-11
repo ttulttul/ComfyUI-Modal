@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterator, Mapping
 if __package__:
     from .execution_environments import ExecutionProvider, WorkflowExecutionPreferences
     from .llm_profiles import get_llm_profile
+    from .modal_map_channels import modal_map_channel
     from .modal_executor_node import (
         MODAL_ARTIFACT_FINALIZER_NODE_ID,
         MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
@@ -39,6 +40,7 @@ if __package__:
 else:  # pragma: no cover - flat import inside the Modal container.
     from execution_environments import ExecutionProvider, WorkflowExecutionPreferences
     from llm_profiles import get_llm_profile
+    from modal_map_channels import modal_map_channel
     from modal_executor_node import (
         MODAL_ARTIFACT_FINALIZER_NODE_ID,
         MODAL_LOCAL_BRIDGE_MATERIALIZER_NODE_ID,
@@ -868,10 +870,59 @@ def _remote_component_partition_groups(
             ):
                 pending_node_ids.append(downstream_node_id)
 
+    for channel_id, anchor_node_ids in sorted(
+        _modal_map_channel_anchor_node_ids(prompt, remote_node_ids, consumers).items()
+    ):
+        for anchor_node_id in anchor_node_ids[1:]:
+            union(anchor_node_ids[0], anchor_node_id, preserve_coarse_dag=False)
+        logger.info(
+            "Co-locating remote nodes %s because their Modal Map Input markers share "
+            "channel %s.",
+            anchor_node_ids,
+            channel_id,
+        )
+
     groups: dict[str, set[str]] = defaultdict(set)
     for node_id in sorted(remote_node_ids):
         groups[find(node_id)].add(node_id)
     return groups
+
+
+def _modal_map_channel_anchor_node_ids(
+    prompt: dict[str, Any],
+    remote_node_ids: set[str],
+    consumers: dict[LinkedOutputRef, list[InputTarget]],
+) -> dict[str, list[str]]:
+    """Return, per Modal Input Channel, the remote nodes its markers must share.
+
+    A remote marker anchors itself; a local marker anchors the remote nodes it
+    feeds. Only channels with at least two anchors are returned.
+    """
+    anchors_by_channel: dict[str, set[str]] = defaultdict(set)
+    for node_id, prompt_node in prompt.items():
+        if not isinstance(prompt_node, Mapping):
+            continue
+        if str(prompt_node.get("class_type")) != MODAL_MAP_INPUT_NODE_ID:
+            continue
+        channel_id = modal_map_channel(prompt_node)
+        if channel_id is None:
+            continue
+        marker_id = str(node_id)
+        if marker_id in remote_node_ids:
+            anchors_by_channel[channel_id].add(marker_id)
+            continue
+        anchors_by_channel[channel_id].update(
+            target.node_id
+            for target in consumers.get(
+                LinkedOutputRef(node_id=marker_id, output_index=0), []
+            )
+            if target.node_id in remote_node_ids
+        )
+    return {
+        channel_id: sorted(anchor_node_ids)
+        for channel_id, anchor_node_ids in anchors_by_channel.items()
+        if len(anchor_node_ids) >= 2
+    }
 
 
 def _component_topological_order(

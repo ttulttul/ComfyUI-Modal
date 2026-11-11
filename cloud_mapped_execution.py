@@ -12,13 +12,15 @@ try:
     from . import cloud_prompt_execution as _prompt_execution
     from .serialization import (
         join_mapped_values_for_scheduler,
-        split_mapped_value,
+        payload_mapped_input_specs,
+        split_zipped_mapped_inputs,
     )
 except ImportError:  # pragma: no cover - flat Modal-container import.
     import cloud_prompt_execution as _prompt_execution
     from serialization import (
         join_mapped_values_for_scheduler,
-        split_mapped_value,
+        payload_mapped_input_specs,
+        split_zipped_mapped_inputs,
     )
 
 logger = logging.getLogger(__name__)
@@ -227,26 +229,18 @@ def _execute_mapped_subgraph_payload(
     interrupt_flag_key: str | None = None,
 ) -> tuple[Any, ...]:
     """Execute one mapped payload inside a single remote runtime process."""
-    mapped_input = payload.get("mapped_input") or {}
-    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
-    if not mapped_input_name:
+    mapped_input_specs = payload_mapped_input_specs(payload)
+    if not mapped_input_specs:
         raise _remote_subgraph_execution_error(
             "Mapped remote payloads must define mapped_input.proxy_input_name."
         )
-    if mapped_input_name not in hydrated_inputs:
-        raise KeyError(
-            f"Mapped remote payload input {mapped_input_name!r} was not provided."
-        )
-
-    mapped_items = split_mapped_value(
-        hydrated_inputs[mapped_input_name],
-        str(mapped_input.get("io_type", "*")),
+    per_item_mapped_inputs = split_zipped_mapped_inputs(
+        hydrated_inputs, mapped_input_specs
     )
-    if not mapped_items:
-        raise ValueError("Mapped remote execution requires at least one input item.")
 
     broadcast_inputs = dict(hydrated_inputs)
-    broadcast_inputs.pop(mapped_input_name, None)
+    for mapped_input_spec in mapped_input_specs:
+        broadcast_inputs.pop(str(mapped_input_spec["proxy_input_name"]), None)
     static_to_mapped_boundaries = list(payload.get("static_to_mapped_boundaries", []))
     bridge_output_names = {
         str(boundary_spec.get("proxy_name") or "")
@@ -285,13 +279,13 @@ def _execute_mapped_subgraph_payload(
                 "node_id": str(payload.get("component_id") or "modal-subgraph"),
                 "display_node_id": str(payload.get("component_id") or "modal-subgraph"),
                 "value": 0.0,
-                "max": float(len(mapped_items)),
+                "max": float(len(per_item_mapped_inputs)),
                 "aggregate_only": True,
             }
         )
 
     per_item_outputs: list[tuple[Any, ...]] = []
-    for item_index, item_value in enumerate(mapped_items):
+    for item_index, item_mapped_inputs in enumerate(per_item_mapped_inputs):
         last_lane_node_id: str | None = None
         lane_id = str(payload.get("mapped_progress_lane_id") or item_index)
 
@@ -324,7 +318,7 @@ def _execute_mapped_subgraph_payload(
             f"{payload.get('component_id', 'modal-subgraph')}::item:{item_index}",
         )
         item_inputs = dict(broadcast_inputs)
-        item_inputs[mapped_input_name] = item_value
+        item_inputs.update(item_mapped_inputs)
         per_item_outputs.append(
             _execute_prompt_subgraph(
                 item_payload,
@@ -359,7 +353,7 @@ def _execute_mapped_subgraph_payload(
                         payload.get("component_id") or "modal-subgraph"
                     ),
                     "value": float(item_index + 1),
-                    "max": float(len(mapped_items)),
+                    "max": float(len(per_item_mapped_inputs)),
                     "aggregate_only": True,
                 }
             )
