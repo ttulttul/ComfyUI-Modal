@@ -2646,3 +2646,75 @@ def test_mapped_phase_payloads_preserve_parent_runtime_fingerprint(
             modal_deployment_module._expected_remote_runtime_fingerprint(derived_payload)
             == parent_fingerprint
         )
+
+
+def test_multi_item_bridge_refs_fan_out_next_phase_per_item(
+    remote_modal_app_module: Any,
+    session_state_module: Any,
+) -> None:
+    """A CreateList-driven phase bridge should fan the next phase out per list item.
+
+    The producer phase ran ComfyUI's native list mapping (5 models into one
+    sampler), so its MODEL and LATENT bridges each carry one ref to 5 items.
+    The consumer must get one item per lane, while single refs are broadcast.
+    """
+    model_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_models", node_id="147:2", output_index=0, item_count=5
+    ).to_payload()
+    latent_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_latents", node_id="136", output_index=0, item_count=5
+    ).to_payload()
+    conditioning_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_positive", node_id="147:5", output_index=0
+    ).to_payload()
+    consumer_payload = {
+        "payload_kind": "subgraph",
+        "component_id": "9",
+        "subgraph_prompt": {
+            "143": {
+                "class_type": "LatentUpscaleBy",
+                "inputs": {"samples": ["136", 0], "upscale_method": "bislerp", "scale_by": 1.33},
+            },
+            "139": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model": ["147:2", 0],
+                    "positive": ["147:5", 0],
+                    "latent_image": ["143", 0],
+                },
+            },
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "phase_bridge_2",
+                "io_type": "MODEL",
+                "targets": [{"node_id": "139", "input_name": "model"}],
+            },
+            {
+                "proxy_input_name": "phase_bridge_3",
+                "io_type": "CONDITIONING",
+                "targets": [{"node_id": "139", "input_name": "positive"}],
+            },
+            {
+                "proxy_input_name": "phase_bridge_5",
+                "io_type": "LATENT",
+                "targets": [{"node_id": "143", "input_name": "samples"}],
+            },
+        ],
+    }
+
+    split = remote_modal_app_module._split_batch_boundary_inputs(
+        consumer_payload,
+        {
+            "phase_bridge_2": [model_ref],
+            "phase_bridge_3": [conditioning_ref],
+            "phase_bridge_5": latent_ref,
+        },
+    )
+
+    assert split is not None
+    split_inputs, item_count = split
+    assert item_count == 5
+    assert sorted(split_inputs) == ["phase_bridge_2", "phase_bridge_5"]
+    assert [ref["item_index"] for ref in split_inputs["phase_bridge_5"]] == list(range(5))
+    assert {ref["bridge_key"] for ref in split_inputs["phase_bridge_2"]} == {"RSB_models"}

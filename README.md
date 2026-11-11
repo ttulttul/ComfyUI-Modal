@@ -352,6 +352,8 @@ Mapped execution supports scalar primitives (as one-item maps), Python lists, `I
 
 Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary, and semantic batches destined for aggregate consumers (for example the frame sequence feeding `CreateVideo`) stay intact instead of being split per item.
 
+ComfyUI-native lists made inside a remote component (for example several `UNETLoader` models joined by `CreateList` into one sampler chain) keep working when the component is split into ordered phases. Each phase-bridge output that holds several list items records its item count, and the next phase fans out once per item, as if a `Modal Map Input` were in place.
+
 Mapped progress is summarized on the global status pill and a representative node with counts such as `3/16`. Fan-out is clamped to `COMFY_MODAL_MAX_INFLIGHT_CALLS`.
 
 ### Remote Progressive Preview

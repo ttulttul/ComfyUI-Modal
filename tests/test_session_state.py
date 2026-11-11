@@ -380,3 +380,126 @@ def test_remote_session_store_resolves_nested_bridge_ref_lists(
         "conditioning-a",
         "conditioning-b",
     ]
+
+
+def test_bridge_ref_payload_round_trips_slot_item_fields(session_state_module: Any) -> None:
+    """Multi-item bridge refs keep item_count and item_index through payloads."""
+    ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_list",
+        node_id="136",
+        output_index=0,
+        session_id="session-1",
+        item_count=3,
+    )
+
+    restored = session_state_module.RemoteSessionBridgeRef.from_payload(ref.to_payload())
+
+    assert restored == ref
+    assert restored.is_multi_item()
+    assert [item.item_index for item in restored.split_items()] == [0, 1, 2]
+    assert all(not item.is_multi_item() for item in restored.split_items())
+
+
+def test_plain_bridge_ref_payload_omits_slot_item_fields(session_state_module: Any) -> None:
+    """Single-item bridge refs keep their existing payload shape."""
+    payload = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_single", node_id="8", output_index=0
+    ).to_payload()
+
+    assert "item_count" not in payload
+    assert "item_index" not in payload
+
+
+def test_slot_item_count_only_reports_multi_item_non_list_slots(
+    session_state_module: Any,
+) -> None:
+    """Only collapsed slots that hold several items need per-item bridge refs."""
+    assert session_state_module.slot_item_count(["a", "b"], is_list=False) == 2
+    assert session_state_module.slot_item_count(["a"], is_list=False) is None
+    assert session_state_module.slot_item_count(["a", "b"], is_list=True) is None
+    assert session_state_module.slot_item_count("a", is_list=False) is None
+
+
+def test_split_multi_item_bridge_ref_expands_singleton_wrapped_ref(
+    session_state_module: Any,
+) -> None:
+    """ComfyUI's singleton list wrapper around a multi-item ref still expands per item."""
+    ref_payload = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_list", node_id="136", output_index=0, item_count=2
+    ).to_payload()
+
+    expanded = session_state_module.split_multi_item_bridge_ref([ref_payload])
+
+    assert expanded is not None
+    assert [item["item_index"] for item in expanded] == [0, 1]
+    assert {item["bridge_key"] for item in expanded} == {"RSB_list"}
+    plain_payload = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_single", node_id="8", output_index=0
+    ).to_payload()
+    assert session_state_module.split_multi_item_bridge_ref(plain_payload) is None
+    assert session_state_module.split_multi_item_bridge_ref("not-a-ref") is None
+
+
+def test_resolve_value_with_bridges_selects_slot_item(session_state_module: Any) -> None:
+    """A per-item ref resolves the whole bridged list once and returns its own item."""
+    handle = session_state_module.RemoteSessionHandle(session_id="session-1")
+    store = session_state_module.InMemoryRemoteSessionStore()
+    store.put_bridge_output(
+        handle,
+        bridge_key="RSB_list",
+        node_id="136",
+        output_index=0,
+        value=["latent-0", "latent-1", "latent-2"],
+    )
+    whole_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_list", node_id="136", output_index=0, item_count=3
+    )
+
+    resolved = [
+        store.resolve_value_with_bridges(
+            item_ref.to_payload(), target_session_handle=handle
+        )
+        for item_ref in whole_ref.split_items()
+    ]
+
+    assert resolved == ["latent-0", "latent-1", "latent-2"]
+    assert store.resolve_value_with_bridges(
+        whole_ref.to_payload(), target_session_handle=handle
+    ) == ["latent-0", "latent-1", "latent-2"]
+
+
+def test_resolve_value_with_bridges_rejects_out_of_range_slot_item(
+    session_state_module: Any,
+) -> None:
+    """Selecting a missing slot item should fail loudly instead of broadcasting."""
+    handle = session_state_module.RemoteSessionHandle(session_id="session-1")
+    store = session_state_module.InMemoryRemoteSessionStore()
+    store.put_bridge_output(
+        handle, bridge_key="RSB_list", node_id="136", output_index=0, value=["only"]
+    )
+    item_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_list", node_id="136", output_index=0, item_count=2, item_index=1
+    )
+
+    with pytest.raises(session_state_module.RemoteSessionStateError):
+        store.resolve_value_with_bridges(
+            item_ref.to_payload(), target_session_handle=handle
+        )
+
+
+def test_stable_bridge_key_distinguishes_slot_item_inputs(session_state_module: Any) -> None:
+    """Per-item consumers of one multi-item ref must produce distinct bridge keys."""
+    base_ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_list", node_id="136", output_index=0, item_count=2
+    )
+    keys = {
+        session_state_module.stable_session_bridge_key(
+            producer_payload={"component_id": "9"},
+            producer_inputs={"phase_bridge_5": item_ref.to_payload()},
+            node_id="139",
+            output_index=0,
+        )
+        for item_ref in base_ref.split_items()
+    }
+
+    assert len(keys) == 2

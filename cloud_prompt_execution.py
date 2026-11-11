@@ -84,6 +84,7 @@ try:
         RemoteSessionValueRef,
         is_remote_session_bridge_ref_payload,
         is_remote_session_value_ref_payload,
+        slot_item_count,
     )
     from .settings import get_settings
 except ImportError:  # pragma: no cover - flat Modal-container import.
@@ -155,6 +156,7 @@ except ImportError:  # pragma: no cover - flat Modal-container import.
         RemoteSessionValueRef,
         is_remote_session_bridge_ref_payload,
         is_remote_session_value_ref_payload,
+        slot_item_count,
     )
     from settings import get_settings
 
@@ -1084,8 +1086,13 @@ def _store_session_boundary_output(
     hydrated_inputs: dict[str, Any],
     boundary_output: Mapping[str, Any],
     output_value: Any,
+    item_count: int | None = None,
 ) -> Any:
-    """Store one session-backed boundary value and return its durable reference."""
+    """Store one session-backed boundary value and return its durable reference.
+
+    ``item_count`` marks a value that is the ordered item list of a multi-item
+    ComfyUI output slot, so the host can fan consumers out per item.
+    """
     session_handle = prepared.session_handle
     if session_handle is None:
         raise RemoteSessionStateError(
@@ -1115,6 +1122,7 @@ def _store_session_boundary_output(
         node_id=node_id,
         output_index=output_index,
         session_id=live_ref.session_id,
+        item_count=item_count,
     ).to_payload()
 
 
@@ -1147,16 +1155,29 @@ def _collect_subgraph_boundary_outputs(
                 raise RemoteSubgraphExecutionError(
                     f"Remote subgraph output index {output_index} is missing for node {node_id}."
                 )
+            slot_values = cache_entry.outputs[output_index]
+            is_list = bool(boundary_output.get("is_list", False))
             output_value = _collapse_cache_slot(
-                slot_values=cache_entry.outputs[output_index],
-                is_list=bool(boundary_output.get("is_list", False)),
+                slot_values=slot_values,
+                is_list=is_list,
             )
             if bool(boundary_output.get("session_output")):
+                item_count = slot_item_count(slot_values, is_list)
+                if item_count is not None:
+                    logger.info(
+                        "Session boundary output %s:%d of component=%s holds %d slot items; "
+                        "tagging its bridge ref so consumers fan out per item.",
+                        node_id,
+                        output_index,
+                        prepared.component_id,
+                        item_count,
+                    )
                 output_value = _store_session_boundary_output(
                     prepared=prepared,
                     hydrated_inputs=hydrated_inputs,
                     boundary_output=boundary_output,
                     output_value=output_value,
+                    item_count=item_count,
                 )
             outputs.append(output_value)
     return tuple(outputs)
