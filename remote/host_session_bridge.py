@@ -24,6 +24,7 @@ from ..serialization import (
     deserialize_node_inputs,
     deserialize_node_outputs,
     deserialize_value,
+    join_mapped_values,
     serialize_mapping,
     serialize_node_inputs,
     serialize_node_outputs,
@@ -562,13 +563,49 @@ def _restore_serialized_remote_session_bridge_value(
     return restored_value
 
 
-def materialize_remote_session_bridge_ref_locally(
-    ref_payload: Mapping[str, Any],
-) -> Any:
-    """Download and deserialize one durable bridge value for local ComfyUI work."""
+def materialize_remote_session_bridge_ref_locally(ref_payload: Any) -> Any:
+    """Download and deserialize a durable bridge value for local ComfyUI work.
+
+    Accepts one bridge ref, or the ordered list of per-item refs that a mapped
+    phase returns; per-item values are joined like any mapped output (tensor
+    batches concatenated, LATENT mappings merged).
+    """
+    item_refs = _bridge_ref_items(ref_payload)
+    if item_refs is None:
+        return _materialize_single_bridge_ref(ref_payload)
+    values = [_materialize_single_bridge_ref(item_ref) for item_ref in item_refs]
+    io_type = "LATENT" if all(_is_latent_value(value) for value in values) else "*"
+    joined_value = join_mapped_values(values, io_type=io_type, is_list=False)
+    logger.info(
+        "Materialized %d mapped bridge items locally and joined them as %s.",
+        len(values),
+        type(joined_value).__name__,
+    )
+    return joined_value
+
+
+def _bridge_ref_items(ref_payload: Any) -> list[Mapping[str, Any]] | None:
+    """Return the per-item refs of a mapped bridge output, or ``None`` for one ref."""
+    if (
+        isinstance(ref_payload, list)
+        and ref_payload
+        and all(is_remote_session_bridge_ref_payload(item) for item in ref_payload)
+    ):
+        return list(ref_payload)
+    return None
+
+
+def _is_latent_value(value: Any) -> bool:
+    """Return whether one materialized value is a ComfyUI LATENT mapping."""
+    return isinstance(value, Mapping) and "samples" in value
+
+
+def _materialize_single_bridge_ref(ref_payload: Any) -> Any:
+    """Download and deserialize one durable bridge ref, selecting its item if any."""
     if not is_remote_session_bridge_ref_payload(ref_payload):
         raise TypeError(
-            "Local Modal bridge materialization requires a remote session bridge ref."
+            "Local Modal bridge materialization requires a remote session bridge ref, "
+            f"got {type(ref_payload).__name__}."
         )
     ref = RemoteSessionBridgeRef.from_payload(ref_payload)
     materialization_started_at = time.perf_counter()
@@ -623,7 +660,7 @@ def materialize_remote_session_bridge_ref_locally(
         storage_kind,
         record.serialized_output_io_type or "bridge",
     )
-    return restored_value
+    return ref.select_item(restored_value)
 
 
 def _load_local_materialization_bridge_record(

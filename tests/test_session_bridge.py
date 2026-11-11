@@ -1921,3 +1921,90 @@ def test_local_remote_app_refuses_sampler_ancestor_bridge_replay(
 
     assert resolution_stats.bridge_record_lookups == 1
     assert resolution_stats.replay_count == 0
+
+
+def _inline_image_records(
+    remote_modal_app_module: Any,
+    images: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one inline-serialized IMAGE bridge record per bridge key."""
+    return {
+        bridge_key: remote_modal_app_module.RemoteSessionBridgeRecord(
+            bridge_key=bridge_key,
+            node_id="9",
+            output_index=0,
+            producer_payload={"component_id": "9"},
+            producer_inputs={},
+            serialized_output=remote_modal_app_module.serialize_value(image),
+            serialized_output_io_type="IMAGE",
+        )
+        for bridge_key, image in images.items()
+    }
+
+
+def test_local_bridge_materialization_joins_mapped_item_refs(
+    remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A mapped phase's list of per-item refs materializes as one image batch."""
+    import torch
+
+    images = {
+        f"RSB_item_{index}": torch.full((1, 2, 2, 3), float(index)) for index in range(3)
+    }
+    records = _inline_image_records(remote_modal_app_module, images)
+    monkeypatch.setattr(
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE,
+        "get_record",
+        lambda bridge_key: records[bridge_key],
+    )
+    item_refs = [
+        remote_modal_app_module.RemoteSessionBridgeRef(
+            bridge_key=bridge_key, node_id="9", output_index=0
+        ).to_payload()
+        for bridge_key in images
+    ]
+
+    restored = host_session_bridge_module.materialize_remote_session_bridge_ref_locally(
+        item_refs
+    )
+
+    assert restored.shape == (3, 2, 2, 3)
+    assert [float(restored[index, 0, 0, 0]) for index in range(3)] == [0.0, 1.0, 2.0]
+
+
+def test_local_bridge_materialization_selects_slot_item(
+    remote_modal_app_module: Any,
+    host_session_bridge_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A per-item ref of a multi-item slot materializes only its own item."""
+    import torch
+
+    slot_items = [torch.full((1, 2, 2, 3), float(index)) for index in range(2)]
+    records = _inline_image_records(remote_modal_app_module, {"RSB_slot": slot_items})
+    monkeypatch.setattr(
+        host_session_bridge_module._REMOTE_SESSION_BRIDGE_STORE,
+        "get_record",
+        lambda bridge_key: records[bridge_key],
+    )
+    item_ref = remote_modal_app_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_slot", node_id="9", output_index=0, item_count=2, item_index=1
+    ).to_payload()
+
+    restored = host_session_bridge_module.materialize_remote_session_bridge_ref_locally(
+        item_ref
+    )
+
+    assert torch.equal(restored, slot_items[1])
+
+
+def test_local_bridge_materialization_rejects_non_refs(
+    host_session_bridge_module: Any,
+) -> None:
+    """Values that are neither a ref nor a list of refs still fail loudly."""
+    with pytest.raises(TypeError, match="got list"):
+        host_session_bridge_module.materialize_remote_session_bridge_ref_locally(
+            ["not-a-ref"]
+        )
