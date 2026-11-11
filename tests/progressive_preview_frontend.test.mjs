@@ -154,7 +154,8 @@ runInThisContext(
     "globalThis.__progressiveExports = {",
     "  applyProgressivePreviewEvent, applyFinalPreviewOutput, createSlotState, stepSlotIndex,",
     "  slotGridColumns, filledSlotCount, progressivePreviewHeaderText, progressivePreviewFileUrl,",
-    "  normalizePreviewEntry,",
+    "  normalizePreviewEntry, fitSlotGrid, applyProgressivePreviewGridLayout,",
+    "  adoptProgressivePreviewImageAspect,",
     "  resolveProgressivePreviewNode, handleProgressivePreviewEvent, finishProgressivePreview,",
     "  restoreStoredProgressivePreview, progressivePreviewPanels, runProgressivePreviewAction,",
     "};",
@@ -219,6 +220,16 @@ assert.equal(
   preview.progressivePreviewFileUrl({ filename: "a b.png", subfolder: "", type: "temp" }),
   "/api/view?filename=a+b.png&subfolder=&type=temp",
 );
+
+// The grid picks the column count that makes slots largest while all of them fit.
+assert.deepEqual(preview.fitSlotGrid(12, 400, 300), { columns: 4, cellWidth: 97, cellHeight: 97 });
+assert.deepEqual(preview.fitSlotGrid(12, 900, 120), { columns: 12, cellWidth: 71, cellHeight: 71 });
+assert.deepEqual(preview.fitSlotGrid(12, 120, 900), { columns: 1, cellWidth: 71, cellHeight: 71 });
+// Portrait items get portrait cells.
+assert.deepEqual(preview.fitSlotGrid(4, 400, 400, 0.75), { columns: 2, cellWidth: 148, cellHeight: 197 });
+// Too many slots for the space keeps a minimum cell size and lets the grid scroll.
+assert.equal(preview.fitSlotGrid(400, 100, 100).cellWidth, 32);
+assert.equal(preview.fitSlotGrid(0, 100, 100).columns, 1);
 
 // Subgraph node ids resolve through each subgraph node.
 const innerNode = { id: 18, comfyClass: "RemoteProgressivePreview" };
@@ -496,6 +507,23 @@ preview.restoreStoredProgressivePreview(restoredTextNode);
 const restoredTextPanel = preview.progressivePreviewPanels.get(restoredTextNode);
 assert.equal(restoredTextPanel.visible, true);
 assert.equal(restoredTextPanel.grid.children[0].children[0].textContent, "saved");
+
+// Resizing the node refits the grid to the panel; the first loaded image sets the cell shape.
+const fitPanel = preview.progressivePreviewPanels.get(mixedNode);
+fitPanel.grid.clientWidth = 400;
+fitPanel.grid.clientHeight = 300;
+handler({ detail: { phase: "start", prompt_id: "p8", node: "10", slot_count: 12 } });
+assert.equal(fitPanel.grid.style.gridTemplateColumns, "repeat(4, 97px)");
+assert.equal(fitPanel.grid.style.gridAutoRows, "97px");
+preview.adoptProgressivePreviewImageAspect(fitPanel, { naturalWidth: 768, naturalHeight: 1024 });
+assert.equal(fitPanel.grid.style.gridTemplateColumns, "repeat(4, 73px)");
+assert.equal(fitPanel.grid.style.gridAutoRows, "97px");
+fitPanel.grid.clientWidth = 0;
+preview.applyProgressivePreviewGridLayout(fitPanel);
+assert.equal(fitPanel.grid.style.gridTemplateColumns, "repeat(4, minmax(0, 1fr))");
+// Waiting slots are drawn without a running animation, which would repaint the whole Nodes 2.0 graph every frame.
+const panelStyles = document.head.children.map((child) => child.textContent).join("\n");
+assert.equal(/animation|@keyframes/.test(panelStyles), false);
 
 // Removing the node stops observing its panel.
 offscreenNode.onRemoved();

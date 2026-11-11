@@ -7,6 +7,8 @@ const PROGRESSIVE_PREVIEW_WIDGET_NAME = "progressive_preview";
 const PROGRESSIVE_PREVIEW_STYLE_ID = "comfy-progressive-preview-style";
 const PROGRESSIVE_PREVIEW_MIN_HEIGHT = 160;
 const PROGRESSIVE_PREVIEW_MIN_WIDTH = 280;
+const PROGRESSIVE_PREVIEW_GRID_GAP = 4;
+const PROGRESSIVE_PREVIEW_MIN_CELL = 32;
 
 /** @type {WeakMap<object, ProgressivePreviewPanel>} */
 const progressivePreviewPanels = new WeakMap();
@@ -39,7 +41,8 @@ const PREVIEW_ACTIONS_BY_KIND = {
  *   viewerIndex: number|null, focusSlotIndex: number|null, visible: boolean,
  *   widget: object|null, finishedPromptId: string|null,
  *   imageElements: Map<string, HTMLImageElement>, onScreen: boolean,
- *   stale: boolean}} ProgressivePreviewPanel
+ *   stale: boolean, cellAspect: number, gridLayoutKey: string}} ProgressivePreviewPanel
+ * @typedef {{columns: number, cellWidth: number, cellHeight: number}} SlotGridLayout
  */
 
 /**
@@ -159,6 +162,33 @@ function stepSlotIndex(state, index, delta) {
  */
 function slotGridColumns(slotCount) {
   return Math.max(1, Math.ceil(Math.sqrt(Math.max(1, slotCount))));
+}
+
+/**
+ * Return the column count and cell size that make the slots as large as possible
+ * while all of them fit in the given area.
+ * @param {number} slotCount
+ * @param {number} width
+ * @param {number} height
+ * @param {number} [aspect] Cell width divided by cell height.
+ * @param {number} [gap]
+ * @returns {SlotGridLayout}
+ */
+function fitSlotGrid(slotCount, width, height, aspect = 1, gap = PROGRESSIVE_PREVIEW_GRID_GAP) {
+  const count = Math.max(1, slotCount);
+  const ratio = Number.isFinite(aspect) && aspect > 0 ? aspect : 1;
+  let best = { columns: 1, cellWidth: 0 };
+  for (let columns = 1; columns <= count; columns += 1) {
+    const rows = Math.ceil(count / columns);
+    const widthLimit = (width - gap * (columns - 1)) / columns;
+    const heightLimit = ((height - gap * (rows - 1)) / rows) * ratio;
+    const cellWidth = Math.min(widthLimit, heightLimit);
+    if (cellWidth > best.cellWidth) {
+      best = { columns, cellWidth };
+    }
+  }
+  const cellWidth = Math.max(PROGRESSIVE_PREVIEW_MIN_CELL, Math.floor(best.cellWidth));
+  return { columns: best.columns, cellWidth, cellHeight: Math.max(1, Math.floor(cellWidth / ratio)) };
 }
 
 /**
@@ -287,14 +317,15 @@ function installProgressivePreviewStyles() {
     .comfy-progressive-preview[hidden] { display: none; }
     .comfy-progressive-preview-header { font-size: 11px; opacity: 0.75;
       color: var(--input-text, #ddd); white-space: nowrap; }
-    .comfy-progressive-preview-grid { display: grid; gap: 4px; flex: 1; min-height: 0;
-      overflow: auto; align-content: start; }
-    .comfy-progressive-preview-cell { position: relative; aspect-ratio: 1; min-height: 0;
+    .comfy-progressive-preview-grid { display: grid; gap: ${PROGRESSIVE_PREVIEW_GRID_GAP}px;
+      flex: 1; min-height: 0; min-width: 0; overflow: auto; align-content: safe center;
+      justify-content: safe center; }
+    .comfy-progressive-preview-cell { position: relative; min-height: 0; min-width: 0;
       padding: 0; border: 0; border-radius: 4px; overflow: hidden; cursor: zoom-in;
       background: var(--comfy-input-bg, #222); display: flex; align-items: center;
       justify-content: center; pointer-events: auto; touch-action: manipulation; }
     .comfy-progressive-preview-cell.is-empty { border: 1px dashed var(--border-color, #555);
-      animation: comfy-progressive-preview-pulse 1.6s ease-in-out infinite; }
+      opacity: 0.6; cursor: default; }
     .comfy-progressive-preview-cell img { width: 100%; height: 100%; object-fit: contain; }
     .comfy-progressive-preview-text-thumb { width: 100%; height: 100%; box-sizing: border-box;
       padding: 4px 4px 14px; overflow: hidden; font-size: 10px; line-height: 1.3; text-align: left;
@@ -339,7 +370,6 @@ function installProgressivePreviewStyles() {
     .comfy-progressive-preview-counter { position: absolute; bottom: 6px; left: 50%;
       transform: translateX(-50%); padding: 1px 8px; border-radius: 8px; font-size: 11px;
       background: rgba(0, 0, 0, 0.55); color: #fff; }
-    @keyframes comfy-progressive-preview-pulse { 50% { opacity: 0.45; } }
   `;
   document.head?.appendChild(style);
 }
@@ -499,6 +529,8 @@ function ensureProgressivePreviewPanel(node) {
     imageElements: new Map(),
     onScreen: typeof IntersectionObserver !== "function",
     stale: false,
+    cellAspect: 1,
+    gridLayoutKey: "",
   };
   panel.viewer = createProgressivePreviewViewer(panel);
   root.appendChild(panel.viewer.root);
@@ -519,7 +551,58 @@ function ensureProgressivePreviewPanel(node) {
   }
   progressivePreviewPanels.set(node, panel);
   trackProgressivePreviewVisibility(panel);
+  observeProgressivePreviewGridSize(panel);
   return panel;
+}
+
+/**
+ * Refit the slot grid whenever the node resizes its panel.
+ * @param {ProgressivePreviewPanel} panel
+ */
+function observeProgressivePreviewGridSize(panel) {
+  if (typeof ResizeObserver !== "function") {
+    return;
+  }
+  const observer = new ResizeObserver(() => applyProgressivePreviewGridLayout(panel));
+  observer.observe(panel.grid);
+}
+
+/**
+ * Size the slot grid's columns and rows so every slot fits the panel at the largest size.
+ * Without a measured size (panel hidden or not yet laid out) the grid falls back to equal columns.
+ * @param {ProgressivePreviewPanel} panel
+ */
+function applyProgressivePreviewGridLayout(panel) {
+  const { grid, state } = panel;
+  const width = Number(grid.clientWidth) || 0;
+  const height = Number(grid.clientHeight) || 0;
+  const layoutKey = `${state.slotCount}:${width}x${height}:${panel.cellAspect.toFixed(3)}`;
+  if (layoutKey === panel.gridLayoutKey) {
+    return;
+  }
+  panel.gridLayoutKey = layoutKey;
+  if (width <= 0 || height <= 0) {
+    grid.style.gridTemplateColumns = `repeat(${slotGridColumns(state.slotCount)}, minmax(0, 1fr))`;
+    grid.style.gridAutoRows = "";
+    return;
+  }
+  const layout = fitSlotGrid(state.slotCount, width, height, panel.cellAspect);
+  grid.style.gridTemplateColumns = `repeat(${layout.columns}, ${layout.cellWidth}px)`;
+  grid.style.gridAutoRows = `${layout.cellHeight}px`;
+}
+
+/**
+ * Adopt a loaded image's shape for the slot cells so images fill them without letterboxing.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {HTMLImageElement} image
+ */
+function adoptProgressivePreviewImageAspect(panel, image) {
+  const aspect = Number(image.naturalWidth) / Number(image.naturalHeight);
+  if (!Number.isFinite(aspect) || aspect <= 0 || Math.abs(aspect - panel.cellAspect) < 0.01) {
+    return;
+  }
+  panel.cellAspect = aspect;
+  applyProgressivePreviewGridLayout(panel);
 }
 
 /**
@@ -639,12 +722,13 @@ function progressivePreviewCell(panel, index) {
 
 /**
  * Build the small grid thumbnail for one entry.
+ * @param {ProgressivePreviewPanel} panel
  * @param {PreviewEntry} entry
  * @param {number} index
  * @param {HTMLElement} cell
  * @returns {HTMLElement}
  */
-function createPreviewEntryThumbnail(entry, index, cell) {
+function createPreviewEntryThumbnail(panel, entry, index, cell) {
   if (entry.kind === "text") {
     return createPreviewElement("div", "comfy-progressive-preview-text-thumb", entry.text);
   }
@@ -652,9 +736,11 @@ function createPreviewEntryThumbnail(entry, index, cell) {
     return createPreviewElement("div", "comfy-progressive-preview-audio-thumb", "♪");
   }
   const image = document.createElement("img");
+  image.decoding = "async";
   image.addEventListener?.("error", () => {
     delete cell.dataset.entryKey;
   });
+  image.addEventListener?.("load", () => adoptProgressivePreviewImageAspect(panel, image));
   image.src = progressivePreviewFileUrl(entry);
   image.alt = `Remote preview item ${index + 1}`;
   return image;
@@ -662,11 +748,12 @@ function createPreviewEntryThumbnail(entry, index, cell) {
 
 /**
  * Render one slot cell as an empty placeholder or a thumbnail of its first entry.
+ * @param {ProgressivePreviewPanel} panel
  * @param {HTMLElement} cell
  * @param {number} index
  * @param {PreviewEntry[]} entries
  */
-function renderProgressivePreviewCell(cell, index, entries) {
+function renderProgressivePreviewCell(panel, cell, index, entries) {
   const firstEntry = entries[0];
   const entryKey = firstEntry ? previewEntryKey(firstEntry) : "";
   if (cell.dataset.entryKey === entryKey && cell.dataset.entryCount === String(entries.length)) {
@@ -680,7 +767,7 @@ function renderProgressivePreviewCell(cell, index, entries) {
     ? `Item ${index + 1} · ${previewEntryNoun(firstEntry)} · click to enlarge`
     : `Item ${index + 1} · waiting for remote result`;
   if (firstEntry) {
-    cell.appendChild(createPreviewEntryThumbnail(firstEntry, index, cell));
+    cell.appendChild(createPreviewEntryThumbnail(panel, firstEntry, index, cell));
   }
   if (entries.length > 1) {
     cell.appendChild(createPreviewElement("span", "comfy-progressive-preview-badge", `×${entries.length}`));
@@ -758,11 +845,11 @@ function renderProgressivePreviewPanel(panel) {
     panel.stale = true;
   }
   panel.header.textContent = progressivePreviewHeaderText(state);
-  panel.grid.style.gridTemplateColumns = `repeat(${slotGridColumns(state.slotCount)}, minmax(0, 1fr))`;
+  applyProgressivePreviewGridLayout(panel);
   const cells = [];
   for (let index = 0; index < state.slotCount; index += 1) {
     const cell = progressivePreviewCell(panel, index);
-    renderProgressivePreviewCell(cell, index, state.slots.get(index) ?? []);
+    renderProgressivePreviewCell(panel, cell, index, state.slots.get(index) ?? []);
     cells.push(cell);
   }
   panel.cells.length = state.slotCount;
