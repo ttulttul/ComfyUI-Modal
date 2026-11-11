@@ -7,6 +7,8 @@ const PROGRESSIVE_PREVIEW_WIDGET_NAME = "progressive_preview";
 const PROGRESSIVE_PREVIEW_STYLE_ID = "comfy-progressive-preview-style";
 const PROGRESSIVE_PREVIEW_MIN_HEIGHT = 160;
 const PROGRESSIVE_PREVIEW_MIN_WIDTH = 280;
+const PROGRESSIVE_PREVIEW_GRID_GAP = 4;
+const PROGRESSIVE_PREVIEW_MIN_CELL = 32;
 
 /** @type {WeakMap<object, ProgressivePreviewPanel>} */
 const progressivePreviewPanels = new WeakMap();
@@ -20,18 +22,27 @@ const progressivePreviewPanelsByRoot = new WeakMap();
 /** @type {IntersectionObserver|null} */
 let progressivePreviewObserver = null;
 
+/** Toolbar actions each preview kind supports in the enlarged viewer. */
+const PREVIEW_ACTIONS_BY_KIND = {
+  image: ["open", "save", "copy"],
+  audio: ["open", "save"],
+  text: ["save", "copy"],
+};
+
 /**
- * @typedef {{filename: string, subfolder?: string, type?: string}} PreviewImage
- * @typedef {{promptId: string|null, slotCount: number, slots: Map<number, PreviewImage[]>}} SlotState
- * @typedef {{stage: HTMLElement, image: HTMLImageElement, waiting: HTMLElement,
- *   counter: HTMLElement, root: HTMLElement,
+ * @typedef {{kind: "image"|"audio"|"text", filename?: string, subfolder?: string,
+ *   type?: string, text?: string}} PreviewEntry
+ * @typedef {{promptId: string|null, slotCount: number, slots: Map<number, PreviewEntry[]>}} SlotState
+ * @typedef {{stage: HTMLElement, image: HTMLImageElement, audio: HTMLAudioElement,
+ *   text: HTMLElement, waiting: HTMLElement, counter: HTMLElement, root: HTMLElement,
  *   actionButtons: Record<string, HTMLButtonElement>}} ProgressivePreviewViewer
  * @typedef {{node: object, root: HTMLElement, header: HTMLElement, grid: HTMLElement,
  *   cells: HTMLElement[], viewer: ProgressivePreviewViewer, state: SlotState,
  *   viewerIndex: number|null, focusSlotIndex: number|null, visible: boolean,
  *   widget: object|null, finishedPromptId: string|null,
  *   imageElements: Map<string, HTMLImageElement>, onScreen: boolean,
- *   stale: boolean}} ProgressivePreviewPanel
+ *   stale: boolean, cellAspect: number, gridLayoutKey: string}} ProgressivePreviewPanel
+ * @typedef {{columns: number, cellWidth: number, cellHeight: number}} SlotGridLayout
  */
 
 /**
@@ -40,6 +51,39 @@ let progressivePreviewObserver = null;
  */
 function createSlotState() {
   return { promptId: null, slotCount: 0, slots: new Map() };
+}
+
+/**
+ * Return one preview entry in canonical form, or null when it cannot be shown.
+ * Entries without a kind are images, as sent by earlier versions of the node.
+ * @param {Record<string, any>|null|undefined} entry
+ * @returns {PreviewEntry|null}
+ */
+function normalizePreviewEntry(entry) {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  if (entry.kind === "text") {
+    return { kind: "text", text: String(entry.text ?? "") };
+  }
+  if (!entry.filename) {
+    return null;
+  }
+  return {
+    kind: entry.kind === "audio" ? "audio" : "image",
+    filename: String(entry.filename),
+    subfolder: String(entry.subfolder ?? ""),
+    type: String(entry.type ?? "temp"),
+  };
+}
+
+/**
+ * Return the showable entries of a list of raw preview entries.
+ * @param {unknown} entries
+ * @returns {PreviewEntry[]}
+ */
+function normalizePreviewEntries(entries) {
+  return Array.isArray(entries) ? entries.map(normalizePreviewEntry).filter(Boolean) : [];
 }
 
 /**
@@ -68,26 +112,35 @@ function applyProgressivePreviewEvent(state, detail) {
     return false;
   }
   const slotIndex = Math.max(0, Number(detail.slot_index) || 0);
-  const images = Array.isArray(detail.images) ? detail.images : [];
-  state.slots.set(slotIndex, images);
+  state.slots.set(slotIndex, normalizePreviewEntries(detail.items ?? detail.images));
   state.slotCount = Math.max(state.slotCount, declaredCount, slotIndex + 1);
   return true;
 }
 
 /**
- * Replace a slot state with the final images ComfyUI delivered, one image per slot.
+ * Replace a slot state with the final entries ComfyUI delivered, one entry per slot.
+ * Outputs saved before the node took other types carry only an ``images`` list.
  * @param {SlotState} state
- * @param {PreviewImage[]} images
- * @returns {boolean} Whether there were images to show.
+ * @param {Record<string, any>|undefined} output
+ * @returns {boolean} Whether there were entries to show.
  */
-function applyFinalPreviewImages(state, images) {
-  const finalImages = Array.isArray(images) ? images.filter((image) => image?.filename) : [];
-  if (finalImages.length === 0) {
+function applyFinalPreviewOutput(state, output) {
+  const entries = normalizePreviewEntries(output?.modal_preview ?? output?.images);
+  if (entries.length === 0) {
     return false;
   }
-  state.slotCount = finalImages.length;
-  state.slots = new Map(finalImages.map((image, index) => [index, [image]]));
+  state.slotCount = entries.length;
+  state.slots = new Map(entries.map((entry, index) => [index, [entry]]));
   return true;
+}
+
+/**
+ * Return whether a stored node output has anything for the panel to show.
+ * @param {Record<string, any>|undefined} output
+ * @returns {boolean}
+ */
+function hasStoredPreviewOutput(output) {
+  return Boolean(output?.modal_preview?.length || output?.images?.length);
 }
 
 /**
@@ -112,6 +165,33 @@ function slotGridColumns(slotCount) {
 }
 
 /**
+ * Return the column count and cell size that make the slots as large as possible
+ * while all of them fit in the given area.
+ * @param {number} slotCount
+ * @param {number} width
+ * @param {number} height
+ * @param {number} [aspect] Cell width divided by cell height.
+ * @param {number} [gap]
+ * @returns {SlotGridLayout}
+ */
+function fitSlotGrid(slotCount, width, height, aspect = 1, gap = PROGRESSIVE_PREVIEW_GRID_GAP) {
+  const count = Math.max(1, slotCount);
+  const ratio = Number.isFinite(aspect) && aspect > 0 ? aspect : 1;
+  let best = { columns: 1, cellWidth: 0 };
+  for (let columns = 1; columns <= count; columns += 1) {
+    const rows = Math.ceil(count / columns);
+    const widthLimit = (width - gap * (columns - 1)) / columns;
+    const heightLimit = ((height - gap * (rows - 1)) / rows) * ratio;
+    const cellWidth = Math.min(widthLimit, heightLimit);
+    if (cellWidth > best.cellWidth) {
+      best = { columns, cellWidth };
+    }
+  }
+  const cellWidth = Math.max(PROGRESSIVE_PREVIEW_MIN_CELL, Math.floor(best.cellWidth));
+  return { columns: best.columns, cellWidth, cellHeight: Math.max(1, Math.floor(cellWidth / ratio)) };
+}
+
+/**
  * Return how many slots have received images.
  * @param {SlotState} state
  * @returns {number}
@@ -133,7 +213,7 @@ function filledSlotCount(state) {
  */
 function progressivePreviewHeaderText(state) {
   if (state.slotCount <= 0) {
-    return "Waiting for remote images…";
+    return "Waiting for remote results…";
   }
   const filled = filledSlotCount(state);
   if (filled >= state.slotCount) {
@@ -143,18 +223,36 @@ function progressivePreviewHeaderText(state) {
 }
 
 /**
- * Build the ComfyUI /view URL for one saved preview image.
- * @param {PreviewImage} image
+ * Build the ComfyUI /view URL for one saved preview image or audio file.
+ * @param {PreviewEntry} entry
  * @returns {string}
  */
-function progressivePreviewImageUrl(image) {
+function progressivePreviewFileUrl(entry) {
   const params = new URLSearchParams({
-    filename: String(image.filename ?? ""),
-    subfolder: String(image.subfolder ?? ""),
-    type: String(image.type ?? "temp"),
+    filename: String(entry.filename ?? ""),
+    subfolder: String(entry.subfolder ?? ""),
+    type: String(entry.type ?? "temp"),
   });
   const path = `/view?${params.toString()}`;
   return typeof api?.apiURL === "function" ? api.apiURL(path) : path;
+}
+
+/**
+ * Return a key that changes whenever an entry's displayed content changes.
+ * @param {PreviewEntry} entry
+ * @returns {string}
+ */
+function previewEntryKey(entry) {
+  return entry.kind === "text" ? `text:${entry.text}` : `${entry.kind}:${progressivePreviewFileUrl(entry)}`;
+}
+
+/**
+ * Return the word used for an entry in titles and tooltips.
+ * @param {PreviewEntry|null} entry
+ * @returns {string}
+ */
+function previewEntryNoun(entry) {
+  return { audio: "audio", text: "text" }[entry?.kind] ?? "image";
 }
 
 /**
@@ -219,15 +317,21 @@ function installProgressivePreviewStyles() {
     .comfy-progressive-preview[hidden] { display: none; }
     .comfy-progressive-preview-header { font-size: 11px; opacity: 0.75;
       color: var(--input-text, #ddd); white-space: nowrap; }
-    .comfy-progressive-preview-grid { display: grid; gap: 4px; flex: 1; min-height: 0;
-      overflow: auto; align-content: start; }
-    .comfy-progressive-preview-cell { position: relative; aspect-ratio: 1; min-height: 0;
+    .comfy-progressive-preview-grid { display: grid; gap: ${PROGRESSIVE_PREVIEW_GRID_GAP}px;
+      flex: 1; min-height: 0; min-width: 0; overflow: auto; align-content: safe center;
+      justify-content: safe center; }
+    .comfy-progressive-preview-cell { position: relative; min-height: 0; min-width: 0;
       padding: 0; border: 0; border-radius: 4px; overflow: hidden; cursor: zoom-in;
       background: var(--comfy-input-bg, #222); display: flex; align-items: center;
       justify-content: center; pointer-events: auto; touch-action: manipulation; }
     .comfy-progressive-preview-cell.is-empty { border: 1px dashed var(--border-color, #555);
-      animation: comfy-progressive-preview-pulse 1.6s ease-in-out infinite; }
+      opacity: 0.6; cursor: default; }
     .comfy-progressive-preview-cell img { width: 100%; height: 100%; object-fit: contain; }
+    .comfy-progressive-preview-text-thumb { width: 100%; height: 100%; box-sizing: border-box;
+      padding: 4px 4px 14px; overflow: hidden; font-size: 10px; line-height: 1.3; text-align: left;
+      white-space: pre-wrap; word-break: break-word; color: var(--input-text, #ddd); }
+    .comfy-progressive-preview-audio-thumb { font-size: 28px; opacity: 0.8;
+      color: var(--input-text, #ddd); }
     .comfy-progressive-preview-label { position: absolute; left: 4px; bottom: 2px;
       font-size: 10px; color: var(--input-text, #ddd); opacity: 0.7; }
     .comfy-progressive-preview-badge { position: absolute; right: 4px; top: 3px; font-size: 10px;
@@ -239,6 +343,10 @@ function installProgressivePreviewStyles() {
     .comfy-progressive-preview-stage { position: absolute; inset: 0; display: flex;
       align-items: center; justify-content: center; cursor: zoom-out; pointer-events: auto; }
     .comfy-progressive-preview-stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    .comfy-progressive-preview-stage audio { width: calc(100% - 96px); }
+    .comfy-progressive-preview-text { position: absolute; inset: 36px 44px 30px; overflow: auto;
+      font-size: 12px; line-height: 1.4; text-align: left; white-space: pre-wrap;
+      word-break: break-word; user-select: text; cursor: text; color: var(--input-text, #ddd); }
     .comfy-progressive-preview-waiting { font-size: 12px; opacity: 0.7;
       color: var(--input-text, #ddd); }
     .comfy-progressive-preview-nav, .comfy-progressive-preview-close {
@@ -262,7 +370,6 @@ function installProgressivePreviewStyles() {
     .comfy-progressive-preview-counter { position: absolute; bottom: 6px; left: 50%;
       transform: translateX(-50%); padding: 1px 8px; border-radius: 8px; font-size: 11px;
       background: rgba(0, 0, 0, 0.55); color: #fff; }
-    @keyframes comfy-progressive-preview-pulse { 50% { opacity: 0.45; } }
   `;
   document.head?.appendChild(style);
 }
@@ -301,7 +408,16 @@ function isolateProgressivePreviewPointerEvents(root) {
 }
 
 /**
- * Build the enlarged single-image viewer that overlays the slot grid.
+ * Return whether a click inside the viewer stage landed on content the user interacts with.
+ * @param {Event} event
+ * @returns {boolean}
+ */
+function isInteractiveViewerTarget(event) {
+  return Boolean(event?.target?.closest?.("audio, .comfy-progressive-preview-text"));
+}
+
+/**
+ * Build the enlarged single-entry viewer that overlays the slot grid.
  * @param {ProgressivePreviewPanel} panel
  * @returns {ProgressivePreviewViewer}
  */
@@ -311,9 +427,15 @@ function createProgressivePreviewViewer(panel) {
   root.style.display = "none";
   const stage = createPreviewElement("div", "comfy-progressive-preview-stage");
   const image = createPreviewElement("img", "");
+  const audio = createPreviewElement("audio", "");
+  audio.controls = true;
+  audio.preload = "metadata";
+  const text = createPreviewElement("div", "comfy-progressive-preview-text");
   const waiting = createPreviewElement("div", "comfy-progressive-preview-waiting");
-  stage.appendChild(image);
-  stage.appendChild(waiting);
+  for (const child of [image, audio, text, waiting]) {
+    child.style.display = "none";
+    stage.appendChild(child);
+  }
   const prev = createPreviewElement("button", "comfy-progressive-preview-nav is-prev", "‹");
   const next = createPreviewElement("button", "comfy-progressive-preview-nav is-next", "›");
   const close = createPreviewElement("button", "comfy-progressive-preview-close", "✕");
@@ -324,24 +446,25 @@ function createProgressivePreviewViewer(panel) {
     save: createPreviewElement("button", "comfy-progressive-preview-action", "⤓"),
     copy: createPreviewElement("button", "comfy-progressive-preview-action", "⧉"),
   };
-  actionButtons.open.title = "Open image in a new tab";
-  actionButtons.save.title = "Save image";
-  actionButtons.copy.title = "Copy image";
   for (const [name, button] of Object.entries(actionButtons)) {
     actions.appendChild(button);
     button.addEventListener("click", () => void runProgressivePreviewAction(panel, name, button));
   }
-  prev.title = "Previous image (←)";
-  next.title = "Next image (→)";
-  close.title = "Back to all images (Esc)";
+  prev.title = "Previous item (←)";
+  next.title = "Next item (→)";
+  close.title = "Back to all items (Esc)";
   for (const child of [stage, prev, next, close, actions, counter]) {
     root.appendChild(child);
   }
-  stage.addEventListener("click", () => closeProgressivePreviewViewer(panel));
+  stage.addEventListener("click", (event) => {
+    if (!isInteractiveViewerTarget(event)) {
+      closeProgressivePreviewViewer(panel);
+    }
+  });
   close.addEventListener("click", () => closeProgressivePreviewViewer(panel));
   prev.addEventListener("click", () => stepProgressivePreviewViewer(panel, -1));
   next.addEventListener("click", () => stepProgressivePreviewViewer(panel, 1));
-  return { root, stage, image, waiting, counter, actionButtons };
+  return { root, stage, image, audio, text, waiting, counter, actionButtons };
 }
 
 /**
@@ -406,6 +529,8 @@ function ensureProgressivePreviewPanel(node) {
     imageElements: new Map(),
     onScreen: typeof IntersectionObserver !== "function",
     stale: false,
+    cellAspect: 1,
+    gridLayoutKey: "",
   };
   panel.viewer = createProgressivePreviewViewer(panel);
   root.appendChild(panel.viewer.root);
@@ -426,7 +551,58 @@ function ensureProgressivePreviewPanel(node) {
   }
   progressivePreviewPanels.set(node, panel);
   trackProgressivePreviewVisibility(panel);
+  observeProgressivePreviewGridSize(panel);
   return panel;
+}
+
+/**
+ * Refit the slot grid whenever the node resizes its panel.
+ * @param {ProgressivePreviewPanel} panel
+ */
+function observeProgressivePreviewGridSize(panel) {
+  if (typeof ResizeObserver !== "function") {
+    return;
+  }
+  const observer = new ResizeObserver(() => applyProgressivePreviewGridLayout(panel));
+  observer.observe(panel.grid);
+}
+
+/**
+ * Size the slot grid's columns and rows so every slot fits the panel at the largest size.
+ * Without a measured size (panel hidden or not yet laid out) the grid falls back to equal columns.
+ * @param {ProgressivePreviewPanel} panel
+ */
+function applyProgressivePreviewGridLayout(panel) {
+  const { grid, state } = panel;
+  const width = Number(grid.clientWidth) || 0;
+  const height = Number(grid.clientHeight) || 0;
+  const layoutKey = `${state.slotCount}:${width}x${height}:${panel.cellAspect.toFixed(3)}`;
+  if (layoutKey === panel.gridLayoutKey) {
+    return;
+  }
+  panel.gridLayoutKey = layoutKey;
+  if (width <= 0 || height <= 0) {
+    grid.style.gridTemplateColumns = `repeat(${slotGridColumns(state.slotCount)}, minmax(0, 1fr))`;
+    grid.style.gridAutoRows = "";
+    return;
+  }
+  const layout = fitSlotGrid(state.slotCount, width, height, panel.cellAspect);
+  grid.style.gridTemplateColumns = `repeat(${layout.columns}, ${layout.cellWidth}px)`;
+  grid.style.gridAutoRows = `${layout.cellHeight}px`;
+}
+
+/**
+ * Adopt a loaded image's shape for the slot cells so images fill them without letterboxing.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {HTMLImageElement} image
+ */
+function adoptProgressivePreviewImageAspect(panel, image) {
+  const aspect = Number(image.naturalWidth) / Number(image.naturalHeight);
+  if (!Number.isFinite(aspect) || aspect <= 0 || Math.abs(aspect - panel.cellAspect) < 0.01) {
+    return;
+  }
+  panel.cellAspect = aspect;
+  applyProgressivePreviewGridLayout(panel);
 }
 
 /**
@@ -498,18 +674,19 @@ function repaintStaleProgressivePreview(panel) {
   panel.stale = false;
   for (const cell of panel.cells) {
     if (cell) {
-      delete cell.dataset.imageKey;
+      delete cell.dataset.entryKey;
     }
   }
   clearProgressivePreviewImageSource(panel.viewer.image);
+  clearProgressivePreviewImageSource(panel.viewer.audio);
   renderProgressivePreviewPanel(panel);
   panel.node.setDirtyCanvas?.(true, true);
   return true;
 }
 
 /**
- * Drop an image's source so the next render assigns it afresh and the browser repaints it.
- * @param {HTMLImageElement} image
+ * Drop a media element's source so the next render assigns it afresh and the browser repaints it.
+ * @param {HTMLImageElement|HTMLAudioElement} image
  */
 function clearProgressivePreviewImageSource(image) {
   if (typeof image.removeAttribute === "function") {
@@ -544,35 +721,99 @@ function progressivePreviewCell(panel, index) {
 }
 
 /**
- * Render one slot cell as an empty placeholder or its first image.
+ * Build the small grid thumbnail for one entry.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {PreviewEntry} entry
+ * @param {number} index
+ * @param {HTMLElement} cell
+ * @returns {HTMLElement}
+ */
+function createPreviewEntryThumbnail(panel, entry, index, cell) {
+  if (entry.kind === "text") {
+    return createPreviewElement("div", "comfy-progressive-preview-text-thumb", entry.text);
+  }
+  if (entry.kind === "audio") {
+    return createPreviewElement("div", "comfy-progressive-preview-audio-thumb", "♪");
+  }
+  const image = document.createElement("img");
+  image.decoding = "async";
+  image.addEventListener?.("error", () => {
+    delete cell.dataset.entryKey;
+  });
+  image.addEventListener?.("load", () => adoptProgressivePreviewImageAspect(panel, image));
+  image.src = progressivePreviewFileUrl(entry);
+  image.alt = `Remote preview item ${index + 1}`;
+  return image;
+}
+
+/**
+ * Render one slot cell as an empty placeholder or a thumbnail of its first entry.
+ * @param {ProgressivePreviewPanel} panel
  * @param {HTMLElement} cell
  * @param {number} index
- * @param {PreviewImage[]} images
+ * @param {PreviewEntry[]} entries
  */
-function renderProgressivePreviewCell(cell, index, images) {
-  const firstImage = images[0];
-  const imageKey = firstImage ? progressivePreviewImageUrl(firstImage) : "";
-  if (cell.dataset.imageKey === imageKey && cell.dataset.imageCount === String(images.length)) {
+function renderProgressivePreviewCell(panel, cell, index, entries) {
+  const firstEntry = entries[0];
+  const entryKey = firstEntry ? previewEntryKey(firstEntry) : "";
+  if (cell.dataset.entryKey === entryKey && cell.dataset.entryCount === String(entries.length)) {
     return;
   }
-  cell.dataset.imageKey = imageKey;
-  cell.dataset.imageCount = String(images.length);
+  cell.dataset.entryKey = entryKey;
+  cell.dataset.entryCount = String(entries.length);
   cell.replaceChildren?.();
-  cell.className = `comfy-progressive-preview-cell${firstImage ? "" : " is-empty"}`;
-  cell.title = firstImage ? `Item ${index + 1} · click to enlarge` : `Item ${index + 1} · waiting for remote result`;
-  if (firstImage) {
-    const image = document.createElement("img");
-    image.addEventListener?.("error", () => {
-      delete cell.dataset.imageKey;
-    });
-    image.src = imageKey;
-    image.alt = `Remote preview item ${index + 1}`;
-    cell.appendChild(image);
+  cell.className = `comfy-progressive-preview-cell ${firstEntry ? `is-${firstEntry.kind}` : "is-empty"}`;
+  cell.title = firstEntry
+    ? `Item ${index + 1} · ${previewEntryNoun(firstEntry)} · click to enlarge`
+    : `Item ${index + 1} · waiting for remote result`;
+  if (firstEntry) {
+    cell.appendChild(createPreviewEntryThumbnail(panel, firstEntry, index, cell));
   }
-  if (images.length > 1) {
-    cell.appendChild(createPreviewElement("span", "comfy-progressive-preview-badge", `×${images.length}`));
+  if (entries.length > 1) {
+    cell.appendChild(createPreviewElement("span", "comfy-progressive-preview-badge", `×${entries.length}`));
   }
   cell.appendChild(createPreviewElement("span", "comfy-progressive-preview-label", String(index + 1)));
+}
+
+/**
+ * Show one entry, or the waiting message, on the viewer stage.
+ * @param {ProgressivePreviewViewer} viewer
+ * @param {PreviewEntry|null} entry
+ * @param {number} index
+ */
+function showViewerEntry(viewer, entry, index) {
+  const kind = entry?.kind ?? null;
+  const url = entry && kind !== "text" ? progressivePreviewFileUrl(entry) : "";
+  if (kind === "image" && viewer.image.src !== url) {
+    viewer.image.src = url;
+  }
+  if (kind !== "audio") {
+    viewer.audio.pause?.();
+  } else if (viewer.audio.src !== url) {
+    viewer.audio.src = url;
+  }
+  viewer.text.textContent = kind === "text" ? entry.text : "";
+  viewer.image.alt = `Remote preview item ${index + 1}`;
+  viewer.image.style.display = kind === "image" ? "" : "none";
+  viewer.audio.style.display = kind === "audio" ? "" : "none";
+  viewer.text.style.display = kind === "text" ? "" : "none";
+  viewer.waiting.textContent = entry ? "" : `Waiting for item ${index + 1}…`;
+  viewer.waiting.style.display = entry ? "none" : "";
+}
+
+/**
+ * Enable and label the toolbar actions the shown entry supports.
+ * @param {ProgressivePreviewViewer} viewer
+ * @param {PreviewEntry|null} entry
+ */
+function syncViewerActions(viewer, entry) {
+  const allowed = entry ? PREVIEW_ACTIONS_BY_KIND[entry.kind] ?? [] : [];
+  const noun = previewEntryNoun(entry);
+  const titles = { open: `Open ${noun} in a new tab`, save: `Save ${noun}`, copy: `Copy ${noun}` };
+  for (const [name, button] of Object.entries(viewer.actionButtons)) {
+    button.disabled = !allowed.includes(name);
+    button.title = titles[name];
+  }
 }
 
 /**
@@ -585,21 +826,13 @@ function renderProgressivePreviewViewer(panel) {
   viewer.root.hidden = !open;
   viewer.root.style.display = open ? "" : "none";
   if (!open) {
+    viewer.audio.pause?.();
     return;
   }
-  const image = (state.slots.get(viewerIndex) ?? [])[0];
-  const url = image ? progressivePreviewImageUrl(image) : "";
-  if (viewer.image.src !== url) {
-    viewer.image.src = url;
-  }
-  viewer.image.alt = `Remote preview item ${viewerIndex + 1}`;
-  viewer.image.style.display = image ? "" : "none";
-  viewer.waiting.textContent = image ? "" : `Waiting for item ${viewerIndex + 1}…`;
-  viewer.waiting.style.display = image ? "none" : "";
+  const entry = progressivePreviewSlotEntry(panel, viewerIndex);
+  showViewerEntry(viewer, entry, viewerIndex);
   viewer.counter.textContent = `${viewerIndex + 1} / ${state.slotCount}`;
-  for (const button of Object.values(viewer.actionButtons)) {
-    button.disabled = !image;
-  }
+  syncViewerActions(viewer, entry);
 }
 
 /**
@@ -612,11 +845,11 @@ function renderProgressivePreviewPanel(panel) {
     panel.stale = true;
   }
   panel.header.textContent = progressivePreviewHeaderText(state);
-  panel.grid.style.gridTemplateColumns = `repeat(${slotGridColumns(state.slotCount)}, minmax(0, 1fr))`;
+  applyProgressivePreviewGridLayout(panel);
   const cells = [];
   for (let index = 0; index < state.slotCount; index += 1) {
     const cell = progressivePreviewCell(panel, index);
-    renderProgressivePreviewCell(cell, index, state.slots.get(index) ?? []);
+    renderProgressivePreviewCell(panel, cell, index, state.slots.get(index) ?? []);
     cells.push(cell);
   }
   panel.cells.length = state.slotCount;
@@ -704,13 +937,24 @@ function suppressNativeImagePreview(node) {
 }
 
 /**
- * Return the first image of one slot, if it has arrived.
+ * Return the first entry of one slot, if it has arrived.
  * @param {ProgressivePreviewPanel} panel
  * @param {number|null} index
- * @returns {PreviewImage|null}
+ * @returns {PreviewEntry|null}
+ */
+function progressivePreviewSlotEntry(panel, index) {
+  return index === null ? null : (panel.state.slots.get(index) ?? [])[0] ?? null;
+}
+
+/**
+ * Return the first entry of one slot when it is an image.
+ * @param {ProgressivePreviewPanel} panel
+ * @param {number|null} index
+ * @returns {PreviewEntry|null}
  */
 function progressivePreviewSlotImage(panel, index) {
-  return index === null ? null : (panel.state.slots.get(index) ?? [])[0] ?? null;
+  const entry = progressivePreviewSlotEntry(panel, index);
+  return entry?.kind === "image" ? entry : null;
 }
 
 /**
@@ -730,7 +974,7 @@ function progressivePreviewImageElement(panel, url) {
 }
 
 /**
- * Expose the slot images through node.imgs so ComfyUI's Open/Copy/Save Image menu works.
+ * Expose the image slots through node.imgs so ComfyUI's Open/Copy/Save Image menu works.
  * The selected image is the enlarged one, else the last hovered slot, else the first.
  * @param {ProgressivePreviewPanel} panel
  */
@@ -741,7 +985,7 @@ function syncProgressivePreviewMenuImages(panel) {
     const image = progressivePreviewSlotImage(panel, index);
     if (image) {
       slotIndices.push(index);
-      elements.push(progressivePreviewImageElement(panel, progressivePreviewImageUrl(image)));
+      elements.push(progressivePreviewImageElement(panel, progressivePreviewFileUrl(image)));
     }
   }
   const node = panel.node;
@@ -781,24 +1025,64 @@ async function fetchProgressivePreviewPng(url) {
 }
 
 /**
- * Open, save, or copy one preview image.
- * @param {PreviewImage} image
- * @param {"open"|"save"|"copy"} action
+ * Download a URL under a file name through a temporary link.
+ * @param {string} url
+ * @param {string} filename
+ */
+function downloadProgressivePreviewUrl(url, filename) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+/**
+ * Save or copy one text entry.
+ * @param {PreviewEntry} entry
+ * @param {"save"|"copy"} action
+ * @param {number} index
  * @returns {Promise<void>}
  */
-async function performProgressivePreviewImageAction(image, action) {
-  const url = progressivePreviewImageUrl(image);
+async function performProgressivePreviewTextAction(entry, action, index) {
+  if (action === "copy") {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("Text clipboard access is unavailable in this browser context.");
+    }
+    await navigator.clipboard.writeText(entry.text);
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([entry.text], { type: "text/plain;charset=utf-8" }));
+  try {
+    downloadProgressivePreviewUrl(url, `remote-preview-item-${index + 1}.txt`);
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
+/**
+ * Open, save, or copy one preview entry.
+ * @param {PreviewEntry} entry
+ * @param {"open"|"save"|"copy"} action
+ * @param {number} index
+ * @returns {Promise<void>}
+ */
+async function performProgressivePreviewEntryAction(entry, action, index) {
+  if (!(PREVIEW_ACTIONS_BY_KIND[entry.kind] ?? []).includes(action)) {
+    throw new Error(`Cannot ${action} a ${entry.kind} preview.`);
+  }
+  if (entry.kind === "text") {
+    await performProgressivePreviewTextAction(entry, action, index);
+    return;
+  }
+  const url = progressivePreviewFileUrl(entry);
   if (action === "open") {
     window.open(url, "_blank");
     return;
   }
   if (action === "save") {
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = String(image.filename ?? "image.png");
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+    downloadProgressivePreviewUrl(url, String(entry.filename ?? "preview"));
     return;
   }
   if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) {
@@ -809,24 +1093,24 @@ async function performProgressivePreviewImageAction(image, action) {
 }
 
 /**
- * Run one viewer toolbar action on the enlarged image and flash the result.
+ * Run one viewer toolbar action on the enlarged entry and flash the result.
  * @param {ProgressivePreviewPanel} panel
  * @param {"open"|"save"|"copy"} action
  * @param {HTMLElement} button
  * @returns {Promise<boolean>} Whether the action succeeded.
  */
 async function runProgressivePreviewAction(panel, action, button) {
-  const image = progressivePreviewSlotImage(panel, panel.viewerIndex);
-  if (!image) {
+  const entry = progressivePreviewSlotEntry(panel, panel.viewerIndex);
+  if (!entry) {
     return false;
   }
   const label = button.textContent;
   try {
-    await performProgressivePreviewImageAction(image, action);
+    await performProgressivePreviewEntryAction(entry, action, panel.viewerIndex);
     button.textContent = "✓";
     return true;
   } catch (error) {
-    console.error(`Remote progressive preview could not ${action} the image.`, error);
+    console.error(`Remote progressive preview could not ${action} the ${entry.kind}.`, error);
     button.textContent = "!";
     return false;
   } finally {
@@ -878,10 +1162,10 @@ function handleProgressivePreviewEvent(event) {
 }
 
 /**
- * Show ComfyUI's final images in the slot grid, which stays the node's only display.
+ * Show ComfyUI's final entries in the slot grid, which stays the node's only display.
  * @param {object} node
  * @param {Record<string, any>|undefined} output
- * @returns {boolean} Whether final images were shown.
+ * @returns {boolean} Whether final entries were shown.
  */
 function finishProgressivePreview(node, output) {
   const panel = ensureProgressivePreviewPanel(node);
@@ -890,7 +1174,7 @@ function finishProgressivePreview(node, output) {
   }
   suppressNativeImagePreview(node);
   panel.finishedPromptId = panel.state.promptId;
-  if (!applyFinalPreviewImages(panel.state, output?.images)) {
+  if (!applyFinalPreviewOutput(panel.state, output)) {
     return false;
   }
   renderProgressivePreviewPanel(panel);
@@ -908,7 +1192,7 @@ function restoreStoredProgressivePreview(node) {
     return;
   }
   const stored = app.nodeOutputs?.[String(node.id)] ?? app.nodeOutputs?.[node.id];
-  if (stored?.images?.length) {
+  if (hasStoredPreviewOutput(stored)) {
     finishProgressivePreview(node, stored);
   }
 }

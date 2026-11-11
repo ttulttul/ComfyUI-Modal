@@ -114,9 +114,20 @@ globalThis.ClipboardItem = class ClipboardItem {
   }
 };
 Object.defineProperty(globalThis, "navigator", {
-  value: { clipboard: { write: async (items) => clipboardWrites.push(items) } },
+  value: {
+    clipboard: {
+      write: async (items) => clipboardWrites.push(items),
+      writeText: async (text) => clipboardWrites.push(text),
+    },
+  },
   configurable: true,
 });
+const objectUrlBlobs = [];
+URL.createObjectURL = (blob) => {
+  objectUrlBlobs.push(blob);
+  return `blob:preview-${objectUrlBlobs.length}`;
+};
+URL.revokeObjectURL = () => {};
 globalThis.fetch = async (url) => ({ blob: async () => ({ type: "image/png", url }) });
 
 const listeners = new Map();
@@ -141,8 +152,10 @@ runInThisContext(
     "const api = globalThis.__progressiveApiStub;",
     originalSource.replace(/^import .*?;\n/gm, ""),
     "globalThis.__progressiveExports = {",
-    "  applyProgressivePreviewEvent, applyFinalPreviewImages, createSlotState, stepSlotIndex,",
-    "  slotGridColumns, filledSlotCount, progressivePreviewHeaderText, progressivePreviewImageUrl,",
+    "  applyProgressivePreviewEvent, applyFinalPreviewOutput, createSlotState, stepSlotIndex,",
+    "  slotGridColumns, filledSlotCount, progressivePreviewHeaderText, progressivePreviewFileUrl,",
+    "  normalizePreviewEntry, fitSlotGrid, applyProgressivePreviewGridLayout,",
+    "  adoptProgressivePreviewImageAspect,",
     "  resolveProgressivePreviewNode, handleProgressivePreviewEvent, finishProgressivePreview,",
     "  restoreStoredProgressivePreview, progressivePreviewPanels, runProgressivePreviewAction,",
     "};",
@@ -169,11 +182,31 @@ assert.equal(state.slotCount, 1);
 assert.equal(preview.progressivePreviewHeaderText(state), "Remote preview · all 1 received");
 assert.equal(preview.applyProgressivePreviewEvent(state, { phase: "bogus", prompt_id: "p2" }), false);
 
-// Final images replace the slots one image per slot; empty finals are ignored.
-assert.equal(preview.applyFinalPreviewImages(state, []), false);
-assert.equal(preview.applyFinalPreviewImages(state, [{ filename: "x.png" }, { filename: "y.png" }]), true);
+// Final entries replace the slots one entry per slot; empty finals are ignored.
+assert.equal(preview.applyFinalPreviewOutput(state, { images: [] }), false);
+assert.equal(preview.applyFinalPreviewOutput(state, { images: [{ filename: "x.png" }, { filename: "y.png" }] }), true);
 assert.equal(state.slotCount, 2);
 assert.equal(state.slots.get(1)[0].filename, "y.png");
+assert.equal(state.slots.get(1)[0].kind, "image");
+assert.equal(
+  preview.applyFinalPreviewOutput(state, {
+    modal_preview: [{ kind: "text", text: "hi" }, { kind: "audio", filename: "a.flac" }, { kind: "bogus" }],
+    images: [],
+  }),
+  true,
+);
+assert.equal(state.slotCount, 2);
+assert.deepEqual(state.slots.get(0)[0], { kind: "text", text: "hi" });
+assert.equal(state.slots.get(1)[0].kind, "audio");
+
+// Entries normalize by kind; untyped file entries are images from earlier versions.
+assert.deepEqual(preview.normalizePreviewEntry({ filename: "a.png" }), {
+  kind: "image", filename: "a.png", subfolder: "", type: "temp",
+});
+assert.deepEqual(preview.normalizePreviewEntry({ kind: "text", text: 3 }), { kind: "text", text: "3" });
+assert.equal(preview.normalizePreviewEntry({ kind: "audio" }), null);
+assert.equal(preview.normalizePreviewEntry(null), null);
+assert.equal(preview.progressivePreviewHeaderText(preview.createSlotState()), "Waiting for remote results…");
 
 // Navigation wraps in both directions.
 assert.equal(preview.stepSlotIndex({ slotCount: 3 }, 2, 1), 0);
@@ -184,9 +217,19 @@ assert.equal(preview.slotGridColumns(0), 1);
 assert.equal(preview.slotGridColumns(4), 2);
 assert.equal(preview.slotGridColumns(5), 3);
 assert.equal(
-  preview.progressivePreviewImageUrl({ filename: "a b.png", subfolder: "", type: "temp" }),
+  preview.progressivePreviewFileUrl({ filename: "a b.png", subfolder: "", type: "temp" }),
   "/api/view?filename=a+b.png&subfolder=&type=temp",
 );
+
+// The grid picks the column count that makes slots largest while all of them fit.
+assert.deepEqual(preview.fitSlotGrid(12, 400, 300), { columns: 4, cellWidth: 97, cellHeight: 97 });
+assert.deepEqual(preview.fitSlotGrid(12, 900, 120), { columns: 12, cellWidth: 71, cellHeight: 71 });
+assert.deepEqual(preview.fitSlotGrid(12, 120, 900), { columns: 1, cellWidth: 71, cellHeight: 71 });
+// Portrait items get portrait cells.
+assert.deepEqual(preview.fitSlotGrid(4, 400, 400, 0.75), { columns: 2, cellWidth: 148, cellHeight: 197 });
+// Too many slots for the space keeps a minimum cell size and lets the grid scroll.
+assert.equal(preview.fitSlotGrid(400, 100, 100).cellWidth, 32);
+assert.equal(preview.fitSlotGrid(0, 100, 100).columns, 1);
 
 // Subgraph node ids resolve through each subgraph node.
 const innerNode = { id: 18, comfyClass: "RemoteProgressivePreview" };
@@ -387,6 +430,100 @@ setOnScreen(offscreenPanel.root, false);
 handler({ detail: { phase: "slot", prompt_id: "p6", node: "9", slot_index: 0, slot_count: 1, images: [{ filename: "h2.png" }] } });
 setOnScreen(offscreenPanel.root, true);
 assert.equal(offscreenPanel.viewer.image.src, viewUrl("h2.png"));
+
+// Text and audio slots render by kind, and the viewer and toolbar adapt to each.
+const mixedNode = makeNode(10);
+graphNodes.set("10", mixedNode);
+handler({ detail: { phase: "start", prompt_id: "p7", node: "10", slot_count: 3 } });
+handler({ detail: { phase: "slot", prompt_id: "p7", node: "10", slot_index: 0, slot_count: 3,
+  items: [{ kind: "text", text: "a red fox" }] } });
+handler({ detail: { phase: "slot", prompt_id: "p7", node: "10", slot_index: 1, slot_count: 3,
+  items: [{ kind: "audio", filename: "clip.flac", type: "temp" }] } });
+handler({ detail: { phase: "slot", prompt_id: "p7", node: "10", slot_index: 2, slot_count: 3,
+  items: [{ kind: "image", filename: "m.png", type: "temp" }] } });
+const mixedPanel = preview.progressivePreviewPanels.get(mixedNode);
+const [textCell, audioCell, imageCell] = mixedPanel.grid.children;
+assert.equal(textCell.className.includes("is-text"), true);
+assert.equal(textCell.children[0].textContent, "a red fox");
+assert.equal(audioCell.className.includes("is-audio"), true);
+assert.equal(audioCell.children[0].textContent, "♪");
+assert.equal(imageCell.children[0].src, viewUrl("m.png"));
+assert.equal(mixedPanel.header.textContent, "Remote preview · all 3 received");
+// ComfyUI's image menu sees only the image slot.
+assert.equal(mixedNode.imgs.length, 1);
+assert.equal(mixedNode.imgs[0].src, viewUrl("m.png"));
+const mixedViewer = mixedPanel.viewer;
+textCell.dispatch("click");
+assert.equal(mixedViewer.text.textContent, "a red fox");
+assert.equal(mixedViewer.text.style.display, "");
+assert.equal(mixedViewer.image.style.display, "none");
+assert.equal(mixedViewer.audio.style.display, "none");
+assert.deepEqual(
+  Object.fromEntries(Object.entries(mixedViewer.actionButtons).map(([name, button]) => [name, button.disabled])),
+  { open: true, save: false, copy: false },
+);
+assert.equal(mixedViewer.actionButtons.copy.title, "Copy text");
+assert.equal(await preview.runProgressivePreviewAction(mixedPanel, "copy", mixedViewer.actionButtons.copy), true);
+assert.equal(clipboardWrites.at(-1), "a red fox");
+assert.equal(await preview.runProgressivePreviewAction(mixedPanel, "save", mixedViewer.actionButtons.save), true);
+const textDownload = createdElements.filter((element) => element.tagName === "a").at(-1);
+assert.equal(textDownload.download, "remote-preview-item-1.txt");
+assert.equal(textDownload.href.startsWith("blob:"), true);
+assert.equal(await objectUrlBlobs.at(-1).text(), "a red fox");
+assert.equal(await preview.runProgressivePreviewAction(mixedPanel, "open", mixedViewer.actionButtons.open), false);
+// Clicking the text keeps the viewer open so it can be selected; clicking elsewhere closes it.
+mixedViewer.stage.dispatch("click", { target: { closest: () => mixedViewer.text } });
+assert.equal(mixedPanel.viewerIndex, 0);
+mixedPanel.root.dispatch("keydown", { key: "ArrowRight" });
+assert.equal(mixedViewer.audio.src, viewUrl("clip.flac"));
+assert.equal(mixedViewer.audio.style.display, "");
+assert.equal(mixedViewer.text.style.display, "none");
+assert.equal(mixedViewer.actionButtons.copy.disabled, true);
+assert.equal(mixedViewer.actionButtons.open.title, "Open audio in a new tab");
+assert.equal(await preview.runProgressivePreviewAction(mixedPanel, "open", mixedViewer.actionButtons.open), true);
+assert.equal(openedUrls.at(-1), viewUrl("clip.flac"));
+let audioPaused = false;
+mixedViewer.audio.pause = () => {
+  audioPaused = true;
+};
+mixedPanel.root.dispatch("keydown", { key: "ArrowRight" });
+assert.equal(audioPaused, true);
+assert.equal(mixedViewer.image.src, viewUrl("m.png"));
+assert.equal(mixedViewer.actionButtons.copy.disabled, false);
+mixedViewer.stage.dispatch("click");
+assert.equal(mixedPanel.viewerIndex, null);
+// Final outputs keep each kind, and a reload restores them from the stored output.
+nodeType.prototype.onExecuted.call(mixedNode, {
+  modal_preview: [{ kind: "text", text: "done" }, { kind: "image", filename: "f.png", type: "temp" }],
+  images: [{ filename: "f.png", type: "temp" }],
+});
+assert.equal(mixedPanel.grid.children.length, 2);
+assert.equal(mixedPanel.grid.children[0].children[0].textContent, "done");
+const restoredTextNode = makeNode(11);
+graphNodes.set("11", restoredTextNode);
+globalThis.__progressiveAppStub.nodeOutputs["11"] = { modal_preview: [{ kind: "text", text: "saved" }] };
+await extensions[0].nodeCreated(restoredTextNode);
+preview.restoreStoredProgressivePreview(restoredTextNode);
+const restoredTextPanel = preview.progressivePreviewPanels.get(restoredTextNode);
+assert.equal(restoredTextPanel.visible, true);
+assert.equal(restoredTextPanel.grid.children[0].children[0].textContent, "saved");
+
+// Resizing the node refits the grid to the panel; the first loaded image sets the cell shape.
+const fitPanel = preview.progressivePreviewPanels.get(mixedNode);
+fitPanel.grid.clientWidth = 400;
+fitPanel.grid.clientHeight = 300;
+handler({ detail: { phase: "start", prompt_id: "p8", node: "10", slot_count: 12 } });
+assert.equal(fitPanel.grid.style.gridTemplateColumns, "repeat(4, 97px)");
+assert.equal(fitPanel.grid.style.gridAutoRows, "97px");
+preview.adoptProgressivePreviewImageAspect(fitPanel, { naturalWidth: 768, naturalHeight: 1024 });
+assert.equal(fitPanel.grid.style.gridTemplateColumns, "repeat(4, 73px)");
+assert.equal(fitPanel.grid.style.gridAutoRows, "97px");
+fitPanel.grid.clientWidth = 0;
+preview.applyProgressivePreviewGridLayout(fitPanel);
+assert.equal(fitPanel.grid.style.gridTemplateColumns, "repeat(4, minmax(0, 1fr))");
+// Waiting slots are drawn without a running animation, which would repaint the whole Nodes 2.0 graph every frame.
+const panelStyles = document.head.children.map((child) => child.textContent).join("\n");
+assert.equal(/animation|@keyframes/.test(panelStyles), false);
 
 // Removing the node stops observing its panel.
 offscreenNode.onRemoved();

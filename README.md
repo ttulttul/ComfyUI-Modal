@@ -374,12 +374,22 @@ Mapped progress is summarized on the global status pill and a representative nod
 
 ### Remote Progressive Preview
 
-`Remote Progressive Preview` (category `Modal`) is a drop-in replacement for `PreviewImage` on the output of remote work. Connect it directly to a remote `IMAGE` output and keep it local.
+`Remote Progressive Preview` (category `Modal`) is a drop-in replacement for `PreviewImage` on the output of remote work. Connect it directly to a remote output and keep it local. It accepts `IMAGE`, `MASK`, `AUDIO` and `STRING` outputs and previews each item by what it contains:
+
+| Item | Slot shows | Enlarged view | Toolbar |
+| --- | --- | --- | --- |
+| Image | thumbnail | full image | open, save, copy |
+| Mask | grayscale thumbnail, like `MaskPreview` | full mask | open, save, copy |
+| Audio | ♪ | audio player | open, save |
+| Text, numbers | start of the text | scrollable, selectable text | save as `.txt`, copy |
+
+A 3-D tensor whose type is unknown (a local value) is treated as a single image frame when its last dimension is 3 or 4, and as a mask batch otherwise. Streamed remote values carry their type, so a mask is never mistaken for an image there.
 
 - When a mapped component starts, the node shows one empty slot per item.
-- As each remote item finishes, its images are streamed straight to the host and fill that item's slot. Slots fill in completion order, not item order. This does not wait for ComfyUI's scheduler, which only hands a node its input after every item has finished.
-- When ComfyUI finally runs the node, it reuses the images it already received instead of downloading them again. The final images fill the same grid, which remains the node's only display; ComfyUI's own image preview is not drawn below it. The images still appear in the queue and history.
-- Click any slot to enlarge it to fill the node. Use the ‹ › buttons or the ← → keys to move between items; navigation wraps around. Press Esc, click the image, or use ✕ to return to the grid. An enlarged slot that is still waiting shows its image as soon as it arrives.
+- As each remote item finishes, its result is streamed straight to the host and fills that item's slot. Slots fill in completion order, not item order. This does not wait for ComfyUI's scheduler, which only hands a node its input after every item has finished.
+- When ComfyUI finally runs the node, it reuses the results it already received instead of downloading them again. The final results fill the same grid, which remains the node's only display; ComfyUI's own image preview is not drawn below it. Images still appear in the queue and history.
+- Click any slot to enlarge it to fill the node. Use the ‹ › buttons or the ← → keys to move between items; navigation wraps around. Press Esc, click outside the text or player, or use ✕ to return to the grid. An enlarged slot that is still waiting shows its result as soon as it arrives.
+- The grid fits the node: resize the node and the slots grow or shrink so every item stays visible, in as many columns as make them largest. Cells take the shape of the first image, so portrait results get portrait cells. When there are too many items for the space, cells stop shrinking at 32 px and the grid scrolls.
 - Slots that arrive while the node is scrolled off-screen, or while the browser tab is in the background, are repainted when the node comes back into view.
 - Copy and save work as on `PreviewImage`. The node's right-click menu offers **Open Image**, **Copy Image** and **Save Image** for the enlarged image, or for the last slot under the pointer in the grid. The enlarged view also has ↗ open, ⤓ save and ⧉ copy buttons. Copying uses the browser clipboard, which needs a secure context (`localhost` or HTTPS).
 
