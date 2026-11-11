@@ -2023,3 +2023,44 @@ def test_format_prompt_executor_error_payload_includes_node_context(
     assert "node_id='12'" in message
     assert "node_type='KSampler'" in message
     assert "current_inputs=" in message
+
+
+def test_collect_boundary_outputs_tags_multi_item_session_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session output whose slot holds several items should carry its item count."""
+    owner = _cloud_prompt_execution_owner()
+    slots = {"136": [["latent-0", "latent-1", "latent-2"]], "147:5": [["cond"]]}
+    monkeypatch.setattr(
+        owner,
+        "_prompt_executor_cache_get_sync",
+        lambda _cache, node_id: types.SimpleNamespace(outputs=slots[node_id]),
+    )
+    stored_item_counts: dict[str, int | None] = {}
+
+    def fake_store(**kwargs: Any) -> dict[str, Any]:
+        """Record the item count passed for each stored session output."""
+        node_id = str(kwargs["boundary_output"]["node_id"])
+        stored_item_counts[node_id] = kwargs["item_count"]
+        return {"ref": node_id, "value": kwargs["output_value"]}
+
+    monkeypatch.setattr(owner, "_store_session_boundary_output", fake_store)
+    prepared = types.SimpleNamespace(
+        component_id="141",
+        payload={
+            "boundary_outputs": [
+                {"node_id": "136", "output_index": 0, "session_output": True},
+                {"node_id": "147:5", "output_index": 0, "session_output": True},
+            ]
+        },
+    )
+
+    outputs = owner._collect_subgraph_boundary_outputs(
+        prepared=prepared,
+        executor=types.SimpleNamespace(caches=types.SimpleNamespace(outputs=None)),
+        hydrated_inputs={},
+    )
+
+    assert stored_item_counts == {"136": 3, "147:5": None}
+    assert outputs[0]["value"] == ["latent-0", "latent-1", "latent-2"]
+    assert outputs[1]["value"] == "cond"

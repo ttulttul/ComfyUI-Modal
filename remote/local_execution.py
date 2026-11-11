@@ -28,6 +28,7 @@ from ..session_state import (
     RemoteSessionHandle,
     RemoteSessionStateError,
     RemoteSessionValueRef,
+    slot_item_count,
 )
 from ..settings import get_settings
 from . import host_session_bridge as _host_session_bridge
@@ -1224,9 +1225,11 @@ def _execute_subgraph_prompt(
                 raise RemoteSubgraphExecutionError(
                     f"Remote subgraph output index {output_index} is missing for node {node_id}."
                 )
+            slot_values = cache_entry.outputs[output_index]
+            is_list = bool(boundary_output.get("is_list", False))
             output_value = _collapse_cache_slot(
-                slot_values=cache_entry.outputs[output_index],
-                is_list=bool(boundary_output.get("is_list", False)),
+                slot_values=slot_values,
+                is_list=is_list,
             )
             if bool(boundary_output.get("session_output")):
                 if session_handle is None:
@@ -1257,6 +1260,7 @@ def _execute_subgraph_prompt(
                     node_id=node_id,
                     output_index=output_index,
                     session_id=live_ref.session_id,
+                    item_count=slot_item_count(slot_values, is_list),
                 ).to_payload()
             outputs.append(output_value)
             logger.info(

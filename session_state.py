@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Mapping
@@ -109,22 +110,35 @@ class RemoteSessionValueRef:
 
 @dataclass(frozen=True)
 class RemoteSessionBridgeRef:
-    """Durable reference to one replayable remote-only value."""
+    """Durable reference to one replayable remote-only value.
+
+    ``item_count`` is set when the producer's ComfyUI output slot held several
+    items (for example downstream of ``CreateList``); the bridged value is then
+    the ordered list of those items. ``item_index`` selects one of them, so a
+    host fan-out can hand each mapped lane a single item.
+    """
 
     bridge_key: str
     node_id: str
     output_index: int
     session_id: str | None = None
+    item_count: int | None = None
+    item_index: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize this durable bridge ref into a JSON-safe payload mapping."""
-        return {
+        payload: dict[str, Any] = {
             _REMOTE_SESSION_BRIDGE_REF_MARKER: True,
             "bridge_key": self.bridge_key,
             "node_id": self.node_id,
             "output_index": self.output_index,
             "session_id": self.session_id,
         }
+        if self.item_count is not None:
+            payload["item_count"] = self.item_count
+        if self.item_index is not None:
+            payload["item_index"] = self.item_index
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "RemoteSessionBridgeRef":
@@ -139,12 +153,79 @@ class RemoteSessionBridgeRef:
         if output_index is None:
             raise RemoteSessionStateError("Remote session bridge refs must define output_index.")
         session_id = payload.get("session_id")
+        item_count = payload.get("item_count")
+        item_index = payload.get("item_index")
         return cls(
             bridge_key=bridge_key,
             node_id=node_id,
             output_index=int(output_index),
             session_id=(str(session_id) if session_id is not None and str(session_id).strip() else None),
+            item_count=int(item_count) if item_count is not None else None,
+            item_index=int(item_index) if item_index is not None else None,
         )
+
+    def is_multi_item(self) -> bool:
+        """Return whether this ref covers several slot items and selects none of them."""
+        return (
+            self.item_index is None
+            and self.item_count is not None
+            and self.item_count > 1
+        )
+
+    def split_items(self) -> list["RemoteSessionBridgeRef"]:
+        """Return one ref per slot item, each selecting its own item index."""
+        if not self.is_multi_item():
+            return [self]
+        return [
+            dataclasses.replace(self, item_index=item_index)
+            for item_index in range(int(self.item_count or 0))
+        ]
+
+    def select_item(self, value: Any) -> Any:
+        """Return the selected slot item from one resolved multi-item bridge value."""
+        if self.item_index is None:
+            return value
+        if not isinstance(value, list | tuple):
+            raise RemoteSessionStateError(
+                f"Remote session bridge {self.bridge_key!r} selects item {self.item_index} "
+                f"but resolved to {type(value).__name__}, not a list of slot items."
+            )
+        if not 0 <= self.item_index < len(value):
+            raise RemoteSessionStateError(
+                f"Remote session bridge {self.bridge_key!r} selects item {self.item_index} "
+                f"but only {len(value)} items were resolved."
+            )
+        return value[self.item_index]
+
+
+def slot_item_count(slot_values: Any, is_list: bool) -> int | None:
+    """Return the item count of one ComfyUI output slot that holds several items.
+
+    Returns ``None`` for declared list outputs and single-item slots, whose
+    collapsed value is the node's value itself.
+    """
+    if is_list or not isinstance(slot_values, list) or len(slot_values) <= 1:
+        return None
+    return len(slot_values)
+
+
+def split_multi_item_bridge_ref(value: Any) -> list[Any] | None:
+    """Expand one multi-item bridge ref (optionally singleton-wrapped) into per-item refs.
+
+    Returns ``None`` when ``value`` is not a multi-item bridge ref.
+    """
+    candidate = value
+    if isinstance(candidate, list) and len(candidate) == 1:
+        candidate = candidate[0]
+    if (
+        not is_remote_session_bridge_ref_payload(candidate)
+        or candidate.get("item_count") is None
+    ):
+        return None
+    ref = RemoteSessionBridgeRef.from_payload(candidate)
+    if not ref.is_multi_item():
+        return None
+    return [item_ref.to_payload() for item_ref in ref.split_items()]
 
 
 @dataclass(frozen=True)
@@ -310,12 +391,15 @@ def _canonicalize_bridge_key_value(value: Any) -> Any:
             "output_index": value.get("output_index"),
         }
     if is_remote_session_bridge_ref_payload(value):
-        return {
+        canonical_ref = {
             _REMOTE_SESSION_BRIDGE_REF_MARKER: True,
             "bridge_key": value.get("bridge_key"),
             "node_id": value.get("node_id"),
             "output_index": value.get("output_index"),
         }
+        if value.get("item_index") is not None:
+            canonical_ref["item_index"] = value.get("item_index")
+        return canonical_ref
     return {
         str(key): _canonicalize_bridge_key_value(item)
         for key, item in value.items()
@@ -614,13 +698,32 @@ class InMemoryRemoteSessionStore:
 
         ref = RemoteSessionBridgeRef.from_payload(value)
         logger.info(
-            "Resolving remote session bridge ref bridge_key=%s node_id=%s output_index=%d target_session_id=%s source_session_id=%s.",
+            "Resolving remote session bridge ref bridge_key=%s node_id=%s output_index=%d item_index=%s target_session_id=%s source_session_id=%s.",
             ref.bridge_key,
             ref.node_id,
             ref.output_index,
+            ref.item_index,
             target_session_handle.session_id if target_session_handle is not None else None,
             ref.session_id,
         )
+        return ref.select_item(
+            self._resolve_bridge_ref_value(
+                ref,
+                target_session_handle=target_session_handle,
+                bridge_resolver=bridge_resolver,
+                resolution_callback=resolution_callback,
+            )
+        )
+
+    def _resolve_bridge_ref_value(
+        self,
+        ref: RemoteSessionBridgeRef,
+        *,
+        target_session_handle: RemoteSessionHandle | None,
+        bridge_resolver: Callable[[RemoteSessionBridgeRef], Any] | None,
+        resolution_callback: Callable[[str, Mapping[str, Any]], None] | None,
+    ) -> Any:
+        """Return the whole bridged value from live session caches or the bridge resolver."""
         if target_session_handle is not None:
             found, live_value = self.try_get_bridge_output(target_session_handle, ref.bridge_key)
             if found:

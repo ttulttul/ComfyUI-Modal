@@ -22,6 +22,7 @@ from ..session_state import (
     is_remote_session_bridge_ref_payload,
     is_remote_session_handle_payload,
     is_remote_session_value_ref_payload,
+    split_multi_item_bridge_ref,
 )
 from .host_session_bridge import _payload_remote_session_handle
 from .local_execution import (
@@ -789,6 +790,14 @@ def _split_batch_boundary_inputs(
         input_value = unwrap_singleton_session_ref_list(
             hydrated_inputs[proxy_input_name]
         )
+        per_item_refs = split_multi_item_bridge_ref(input_value)
+        if per_item_refs is not None:
+            logger.info(
+                "Expanding multi-item bridge ref for boundary input %s into %d per-item refs.",
+                proxy_input_name,
+                len(per_item_refs),
+            )
+            input_value = per_item_refs
         io_type = _implicit_batch_boundary_effective_io_type(
             payload=payload,
             boundary_input=boundary_input,
