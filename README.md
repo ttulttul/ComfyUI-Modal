@@ -40,6 +40,9 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
   - [Canvas State](#canvas-state)
   - [Remote Execution Configurator Panel](#remote-execution-configurator-panel)
   - [Batched And Mapped Workflows](#batched-and-mapped-workflows)
+    - [How Modal Map Input works](#how-modal-map-input-works)
+    - [Zipping several inputs with a Modal Input Channel](#zipping-several-inputs-with-a-modal-input-channel)
+    - [Running every combination](#running-every-combination)
     - [Example: Seed And Prompt Variations With Progressive Preview](#example-seed-and-prompt-variations-with-progressive-preview)
   - [Remote Progressive Preview](#remote-progressive-preview)
 - [LLM Nodes](#llm-nodes)
@@ -349,13 +352,49 @@ Legacy workflows without a configurator use the global status pill instead.
 
 ### Batched And Mapped Workflows
 
-`Modal Map Input` is a pass-through adapter node that fans one boundary input out across remote workers. Place it before a remote-marked region; at queue time each item of the mapped input becomes its own remote invocation.
+A remote component normally runs once: every input crosses to the worker whole, the nodes run, and the outputs come back. `Modal Map Input` changes that for the input it sits on. It tells the planner to treat that input as a list of items and to run the remote work once per item, on as many workers as the configuration allows. A `Modal Input Channel` ties several `Modal Map Input` nodes together so that their lists are consumed in step.
 
-Mapped execution supports scalar primitives (as one-item maps), Python lists, `IMAGE` batches, `LATENT` batches, and other batched tensors split on dimension 0. One `Modal Map Input` boundary is supported per remote component; non-mapped boundary inputs are broadcast unchanged to every item, and mapped outputs are reassembled in item order — concatenated where shapes allow, otherwise returned as an ordered list so downstream nodes execute once per item. Mapped components can mix one-time work (a shared model loader) with per-item work (a fanned-out sampler); the shared work runs once.
+The workflow below uses both. It sends 4 seeds and 3 prompts into a two-stage `KSampler` cascade as 12 separate items and shows each item in a `Remote Progressive Preview` as it finishes. The [walk-through](#example-seed-and-prompt-variations-with-progressive-preview) further down explains every node in it.
 
-#### Zipping several mapped inputs with a Modal Input Channel
+![Twelve mapped seed and prompt variations filling two Remote Progressive Preview nodes](docs/images/modal-map-progressive-preview.png)
 
-To pair several lists item by item (for example prompt *i* with seed *i*), give each list its own `Modal Map Input` and connect every marker's optional `channel` input to one `Modal Input Channel` node:
+*The preview images in this screenshot are placeholders, not model output. Stage 1 has received all 12 items; stage 2 has received 7 of 12, in completion order.*
+
+#### How Modal Map Input works
+
+`Modal Map Input` (category `Modal`) has one `value` input, one `value` output and an optional `channel` input. At run time it passes its value through unchanged. Its effect is at queue time: it marks the link it sits on as the place where the work fans out. In this section it is called a *marker*.
+
+**Where to put it.** Wire the marker into the link that carries the values you want to vary, between the node that produces them and the remote node that consumes them. In the screenshot, the seed list reaches the samplers through one marker and the prompt list reaches the text encoder through another. The marker itself can stay local.
+
+**What counts as an item.** The planner splits the marked value like this:
+
+| Marked value | Items |
+| --- | --- |
+| A list, such as the output of `Create List` | one per list entry |
+| An `IMAGE` batch, or any other batched tensor | one per entry along dimension 0 |
+| A `LATENT` batch | one per latent in the batch |
+| A single number, string or boolean | one item |
+
+**What happens at queue time.** The planner finds the remote component that the marker feeds and turns it into mapped work:
+
+1. The marked value is split into items.
+2. Each item becomes its own remote call. The call runs the whole remote chain downstream of the marker, from the first node that uses the item to the last remote save.
+3. Every other input of the component is sent whole to every call. In the screenshot, all 12 items share the same negative prompt and the same sampler settings.
+4. Remote work that does not depend on the marked value runs once and is shared. The model, CLIP and VAE loaders in the screenshot load once, not 12 times.
+5. Workers take the next item as soon as they are free. A container that is slow to start delays only the items it runs, never the others.
+6. The outputs are put back together in item order, whatever order the items finished in. Image and latent results are concatenated into one batch when their shapes match. Otherwise they come back as an ordered list, and downstream nodes run once per item.
+
+**How many items run at once.** The `instance_count` of the assigned [configuration](#instance-count) caps the containers, and `COMFY_MODAL_MAX_INFLIGHT_CALLS` (default `4`) caps the calls dispatched at once. The remaining items wait their turn.
+
+**One marker per component, unless they share a channel.** A remote component accepts a single marker on its own. Two markers that feed the same component and are not on a channel are rejected at queue time, because the planner cannot tell how their items should be paired. A channel answers that question.
+
+**Other back-ends.** Markers work on SSH and Vast.ai targets as well as Modal. See [Self-Hosted SSH Hosts](#self-hosted-ssh-hosts).
+
+#### Zipping several inputs with a Modal Input Channel
+
+One marker varies one input. Often two inputs must vary together: prompt 1 with seed 1, prompt 2 with seed 2, and so on. A `Modal Input Channel` declares that pairing.
+
+`Modal Input Channel` (category `Modal`) has no data inputs. It has an optional `name` widget and one `channel` output. Connect that output to the `channel` input of every marker that belongs together:
 
 ```
 Modal Input Channel (name: portraits) ──┬─────────────┐
@@ -364,32 +403,64 @@ seed list   ──► Modal Map Input ──► KSampler.seed
 prompt list ──► Modal Map Input ──► CLIPTextEncode.text
 ```
 
-Markers on one channel map the same remote component together: mapped item *i* receives item *i* of every marker's list, and a single-item input is shared by every item. The lists must otherwise have the same length; the [example below](#example-seed-and-prompt-variations-with-progressive-preview) shows how to repeat two lists of different lengths so that every combination runs. When they don't, the error names each marker and its item count. The channel's optional `name` is shared by all of its markers and labels them in logs and errors, for example `Modal Map Input 12 on "portraits" (channel 7)`. Without a channel, a component accepts only one `Modal Map Input`; two unchanneled markers feeding one component are rejected at queue time. The channel only steers planning: it is removed before the prompt runs and never crosses the remote boundary.
+The markers on one channel then act as a single mapped input with several fields. They map the same remote component together, and item *i* receives entry *i* of every marker's list. This is a zip, the same pairing as rows in a table:
 
-Each mapped item runs the whole remote chain downstream of its `Modal Map Input` in one call, from the first mapped node to the last remote save. Workers pull the next item as soon as they are free, so a container that is slow to start delays only the items it runs, never the others. Local nodes that read intermediate results of the chain, such as `PreviewImage`, `MaskPreview` or image comparisons, run once the mapped work finishes; use `Remote Progressive Preview` to watch items while they finish. A chain still splits where a local node feeds its output back into later remote nodes, because that local node needs every item before the chain can continue.
+| Item | Seed marker | Prompt marker |
+| --- | --- | --- |
+| 1 | seed 1 | prompt 1 |
+| 2 | seed 2 | prompt 2 |
+| 3 | seed 3 | prompt 3 |
 
-Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary, and semantic batches destined for aggregate consumers (for example the frame sequence feeding `CreateVideo`) stay intact instead of being split per item.
+The rules:
 
-ComfyUI-native lists made inside a remote component (for example several `UNETLoader` models joined by `CreateList` into one sampler chain) keep working when the component is split into ordered phases. Each phase-bridge output that holds several list items records its item count, and the next phase fans out once per item, as if a `Modal Map Input` were in place.
+- **Equal lengths.** Every list on a channel must have the same number of items. Three seeds and three prompts give three items, not nine.
+- **A single item is shared.** A marker whose value has exactly one item gives that item to every row. One prompt and eight seeds give eight items that all use the prompt.
+- **Mismatches are reported, not guessed.** If two lists have different lengths, and neither has one item, the run stops with an error that names each marker and its item count.
+- **The name is a label.** The channel's `name` is shared by its markers and appears in logs and errors, for example `Modal Map Input 12 on "portraits" (channel 7)`. It has no other effect, and it can be left empty.
+- **One channel per component.** All markers that feed one remote component must be on the same channel.
+- **The channel carries no data.** It only steers planning. It is removed before the prompt runs and never crosses the remote boundary, so it costs nothing at run time.
 
-Mapped progress is summarized on the global status pill and a representative node with counts such as `3/16`. Fan-out is clamped to `COMFY_MODAL_MAX_INFLIGHT_CALLS`.
+#### Running every combination
+
+A channel zips; it does not multiply. To run every combination of two lists, make both lists as long as the number of combinations before they reach their markers.
+
+The screenshot does this for 4 seeds and 3 prompts with core `Create List` nodes. `Create List` flattens any list wired into it, so wiring the 4-seed list into a second `Create List` three times gives 12 seeds, and wiring the 3-prompt list in four times gives 12 prompts:
+
+| Item | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Seed | 1 | 2 | 3 | 4 | 1 | 2 | 3 | 4 | 1 | 2 | 3 | 4 |
+| Prompt | 1 | 2 | 3 | 1 | 2 | 3 | 1 | 2 | 3 | 1 | 2 | 3 |
+
+Each of the 12 seed and prompt pairs appears exactly once. This works because 4 and 3 share no common factor. Lists whose lengths do share one, such as 4 and 2, would repeat some pairs and miss others under this wiring. For those, repeat each entry of one list in blocks instead (1, 1, 2, 2, …).
 
 #### Example: Seed And Prompt Variations With Progressive Preview
 
-[`examples/Mapped Variations Progressive Preview.json`](examples/Mapped%20Variations%20Progressive%20Preview.json) puts the three nodes together. It renders 4 seeds × 3 prompts through a two-stage `KSampler` cascade and previews both stages while the items run. Drag the file onto the canvas and pick your own models; the model names in it are placeholders.
-
-![Twelve mapped seed and prompt variations filling two Remote Progressive Preview nodes](docs/images/modal-map-progressive-preview.png)
-
-*The preview images in this screenshot are placeholders, not model output. Stage 1 has received all 12 items; stage 2 has received 7 of 12, in completion order.*
+[`examples/Mapped Variations Progressive Preview.json`](examples/Mapped%20Variations%20Progressive%20Preview.json) is the workflow in the screenshot at the top of this section. Drag the file onto the canvas and pick your own models; the model names in it are placeholders.
 
 From left to right:
 
 1. **Variation lists (local).** Four `Int` seeds and three `Text (Multiline)` prompts each go into a `Create List` node.
-2. **Every combination.** A channel zips lists item by item, so a 4-item list and a 3-item list cannot share one. A second `Create List` repeats the seed list 3 times and the prompt list 4 times. Both lists then have 12 items, and because 4 and 3 share no common factor, item *i* pairs seed *i* mod 4 with prompt *i* mod 3, which covers all 12 combinations exactly once. To pair lists one to one instead (prompt *i* with seed *i*), give them the same length and skip the repeat.
-3. **Channel and markers (local).** Each list passes through its own `Modal Map Input`. Both markers take their `channel` input from one `Modal Input Channel` named `variations`. The seed marker feeds the `seed` input of both samplers and the prompt marker feeds the positive `CLIP Text Encode`, so both stages of an item share one seed and one prompt.
-4. **Remote region.** The loaders, both text encoders, the empty latent, both samplers, the latent upscale and both `VAE Decode` nodes have **Run Remotely** enabled. Stage 1 samples at 768 × 768; its latent is upscaled 1.5× and refined by stage 2 at 0.45 denoise. The loaders run once and all 12 items share them.
+2. **Every combination (local).** A second `Create List` repeats the seed list 3 times and the prompt list 4 times, as described [above](#running-every-combination). Both lists now have 12 items.
+3. **Channel and markers (local).** Each list passes through its own `Modal Map Input`. Both markers take their `channel` input from one `Modal Input Channel` named `variations`, so item *i* gets seed *i* and prompt *i* of the 12-item lists. The seed marker feeds the `seed` input of both samplers and the prompt marker feeds the positive `CLIP Text Encode`, so both stages of an item use the same seed and prompt.
+4. **Remote region.** The loaders, both text encoders, the empty latent, both samplers, the latent upscale and both `VAE Decode` nodes have **Run Remotely** enabled. Stage 1 samples at 768 × 768. Its latent is upscaled 1.5× and refined by stage 2 at 0.45 denoise. The loaders and the negative prompt are shared by all 12 items.
 5. **Progressive previews (local).** One `Remote Progressive Preview` reads the stage 1 decode and another reads the stage 2 decode. Each shows 12 empty slots when the run starts and fills a slot as soon as that item's image is ready.
 6. **Capacity.** The `Modal Configuration` allows 4 containers, so up to 4 items run at once.
+
+To pair the lists one to one instead (4 seeds with 4 prompts, 4 images), give them the same length and wire each first `Create List` straight into its marker.
+
+#### Watching mapped items and reading their results
+
+Each item runs its whole remote chain in one call, so its intermediate results exist only on the worker until the item is done. Local nodes that read those results, such as `PreviewImage`, `MaskPreview` or image comparisons, run once all the mapped work has finished, because ComfyUI hands a node its input only when every item is available. Use [`Remote Progressive Preview`](#remote-progressive-preview) to see items as they finish.
+
+A chain still splits where a local node feeds its output back into later remote nodes. That local node needs every item before the chain can continue, so the items wait for each other at that point.
+
+Mapped progress is summarized on the global status pill and on a representative node, with counts such as `3/16`.
+
+#### Batches and lists without a marker
+
+Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary. Semantic batches destined for aggregate consumers, such as the frame sequence feeding `CreateVideo`, stay intact instead of being split per item.
+
+ComfyUI-native lists made inside a remote component (for example several `UNETLoader` models joined by `Create List` into one sampler chain) keep working when the component is split into ordered phases. Each phase-bridge output that holds several list items records its item count, and the next phase fans out once per item, as if a `Modal Map Input` were in place.
 
 ### Remote Progressive Preview
 
