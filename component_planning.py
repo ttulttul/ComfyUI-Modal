@@ -579,6 +579,24 @@ def _component_has_local_reentry_dependency(
     return False
 
 
+def component_runs_items_end_to_end(
+    *,
+    prompt: dict[str, Any],
+    component: RemoteComponentPlan,
+) -> bool:
+    """Return whether each Modal Map Input item should run the whole component at once.
+
+    Such components never split into ordered phases for local side taps. Splitting
+    would make every phase wait for all items before the next phase starts, so a
+    single slow or pending container would stall every other item. Local re-entry
+    still needs phases, because a local node must see one phase's outputs before
+    the next phase can run.
+    """
+    return bool(component.mapped_boundary_inputs) and not (
+        _component_has_local_reentry_dependency(prompt=prompt, component=component)
+    )
+
+
 def _component_has_parallel_local_remote_fanout(
     component: RemoteComponentPlan,
 ) -> bool:
@@ -1046,6 +1064,10 @@ def _mark_remote_to_remote_session_boundaries(
     session_sources: set[LinkedOutputRef] = set()
 
     for component in components:
+        runs_items_end_to_end = component_runs_items_end_to_end(
+            prompt=prompt, component=component
+        )
+        component_node_id_set = set(component.node_ids)
         for boundary_output in component.boundary_outputs:
             output_consumers = consumers.get(boundary_output.source, [])
             if not output_consumers:
@@ -1056,6 +1078,18 @@ def _mark_remote_to_remote_session_boundaries(
                 if consumer.node_id in component_id_by_node_id
             ]
             if not remote_consumers:
+                continue
+            if runs_items_end_to_end and all(
+                consumer.node_id in component_node_id_set for consumer in remote_consumers
+            ):
+                logger.info(
+                    "Returning mapped boundary output source=%s:%d directly because "
+                    "component %s runs each item end to end; its remote consumers "
+                    "stay inside the same per-item execution.",
+                    boundary_output.source.node_id,
+                    boundary_output.source.output_index,
+                    component.representative_node_id,
+                )
                 continue
             producer_assignment = assignments_by_component_id[
                 component.representative_node_id

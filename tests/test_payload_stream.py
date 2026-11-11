@@ -1080,7 +1080,11 @@ def test_implicit_mapping_propagates_scheduler_list_through_downstream_component
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Heterogeneous implicit LATENT outputs should map into an ordinary local consumer."""
+    """Heterogeneous implicit LATENT outputs should map into an ordinary local consumer.
+
+    The seeds arrive as a native ComfyUI list, not through Modal Map Input, so the
+    cheap INT edge still splits the remote work into two components.
+    """
     torch = pytest.importorskip("torch")
 
     class PromptSeedList:
@@ -1089,13 +1093,6 @@ def test_implicit_mapping_propagates_scheduler_list_through_downstream_component
         RETURN_TYPES = ("INT",)
         RETURN_NAMES = ("seeds",)
         OUTPUT_IS_LIST = (True,)
-
-    class ModalMapInput:
-        """Represent the explicit queue-time mapped input marker."""
-
-        RETURN_TYPES = ("*",)
-        RETURN_NAMES = ("value",)
-        OUTPUT_IS_LIST = (False,)
 
     class RemoteSeed:
         """Publish an inexpensive mapped integer across a remote component boundary."""
@@ -1147,7 +1144,6 @@ def test_implicit_mapping_propagates_scheduler_list_through_downstream_component
         {
             "NODE_CLASS_MAPPINGS": {
                 "PromptSeedList": PromptSeedList,
-                "ModalMapInput": ModalMapInput,
                 "RemoteSeed": RemoteSeed,
                 "RemoteLatent": RemoteLatent,
                 "VAEDecode": LocalVAEDecode,
@@ -1158,7 +1154,6 @@ def test_implicit_mapping_propagates_scheduler_list_through_downstream_component
     workflow = {
         "nodes": [
             {"id": 49, "properties": {"is_modal_remote": False}},
-            {"id": 50, "properties": {"is_modal_remote": False}},
             {"id": 51, "properties": {"is_modal_remote": True}},
             {"id": 1, "properties": {"is_modal_remote": True}},
             {"id": 11, "properties": {"is_modal_remote": False}},
@@ -1166,8 +1161,7 @@ def test_implicit_mapping_propagates_scheduler_list_through_downstream_component
     }
     prompt = {
         "49": {"class_type": "PromptSeedList", "inputs": {}},
-        "50": {"class_type": "ModalMapInput", "inputs": {"value": ["49", 0]}},
-        "51": {"class_type": "RemoteSeed", "inputs": {"seed": ["50", 0]}},
+        "51": {"class_type": "RemoteSeed", "inputs": {"seed": ["49", 0]}},
         "1": {"class_type": "RemoteLatent", "inputs": {"seed": ["51", 0]}},
         "11": {"class_type": "VAEDecode", "inputs": {"samples": ["1", 0]}},
     }
