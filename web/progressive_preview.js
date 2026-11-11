@@ -11,6 +11,15 @@ const PROGRESSIVE_PREVIEW_MIN_WIDTH = 280;
 /** @type {WeakMap<object, ProgressivePreviewPanel>} */
 const progressivePreviewPanels = new WeakMap();
 
+/** @type {Set<ProgressivePreviewPanel>} Panels mounted on live nodes, for tab-refocus repaints. */
+const liveProgressivePreviewPanels = new Set();
+
+/** @type {WeakMap<Element, ProgressivePreviewPanel>} */
+const progressivePreviewPanelsByRoot = new WeakMap();
+
+/** @type {IntersectionObserver|null} */
+let progressivePreviewObserver = null;
+
 /**
  * @typedef {{filename: string, subfolder?: string, type?: string}} PreviewImage
  * @typedef {{promptId: string|null, slotCount: number, slots: Map<number, PreviewImage[]>}} SlotState
@@ -21,7 +30,8 @@ const progressivePreviewPanels = new WeakMap();
  *   cells: HTMLElement[], viewer: ProgressivePreviewViewer, state: SlotState,
  *   viewerIndex: number|null, focusSlotIndex: number|null, visible: boolean,
  *   widget: object|null, finishedPromptId: string|null,
- *   imageElements: Map<string, HTMLImageElement>}} ProgressivePreviewPanel
+ *   imageElements: Map<string, HTMLImageElement>, onScreen: boolean,
+ *   stale: boolean}} ProgressivePreviewPanel
  */
 
 /**
@@ -394,6 +404,8 @@ function ensureProgressivePreviewPanel(node) {
     widget: null,
     finishedPromptId: null,
     imageElements: new Map(),
+    onScreen: typeof IntersectionObserver !== "function",
+    stale: false,
   };
   panel.viewer = createProgressivePreviewViewer(panel);
   root.appendChild(panel.viewer.root);
@@ -413,7 +425,105 @@ function ensureProgressivePreviewPanel(node) {
     panel.widget.serialize = false;
   }
   progressivePreviewPanels.set(node, panel);
+  trackProgressivePreviewVisibility(panel);
   return panel;
+}
+
+/**
+ * Return the shared observer that reports when panels scroll into or out of view.
+ * @returns {IntersectionObserver|null}
+ */
+function progressivePreviewVisibilityObserver() {
+  if (!progressivePreviewObserver && typeof IntersectionObserver === "function") {
+    progressivePreviewObserver = new IntersectionObserver(handleProgressivePreviewIntersections);
+  }
+  return progressivePreviewObserver;
+}
+
+/**
+ * Record panel on-screen changes and repaint panels that changed while off-screen.
+ * @param {IntersectionObserverEntry[]} entries
+ */
+function handleProgressivePreviewIntersections(entries) {
+  for (const entry of entries) {
+    const panel = progressivePreviewPanelsByRoot.get(entry.target);
+    if (!panel) {
+      continue;
+    }
+    panel.onScreen = entry.isIntersecting;
+    if (panel.onScreen) {
+      repaintStaleProgressivePreview(panel);
+    }
+  }
+}
+
+/**
+ * Watch a panel's visibility and stop watching once its node is removed.
+ * @param {ProgressivePreviewPanel} panel
+ */
+function trackProgressivePreviewVisibility(panel) {
+  liveProgressivePreviewPanels.add(panel);
+  progressivePreviewPanelsByRoot.set(panel.root, panel);
+  progressivePreviewVisibilityObserver()?.observe(panel.root);
+  const node = panel.node;
+  const originalOnRemoved = node.onRemoved;
+  node.onRemoved = function onProgressivePreviewRemoved(...args) {
+    liveProgressivePreviewPanels.delete(panel);
+    progressivePreviewObserver?.unobserve(panel.root);
+    return originalOnRemoved?.apply(this, args);
+  };
+}
+
+/**
+ * Return whether the panel is currently painted: on screen in a visible browser tab.
+ * @param {ProgressivePreviewPanel} panel
+ * @returns {boolean}
+ */
+function isProgressivePreviewOnScreen(panel) {
+  const tabHidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+  return panel.onScreen && !tabHidden;
+}
+
+/**
+ * Rebuild a panel's images if they changed while it was out of view.
+ * Browsers do not reliably paint image content that arrived while its layer was hidden,
+ * so every image element is recreated rather than trusting the existing DOM.
+ * @param {ProgressivePreviewPanel} panel
+ * @returns {boolean} Whether the panel was repainted.
+ */
+function repaintStaleProgressivePreview(panel) {
+  if (!panel.stale || !isProgressivePreviewOnScreen(panel)) {
+    return false;
+  }
+  panel.stale = false;
+  for (const cell of panel.cells) {
+    if (cell) {
+      delete cell.dataset.imageKey;
+    }
+  }
+  clearProgressivePreviewImageSource(panel.viewer.image);
+  renderProgressivePreviewPanel(panel);
+  panel.node.setDirtyCanvas?.(true, true);
+  return true;
+}
+
+/**
+ * Drop an image's source so the next render assigns it afresh and the browser repaints it.
+ * @param {HTMLImageElement} image
+ */
+function clearProgressivePreviewImageSource(image) {
+  if (typeof image.removeAttribute === "function") {
+    image.removeAttribute("src");
+  } else {
+    image.src = "";
+  }
+}
+
+/** Repaint every stale on-screen panel, such as after the browser tab becomes visible again. */
+function repaintStaleProgressivePreviews() {
+  for (const panel of liveProgressivePreviewPanels) {
+    repaintStaleProgressivePreview(panel);
+  }
 }
 
 /**
@@ -452,6 +562,9 @@ function renderProgressivePreviewCell(cell, index, images) {
   cell.title = firstImage ? `Item ${index + 1} · click to enlarge` : `Item ${index + 1} · waiting for remote result`;
   if (firstImage) {
     const image = document.createElement("img");
+    image.addEventListener?.("error", () => {
+      delete cell.dataset.imageKey;
+    });
     image.src = imageKey;
     image.alt = `Remote preview item ${index + 1}`;
     cell.appendChild(image);
@@ -495,6 +608,9 @@ function renderProgressivePreviewViewer(panel) {
  */
 function renderProgressivePreviewPanel(panel) {
   const { state } = panel;
+  if (!isProgressivePreviewOnScreen(panel)) {
+    panel.stale = true;
+  }
   panel.header.textContent = progressivePreviewHeaderText(state);
   panel.grid.style.gridTemplateColumns = `repeat(${slotGridColumns(state.slotCount)}, minmax(0, 1fr))`;
   const cells = [];
@@ -802,6 +918,9 @@ app.registerExtension({
   setup() {
     installProgressivePreviewStyles();
     api.addEventListener(PROGRESSIVE_PREVIEW_EVENT, handleProgressivePreviewEvent);
+    if (typeof document !== "undefined") {
+      document.addEventListener?.("visibilitychange", repaintStaleProgressivePreviews);
+    }
   },
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData?.name !== PROGRESSIVE_PREVIEW_NODE_CLASS) {
