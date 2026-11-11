@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 if __package__:
+    from .modal_map_channels import resolve_modal_map_channels
     from .component_planning import (
         _build_component_plans,
         _implicitly_mapped_boundary_output_sources,
@@ -80,6 +81,7 @@ if __package__:
     )
     from .vast_service import VastService
 else:  # pragma: no cover - flat import inside the Modal container.
+    from modal_map_channels import resolve_modal_map_channels
     from component_planning import (
         _build_component_plans,
         _implicitly_mapped_boundary_output_sources,
@@ -1052,6 +1054,7 @@ def rewrite_prompt_for_modal(
     if cancellation_check is not None and cancellation_check():
         raise SyncCancelledError("Remote workflow preparation was cancelled.")
     resolved_settings = settings or get_settings()
+    prompt = resolve_modal_map_channels(prompt)
     remote_node_ids = requested_remote_node_ids(
         prompt=prompt,
         workflow=workflow,

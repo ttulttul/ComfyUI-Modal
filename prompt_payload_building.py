@@ -462,6 +462,7 @@ def _build_phase_payloads_for_transportable_splits(
     _attach_ordered_phase_session(
         component, context, state.payloads, remote_session
     )
+    _attach_phase_mapped_inputs(component, state.payloads)
     logger.info(
         "Split ordinary remote component %s into ordered phases: %s",
         component.representative_node_id,
@@ -568,6 +569,34 @@ def _hybrid_payload_parts(component: RemoteComponentPlan) -> _HybridPayloadParts
     )
 
 
+def _attach_phase_mapped_inputs(
+    component: RemoteComponentPlan,
+    phase_payloads: list[dict[str, Any]],
+) -> None:
+    """Give each ordered phase the channel-zipped mapped inputs it receives."""
+    if len(component.mapped_boundary_inputs) <= 1:
+        return
+    for phase_payload in phase_payloads:
+        phase_input_names = {
+            str(boundary_input.get("proxy_input_name"))
+            for boundary_input in phase_payload.get("boundary_inputs", [])
+        }
+        phase_mapped_inputs = [
+            mapped_input
+            for mapped_input in _mapped_inputs_payload(component)
+            if mapped_input["proxy_input_name"] in phase_input_names
+        ]
+        if phase_mapped_inputs:
+            phase_payload["mapped_inputs"] = phase_mapped_inputs
+
+
+def _mapped_inputs_payload(component: RemoteComponentPlan) -> list[dict[str, Any]]:
+    """Return the zipped Modal Map Input boundaries of one channel-mapped component."""
+    return [
+        mapped_spec.to_payload() for mapped_spec in component.mapped_boundary_inputs
+    ]
+
+
 def _build_base_component_payload(
     component: RemoteComponentPlan,
     context: _PayloadBuildContext,
@@ -620,6 +649,8 @@ def _build_base_component_payload(
             else None
         ),
     }
+    if len(component.mapped_boundary_inputs) > 1:
+        payload["mapped_inputs"] = _mapped_inputs_payload(component)
     if remote_session is not None:
         payload["remote_session"] = copy.deepcopy(remote_session)
         payload["clear_remote_session"] = True
@@ -716,6 +747,8 @@ def _build_split_hybrid_payload(
         mapped_progress_display_node_id=component.static_node_ids[0],
     )
     mapped_payload["static_to_mapped_boundaries"] = parts.static_to_mapped_payloads
+    if len(component.mapped_boundary_inputs) > 1:
+        mapped_payload["mapped_inputs"] = _mapped_inputs_payload(component)
     mapped_payload["static_phase"] = {
         "component_node_ids": list(component.static_node_ids),
         "subgraph_prompt": _subset_component_prompt(

@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 if __package__:
     from .execution_environments import ExecutionAssignment, ExecutionProvider
     from .modal_executor_node import MODAL_MAP_INPUT_NODE_ID
+    from .modal_map_channels import modal_map_channel, modal_map_input_label
     from .progressive_preview import (
         PROGRESSIVE_PREVIEW_NODE_ID,
         PROGRESSIVE_PREVIEW_TARGETS_KEY,
@@ -33,6 +34,7 @@ if __package__:
         BoundaryOutputSpec,
         InputTarget,
         LinkedOutputRef,
+        MappedBoundaryInputSpec,
         ModalPromptValidationError,
         RemoteComponentPlan,
         StaticToMappedBoundarySpec,
@@ -40,6 +42,7 @@ if __package__:
 else:  # pragma: no cover - flat import inside the Modal container.
     from execution_environments import ExecutionAssignment, ExecutionProvider
     from modal_executor_node import MODAL_MAP_INPUT_NODE_ID
+    from modal_map_channels import modal_map_channel, modal_map_input_label
     from progressive_preview import (
         PROGRESSIVE_PREVIEW_NODE_ID,
         PROGRESSIVE_PREVIEW_TARGETS_KEY,
@@ -62,6 +65,7 @@ else:  # pragma: no cover - flat import inside the Modal container.
         BoundaryOutputSpec,
         InputTarget,
         LinkedOutputRef,
+        MappedBoundaryInputSpec,
         ModalPromptValidationError,
         RemoteComponentPlan,
         StaticToMappedBoundarySpec,
@@ -212,37 +216,18 @@ def _build_component_plan(
         if not has_downstream_consumer:
             output_execution_targets.add(node_id)
 
-    mapped_boundary_spec: BoundaryInputSpec | None = None
-    mapped_boundary_input_io_type: str | None = None
-    for boundary_input in boundary_inputs_by_source.values():
-        source_prompt_node = prompt.get(boundary_input.source.node_id)
-        source_class_type = (
-            str(source_prompt_node.get("class_type"))
-            if source_prompt_node is not None
-            else None
-        )
-        mapped_targets = [
-            target
-            for target in boundary_input.targets
-            if str(prompt[target.node_id]["class_type"]) == MODAL_MAP_INPUT_NODE_ID
-        ]
-        source_is_modal_map_input = source_class_type == MODAL_MAP_INPUT_NODE_ID
-        if not mapped_targets and not source_is_modal_map_input:
-            continue
-        if mapped_targets and len(mapped_targets) != len(boundary_input.targets):
-            raise ModalPromptValidationError(
-                "Mapped remote execution requires the mapped boundary input to feed only ModalMapInput nodes."
-            )
-        if mapped_boundary_spec is not None:
-            raise ModalPromptValidationError(
-                "Remote components currently support only one mapped ModalMapInput boundary."
-            )
-        mapped_boundary_spec = boundary_input
-        mapped_boundary_input_io_type = _mapped_boundary_origin_io_type(
-            prompt,
-            boundary_input,
-            nodes_module,
-        )
+    mapped_boundary_specs = _collect_mapped_boundary_inputs(
+        prompt=prompt,
+        boundary_inputs=list(boundary_inputs_by_source.values()),
+        nodes_module=nodes_module,
+        component_id=representative_node_id,
+    )
+    mapped_boundary_spec: BoundaryInputSpec | None = (
+        mapped_boundary_specs[0][0] if mapped_boundary_specs else None
+    )
+    mapped_boundary_input_io_type: str | None = (
+        mapped_boundary_specs[0][2] if mapped_boundary_specs else None
+    )
 
     mapped_node_ids: list[str] = []
     mapped_execute_node_ids: list[str] = []
@@ -251,7 +236,11 @@ def _build_component_plan(
     static_to_mapped_boundaries: list[StaticToMappedBoundarySpec] = []
     if mapped_boundary_spec is not None:
         mapped_reachable_node_ids = _component_downstream_closure(
-            seed_node_ids={target.node_id for target in mapped_boundary_spec.targets},
+            seed_node_ids={
+                target.node_id
+                for boundary_spec, _mapped_spec, _origin_io_type in mapped_boundary_specs
+                for target in boundary_spec.targets
+            },
             component_node_id_set=component_node_id_set,
             consumers=consumers,
         )
@@ -340,6 +329,10 @@ def _build_component_plan(
             == MODAL_MAP_INPUT_NODE_ID
             else None
         ),
+        mapped_boundary_inputs=[
+            mapped_spec
+            for _boundary_spec, mapped_spec, _origin_io_type in mapped_boundary_specs
+        ],
         static_node_ids=static_node_ids,
         mapped_node_ids=mapped_node_ids,
         mapped_execute_node_ids=mapped_execute_node_ids,
@@ -1352,6 +1345,106 @@ def _mark_payload_scheduler_list_outputs(
                     split_payload,
                     scheduler_list_output_sources,
                 )
+
+
+_MappedBoundaryEntry = tuple[BoundaryInputSpec, MappedBoundaryInputSpec, str | None]
+
+
+def _boundary_input_marker_ids(
+    prompt: dict[str, Any],
+    boundary_input: BoundaryInputSpec,
+) -> list[str]:
+    """Return the Modal Map Input markers that map one boundary input, if any.
+
+    A local marker is the boundary's source; remote markers are its targets.
+    """
+    source_prompt_node = prompt.get(boundary_input.source.node_id)
+    if (
+        source_prompt_node is not None
+        and str(source_prompt_node.get("class_type")) == MODAL_MAP_INPUT_NODE_ID
+    ):
+        return [boundary_input.source.node_id]
+    mapped_target_ids = [
+        target.node_id
+        for target in boundary_input.targets
+        if str(prompt[target.node_id]["class_type"]) == MODAL_MAP_INPUT_NODE_ID
+    ]
+    if mapped_target_ids and len(mapped_target_ids) != len(boundary_input.targets):
+        raise ModalPromptValidationError(
+            "Mapped remote execution requires the mapped boundary input to feed only ModalMapInput nodes."
+        )
+    return sorted(set(mapped_target_ids))
+
+
+def _mapped_boundary_entry(
+    prompt: dict[str, Any],
+    boundary_input: BoundaryInputSpec,
+    marker_ids: list[str],
+    nodes_module: Any,
+) -> _MappedBoundaryEntry:
+    """Describe one mapped boundary input with its marker label and channel."""
+    channel_ids = {modal_map_channel(prompt.get(marker_id)) for marker_id in marker_ids}
+    label = ", ".join(modal_map_input_label(prompt, marker_id) for marker_id in marker_ids)
+    if len(channel_ids) != 1:
+        raise ModalPromptValidationError(
+            f"Boundary input {boundary_input.proxy_input_name} feeds Modal Map Input "
+            f"markers on different channels: {label}."
+        )
+    origin_io_type = _mapped_boundary_origin_io_type(prompt, boundary_input, nodes_module)
+    mapped_spec = MappedBoundaryInputSpec(
+        proxy_input_name=boundary_input.proxy_input_name,
+        io_type=str(origin_io_type or "*"),
+        label=label,
+        marker_node_id=marker_ids[0],
+        channel_id=next(iter(channel_ids)),
+    )
+    return boundary_input, mapped_spec, origin_io_type
+
+
+def _validate_mapped_boundary_channels(
+    entries: list[_MappedBoundaryEntry],
+    component_id: str,
+) -> None:
+    """Allow several mapped boundaries only when they all share one channel."""
+    if len(entries) <= 1:
+        return
+    channel_ids = {mapped_spec.channel_id for _boundary, mapped_spec, _io in entries}
+    if None not in channel_ids and len(channel_ids) == 1:
+        return
+    described = "; ".join(
+        f"{mapped_spec.label} on channel {mapped_spec.channel_id or '(none)'}"
+        for _boundary, mapped_spec, _io in entries
+    )
+    raise ModalPromptValidationError(
+        f"Remote component {component_id} receives several Modal Map Input "
+        f"boundaries: {described}. Connect them all to the same Modal Input "
+        "Channel so their items are zipped, or remove the extra markers."
+    )
+
+
+def _collect_mapped_boundary_inputs(
+    *,
+    prompt: dict[str, Any],
+    boundary_inputs: list[BoundaryInputSpec],
+    nodes_module: Any,
+    component_id: str,
+) -> list[_MappedBoundaryEntry]:
+    """Return every Modal Map Input boundary of one component, validated as a group."""
+    entries = [
+        _mapped_boundary_entry(prompt, boundary_input, marker_ids, nodes_module)
+        for boundary_input in boundary_inputs
+        if (marker_ids := _boundary_input_marker_ids(prompt, boundary_input))
+    ]
+    _validate_mapped_boundary_channels(entries, component_id)
+    if len(entries) > 1:
+        logger.info(
+            "Remote component %s zips %d Modal Map Input boundaries on channel %s: %s.",
+            component_id,
+            len(entries),
+            entries[0][1].channel_id,
+            [mapped_spec.label for _boundary, mapped_spec, _io in entries],
+        )
+    return entries
 
 
 def _mapped_boundary_origin_io_type(

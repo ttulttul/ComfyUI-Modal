@@ -16,7 +16,9 @@ from ..serialization import (
     join_mapped_values_for_scheduler,
     serialize_node_inputs,
     serialize_node_outputs,
+    payload_mapped_input_specs,
     split_mapped_value,
+    split_zipped_mapped_inputs,
 )
 from ..session_state import (
     is_remote_session_bridge_ref_payload,
@@ -239,26 +241,18 @@ def _execute_mapped_subgraph_payload(
     node_mapping: dict[str, type[Any]] | None = None,
 ) -> tuple[Any, ...]:
     """Execute one mapped payload locally using explicit static and mapped phases."""
-    mapped_input = payload.get("mapped_input") or {}
-    mapped_input_name = str(mapped_input.get("proxy_input_name") or "")
-    if not mapped_input_name:
+    mapped_input_specs = payload_mapped_input_specs(payload)
+    if not mapped_input_specs:
         raise ModalRemoteInvocationError(
             "Mapped remote payloads must define mapped_input.proxy_input_name."
         )
-    if mapped_input_name not in hydrated_inputs:
-        raise KeyError(
-            f"Mapped remote payload input {mapped_input_name!r} was not provided."
-        )
-
-    mapped_items = split_mapped_value(
-        hydrated_inputs[mapped_input_name],
-        str(mapped_input.get("io_type", "*")),
+    per_item_mapped_inputs = split_zipped_mapped_inputs(
+        hydrated_inputs, mapped_input_specs
     )
-    if not mapped_items:
-        raise ValueError("Mapped remote execution requires at least one input item.")
 
     broadcast_inputs = dict(hydrated_inputs)
-    broadcast_inputs.pop(mapped_input_name, None)
+    for mapped_input_spec in mapped_input_specs:
+        broadcast_inputs.pop(str(mapped_input_spec["proxy_input_name"]), None)
     static_to_mapped_boundaries = list(payload.get("static_to_mapped_boundaries", []))
     bridge_output_names = {
         str(boundary_spec.get("proxy_name") or "")
@@ -298,11 +292,11 @@ def _execute_mapped_subgraph_payload(
             )
             broadcast_inputs.update(bridge_inputs)
 
-    total_items = len(mapped_items)
+    total_items = len(per_item_mapped_inputs)
     _emit_local_mapped_progress(payload, 0, total_items)
     _emit_mapped_progressive_preview_start(payload, total_items)
     per_item_outputs: list[tuple[Any, ...]] = []
-    for item_index, item_value in enumerate(mapped_items):
+    for item_index, item_mapped_inputs in enumerate(per_item_mapped_inputs):
         if _local_processing_interrupted():
             _raise_local_interrupt()
         if payload.get("mapped_phase") is not None:
@@ -320,7 +314,7 @@ def _execute_mapped_subgraph_payload(
                 payload, item_index, 0, item_count=total_items
             )
         item_inputs = dict(broadcast_inputs)
-        item_inputs[mapped_input_name] = item_value
+        item_inputs.update(item_mapped_inputs)
         logger.info(
             "Executing mapped item %d/%d for component=%s with execute nodes=%s.",
             item_index + 1,
@@ -760,6 +754,12 @@ def _split_batch_boundary_inputs(
         {"IMAGE", "LATENT", "MASK", "NOISE", "SIGMAS"}
     )
     split_inputs: dict[str, list[Any]] = {}
+    channel_labels = {
+        str(mapped_input["proxy_input_name"]): str(
+            mapped_input.get("label") or mapped_input["proxy_input_name"]
+        )
+        for mapped_input in payload.get("mapped_inputs") or []
+    }
 
     def is_session_ref_list(value: Any) -> bool:
         """Return whether `value` is a non-empty list of remote session refs."""
@@ -819,6 +819,7 @@ def _split_batch_boundary_inputs(
         input_is_session_ref_list = is_session_ref_list(input_value)
         if (
             isinstance(input_value, list)
+            and proxy_input_name not in channel_labels
             and not is_mapped_output_value(input_value)
             and not input_is_session_ref_list
             and io_type
@@ -858,10 +859,37 @@ def _split_batch_boundary_inputs(
     unique_counts = set(item_counts.values())
     if len(unique_counts) != 1:
         raise ModalRemoteInvocationError(
-            "Implicit Modal batch boundary inputs must all have the same item count. "
-            f"Received counts: {item_counts!r}"
+            _describe_mismatched_batch_counts(
+                payload, item_counts, channel_labels
+            )
         )
     return split_inputs, next(iter(unique_counts))
+
+
+def _describe_mismatched_batch_counts(
+    payload: dict[str, Any],
+    item_counts: dict[str, int],
+    channel_labels: dict[str, str],
+) -> str:
+    """Explain mismatched zipped item counts, naming the target node of each input."""
+    target_names_by_input = {
+        str(boundary_input.get("proxy_input_name")): ", ".join(
+            f"{target.get('node_id')}.{target.get('input_name')}"
+            for target in boundary_input.get("targets", [])
+        )
+        for boundary_input in payload.get("boundary_inputs", [])
+    }
+    described = "; ".join(
+        f"{channel_labels.get(input_name, input_name)} -> "
+        f"{target_names_by_input.get(input_name, '?')}: {count} items"
+        for input_name, count in sorted(item_counts.items())
+    )
+    return (
+        "Implicit Modal batch boundary inputs must all have the same item count "
+        f"in component {payload.get('component_id')}. Received {described}. "
+        "Check upstream list-producing nodes (for example a NextSeeds count above 1 "
+        "on a node that already receives a list) for multiplied list lengths."
+    )
 
 
 def _is_latent_like_mapping(value: Any) -> bool:
