@@ -1,4 +1,4 @@
-"""Local ComfyUI node that shows remote IMAGE results as they stream in."""
+"""Local ComfyUI node that shows remote images, masks, audio, and text as they stream in."""
 
 from __future__ import annotations
 
@@ -13,18 +13,20 @@ if __package__:
     from .progressive_preview import (
         PROGRESSIVE_PREVIEW_NODE_ID,
         PROGRESSIVE_PREVIEW_REGISTRY,
-        PreviewImageRef,
+        PreviewEntry,
         ProgressivePreviewState,
-        save_temp_preview_images,
+        progressive_preview_ui,
+        save_temp_preview_entries,
     )
     from .session_state import is_remote_session_bridge_ref_payload
 else:  # pragma: no cover - flat import inside the Modal container.
     from progressive_preview import (
         PROGRESSIVE_PREVIEW_NODE_ID,
         PROGRESSIVE_PREVIEW_REGISTRY,
-        PreviewImageRef,
+        PreviewEntry,
         ProgressivePreviewState,
-        save_temp_preview_images,
+        progressive_preview_ui,
+        save_temp_preview_entries,
     )
     from session_state import is_remote_session_bridge_ref_payload
 
@@ -51,62 +53,67 @@ def _materialize_bridge_ref(bridge_ref: Mapping[str, Any]) -> Any:
     return materialize_remote_session_bridge_ref_locally(bridge_ref)
 
 
-async def _resolve_item_images(
+async def _resolve_item_entries(
     index: int,
     item: Any,
     state: ProgressivePreviewState | None,
-) -> list[PreviewImageRef]:
-    """Return saved preview images for one input item, reusing streamed slots."""
+) -> list[PreviewEntry]:
+    """Return saved preview entries for one input item, reusing streamed slots."""
     if not is_remote_session_bridge_ref_payload(item):
-        return save_temp_preview_images(item)
-    streamed_images = state.slots.get(index) if state is not None else None
-    if streamed_images:
-        return list(streamed_images)
+        return save_temp_preview_entries(item)
+    streamed_entries = state.slots.get(index) if state is not None else None
+    if streamed_entries:
+        return list(streamed_entries)
     logger.info(
         "Materializing progressive preview slot %d locally because it was not streamed.",
         index,
     )
     materialized = await asyncio.to_thread(_materialize_bridge_ref, item)
-    return save_temp_preview_images(materialized)
+    return save_temp_preview_entries(materialized)
 
 
-async def resolve_progressive_preview_images(
+async def resolve_progressive_preview_entries(
     items: list[Any],
     state: ProgressivePreviewState | None,
-) -> list[PreviewImageRef]:
-    """Return the final preview images, preferring images already streamed."""
+) -> list[PreviewEntry]:
+    """Return the final preview entries, preferring entries already streamed."""
     if state is not None and state.is_complete():
         logger.info(
             "Reusing %d streamed progressive preview slot(s) without re-downloading.",
             state.slot_count,
         )
-        return state.ordered_images()
-    resolved: list[PreviewImageRef] = []
+        return state.ordered_entries()
+    resolved: list[PreviewEntry] = []
     for index, item in enumerate(items):
-        resolved.extend(await _resolve_item_images(index, item, state))
+        resolved.extend(await _resolve_item_entries(index, item, state))
     return resolved
 
 
 class RemoteProgressivePreview(io.ComfyNode):
-    """Preview remote images, filling one slot per item as remote work finishes."""
+    """Preview remote results, filling one slot per item as remote work finishes."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
-        """Declare a PreviewImage-style output node that accepts the whole list."""
+        """Declare a preview output node that accepts the whole list of any previewable type."""
         return io.Schema(
             node_id=PROGRESSIVE_PREVIEW_NODE_ID,
             display_name="Remote Progressive Preview",
             category="Modal",
             description=(
-                "Preview images produced by remote execution. When remote work "
-                "starts, the node shows one empty slot per mapped item and fills "
-                "each slot as soon as that item finishes, without waiting for "
-                "ComfyUI to receive the whole result."
+                "Preview images, masks, audio, or text produced by remote "
+                "execution. When remote work starts, the node shows one empty "
+                "slot per mapped item and fills each slot as soon as that item "
+                "finishes, without waiting for ComfyUI to receive the whole result."
             ),
             inputs=[
-                io.Image.Input(
+                io.MultiType.Input(
                     "images",
-                    tooltip="Images from a remote node, usually a mapped component.",
+                    types=[io.Image, io.Mask, io.Audio, io.String],
+                    display_name="value",
+                    tooltip=(
+                        "Images, masks, audio, or text from a remote node, usually "
+                        "a mapped component. Each item is previewed by its type."
+                    ),
                 )
             ],
             outputs=[],
@@ -123,11 +130,11 @@ class RemoteProgressivePreview(io.ComfyNode):
             if prompt_id and node_id
             else None
         )
-        saved_images = await resolve_progressive_preview_images(list(images), state)
+        entries = await resolve_progressive_preview_entries(list(images), state)
         logger.info(
-            "Finalized progressive preview prompt=%s node=%s images=%d.",
+            "Finalized progressive preview prompt=%s node=%s entries=%d.",
             prompt_id,
             node_id,
-            len(saved_images),
+            len(entries),
         )
-        return io.NodeOutput(ui={"images": [image.as_ui() for image in saved_images]})
+        return io.NodeOutput(ui=progressive_preview_ui(entries))

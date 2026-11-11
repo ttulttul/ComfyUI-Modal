@@ -1337,6 +1337,60 @@ def test_modal_cloud_tracing_prompt_server_emits_boundary_image_outputs(
     assert observed_updates[2]["phase"] == "executing"
 
 @pytest.mark.parametrize(
+    ("io_type", "preview_targets", "progressive_targets", "streams"),
+    [
+        ("STRING", [], ["18"], True),
+        ("AUDIO", [], ["18"], True),
+        ("MASK", [], ["18"], True),
+        ("STRING", ["9"], [], False),
+        ("LATENT", [], ["18"], False),
+    ],
+)
+def test_modal_cloud_tracing_prompt_server_streams_progressive_preview_types(
+    modal_cloud_module: Any,
+    io_type: str,
+    preview_targets: list[str],
+    progressive_targets: list[str],
+    streams: bool,
+) -> None:
+    """Progressive previews receive masks, audio, and text; PreviewImage receives only images."""
+    observed_updates: list[dict[str, Any]] = []
+    server = modal_cloud_module._TracingPromptServer(
+        "component-1",
+        {
+            "7": {"class_type": "TextNode", "inputs": {}},
+            "8": {"class_type": "OtherNode", "inputs": {}},
+        },
+        status_callback=observed_updates.append,
+    )
+    cache_entries = {"7": types.SimpleNamespace(outputs=[["a caption"]])}
+    server.configure_boundary_output_stream(
+        boundary_outputs=[
+            {
+                "node_id": "7",
+                "output_index": 0,
+                "io_type": io_type,
+                "is_list": False,
+                "preview_target_node_ids": preview_targets,
+                "progressive_preview_target_node_ids": progressive_targets,
+            }
+        ],
+        lookup_cache_entry=lambda node_id: cache_entries.get(node_id),
+    )
+
+    server.send_sync("executing", {"node": "7"}, None)
+    server.send_sync("executing", {"node": "8"}, None)
+
+    boundary_events = [
+        update for update in observed_updates if update.get("event_type") == "boundary_output"
+    ]
+    assert len(boundary_events) == (1 if streams else 0)
+    if streams:
+        assert boundary_events[0]["io_type"] == io_type
+        assert boundary_events[0]["progressive_preview_target_node_ids"] == ["18"]
+
+
+@pytest.mark.parametrize(
     ("module_fixture_name",),
     [
         ("local_execution_module",),

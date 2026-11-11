@@ -1,4 +1,4 @@
-"""Tests for progressive remote image previews."""
+"""Tests for progressive remote previews of images, masks, audio, and text."""
 
 from __future__ import annotations
 
@@ -36,9 +36,9 @@ def _clear_progressive_registry(progressive_preview_module: Any) -> None:
 
 
 def _image_ref(progressive_preview_module: Any, name: str) -> Any:
-    """Return one temp preview image reference."""
-    return progressive_preview_module.PreviewImageRef(
-        filename=name, subfolder="", type="temp"
+    """Return one temp preview image entry."""
+    return progressive_preview_module.PreviewEntry(
+        kind="image", filename=name, subfolder="", type="temp"
     )
 
 
@@ -63,7 +63,7 @@ def test_registry_tracks_slots_until_complete(progressive_preview_module: Any) -
     final_state = registry.pop("prompt-1", "18")
 
     assert final_state is not None and final_state.is_complete()
-    assert [image.filename for image in final_state.ordered_images()] == [
+    assert [image.filename for image in final_state.ordered_entries()] == [
         "a.png",
         "b.png",
         "c.png",
@@ -101,18 +101,107 @@ def test_registry_drops_earlier_prompts_for_the_same_node(
     assert registry.get("prompt-2", "20") is not None
 
 
-def test_iter_image_batches_flattens_lists_and_adds_batch_dimension(
+def test_iter_preview_values_sorts_each_value_by_type(
     progressive_preview_module: Any,
 ) -> None:
-    """Lists of IMAGE tensors flatten and single frames gain a batch dimension."""
+    """Lists flatten; tensors, audio dicts, text, and numbers each get their own preview kind."""
     torch = pytest.importorskip("torch")
-    batches = list(
-        progressive_preview_module.iter_image_batches(
-            [torch.zeros(2, 4, 4, 3), [torch.zeros(4, 4, 3)], "not-an-image"]
+    audio = {"waveform": torch.zeros(1, 2, 8), "sample_rate": 44100}
+    values = list(
+        progressive_preview_module.iter_preview_values(
+            [
+                torch.zeros(2, 4, 4, 3),
+                [torch.zeros(4, 4, 3)],
+                torch.zeros(4, 4),
+                torch.zeros(2, 4, 5),
+                audio,
+                "a caption",
+                7,
+                None,
+                {"samples": torch.zeros(1, 4, 8, 8)},
+            ]
         )
     )
 
-    assert [tuple(batch.shape) for batch in batches] == [(2, 4, 4, 3), (1, 4, 4, 3)]
+    assert [value.kind for value in values] == [
+        "image",
+        "image",
+        "mask",
+        "mask",
+        "audio",
+        "text",
+        "text",
+    ]
+    assert tuple(values[1].value.shape) == (1, 4, 4, 3)
+    assert values[4].value is audio
+    assert [values[5].value, values[6].value] == ["a caption", "7"]
+
+
+def test_iter_preview_values_trusts_the_mask_io_type(
+    progressive_preview_module: Any,
+) -> None:
+    """A MASK batch whose width happens to be 3 is still a mask when the type says so."""
+    torch = pytest.importorskip("torch")
+    mask = torch.zeros(2, 4, 3)
+
+    [guessed] = progressive_preview_module.iter_preview_values(mask)
+    [typed] = progressive_preview_module.iter_preview_values(mask, "MASK")
+
+    assert guessed.kind == "image"
+    assert typed.kind == "mask"
+
+
+def test_save_preview_value_routes_each_kind(
+    progressive_preview_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Masks save as grayscale images, audio saves as clips, and text needs no file."""
+    torch = pytest.importorskip("torch")
+    saved_batches: list[Any] = []
+    monkeypatch.setattr(
+        progressive_preview_module,
+        "_save_image_batch",
+        lambda batch: saved_batches.append(batch) or [_image_ref(progressive_preview_module, "m.png")],
+    )
+    monkeypatch.setattr(
+        progressive_preview_module,
+        "_save_audio",
+        lambda audio: [
+            progressive_preview_module.PreviewEntry(kind="audio", filename="a.flac")
+        ],
+    )
+
+    entries = progressive_preview_module.save_temp_preview_entries(
+        [torch.ones(2, 4, 5), {"waveform": torch.zeros(1, 1, 8), "sample_rate": 8000}, "hi"]
+    )
+
+    assert [entry.as_ui() for entry in entries] == [
+        {"kind": "image", "filename": "m.png", "subfolder": "", "type": "temp"},
+        {"kind": "audio", "filename": "a.flac", "subfolder": "", "type": "temp"},
+        {"kind": "text", "text": "hi"},
+    ]
+    assert tuple(saved_batches[0].shape) == (2, 4, 5, 3)
+
+
+def test_progressive_preview_ui_lists_images_for_history(
+    progressive_preview_module: Any,
+) -> None:
+    """Every entry reaches the panel; images are also listed for ComfyUI's history."""
+    entries = [
+        progressive_preview_module.PreviewEntry.from_text("caption"),
+        _image_ref(progressive_preview_module, "a.png"),
+    ]
+
+    assert progressive_preview_module.progressive_preview_ui(entries) == {
+        "modal_preview": [
+            {"kind": "text", "text": "caption"},
+            {"kind": "image", "filename": "a.png", "subfolder": "", "type": "temp"},
+        ],
+        "images": [{"filename": "a.png", "subfolder": "", "type": "temp"}],
+    }
+    assert progressive_preview_module.progressive_preview_ui(entries[:1]) == {
+        "modal_preview": [{"kind": "text", "text": "caption"}]
+    }
 
 
 def test_resolve_reuses_complete_streamed_slots(
@@ -123,7 +212,7 @@ def test_resolve_reuses_complete_streamed_slots(
     """A fully streamed preview never saves or downloads the delivered value again."""
     monkeypatch.setattr(
         progressive_preview_node_module,
-        "save_temp_preview_images",
+        "save_temp_preview_entries",
         lambda value: pytest.fail("streamed slots should be reused"),
     )
     state = progressive_preview_module.ProgressivePreviewState(
@@ -135,7 +224,7 @@ def test_resolve_reuses_complete_streamed_slots(
     )
 
     images = asyncio.run(
-        progressive_preview_node_module.resolve_progressive_preview_images(
+        progressive_preview_node_module.resolve_progressive_preview_entries(
             [_bridge_ref(0), _bridge_ref(1)], state
         )
     )
@@ -157,7 +246,7 @@ def test_resolve_materializes_only_missing_bridge_slots(
     )
     monkeypatch.setattr(
         progressive_preview_node_module,
-        "save_temp_preview_images",
+        "save_temp_preview_entries",
         lambda value: [_image_ref(progressive_preview_module, f"{value}.png")],
     )
     state = progressive_preview_module.ProgressivePreviewState(
@@ -165,7 +254,7 @@ def test_resolve_materializes_only_missing_bridge_slots(
     )
 
     images = asyncio.run(
-        progressive_preview_node_module.resolve_progressive_preview_images(
+        progressive_preview_node_module.resolve_progressive_preview_entries(
             [_bridge_ref(0), _bridge_ref(1)], state
         )
     )
@@ -184,6 +273,8 @@ def test_node_schema_is_list_input_output_node(
     assert schema.is_output_node is True
     assert schema.is_input_list is True
     assert schema.outputs == []
+    assert schema.inputs[0].id == "images"
+    assert schema.inputs[0].get_io_type() == "IMAGE,MASK,AUDIO,STRING"
 
 
 def test_node_execute_pops_registry_and_returns_ui_images(
@@ -208,9 +299,37 @@ def test_node_execute_pops_registry_and_returns_ui_images(
     )
 
     assert output.ui == {
-        "images": [{"filename": "a.png", "subfolder": "", "type": "temp"}]
+        "modal_preview": [
+            {"kind": "image", "filename": "a.png", "subfolder": "", "type": "temp"}
+        ],
+        "images": [{"filename": "a.png", "subfolder": "", "type": "temp"}],
     }
     assert registry.get("prompt-1", "18") is None
+
+
+def test_node_execute_previews_local_text_values(
+    progressive_preview_node_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local text and number items become text entries without saving any file."""
+    monkeypatch.setattr(
+        progressive_preview_node_module,
+        "_executing_prompt_and_node",
+        lambda: ("prompt-1", "18"),
+    )
+
+    output = asyncio.run(
+        progressive_preview_node_module.RemoteProgressivePreview.execute(
+            ["first caption", 2]
+        )
+    )
+
+    assert output.ui == {
+        "modal_preview": [
+            {"kind": "text", "text": "first caption"},
+            {"kind": "text", "text": "2"},
+        ]
+    }
 
 
 class _FakePromptServer:
@@ -240,8 +359,8 @@ def test_local_emitters_send_start_and_slot_events(
     )
     monkeypatch.setattr(
         progressive_preview_module,
-        "save_temp_preview_images",
-        lambda value: [_image_ref(progressive_preview_module, f"{value}.png")],
+        "save_temp_preview_entries",
+        lambda value, io_type=None: [_image_ref(progressive_preview_module, f"{value}.png")],
     )
 
     local_ui_events_module._emit_local_progressive_preview_start(
@@ -253,7 +372,7 @@ def test_local_emitters_send_start_and_slot_events(
         node_ids=["18"],
         slot_index=1,
         slot_count=3,
-        image_value="item-1",
+        value="item-1",
     )
 
     assert prompt_server.events == [
@@ -270,7 +389,9 @@ def test_local_emitters_send_start_and_slot_events(
                 "node": "18",
                 "slot_index": 1,
                 "slot_count": 3,
-                "images": [{"filename": "item-1.png", "subfolder": "", "type": "temp"}],
+                "items": [
+                    {"kind": "image", "filename": "item-1.png", "subfolder": "", "type": "temp"}
+                ],
             },
             "client-1",
         ),
@@ -321,7 +442,8 @@ def test_boundary_stream_event_fills_the_mapped_item_slot(
             "node_ids": ["18"],
             "slot_index": 2,
             "slot_count": 4,
-            "image_value": ["image-2"],
+            "value": ["image-2"],
+            "io_type": None,
         }
     ]
     assert preview_calls == []

@@ -365,7 +365,7 @@ def _handle_boundary_output_event(
         target_node_ids,
         progressive_node_ids,
     )
-    image_value = deserialize_value(stream_event.get("value"))
+    value = deserialize_value(stream_event.get("value"))
     if progressive_node_ids:
         _emit_local_progressive_preview_slot(
             prompt_id=state.prompt_id,
@@ -373,14 +373,15 @@ def _handle_boundary_output_event(
             node_ids=progressive_node_ids,
             slot_index=_optional_payload_int(state.payload, "map_item_index") or 0,
             slot_count=_optional_payload_int(state.payload, "map_item_count"),
-            image_value=image_value,
+            value=value,
+            io_type=str(stream_event.get("io_type") or "") or None,
         )
     if target_node_ids:
         _emit_local_preview_boundary_output(
             prompt_id=state.prompt_id,
             client_id=state.client_id,
             preview_target_node_ids=target_node_ids,
-            image_value=image_value,
+            image_value=value,
         )
 
 

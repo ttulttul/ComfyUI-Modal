@@ -47,6 +47,25 @@ def _boundary_target_node_ids(boundary_output: dict[str, Any], key: str) -> list
     return [str(node_id) for node_id in boundary_output.get(key, []) or [] if str(node_id)]
 
 
+_PROGRESSIVE_PREVIEW_IO_TYPES = frozenset({"IMAGE", "MASK", "AUDIO", "STRING"})
+
+
+def _streams_boundary_previews(
+    *,
+    io_type: str,
+    has_image_previews: bool,
+    has_progressive_previews: bool,
+) -> bool:
+    """Return whether one boundary output should stream its value to local previews.
+
+    PreviewImage targets take only IMAGE values; progressive previews also take
+    masks, audio, and text.
+    """
+    if io_type == "IMAGE":
+        return has_image_previews or has_progressive_previews
+    return has_progressive_previews and io_type in _PROGRESSIVE_PREVIEW_IO_TYPES
+
+
 def _emit_cloud_info(message: str, *args: Any) -> None:
     """Delegate timestamped cloud logging to the stable entrypoint."""
     _prompt_server_hooks().emit_cloud_info(message, *args)
@@ -306,9 +325,11 @@ class _TracingPromptServer(_NullPromptServer):
             progressive_target_node_ids = _boundary_target_node_ids(
                 boundary_output, "progressive_preview_target_node_ids"
             )
-            if not preview_target_node_ids and not progressive_target_node_ids:
-                continue
-            if str(boundary_output.get("io_type")) != "IMAGE":
+            if not _streams_boundary_previews(
+                io_type=str(boundary_output.get("io_type")),
+                has_image_previews=bool(preview_target_node_ids),
+                has_progressive_previews=bool(progressive_target_node_ids),
+            ):
                 continue
             node_id = str(boundary_output["node_id"])
             outputs_by_node_id.setdefault(node_id, []).append(boundary_output)
@@ -318,7 +339,7 @@ class _TracingPromptServer(_NullPromptServer):
         self._published_boundary_outputs.clear()
 
     def _emit_boundary_outputs_for_node(self, node_id: str | None) -> None:
-        """Publish configured boundary image outputs for one completed node once."""
+        """Publish configured boundary preview outputs for one completed node once."""
         if (
             node_id is None
             or self._status_callback is None

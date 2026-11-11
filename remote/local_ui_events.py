@@ -469,37 +469,39 @@ def _emit_local_progressive_preview_slot(
     node_ids: list[str],
     slot_index: int,
     slot_count: int | None,
-    image_value: Any,
+    value: Any,
+    io_type: str | None = None,
 ) -> None:
-    """Save one streamed IMAGE value and fill its slot on each progressive preview."""
+    """Save one streamed value and fill its slot on each progressive preview."""
     if not prompt_id or not node_ids:
         return
     preview_module = _progressive_preview_module()
     try:
-        images = preview_module.save_temp_preview_images(image_value)
+        entries = preview_module.save_temp_preview_entries(value, io_type)
     except ModuleNotFoundError:
         logger.warning(
-            "Progressive preview is unavailable because ComfyUI nodes could not be imported."
+            "Progressive preview is unavailable because ComfyUI modules could not be imported."
         )
         return
-    if not images:
+    if not entries:
         logger.warning(
-            "Progressive preview slot %d for prompt=%s carried no images.",
+            "Progressive preview slot %d for prompt=%s carried nothing previewable.",
             slot_index,
             prompt_id,
         )
         return
     for node_id in node_ids:
         state = preview_module.PROGRESSIVE_PREVIEW_REGISTRY.fill(
-            prompt_id, node_id, slot_index, images, slot_count
+            prompt_id, node_id, slot_index, entries, slot_count
         )
         logger.info(
-            "Filled progressive preview prompt=%s node=%s slot=%d/%d images=%d.",
+            "Filled progressive preview prompt=%s node=%s slot=%d/%d entries=%d kinds=%s.",
             prompt_id,
             node_id,
             slot_index + 1,
             state.effective_slot_count(),
-            len(images),
+            len(entries),
+            sorted({entry.kind for entry in entries}),
         )
         _send_progressive_preview_event(
             client_id=client_id,
@@ -509,7 +511,7 @@ def _emit_local_progressive_preview_slot(
                 "node": node_id,
                 "slot_index": int(slot_index),
                 "slot_count": state.effective_slot_count(),
-                "images": [image.as_ui() for image in images],
+                "items": [entry.as_ui() for entry in entries],
             },
         )
 
