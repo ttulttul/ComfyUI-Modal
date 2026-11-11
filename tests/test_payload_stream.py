@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from modal_executor_test_support import *  # noqa: F401,F403
 
+
+@pytest.fixture(autouse=True)
+def _reset_gpu_usage_ledger(payload_stream_module: Any) -> Iterator[None]:
+    """Start every test with an empty per-prompt GPU usage ledger."""
+    payload_stream_module.GPU_USAGE_LEDGER.clear()
+    yield
+    payload_stream_module.GPU_USAGE_LEDGER.clear()
+
 def test_modal_cloud_streams_progress_and_result_events(
     modal_cloud_module: Any,
     monkeypatch: Any,
@@ -269,7 +277,13 @@ def test_remote_modal_consumes_streamed_progress_and_result(
     assert "event_count=4 progress_event_count=3" in caplog.text
     assert "Finished local Modal result stream close" in caplog.text
     assert "Finished local Modal stream consumption" in caplog.text
-    assert prompt_server.messages == [
+    gpu_usage_event = prompt_server.messages[-1]
+    assert gpu_usage_event[0] == "modal_gpu_usage"
+    assert gpu_usage_event[1]["prompt_id"] == "prompt-1"
+    assert gpu_usage_event[1]["invocation_count"] == 1
+    assert [node["node_id"] for node in gpu_usage_event[1]["nodes"]] == ["7"]
+    assert gpu_usage_event[1]["nodes"][0]["runs"] == 1
+    assert prompt_server.messages[:-1] == [
         (
             "modal_status",
             {
@@ -832,7 +846,11 @@ def test_remote_modal_consumes_streamed_boundary_output_preview_targets(
     )
 
     assert result == b"serialized-outputs"
-    assert prompt_server.messages == [
+    gpu_usage_event = prompt_server.messages[-1]
+    assert gpu_usage_event[0] == "modal_gpu_usage"
+    assert gpu_usage_event[1]["prompt_id"] == "prompt-1"
+    assert gpu_usage_event[1]["invocation_count"] == 1
+    assert prompt_server.messages[:-1] == [
         (
             "executed",
             {

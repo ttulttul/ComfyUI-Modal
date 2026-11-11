@@ -14,6 +14,7 @@ from ..serialization import (
 )
 from .local_ui_events import (
     _emit_local_executed_output,
+    _emit_local_gpu_usage,
     _emit_local_modal_progress,
     _emit_local_modal_status,
     _emit_local_preview_boundary_output,
@@ -25,8 +26,10 @@ from .local_ui_events import (
     _remote_prompt_ancestor_node_ids,
     _should_forward_suppressed_stream_event,
 )
+from .gpu_usage import GPU_USAGE_LEDGER, InvocationGpuUsage
 from .mapped_execution import _remember_mapped_lane_node_id
 from .modal_container_logs import (
+    MODAL_GPU_ESTIMATED_USD_PER_SECOND,
     _coerce_modal_task_id,
     _is_remote_container_log_stream_enabled,
     _release_remote_container_log_stream,
@@ -598,12 +601,40 @@ def _close_consumed_payload_stream(
         _release_remote_container_log_stream(state.active_remote_log_task_id)
 
 
+def _record_invocation_gpu_usage(
+    gpu_usage: InvocationGpuUsage, *, succeeded: bool
+) -> None:
+    """Add one finished call to its prompt's GPU time and update the panel."""
+    recorded = GPU_USAGE_LEDGER.record(
+        gpu_usage,
+        finished_at=time.monotonic(),
+        succeeded=succeeded,
+        usd_per_second_by_gpu=MODAL_GPU_ESTIMATED_USD_PER_SECOND,
+    )
+    if recorded is None:
+        return
+    client_id, snapshot = recorded
+    logger.info(
+        "Prompt %s GPU time so far: busy=%.1fs nodes=%.1fs setup=%.1fs returning=%.1fs "
+        "waiting=%.1fs calls=%d.",
+        snapshot["prompt_id"],
+        snapshot["busy_seconds"],
+        snapshot["node_seconds"],
+        snapshot["setup_seconds"],
+        snapshot["return_seconds"],
+        snapshot["wait_seconds"],
+        snapshot["invocation_count"],
+    )
+    _emit_local_gpu_usage(client_id, snapshot)
+
+
 def _consume_remote_payload_stream(
     payload: dict[str, Any],
     stream_events: Iterator[dict[str, Any]],
 ) -> bytes:
     """Forward remote progress events into the local UI and return final bytes."""
     state = _new_payload_stream_state(payload)
+    gpu_usage = InvocationGpuUsage(payload=payload, dispatched_at=state.stream_started_at)
     logger.info(
         "Starting local Modal stream consumption component=%s prompt_id=%s invocation_id=%s.",
         state.component_id,
@@ -618,6 +649,7 @@ def _consume_remote_payload_stream(
             )
             state.previous_event_at = event_received_at
             state.event_count += 1
+            gpu_usage.observe(event_received_at, stream_event)
             if not state.speculative_prewarm_checked:
                 state.speculative_prewarm_checked = True
                 _schedule_speculative_affinity_prewarm(
@@ -646,6 +678,7 @@ def _consume_remote_payload_stream(
             )
     finally:
         _close_consumed_payload_stream(state, stream_events)
+        _record_invocation_gpu_usage(gpu_usage, succeeded=state.result_payload is not None)
 
     if state.result_payload is None:
         raise ModalRemoteInvocationError(
