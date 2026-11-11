@@ -40,6 +40,7 @@ The back-end layer is pluggable. Each provider implements only host discovery, p
   - [Canvas State](#canvas-state)
   - [Remote Execution Configurator Panel](#remote-execution-configurator-panel)
   - [Batched And Mapped Workflows](#batched-and-mapped-workflows)
+    - [Example: Seed And Prompt Variations With Progressive Preview](#example-seed-and-prompt-variations-with-progressive-preview)
   - [Remote Progressive Preview](#remote-progressive-preview)
 - [LLM Nodes](#llm-nodes)
   - [Modal LLM](#modal-llm)
@@ -73,6 +74,7 @@ A minimal Modal workflow looks like this. The eight blue-bordered nodes have `Ru
 - Capability- and cost-aware scheduling: the planner checks VRAM/RAM requirements against each candidate and picks the lowest predicted total cost
 - Automatic sync of referenced model files and, optionally, your `custom_nodes/` packages
 - Streamed remote status, sampler progress, preview images, and UI payloads rendered live on the local canvas
+- Data-parallel fan-out with `Modal Map Input`, lists zipped item by item through a `Modal Input Channel`, and a `Remote Progressive Preview` that fills one slot per item as it finishes ([example](#example-seed-and-prompt-variations-with-progressive-preview))
 - A resident `Modal LLM` node for text, image, video, and file understanding — locally on Apple Silicon or on the same remote GPU as the rest of the component
 - A `Modal Endpoint Chat` node for inference through Modal hosted-model endpoints
 - A local in-process execution mode for development and testing, no credentials required
@@ -362,7 +364,7 @@ seed list   ──► Modal Map Input ──► KSampler.seed
 prompt list ──► Modal Map Input ──► CLIPTextEncode.text
 ```
 
-Markers on one channel map the same remote component together: mapped item *i* receives item *i* of every marker's list, and a single-item input is shared by every item. The lists must otherwise have the same length. When they don't, the error names each marker and its item count. The channel's optional `name` is shared by all of its markers and labels them in logs and errors, for example `Modal Map Input 12 on "portraits" (channel 7)`. Without a channel, a component accepts only one `Modal Map Input`; two unchanneled markers feeding one component are rejected at queue time. The channel only steers planning: it is removed before the prompt runs and never crosses the remote boundary.
+Markers on one channel map the same remote component together: mapped item *i* receives item *i* of every marker's list, and a single-item input is shared by every item. The lists must otherwise have the same length; the [example below](#example-seed-and-prompt-variations-with-progressive-preview) shows how to repeat two lists of different lengths so that every combination runs. When they don't, the error names each marker and its item count. The channel's optional `name` is shared by all of its markers and labels them in logs and errors, for example `Modal Map Input 12 on "portraits" (channel 7)`. Without a channel, a component accepts only one `Modal Map Input`; two unchanneled markers feeding one component are rejected at queue time. The channel only steers planning: it is removed before the prompt runs and never crosses the remote boundary.
 
 Each mapped item runs the whole remote chain downstream of its `Modal Map Input` in one call, from the first mapped node to the last remote save. Workers pull the next item as soon as they are free, so a container that is slow to start delays only the items it runs, never the others. Local nodes that read intermediate results of the chain, such as `PreviewImage`, `MaskPreview` or image comparisons, run once the mapped work finishes; use `Remote Progressive Preview` to watch items while they finish. A chain still splits where a local node feeds its output back into later remote nodes, because that local node needs every item before the chain can continue.
 
@@ -371,6 +373,23 @@ Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-b
 ComfyUI-native lists made inside a remote component (for example several `UNETLoader` models joined by `CreateList` into one sampler chain) keep working when the component is split into ordered phases. Each phase-bridge output that holds several list items records its item count, and the next phase fans out once per item, as if a `Modal Map Input` were in place.
 
 Mapped progress is summarized on the global status pill and a representative node with counts such as `3/16`. Fan-out is clamped to `COMFY_MODAL_MAX_INFLIGHT_CALLS`.
+
+#### Example: Seed And Prompt Variations With Progressive Preview
+
+[`examples/Mapped Variations Progressive Preview.json`](examples/Mapped%20Variations%20Progressive%20Preview.json) puts the three nodes together. It renders 4 seeds × 3 prompts through a two-stage `KSampler` cascade and previews both stages while the items run. Drag the file onto the canvas and pick your own models; the model names in it are placeholders.
+
+![Twelve mapped seed and prompt variations filling two Remote Progressive Preview nodes](docs/images/modal-map-progressive-preview.png)
+
+*The preview images in this screenshot are placeholders, not model output. Stage 1 has received all 12 items; stage 2 has received 7 of 12, in completion order.*
+
+From left to right:
+
+1. **Variation lists (local).** Four `Int` seeds and three `Text (Multiline)` prompts each go into a `Create List` node.
+2. **Every combination.** A channel zips lists item by item, so a 4-item list and a 3-item list cannot share one. A second `Create List` repeats the seed list 3 times and the prompt list 4 times. Both lists then have 12 items, and because 4 and 3 share no common factor, item *i* pairs seed *i* mod 4 with prompt *i* mod 3, which covers all 12 combinations exactly once. To pair lists one to one instead (prompt *i* with seed *i*), give them the same length and skip the repeat.
+3. **Channel and markers (local).** Each list passes through its own `Modal Map Input`. Both markers take their `channel` input from one `Modal Input Channel` named `variations`. The seed marker feeds the `seed` input of both samplers and the prompt marker feeds the positive `CLIP Text Encode`, so both stages of an item share one seed and one prompt.
+4. **Remote region.** The loaders, both text encoders, the empty latent, both samplers, the latent upscale and both `VAE Decode` nodes have **Run Remotely** enabled. Stage 1 samples at 768 × 768; its latent is upscaled 1.5× and refined by stage 2 at 0.45 denoise. The loaders run once and all 12 items share them.
+5. **Progressive previews (local).** One `Remote Progressive Preview` reads the stage 1 decode and another reads the stage 2 decode. Each shows 12 empty slots when the run starts and fills a slot as soon as that item's image is ready.
+6. **Capacity.** The `Modal Configuration` allows 4 containers, so up to 4 items run at once.
 
 ### Remote Progressive Preview
 
@@ -396,6 +415,8 @@ A 3-D tensor whose type is unknown (a local value) is treated as a single image 
 Use it in place of `PreviewImage` when the same remote output also feeds later remote nodes. That output stays in remote session storage, and the progressive node handles the session references itself, so no separate local download step is added. Only a slot that was never streamed is downloaded at the end. On SSH and Vast.ai back-ends, the host cannot read remote session storage, so the final value is delivered through ComfyUI as usual. Streamed slots still fill in progressively there.
 
 A non-mapped remote component fills a single slot when it finishes. The node must be wired directly to the remote output; slots are not streamed through intermediate local nodes.
+
+The [mapped variations example](#example-seed-and-prompt-variations-with-progressive-preview) uses two of these nodes to watch both stages of a sampler cascade.
 
 ## LLM Nodes
 
@@ -699,7 +720,7 @@ COMFY_MODAL_RUN_LIVE_VAST=1 uv run pytest -q tests/test_live_vast_canary.py
 
 The repository is structured as a ComfyUI Registry node pack with metadata in [`pyproject.toml`](pyproject.toml) and a publish workflow in [`.github/workflows/publish_action.yml`](.github/workflows/publish_action.yml). The registry pack name is `modal-sync`, the display name is `Modal Sync`, and the current publisher id is `ttulttul`.
 
-[`modal_test_workflow.json`](modal_test_workflow.json) is a checked-in smoke artifact from a successful remote run, not a pristine authoring workflow.
+[`modal_test_workflow.json`](modal_test_workflow.json) is a checked-in smoke artifact from a successful remote run, not a pristine authoring workflow. For a workflow to start from, use [`examples/Mapped Variations Progressive Preview.json`](examples/Mapped%20Variations%20Progressive%20Preview.json).
 
 ## Current Limitations
 

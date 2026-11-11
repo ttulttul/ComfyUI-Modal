@@ -117,6 +117,11 @@
 !/vast_service.py
 !/vllm_instrumentation.py
 
+!/examples/
+/examples/*
+!/examples/*.json
+!/examples/*.png
+
 !/docs/
 /docs/*
 !/docs/ARCHITECTURE.md
