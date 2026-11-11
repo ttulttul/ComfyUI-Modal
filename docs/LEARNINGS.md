@@ -999,3 +999,10 @@ Measuring this needs an unthrottled browser: hidden preview tabs cap `requestAni
 
 The panel also did not fit the node in Nodes 1.0: cells were `aspect-ratio: 1` squares sized from the width, so a short, wide node overflowed and scrolled. The grid now measures itself with a `ResizeObserver` and picks the column count and pixel cell size that make every slot as large as possible within the panel (`fitSlotGrid`), using the first image's aspect ratio. Cell sizes depend only on the grid's own box, never on its content, so the observer cannot feed back into itself.
 
+## A channel zips; repeat coprime lists to get every combination (2026-11-11)
+
+A `Modal Input Channel` only zips: its lists must have the same length, or one item. Sending 4 seeds and 3 prompts through one channel therefore fails with a length error. The example workflow `examples/Mapped Variations Progressive Preview.json` gets all 12 combinations with core nodes only. `Create List` flattens list inputs, so wiring the 4-seed list into a second `Create List` 3 times gives 12 seeds, and wiring the 3-prompt list in 4 times gives 12 prompts. Item *i* then pairs seed *i* mod 4 with prompt *i* mod 3. Because 4 and 3 share no common factor, each pair occurs exactly once. Lists whose lengths share a factor (for example 4 and 2) would repeat some pairs and miss others under this wiring; those need each item of one list repeated in blocks instead.
+
+`tests/test_example_mapped_variations_workflow.py` rebuilds the API prompt links from the saved workflow and runs the real planner on it, so the example cannot drift into a shape the planner rejects.
+
+The README screenshot was taken from a throwaway ComfyUI (current upstream checkout, `--cpu`, empty placeholder model files, no Modal token) driven by headless Chromium. The preview slots were filled by dispatching `modal_progressive_preview` events from the page with placeholder images in ComfyUI's `temp/` folder, so no remote work ran. The local `~/git/ComfyUI` checkout (0.11.1) is too old to load this pack: `Schema.__init__()` rejects `essentials_category`.
