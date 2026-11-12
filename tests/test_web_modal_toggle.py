@@ -418,6 +418,9 @@ def test_configurator_lists_and_kills_exact_managed_capacity() -> None:
     assert "function remoteManagedCapacityEntries(" in source
     assert "function refreshRemoteManagedCapacity(" in source
     assert "function killRemoteManagedCapacity(" in source
+    assert "function scheduleRemoteManagedCapacityPoll(" in source
+    assert "function refreshAllRemoteManagedCapacity(" in source
+    assert "refreshRemoteManagedCapacity(panel, { quiet: true })" in source
     assert "function invalidateRemoteConfiguratorExecutionPlan(panel)" in source
     assert "promptState.remoteExecutionPlanInvalidated = true;" in source
     assert "Any workflow using it will fail. This cannot be undone." in source
