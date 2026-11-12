@@ -163,6 +163,28 @@ def test_ensure_remote_warm_capacity_deduplicates_prompt_slots(
     assert len(submitted_tasks) == 4
     assert [args[1] for _fn, args in submitted_tasks] == [0, 1, 2, 3]
 
+
+def test_warmup_target_is_clamped_to_the_workflow_container_limit(
+    remote_modal_app_module: Any,
+    modal_warmup_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """A warmup must not start more containers than the workflow's instance count."""
+    monkeypatch.delenv("COMFY_MODAL_MAX_CONTAINERS", raising=False)
+    remote_modal_app_module.get_settings.cache_clear()
+    try:
+        limited = modal_warmup_module._clamp_prompt_warmup_target(
+            12, {"prompt_id": "prompt-1", "modal_max_containers": 2}
+        )
+        unlimited = modal_warmup_module._clamp_prompt_warmup_target(
+            12, {"prompt_id": "prompt-1"}
+        )
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert limited == 2
+    assert unlimited == 12
+
 def test_speculative_affinity_prewarm_is_distinct_and_deduplicated(
     remote_modal_app_module: Any,
     modal_warmup_module: Any,
@@ -1815,9 +1837,9 @@ def test_warmup_slot_payload_preserves_dispatch_runtime_fingerprint(
         warmup_fingerprint = (
             modal_deployment_module._expected_remote_runtime_fingerprint(slot_payload)
         )
-        default_fingerprint = (
+        other_gpu_fingerprint = (
             modal_deployment_module._expected_remote_runtime_fingerprint(
-                {"modal_gpu": "B300"}
+                {"modal_gpu": "T4"}
             )
         )
     finally:
@@ -1825,4 +1847,4 @@ def test_warmup_slot_payload_preserves_dispatch_runtime_fingerprint(
 
     assert slot_payload["modal_max_containers"] == 7
     assert warmup_fingerprint == dispatch_fingerprint
-    assert default_fingerprint != dispatch_fingerprint
+    assert other_gpu_fingerprint != dispatch_fingerprint

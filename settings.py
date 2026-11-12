@@ -254,10 +254,13 @@ def modal_deployment_app_name(settings: ModalSyncSettings) -> str:
 
 
 MODAL_DEPLOYMENT_PAYLOAD_FIELDS = ("modal_gpu", "modal_max_containers")
-"""Payload fields that select deployment settings and so shape the runtime fingerprint.
+"""Payload fields that select the Modal app and the container limit for a call.
 
-Any payload derived from another (warmups, prewarm targets, mapped phases) must
-copy these, or it will expect a different fingerprint for the same Modal app.
+``modal_gpu`` picks the deployed app and shapes its runtime fingerprint.
+``modal_max_containers`` is the workflow's container limit, enforced per call on
+the host; it does not shape the deployment. Any payload derived from another
+(warmups, prewarm targets, mapped phases) must copy both, or it will target a
+different app or run under a different limit.
 """
 
 MODAL_GLOBAL_COOLDOWN_FIELD = "modal_global_cooldown_seconds"

@@ -173,10 +173,17 @@ def _ensure_prompt_warmup_state(prompt_id: str) -> _PromptWarmupState:
     return state
 
 
-def _clamp_prompt_warmup_target(warmup_target: int) -> int:
-    """Clamp one proactive warmup target to the configured Modal container cap."""
+def _clamp_prompt_warmup_target(
+    warmup_target: int, payload: Mapping[str, Any] | None = None
+) -> int:
+    """Clamp one proactive warmup target to the payload's container limit.
+
+    The deployed app carries no per-workflow limit, so this is what stops a
+    warmup from starting more containers than the workflow allows.
+    """
     normalized_target = max(0, int(warmup_target))
-    max_containers = get_settings().max_containers
+    settings = _settings_for_payload(payload) if payload is not None else get_settings()
+    max_containers = settings.max_containers
     if max_containers is not None:
         return min(normalized_target, max_containers)
     return normalized_target
@@ -608,7 +615,7 @@ def _prompt_parallelism_target(
     fallback_parallelism = metadata.get("estimated_max_parallel_requests")
     if stage_parallelism <= 0 and isinstance(fallback_parallelism, int):
         stage_parallelism = max(stage_parallelism, fallback_parallelism)
-    return _clamp_prompt_warmup_target(max(1, stage_parallelism))
+    return _clamp_prompt_warmup_target(max(1, stage_parallelism), payload)
 
 
 def _register_exact_component_parallelism(
@@ -624,7 +631,7 @@ def _register_exact_component_parallelism(
         else None
     )
     if not prompt_id or not component_id:
-        return _clamp_prompt_warmup_target(component_parallelism)
+        return _clamp_prompt_warmup_target(component_parallelism, payload)
 
     with _PROMPT_WARMUP_STATES_LOCK:
         warmup_state = _ensure_prompt_warmup_state(prompt_id)
@@ -877,7 +884,7 @@ def ensure_remote_warm_capacity(
     if prompt_id is None:
         return 0
 
-    clamped_target = _clamp_prompt_warmup_target(warmup_target)
+    clamped_target = _clamp_prompt_warmup_target(warmup_target, warmup_request)
     if clamped_target <= 0:
         return 0
 

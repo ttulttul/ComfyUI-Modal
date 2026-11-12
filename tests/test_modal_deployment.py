@@ -1778,6 +1778,16 @@ def test_remote_modal_refuses_to_stop_app_validated_by_this_process(
     sibling_payload = {"component_id": "component-1", "modal_max_containers": 4}
     warmup_payload = {"component_id": "component-1::warmup:0", "warmup_only": True}
     sibling_version_payload = _current_remote_runtime_payload(remote_modal_app_module)
+    current_fingerprint = modal_deployment_module._expected_remote_runtime_fingerprint
+    monkeypatch.setattr(
+        modal_deployment_module,
+        "_expected_remote_runtime_fingerprint",
+        lambda payload=None: (
+            "divergent-fingerprint"
+            if payload is warmup_payload
+            else current_fingerprint(payload)
+        ),
+    )
     monkeypatch.setattr(
         modal_deployment_module,
         "_stop_modal_app_for_replacement",
@@ -1812,6 +1822,56 @@ def test_remote_modal_refuses_to_stop_app_validated_by_this_process(
 
     assert stop_calls == []
     assert deploy_calls == []
+
+
+def test_workflow_container_count_does_not_shape_the_deployment(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """Workflows with different instance counts must share one deployed app."""
+    monkeypatch.delenv("COMFY_MODAL_MAX_CONTAINERS", raising=False)
+    remote_modal_app_module.get_settings.cache_clear()
+    two_containers = {"component_id": "a", "modal_gpu": "L40S", "modal_max_containers": 2}
+    four_containers = {"component_id": "b", "modal_gpu": "L40S", "modal_max_containers": 4}
+    other_gpu = {"component_id": "c", "modal_gpu": "T4", "modal_max_containers": 2}
+    try:
+        assert modal_deployment_module._modal_runtime_cache_key(
+            two_containers
+        ) == modal_deployment_module._modal_runtime_cache_key(four_containers)
+        assert modal_deployment_module._modal_runtime_cache_key(
+            two_containers
+        ) != modal_deployment_module._modal_runtime_cache_key(other_gpu)
+        assert modal_deployment_module._settings_for_payload(four_containers).max_containers == 4
+        workflow_settings = modal_deployment_module._settings_for_payload(four_containers)
+        with modal_deployment_module._modal_cloud_settings_override(workflow_settings):
+            deployed = modal_deployment_module._MODAL_CLOUD_SETTINGS_STATE.settings
+        assert deployed.modal_gpu == "L40S"
+        assert deployed.max_containers is None
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+
+def test_installation_container_limit_still_shapes_the_deployment(
+    remote_modal_app_module: Any,
+    modal_deployment_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The installation-wide limit stays the deployed cap and part of the fingerprint."""
+    payload = {"component_id": "a", "modal_max_containers": 2}
+    try:
+        monkeypatch.delenv("COMFY_MODAL_MAX_CONTAINERS", raising=False)
+        remote_modal_app_module.get_settings.cache_clear()
+        unlimited = modal_deployment_module._expected_remote_runtime_fingerprint(payload)
+        monkeypatch.setenv("COMFY_MODAL_MAX_CONTAINERS", "3")
+        remote_modal_app_module.get_settings.cache_clear()
+        limited = modal_deployment_module._expected_remote_runtime_fingerprint(payload)
+        settings = modal_deployment_module._settings_for_payload(payload)
+        assert modal_deployment_module._deployment_settings(settings).max_containers == 3
+    finally:
+        remote_modal_app_module.get_settings.cache_clear()
+
+    assert unlimited != limited
 
 
 @pytest.mark.parametrize(
