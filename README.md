@@ -173,10 +173,10 @@ When the run finishes, the image is downloaded into the local `output/` director
 
 #### Instance count
 
-`instance_count` is a hard ceiling on the GPU containers one Modal Configuration uses. Two mechanisms enforce it together:
+`instance_count` caps the GPU containers one Modal Configuration keeps busy. It is enforced on the ComfyUI host for each call and is not part of the deployed app, so workflows with different counts share one app per GPU type and changing the count never redeploys it. Two mechanisms work together:
 
-- **One container pool per workflow.** Modal gives each distinct `RemoteEngine` parameter set (loader snapshot profile, snapshot mode, pool) its own containers and its own `max_containers`. Remote components that load no models, such as a remote Save Image, therefore inherit the workflow's loader snapshot profile and run in the same containers as the samplers, instead of opening a second pool.
-- **A host-side slot limit.** Every Modal call from ComfyUI holds one of `instance_count` slots for its deployed app while it runs. Mapped components that run side by side share those slots, so busy containers never exceed the limit, even when a workflow mixes several loader profiles. In that mixed case, idle containers from an earlier profile can stay warm until their cooldown ends; the planner logs a warning when this can happen.
+- **One container pool per workflow.** Modal gives each distinct `RemoteEngine` parameter set (loader snapshot profile, snapshot mode, pool) its own containers. Remote components that load no models, such as a remote Save Image, therefore inherit the workflow's loader snapshot profile and run in the same containers as the samplers, instead of opening a second pool.
+- **A host-side slot limit.** Every Modal call from ComfyUI holds one of `instance_count` slots for its deployed app while it runs. Mapped components that run side by side share those slots, so busy containers never exceed the limit, even when a workflow mixes several loader profiles. In that mixed case, idle containers from an earlier profile can stay warm until their cooldown ends; the planner logs a warning when this can happen. Proactive warmups are clamped to the same count.
 
 #### Cooldowns
 
@@ -683,7 +683,7 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 | `COMFY_MODAL_LOCAL_GAP_KEEPALIVE_SECONDS` | `900` | Maximum time to retain a matching worker slot across a remote → local → remote workflow gap; `0` disables pulses. |
 | `COMFY_MODAL_LOCAL_GAP_KEEPALIVE_INTERVAL_SECONDS` | `15` | Seconds between worker-retention pulses during a local gap. |
 | `COMFY_MODAL_MIN_CONTAINERS` | `0` | Minimum warm containers. |
-| `COMFY_MODAL_MAX_CONTAINERS` | unset | Optional upper bound on simultaneously scaled Modal containers. |
+| `COMFY_MODAL_MAX_CONTAINERS` | unset | Optional installation-wide upper bound on simultaneously scaled Modal containers. Unlike a workflow's `instance_count`, it is deployed with each app, so changing it redeploys them. |
 | `COMFY_MODAL_BUFFER_CONTAINERS` | unset | Optional spare warm containers above current load. |
 | `COMFY_MODAL_MAX_INFLIGHT_CALLS` | `4` | Maximum local remote calls dispatched at once; mapped fan-out is clamped to this budget. |
 | `COMFY_MODAL_EXECUTION_TIMEOUT_SECONDS` | `3600` | Maximum runtime for one remote workflow call. |

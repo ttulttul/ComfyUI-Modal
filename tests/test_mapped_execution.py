@@ -2633,7 +2633,7 @@ def test_mapped_phase_payloads_preserve_parent_runtime_fingerprint(
 
     assert parent_fingerprint != (
         modal_deployment_module._expected_remote_runtime_fingerprint(
-            {"modal_gpu": "B300"}
+            {"modal_gpu": "T4"}
         )
     )
     for derived_payload in derived_payloads:

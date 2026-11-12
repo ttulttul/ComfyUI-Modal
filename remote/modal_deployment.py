@@ -136,11 +136,20 @@ def _settings_for_payload(payload: Mapping[str, Any]) -> ModalSyncSettings:
         raise ValueError("modal_max_containers must be positive.")
     return replace(settings, max_containers=max_containers)
 
+def _deployment_settings(settings: ModalSyncSettings) -> ModalSyncSettings:
+    """Return the settings a deployed Modal app is built from.
+
+    A workflow's container count is enforced per call by ``MODAL_CONTAINER_SLOTS``
+    and never shapes the deployment, so workflows with different counts share one
+    app per GPU instead of redeploying it. Only the installation-wide limit applies.
+    """
+    return replace(settings, max_containers=get_settings().max_containers)
+
 @contextmanager
 def _modal_cloud_settings_override(settings: ModalSyncSettings) -> Iterator[None]:
     """Expose request-specific settings while constructing the deployable cloud module."""
     previous_settings = getattr(_MODAL_CLOUD_SETTINGS_STATE, "settings", None)
-    _MODAL_CLOUD_SETTINGS_STATE.settings = settings
+    _MODAL_CLOUD_SETTINGS_STATE.settings = _deployment_settings(settings)
     try:
         yield
     finally:
@@ -501,7 +510,9 @@ def _expected_remote_runtime_fingerprint(
 ) -> str:
     """Return the exact deployment fingerprint required by this local client."""
     settings = _settings_for_payload(payload) if payload is not None else get_settings()
-    return _remote_runtime_identity_for_settings(settings).fingerprint
+    return _remote_runtime_identity_for_settings(
+        _deployment_settings(settings)
+    ).fingerprint
 
 def _modal_runtime_cache_key(
     payload: Mapping[str, Any] | None = None,
