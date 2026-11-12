@@ -1006,3 +1006,8 @@ A `Modal Input Channel` only zips: its lists must have the same length, or one i
 `tests/test_example_mapped_variations_workflow.py` rebuilds the API prompt links from the saved workflow and runs the real planner on it, so the example cannot drift into a shape the planner rejects.
 
 The README screenshot was taken from a throwaway ComfyUI (current upstream checkout, `--cpu`, empty placeholder model files, no Modal token) driven by headless Chromium. The preview slots were filled by dispatching `modal_progressive_preview` events from the page with placeholder images in ComfyUI's `temp/` folder, so no remote work ran. The local `~/git/ComfyUI` checkout (0.11.1) is too old to load this pack: `Schema.__init__()` rejects `essentials_category`.
+
+## 2026-11-11: Managed capacity must be polled, not fetched once
+
+- The Configurator's Managed capacity list was fetched only when the panel mounted and when **Reload** was clicked, yet it kept an "Updated" label. After a run on one Modal GPU, a later run on another GPU still showed the earlier run's containers. An inventory of live cloud resources is not a one-shot payload: poll it quietly (5 s while a prompt is active, 30 s while idle resources remain, stopped when idle and empty), refresh at prompt start and terminal, and redraw only when the row signature changes so KILL buttons are not rebuilt under the pointer.
+- The Vast inventory route calls the Vast API, so automatic polls reuse an answer younger than 30 s; a manual Reload or a kill always refetches.

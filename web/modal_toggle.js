@@ -131,6 +131,9 @@ const BYTE_SCALE = 1000;
 const CONTAINER_STATUS_FAST_POLL_MS = 1500;
 const CONTAINER_STATUS_STABLE_POLL_MS = 5000;
 const CONTAINER_STATUS_HIDDEN_POLL_MS = 15000;
+const MANAGED_CAPACITY_ACTIVE_POLL_MS = 5000;
+const MANAGED_CAPACITY_IDLE_POLL_MS = 30000;
+const MANAGED_CAPACITY_VAST_MAX_AGE_MS = 30000;
 const CONTAINER_STATUS_MAX_BACKOFF_MS = 30000;
 
 const modalNodeStates = new Map();
@@ -149,6 +152,7 @@ const syntheticPromptUiStates = new Map();
 const modalGlobalStatusStates = new Map();
 const remoteLocationIconImages = new Map();
 const remoteConfiguratorPanels = new Map();
+let managedCapacityPollTimer = null;
 const REMOTE_CONFIGURATOR_WIDGET_WIDTH_VALUE = "__comfyModalResponsiveWidth";
 const REMOTE_CONFIGURATOR_WIDGET_WIDTH_GUARD = "__comfyModalResponsiveWidthGuard";
 
@@ -4159,8 +4163,73 @@ function renderRemoteManagedCapacity(panel, entries) {
   panel.capacityHeight = 29 + Math.max(20, entries.length * 49);
 }
 
-/** Reload all managed Vast leases and Modal containers shown by one panel. */
-async function refreshRemoteManagedCapacity(panel, { preserveStatus = false } = {}) {
+/** Return a stable identity for the rows a managed-capacity list displays. */
+function remoteManagedCapacitySignature(entries) {
+  return JSON.stringify(
+    entries.map((entry) => [
+      entry.provider,
+      entry.resourceId,
+      entry.title,
+      entry.state,
+      entry.active,
+      entry.details,
+    ]),
+  );
+}
+
+/** Show or hide the loading affordances of one managed-capacity refresh. */
+function setRemoteManagedCapacityLoading(panel, loading, showStatus) {
+  panel.capacityRefreshInFlight = loading;
+  panel.capacityReload.disabled = loading;
+  panel.capacityReload.textContent = loading ? "Reloading…" : "Reload";
+  if (loading && showStatus) {
+    panel.capacityRefreshStatus.hidden = false;
+    panel.capacityRefreshStatus.dataset.state = "loading";
+    panel.capacityRefreshStatus.textContent = "Refreshing capacity";
+    panel.capacityRefreshStatus.title = "";
+  }
+}
+
+/** Fetch Vast leases, reusing a recent answer during automatic polling. */
+async function requestRemoteManagedVastStatus(panel, allowCached) {
+  const cached = panel.capacityVastSnapshot;
+  if (
+    allowCached &&
+    cached &&
+    nowMs() - cached.fetchedAt < MANAGED_CAPACITY_VAST_MAX_AGE_MS
+  ) {
+    return cached.payload;
+  }
+  const payload = await requestRemoteCapacityJson(VAST_STATUS_ROUTE);
+  panel.capacityVastSnapshot = { payload, fetchedAt: nowMs() };
+  return payload;
+}
+
+/** Report the outcome of one managed-capacity refresh beside the Reload button. */
+function renderRemoteManagedCapacityOutcome(panel, errors, entryCount, preserveStatus) {
+  const status = panel.capacityRefreshStatus;
+  if (errors.length > 0) {
+    status.hidden = false;
+    status.dataset.state = "error";
+    status.textContent = entryCount > 0 ? "Partially refreshed" : "Refresh failed";
+    status.title = errors.join("\n");
+  } else if (!preserveStatus) {
+    status.hidden = false;
+    status.dataset.state = "success";
+    status.textContent = "Updated";
+    status.title = `Last refreshed ${new Date().toLocaleTimeString()}`;
+  }
+}
+
+/**
+ * Reload all managed Vast leases and Modal containers shown by one panel.
+ * A quiet refresh is an automatic poll: it shows no loading state and redraws
+ * only when the listed resources actually changed.
+ */
+async function refreshRemoteManagedCapacity(
+  panel,
+  { preserveStatus = false, quiet = false } = {},
+) {
   if (
     !panel ||
     panel.capacityRefreshInFlight ||
@@ -4168,17 +4237,13 @@ async function refreshRemoteManagedCapacity(panel, { preserveStatus = false } = 
   ) {
     return;
   }
-  panel.capacityRefreshInFlight = true;
-  panel.capacityReload.disabled = true;
-  panel.capacityReload.textContent = "Reloading…";
-  if (!preserveStatus) {
-    panel.capacityRefreshStatus.hidden = false;
-    panel.capacityRefreshStatus.dataset.state = "loading";
-    panel.capacityRefreshStatus.textContent = "Refreshing capacity";
-    panel.capacityRefreshStatus.title = "";
+  if (quiet) {
+    panel.capacityRefreshInFlight = true;
+  } else {
+    setRemoteManagedCapacityLoading(panel, true, !preserveStatus);
   }
   const results = await Promise.allSettled([
-    requestRemoteCapacityJson(VAST_STATUS_ROUTE),
+    requestRemoteManagedVastStatus(panel, quiet),
     requestRemoteCapacityJson(`${MODAL_CONTAINER_STATUS_ROUTE}?include_billing=false`),
   ]);
   const errors = results
@@ -4188,22 +4253,75 @@ async function refreshRemoteManagedCapacity(panel, { preserveStatus = false } = 
     results[0].status === "fulfilled" ? results[0].value : {},
     results[1].status === "fulfilled" ? results[1].value : {},
   );
-  renderRemoteManagedCapacity(panel, entries);
-  if (errors.length > 0) {
-    panel.capacityRefreshStatus.hidden = false;
-    panel.capacityRefreshStatus.dataset.state = "error";
-    panel.capacityRefreshStatus.textContent = entries.length > 0 ? "Partially refreshed" : "Refresh failed";
-    panel.capacityRefreshStatus.title = errors.join("\n");
-  } else if (!preserveStatus) {
-    panel.capacityRefreshStatus.hidden = false;
-    panel.capacityRefreshStatus.dataset.state = "success";
-    panel.capacityRefreshStatus.textContent = "Updated";
-    panel.capacityRefreshStatus.title = "";
+  const signature = remoteManagedCapacitySignature(entries);
+  const changed = signature !== panel.capacitySignature;
+  panel.capacitySignature = signature;
+  panel.capacityEntryCount = entries.length;
+  if (changed || !quiet) {
+    renderRemoteManagedCapacity(panel, entries);
   }
-  panel.capacityRefreshInFlight = false;
-  panel.capacityReload.disabled = false;
-  panel.capacityReload.textContent = "Reload";
-  renderRemoteConfiguratorPlan(panel, panel.assignments, panel.configurations);
+  renderRemoteManagedCapacityOutcome(panel, errors, entries.length, preserveStatus);
+  if (quiet) {
+    panel.capacityRefreshInFlight = false;
+  } else {
+    setRemoteManagedCapacityLoading(panel, false, false);
+  }
+  if (changed || !quiet) {
+    renderRemoteConfiguratorPlan(panel, panel.assignments, panel.configurations);
+  }
+  scheduleRemoteManagedCapacityPoll();
+}
+
+/**
+ * Return how long to wait before the next automatic managed-capacity refresh.
+ * Polling is fast while a prompt runs, slow while idle resources remain listed,
+ * and stops when nothing is running and nothing is listed.
+ * @returns {number | null}
+ */
+function remoteManagedCapacityPollDelay() {
+  const panels = Array.from(remoteConfiguratorPanels.values());
+  if (panels.length === 0) {
+    return null;
+  }
+  const promptActive =
+    currentGlobalStatus() != null ||
+    panels.some((panel) => {
+      const promptId = String(panel.promptId ?? "");
+      return modalPromptStates.has(promptId) && !isPromptTerminal(promptId);
+    });
+  const resourcesListed = panels.some((panel) => panel.capacityEntryCount > 0);
+  if (!promptActive && !resourcesListed) {
+    return null;
+  }
+  const visible =
+    typeof document === "undefined" || document.visibilityState === "visible";
+  return promptActive && visible
+    ? MANAGED_CAPACITY_ACTIVE_POLL_MS
+    : MANAGED_CAPACITY_IDLE_POLL_MS;
+}
+
+/** Arm the next automatic managed-capacity refresh when one is warranted. */
+function scheduleRemoteManagedCapacityPoll() {
+  if (managedCapacityPollTimer != null) {
+    return;
+  }
+  const delayMs = remoteManagedCapacityPollDelay();
+  if (delayMs == null) {
+    return;
+  }
+  managedCapacityPollTimer = setTimeout(() => {
+    managedCapacityPollTimer = null;
+    refreshAllRemoteManagedCapacity();
+  }, delayMs);
+  managedCapacityPollTimer?.unref?.();
+}
+
+/** Quietly refresh every mounted managed-capacity list, then keep polling. */
+function refreshAllRemoteManagedCapacity() {
+  for (const panel of remoteConfiguratorPanels.values()) {
+    void refreshRemoteManagedCapacity(panel, { quiet: true });
+  }
+  scheduleRemoteManagedCapacityPoll();
 }
 
 /** Return compact GPU-memory and RAM capacity labels for one target. */
@@ -4441,6 +4559,7 @@ function registerPromptConfigurator(promptId, configuratorNodeId) {
       statusMessage: "Preparing remote workflow",
     });
     renderRemoteConfiguratorGpuUsage(panel, modalGpuUsageByPrompt.get(promptId) ?? null);
+    refreshAllRemoteManagedCapacity();
   }
 }
 
@@ -4639,6 +4758,7 @@ function setRemoteConfiguratorTerminalStatus(promptId, phase, message = null) {
     return;
   }
   renderRemoteConfiguratorStatus(panel, terminalState);
+  refreshAllRemoteManagedCapacity();
   for (const [environmentId, row] of panel.environmentRows.entries()) {
     renderRemoteConfiguratorEnvironmentStatus(
       row,
@@ -4955,6 +5075,9 @@ function mountRemoteExecutionConfiguratorPanel(node) {
     storageRefreshInFlight: false,
     keychainUnlockInFlight: false,
     capacityRefreshInFlight: false,
+    capacitySignature: null,
+    capacityEntryCount: 0,
+    capacityVastSnapshot: null,
     capacityKillInFlight: null,
     assignments: {},
     configurations: [],

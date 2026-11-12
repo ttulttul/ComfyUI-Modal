@@ -160,6 +160,7 @@ const transformedSource = `${[
   "  unlockRemoteConfiguratorKeychain,",
   "  remoteManagedCapacityEntries,",
   "  refreshRemoteManagedCapacity,",
+  "  remoteManagedCapacityPollDelay,",
   "  killRemoteManagedCapacity,",
   "  remoteStorageSizeLabel,",
   "  remoteStorageUsageLabel,",
@@ -2157,3 +2158,60 @@ modalToggle.clearRefocusCompletedPrompt("newer-prompt", failedHistoryOutcome);
 assert.equal(retainedPanel.statusText.textContent, "SSH worker has no GPU");
 assert.equal(retainedPanel.root.dataset.phase, "error");
 assert.equal(modalToggle.modalPromptStates.has("newer-prompt"), false);
+
+const capacityRoutes = [];
+let listedModalGpu = "RTX-PRO-6000";
+globalThis.__modalApiStub.fetchApi = async (route) => {
+  capacityRoutes.push(route);
+  const payload = route === "/remote/vast/status"
+    ? { leases: [] }
+    : {
+        containers: [
+          { container_id: `ta-${listedModalGpu}`, modal_gpu: listedModalGpu, state: "running" },
+        ],
+      };
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    async json() {
+      return payload;
+    },
+  };
+};
+const capacitySummary = () =>
+  retainedPanel.capacityList.children[0].children[2].textContent;
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(retainedPanel.capacityRefreshInFlight, false);
+capacityRoutes.length = 0;
+retainedPanel.capacityVastSnapshot = null;
+await modalToggle.refreshRemoteManagedCapacity(retainedPanel);
+assert.match(capacitySummary(), /RTX-PRO-6000/);
+assert.equal(capacityRoutes.filter((route) => route === "/remote/vast/status").length, 1);
+assert.equal(
+  modalToggle.remoteManagedCapacityPollDelay(),
+  30000,
+  "idle listed containers must keep being polled until they scale down",
+);
+
+listedModalGpu = "B300";
+const cardBeforeQuietRefresh = retainedPanel.capacityList.children[0];
+await modalToggle.refreshRemoteManagedCapacity(retainedPanel, { quiet: true });
+assert.match(capacitySummary(), /B300/, "automatic polling must replace stale containers");
+assert.notEqual(retainedPanel.capacityList.children[0], cardBeforeQuietRefresh);
+assert.equal(
+  capacityRoutes.filter((route) => route === "/remote/vast/status").length,
+  1,
+  "automatic polling reuses a recent Vast inventory",
+);
+const unchangedCard = retainedPanel.capacityList.children[0];
+await modalToggle.refreshRemoteManagedCapacity(retainedPanel, { quiet: true });
+assert.equal(
+  retainedPanel.capacityList.children[0],
+  unchangedCard,
+  "an unchanged poll must not rebuild the KILL buttons",
+);
+
+modalToggle.registerPromptConfigurator("capacity-poll-prompt", "381");
+assert.equal(modalToggle.remoteManagedCapacityPollDelay(), 5000);
+modalToggle.modalPromptStates.delete("capacity-poll-prompt");
