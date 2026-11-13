@@ -492,8 +492,21 @@ def _resolve_runtime_asset_path(value: str) -> str:
     return str(materialized_path)
 
 
+def _is_uninitialized_comfy_wrapper(value: Any) -> bool:
+    """Return whether a ComfyUI VAE/CLIP wrapper was built without weights and cannot clone.
+
+    ComfyUI returns a placeholder VAE (no ``patcher``) when a checkpoint has no VAE weights,
+    for example SAM checkpoints loaded through CheckpointLoaderSimple. Its ``clone`` raises
+    AttributeError, so the placeholder must be passed through unchanged.
+    """
+    return type(value).__module__ == "comfy.sd" and not hasattr(value, "patcher")
+
+
 def _clone_loader_cache_value(value: Any) -> Any:
     """Clone a cached loader output when the runtime object supports safe cloning."""
+    if _is_uninitialized_comfy_wrapper(value):
+        logger.debug("Skipping clone of uninitialized %s loader output.", type(value).__name__)
+        return value
     clone_method = getattr(value, "clone", None)
     if callable(clone_method):
         return clone_method()

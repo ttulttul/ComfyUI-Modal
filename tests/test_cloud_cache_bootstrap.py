@@ -552,6 +552,28 @@ def test_modal_cloud_loader_cache_reuses_and_clones_outputs(
     assert first is not second
     assert metrics_snapshot == {"hit": 1, "miss": 2}
 
+
+def test_loader_cache_passes_through_uninitialized_comfy_vae() -> None:
+    """A weightless ComfyUI VAE (no patcher) must pass through instead of crashing on clone."""
+
+    class VAE:
+        """Stand-in for comfy.sd.VAE built from a checkpoint without VAE weights."""
+
+        def clone(self) -> "VAE":
+            """Mirror ComfyUI's clone, which dereferences the missing patcher."""
+            return self.patcher.clone()  # type: ignore[attr-defined]
+
+    VAE.__module__ = "comfy.sd"
+    bootstrap_owner = _cloud_comfy_bootstrap_owner()
+    placeholder = VAE()
+    cloneable = _CloneableCacheValue("ok")
+
+    outputs = bootstrap_owner._clone_loader_cache_outputs((placeholder, cloneable))
+
+    assert outputs[0] is placeholder
+    assert outputs[1] is not cloneable
+    assert outputs[1].value == "ok"
+
 def test_modal_cloud_installs_loader_cache_wrappers_for_builtin_loaders(
     modal_cloud_module: Any,
     monkeypatch: Any,

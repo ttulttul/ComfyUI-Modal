@@ -1018,3 +1018,10 @@ The README screenshot was taken from a throwaway ComfyUI (current upstream check
 - The deployed limit was also not what the fingerprint claimed: `_load_modal_cloud_module` reuses the cached cloud module by GPU, app name, and secret, so a redeploy in the same process kept the first workflow's `max_containers`.
 - `_deployment_settings` now resets `max_containers` to the installation value (`COMFY_MODAL_MAX_CONTAINERS`) for both the fingerprint and `_modal_cloud_settings_override`. The workflow count is enforced only on the host: `MODAL_CONTAINER_SLOTS` for calls and `_clamp_prompt_warmup_target` for proactive warmups. The warmup clamp previously read only the installation value and relied on Modal's deployed cap, so it now reads the payload's count.
 - This supersedes the 2026-11-05 note that called `modal_max_containers` fingerprint-shaping. Derived payloads must still copy it, because it sets their slot and warmup limits.
+
+
+## Weightless VAE placeholders crash the loader cache (2026-11-12)
+- A checkpoint with no VAE weights (for example `sam3.1_multiplex_fp16.safetensors` through `CheckpointLoaderSimple`) makes ComfyUI return a placeholder `comfy.sd.VAE` that has no `patcher`. Its `clone()` raises `AttributeError`.
+- The loader cache clones every output, so loader prewarm failed while the container started. Modal marked `RemoteEngine` as crash-looping, and the local ComfyUI call sat waiting for a container with no error shown locally.
+- `_clone_loader_cache_value` now passes `comfy.sd` wrappers that have no `patcher` through unchanged.
+- To diagnose a "stuck" run, look at `modal app list` (Tasks > 0 but `modal container list` empty) and `modal app logs <app-id>` for "crash-looping" before you blame GPU availability.
