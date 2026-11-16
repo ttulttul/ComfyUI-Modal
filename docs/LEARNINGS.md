@@ -1025,3 +1025,9 @@ The README screenshot was taken from a throwaway ComfyUI (current upstream check
 - The loader cache clones every output, so loader prewarm failed while the container started. Modal marked `RemoteEngine` as crash-looping, and the local ComfyUI call sat waiting for a container with no error shown locally.
 - `_clone_loader_cache_value` now passes `comfy.sd` wrappers that have no `patcher` through unchanged.
 - To diagnose a "stuck" run, look at `modal app list` (Tasks > 0 but `modal container list` empty) and `modal app logs <app-id>` for "crash-looping" before you blame GPU availability.
+
+## Progressive preview lost slots after a backgrounded tab (2026-11-16)
+- The refocus replay buffer (`modal_ui_events.py`) is one 512-entry deque per client. `modal_progress` (one event per sampler step per mapped item), `modal_status`, `modal_gpu_usage`, and `modal_progressive_preview` all shared it. In a mapped run, progress events pushed the preview's `start` and early `slot` events out before the user came back to the tab. The replay then restored only the last few slots, or none, and the panel looked stuck.
+- Progressive preview events now go into a separate per-client snapshot keyed by `(prompt_id, node)` and capped at 16 snapshots. `start` clears it and `slot` fills it. The replay route returns each snapshot as one `phase: "snapshot"` event after the ordinary buffered events.
+- The frontend applies a `snapshot` by replacing every slot at once. It does not reset `viewerIndex`, so an enlarged item stays open across a refocus. A `snapshot` for a prompt that already received its `executed` output is still ignored through `finishedPromptId`.
+- Any future high-value UI state should not share the deque with per-step progress. Store it as latest-state snapshots instead.

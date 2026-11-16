@@ -108,6 +108,10 @@ function applyProgressivePreviewEvent(state, detail) {
     state.slots = new Map();
     return true;
   }
+  if (detail.phase === "snapshot") {
+    applyProgressivePreviewSnapshot(state, detail, declaredCount);
+    return true;
+  }
   if (detail.phase !== "slot") {
     return false;
   }
@@ -115,6 +119,22 @@ function applyProgressivePreviewEvent(state, detail) {
   state.slots.set(slotIndex, normalizePreviewEntries(detail.items ?? detail.images));
   state.slotCount = Math.max(state.slotCount, declaredCount, slotIndex + 1);
   return true;
+}
+
+/**
+ * Replace a slot state with every slot the server accumulated, as replayed after a tab refocus.
+ * @param {SlotState} state
+ * @param {Record<string, any>} detail
+ * @param {number} declaredCount
+ */
+function applyProgressivePreviewSnapshot(state, detail, declaredCount) {
+  const slots = new Map();
+  for (const slot of Array.isArray(detail.slots) ? detail.slots : []) {
+    const slotIndex = Math.max(0, Number(slot?.slot_index) || 0);
+    slots.set(slotIndex, normalizePreviewEntries(slot?.items));
+  }
+  state.slots = slots;
+  state.slotCount = Math.max(declaredCount, ...Array.from(slots.keys(), (index) => index + 1));
 }
 
 /**
