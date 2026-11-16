@@ -182,6 +182,21 @@ assert.equal(state.slotCount, 1);
 assert.equal(preview.progressivePreviewHeaderText(state), "Remote preview · all 1 received");
 assert.equal(preview.applyProgressivePreviewEvent(state, { phase: "bogus", prompt_id: "p2" }), false);
 
+// A refocus snapshot replaces every slot at once, sized by the declared count or highest slot.
+const snapshotState = preview.createSlotState();
+assert.equal(preview.applyProgressivePreviewEvent(snapshotState, {
+  phase: "snapshot", prompt_id: "p9", slot_count: 3,
+  slots: [{ slot_index: 0, items: [{ filename: "s0.png" }] }, { slot_index: 2, items: [{ kind: "text", text: "t" }] }],
+}), true);
+assert.equal(snapshotState.slotCount, 3);
+assert.equal(preview.filledSlotCount(snapshotState), 2);
+assert.equal(snapshotState.slots.get(2)[0].kind, "text");
+preview.applyProgressivePreviewEvent(snapshotState, {
+  phase: "snapshot", prompt_id: "p9", slot_count: 0, slots: [{ slot_index: 4, items: [{ filename: "s4.png" }] }],
+});
+assert.equal(snapshotState.slotCount, 5);
+assert.equal(preview.filledSlotCount(snapshotState), 1);
+
 // Final entries replace the slots one entry per slot; empty finals are ignored.
 assert.equal(preview.applyFinalPreviewOutput(state, { images: [] }), false);
 assert.equal(preview.applyFinalPreviewOutput(state, { images: [{ filename: "x.png" }, { filename: "y.png" }] }), true);
@@ -376,6 +391,22 @@ panel.grid.children[0].dispatch("click");
 assert.equal(handler({ detail: { phase: "start", prompt_id: "p4", node: "7", slot_count: 2 } }), true);
 assert.equal(panel.viewerIndex, null);
 assert.equal(panel.grid.children.length, 2);
+
+// A refocus snapshot catches up slots missed while hidden without closing the open viewer.
+handler({ detail: { phase: "slot", prompt_id: "p4", node: "7", slot_index: 0, slot_count: 2, images: [{ filename: "m0.png" }] } });
+panel.grid.children[0].dispatch("click");
+assert.equal(handler({
+  detail: {
+    phase: "snapshot", prompt_id: "p4", node: "7", slot_count: 2,
+    slots: [
+      { slot_index: 0, items: [{ kind: "image", filename: "m0.png", subfolder: "", type: "temp" }] },
+      { slot_index: 1, items: [{ kind: "image", filename: "m1.png", subfolder: "", type: "temp" }] },
+    ],
+  },
+}), true);
+assert.equal(panel.viewerIndex, 0);
+assert.equal(panel.header.textContent, "Remote preview · all 2 received");
+assert.equal(panel.grid.children[1].children[0].src, viewUrl("m1.png"));
 
 // Outputs restored without an executed event (page reload) still render in the panel.
 const reloadedNode = makeNode(8);

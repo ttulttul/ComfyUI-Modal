@@ -137,6 +137,81 @@ def test_modal_ui_event_replay_is_client_scoped(modal_ui_events_module: Any) -> 
     }
     assert modal_ui_events_module.modal_ui_events_for_client(None) == []
 
+def _clear_modal_ui_replay_state(modal_ui_events_module: Any) -> None:
+    """Reset the module-level replay buffers between tests."""
+    modal_ui_events_module._MODAL_UI_EVENTS_BY_CLIENT.clear()
+    modal_ui_events_module._PROGRESSIVE_PREVIEW_SNAPSHOTS_BY_CLIENT.clear()
+
+
+def _preview_slot_payload(prompt_id: str, slot_index: int, slot_count: int) -> dict[str, Any]:
+    """Return one progressive preview slot websocket payload."""
+    return {
+        "phase": "slot",
+        "prompt_id": prompt_id,
+        "node": "7",
+        "slot_index": slot_index,
+        "slot_count": slot_count,
+        "items": [{"kind": "image", "filename": f"{slot_index}.png", "type": "temp"}],
+    }
+
+
+def test_progressive_preview_replay_survives_progress_event_flood(
+    modal_ui_events_module: Any,
+) -> None:
+    """Preview slots must still replay after a run's progress events overflow the deque."""
+    _clear_modal_ui_replay_state(modal_ui_events_module)
+    record = modal_ui_events_module.record_modal_ui_event
+    record(
+        "modal_progressive_preview",
+        {"phase": "start", "prompt_id": "p1", "node": "7", "slot_count": 3},
+        "client-1",
+    )
+    record("modal_progressive_preview", _preview_slot_payload("p1", 2, 3), "client-1")
+    record("modal_progressive_preview", _preview_slot_payload("p1", 0, 3), "client-1")
+    for step in range(modal_ui_events_module._MODAL_UI_EVENT_LIMIT_PER_CLIENT + 10):
+        record("modal_progress", {"prompt_id": "p1", "value": step}, "client-1")
+
+    replay_events = modal_ui_events_module.modal_ui_events_for_client("client-1")
+
+    preview_events = [e for e in replay_events if e["event"] == "modal_progressive_preview"]
+    assert len(preview_events) == 1
+    assert preview_events[0]["payload"] == {
+        "phase": "snapshot",
+        "prompt_id": "p1",
+        "node": "7",
+        "slot_count": 3,
+        "slots": [
+            {"slot_index": 0, "items": [{"kind": "image", "filename": "0.png", "type": "temp"}]},
+            {"slot_index": 2, "items": [{"kind": "image", "filename": "2.png", "type": "temp"}]},
+        ],
+    }
+    assert modal_ui_events_module.modal_ui_events_for_client("client-2") == []
+
+
+def test_progressive_preview_start_resets_snapshot_and_old_prompts_are_bounded(
+    modal_ui_events_module: Any,
+) -> None:
+    """A repeated start clears slots, and each client keeps only recent prompt snapshots."""
+    _clear_modal_ui_replay_state(modal_ui_events_module)
+    record = modal_ui_events_module.record_modal_ui_event
+    record("modal_progressive_preview", _preview_slot_payload("p1", 0, 2), "client-1")
+    record(
+        "modal_progressive_preview",
+        {"phase": "start", "prompt_id": "p1", "node": "7", "slot_count": 2},
+        "client-1",
+    )
+    payload = modal_ui_events_module.modal_ui_events_for_client("client-1")[0]["payload"]
+    assert payload["slots"] == []
+    assert payload["slot_count"] == 2
+
+    limit = modal_ui_events_module._PROGRESSIVE_PREVIEW_SNAPSHOT_LIMIT_PER_CLIENT
+    for index in range(limit + 3):
+        record("modal_progressive_preview", _preview_slot_payload(f"q{index}", 0, 1), "client-1")
+    replayed = modal_ui_events_module.modal_ui_events_for_client("client-1")
+    assert len(replayed) == limit
+    assert replayed[-1]["payload"]["prompt_id"] == f"q{limit + 2}"
+
+
 def test_progress_state_route_is_queue_route_sibling(api_intercept_module: Any) -> None:
     """The frontend should have a stable sibling route for Modal UI replay."""
     assert api_intercept_module._progress_state_route_path("/modal/queue_prompt") == (
