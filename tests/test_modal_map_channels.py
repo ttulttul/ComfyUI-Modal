@@ -354,6 +354,94 @@ def test_implicit_split_always_splits_channel_inputs_of_any_type(
     assert split == ({"remote_input_0": ["model-a", "model-b"]}, 2)
 
 
+def _crossing_payload(mapped_inputs_key: str) -> dict[str, Any]:
+    """Return a mapped payload with two channel inputs and one static MODEL list."""
+    payload: dict[str, Any] = {
+        "payload_kind": "subgraph",
+        "component_id": "100__mapped",
+        "subgraph_prompt": {
+            "147:5": {"class_type": "CLIPTextEncode", "inputs": {"text": "x"}},
+            "22": {"class_type": "KSampler", "inputs": {"seed": 0}},
+        },
+        "boundary_inputs": [
+            {
+                "proxy_input_name": "remote_input_0",
+                "io_type": "STRING",
+                "targets": [{"node_id": "147:5", "input_name": "text"}],
+            },
+            {
+                "proxy_input_name": "remote_input_1",
+                "io_type": "INT",
+                "targets": [{"node_id": "22", "input_name": "seed"}],
+            },
+            {
+                "proxy_input_name": "static_input_0",
+                "io_type": "LATENT",
+                "targets": [{"node_id": "22", "input_name": "latent_image"}],
+            },
+        ],
+    }
+    if mapped_inputs_key == "mapped_inputs":
+        payload["mapped_inputs"] = [
+            {"proxy_input_name": "remote_input_0", "label": "prompts"},
+            {"proxy_input_name": "remote_input_1", "label": "seeds"},
+        ]
+    else:
+        payload["mapped_input"] = {"proxy_input_name": "remote_input_0", "io_type": "STRING"}
+    return payload
+
+
+def test_implicit_split_crosses_non_channel_lists_with_channel_items(
+    remote_modal_app_module: Any,
+) -> None:
+    """A list outside the channel applies to every mapped item instead of zipping."""
+    prompts = [f"p{index}" for index in range(16)]
+    seeds = list(range(16))
+    models = [{"samples": "model-a"}, {"samples": "model-b"}]
+
+    split_inputs, total_items = remote_modal_app_module._split_batch_boundary_inputs(
+        _crossing_payload("mapped_inputs"),
+        {"remote_input_0": prompts, "remote_input_1": seeds, "static_input_0": models},
+    )
+
+    assert total_items == 32
+    assert split_inputs["remote_input_0"][:4] == ["p0", "p0", "p1", "p1"]
+    assert split_inputs["remote_input_1"][:4] == [0, 0, 1, 1]
+    assert split_inputs["static_input_0"][:4] == models + models
+    assert all(len(items) == 32 for items in split_inputs.values())
+
+
+def test_implicit_split_crosses_lists_with_single_mapped_input(
+    remote_modal_app_module: Any,
+) -> None:
+    """One Modal Map Input still defines the axis that other lists cross."""
+    payload = _crossing_payload("mapped_input")
+    payload["boundary_inputs"] = [payload["boundary_inputs"][0], payload["boundary_inputs"][2]]
+
+    split_inputs, total_items = remote_modal_app_module._split_batch_boundary_inputs(
+        payload,
+        {"remote_input_0": ["a", "b", "c"], "static_input_0": [{"samples": 1}, {"samples": 2}]},
+    )
+
+    assert total_items == 6
+    assert split_inputs["remote_input_0"] == ["a", "a", "b", "b", "c", "c"]
+    assert [item["samples"] for item in split_inputs["static_input_0"]] == [1, 2, 1, 2, 1, 2]
+
+
+def test_implicit_split_without_map_input_still_requires_matching_counts(
+    remote_modal_app_module: Any,
+) -> None:
+    """Plain implicit batching keeps zipped semantics and rejects mismatched lists."""
+    payload = _crossing_payload("mapped_inputs")
+    payload.pop("mapped_inputs")
+
+    with pytest.raises(Exception, match="must all have the same item count"):
+        remote_modal_app_module._split_batch_boundary_inputs(
+            payload,
+            {"remote_input_0": ["a", "b", "c"], "static_input_0": [{"samples": 1}, {"samples": 2}]},
+        )
+
+
 def test_channel_anchor_nodes_cover_local_and_remote_markers(
     remote_graph_analysis_module: Any,
     channels_module: Any,

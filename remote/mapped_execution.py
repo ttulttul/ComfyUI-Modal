@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import itertools
 from dataclasses import dataclass
 import logging
 import threading
@@ -854,7 +855,70 @@ def _split_batch_boundary_inputs(
 
     if not split_inputs:
         return None
+    return _combine_split_boundary_inputs(payload, split_inputs, channel_labels)
 
+
+def _map_axis_input_names(payload: Mapping[str, Any]) -> set[str]:
+    """Return the boundary inputs fed by Modal Map Input markers in one payload."""
+    axis_names = {
+        str(mapped_input["proxy_input_name"])
+        for mapped_input in payload.get("mapped_inputs") or []
+        if mapped_input.get("proxy_input_name")
+    }
+    single_mapped_input = payload.get("mapped_input")
+    if isinstance(single_mapped_input, Mapping) and single_mapped_input.get(
+        "proxy_input_name"
+    ):
+        axis_names.add(str(single_mapped_input["proxy_input_name"]))
+    return axis_names
+
+
+def _combine_split_boundary_inputs(
+    payload: dict[str, Any],
+    split_inputs: dict[str, list[Any]],
+    channel_labels: dict[str, str],
+) -> tuple[dict[str, list[Any]], int]:
+    """Zip Modal Map Input lists together and cross every other list with them.
+
+    Modal Map Input markers define the mapped item axis. Any other multi-item
+    boundary list, such as a list of MODELs from the static phase, applies to
+    every mapped item, so the result holds one item per combination.
+    Components without Modal Map Input markers keep zipped implicit batching.
+    """
+    axis_names = _map_axis_input_names(payload)
+    crossed_inputs = {
+        input_name: items
+        for input_name, items in split_inputs.items()
+        if input_name not in axis_names
+    }
+    if not axis_names or not crossed_inputs:
+        return _zip_split_boundary_inputs(payload, split_inputs, channel_labels)
+
+    axis_inputs = {
+        input_name: items
+        for input_name, items in split_inputs.items()
+        if input_name in axis_names
+    }
+    axis_count = (
+        _zip_split_boundary_inputs(payload, axis_inputs, channel_labels)[1]
+        if axis_inputs
+        else 1
+    )
+    logger.info(
+        "Crossing %d Modal Map Input item(s) of component=%s with non-mapped list inputs %s.",
+        axis_count,
+        payload.get("component_id"),
+        {input_name: len(items) for input_name, items in crossed_inputs.items()},
+    )
+    return _cross_split_boundary_inputs(axis_inputs, axis_count, crossed_inputs)
+
+
+def _zip_split_boundary_inputs(
+    payload: dict[str, Any],
+    split_inputs: dict[str, list[Any]],
+    channel_labels: dict[str, str],
+) -> tuple[dict[str, list[Any]], int]:
+    """Return zipped split inputs, raising when their item counts differ."""
     item_counts = {input_name: len(items) for input_name, items in split_inputs.items()}
     unique_counts = set(item_counts.values())
     if len(unique_counts) != 1:
@@ -864,6 +928,32 @@ def _split_batch_boundary_inputs(
             )
         )
     return split_inputs, next(iter(unique_counts))
+
+
+def _cross_split_boundary_inputs(
+    axis_inputs: dict[str, list[Any]],
+    axis_count: int,
+    crossed_inputs: dict[str, list[Any]],
+) -> tuple[dict[str, list[Any]], int]:
+    """Expand mapped axis items by every combination of the crossed list inputs.
+
+    Items are ordered axis-major: all combinations for mapped item 0 come
+    first, then all combinations for mapped item 1, and so on.
+    """
+    crossed_names = list(crossed_inputs)
+    combinations = list(
+        itertools.product(*(crossed_inputs[input_name] for input_name in crossed_names))
+    )
+    expanded: dict[str, list[Any]] = {
+        input_name: [] for input_name in [*axis_inputs, *crossed_names]
+    }
+    for axis_index in range(axis_count):
+        for combination in combinations:
+            for input_name, items in axis_inputs.items():
+                expanded[input_name].append(items[axis_index])
+            for input_name, item in zip(crossed_names, combination, strict=True):
+                expanded[input_name].append(item)
+    return expanded, axis_count * len(combinations)
 
 
 def _describe_mismatched_batch_counts(

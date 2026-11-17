@@ -416,6 +416,7 @@ The rules:
 - **Equal lengths.** Every list on a channel must have the same number of items. Three seeds and three prompts give three items, not nine.
 - **A single item is shared.** A marker whose value has exactly one item gives that item to every row. One prompt and eight seeds give eight items that all use the prompt.
 - **Mismatches are reported, not guessed.** If two lists have different lengths, and neither has one item, the run stops with an error that names each marker and its item count.
+- **Other lists apply to every item.** A list that reaches the mapped work without a marker is not zipped with the channel. Each mapped item runs once per entry of that list. For example, 16 prompt-and-seed items and a list of 2 `MODEL`s produce 32 runs: item 1 with model A, item 1 with model B, item 2 with model A, and so on. Outputs come back in that order.
 - **The name is a label.** The channel's `name` is shared by its markers and appears in logs and errors, for example `Modal Map Input 12 on "portraits" (channel 7)`. It has no other effect, and it can be left empty.
 - **One channel per component.** All markers that feed one remote component must be on the same channel.
 - **The channel carries no data.** It only steers planning. It is removed before the prompt runs and never crosses the remote boundary, so it costs nothing at run time.
