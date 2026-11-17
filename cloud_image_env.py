@@ -56,17 +56,29 @@ _COMFYUI_IMAGE_EXCLUDED_SUFFIXES = frozenset(
 )
 
 
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _repo_relative_parts(path: Path) -> tuple[str, ...]:
+    """Return the parts of one repo image candidate relative to the repo root."""
+    if path.is_absolute():
+        try:
+            path = path.relative_to(_REPO_ROOT)
+        except ValueError:
+            return tuple(path.parts)
+    return tuple(part for part in path.parts if part not in {"", "."})
+
+
 def _should_ignore_repo_path(path: Path) -> bool:
-    """Return whether a local repo path should be omitted from the Modal image mount."""
-    parts = set(path.parts)
-    if {
-        ".git",
-        ".venv",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-    } & parts:
+    """Return whether a local repo path should be omitted from the Modal image mount.
+
+    Every dot-prefixed file or directory is skipped. Besides VCS and tool
+    caches, that covers runtime caches such as ``.cache/`` that other nodes
+    write into the extension directory while ComfyUI runs; Modal rejects an
+    image build when a file in its context changes mid-build.
+    """
+    parts = _repo_relative_parts(path)
+    if "__pycache__" in parts or any(part.startswith(".") for part in parts):
         return True
     return path.suffix.lower() in {".log", ".pyc", ".pyo", ".swp", ".tmp"}
 
