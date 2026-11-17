@@ -1031,3 +1031,9 @@ The README screenshot was taken from a throwaway ComfyUI (current upstream check
 - Progressive preview events now go into a separate per-client snapshot keyed by `(prompt_id, node)` and capped at 16 snapshots. `start` clears it and `slot` fills it. The replay route returns each snapshot as one `phase: "snapshot"` event after the ordinary buffered events.
 - The frontend applies a `snapshot` by replacing every slot at once. It does not reset `viewerIndex`, so an enlarged item stays open across a refocus. A `snapshot` for a prompt that already received its `executed` output is still ignored through `finishedPromptId`.
 - Any future high-value UI state should not share the deque with per-step progress. Store it as latest-state snapshots instead.
+
+## Non-marker lists cross the Modal Map Input axis (2026-11-17)
+- A mapped component's implicit splitter used to zip every multi-item boundary list, including static-phase outputs such as `static_input_0` holding 2 `MODEL` session refs. With a 16-item channel that raised a "same item count" error, although users expect the 2 models to apply to each of the 16 items.
+- The splitter now treats inputs named in `mapped_inputs` or `mapped_input` as the item axis. Those inputs zip and must have equal counts. Every other multi-item list is crossed with the axis, item-major, so 16 × 2 gives 32 item runs. Components with no Modal Map Input keep ComfyUI-style zipped batching and the mismatch error.
+- A whole list cannot simply be broadcast into each item run instead. Boundary values are injected as literal prompt inputs, and ComfyUI's `get_input_data` wraps a literal as `[value]`, so the sampler would receive the Python list as one `MODEL`. Crossing at the scheduler gives each item run one model.
+- The in-process explicit mapped path (`_execute_mapped_subgraph_payload`, local execution mode) still passes static bridge values whole and does not cross them.
