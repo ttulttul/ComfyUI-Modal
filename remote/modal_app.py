@@ -33,6 +33,7 @@ from ..serialization import (
     split_mapped_value,
     unwrap_mapped_output_value,
 )
+from ..torch_inference import call_in_inference_mode
 from ..durable_state import (
     DurableObjectRef,
     DurableStateError,
@@ -1126,6 +1127,7 @@ async def invoke_remote_engine_async(
             )
     if execution_mode == "local" or modal is None:
         return await asyncio.to_thread(
+            call_in_inference_mode,
             invoke_remote_engine,
             payload,
             kwargs_payload,

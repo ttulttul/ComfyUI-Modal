@@ -706,8 +706,10 @@ class ModalLocalBridgeMaterializer(io.ComfyNode):
     async def execute(cls, bridge_ref: Mapping[str, Any]) -> io.NodeOutput:
         """Materialize the bridge without blocking ComfyUI's async scheduler."""
         from .remote.modal_app import materialize_remote_session_bridge_ref_locally
+        from .torch_inference import call_in_inference_mode
 
         value = await asyncio.to_thread(
+            call_in_inference_mode,
             materialize_remote_session_bridge_ref_locally,
             bridge_ref,
         )

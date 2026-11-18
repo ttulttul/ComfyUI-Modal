@@ -31,6 +31,7 @@ from ..session_state import (
     slot_item_count,
 )
 from ..settings import get_settings
+from ..torch_inference import call_in_inference_mode
 from . import host_session_bridge as _host_session_bridge
 from .host_session_bridge import (
     _RemoteSessionBridgeResolutionStats,
@@ -1372,7 +1373,11 @@ def execute_subgraph_locally(
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
-                _execute_subgraph_prompt, payload, hydrated_inputs, node_mapping
+                call_in_inference_mode,
+                _execute_subgraph_prompt,
+                payload,
+                hydrated_inputs,
+                node_mapping,
             )
             try:
                 outputs = future.result()

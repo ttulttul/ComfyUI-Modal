@@ -103,6 +103,7 @@
 !/sync_hashing.py
 !/sync_protocols.py
 !/sync_r2_transfer.py
+!/torch_inference.py
 !/vast_api.py
 !/vast_config_node.py
 !/vast_executor.py

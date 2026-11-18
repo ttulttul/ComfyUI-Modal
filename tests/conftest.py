@@ -554,6 +554,12 @@ def serialization_module(extension_package: object) -> object:
 
 
 @pytest.fixture(scope="session")
+def torch_inference_module(extension_package: object) -> object:
+    """Return the worker-thread inference-mode helper module."""
+    return importlib.import_module(f"{PACKAGE_NAME}.torch_inference")
+
+
+@pytest.fixture(scope="session")
 def durable_state_module(extension_package: object) -> object:
     """Return the durable invocation and object-storage helpers module."""
     return importlib.import_module(f"{PACKAGE_NAME}.durable_state")

@@ -27,6 +27,7 @@ from ..session_state import (
     is_remote_session_value_ref_payload,
     split_multi_item_bridge_ref,
 )
+from ..torch_inference import call_in_inference_mode
 from .host_session_bridge import _payload_remote_session_handle
 from .local_execution import (
     RemoteSubgraphExecutionError,
@@ -1566,12 +1567,13 @@ async def _invoke_mapped_remote_engine_async(
     """Execute one mapped payload locally using explicit static and mapped phases."""
     hydrated_inputs = deserialize_node_inputs(kwargs_payload)
     return await asyncio.to_thread(
+        call_in_inference_mode,
         lambda: serialize_node_outputs(
             _execute_mapped_subgraph_payload(
                 payload,
                 hydrated_inputs,
             )
-        )
+        ),
     )
 
 
