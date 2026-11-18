@@ -87,6 +87,7 @@ try:
         slot_item_count,
     )
     from .settings import get_settings
+    from .torch_inference import call_in_inference_mode
 except ImportError:  # pragma: no cover - flat Modal-container import.
     from cloud_comfy_bootstrap import (
         _ensure_comfy_runtime_initialized,
@@ -159,6 +160,7 @@ except ImportError:  # pragma: no cover - flat Modal-container import.
         slot_item_count,
     )
     from settings import get_settings
+    from torch_inference import call_in_inference_mode
 
 logger = logging.getLogger(__name__)
 
@@ -1409,6 +1411,7 @@ def execute_subgraph_locally(
             with _timed_phase("subgraph_worker_roundtrip", component=component_id):
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(
+                        call_in_inference_mode,
                         _execute_subgraph_prompt,
                         payload,
                         hydrated_inputs,
