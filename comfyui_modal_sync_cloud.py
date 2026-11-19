@@ -939,11 +939,11 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             self, payload: dict[str, Any], kwargs_payload: bytes
         ) -> bytes:
             """Execute a proxied node or subgraph inside the Modal container."""
-            _observe_remote_workflow_for_llm_mode(payload)
             component_id = payload.get("component_id", "single-node")
             reload_marker = _modal_volume_reload_marker(payload)
             try:
                 with _registered_remote_execution(payload) as execution_control:
+                    _observe_remote_workflow_for_llm_mode(payload)
                     with _timed_phase(
                         "remote_engine_execute_payload",
                         component=component_id,
@@ -1062,11 +1062,11 @@ if modal is not None:  # pragma: no branch - remote entrypoint configuration.
             kwargs_payload: bytes,
         ) -> Iterator[dict[str, Any]]:
             """Stream progress envelopes and a final serialized result for one payload."""
-            _observe_remote_workflow_for_llm_mode(payload)
             component_id = payload.get("component_id", "single-node")
             reload_marker = _modal_volume_reload_marker(payload)
             try:
                 with _registered_remote_execution(payload) as execution_control:
+                    _observe_remote_workflow_for_llm_mode(payload)
                     with _timed_phase(
                         "remote_engine_execute_payload",
                         component=component_id,

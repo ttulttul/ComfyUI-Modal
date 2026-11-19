@@ -334,7 +334,7 @@ Queue-time preparation appears in ComfyUI's queue through the server-side prepar
 
 While a Modal workflow is active, the global status pill lists this instance's active containers, an estimated accumulated GPU cost with the current burn rate (based on Modal's published GPU prices; excludes CPU, memory, storage, credits, and reservations), and — where the workspace plan allows billing-report access — Modal's actual metered app cost at hourly resolution.
 
-Cancelling a local prompt propagates a targeted interrupt to the active remote work. If the back-end is slow to observe it, the local prompt is released after a grace period while remote cleanup continues.
+Cancelling a local prompt propagates a targeted interrupt to the active remote work. If the back-end is slow to observe it, the local prompt is released after a grace period while remote cleanup continues. Modal cannot withdraw a streaming call that is still waiting for a GPU, so each Modal worker checks the interrupt flag before it starts a request. A request that was cancelled while queued is skipped before any volume reload or model loading, and the container stays up to run the next request instead of going back into the GPU queue.
 
 ### Remote Execution Configurator Panel
 
