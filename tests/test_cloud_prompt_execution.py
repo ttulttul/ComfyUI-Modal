@@ -1542,6 +1542,11 @@ def test_modal_cloud_registered_execution_preserves_pre_start_interrupt_flags(
             """Initialize captured pop calls."""
             self.pop_calls: list[tuple[str, Any]] = []
 
+        def contains(self, key: str) -> bool:
+            """Report no cancel flag so registration proceeds past the pre-start check."""
+            del key
+            return False
+
         def pop(self, key: str, default: Any = None) -> Any:
             """Record one cleared interrupt flag."""
             self.pop_calls.append((key, default))
