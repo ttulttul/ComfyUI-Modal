@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 REMOTE_APP_PROTOCOL_VERSION = 10
 REMOTE_RUNTIME_DEPENDENCY_LAYER_VERSION = 2
 REMOTE_PYTHON_VERSION = "3.13"
+REMOTE_PIP_SPEC = "pip==26.1.2"
 REMOTE_MODAL_SDK_SPEC = "modal==1.4.2"
 REMOTE_HUGGINGFACE_HUB_SPEC = "huggingface-hub==1.28.0"
 REMOTE_HF_XET_SPEC = "hf-xet==1.6.0"
@@ -43,6 +44,7 @@ REMOTE_OPENCV_SPEC = "opencv-python-headless==4.13.0.92"
 
 _REMOTE_APT_PACKAGES = (
     "build-essential",
+    "git",
     "libgl1",
     "libglib2.0-0",
 )
@@ -184,6 +186,7 @@ _REMOTE_RUNTIME_DEPENDENCY_MANIFEST_KEYS = frozenset(
         "dependency_layer_version",
         "llama_cpp_server_image",
         "modal_sdk_spec",
+        "pip_spec",
         "python_base_image",
         "python_version",
         "runtime_packages",
@@ -584,6 +587,7 @@ def _remote_image_manifest(
         "protocol_version": REMOTE_APP_PROTOCOL_VERSION,
         "dependency_layer_version": REMOTE_RUNTIME_DEPENDENCY_LAYER_VERSION,
         "python_version": REMOTE_PYTHON_VERSION,
+        "pip_spec": REMOTE_PIP_SPEC,
         "python_base_image": f"python:{REMOTE_PYTHON_VERSION}-slim-bookworm",
         "llama_cpp_server_image": REMOTE_LLAMA_CPP_SERVER_IMAGE,
         "modal_sdk_spec": REMOTE_MODAL_SDK_SPEC,

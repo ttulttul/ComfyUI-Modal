@@ -1,5 +1,10 @@
 # Learnings
 
+## 2026-11-23: Custom-node dependency installation on Modal
+
+- `git+https` requirements need the system Git executable in the worker image; installing GitPython does not provide it.
+- Pip 25.1.1 can raise `InvalidVersion` when evaluating dependency markers against Modal’s `4.19.0-gvisor` kernel release. Pip 26.1.2 evaluates those markers without raising. Upgrade pip in a separate layer before resolving custom-node dependencies and include its pin in the dependency fingerprint.
+
 ## 2026-08-30: Module compatibility fallback does not populate function globals
 
 - PEP 562 module `__getattr__` preserves callers that read a moved private helper as `module._helper`, but code defined inside that module resolves `_helper` directly from the module globals dictionary and never invokes `__getattr__`. A compatibility-export test can therefore pass while the deployed Modal method raises `NameError`.

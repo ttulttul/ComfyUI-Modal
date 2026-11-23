@@ -714,6 +714,8 @@ New workflow SSH host settings (destinations, cost, worker limits, VRAM reserve,
 
 ## Troubleshooting
 
+- **Git-based custom-node requirements or gVisor kernel-marker errors during image builds**: update this extension and restart ComfyUI. Worker images include Git and upgrade to the pinned pip before installing custom-node requirements. The next remote run rebuilds an outdated deployment when auto-deploy is enabled.
+
 - **App not found or deleted**: leave `COMFY_MODAL_AUTO_DEPLOY=true` so the next lookup deploys the app again.
 - **Changed the workflow GPU**: just queue the next remote run — Modal-Sync looks up or builds the GPU-specific app without touching the previous one.
 - **Remote mode still uses local mirror storage**: check that `COMFY_MODAL_EXECUTION_MODE` is not set to `local` in the environment that launches ComfyUI, then restart with the Modal SDK available so sync and invocation resolve the same mode.

@@ -12,6 +12,7 @@ try:
     from .runtime_environment import (
         COMFYUI_RUNTIME_SOURCE_DIRECTORIES as _COMFYUI_IMAGE_RUNTIME_DIRECTORIES,
         COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
+        REMOTE_PIP_SPEC,
         REMOTE_PYTHON_VERSION,
         RemoteTorchBuild as _RemoteTorchBuild,
         remote_accelerator_packages as _remote_accelerator_packages,
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover - flat Modal-container import.
     from runtime_environment import (
         COMFYUI_RUNTIME_SOURCE_DIRECTORIES as _COMFYUI_IMAGE_RUNTIME_DIRECTORIES,
         COMFYUI_RUNTIME_SOURCE_FILES as _COMFYUI_IMAGE_RUNTIME_FILES,
+        REMOTE_PIP_SPEC,
         REMOTE_PYTHON_VERSION,
         RemoteTorchBuild as _RemoteTorchBuild,
         remote_accelerator_packages as _remote_accelerator_packages,
@@ -288,6 +290,8 @@ def _install_custom_node_packages(image: Any, packages: tuple[str, ...]) -> Any:
     """Install custom requirements and then restore deployment-owned package pins."""
     if not packages:
         return image
+    # Older pip raises InvalidVersion for kernel markers on Modal gVisor.
+    image = image.pip_install(REMOTE_PIP_SPEC)
     image = image.pip_install(*packages)
     return image.pip_install(*_comfyui_runtime_packages())
 

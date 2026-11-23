@@ -82,7 +82,7 @@ def test_remote_environment_is_fully_pinned(runtime_environment_module: Any) -> 
     assert runtime_environment_module.DEFAULT_MODAL_GPU == "RTX-PRO-6000"
     assert runtime_environment_module.REMOTE_APP_PROTOCOL_VERSION == 10
     assert runtime_environment_module.REMOTE_PYTHON_VERSION == "3.13"
-    assert apt_packages == ("build-essential", "libgl1", "libglib2.0-0")
+    assert apt_packages == ("build-essential", "git", "libgl1", "libglib2.0-0")
     assert all("==" in requirement for requirement in runtime_packages)
     assert all("==" in requirement for requirement in torch_packages)
     assert len(runtime_packages) == len(set(runtime_packages))
@@ -350,8 +350,10 @@ def test_runtime_identity_records_system_packages(
 
     identity = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
 
+    assert identity.manifest["pip_spec"] == "pip==26.1.2"
     assert identity.manifest["apt_packages"] == [
         "build-essential",
+        "git",
         "libgl1",
         "libglib2.0-0",
     ]
@@ -540,3 +542,23 @@ def test_runtime_identity_tracks_comfyui_package_data(
     )
 
     assert tokenizer_changed.fingerprint != baseline.fingerprint
+
+
+def test_pip_pin_changes_dependency_fingerprint(
+    runtime_environment_module: Any,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Changing pip must invalidate the cached dependency image."""
+    repo_root = tmp_path / "repo"
+    comfyui_root = tmp_path / "ComfyUI"
+    repo_root.mkdir()
+    comfyui_root.mkdir()
+    baseline = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+
+    monkeypatch.setattr(runtime_environment_module, "REMOTE_PIP_SPEC", "pip==26.3")
+    changed = _runtime_identity(runtime_environment_module, repo_root, comfyui_root)
+
+    assert runtime_environment_module.remote_runtime_dependency_fingerprint(
+        baseline
+    ) != runtime_environment_module.remote_runtime_dependency_fingerprint(changed)
