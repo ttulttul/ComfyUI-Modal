@@ -994,12 +994,13 @@ def test_modal_cloud_restores_runtime_pins_after_custom_node_packages(
     )
 
     assert result is image
-    assert image.calls[0] == (
+    assert image.calls[0] == ("pip==26.1.2",)
+    assert image.calls[1] == (
         "numpy==1.26.4",
         "opencv-python-headless==4.11.0.86",
     )
-    assert "numpy==2.3.5" in image.calls[1]
-    assert "opencv-python-headless==4.13.0.92" in image.calls[1]
+    assert "numpy==2.3.5" in image.calls[2]
+    assert "opencv-python-headless==4.13.0.92" in image.calls[2]
 
 def test_modal_cloud_missing_prompt_node_class_reports_unavailable_bundle_path(
     modal_cloud_module: Any,
@@ -2069,3 +2070,10 @@ def test_modal_cloud_creates_default_custom_nodes_dir_when_missing(
     assert custom_nodes_dir is not None
     assert custom_nodes_dir.exists()
     assert custom_nodes_dir.is_dir()
+
+
+def test_modal_cloud_skips_empty_custom_package_layers(modal_cloud_module: Any) -> None:
+    """An image without custom requirements should not add package layers."""
+    image = object()
+
+    assert modal_cloud_module._install_custom_node_packages(image, ()) is image

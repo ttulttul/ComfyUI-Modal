@@ -720,6 +720,7 @@ def test_modal_cloud_installs_comfyui_runtime_packages(
     """The Modal cloud image should include the core packages ComfyUI imports at runtime."""
     assert modal_cloud_module._comfyui_apt_packages() == (
         "build-essential",
+        "git",
         "libgl1",
         "libglib2.0-0",
     )
