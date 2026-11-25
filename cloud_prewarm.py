@@ -140,7 +140,14 @@ def _prewarm_snapshot_state(
 
 
 def _reload_compile_cache_volume(volume: Any | None) -> bool:
-    """Refresh persistent compiler artifacts before a runtime opens its caches."""
+    """Refresh persistent compiler artifacts before a runtime opens its caches.
+
+    A GPU memory snapshot restores processes whose native code (for example the
+    CUDA driver's JIT cache index under ``CUDA_CACHE_PATH``) already maps files
+    from this Volume, so Modal rejects the reload as busy. The cache is only an
+    accelerator: keep the snapshot's view and compile any missing entries
+    instead of failing container startup.
+    """
     if volume is None:
         return False
     reload_method = getattr(volume, "reload", None)
@@ -151,9 +158,16 @@ def _reload_compile_cache_volume(volume: Any | None) -> bool:
         try:
             reload_method()
         except RuntimeError as exc:
-            if _is_modal_volume_open_files_error(exc):
-                _log_compile_cache_memory_maps()
-            raise
+            if not _is_modal_volume_open_files_error(exc):
+                raise
+            _log_compile_cache_memory_maps()
+            logger.warning(
+                "Skipping Modal compile-cache Volume reload because restored "
+                "processes hold cache files open (%s); continuing with the "
+                "snapshot's cache view and compiling missing entries.",
+                exc,
+            )
+            return False
     return True
 
 
@@ -202,7 +216,7 @@ def _log_compile_cache_memory_maps() -> None:
             "memory-mapped cache files were visible in /proc."
         )
         return
-    logger.error(
+    logger.warning(
         "Modal compile-cache Volume reload is blocked by %d memory-mapped "
         "native cache file(s): %s",
         len(mapped_files),

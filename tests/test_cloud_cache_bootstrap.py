@@ -1177,6 +1177,59 @@ def test_modal_cloud_reloads_compile_cache_before_restored_runtime(
 
     assert calls == ["reload", "runtime", "execution"]
 
+
+def test_restored_runtime_survives_compile_cache_held_open_by_snapshot(
+    modal_cloud_module: Any,
+    monkeypatch: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """GPU-snapshot restores map CUDA cache files, so a busy reload must not abort startup."""
+    calls: list[str] = []
+
+    class BusyVolume:
+        """Reject reload the way Modal does when cache files are mapped."""
+
+        def reload(self) -> None:
+            """Raise Modal's open-files reload error."""
+            calls.append("reload")
+            raise RuntimeError(
+                "there are open files preventing the operation: "
+                "path 62c9d5dfee8024f7a6a84be2/cuda/.metadata is open"
+            )
+
+    monkeypatch.setattr(
+        _cloud_prewarm_owner(),
+        "_ensure_comfy_runtime_initialized",
+        lambda custom_nodes_root: calls.append("runtime"),
+    )
+    monkeypatch.setattr(
+        _cloud_prewarm_owner(),
+        "_load_execution_module",
+        lambda: calls.append("execution"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        modal_cloud_module._prewarm_restored_runtime(BusyVolume())
+
+    assert calls == ["reload", "runtime", "execution"]
+    assert "Skipping Modal compile-cache Volume reload" in caplog.text
+
+
+def test_compile_cache_reload_propagates_unrelated_runtime_errors(
+    modal_cloud_module: Any,
+) -> None:
+    """Only Modal's open-files conflict is tolerated during compile-cache reload."""
+
+    class BrokenVolume:
+        """Fail reload for a reason unrelated to open files."""
+
+        def reload(self) -> None:
+            """Raise an unexpected reload failure."""
+            raise RuntimeError("volume not found")
+
+    with pytest.raises(RuntimeError, match="volume not found"):
+        modal_cloud_module._reload_compile_cache_volume(BrokenVolume())
+
 def test_get_hourly_modal_app_billing_filters_and_caches_gpu_app(
     modal_billing_module: Any,
     monkeypatch: Any,
