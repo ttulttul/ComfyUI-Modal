@@ -1060,3 +1060,8 @@ The README screenshot was taken from a throwaway ComfyUI (current upstream check
 - The remote boundary's implicit IMAGE mapping treated a 240-frame clip as 240 independent jobs because only `CreateVideo.images` was recognized as an aggregate consumer.
 - Extend the existing socket-specific preservation set to `RemakeConditioning.source`. Keep ordinary IMAGE batching and other Remake sockets unchanged.
 - The shared 240-frame regression passes for CreateVideo and fails for Remake before the fix; both must remain unsplit afterward.
+
+### PR review: preserve clip tensors, not lists of clips (2026-11-28)
+- The preservation guard also bypassed list-level mapping, so an ordered phase could pass a list of complete video tensors into a node expecting one video. This affected both aggregate consumers.
+- After normalizing singleton bridge wrappers and expanding multi-item bridge refs, apply preservation only to non-list values. Ordinary lists and MappedOutputValue (a list subclass) keep the existing one-job-per-item behavior; each tensor item remains a complete clip.
+- Twelve regression cases reproduce this for CreateVideo and Remake across tensor lists, mapped tensor lists, direct/wrapped per-item refs, and direct/wrapped multi-item refs. The original single-clip 240-frame tests still verify that individual clips are never split per frame.

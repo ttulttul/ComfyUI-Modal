@@ -811,7 +811,7 @@ def _split_batch_boundary_inputs(
             payload,
             boundary_input,
         )
-        if preserving_targets:
+        if preserving_targets and not isinstance(input_value, list):
             logger.info(
                 "Skipping implicit batch split for boundary input %s io_type=%s "
                 "because target sockets consume the complete tensor batch: %s.",

@@ -971,6 +971,62 @@ def test_implicit_mapping_preserves_video_frame_sequence(
 
 @pytest.mark.parametrize(
     ("class_type", "input_name"),
+    [("CreateVideo", "images"), ("RemakeConditioning", "source")],
+)
+@pytest.mark.parametrize("representation", [
+    "clips", "mapped_clips", "refs", "wrapped_refs", "multi_ref", "wrapped_multi_ref",
+])
+def test_video_clip_lists_still_map_per_clip(
+    class_type: str,
+    input_name: str,
+    representation: str,
+    remote_modal_app_module: Any,
+    session_state_module: Any,
+    serialization_module: Any,
+) -> None:
+    """Map complete clips or bridge items without splitting any clip's frames."""
+    torch = pytest.importorskip("torch")
+    clips = [torch.zeros((240, 8, 8, 3)), torch.ones((124, 8, 8, 3))]
+    ref = session_state_module.RemoteSessionBridgeRef(
+        bridge_key="RSB_clips", node_id="10", output_index=0, item_count=2,
+    )
+    refs = [item.to_payload() for item in ref.split_items()]
+    values = {
+        "clips": clips,
+        "mapped_clips": serialization_module.MappedOutputValue(clips, "IMAGE", False),
+        "refs": refs,
+        "wrapped_refs": [refs],
+        "multi_ref": ref.to_payload(),
+        "wrapped_multi_ref": [ref.to_payload()],
+    }
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "91",
+        "subgraph_prompt": {
+            "91": {"class_type": class_type, "inputs": {input_name: ["10", 0]}},
+        },
+        "boundary_inputs": [{
+            "proxy_input_name": "phase_bridge_0",
+            "io_type": "IMAGE",
+            "targets": [{"node_id": "91", "input_name": input_name}],
+        }],
+    }
+    split = remote_modal_app_module._split_batch_boundary_inputs(
+        payload, {"phase_bridge_0": values[representation]},
+    )
+    assert split is not None
+    inputs, count = split
+    assert count == 2
+    actual = inputs["phase_bridge_0"]
+    if representation in {"clips", "mapped_clips"}:
+        assert len(actual) == 2
+        assert all(item is clip for item, clip in zip(actual, clips))
+    else:
+        assert actual == refs
+
+
+@pytest.mark.parametrize(
+    ("class_type", "input_name"),
     [("RemakeConditioning", "ref_1"), ("ImageScale", "image")],
 )
 def test_implicit_mapping_still_splits_independent_images(

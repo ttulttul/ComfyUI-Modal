@@ -459,7 +459,7 @@ Mapped progress is summarized on the global status pill and on a representative 
 
 #### Batches and lists without a marker
 
-Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary. Semantic batches destined for aggregate consumers, such as `CreateVideo.images` and Viggle Remake's `RemakeConditioning.source`, stay intact instead of being split per item.
+Ordinary components without `Modal Map Input` preserve ComfyUI's normal zipped-batch behavior at the remote boundary. Semantic batches destined for aggregate consumers, such as `CreateVideo.images` and Viggle Remake's `RemakeConditioning.source`, stay intact instead of being split per item. Lists of complete clips, including mapped outputs and multi-item phase bridges, still map once per clip.
 
 ComfyUI-native lists made inside a remote component (for example several `UNETLoader` models joined by `Create List` into one sampler chain) keep working when the component is split into ordered phases. Each phase-bridge output that holds several list items records its item count, and the next phase fans out once per item, as if a `Modal Map Input` were in place.
 
