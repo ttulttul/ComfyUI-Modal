@@ -63,7 +63,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - local fallback environments.
     modal = None
 
-_IMPLICIT_BATCH_PRESERVING_TARGETS = frozenset({("CreateVideo", "images")})
+_IMPLICIT_BATCH_PRESERVING_TARGETS = frozenset(
+    {("CreateVideo", "images"), ("RemakeConditioning", "source")}
+)
 _MAPPED_PROGRESS_NODE_IDS_LOCK = threading.Lock()
 _MAPPED_PROGRESS_NODE_IDS: dict[tuple[str, str, str], str] = {}
 

@@ -928,27 +928,33 @@ def test_invoke_implicitly_mapped_subgraph_async_zips_batched_boundary_inputs(
         ["latent-a:10", "latent-b:11"],
     )
 
-def test_implicit_mapping_preserves_create_video_frame_sequence(
+@pytest.mark.parametrize(
+    ("class_type", "input_name"),
+    [("CreateVideo", "images"), ("RemakeConditioning", "source")],
+)
+def test_implicit_mapping_preserves_video_frame_sequence(
+    class_type: str,
+    input_name: str,
     remote_modal_app_module: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """CreateVideo should receive one complete IMAGE frame sequence."""
+    """Video consumers should receive one complete temporal IMAGE sequence."""
     torch = pytest.importorskip("torch")
-    frame_sequence = torch.zeros((124, 8, 8, 3), dtype=torch.float32)
+    frame_sequence = torch.zeros((240, 8, 8, 3), dtype=torch.float32)
     payload = {
         "payload_kind": "subgraph",
         "component_id": "105:91",
         "subgraph_prompt": {
             "105:91": {
-                "class_type": "CreateVideo",
-                "inputs": {"images": ["105:10", 0]},
+                "class_type": class_type,
+                "inputs": {input_name: ["105:10", 0]},
             }
         },
         "boundary_inputs": [
             {
                 "proxy_input_name": "remote_input_0",
                 "io_type": "IMAGE",
-                "targets": [{"node_id": "105:91", "input_name": "images"}],
+                "targets": [{"node_id": "105:91", "input_name": input_name}],
             }
         ],
     }
@@ -961,7 +967,42 @@ def test_implicit_mapping_preserves_create_video_frame_sequence(
 
     assert split_inputs is None
     assert "target sockets consume the complete tensor batch" in caplog.text
-    assert "105:91.images" in caplog.text
+    assert f"105:91.{input_name}" in caplog.text
+
+@pytest.mark.parametrize(
+    ("class_type", "input_name"),
+    [("RemakeConditioning", "ref_1"), ("ImageScale", "image")],
+)
+def test_implicit_mapping_still_splits_independent_images(
+    class_type: str,
+    input_name: str,
+    remote_modal_app_module: Any,
+) -> None:
+    """Only temporal consumer sockets should opt out of ordinary IMAGE mapping."""
+    torch = pytest.importorskip("torch")
+    images = torch.arange(2 * 8 * 8 * 3, dtype=torch.float32).reshape(2, 8, 8, 3)
+    payload = {
+        "payload_kind": "subgraph",
+        "component_id": "91",
+        "subgraph_prompt": {
+            "91": {"class_type": class_type, "inputs": {input_name: ["10", 0]}},
+        },
+        "boundary_inputs": [{
+            "proxy_input_name": "remote_input_0",
+            "io_type": "IMAGE",
+            "targets": [{"node_id": "91", "input_name": input_name}],
+        }],
+    }
+    split = remote_modal_app_module._split_batch_boundary_inputs(
+        payload, {"remote_input_0": images},
+    )
+    assert split is not None
+    inputs, count = split
+    assert count == 2
+    assert len(inputs["remote_input_0"]) == 2
+    for index, item in enumerate(inputs["remote_input_0"]):
+        assert torch.equal(item, images[index:index + 1])
+
 
 def test_mapped_phase_latent_bridge_refs_split_per_item_in_next_phase(
     remote_modal_app_module: Any,

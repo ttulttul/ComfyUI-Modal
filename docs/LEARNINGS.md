@@ -1054,3 +1054,9 @@ The README screenshot was taken from a throwaway ComfyUI (current upstream check
 - During a GPU shortage the cancelled call was delivered to the first container that came up. The container reloaded the volume, started loading models, saw the flag, and then exited through `_schedule_remote_cancel_restart` because the loader did not stop within a second. The resubmitted prompt, queued right behind it, waited another ~16 minutes for a new RTX PRO 6000.
 - `_registered_remote_execution` now checks the flag before the request does anything and raises `RemoteExecutionCancelledBeforeStart`. Its message contains "interrupt", so `_remote_failure_disposition` treats it as EXPECTED and the container stays up for the next queued input. `_observe_remote_workflow_for_llm_mode` now runs after that check, so a skipped request does not count as the container's first workflow.
 - To tell "waiting for a GPU" apart from other stalls, use `modal app logs <app-id> --since <time> --timestamps --show-container-id`. Modal logs "waiting to be scheduled on a GPU_<type> worker" when it is out of capacity.
+
+## Remake source videos were split into one remote job per frame (2026-11-28)
+- `RemakeConditioning.source` is typed IMAGE but represents a complete temporal sequence. The node slices the sequence to its requested frame count, checks that count, and encodes it as video conditioning.
+- The remote boundary's implicit IMAGE mapping treated a 240-frame clip as 240 independent jobs because only `CreateVideo.images` was recognized as an aggregate consumer.
+- Extend the existing socket-specific preservation set to `RemakeConditioning.source`. Keep ordinary IMAGE batching and other Remake sockets unchanged.
+- The shared 240-frame regression passes for CreateVideo and fails for Remake before the fix; both must remain unsplit afterward.
