@@ -543,6 +543,11 @@ class CustomNodesSynchronizer:
         archive_specs: list[_CustomNodesArchiveSpec] = []
         asset_specs: list[_CustomNodeAssetSpec] = []
 
+        files_by_entry: dict[str, list[Path]] = {}
+        for file_path in self._host._iter_files(resolved_root):
+            entry_name = file_path.relative_to(resolved_root).parts[0]
+            files_by_entry.setdefault(entry_name, []).append(file_path)
+
         for child in sorted(resolved_root.iterdir(), key=lambda item: item.name):
             if child.name in _SKIP_DIRS:
                 continue
@@ -553,7 +558,7 @@ class CustomNodesSynchronizer:
                 continue
             if child.is_dir():
                 entry_files = sorted(
-                    self._host._iter_files(child),
+                    files_by_entry.get(child.name, []),
                     key=lambda item: item.relative_to(resolved_root).as_posix(),
                 )
                 code_files, entry_assets = self._partition_custom_node_files(entry_files)
