@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import base64
 import copy
+import io
 import json
 import logging
+import math
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Callable
 
@@ -28,6 +31,28 @@ _BINARY_ENVELOPE_MAGIC = b"CMODALB1"
 _BINARY_ENVELOPE_VERSION = 1
 _BINARY_HEADER_LENGTH_BYTES = 8
 _MAX_BINARY_HEADER_BYTES = 16 * 1024 * 1024
+_SAFETENSORS_HEADER_LENGTH_BYTES = 8
+_SAFETENSORS_HEADER_ALIGNMENT = 8
+_SAFETENSORS_DTYPE_TORCH_NAMES = {
+    "F64": "float64",
+    "F32": "float32",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "I64": "int64",
+    "I32": "int32",
+    "I16": "int16",
+    "I8": "int8",
+    "U8": "uint8",
+    "BOOL": "bool",
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E4M3FNUZ": "float8_e4m3fnuz",
+    "F8_E5M2": "float8_e5m2",
+    "F8_E5M2FNUZ": "float8_e5m2fnuz",
+    "C64": "complex64",
+    "U64": "uint64",
+    "U32": "uint32",
+    "U16": "uint16",
+}
 
 
 class MappedOutputValue(list[Any]):
@@ -99,21 +124,127 @@ def _deserialize_tensor(payload: Mapping[str, Any]) -> Any:
     return tensor_map[_VALUE_KEY]
 
 
-def _serialize_tensor_bytes(value: Any) -> bytes:
-    """Serialize a tensor directly to safetensors bytes without base64 expansion."""
-    from safetensors.torch import save
+@dataclass(frozen=True)
+class _BinaryAttachment:
+    """One binary-envelope attachment held as zero-copy chunks until it is written."""
 
+    chunks: tuple[memoryview, ...]
+
+    @property
+    def length(self) -> int:
+        """Return the attachment's total byte length."""
+        return sum(chunk.nbytes for chunk in self.chunks)
+
+
+def _safetensors_dtype_names() -> dict[Any, str]:
+    """Map every torch dtype available in this runtime to its safetensors name."""
+    torch = _import_torch()
+    names: dict[Any, str] = {}
+    for safetensors_name, torch_name in _SAFETENSORS_DTYPE_TORCH_NAMES.items():
+        dtype = getattr(torch, torch_name, None)
+        if dtype is not None:
+            names[dtype] = safetensors_name
+    return names
+
+
+def _safetensors_torch_dtype(safetensors_name: str) -> Any:
+    """Resolve one safetensors dtype name to the matching torch dtype."""
+    torch_name = _SAFETENSORS_DTYPE_TORCH_NAMES.get(safetensors_name)
+    dtype = getattr(_import_torch(), torch_name, None) if torch_name else None
+    if dtype is None:
+        raise ValueError(f"Unsupported safetensors dtype {safetensors_name!r}.")
+    return dtype
+
+
+def _host_tensor_byte_view(value: Any) -> memoryview:
+    """Return a flat byte view over a contiguous CPU copy of the tensor's storage.
+
+    No bytes are copied for tensors that are already contiguous on the CPU. The
+    view keeps the backing tensor alive until the envelope has been written.
+    """
+    torch = _import_torch()
+    host_tensor = value.detach().to("cpu").contiguous()
+    return memoryview(host_tensor.reshape(-1).view(torch.uint8).numpy())
+
+
+def _safetensors_header(value: Any, data_length: int) -> bytes:
+    """Build a single-tensor safetensors header identical to safetensors.torch.save."""
+    dtype_name = _safetensors_dtype_names().get(value.dtype)
+    if dtype_name is None:
+        raise TypeError(f"Tensor dtype {value.dtype} is not supported by safetensors.")
+    header = json.dumps(
+        {
+            _VALUE_KEY: {
+                "dtype": dtype_name,
+                "shape": list(value.shape),
+                "data_offsets": [0, data_length],
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    header += b" " * (-len(header) % _SAFETENSORS_HEADER_ALIGNMENT)
+    return struct.pack("<Q", len(header)) + header
+
+
+def _tensor_attachment(value: Any) -> _BinaryAttachment:
+    """Describe one tensor as safetensors bytes without materializing them."""
     torch = _import_torch()
     if not isinstance(value, torch.Tensor):
         raise TypeError("Expected a torch.Tensor payload.")
-    return save({_VALUE_KEY: value.detach().contiguous()})
+    data = _host_tensor_byte_view(value)
+    header = _safetensors_header(value, data.nbytes)
+    return _BinaryAttachment(chunks=(memoryview(header), data))
 
 
-def _deserialize_tensor_bytes(payload: bytes) -> Any:
-    """Deserialize direct safetensors bytes back into a tensor."""
-    from safetensors.torch import load
+def _serialize_tensor_bytes(value: Any) -> bytes:
+    """Serialize a tensor directly to safetensors bytes without base64 expansion."""
+    return _join_chunks(_tensor_attachment(value).chunks)
 
-    return load(payload)[_VALUE_KEY]
+
+def _parse_safetensors_entry(payload: memoryview) -> tuple[Mapping[str, Any], memoryview]:
+    """Validate one single-tensor safetensors payload and return its entry and data view."""
+    if payload.nbytes < _SAFETENSORS_HEADER_LENGTH_BYTES:
+        raise ValueError("Tensor attachment is truncated before its safetensors header.")
+    header_length = struct.unpack("<Q", payload[:_SAFETENSORS_HEADER_LENGTH_BYTES])[0]
+    data_offset = _SAFETENSORS_HEADER_LENGTH_BYTES + header_length
+    if header_length > _MAX_BINARY_HEADER_BYTES or data_offset > payload.nbytes:
+        raise ValueError("Tensor attachment has an invalid safetensors header length.")
+    try:
+        header = json.loads(bytes(payload[_SAFETENSORS_HEADER_LENGTH_BYTES:data_offset]))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Tensor attachment safetensors header is invalid JSON.") from exc
+    entry = header.get(_VALUE_KEY) if isinstance(header, Mapping) else None
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"Tensor attachment is missing its {_VALUE_KEY!r} entry.")
+    return entry, payload[data_offset:]
+
+
+def _validated_tensor_layout(entry: Mapping[str, Any], data: memoryview) -> tuple[Any, list[int], memoryview]:
+    """Return the dtype, shape, and exact data view described by one safetensors entry."""
+    dtype = _safetensors_torch_dtype(str(entry.get("dtype")))
+    shape = entry.get("shape")
+    offsets = entry.get("data_offsets")
+    if not isinstance(shape, list) or not all(
+        isinstance(size, int) and not isinstance(size, bool) and size >= 0 for size in shape
+    ):
+        raise ValueError("Tensor attachment shape must be a list of non-negative integers.")
+    if not isinstance(offsets, list) or len(offsets) != 2:
+        raise ValueError("Tensor attachment data offsets must contain two integers.")
+    start, end = offsets
+    expected_length = math.prod(shape) * _import_torch().empty((), dtype=dtype).element_size()
+    if not (0 <= start <= end <= data.nbytes) or end - start != expected_length:
+        raise ValueError("Tensor attachment data offsets do not match its shape and dtype.")
+    return dtype, shape, data[start:end]
+
+
+def _deserialize_tensor_bytes(payload: bytes | bytearray | memoryview) -> Any:
+    """Deserialize direct safetensors bytes into a writable tensor with one copy."""
+    torch = _import_torch()
+    entry, data = _parse_safetensors_entry(memoryview(payload).cast("B"))
+    dtype, shape, tensor_data = _validated_tensor_layout(entry, data)
+    storage = torch.empty(tensor_data.nbytes, dtype=torch.uint8)
+    memoryview(storage.numpy())[:] = tensor_data
+    return storage.view(dtype).reshape(shape)
 
 
 def _load_nested_tensor_transport_type() -> type[Any] | None:
@@ -338,7 +469,37 @@ def deserialize_value(payload: Any) -> Any:
     return {str(key): deserialize_value(value) for key, value in payload.items()}
 
 
-def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
+def _join_chunks(chunks: Sequence[memoryview | bytes]) -> bytes:
+    """Concatenate byte chunks into one ``bytes`` object, copying each byte once.
+
+    The buffer is sized up front so it never grows while large chunks are
+    written, and ``BytesIO.getvalue`` returns that buffer itself instead of a
+    second copy when nothing else holds a view of it.
+    """
+    total_length = sum(memoryview(chunk).nbytes for chunk in chunks)
+    buffer = io.BytesIO()
+    if total_length:
+        buffer.seek(total_length - 1)
+        buffer.write(b"\0")
+        buffer.seek(0)
+    for chunk in chunks:
+        buffer.write(chunk)
+    return buffer.getvalue()
+
+
+def _binary_envelope_chunks(header: bytes, attachments: Iterable[_BinaryAttachment]) -> list[memoryview | bytes]:
+    """Return the ordered chunks of one binary transport envelope."""
+    chunks: list[memoryview | bytes] = [
+        _BINARY_ENVELOPE_MAGIC,
+        struct.pack(">Q", len(header)),
+        header,
+    ]
+    for attachment in attachments:
+        chunks.extend(attachment.chunks)
+    return chunks
+
+
+def _serialize_transport_value(value: Any, attachments: list[_BinaryAttachment]) -> Any:
     """Convert one value into JSON metadata plus raw binary attachments."""
     if _is_scalar(value):
         return value
@@ -358,7 +519,7 @@ def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
 
     if torch is not None and isinstance(value, torch.Tensor):
         attachment_index = len(attachments)
-        attachments.append(_serialize_tensor_bytes(value))
+        attachments.append(_tensor_attachment(value))
         return {_KIND_KEY: _TENSOR_KIND, "attachment": attachment_index}
 
     if _is_comfy_nested_tensor(value):
@@ -375,7 +536,7 @@ def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
 
     if isinstance(value, bytes):
         attachment_index = len(attachments)
-        attachments.append(value)
+        attachments.append(_BinaryAttachment(chunks=(memoryview(value),)))
         return {_KIND_KEY: _BYTES_KIND, "attachment": attachment_index}
 
     if isinstance(value, tuple):
@@ -402,8 +563,12 @@ def _serialize_transport_value(value: Any, attachments: list[bytes]) -> Any:
 
 
 def _serialize_transport_payload(value: Any, *, sort_keys: bool) -> bytes:
-    """Serialize one transport payload, using raw attachments when needed."""
-    attachments: list[bytes] = []
+    """Serialize one transport payload, using raw attachments when needed.
+
+    Tensor and byte attachments are written straight from their source buffers
+    into the final envelope, so the payload costs one copy of their data.
+    """
+    attachments: list[_BinaryAttachment] = []
     metadata = _serialize_transport_value(value, attachments)
     if not attachments:
         return json.dumps(metadata, sort_keys=sort_keys).encode("utf-8")
@@ -412,22 +577,21 @@ def _serialize_transport_payload(value: Any, *, sort_keys: bool) -> bytes:
         {
             "version": _BINARY_ENVELOPE_VERSION,
             "payload": metadata,
-            "attachment_lengths": [len(attachment) for attachment in attachments],
+            "attachment_lengths": [attachment.length for attachment in attachments],
         },
         sort_keys=sort_keys,
         separators=(",", ":"),
     ).encode("utf-8")
-    return b"".join(
-        (
-            _BINARY_ENVELOPE_MAGIC,
-            struct.pack(">Q", len(header)),
-            header,
-            *attachments,
-        )
+    envelope = _join_chunks(_binary_envelope_chunks(header, attachments))
+    logger.debug(
+        "Serialized binary transport envelope bytes=%d attachments=%d.",
+        len(envelope),
+        len(attachments),
     )
+    return envelope
 
 
-def _deserialize_transport_value(payload: Any, attachments: tuple[bytes, ...]) -> Any:
+def _deserialize_transport_value(payload: Any, attachments: tuple[memoryview, ...]) -> Any:
     """Reconstruct one value from metadata and binary attachments."""
     if _is_scalar(payload):
         return payload
@@ -446,7 +610,7 @@ def _deserialize_transport_value(payload: Any, attachments: tuple[bytes, ...]) -
         attachment = attachments[attachment_index]
         if kind == _TENSOR_KIND:
             return _deserialize_tensor_bytes(attachment)
-        return attachment
+        return bytes(attachment)
     if kind == _TENSOR_KIND:
         return _deserialize_tensor(payload)
     if kind == _BYTES_KIND:
@@ -482,8 +646,8 @@ def _deserialize_transport_value(payload: Any, attachments: tuple[bytes, ...]) -
     }
 
 
-def _deserialize_binary_envelope(payload: bytes) -> tuple[Any, tuple[bytes, ...]]:
-    """Parse one validated binary transport envelope."""
+def _deserialize_binary_envelope(payload: memoryview) -> tuple[Any, tuple[memoryview, ...]]:
+    """Parse one validated binary transport envelope into zero-copy attachment views."""
     length_offset = len(_BINARY_ENVELOPE_MAGIC)
     header_offset = length_offset + _BINARY_HEADER_LENGTH_BYTES
     if len(payload) < header_offset:
@@ -497,7 +661,7 @@ def _deserialize_binary_envelope(payload: bytes) -> tuple[Any, tuple[bytes, ...]
     if attachment_offset > len(payload):
         raise ValueError("Binary transport envelope is truncated inside its header.")
     try:
-        header = json.loads(payload[header_offset:attachment_offset].decode("utf-8"))
+        header = json.loads(bytes(payload[header_offset:attachment_offset]).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Binary transport envelope header is invalid JSON.") from exc
     if not isinstance(header, Mapping):
@@ -508,7 +672,7 @@ def _deserialize_binary_envelope(payload: bytes) -> tuple[Any, tuple[bytes, ...]
     if not isinstance(attachment_lengths, list):
         raise ValueError("Binary transport envelope is missing attachment lengths.")
 
-    attachments: list[bytes] = []
+    attachments: list[memoryview] = []
     next_offset = attachment_offset
     for attachment_length in attachment_lengths:
         if (
@@ -520,21 +684,23 @@ def _deserialize_binary_envelope(payload: bytes) -> tuple[Any, tuple[bytes, ...]
         next_attachment_offset = next_offset + attachment_length
         if next_attachment_offset > len(payload):
             raise ValueError("Binary transport envelope is truncated inside an attachment.")
-        attachments.append(bytes(memoryview(payload)[next_offset:next_attachment_offset]))
+        attachments.append(payload[next_offset:next_attachment_offset])
         next_offset = next_attachment_offset
     if next_offset != len(payload):
         raise ValueError("Binary transport envelope contains trailing bytes.")
     return header.get("payload"), tuple(attachments)
 
 
-def _deserialize_transport_payload(payload: bytes | bytearray | str) -> tuple[Any, tuple[bytes, ...]]:
+def _deserialize_transport_payload(
+    payload: bytes | bytearray | memoryview | str,
+) -> tuple[Any, tuple[memoryview, ...]]:
     """Decode either the binary transport or the legacy JSON representation."""
     if isinstance(payload, str):
         return json.loads(payload), ()
-    normalized_payload = bytes(payload)
-    if normalized_payload.startswith(_BINARY_ENVELOPE_MAGIC):
-        return _deserialize_binary_envelope(normalized_payload)
-    return json.loads(normalized_payload.decode("utf-8")), ()
+    payload_view = memoryview(payload).cast("B")
+    if payload_view[: len(_BINARY_ENVELOPE_MAGIC)] == _BINARY_ENVELOPE_MAGIC:
+        return _deserialize_binary_envelope(payload_view)
+    return json.loads(bytes(payload_view).decode("utf-8")), ()
 
 
 def serialize_node_inputs(inputs: Mapping[str, Any]) -> bytes:
@@ -542,11 +708,11 @@ def serialize_node_inputs(inputs: Mapping[str, Any]) -> bytes:
     return _serialize_transport_payload(dict(inputs), sort_keys=True)
 
 
-def deserialize_node_inputs(payload: bytes | bytearray | str | Mapping[str, Any]) -> dict[str, Any]:
+def deserialize_node_inputs(payload: bytes | bytearray | memoryview | str | Mapping[str, Any]) -> dict[str, Any]:
     """Deserialize node keyword arguments from transport bytes."""
     if isinstance(payload, Mapping):
         raw_payload = dict(payload)
-        attachments: tuple[bytes, ...] = ()
+        attachments: tuple[memoryview, ...] = ()
     else:
         raw_payload, attachments = _deserialize_transport_payload(payload)
 
@@ -580,7 +746,7 @@ def deserialize_node_outputs(payload: bytes | bytearray | str | Sequence[Any]) -
     """Deserialize node outputs from transport bytes."""
     if isinstance(payload, Sequence) and not isinstance(payload, (bytes, bytearray, str)):
         raw_payload = list(payload)
-        attachments: tuple[bytes, ...] = ()
+        attachments: tuple[memoryview, ...] = ()
     else:
         raw_payload, attachments = _deserialize_transport_payload(payload)
 
