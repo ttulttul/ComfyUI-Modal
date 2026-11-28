@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 from modal_executor_test_support import *  # noqa: F401,F403
 
 def test_remote_modal_call_worker_count_is_bounded_independently_of_local_cpus(
@@ -405,6 +408,51 @@ def test_invoke_remote_engine_async_propagates_local_interrupt_to_modal(
 
     assert len(observed_cancellation_events) == 1
     assert observed_cancellation_events[0].is_set()
+
+def test_invoke_remote_engine_async_releases_decoded_inputs_before_dispatch(
+    remote_modal_app_module: Any,
+    serialization_module: Any,
+    monkeypatch: Any,
+) -> None:
+    """The implicit-split check must not keep a decoded copy of the inputs during the remote call."""
+    torch = pytest.importorskip("torch")
+    decoded_tensor_refs: list[weakref.ref[Any]] = []
+    live_at_dispatch: list[bool] = []
+    real_deserialize = remote_modal_app_module.deserialize_node_inputs
+
+    def tracking_deserialize(kwargs_payload: bytes) -> dict[str, Any]:
+        """Decode inputs and remember a weak reference to the decoded tensor."""
+        hydrated_inputs = real_deserialize(kwargs_payload)
+        decoded_tensor_refs.append(weakref.ref(hydrated_inputs["remote_input_0"]))
+        return hydrated_inputs
+
+    def fake_blocking_invoke(
+        payload: dict[str, Any],
+        kwargs_payload: bytes,
+        cancellation_event: threading.Event | None = None,
+    ) -> bytes:
+        """Record whether any decoded input copy is still alive when dispatch starts."""
+        gc.collect()
+        live_at_dispatch.append(any(ref() is not None for ref in decoded_tensor_refs))
+        return serialization_module.serialize_node_outputs((None,))
+
+    monkeypatch.setenv("COMFY_MODAL_EXECUTION_MODE", "remote")
+    monkeypatch.setattr(remote_modal_app_module, "modal", object())
+    monkeypatch.setattr(remote_modal_app_module, "deserialize_node_inputs", tracking_deserialize)
+    monkeypatch.setattr(remote_modal_app_module, "_invoke_modal_payload_blocking", fake_blocking_invoke)
+    kwargs_payload = serialization_module.serialize_node_inputs(
+        {"remote_input_0": torch.zeros((4, 8, 8, 3), dtype=torch.float32)}
+    )
+
+    asyncio.run(
+        remote_modal_app_module.invoke_remote_engine_async(
+            {"component_id": "component-1", "payload_kind": "subgraph"},
+            kwargs_payload,
+        )
+    )
+
+    assert decoded_tensor_refs, "the implicit-split check should decode the inputs once"
+    assert live_at_dispatch == [False]
 
 def test_invoke_remote_engine_payload_refuses_dispatch_after_prestart_cancel(
     remote_modal_app_module: Any,

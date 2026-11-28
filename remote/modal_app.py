@@ -1016,6 +1016,20 @@ def _invoke_modal_payload_blocking(
     return result
 
 
+def _payload_has_implicit_batch_split(
+    payload: dict[str, Any],
+    kwargs_payload: bytes,
+) -> bool:
+    """Return whether a subgraph payload's boundary inputs arrive as a splittable batch.
+
+    The decoded inputs are a full copy of every boundary tensor. Keeping them in a
+    caller's local variable held that copy for the whole remote call, so they are
+    decoded here and released as soon as the check returns.
+    """
+    hydrated_inputs = deserialize_node_inputs(kwargs_payload)
+    return _split_batch_boundary_inputs(payload, hydrated_inputs) is not None
+
+
 def invoke_remote_engine(
     payload: dict[str, Any],
     kwargs_payload: bytes,
@@ -1031,8 +1045,7 @@ def invoke_remote_engine(
                 _execute_mapped_subgraph_payload(payload, hydrated_inputs)
             )
     if allow_implicit_mapping and payload.get("payload_kind") == "subgraph":
-        hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-        if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
+        if _payload_has_implicit_batch_split(payload, kwargs_payload):
             return asyncio.run(
                 _invoke_implicitly_mapped_subgraph_async(payload, kwargs_payload)
             )
@@ -1115,8 +1128,7 @@ async def invoke_remote_engine_async(
         if execution_mode == "local" or modal is None:
             return await _invoke_mapped_remote_engine_async(payload, kwargs_payload)
     if allow_implicit_mapping and payload.get("payload_kind") == "subgraph":
-        hydrated_inputs = deserialize_node_inputs(kwargs_payload)
-        if _split_batch_boundary_inputs(payload, hydrated_inputs) is not None:
+        if _payload_has_implicit_batch_split(payload, kwargs_payload):
             if execution_mode != "local" and modal is not None:
                 await asyncio.to_thread(
                     _lookup_protocol_current_remote_engine,

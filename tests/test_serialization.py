@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tracemalloc
 from fractions import Fraction
 from types import SimpleNamespace
 from typing import Any
@@ -191,6 +192,148 @@ def test_binary_transport_rejects_truncated_attachments(serialization_module: An
 
     with pytest.raises(ValueError, match="truncated inside an attachment"):
         serialization_module.deserialize_node_inputs(encoded[:-1])
+
+
+def _transport_test_tensors(torch: Any) -> list[Any]:
+    """Return tensors covering dtypes, empty and scalar shapes, and strided layouts."""
+    tensors = [
+        torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),
+        torch.arange(24, dtype=torch.float32).reshape(4, 6).t(),
+        torch.linspace(-2, 2, 10, dtype=torch.float16),
+        torch.linspace(-2, 2, 10, dtype=torch.bfloat16),
+        torch.arange(-5, 5, dtype=torch.int64),
+        torch.arange(7, dtype=torch.uint8),
+        torch.tensor([True, False, True]),
+        torch.tensor(3.5, dtype=torch.float64),
+        torch.empty((0, 3), dtype=torch.float32),
+    ]
+    if hasattr(torch, "float8_e4m3fn"):
+        tensors.append(torch.linspace(-1, 1, 8).to(torch.float8_e4m3fn))
+    return tensors
+
+
+def test_tensor_attachment_matches_safetensors_save_bytes(serialization_module: Any) -> None:
+    """Directly written tensor attachments must stay byte-identical to safetensors.save."""
+    torch = pytest.importorskip("torch")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+
+    for tensor in _transport_test_tensors(torch):
+        expected = safetensors_torch.save({"value": tensor.contiguous()})
+        assert serialization_module._serialize_tensor_bytes(tensor) == expected, tensor.dtype
+
+
+def test_tensor_transport_round_trips_every_test_dtype(serialization_module: Any) -> None:
+    """Every supported dtype and layout should decode to an equal, writable tensor."""
+    torch = pytest.importorskip("torch")
+    tensors = _transport_test_tensors(torch)
+
+    decoded = serialization_module.deserialize_node_outputs(
+        serialization_module.serialize_node_outputs(tuple(tensors))
+    )
+
+    for original, restored in zip(tensors, decoded, strict=True):
+        assert restored.dtype == original.dtype
+        assert restored.shape == original.shape
+        assert torch.equal(
+            restored.reshape(-1).view(torch.uint8),
+            original.contiguous().reshape(-1).view(torch.uint8),
+        )
+    decoded[0].add_(1)
+
+
+def test_tensor_transport_decodes_writers_that_used_safetensors_save(
+    serialization_module: Any,
+) -> None:
+    """Envelopes produced by already-deployed workers must still decode."""
+    torch = pytest.importorskip("torch")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    attachment = safetensors_torch.save({"value": tensor})
+    header = json.dumps(
+        {
+            "version": 1,
+            "payload": [{"__comfy_modal_kind__": "tensor", "attachment": 0}],
+            "attachment_lengths": [len(attachment)],
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    legacy_envelope = b"".join(
+        (b"CMODALB1", len(header).to_bytes(8, "big"), header, attachment)
+    )
+
+    decoded = serialization_module.deserialize_node_outputs(legacy_envelope)
+
+    assert torch.equal(decoded[0], tensor)
+
+
+def test_tensor_transport_accepts_bytearray_and_memoryview(serialization_module: Any) -> None:
+    """Readers should decode binary envelopes from any contiguous byte buffer."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(6, dtype=torch.float32)
+    encoded = serialization_module.serialize_node_inputs({"tensor": tensor, "raw": b"xy"})
+
+    for payload in (bytearray(encoded), memoryview(encoded)):
+        decoded = serialization_module.deserialize_node_inputs(payload)
+        assert torch.equal(decoded["tensor"], tensor)
+        assert decoded["raw"] == b"xy"
+        assert isinstance(decoded["raw"], bytes)
+
+
+def test_decoded_tensors_do_not_keep_the_payload_alive(serialization_module: Any) -> None:
+    """Decoded tensors must own their storage so the transport payload can be freed."""
+    torch = pytest.importorskip("torch")
+    payload = bytearray(
+        serialization_module.serialize_node_outputs((torch.zeros(16, dtype=torch.float32),))
+    )
+
+    decoded = serialization_module.deserialize_node_outputs(payload)[0]
+    payload[:] = b"\xff" * len(payload)
+
+    assert torch.equal(decoded, torch.zeros(16, dtype=torch.float32))
+
+
+def test_tensor_transport_decodes_to_cpu_under_a_non_cpu_default_device(
+    serialization_module: Any,
+) -> None:
+    """Decoding must not follow a default device set by another node, as safetensors.load did not."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    encoded = serialization_module.serialize_node_outputs((tensor,))
+
+    with torch.device("meta"):
+        decoded = serialization_module.deserialize_node_outputs(encoded)[0]
+
+    assert decoded.device.type == "cpu"
+    assert torch.equal(decoded, tensor)
+
+
+def test_tensor_attachment_rejects_mismatched_data_offsets(serialization_module: Any) -> None:
+    """A tensor attachment whose offsets disagree with its shape must fail loudly."""
+    torch = pytest.importorskip("torch")
+    attachment = bytearray(
+        serialization_module._serialize_tensor_bytes(torch.zeros(4, dtype=torch.float32))
+    )
+    corrupted = bytes(attachment).replace(b'"data_offsets":[0,16]', b'"data_offsets":[0,12]')
+
+    with pytest.raises(ValueError, match="do not match its shape and dtype"):
+        serialization_module._deserialize_tensor_bytes(corrupted)
+
+
+def test_binary_transport_copies_tensor_data_once(serialization_module: Any) -> None:
+    """Serializing a large tensor should allocate about one payload, not two or three."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.zeros(8 * 1024 * 1024, dtype=torch.float32)
+    serialization_module.serialize_node_inputs({"warmup": torch.zeros(1)})
+
+    tracemalloc.start()
+    try:
+        encoded = serialization_module.serialize_node_inputs({"tensor": tensor})
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(encoded) > tensor.numel() * tensor.element_size()
+    assert peak_bytes < len(encoded) * 1.1
 
 
 def test_serialize_mapping_supports_nested_tensors(serialization_module: Any) -> None:
