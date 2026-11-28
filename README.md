@@ -542,6 +542,9 @@ For credential safety, the node accepts only HTTPS `modal.direct` origins, refus
 
 ## Asset And Custom Node Sync
 
+Symlinked custom-node directories are included in both content hashes and package archives under their logical package names. Ancestor cycles are skipped; separate aliases remain separate packages. Changes are detected on the next custom-node scan (normally after restarting ComfyUI), including when a linked target is edited or replaced.
+
+
 The sync engine looks for node inputs that resolve to model files ending in `.safetensors`, `.ckpt`, `.gguf`, `.pt`, or `.vae`. Absolute paths and model names resolvable through ComfyUI's `folder_paths` both work; arbitrary unresolved strings do not sync, and a remote-marked node depending on an unresolvable model filename fails at queue time rather than sending a broken remote request.
 
 Assets are content-addressed and uploaded once: repeated references across nodes and components share one hash and upload decision, and unchanged files are skipped on later runs. In local mode, a local mirror stands in for remote storage.

@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 import time
 from typing import Any
@@ -134,6 +133,8 @@ class SyncHasher:
         digest = hashlib.sha256()
         for child in files:
             stat_result = child.stat()
+            digest.update(str(child.resolve()).encode("utf-8"))
+            digest.update(b"\0")
             digest.update(child.relative_to(root).as_posix().encode("utf-8"))
             digest.update(b"\0")
             digest.update(str(stat_result.st_size).encode("ascii"))
@@ -179,14 +180,21 @@ class SyncHasher:
         self._hash_cache_dirty = False
 
     def _iter_files(self, path: Path) -> list[Path]:
-        """Yield files from a directory tree while skipping cache folders."""
+        """List logical file paths, following directory links but never ancestor cycles."""
         files: list[Path] = []
-        for root, dirnames, filenames in os.walk(path):
-            dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
-            for filename in filenames:
-                child = Path(root) / filename
-                if child.suffix.lower() in _SKIP_FILE_SUFFIXES:
-                    continue
-                files.append(child)
+        pending: list[tuple[Path, frozenset[Path]]] = [(path, frozenset())]
+        while pending:
+            self._raise_if_cancelled()
+            directory, ancestors = pending.pop()
+            resolved = directory.resolve()
+            if resolved in ancestors:
+                logger.debug("Skipping cyclic directory link at %s", directory)
+                continue
+            lineage = ancestors | {resolved}
+            for child in sorted(directory.iterdir(), key=lambda item: item.name):
+                if child.is_dir():
+                    if child.name not in _SKIP_DIRS:
+                        pending.append((child, lineage))
+                elif child.is_file() and child.suffix.lower() not in _SKIP_FILE_SUFFIXES:
+                    files.append(child)
         return files
-
