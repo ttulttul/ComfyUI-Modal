@@ -292,6 +292,21 @@ def test_decoded_tensors_do_not_keep_the_payload_alive(serialization_module: Any
     assert torch.equal(decoded, torch.zeros(16, dtype=torch.float32))
 
 
+def test_tensor_transport_decodes_to_cpu_under_a_non_cpu_default_device(
+    serialization_module: Any,
+) -> None:
+    """Decoding must not follow a default device set by another node, as safetensors.load did not."""
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    encoded = serialization_module.serialize_node_outputs((tensor,))
+
+    with torch.device("meta"):
+        decoded = serialization_module.deserialize_node_outputs(encoded)[0]
+
+    assert decoded.device.type == "cpu"
+    assert torch.equal(decoded, tensor)
+
+
 def test_tensor_attachment_rejects_mismatched_data_offsets(serialization_module: Any) -> None:
     """A tensor attachment whose offsets disagree with its shape must fail loudly."""
     torch = pytest.importorskip("torch")

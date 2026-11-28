@@ -231,7 +231,7 @@ def _validated_tensor_layout(entry: Mapping[str, Any], data: memoryview) -> tupl
     if not isinstance(offsets, list) or len(offsets) != 2:
         raise ValueError("Tensor attachment data offsets must contain two integers.")
     start, end = offsets
-    expected_length = math.prod(shape) * _import_torch().empty((), dtype=dtype).element_size()
+    expected_length = math.prod(shape) * dtype.itemsize
     if not (0 <= start <= end <= data.nbytes) or end - start != expected_length:
         raise ValueError("Tensor attachment data offsets do not match its shape and dtype.")
     return dtype, shape, data[start:end]
@@ -242,7 +242,7 @@ def _deserialize_tensor_bytes(payload: bytes | bytearray | memoryview) -> Any:
     torch = _import_torch()
     entry, data = _parse_safetensors_entry(memoryview(payload).cast("B"))
     dtype, shape, tensor_data = _validated_tensor_layout(entry, data)
-    storage = torch.empty(tensor_data.nbytes, dtype=torch.uint8)
+    storage = torch.empty(tensor_data.nbytes, dtype=torch.uint8, device="cpu")
     memoryview(storage.numpy())[:] = tensor_data
     return storage.view(dtype).reshape(shape)
 
